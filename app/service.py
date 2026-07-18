@@ -199,6 +199,7 @@ class OpsService:
 
         state = self.get_state(vmid)
         prior_operation = state["operation_status"]
+        prior_stage = state["job_stage"]
         state.update(
             {
                 "update_status": "scanning",
@@ -211,10 +212,11 @@ class OpsService:
         try:
             data = self.executor.run("scan", vmid, timeout=700).get("data", {})
         except ExecutorError as exc:
+            state = self.get_state(vmid)
             state.update(
                 {
                     "update_status": "unknown",
-                    "job_stage": "idle" if prior_operation == "idle" else state["job_stage"],
+                    "job_stage": prior_stage,
                     "last_error": sanitize_text(exc, limit=2000),
                     "last_scan": utc_now(),
                     "operation_status": prior_operation,
@@ -231,12 +233,13 @@ class OpsService:
         count = max(0, int(data.get("pending_count", 0) or 0))
         data = dict(data)
         data["packages"] = list(data.get("packages") or [])[:200]
+        state = self.get_state(vmid)
         state.update(
             {
                 "updates": data,
                 "pending_updates": count,
                 "update_status": "update_available" if count else "up_to_date",
-                "job_stage": "idle" if prior_operation == "idle" else state["job_stage"],
+                "job_stage": prior_stage,
                 "last_scan": utc_now(),
                 "operation_status": prior_operation,
             }
@@ -618,7 +621,7 @@ class OpsService:
         self._execute(
             "repair",
             int(job["vmid"]),
-            int(policy.repair_timeout_seconds),
+            max(900, int(policy.repair_timeout_seconds)),
             emit,
         )
         return self.stabilizer.wait(
@@ -1049,13 +1052,16 @@ def _safe_int(value: Any, default: int) -> int:
 
 
 def _fingerprint(data: dict[str, Any]) -> str:
-    blob = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    # Match the managed executor contract: only the ordered package plan is
+    # fingerprinted. Volatile fields such as scanned_at must not invalidate approval.
+    packages = list(data.get("packages") or [])
+    blob = json.dumps(packages, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()
 
 
 def _risk_for(cfg: dict[str, Any], data: dict[str, Any]) -> str:
     packages = {
-        str(item.get("name", ""))
+        str(item.get("name", "")).split(":", 1)[0]
         for item in data.get("packages", [])
         if isinstance(item, dict)
     }
