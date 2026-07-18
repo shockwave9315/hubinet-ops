@@ -47,7 +47,6 @@ containers:
     manual_rollback_allowed: false
     repair_actions: []
     dashboard_path: /hubinet-ops/ct-101
-    snapshot_retention_hours: 24
     stabilization: &default_stabilization
       post_update_timeout_seconds: 300
       post_rollback_timeout_seconds: 300
@@ -68,5 +67,4 @@ containers:
       - restart_services
       - restart_required_containers
     dashboard_path: /hubinet-ops/ct-106
-    snapshot_retention_hours: 24
     stabilization: *default_stabilization
