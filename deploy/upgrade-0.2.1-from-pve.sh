@@ -142,7 +142,16 @@ rm -rf /opt/hubinet-ops/app
 cp -a "$staging/app" /opt/hubinet-ops/app
 cp "$staging/requirements.txt" /opt/hubinet-ops/requirements.txt
 chown -R hubinetops:hubinetops /opt/hubinet-ops/app /opt/hubinet-ops/requirements.txt
-/opt/hubinet-ops/.venv/bin/pip install -r /opt/hubinet-ops/requirements.txt
+# The outer deployment uses umask 077 for secrets/backups. Python dependencies,
+# however, must remain readable and traversable by the unprivileged service user.
+(
+  umask 022
+  /opt/hubinet-ops/.venv/bin/pip install -r /opt/hubinet-ops/requirements.txt
+)
+chown -R root:root /opt/hubinet-ops/.venv
+chmod -R a+rX /opt/hubinet-ops/.venv
+runuser -u hubinetops -- /opt/hubinet-ops/.venv/bin/python -c \
+  'import paho.mqtt.client as mqtt; print("paho_mqtt_import=ok", mqtt.__file__)'
 install -m 0644 "$staging/deploy/hubinet-ops.service" /etc/systemd/system/hubinet-ops.service
 
 /opt/hubinet-ops/.venv/bin/python - <<'PY'
