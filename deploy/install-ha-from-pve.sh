@@ -33,9 +33,28 @@ SSH_ARGS=(-p "$HA_PORT" -i /root/.ssh/id_ed25519 "root@$HA_HOST")
   echo "Missing Home Assistant package in source tree" >&2
   exit 1
 }
+[[ -f "$SOURCE_DIR/home-assistant/dashboards/hubinet_ops.yaml" ]] || {
+  echo "Missing Home Assistant dashboard in source tree" >&2
+  exit 1
+}
 
 TOKEN="$(pct exec "$AGENT_VMID" -- sed -n 's/^HUBINET_OPS_API_TOKEN=//p' /etc/hubinet-ops/agent.env)"
 [[ ${#TOKEN} -ge 32 ]] || { echo "Agent token not found or too short" >&2; exit 1; }
+
+# The dashboard requires a registered Lovelace Mushroom resource. A downloaded
+# HACS asset alone is insufficient because browsers will not load it.
+if ! ssh "${SSH_ARGS[@]}" '
+  grep -Rqs "lovelace-mushroom/mushroom.js" \
+    /config/.storage/lovelace_resources \
+    /config/configuration.yaml 2>/dev/null
+'; then
+  cat >&2 <<'EOF'
+A registered Mushroom Lovelace resource was not found in Home Assistant.
+Install "Mushroom" through HACS and ensure its resource is registered, then rerun.
+No Hubinet Ops Home Assistant files were changed.
+EOF
+  exit 1
+fi
 
 # Refuse to append a second top-level lovelace key. Existing installations must
 # already contain the dashboard entry or be edited deliberately by the operator.
@@ -102,7 +121,7 @@ ssh "${SSH_ARGS[@]}" '
   set -e
   awk "!/^hubinet_ops_(scan_url|refresh_url|retry_healthcheck_url|rollback_url|approve_url|reject_url|authorization):/" \
     /config/secrets.yaml > /config/secrets.yaml.new
-  printf "\n# Hubinet Ops 0.2.1\n" >> /config/secrets.yaml.new
+  printf "\n# Hubinet Ops 0.2.2\n" >> /config/secrets.yaml.new
   cat /tmp/hubinet-ops-secrets >> /config/secrets.yaml.new
   mv /config/secrets.yaml.new /config/secrets.yaml
   chmod 600 /config/secrets.yaml
@@ -116,5 +135,5 @@ fi
 
 ssh "${SSH_ARGS[@]}" 'ha core check'
 
-echo "HA files validated. Restart Home Assistant once only if the dashboard/package was not already loaded."
-echo "Normal MQTT state and discovery updates do not require a Home Assistant restart."
+echo "Hubinet Ops 0.2.2 HA files validated. Restart Home Assistant to reload package automations."
+echo "After restart, MQTT state, dashboard logs, and phone progress updates are live without polling."
