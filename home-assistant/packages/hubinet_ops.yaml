@@ -138,7 +138,7 @@ automation:
       - choose:
           - conditions: "{{ event_type == 'approval_required' }}"
             sequence:
-              - action: notify.mobile_app_poco_x8
+              - action: !secret hubinet_ops_notify_service
                 data:
                   title: "CT{{ vmid }} {{ container }}: approval required"
                   message: "{{ trigger.json.pending_count }} updates, {{ trigger.json.risk }} risk. Open Hubinet Ops to review."
@@ -147,21 +147,21 @@ automation:
                     clickAction: "{{ dashboard_path }}"
           - conditions: "{{ event_type == 'job_success' }}"
             sequence:
-              - action: notify.mobile_app_poco_x8
+              - action: !secret hubinet_ops_notify_service
                 data:
                   title: "CT{{ vmid }} {{ container }}: update successful"
                   message: "Health stabilization passed."
                   data: *navigation_data
           - conditions: "{{ event_type == 'job_rolled_back' }}"
             sequence:
-              - action: notify.mobile_app_poco_x8
+              - action: !secret hubinet_ops_notify_service
                 data:
                   title: "CT{{ vmid }} {{ container }}: rollback successful"
                   message: "The snapshot was restored and stabilization passed."
                   data: *navigation_data
           - conditions: "{{ event_type in ['manual_intervention_required', 'job_blocked', 'scan_failed'] }}"
             sequence:
-              - action: notify.mobile_app_poco_x8
+              - action: !secret hubinet_ops_notify_service
                 data:
                   title: "CT{{ vmid }} {{ container }}: attention required"
                   message: "Open Hubinet Ops for the current state and recent events."
