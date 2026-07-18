@@ -56,6 +56,19 @@ def test_invalid_mqtt_port_is_descriptive(port: Any) -> None:
         validate_config(config)
 
 
+def test_quoted_integer_mqtt_settings_are_accepted() -> None:
+    config = base_config()
+    config["mqtt"] = {
+        "enabled": True,
+        "host": "broker.test",
+        "port": "1883",
+        "keepalive_seconds": "60",
+        "reconnect_min_seconds": "2",
+        "reconnect_max_seconds": "60",
+    }
+    validate_config(config)
+
+
 def test_enabled_mqtt_requires_host_and_valid_reconnect_range() -> None:
     config = base_config()
     config["mqtt"] = {"enabled": True, "host": ""}
