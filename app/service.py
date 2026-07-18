@@ -209,7 +209,7 @@ class OpsService:
             state["last_error"] = None
         self._save_state(vmid, state)
         try:
-            data = self.executor.run("scan", vmid, timeout=300).get("data", {})
+            data = self.executor.run("scan", vmid, timeout=700).get("data", {})
         except ExecutorError as exc:
             state.update(
                 {
@@ -425,7 +425,7 @@ class OpsService:
             message="Update job started",
         )
         try:
-            preflight = self._execute("preflight", vmid, 300, emit)
+            preflight = self._execute("preflight", vmid, 700, emit)
             self._validate_approved_plan(job, preflight)
             emit(
                 stage="preflight",
@@ -465,7 +465,7 @@ class OpsService:
                 event_type="update_started",
                 message="Package update started",
             )
-            update = self._execute("update", vmid, 3900, emit)
+            update = self._execute("update", vmid, 4500, emit)
             emit(
                 stage="waiting_services",
                 progress=75,
@@ -491,7 +491,7 @@ class OpsService:
 
             post_scan_error: str | None = None
             try:
-                post_scan = self.executor.run("scan", vmid, timeout=300)
+                post_scan = self.executor.run("scan", vmid, timeout=700)
             except ExecutorError as exc:
                 post_scan_error = str(exc)
                 post_scan = {"ok": False, "data": {}, "error": post_scan_error}
