@@ -38,7 +38,8 @@ for vmid in 101 "$CT106_VMID"; do
 done
 
 restore_all() {
-  local rc=$?
+  local rc="${1:-$?}"
+  [[ "$rc" -ne 0 ]] || rc=1
   trap - ERR INT TERM
   if [[ $COMPLETE -eq 1 ]]; then
     rm -f "$ARCHIVE"
@@ -91,7 +92,9 @@ REMOTE_RESTORE_AGENT
   echo "Previous Hubinet Ops components were restored. Original exit code: $rc" >&2
   exit "$rc"
 }
-trap restore_all ERR INT TERM
+trap 'restore_all $?' ERR
+trap 'restore_all 130' INT
+trap 'restore_all 143' TERM
 trap 'rm -f "$ARCHIVE"' EXIT
 
 install -d -m 0700 "$HOST_BACKUP"
@@ -215,7 +218,9 @@ for vmid in 101 "$CT106_VMID"; do
   pct push "$vmid" "$SOURCE_DIR/deploy/managed/hubinet-maint" /usr/local/sbin/hubinet-maint --perms 0755
   pct exec "$vmid" -- python3 -m py_compile /usr/local/sbin/hubinet-maint
 done
-pct exec "$CT106_VMID" -- python3 - <<'PY'
+pct exec "$CT106_VMID" -- bash -s <<'REMOTE_UPDATE_PROFILE'
+set -Eeuo pipefail
+python3 - <<'PY'
 import json
 from pathlib import Path
 
@@ -224,6 +229,7 @@ data = json.loads(path.read_text(encoding="utf-8"))
 data.setdefault("repair_actions", ["restart_services", "restart_required_containers"])
 path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 PY
+REMOTE_UPDATE_PROFILE
 
 echo "=== START AND VERIFY AGENT ==="
 pct exec "$AGENT_VMID" -- systemctl start hubinet-ops
