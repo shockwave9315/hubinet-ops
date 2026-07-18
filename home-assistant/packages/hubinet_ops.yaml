@@ -1,4 +1,4 @@
-# Hubinet Ops 0.2.1: MQTT Discovery state, authenticated REST actions, navigation-only push.
+# Hubinet Ops 0.2.2: Mushroom dashboard, live progress notifications, authenticated REST actions.
 
 rest_command:
   hubinet_ops_scan_container:
@@ -49,7 +49,7 @@ rest_command:
 
 script:
   hubinet_ops_scan_container:
-    alias: "Hubinet Ops - scan container"
+    alias: "Hubinet Ops — skanuj kontener"
     mode: parallel
     fields: &vmid_field
       vmid:
@@ -64,7 +64,7 @@ script:
           vmid: "{{ vmid | int }}"
 
   hubinet_ops_refresh_container:
-    alias: "Hubinet Ops - refresh container"
+    alias: "Hubinet Ops — odśwież kontener"
     mode: parallel
     fields: *vmid_field
     sequence:
@@ -73,7 +73,7 @@ script:
           vmid: "{{ vmid | int }}"
 
   hubinet_ops_retry_healthcheck:
-    alias: "Hubinet Ops - retry healthcheck"
+    alias: "Hubinet Ops — ponów healthcheck"
     mode: parallel
     fields: *vmid_field
     sequence:
@@ -82,7 +82,7 @@ script:
           vmid: "{{ vmid | int }}"
 
   hubinet_ops_rollback:
-    alias: "Hubinet Ops - rollback"
+    alias: "Hubinet Ops — rollback"
     mode: single
     fields: *vmid_field
     sequence:
@@ -91,7 +91,7 @@ script:
           vmid: "{{ vmid | int }}"
 
   hubinet_ops_approve_container:
-    alias: "Hubinet Ops - approve plan"
+    alias: "Hubinet Ops — zatwierdź plan"
     mode: parallel
     fields: *vmid_field
     variables:
@@ -105,7 +105,7 @@ script:
           plan_id: "{{ plan_id }}"
 
   hubinet_ops_reject_container:
-    alias: "Hubinet Ops - reject plan"
+    alias: "Hubinet Ops — odrzuć plan"
     mode: parallel
     fields: *vmid_field
     variables:
@@ -119,10 +119,10 @@ script:
           plan_id: "{{ plan_id }}"
 
 automation:
-  - id: hubinet_ops_webhook_v021
-    alias: "Hubinet Ops 0.2.1 - agent notifications"
+  - id: hubinet_ops_webhook_notifications_v022
+    alias: "Hubinet Ops 0.2.2 — zdarzenia agenta"
     mode: queued
-    max: 20
+    max: 30
     triggers:
       - trigger: webhook
         webhook_id: !secret hubinet_ops_webhook_id
@@ -131,38 +131,270 @@ automation:
         local_only: true
     variables:
       event_type: "{{ trigger.json.event_type | default('unknown') }}"
-      container: "{{ trigger.json.container | default('unknown service') }}"
+      container: "{{ trigger.json.container | default('nieznany kontener') }}"
       vmid: "{{ trigger.json.vmid | default('?') }}"
       dashboard_path: "{{ trigger.json.dashboard_path | default('/hubinet-ops/overview') }}"
+      job_tag: "hubinet_ops_ct{{ vmid }}_job"
+      plan_tag: "hubinet_ops_ct{{ vmid }}_plan"
     actions:
       - choose:
           - conditions: "{{ event_type == 'approval_required' }}"
             sequence:
               - action: !secret hubinet_ops_notify_service
                 data:
-                  title: "CT{{ vmid }} {{ container }}: approval required"
-                  message: "{{ trigger.json.pending_count }} updates, {{ trigger.json.risk }} risk. Open Hubinet Ops to review."
-                  data: &navigation_data
+                  title: "⚠️ CT{{ vmid }} {{ container }} — decyzja"
+                  message: >-
+                    Dostępne aktualizacje: {{ trigger.json.pending_count | default('?') }}.
+                    Ryzyko: {{ trigger.json.risk | default('unknown') }}. Otwórz panel i sprawdź plan.
+                  data:
+                    tag: "{{ plan_tag }}"
+                    group: hubinet_ops
+                    channel: "Hubinet Ops"
+                    importance: high
+                    priority: high
+                    ttl: 0
+                    notification_icon: mdi:package-up
+                    color: "#FF9800"
                     url: "{{ dashboard_path }}"
                     clickAction: "{{ dashboard_path }}"
+
+          - conditions: "{{ event_type == 'job_queued' }}"
+            sequence:
+              - action: !secret hubinet_ops_notify_service
+                data:
+                  title: "🚀 CT{{ vmid }} {{ container }} — start"
+                  message: "Plan zatwierdzony. Aktualizacja została dodana do kolejki."
+                  data:
+                    tag: "{{ job_tag }}"
+                    group: hubinet_ops
+                    channel: "Hubinet Ops progress"
+                    importance: low
+                    alert_once: true
+                    live_update: true
+                    sticky: true
+                    progress: 1
+                    progress_max: 100
+                    notification_icon: mdi:progress-wrench
+                    color: "#2196F3"
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
           - conditions: "{{ event_type == 'job_success' }}"
             sequence:
               - action: !secret hubinet_ops_notify_service
                 data:
-                  title: "CT{{ vmid }} {{ container }}: update successful"
-                  message: "Health stabilization passed."
-                  data: *navigation_data
+                  title: "✅ CT{{ vmid }} {{ container }} — gotowe"
+                  message: "Aktualizacja i stabilizacja usług zakończone pomyślnie."
+                  data:
+                    tag: "{{ job_tag }}"
+                    group: hubinet_ops
+                    channel: "Hubinet Ops"
+                    importance: default
+                    progress: -1
+                    timeout: 3600
+                    notification_icon: mdi:check-decagram
+                    color: "#4CAF50"
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
           - conditions: "{{ event_type == 'job_rolled_back' }}"
             sequence:
               - action: !secret hubinet_ops_notify_service
                 data:
-                  title: "CT{{ vmid }} {{ container }}: rollback successful"
-                  message: "The snapshot was restored and stabilization passed."
-                  data: *navigation_data
-          - conditions: "{{ event_type in ['manual_intervention_required', 'job_blocked', 'scan_failed'] }}"
+                  title: "↩️ CT{{ vmid }} {{ container }} — rollback"
+                  message: "Aktualizacja nie przeszła. Snapshot został przywrócony, a stabilizacja zakończona."
+                  data:
+                    tag: "{{ job_tag }}"
+                    group: hubinet_ops
+                    channel: "Hubinet Ops alerts"
+                    importance: high
+                    priority: high
+                    ttl: 0
+                    progress: -1
+                    sticky: true
+                    notification_icon: mdi:backup-restore
+                    color: "#FF9800"
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
+          - conditions: >-
+              {{ event_type in ['manual_intervention_required', 'job_blocked', 'scan_failed'] }}
             sequence:
               - action: !secret hubinet_ops_notify_service
                 data:
-                  title: "CT{{ vmid }} {{ container }}: attention required"
-                  message: "Open Hubinet Ops for the current state and recent events."
-                  data: *navigation_data
+                  title: "🚨 CT{{ vmid }} {{ container }} — wymaga uwagi"
+                  message: >-
+                    {{ trigger.json.error | default('Sprawdź stan kontenera i ostatnie logi w Hubinet Ops.') }}
+                  data:
+                    tag: "{{ job_tag }}"
+                    group: hubinet_ops
+                    channel: "Hubinet Ops alerts"
+                    importance: high
+                    priority: high
+                    ttl: 0
+                    progress: -1
+                    sticky: true
+                    notification_icon: mdi:alert-octagon
+                    color: "#F44336"
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
+  - id: hubinet_ops_live_progress_v022
+    alias: "Hubinet Ops 0.2.2 — progress aktualizacji na telefonie"
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        seconds: "/10"
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ is_state('sensor.hubinet_ops_ct101_operation_status', 'running')
+             or is_state('sensor.hubinet_ops_ct106_operation_status', 'running') }}
+    actions:
+      - repeat:
+          for_each:
+            - vmid: 101
+              name: cloudflared
+              operation_entity: sensor.hubinet_ops_ct101_operation_status
+              stage_entity: sensor.hubinet_ops_ct101_job_stage
+              progress_entity: sensor.hubinet_ops_ct101_job_progress
+              state_entity: sensor.hubinet_ops_ct101_health_status
+              dashboard_path: /hubinet-ops/ct-101
+            - vmid: 106
+              name: weather
+              operation_entity: sensor.hubinet_ops_ct106_operation_status
+              stage_entity: sensor.hubinet_ops_ct106_job_stage
+              progress_entity: sensor.hubinet_ops_ct106_job_progress
+              state_entity: sensor.hubinet_ops_ct106_health_status
+              dashboard_path: /hubinet-ops/ct-106
+          sequence:
+            - condition: template
+              value_template: "{{ is_state(repeat.item.operation_entity, 'running') }}"
+            - variables:
+                current_progress: "{{ states(repeat.item.progress_entity) | int(0) }}"
+                current_stage: "{{ states(repeat.item.stage_entity) | replace('_', ' ') }}"
+                current_event: "{{ state_attr(repeat.item.state_entity, 'last_job_event') or {} }}"
+            - action: !secret hubinet_ops_notify_service
+              data:
+                title: "⚙️ CT{{ repeat.item.vmid }} {{ repeat.item.name }} — {{ current_progress }}%"
+                message: >-
+                  {{ current_stage | title }}{% if current_event.get('message') %} · {{ current_event.get('message') }}{% endif %}
+                data:
+                  tag: "hubinet_ops_ct{{ repeat.item.vmid }}_job"
+                  group: hubinet_ops
+                  channel: "Hubinet Ops progress"
+                  importance: low
+                  alert_once: true
+                  live_update: true
+                  sticky: true
+                  progress: "{{ current_progress }}"
+                  progress_max: 100
+                  notification_icon: mdi:progress-wrench
+                  color: "#2196F3"
+                  url: "{{ repeat.item.dashboard_path }}"
+                  clickAction: "{{ repeat.item.dashboard_path }}"
+
+  - id: hubinet_ops_health_watchdog_v022
+    alias: "Hubinet Ops 0.2.2 — watchdog dostępności i zdrowia"
+    mode: queued
+    max: 20
+    triggers:
+      - trigger: state
+        entity_id: sensor.hubinet_ops_agent_availability
+        to: offline
+        for: "00:02:00"
+        id: agent_problem
+      - trigger: state
+        entity_id: sensor.hubinet_ops_agent_availability
+        to: online
+        for: "00:00:30"
+        id: agent_recovery
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct101_health_status
+        to: critical
+        for: "00:01:00"
+        id: ct101_problem
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct101_health_status
+        to: offline
+        for: "00:01:00"
+        id: ct101_problem
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct101_health_status
+        to: healthy
+        for: "00:00:30"
+        id: ct101_recovery
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct106_health_status
+        to: critical
+        for: "00:01:00"
+        id: ct106_problem
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct106_health_status
+        to: offline
+        for: "00:01:00"
+        id: ct106_problem
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct106_health_status
+        to: healthy
+        for: "00:00:30"
+        id: ct106_recovery
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.id in ['agent_problem', 'agent_recovery']
+             or trigger.from_state is none
+             or trigger.from_state.state != trigger.to_state.state }}
+      - condition: template
+        value_template: >-
+          {{ not trigger.id.endswith('_recovery')
+             or (trigger.from_state is not none and trigger.from_state.state in ['critical', 'offline', 'degraded']) }}
+    variables:
+      is_problem: "{{ trigger.id.endswith('_problem') }}"
+      is_agent: "{{ trigger.id.startswith('agent_') }}"
+      vmid: >-
+        {{ 101 if trigger.id.startswith('ct101_') else 106 if trigger.id.startswith('ct106_') else 'agent' }}
+      container: >-
+        {{ 'cloudflared' if trigger.id.startswith('ct101_') else 'weather' if trigger.id.startswith('ct106_') else 'Hubinet Ops Agent' }}
+      dashboard_path: >-
+        {{ '/hubinet-ops/ct-101' if trigger.id.startswith('ct101_') else '/hubinet-ops/ct-106' if trigger.id.startswith('ct106_') else '/hubinet-ops/overview' }}
+      notification_tag: "hubinet_ops_{{ vmid }}_health"
+    actions:
+      - choose:
+          - conditions: "{{ is_problem }}"
+            sequence:
+              - action: !secret hubinet_ops_notify_service
+                data:
+                  title: >-
+                    🚨 {{ container }} — {{ trigger.to_state.state }}
+                  message: >-
+                    {% if is_agent %}Agent nie publikuje telemetrii MQTT.{% else %}CT{{ vmid }} zgłasza stan {{ trigger.to_state.state }}.{% endif %}
+                  data:
+                    tag: "{{ notification_tag }}"
+                    group: hubinet_ops
+                    channel: "Hubinet Ops alerts"
+                    importance: high
+                    priority: high
+                    ttl: 0
+                    sticky: true
+                    notification_icon: mdi:server-alert
+                    color: "#F44336"
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+        default:
+          - action: !secret hubinet_ops_notify_service
+            data:
+              title: "✅ {{ container }} — odzyskano"
+              message: >-
+                {% if is_agent %}Telemetria MQTT znów jest online.{% else %}CT{{ vmid }} wrócił do stanu healthy.{% endif %}
+              data:
+                tag: "{{ notification_tag }}"
+                group: hubinet_ops
+                channel: "Hubinet Ops"
+                importance: default
+                timeout: 1800
+                notification_icon: mdi:server-security
+                color: "#4CAF50"
+                url: "{{ dashboard_path }}"
+                clickAction: "{{ dashboard_path }}"
