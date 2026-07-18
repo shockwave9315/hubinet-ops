@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 from scripts.validate_yaml import HomeAssistantLoader
 import yaml
@@ -10,7 +11,11 @@ ROOT = Path(__file__).parents[1]
 
 
 def test_all_repository_yaml_parses() -> None:
-    for path in [*ROOT.rglob("*.yaml"), *ROOT.rglob("*.yml")]:
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "*.yaml", "*.yml"], cwd=ROOT, text=True
+    ).splitlines()
+    for name in tracked:
+        path = ROOT / name
         yaml.load(path.read_text(encoding="utf-8"), Loader=HomeAssistantLoader)
 
 

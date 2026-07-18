@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,10 @@ HomeAssistantLoader.add_multi_constructor("!", _unknown_tag)
 
 
 def main() -> int:
-    paths = sorted({*Path(".").rglob("*.yaml"), *Path(".").rglob("*.yml")})
+    tracked = subprocess.check_output(
+        ["git", "ls-files", "*.yaml", "*.yml"], text=True
+    ).splitlines()
+    paths = [Path(value) for value in tracked]
     for path in paths:
         with path.open("r", encoding="utf-8") as handle:
             yaml.load(handle, Loader=HomeAssistantLoader)
