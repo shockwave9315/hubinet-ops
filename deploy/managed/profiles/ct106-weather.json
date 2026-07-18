@@ -1,7 +1,7 @@
 {
   "services": [
-    "docker",
-    "containerd"
+    "containerd",
+    "docker"
   ],
   "health_urls": [],
   "min_free_mb": 3072,
