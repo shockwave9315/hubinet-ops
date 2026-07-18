@@ -12,6 +12,7 @@ from scripts.validate_yaml import HomeAssistantLoader
 ROOT = Path(__file__).parents[1]
 PACKAGE = ROOT / "home-assistant" / "packages" / "hubinet_ops.yaml"
 DASHBOARD = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
+INSTALLER = ROOT / "deploy" / "install-ha-from-pve.sh"
 
 
 def _load(path: Path) -> Any:
@@ -26,6 +27,11 @@ def _walk(value: Any):
     elif isinstance(value, list):
         for child in value:
             yield from _walk(child)
+
+
+def _automation(automation_id: str) -> dict[str, Any]:
+    data = _load(PACKAGE)
+    return next(item for item in data["automation"] if item["id"] == automation_id)
 
 
 def test_all_repository_yaml_parses() -> None:
@@ -74,19 +80,37 @@ def test_notifications_are_navigation_only_and_use_private_target() -> None:
     assert "!secret hubinet_ops_notify_service" in PACKAGE.read_text(encoding="utf-8")
 
 
-def test_live_progress_notification_replaces_one_phone_notification_per_ct() -> None:
+def test_live_progress_runs_only_for_active_jobs_and_reuses_one_tag() -> None:
+    progress = _automation("hubinet_ops_live_progress_v022")
     text = PACKAGE.read_text(encoding="utf-8")
 
-    assert 'seconds: "/10"' in text
-    assert "live_update: true" in text
-    assert "progress_max: 100" in text
-    assert "alert_once: true" in text
-    assert 'tag: "hubinet_ops_ct{{ repeat.item.vmid }}_job"' in text
+    assert progress["mode"] == "parallel"
+    assert progress["max"] == 2
+    assert {trigger["entity_id"] for trigger in progress["triggers"]} == {
+        "sensor.hubinet_ops_ct101_operation_status",
+        "sensor.hubinet_ops_ct106_operation_status",
+    }
+    assert all(trigger["to"] == "running" for trigger in progress["triggers"])
+
+    repeat = progress["actions"][0]["repeat"]
+    assert repeat["while"][0]["condition"] == "template"
+    assert "is_state(operation_entity, 'running')" in repeat["while"][0][
+        "value_template"
+    ]
+    assert repeat["sequence"][-1]["delay"] == "00:00:10"
+
+    assert 'tag: "hubinet_ops_ct{{ vmid }}_job"' in text
     assert text.count('tag: "{{ job_tag }}"') >= 5
     assert "plan_tag" not in text
     assert "progress: -1" not in text
-    assert "/hubinet-ops/ct-101" in text
-    assert "/hubinet-ops/ct-106" in text
+    assert 'seconds: "/10"' not in text
+
+
+def test_watchdog_rejects_missing_to_state_before_accessing_it() -> None:
+    watchdog = _automation("hubinet_ops_health_watchdog_v022")
+    first_condition = watchdog["conditions"][0]["value_template"]
+
+    assert "trigger.to_state is not none" in first_condition
 
 
 def test_dashboard_is_mushroom_sections_with_dashboard_only_approval() -> None:
@@ -109,14 +133,15 @@ def test_dashboard_is_mushroom_sections_with_dashboard_only_approval() -> None:
     assert "hubinet_ops_reject" not in automation_text
 
 
-def test_dashboard_has_bounded_reverse_chronological_live_logs_and_packages() -> None:
+def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() -> None:
     text = DASHBOARD.read_text(encoding="utf-8")
 
     assert text.count("title: Logi live") == 2
     assert text.count("recent_job_events") >= 2
     assert text.count("events[-25:] | reverse") == 2
+    assert text.count("replace('|', '¦')") == 2
     assert text.count("packages[:30]") == 2
-    assert "oraz {{ (packages | count) - 30 }} kolejnych pakietów" in text
+    assert "kolejnych pakietów" in text
 
 
 def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
@@ -141,6 +166,8 @@ def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
         "disk_used_percent",
         "disk_free_mb",
         "memory_used_percent",
+        "active_plan_id",
+        "active_job_id",
         "last_scan",
         "last_update",
         "last_error",
@@ -162,11 +189,13 @@ def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
             assert f"sensor.hubinet_ops_ct{vmid}_{stale}" not in dashboard
 
 
-def test_ha_installer_requires_mushroom_and_private_notification_secrets() -> None:
-    installer = (ROOT / "deploy" / "install-ha-0.2.1-from-pve.sh").read_text(
-        encoding="utf-8"
-    )
-    assert "lovelace-mushroom/mushroom.js" in installer
+def test_ha_installer_requires_registered_mushroom_and_private_secrets() -> None:
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert not (ROOT / "deploy" / "install-ha-0.2.1-from-pve.sh").exists()
+    assert "/config/.storage/lovelace_resources" in installer
+    assert "/config/configuration.yaml" in installer
+    assert "test -f /config/www/community/lovelace-mushroom" not in installer
     assert "hubinet_ops_webhook_id" in installer
     assert "hubinet_ops_notify_service" in installer
     assert "notify.mobile_app_poco_x8" not in installer
