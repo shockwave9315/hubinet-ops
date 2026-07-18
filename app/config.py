@@ -166,6 +166,6 @@ def _strict_int(value: Any, name: str) -> int:
         raise RuntimeError(f"{name} must be an integer")
     if isinstance(value, str):
         text = value.strip()
-        if not text or text.lstrip("+-").isdigit():
+        if not text or not text.lstrip("+-").isdigit():
             raise RuntimeError(f"{name} must be an integer")
     return result
