@@ -41,7 +41,7 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
         health = "offline"
     state["health_status"] = health if health in HEALTH_STATUSES else "unknown"
 
-    pending = max(0, int(state.get("pending_updates", 0) or 0))
+    pending = max(0, _safe_int(state.get("pending_updates"), 0))
     update = str(state.get("update_status") or "")
     if update not in UPDATE_STATUSES:
         if legacy_status == "scanning":
@@ -58,7 +58,11 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state["job_stage"] = stage
     operation = str(state.get("operation_status") or "")
     if operation not in OPERATION_STATUSES:
-        operation = _legacy_operation(legacy_status, str(state.get("job_status") or ""), stage)
+        operation = _legacy_operation(
+            legacy_status,
+            str(state.get("job_status") or ""),
+            stage,
+        )
     state["operation_status"] = operation
 
     has_explicit_result = "last_operation_result" in state
@@ -66,9 +70,26 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     if result not in OPERATION_RESULTS or not has_explicit_result:
         result = _legacy_result(str(state.get("job_status") or ""), legacy_status)
     state["last_operation_result"] = result
-    state["job_progress"] = max(0, min(100, int(state.get("job_progress", 0) or 0)))
+    state["job_progress"] = max(
+        0,
+        min(100, _safe_int(state.get("job_progress"), 0)),
+    )
+    state["health_score"] = max(
+        0,
+        min(100, _safe_int(state.get("health_score"), 0)),
+    )
     state["pending_updates"] = pending
-    state.setdefault("updates", {"pending_count": pending, "packages": []})
+
+    raw_updates = state.get("updates")
+    updates = dict(raw_updates) if isinstance(raw_updates, dict) else {}
+    updates["pending_count"] = max(
+        0,
+        _safe_int(updates.get("pending_count"), pending),
+    )
+    packages = updates.get("packages")
+    updates["packages"] = list(packages)[:200] if isinstance(packages, list) else []
+    state["updates"] = updates
+
     state.setdefault("risk", "none")
     state.setdefault("active_plan_id", None)
     state.setdefault("active_plan_status", None)
@@ -77,8 +98,12 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("last_refresh", None)
     state.setdefault("last_update", None)
     state.setdefault("last_error", None)
-    state.setdefault("recent_job_events", [])
-    state.setdefault("last_job_event", None)
+    recent = state.get("recent_job_events")
+    state["recent_job_events"] = list(recent)[-50:] if isinstance(recent, list) else []
+    if not isinstance(state.get("last_job_event"), (dict, type(None))):
+        state["last_job_event"] = None
+    else:
+        state.setdefault("last_job_event", None)
     return state
 
 
@@ -90,6 +115,15 @@ def display_status(state: dict[str, Any]) -> str:
     if health != "healthy":
         return health
     return str(state.get("update_status", "unknown"))
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        if isinstance(value, bool):
+            return default
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _legacy_stage(stage: str) -> str:
