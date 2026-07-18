@@ -62,4 +62,4 @@ pct push "$VMID" "$TMP" /etc/hubinet-maint.json --perms 0644
 pct exec "$VMID" -- /usr/local/sbin/hubinet-maint inspect
 pct exec "$VMID" -- /usr/local/sbin/hubinet-maint healthcheck
 
-echo "CT$VMID przygotowany dla Hubinet Ops 0.2. Najpierw testuj scan/preflight."
+echo "CT$VMID prepared for Hubinet Ops 0.2.1. Test inspect/preflight before any update."

@@ -8,6 +8,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .security import bounded_json, sanitize_data, sanitize_text
+from .state import JOB_STAGES, normalize_state
+
 
 class Database:
     def __init__(self, path: Path):
@@ -49,6 +52,7 @@ class Database:
                     container_name TEXT NOT NULL,
                     status TEXT NOT NULL,
                     stage TEXT NOT NULL,
+                    progress INTEGER NOT NULL DEFAULT 0,
                     snapshot_name TEXT,
                     result TEXT,
                     error TEXT,
@@ -65,12 +69,36 @@ class Database:
                     payload TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS job_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    progress INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    FOREIGN KEY(job_id) REFERENCES jobs(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_job_events_job_created
+                    ON job_events(job_id, created_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_job_events_vmid_created
+                    ON job_events(vmid, created_at DESC, id DESC);
                 """
             )
+            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+            if "progress" not in job_columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
+            self._migrate_container_states(conn)
+            conn.execute("PRAGMA user_version=201")
             # Po restarcie nie udajemy, że przerwane zadanie dalej działa.
             now = utc_now()
             conn.execute(
-                "UPDATE jobs SET status='interrupted', stage='interrupted', updated_at=? "
+                "UPDATE jobs SET status='interrupted', stage='failed', progress=100, updated_at=? "
                 "WHERE status IN ('queued','running')",
                 (now,),
             )
@@ -78,6 +106,20 @@ class Database:
                 "UPDATE plans SET status='interrupted' WHERE status='approved' "
                 "AND id IN (SELECT plan_id FROM jobs WHERE status='interrupted')"
             )
+
+    def _migrate_container_states(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("SELECT vmid, payload FROM container_states").fetchall()
+        for row in rows:
+            try:
+                old = json.loads(row["payload"])
+                migrated = normalize_state(old)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if migrated != old:
+                conn.execute(
+                    "UPDATE container_states SET payload=? WHERE vmid=?",
+                    (json.dumps(migrated, ensure_ascii=False), row["vmid"]),
+                )
 
     def create_plan(
         self,
@@ -126,6 +168,11 @@ class Database:
             args.append(fingerprint)
         query += " ORDER BY created_at DESC LIMIT 1"
         with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE plans SET status='expired' "
+                "WHERE status='waiting_approval' AND expires_at<=?",
+                (utc_now(),),
+            )
             row = conn.execute(query, args).fetchone()
         return _decode_plan(row) if row else None
 
@@ -244,7 +291,7 @@ class Database:
                 return None
             now = utc_now()
             conn.execute(
-                "UPDATE jobs SET status='running', stage='preflight', updated_at=? WHERE id=?",
+                "UPDATE jobs SET status='running', stage='preflight', progress=5, updated_at=? WHERE id=?",
                 (now, row["id"]),
             )
             conn.execute("COMMIT")
@@ -280,8 +327,52 @@ class Database:
             ).fetchall()
         return [_decode_job(row) for row in rows]
 
+    def active_job_count(self) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM jobs WHERE status IN ('queued','running')"
+            ).fetchone()
+        return int(row["count"])
+
+    def create_manual_rollback_job(self, source_job_id: str) -> dict[str, Any]:
+        return self.create_followup_job(source_job_id, stage="rollback", progress=1)
+
+    def create_followup_job(
+        self,
+        source_job_id: str,
+        *,
+        stage: str,
+        progress: int,
+    ) -> dict[str, Any]:
+        source = self.get_job(source_job_id)
+        job_id = uuid.uuid4().hex
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            if conn.execute(
+                "SELECT 1 FROM jobs WHERE vmid=? AND status IN ('queued','running')",
+                (source["vmid"],),
+            ).fetchone():
+                raise ValueError("Another job is already active for this VMID")
+            conn.execute(
+                "INSERT INTO jobs(id,plan_id,vmid,container_name,status,stage,progress,snapshot_name,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    source["plan_id"],
+                    source["vmid"],
+                    source["container_name"],
+                    "running",
+                    stage,
+                    max(0, min(99, int(progress))),
+                    source.get("snapshot_name"),
+                    now,
+                    now,
+                ),
+            )
+        return self.get_job(job_id)
+
     def update_job(self, job_id: str, **fields: Any) -> dict[str, Any]:
-        allowed = {"status", "stage", "snapshot_name", "result", "error"}
+        allowed = {"status", "stage", "progress", "snapshot_name", "result", "error"}
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unknown job fields: {unknown}")
@@ -290,7 +381,9 @@ class Database:
         values = []
         for key, value in fields.items():
             if key == "result" and isinstance(value, (dict, list)):
-                value = json.dumps(value, ensure_ascii=False)
+                value = bounded_json(value)
+            elif key == "error" and value is not None:
+                value = sanitize_text(value, limit=2000)
             values.append(value)
         values.append(job_id)
         with self._lock, self._connect() as conn:
@@ -299,9 +392,9 @@ class Database:
 
     def upsert_container_state(self, vmid: int, payload: dict[str, Any]) -> dict[str, Any]:
         updated_at = utc_now()
-        payload = dict(payload)
+        payload = normalize_state(payload)
         payload["updated_at"] = updated_at
-        raw = json.dumps(payload, ensure_ascii=False)
+        raw = bounded_json(payload, limit=256_000)
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO container_states(vmid, payload, updated_at) VALUES(?,?,?) "
@@ -315,14 +408,93 @@ class Database:
             row = conn.execute(
                 "SELECT payload FROM container_states WHERE vmid=?", (vmid,)
             ).fetchone()
-        return json.loads(row["payload"]) if row else None
+        return normalize_state(json.loads(row["payload"])) if row else None
 
     def list_container_states(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT payload FROM container_states ORDER BY vmid ASC"
             ).fetchall()
-        return [json.loads(row["payload"]) for row in rows]
+        return [normalize_state(json.loads(row["payload"])) for row in rows]
+
+    def insert_job_event(
+        self,
+        *,
+        job_id: str,
+        vmid: int,
+        level: str,
+        stage: str,
+        progress: int,
+        event_type: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+        terminal: bool = False,
+    ) -> dict[str, Any]:
+        safe_level = level if level in {"debug", "info", "warning", "error"} else "info"
+        requested_stage = sanitize_text(stage, limit=64) or "idle"
+        safe_stage = requested_stage if requested_stage in JOB_STAGES else "idle"
+        safe_type = sanitize_text(event_type, limit=64) or "event"
+        safe_message = sanitize_text(message, limit=1000)
+        requested = max(0, min(100, int(progress)))
+        if requested == 100 and not terminal:
+            requested = 99
+        created = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute("SELECT progress FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                conn.execute("ROLLBACK")
+                raise KeyError(job_id)
+            actual = max(int(job["progress"] or 0), requested)
+            conn.execute(
+                "INSERT INTO job_events(job_id,vmid,created_at,level,stage,progress,event_type,message,details_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    int(vmid),
+                    created,
+                    safe_level,
+                    safe_stage,
+                    actual,
+                    safe_type,
+                    safe_message,
+                    bounded_json(details or {}, limit=16_000),
+                ),
+            )
+            event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute(
+                "UPDATE jobs SET stage=?, progress=?, updated_at=? WHERE id=?",
+                (safe_stage, actual, created, job_id),
+            )
+            conn.execute("COMMIT")
+        return self.get_job_event(event_id)
+
+    def get_job_event(self, event_id: int) -> dict[str, Any]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM job_events WHERE id=?", (event_id,)).fetchone()
+        if not row:
+            raise KeyError(event_id)
+        return _decode_event(row)
+
+    def list_job_events(self, job_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        bounded = min(max(int(limit), 1), 200)
+        with self._lock, self._connect() as conn:
+            if not conn.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+                raise KeyError(job_id)
+            rows = conn.execute(
+                "SELECT * FROM job_events WHERE job_id=? ORDER BY created_at DESC,id DESC LIMIT ?",
+                (job_id, bounded),
+            ).fetchall()
+        return [_decode_event(row) for row in reversed(rows)]
+
+    def list_container_events(self, vmid: int, limit: int = 50) -> list[dict[str, Any]]:
+        bounded = min(max(int(limit), 1), 200)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM job_events WHERE vmid=? ORDER BY created_at DESC,id DESC LIMIT ?",
+                (int(vmid), bounded),
+            ).fetchall()
+        return [_decode_event(row) for row in reversed(rows)]
 
 
 def utc_now() -> str:
@@ -342,4 +514,14 @@ def _decode_job(row: sqlite3.Row) -> dict[str, Any]:
             item["result"] = json.loads(item["result"])
         except json.JSONDecodeError:
             pass
+    return item
+
+
+def _decode_event(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    try:
+        item["details"] = sanitize_data(json.loads(item.pop("details_json")))
+    except (json.JSONDecodeError, TypeError):
+        item["details"] = {}
+        item.pop("details_json", None)
     return item
