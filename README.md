@@ -1,122 +1,81 @@
-# Hubinet Ops Agent 0.2.0
+# Hubinet Ops 0.2.1
 
-Wersja 0.2 przenosi decyzję o aktualizacji z przycisku w pushu do osobnego dashboardu Home Assistanta.
+Hubinet Ops is a safety-focused operations agent for approved APT updates in allowlisted Proxmox LXC containers. The FastAPI agent runs in a dedicated container, reaches the Proxmox host through a forced-command SSH wrapper, and delegates a fixed action set to `hubinet-maint` inside managed containers.
 
-## Najważniejsze zmiany
+Version 0.2.1 adds optional MQTT telemetry and Home Assistant Discovery, persistent live job events, incremental update output, and stabilization windows that prevent Docker startup latency from causing an immediate rollback failure.
 
-- trwały stan każdego zarządzanego CT w SQLite;
-- nowe endpointy stanu i ręcznego odświeżania;
-- etap i postęp aktywnego zadania widoczne w HA;
-- zatwierdzanie i odrzucanie planu wyłącznie z dashboardu;
-- push tylko informuje i otwiera widok konkretnego CT;
-- osobny dashboard `Hubinet Ops` z widokami CT101 i CT106;
-- Docker-aware healthcheck dla CT106;
-- lista kontenerów Docker, ich stan i Docker Health Status;
-- wykrywanie dysku, RAM-u, uptime, systemd i adresów IP;
-- post-update scan potwierdzający, czy pakiety rzeczywiście zniknęły;
-- CT106 dodany do allowlisty bez udostępniania agentowi zwykłego shella;
-- endpoint odrzucenia planu;
-- migracja bazy 0.1 → 0.2 wykonywana automatycznie.
+## Safety model
 
-## Endpointy 0.2
+- REST state-changing endpoints require a bearer token.
+- Updates require a plan and manual dashboard approval.
+- MQTT publishes telemetry and discovery only; it has no command topics or buttons.
+- SSH remains a forced command with explicit action, VMID, and snapshot-name validation.
+- Automatic and manual rollback are separate per-container policies.
+- Home Assistant is presentation and controlled input; SQLite and the agent are authoritative.
+- The scheduler and MQTT are disabled by default.
+
+See [architecture](docs/architecture.md), [state model](docs/state-model.md), and [recovery](docs/recovery.md) for the full contract.
+
+## Repository layout
+
+- `app/`: FastAPI, SQLite, executor, state machine, stabilization, and MQTT.
+- `deploy/pve/`: forced-command Proxmox wrapper and access installer.
+- `deploy/managed/`: fixed-action managed-container executor and profiles.
+- `home-assistant/`: package, MQTT-backed dashboard, and example secrets.
+- `deploy/upgrade-0.2.1-from-pve.sh`: backed-up 0.2.0 to 0.2.1 agent upgrade.
+- `tests/`: fake-only unit and integration workflow tests.
+
+## API
+
+All `/api/v1` endpoints require `Authorization: Bearer ...`.
 
 - `GET /health`
-- `GET /api/v1/containers`
 - `GET /api/v1/state`
+- `GET /api/v1/containers`
 - `GET /api/v1/containers/{vmid}/state`
-- `POST /api/v1/refresh`
+- `GET /api/v1/containers/{vmid}/events?limit=50`
+- `GET /api/v1/jobs/{job_id}/events?limit=50`
 - `POST /api/v1/containers/{vmid}/refresh`
-- `POST /api/v1/scan`
 - `POST /api/v1/containers/{vmid}/scan`
+- `POST /api/v1/containers/{vmid}/retry-healthcheck`
+- `POST /api/v1/containers/{vmid}/rollback`
 - `POST /api/v1/plans/approve`
 - `POST /api/v1/plans/reject`
-- `GET /api/v1/plans`
-- `GET /api/v1/jobs`
 
-## CT106 — profil WeatherHub
+Rollback is rejected unless policy and recorded state permit it. No endpoint accepts command text.
 
-Healthcheck wymaga:
+## Configuration
 
-- `docker.service = active`;
-- `containerd.service = active`;
-- `weatherhub-weather-api-1` działa i nie jest unhealthy;
-- `weatherhub-weather-worker-1` działa i nie jest unhealthy;
-- `weatherhub-redis-1` działa i nie jest unhealthy;
-- brak nieoczekiwanych failed units;
-- co najmniej 3072 MiB wolnego miejsca.
+Copy values from `config/config.example.yaml` into the protected runtime config. MQTT remains disabled until `mqtt.enabled: true` is set with a reachable broker. Paho MQTT `2.1.0` is pinned for Python 3.13.
 
-Konfiguracja znajduje się w:
+The per-container stabilization defaults are:
+
+```yaml
+stabilization:
+  post_update_timeout_seconds: 300
+  post_rollback_timeout_seconds: 300
+  repair_timeout_seconds: 180
+  poll_interval_seconds: 10
+  initial_grace_seconds: 10
+  required_consecutive_successes: 2
+```
+
+Progress is best-effort, stage-weighted, monotonic, and capped at 99 until a terminal event. Package output may not map one-to-one to APT's internal work.
+
+## Development validation
+
+Use Python 3.13 and do not point tests at infrastructure:
 
 ```text
-deploy/managed/profiles/ct106-weather.json
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m compileall app
+pytest -q
+python scripts/validate_yaml.py
+python scripts/check_tracked_files.py
 ```
 
-## Aktualizacja istniejącego CT110
+Validate every `.sh` file and `deploy/pve/hubinet-ops-host` with `bash -n`. CI performs the same checks.
 
-Rozpakuj paczkę na hoście Proxmox i uruchom:
+## Deployment
 
-```bash
-cd /root/hubinet-ops-0.2
-bash deploy/upgrade-0.2-from-pve.sh 110 106
-```
-
-Skrypt:
-
-1. robi backup kodu, configu i SQLite w CT110;
-2. aktualizuje ograniczony wrapper na PVE;
-3. dodaje CT106 do allowlisty;
-4. instaluje profil healthchecka w CT106;
-5. aktualizuje `hubinet-maint` w CT101;
-6. migruje config agenta;
-7. uruchamia API 0.2;
-8. wykonuje wyłącznie `inspect/refresh` — nie uruchamia `apt upgrade`.
-
-## Home Assistant
-
-Po aktualizacji agenta uruchom na PVE:
-
-```bash
-cd /root/hubinet-ops-0.2
-bash deploy/install-ha-0.2-from-pve.sh 192.168.4.168 22222 110 192.168.4.200
-```
-
-Skrypt:
-
-- robi backup obecnego package i konfiguracji;
-- usuwa smoke test;
-- instaluje package 0.2;
-- instaluje dashboard;
-- zachowuje obecny webhook;
-- aktualizuje token i URL-e REST;
-- wykonuje `ha core check`;
-- robi jeden restart Core, ponieważ dodawane są sensory REST i nowy dashboard.
-
-Dashboard będzie dostępny pod:
-
-```text
-/hubinet-ops/overview
-/hubinet-ops/ct-101
-/hubinet-ops/ct-106
-```
-
-Dashboard korzysta z kart Mushroom, które są już wymagane przez dostarczony plik Lovelace.
-
-## Bezpieczeństwo
-
-- agent nie przyjmuje dowolnych poleceń powłoki;
-- PVE wrapper ma allowlistę akcji oraz VMID-ów;
-- argumenty są walidowane;
-- REST wymaga Bearer tokenu;
-- push nie zatwierdza aktualizacji;
-- przycisk `AKTUALIZUJ` znajduje się na dashboardzie i ma dodatkowe potwierdzenie;
-- agent ponawia preflight przed zmianą;
-- przy włączonym rollbacku tworzy snapshot przed update'em.
-
-## Testy paczki
-
-```text
-Python compile: OK
-Bash syntax: OK
-YAML/JSON parse: OK
-pytest: 4 passed
-```
+Deployment is intentionally not automatic. Follow [deployment](docs/deployment.md) and [Home Assistant installation](docs/home-assistant.md). The 0.2.1 upgrade backs up code, config, keys, environment, and SQLite state; migrates with `/opt/hubinet-ops/.venv/bin/python`; validates before restart; and performs no scan or update.
