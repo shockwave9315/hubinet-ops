@@ -75,3 +75,57 @@ def test_malformed_legacy_values_fall_back_without_crashing() -> None:
     assert state["updates"] == {"pending_count": 0, "packages": []}
     assert state["recent_job_events"] == []
     assert state["last_job_event"] is None
+
+
+def test_waiting_approval_clears_stale_job_runtime_fields() -> None:
+    state = normalize_state(
+        {
+            "health_status": "healthy",
+            "update_status": "update_available",
+            "operation_status": "waiting_approval",
+            "job_stage": "completed",
+            "job_progress": 100,
+            "active_job_id": "old-terminal-job",
+            "active_plan_id": "current-plan",
+            "last_operation_result": "failed",
+        }
+    )
+
+    assert state["operation_status"] == "waiting_approval"
+    assert state["job_stage"] == "idle"
+    assert state["job_progress"] == 0
+    assert state["active_job_id"] is None
+    assert state["active_plan_id"] == "current-plan"
+    assert state["last_operation_result"] == "failed"
+
+
+def test_terminal_operation_keeps_history_but_has_no_active_job() -> None:
+    state = normalize_state(
+        {
+            "operation_status": "rolled_back",
+            "job_stage": "completed",
+            "job_progress": 100,
+            "active_job_id": "finished-job",
+            "last_operation_result": "rolled_back",
+        }
+    )
+
+    assert state["active_job_id"] is None
+    assert state["job_stage"] == "completed"
+    assert state["job_progress"] == 100
+    assert state["last_operation_result"] == "rolled_back"
+
+
+def test_running_operation_preserves_active_job() -> None:
+    state = normalize_state(
+        {
+            "operation_status": "running",
+            "job_stage": "updating",
+            "job_progress": 42,
+            "active_job_id": "active-job",
+        }
+    )
+
+    assert state["active_job_id"] == "active-job"
+    assert state["job_stage"] == "updating"
+    assert state["job_progress"] == 42

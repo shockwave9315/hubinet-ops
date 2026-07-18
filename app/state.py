@@ -104,6 +104,18 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
         state["last_job_event"] = None
     else:
         state.setdefault("last_job_event", None)
+
+    # active_job_id describes a currently executable job, never historical work.
+    # Terminal outcomes remain available through last_operation_result and job_stage.
+    if state["operation_status"] != "running":
+        state["active_job_id"] = None
+
+    # Waiting for approval is a plan state, not a running or completed job. A stale
+    # terminal progress value from an earlier operation must not leak into this state.
+    if state["operation_status"] == "waiting_approval":
+        state["job_stage"] = "idle"
+        state["job_progress"] = 0
+
     return state
 
 
