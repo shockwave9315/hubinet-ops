@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2
+
+- redesigned the Home Assistant UI as a responsive Sections dashboard built with Mushroom cards;
+- added compact container summaries, resource cards, guarded action cards, and Polish operator labels;
+- changed live job logs to a reverse-chronological bounded table with stage icons and current-operation summary;
+- limited the visible pending-package list to 30 entries while preserving the full bounded MQTT state;
+- replaced the legacy 0.2.1 webhook automation with dedicated event, live-progress, and health-watchdog automations;
+- added one replaceable mobile progress notification per container, updated every 10 seconds during a job;
+- added high-priority agent/CT offline and critical alerts with tagged recovery notifications;
+- kept every mobile notification navigation-only: approval, rejection, retry, and rollback remain dashboard REST actions;
+- added a Mushroom prerequisite check to the HA installer and expanded dashboard/notification safety tests.
+
 ## 0.2.1
 
 - added optional non-blocking MQTT telemetry with LWT, retained state, reconnect backoff, and Home Assistant Discovery;
