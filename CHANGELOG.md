@@ -11,7 +11,15 @@
 - replaced HA REST polling with MQTT entities and live event/package dashboard cards;
 - kept approval, rejection, retry, and rollback on authenticated REST dashboard controls only;
 - added navigation-only notifications for the correct CT dashboard;
-- added a backed-up 0.2.0 upgrade path, Python 3.13 CI, repository validators, and expanded fake-based tests.
+- added a backed-up 0.2.0 upgrade path, Python 3.13 CI, repository validators, and expanded fake-based tests;
+- revalidate the exact approved package fingerprint immediately before snapshot/update and serialize scans, approvals, retries, and jobs per VMID;
+- preserve FIFO MQTT delivery across disconnects and retry the same failed publish before later messages;
+- require configured Docker healthchecks to report `healthy` instead of treating a missing healthcheck as success;
+- terminate the full APT process group on timeout and prevent event callback failures from repeating destructive actions;
+- make the 0.2.1 upgrade transactional across the agent, forced-command wrapper, and managed executors;
+- canonicalize forced-command SSH keys so an older unrestricted copy cannot survive installation;
+- fix CI so pytest failures propagate through `tee` and upload a diagnostic test log on every run;
+- move the Home Assistant notification target to the private `hubinet_ops_notify_service` secret.
 
 ## 0.2.0
 
