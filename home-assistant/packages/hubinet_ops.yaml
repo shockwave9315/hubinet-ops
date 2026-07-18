@@ -1,0 +1,294 @@
+# Hubinet Ops 0.2 — stan kontenerów, REST sterowania i powiadomienia nawigacyjne.
+
+rest:
+  - resource: !secret hubinet_ops_health_url
+    scan_interval: 15
+    timeout: 5
+    sensor:
+      - name: Hubinet Ops Agent
+        unique_id: hubinet_ops_agent
+        value_template: "{{ value_json.status }}"
+        json_attributes:
+          - service
+          - version
+
+  - resource: !secret hubinet_ops_ct101_state_url
+    scan_interval: 10
+    timeout: 5
+    headers:
+      Authorization: !secret hubinet_ops_authorization
+    sensor:
+      - name: Hubinet Ops CT101
+        unique_id: hubinet_ops_ct101
+        value_template: "{{ value_json.status }}"
+        json_attributes:
+          - vmid
+          - name
+          - enabled
+          - adapter
+          - criticality
+          - dashboard_path
+          - health
+          - health_score
+          - lxc_status
+          - hostname
+          - os
+          - ip_addresses
+          - uptime_seconds
+          - disk
+          - memory
+          - services
+          - urls
+          - failed_units
+          - docker
+          - pending_updates
+          - updates
+          - risk
+          - active_plan_id
+          - active_plan_status
+          - active_job_id
+          - job_status
+          - job_stage
+          - job_progress
+          - snapshot_name
+          - last_scan
+          - last_refresh
+          - last_update
+          - last_error
+          - updated_at
+
+  - resource: !secret hubinet_ops_ct106_state_url
+    scan_interval: 10
+    timeout: 5
+    headers:
+      Authorization: !secret hubinet_ops_authorization
+    sensor:
+      - name: Hubinet Ops CT106
+        unique_id: hubinet_ops_ct106
+        value_template: "{{ value_json.status }}"
+        json_attributes:
+          - vmid
+          - name
+          - enabled
+          - adapter
+          - criticality
+          - dashboard_path
+          - health
+          - health_score
+          - lxc_status
+          - hostname
+          - os
+          - ip_addresses
+          - uptime_seconds
+          - disk
+          - memory
+          - services
+          - urls
+          - failed_units
+          - docker
+          - pending_updates
+          - updates
+          - risk
+          - active_plan_id
+          - active_plan_status
+          - active_job_id
+          - job_status
+          - job_stage
+          - job_progress
+          - snapshot_name
+          - last_scan
+          - last_refresh
+          - last_update
+          - last_error
+          - updated_at
+
+rest_command:
+  hubinet_ops_scan_container:
+    url: "http://192.168.4.200:8787/api/v1/containers/{{ vmid }}/scan"
+    method: POST
+    headers:
+      Authorization: !secret hubinet_ops_authorization
+      Content-Type: application/json
+    payload: "{}"
+    timeout: 360
+
+  hubinet_ops_refresh_container:
+    url: "http://192.168.4.200:8787/api/v1/containers/{{ vmid }}/refresh"
+    method: POST
+    headers:
+      Authorization: !secret hubinet_ops_authorization
+      Content-Type: application/json
+    payload: "{}"
+    timeout: 120
+
+  hubinet_ops_approve:
+    url: !secret hubinet_ops_approve_url
+    method: POST
+    headers:
+      Authorization: !secret hubinet_ops_authorization
+      Content-Type: application/json
+    payload: >-
+      {"plan_id": "{{ plan_id }}"}
+    timeout: 20
+
+  hubinet_ops_reject:
+    url: !secret hubinet_ops_reject_url
+    method: POST
+    headers:
+      Authorization: !secret hubinet_ops_authorization
+      Content-Type: application/json
+    payload: >-
+      {"plan_id": "{{ plan_id }}"}
+    timeout: 20
+
+script:
+  hubinet_ops_scan_container:
+    alias: "Hubinet Ops — skanuj kontener"
+    mode: parallel
+    fields:
+      vmid:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 999999
+    sequence:
+      - action: rest_command.hubinet_ops_scan_container
+        data:
+          vmid: "{{ vmid | int }}"
+      - delay: "00:00:01"
+      - action: homeassistant.update_entity
+        target:
+          entity_id: "sensor.hubinet_ops_ct{{ vmid | int }}"
+
+  hubinet_ops_refresh_container:
+    alias: "Hubinet Ops — odśwież kontener"
+    mode: parallel
+    fields:
+      vmid:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 999999
+    sequence:
+      - action: rest_command.hubinet_ops_refresh_container
+        data:
+          vmid: "{{ vmid | int }}"
+      - delay: "00:00:01"
+      - action: homeassistant.update_entity
+        target:
+          entity_id: "sensor.hubinet_ops_ct{{ vmid | int }}"
+
+  hubinet_ops_approve_container:
+    alias: "Hubinet Ops — zatwierdź plan"
+    mode: parallel
+    fields:
+      vmid:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 999999
+    variables:
+      state_entity: "sensor.hubinet_ops_ct{{ vmid | int }}"
+      plan_id: "{{ state_attr(state_entity, 'active_plan_id') }}"
+    sequence:
+      - condition: template
+        value_template: "{{ plan_id not in [none, '', 'None'] }}"
+      - action: rest_command.hubinet_ops_approve
+        data:
+          plan_id: "{{ plan_id }}"
+      - delay: "00:00:01"
+      - action: homeassistant.update_entity
+        target:
+          entity_id: "{{ state_entity }}"
+
+  hubinet_ops_reject_container:
+    alias: "Hubinet Ops — odrzuć plan"
+    mode: parallel
+    fields:
+      vmid:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 999999
+    variables:
+      state_entity: "sensor.hubinet_ops_ct{{ vmid | int }}"
+      plan_id: "{{ state_attr(state_entity, 'active_plan_id') }}"
+    sequence:
+      - condition: template
+        value_template: "{{ plan_id not in [none, '', 'None'] }}"
+      - action: rest_command.hubinet_ops_reject
+        data:
+          plan_id: "{{ plan_id }}"
+      - delay: "00:00:01"
+      - action: homeassistant.update_entity
+        target:
+          entity_id: "{{ state_entity }}"
+
+automation:
+  - id: hubinet_ops_webhook_v02
+    alias: "Hubinet Ops 0.2 — zdarzenia agenta"
+    mode: queued
+    max: 20
+    triggers:
+      - trigger: webhook
+        webhook_id: !secret hubinet_ops_webhook_id
+        allowed_methods:
+          - POST
+        local_only: true
+    variables:
+      event_type: "{{ trigger.json.event_type | default('unknown') }}"
+      container: "{{ trigger.json.container | default('nieznany kontener') }}"
+      vmid: "{{ trigger.json.vmid | default('?') }}"
+      dashboard_path: "{{ trigger.json.dashboard_path | default('/hubinet-ops/overview') }}"
+    actions:
+      - choose:
+          - conditions: "{{ event_type == 'approval_required' }}"
+            sequence:
+              - action: notify.mobile_app_poco_x8
+                data:
+                  title: "Aktualizacje: {{ container }} (CT{{ vmid }})"
+                  message: >-
+                    Pakiety: {{ trigger.json.pending_count }}. Ryzyko: {{ trigger.json.risk }}.
+                    Dotknij, aby zobaczyć plan i podjąć decyzję w Hubinet Ops.
+                  data:
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
+          - conditions: "{{ event_type == 'job_success' }}"
+            sequence:
+              - action: notify.mobile_app_poco_x8
+                data:
+                  title: "✅ {{ container }} — aktualizacja zakończona"
+                  message: >-
+                    CT{{ vmid }} przeszedł healthcheck.
+                    {% if trigger.json.reboot_required %}System zgłasza wymagany restart.{% else %}Restart nie jest wymagany.{% endif %}
+                  data:
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
+          - conditions: "{{ event_type == 'job_rolled_back' }}"
+            sequence:
+              - action: notify.mobile_app_poco_x8
+                data:
+                  title: "↩️ Rollback: {{ container }}"
+                  message: >-
+                    Aktualizacja CT{{ vmid }} nie powiodła się. Agent przywrócił snapshot.
+                    Dotknij, aby zobaczyć szczegóły.
+                  data:
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
+          - conditions: "{{ event_type in ['manual_intervention_required', 'job_blocked', 'scan_failed'] }}"
+            sequence:
+              - action: notify.mobile_app_poco_x8
+                data:
+                  title: "🚨 Hubinet Ops: {{ container }}"
+                  message: >-
+                    CT{{ vmid }} wymaga sprawdzenia: {{ trigger.json.error | default(trigger.json.stage | default('nieznany błąd')) }}
+                  data:
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"

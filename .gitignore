@@ -1,0 +1,44 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Runtime configuration and secrets
+.env
+.env.*
+!.env.example
+config.yaml
+**/config.yaml
+secrets.yaml
+**/secrets.yaml
+*.db
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+id_ed25519*
+authorized_keys
+ssh_known_hosts
+
+# Runtime data
+data/
+state/
+logs/
+backups/
+*.log
+*.bak
+*.tmp
+*.zip
+*.sha256
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

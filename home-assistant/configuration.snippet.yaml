@@ -1,0 +1,10 @@
+# Dodaj do istniejącej sekcji lovelace: albo utwórz ją, jeśli jej nie masz.
+lovelace:
+  mode: storage
+  dashboards:
+    hubinet-ops:
+      mode: yaml
+      title: Hubinet Ops
+      icon: mdi:server-network
+      show_in_sidebar: true
+      filename: dashboards/hubinet_ops.yaml

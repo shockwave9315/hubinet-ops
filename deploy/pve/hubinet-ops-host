@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ALLOWLIST="/etc/hubinet-ops/allowed-vmids"
+ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
+
+json_error() {
+  local message="$1"
+  python3 - "$message" <<'PY'
+import json, sys
+print(json.dumps({"ok": False, "error": sys.argv[1]}, ensure_ascii=False))
+PY
+}
+
+fail() {
+  json_error "$1"
+  exit 1
+}
+
+if [[ -z "$ORIGINAL" ]]; then
+  # Pozwala na lokalny test wrappera jako root.
+  ORIGINAL="$*"
+fi
+
+read -r action vmid argument extra <<<"$ORIGINAL"
+[[ -z "${extra:-}" ]] || fail "Too many arguments"
+[[ "$action" =~ ^(status|inspect|scan|preflight|snapshot|update|healthcheck|repair|rollback|delete-snapshot)$ ]] || fail "Action not allowed"
+[[ "$vmid" =~ ^[1-9][0-9]{1,5}$ ]] || fail "Invalid VMID"
+[[ -f "$ALLOWLIST" ]] || fail "Missing VMID allowlist"
+grep -Fxq "$vmid" "$ALLOWLIST" || fail "VMID not allowed"
+
+if [[ -n "${argument:-}" ]]; then
+  [[ "$argument" =~ ^[A-Za-z0-9_-]+$ ]] || fail "Unsafe argument"
+fi
+
+logger -t hubinet-ops-host "action=$action vmid=$vmid"
+
+case "$action" in
+  status)
+    if ! raw="$(pct status "$vmid" 2>&1)"; then
+      fail "pct status failed: $raw"
+    fi
+    state="$(awk '{print $2}' <<<"$raw")"
+    printf '{"ok":true,"data":{"status":"%s"}}\n' "$state"
+    ;;
+  inspect)
+    if ! raw="$(pct status "$vmid" 2>&1)"; then
+      fail "pct status failed: $raw"
+    fi
+    state="$(awk '{print $2}' <<<"$raw")"
+    if [[ "$state" != "running" ]]; then
+      printf '{"ok":true,"data":{"lxc_status":"%s","health":"offline","health_score":0}}\n' "$state"
+      exit 0
+    fi
+    pct exec "$vmid" -- /usr/local/sbin/hubinet-maint inspect
+    ;;
+  scan)
+    pct exec "$vmid" -- /usr/local/sbin/hubinet-maint check-updates
+    ;;
+  preflight)
+    pct exec "$vmid" -- /usr/local/sbin/hubinet-maint preflight
+    ;;
+  update)
+    pct exec "$vmid" -- /usr/local/sbin/hubinet-maint update
+    ;;
+  healthcheck)
+    pct exec "$vmid" -- /usr/local/sbin/hubinet-maint healthcheck
+    ;;
+  repair)
+    pct exec "$vmid" -- /usr/local/sbin/hubinet-maint repair
+    ;;
+  snapshot)
+    [[ -n "${argument:-}" ]] || fail "Snapshot name required"
+    if ! raw="$(pct snapshot "$vmid" "$argument" --description "Hubinet Ops pre-update snapshot" 2>&1)"; then
+      fail "snapshot failed: $raw"
+    fi
+    printf '{"ok":true,"data":{"snapshot":"%s"}}\n' "$argument"
+    ;;
+  rollback)
+    [[ -n "${argument:-}" ]] || fail "Snapshot name required"
+    pct stop "$vmid" --timeout 90 >/dev/null 2>&1 || true
+    if ! raw="$(pct rollback "$vmid" "$argument" 2>&1)"; then
+      fail "rollback failed: $raw"
+    fi
+    if ! raw="$(pct start "$vmid" 2>&1)"; then
+      fail "container start after rollback failed: $raw"
+    fi
+    printf '{"ok":true,"data":{"rolled_back_to":"%s"}}\n' "$argument"
+    ;;
+  delete-snapshot)
+    [[ -n "${argument:-}" ]] || fail "Snapshot name required"
+    if ! raw="$(pct delsnapshot "$vmid" "$argument" 2>&1)"; then
+      fail "snapshot deletion failed: $raw"
+    fi
+    printf '{"ok":true,"data":{"deleted_snapshot":"%s"}}\n' "$argument"
+    ;;
+esac

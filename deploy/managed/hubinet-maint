@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+CONFIG_PATH = Path("/etc/hubinet-maint.json")
+VERSION = "0.2.0"
+
+
+def output(ok: bool, data: dict[str, Any] | None = None, error: str | None = None, rc: int = 0) -> None:
+    payload: dict[str, Any] = {"ok": ok, "data": data or {}}
+    if error:
+        payload["error"] = error
+    print(json.dumps(payload, ensure_ascii=False))
+    raise SystemExit(rc)
+
+
+def run(cmd: list[str], timeout: int, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, env=env, check=False)
+
+
+def load_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {
+            "services": [],
+            "health_urls": [],
+            "min_free_mb": 1024,
+            "ignore_failed_units": [],
+            "docker": {"enabled": False},
+        }
+    raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError("/etc/hubinet-maint.json must contain an object")
+    return raw
+
+
+def apt_scan() -> dict[str, Any]:
+    refresh = run(["apt-get", "update", "-qq"], timeout=300)
+    if refresh.returncode != 0:
+        output(False, error=f"apt-get update failed: {refresh.stderr[-1000:]}", rc=1)
+
+    sim = run(["apt-get", "-s", "upgrade"], timeout=300)
+    if sim.returncode != 0:
+        output(False, error=f"apt simulation failed: {sim.stderr[-1000:]}", rc=1)
+
+    packages: list[dict[str, Any]] = []
+    pattern = re.compile(r"^Inst\s+(\S+)(?:\s+\[([^\]]+)\])?\s+\(([^ )]+)")
+    for line in sim.stdout.splitlines():
+        match = pattern.match(line)
+        if match:
+            packages.append(
+                {"name": match.group(1), "current": match.group(2), "target": match.group(3)}
+            )
+    fingerprint = hashlib.sha256(
+        json.dumps(packages, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "pending_count": len(packages),
+        "packages": packages,
+        "fingerprint": fingerprint,
+        "scanned_at": int(time.time()),
+    }
+
+
+def dpkg_locked() -> bool:
+    handles = []
+    try:
+        for path in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"):
+            handle = open(path, "a+")
+            handles.append(handle)
+            try:
+                fcntl.lockf(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+        return False
+    finally:
+        for handle in handles:
+            try:
+                fcntl.lockf(handle.fileno(), fcntl.LOCK_UN)
+                handle.close()
+            except Exception:
+                pass
+
+
+def failed_units() -> list[str]:
+    result = run(["systemctl", "--failed", "--no-legend", "--plain"], timeout=30)
+    units = []
+    for line in result.stdout.splitlines():
+        if line.strip():
+            units.append(line.split()[0])
+    return units
+
+
+def service_states(config: dict[str, Any]) -> tuple[dict[str, str], list[str]]:
+    states: dict[str, str] = {}
+    failures: list[str] = []
+    for service in config.get("services", []):
+        name = str(service)
+        result = run(["systemctl", "is-active", name], timeout=30)
+        state = result.stdout.strip() or "inactive"
+        states[name] = state
+        if result.returncode != 0 or state != "active":
+            failures.append(f"service {name} is not active ({state})")
+    return states, failures
+
+
+def check_urls(config: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    result: dict[str, Any] = {}
+    failures: list[str] = []
+    for item in config.get("health_urls", []):
+        if isinstance(item, str):
+            url = item
+            expected_statuses = [200]
+            timeout = 10
+        else:
+            url = str(item.get("url"))
+            expected_statuses = [int(v) for v in item.get("expected_statuses", [item.get("expected_status", 200)])]
+            timeout = int(item.get("timeout_seconds", 10))
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": f"hubinet-maint/{VERSION}"})
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status = int(response.status)
+            result[url] = {"status": status, "ok": status in expected_statuses}
+            if status not in expected_statuses:
+                failures.append(f"{url} returned {status}, expected {expected_statuses}")
+        except Exception as exc:
+            result[url] = {"status": None, "ok": False, "error": str(exc)}
+            failures.append(f"{url} failed: {exc}")
+    return result, failures
+
+
+def _docker_inspect(names: list[str]) -> list[dict[str, Any]]:
+    if not names:
+        return []
+    result = run(["docker", "inspect", *names], timeout=60)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "docker inspect failed")
+    raw = json.loads(result.stdout)
+    containers: list[dict[str, Any]] = []
+    for item in raw:
+        state = item.get("State") or {}
+        health = state.get("Health") or {}
+        restart = ((item.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name", "")
+        ports = []
+        for container_port, bindings in (((item.get("NetworkSettings") or {}).get("Ports")) or {}).items():
+            if bindings:
+                for binding in bindings:
+                    ports.append(f"{binding.get('HostIp', '')}:{binding.get('HostPort', '')}->{container_port}")
+            else:
+                ports.append(container_port)
+        containers.append(
+            {
+                "name": str(item.get("Name", "")).lstrip("/"),
+                "image": (item.get("Config") or {}).get("Image"),
+                "status": state.get("Status", "unknown"),
+                "running": bool(state.get("Running", False)),
+                "health": health.get("Status", "none"),
+                "restart_policy": restart or "none",
+                "ports": ports,
+            }
+        )
+    return containers
+
+
+def docker_state(config: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    docker_cfg = config.get("docker") or {}
+    if not bool(docker_cfg.get("enabled", False)):
+        return {"enabled": False}, []
+
+    failures: list[str] = []
+    version_result = run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=30)
+    if version_result.returncode != 0:
+        return {
+            "enabled": True,
+            "available": False,
+            "error": version_result.stderr.strip() or "docker unavailable",
+        }, ["docker daemon is unavailable"]
+
+    required = [str(v) for v in docker_cfg.get("required_containers", [])]
+    if required:
+        try:
+            containers = _docker_inspect(required)
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "available": True,
+                "server_version": version_result.stdout.strip(),
+                "required": required,
+                "containers": [],
+                "error": str(exc),
+            }, [f"required docker containers cannot be inspected: {exc}"]
+    else:
+        ps = run(["docker", "ps", "-aq"], timeout=30)
+        ids = [line.strip() for line in ps.stdout.splitlines() if line.strip()]
+        containers = _docker_inspect(ids) if ids else []
+
+    by_name = {item["name"]: item for item in containers}
+    require_health = bool(docker_cfg.get("require_health", True))
+    for name in required:
+        item = by_name.get(name)
+        if not item:
+            failures.append(f"docker container {name} is missing")
+            continue
+        if not item["running"]:
+            failures.append(f"docker container {name} is not running")
+        if require_health and item["health"] not in {"healthy", "none"}:
+            failures.append(f"docker container {name} health is {item['health']}")
+
+    running = sum(1 for item in containers if item["running"])
+    healthy = sum(1 for item in containers if item["health"] == "healthy")
+    unhealthy = sum(1 for item in containers if item["health"] == "unhealthy")
+    return {
+        "enabled": True,
+        "available": True,
+        "server_version": version_result.stdout.strip(),
+        "required": required,
+        "required_ok": not failures,
+        "total": len(containers),
+        "running": running,
+        "healthy": healthy,
+        "unhealthy": unhealthy,
+        "containers": containers,
+    }, failures
+
+
+def system_metrics() -> dict[str, Any]:
+    usage = shutil.disk_usage("/")
+    disk_total_mb = usage.total // (1024 * 1024)
+    disk_used_mb = usage.used // (1024 * 1024)
+    disk_free_mb = usage.free // (1024 * 1024)
+    disk_pct = round((usage.used / usage.total) * 100, 1) if usage.total else 0.0
+
+    meminfo: dict[str, int] = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        key, value = line.split(":", 1)
+        meminfo[key] = int(value.strip().split()[0])
+    total_kb = meminfo.get("MemTotal", 0)
+    available_kb = meminfo.get("MemAvailable", 0)
+    used_kb = max(0, total_kb - available_kb)
+    memory_pct = round((used_kb / total_kb) * 100, 1) if total_kb else 0.0
+
+    uptime_seconds = int(float(Path("/proc/uptime").read_text().split()[0]))
+    os_pretty = "unknown"
+    os_release = Path("/etc/os-release")
+    if os_release.exists():
+        for line in os_release.read_text().splitlines():
+            if line.startswith("PRETTY_NAME="):
+                os_pretty = line.split("=", 1)[1].strip().strip('"')
+                break
+
+    ip_result = run(["hostname", "-I"], timeout=10)
+    addresses = [value for value in ip_result.stdout.split() if not value.startswith("172.")]
+
+    return {
+        "hostname": socket.gethostname(),
+        "os": os_pretty,
+        "uptime_seconds": uptime_seconds,
+        "ip_addresses": addresses,
+        "disk": {
+            "total_mb": disk_total_mb,
+            "used_mb": disk_used_mb,
+            "free_mb": disk_free_mb,
+            "used_percent": disk_pct,
+        },
+        "memory": {
+            "total_mb": total_kb // 1024,
+            "used_mb": used_kb // 1024,
+            "available_mb": available_kb // 1024,
+            "used_percent": memory_pct,
+        },
+    }
+
+
+def collect_health(config: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    metrics = system_metrics()
+    failures: list[str] = []
+
+    minimum = int(config.get("min_free_mb", 1024))
+    if metrics["disk"]["free_mb"] < minimum:
+        failures.append(
+            f"only {metrics['disk']['free_mb']} MiB free, minimum is {minimum} MiB"
+        )
+
+    services, service_failures = service_states(config)
+    failures.extend(service_failures)
+
+    urls, url_failures = check_urls(config)
+    failures.extend(url_failures)
+
+    failed = failed_units()
+    ignored = set(config.get("ignore_failed_units", []))
+    unexpected_failed = [unit for unit in failed if unit not in ignored]
+    if unexpected_failed:
+        failures.append(f"failed systemd units: {', '.join(unexpected_failed)}")
+
+    docker, docker_failures = docker_state(config)
+    failures.extend(docker_failures)
+
+    score = 100
+    score -= min(30, len(service_failures) * 20)
+    score -= min(25, len(url_failures) * 15)
+    score -= min(25, len(docker_failures) * 15)
+    score -= min(20, len(unexpected_failed) * 10)
+    if metrics["disk"]["free_mb"] < minimum:
+        score -= 20
+    score = max(0, score)
+
+    health = "healthy" if score >= 90 and not failures else "degraded" if score >= 50 else "critical"
+    data = {
+        "lxc_status": "running",
+        **metrics,
+        "services": services,
+        "urls": urls,
+        "failed_units": unexpected_failed,
+        "docker": docker,
+        "health": health,
+        "health_score": score,
+        "failures": failures,
+        "maint_version": VERSION,
+    }
+    return data, failures
+
+
+def preflight(config: dict[str, Any]) -> dict[str, Any]:
+    data, failures = collect_health(config)
+    audit = run(["dpkg", "--audit"], timeout=60)
+    reasons = list(failures)
+    if dpkg_locked():
+        reasons.append("dpkg/apt lock is currently held")
+    if audit.stdout.strip():
+        reasons.append(f"dpkg audit: {audit.stdout.strip()[:500]}")
+    if reasons:
+        output(False, data=data, error="; ".join(reasons), rc=1)
+    data["updates"] = apt_scan()
+    return data
+
+
+def update_system() -> dict[str, Any]:
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    result = run(
+        [
+            "apt-get",
+            "-o",
+            "Dpkg::Options::=--force-confold",
+            "upgrade",
+            "-y",
+        ],
+        timeout=3600,
+        env=env,
+    )
+    if result.returncode != 0:
+        output(
+            False,
+            data={"stdout_tail": result.stdout[-4000:], "stderr_tail": result.stderr[-4000:]},
+            error=f"apt-get upgrade failed with rc={result.returncode}",
+            rc=1,
+        )
+    configure = run(["dpkg", "--configure", "-a"], timeout=600, env=env)
+    if configure.returncode != 0:
+        output(False, error=f"dpkg --configure -a failed: {configure.stderr[-1000:]}", rc=1)
+    return {
+        "reboot_required": Path("/var/run/reboot-required").exists(),
+        "stdout_tail": result.stdout[-4000:],
+    }
+
+
+def healthcheck(config: dict[str, Any]) -> dict[str, Any]:
+    data, failures = collect_health(config)
+    if failures:
+        output(False, data=data, error="; ".join(failures), rc=1)
+    return data
+
+
+def inspect(config: dict[str, Any]) -> dict[str, Any]:
+    data, _ = collect_health(config)
+    return data
+
+
+def repair(config: dict[str, Any]) -> dict[str, Any]:
+    restarted_services: list[str] = []
+    restarted_containers: list[str] = []
+    failures: list[str] = []
+
+    for service in config.get("services", []):
+        name = str(service)
+        result = run(["systemctl", "restart", name], timeout=180)
+        if result.returncode == 0:
+            restarted_services.append(name)
+        else:
+            failures.append(f"{name}: {result.stderr[-500:]}")
+
+    docker_cfg = config.get("docker") or {}
+    if bool(docker_cfg.get("enabled", False)):
+        for name in docker_cfg.get("required_containers", []):
+            inspect_result = run(
+                ["docker", "inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", str(name)],
+                timeout=30,
+            )
+            state = inspect_result.stdout.strip()
+            if inspect_result.returncode != 0 or not state.startswith("running") or "unhealthy" in state:
+                restart = run(["docker", "restart", str(name)], timeout=180)
+                if restart.returncode == 0:
+                    restarted_containers.append(str(name))
+                else:
+                    failures.append(f"docker {name}: {restart.stderr[-500:]}")
+
+    if failures:
+        output(
+            False,
+            data={
+                "restarted_services": restarted_services,
+                "restarted_containers": restarted_containers,
+            },
+            error="; ".join(failures),
+            rc=1,
+        )
+    return {
+        "restarted_services": restarted_services,
+        "restarted_containers": restarted_containers,
+    }
+
+
+def main() -> None:
+    if os.geteuid() != 0:
+        output(False, error="hubinet-maint must run as root", rc=1)
+    if len(sys.argv) != 2:
+        output(False, error="Exactly one action is required", rc=1)
+    action = sys.argv[1]
+    config = load_config()
+    if action == "check-updates":
+        output(True, apt_scan())
+    if action == "preflight":
+        output(True, preflight(config))
+    if action == "update":
+        output(True, update_system())
+    if action == "healthcheck":
+        output(True, healthcheck(config))
+    if action == "inspect":
+        output(True, inspect(config))
+    if action == "repair":
+        output(True, repair(config))
+    output(False, error="Action not allowed", rc=1)
+
+
+if __name__ == "__main__":
+    main()

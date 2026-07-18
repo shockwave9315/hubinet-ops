@@ -1,0 +1,18 @@
+{
+  "services": [
+    "docker",
+    "containerd"
+  ],
+  "health_urls": [],
+  "min_free_mb": 3072,
+  "ignore_failed_units": [],
+  "docker": {
+    "enabled": true,
+    "require_health": true,
+    "required_containers": [
+      "weatherhub-weather-api-1",
+      "weatherhub-weather-worker-1",
+      "weatherhub-redis-1"
+    ]
+  }
+}

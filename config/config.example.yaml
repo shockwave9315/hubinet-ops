@@ -1,0 +1,44 @@
+api:
+  bind: 0.0.0.0
+  port: 8787
+
+executor:
+  proxmox_host: 192.168.4.249
+  ssh_user: root
+  ssh_key: /etc/hubinet-ops/keys/proxmox_ed25519
+  known_hosts: /etc/hubinet-ops/ssh_known_hosts
+  connect_timeout_seconds: 10
+  command_timeout_seconds: 3900
+
+scheduler:
+  enabled: false
+  scan_interval_minutes: 360
+  initial_scan_delay_seconds: 60
+  approval_ttl_minutes: 1440
+  state_refresh_seconds: 30
+  initial_refresh_delay_seconds: 5
+
+home_assistant:
+  webhook_url: ""
+  request_timeout_seconds: 10
+
+containers:
+  101:
+    name: cloudflared
+    enabled: true
+    adapter: apt
+    criticality: medium
+    approval_mode: always
+    automatic_rollback: true
+    dashboard_path: /hubinet-ops/ct-101
+    snapshot_retention_hours: 24
+
+  106:
+    name: pogoda
+    enabled: true
+    adapter: apt
+    criticality: low
+    approval_mode: always
+    automatic_rollback: true
+    dashboard_path: /hubinet-ops/ct-106
+    snapshot_retention_hours: 24
