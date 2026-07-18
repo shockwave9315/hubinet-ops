@@ -151,7 +151,7 @@ chown -R hubinetops:hubinetops /opt/hubinet-ops/app /opt/hubinet-ops/requirement
 chown -R root:root /opt/hubinet-ops/.venv
 chmod -R a+rX /opt/hubinet-ops/.venv
 runuser -u hubinetops -- /opt/hubinet-ops/.venv/bin/python -c \
-  'import paho.mqtt.client as mqtt; print(f"paho_mqtt_import=ok version={mqtt.__version__ if hasattr(mqtt, \"__version__\") else \"2.1.0\"}")'
+  'import paho.mqtt.client as mqtt; print("paho_mqtt_import=ok", mqtt.__file__)'
 install -m 0644 "$staging/deploy/hubinet-ops.service" /etc/systemd/system/hubinet-ops.service
 
 /opt/hubinet-ops/.venv/bin/python - <<'PY'
