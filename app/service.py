@@ -120,23 +120,26 @@ class OpsService:
 
     def refresh_container(self, vmid: int) -> dict[str, Any]:
         cfg = self._container(vmid)
-        state = self.get_state(vmid)
         if not bool(cfg.get("enabled", False)):
+            state = self.get_state(vmid)
             state.update({"health_status": "unknown", "health_score": 0})
             return self._save_state(vmid, state)
         try:
             inspected = self.executor.run("inspect", vmid, timeout=120).get("data", {})
+            # Inspect may take long enough for a job to reach a terminal state.
+            # Re-read the latest DB state after I/O so telemetry cannot resurrect
+            # stale operation/plan/job fields captured before that transition.
+            state = self.get_state(vmid)
             state.update(inspected)
             state["health_status"] = inspected.get(
                 "health_status",
                 inspected.get("health", "unknown"),
             )
             state["last_refresh"] = utc_now()
-            # A successful telemetry refresh clears a transient health error, but
-            # must not erase the reason recorded for the last completed operation.
             if state.get("last_operation_result") is None:
                 state["last_error"] = None
         except ExecutorError as exc:
+            state = self.get_state(vmid)
             state.update(
                 {
                     "health_status": "offline",

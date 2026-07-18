@@ -168,6 +168,11 @@ class Database:
             args.append(fingerprint)
         query += " ORDER BY created_at DESC LIMIT 1"
         with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE plans SET status='expired' "
+                "WHERE status='waiting_approval' AND expires_at<=?",
+                (utc_now(),),
+            )
             row = conn.execute(query, args).fetchone()
         return _decode_plan(row) if row else None
 
