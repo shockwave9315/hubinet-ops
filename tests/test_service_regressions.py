@@ -120,6 +120,25 @@ def test_successful_refresh_preserves_terminal_operation_error(tmp_path: Path) -
     assert refreshed["last_error"] == "update failed before rollback"
 
 
+def test_scan_preserves_previous_terminal_error(tmp_path: Path) -> None:
+    service, _ = make_service(tmp_path, Executor())
+    state = service.get_state(106)
+    state.update(
+        {
+            "operation_status": "rolled_back",
+            "last_operation_result": "rolled_back",
+            "last_error": "update failed before rollback",
+        }
+    )
+    service._save_state(106, state)
+
+    result = service.scan_container(106)
+    assert result["status"] == "up_to_date"
+    scanned = service.get_state(106)
+    assert scanned["last_operation_result"] == "rolled_back"
+    assert scanned["last_error"] == "update failed before rollback"
+
+
 def test_blocked_job_clears_active_plan_and_exposes_final_plan_status(tmp_path: Path) -> None:
     service, db = make_service(tmp_path, Executor(changed_plan=True))
     plan, job = create_approved_job(service, db)
@@ -161,3 +180,34 @@ def test_approve_is_rejected_while_same_container_scan_is_running(tmp_path: Path
     finally:
         release.set()
         thread.join(timeout=2)
+
+
+def test_retry_healthcheck_is_rejected_while_job_is_active(tmp_path: Path) -> None:
+    service, db = make_service(tmp_path, Executor())
+    plan = db.create_plan(
+        vmid=106,
+        container_name="weather",
+        fingerprint="approved",
+        risk="high",
+        payload={},
+        ttl_minutes=60,
+    )
+    service.approve(plan["id"])
+    with pytest.raises(ValueError, match="already active"):
+        service.retry_healthcheck(106)
+
+
+def test_retry_healthcheck_requires_failed_previous_operation(tmp_path: Path) -> None:
+    service, db = make_service(tmp_path, Executor())
+    plan = db.create_plan(
+        vmid=106,
+        container_name="weather",
+        fingerprint="approved",
+        risk="high",
+        payload={},
+        ttl_minutes=60,
+    )
+    _, job = db.approve_plan(plan["id"])
+    db.update_job(job["id"], status="success", stage="completed", progress=100)
+    with pytest.raises(ValueError, match="only allowed after a failed operation"):
+        service.retry_healthcheck(106)
