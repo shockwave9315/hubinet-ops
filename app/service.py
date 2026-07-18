@@ -200,9 +200,10 @@ class OpsService:
             {
                 "update_status": "scanning",
                 "job_stage": "scanning",
-                "last_error": None,
             }
         )
+        if state.get("last_operation_result") is None:
+            state["last_error"] = None
         self._save_state(vmid, state)
         try:
             data = self.executor.run("scan", vmid, timeout=300).get("data", {})
@@ -234,7 +235,6 @@ class OpsService:
                 "update_status": "update_available" if count else "up_to_date",
                 "job_stage": "idle" if prior_operation == "idle" else state["job_stage"],
                 "last_scan": utc_now(),
-                "last_error": None,
                 "operation_status": prior_operation,
             }
         )
@@ -305,6 +305,7 @@ class OpsService:
                     "operation_status": "running",
                     "job_stage": "preflight",
                     "job_progress": 1,
+                    "last_operation_result": None,
                     "last_error": None,
                 }
             )
@@ -333,9 +334,13 @@ class OpsService:
 
     def retry_healthcheck(self, vmid: int) -> dict[str, Any]:
         cfg = self._container(vmid)
+        if self.db.get_active_job(vmid) is not None:
+            raise ValueError("Another job is already active for this container")
         latest = self.db.get_latest_job(vmid)
         if latest is None:
             raise ValueError("No job is available for retry")
+        if latest.get("status") not in {"failed", "blocked", "interrupted"}:
+            raise ValueError("Healthcheck retry is only allowed after a failed operation")
         job = self.db.create_followup_job(latest["id"], stage="healthcheck", progress=80)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         emit = self._emitter(job)
@@ -791,6 +796,8 @@ class OpsService:
                     "operation_status": "running",
                     "job_stage": event["stage"],
                     "job_progress": event["progress"],
+                    "last_operation_result": None,
+                    "last_error": None,
                     "last_job_event": event,
                 }
             )
