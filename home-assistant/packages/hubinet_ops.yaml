@@ -8,28 +8,28 @@ rest_command:
       Authorization: !secret hubinet_ops_authorization
       Content-Type: application/json
     payload: "{}"
-    timeout: 360
+    timeout: 780
 
   hubinet_ops_refresh_container:
     url: !secret hubinet_ops_refresh_url
     method: POST
     headers: *hubinet_auth_headers
     payload: "{}"
-    timeout: 120
+    timeout: 180
 
   hubinet_ops_retry_healthcheck:
     url: !secret hubinet_ops_retry_healthcheck_url
     method: POST
     headers: *hubinet_auth_headers
     payload: "{}"
-    timeout: 360
+    timeout: 600
 
   hubinet_ops_rollback:
     url: !secret hubinet_ops_rollback_url
     method: POST
     headers: *hubinet_auth_headers
     payload: "{}"
-    timeout: 1500
+    timeout: 1800
 
   hubinet_ops_approve:
     url: !secret hubinet_ops_approve_url
