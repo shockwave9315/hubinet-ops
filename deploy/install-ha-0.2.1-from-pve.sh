@@ -56,6 +56,20 @@ EOF
   fi
 fi
 
+# The package deliberately keeps the phone target outside the repository.
+# Preserve the operator's existing webhook and notify-service secrets.
+ssh "${SSH_ARGS[@]}" '
+  set -e
+  grep -q "^hubinet_ops_webhook_id:" /config/secrets.yaml || {
+    echo "Missing existing hubinet_ops_webhook_id secret" >&2
+    exit 1
+  }
+  grep -q "^hubinet_ops_notify_service:" /config/secrets.yaml || {
+    echo "Missing existing hubinet_ops_notify_service secret, for example notify.mobile_app_poco_x8" >&2
+    exit 1
+  }
+'
+
 ssh "${SSH_ARGS[@]}" "
   set -e
   install -d -m 0700 /config/backups/hubinet-ops/$STAMP
@@ -93,10 +107,6 @@ ssh "${SSH_ARGS[@]}" '
   mv /config/secrets.yaml.new /config/secrets.yaml
   chmod 600 /config/secrets.yaml
   rm -f /tmp/hubinet-ops-secrets
-  grep -q "^hubinet_ops_webhook_id:" /config/secrets.yaml || {
-    echo "Missing existing hubinet_ops_webhook_id secret" >&2
-    exit 1
-  }
 '
 
 if ! ssh "${SSH_ARGS[@]}" 'grep -Eq "^[[:space:]]{4}hubinet-ops:[[:space:]]*$" /config/configuration.yaml'; then
