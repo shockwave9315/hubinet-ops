@@ -8,7 +8,7 @@ executor:
   ssh_key: /etc/hubinet-ops/keys/proxmox_ed25519
   known_hosts: /etc/hubinet-ops/ssh_known_hosts
   connect_timeout_seconds: 10
-  command_timeout_seconds: 3900
+  command_timeout_seconds: 4800
 
 scheduler:
   enabled: false
