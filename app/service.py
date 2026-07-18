@@ -51,10 +51,19 @@ class OpsService:
         self.mqtt = mqtt or MqttTelemetry({"enabled": False}, settings.containers)
         self._stop = threading.Event()
         self.stabilizer = stabilizer or Stabilizer(executor, self._stop)
-        self._scan_lock = threading.Lock()
+        self._scan_all_lock = threading.Lock()
+        self._scan_locks = {vmid: threading.Lock() for vmid in settings.containers}
         self._worker = threading.Thread(target=self._worker_loop, name="ops-worker", daemon=True)
-        self._scheduler = threading.Thread(target=self._scheduler_loop, name="ops-scheduler", daemon=True)
-        self._telemetry = threading.Thread(target=self._telemetry_loop, name="ops-telemetry", daemon=True)
+        self._scheduler = threading.Thread(
+            target=self._scheduler_loop,
+            name="ops-scheduler",
+            daemon=True,
+        )
+        self._telemetry = threading.Thread(
+            target=self._telemetry_loop,
+            name="ops-telemetry",
+            daemon=True,
+        )
         self.mqtt.set_state_provider(self._mqtt_snapshot)
 
     def start(self) -> None:
@@ -97,7 +106,9 @@ class OpsService:
         return {
             "version": VERSION,
             "generated_at": utc_now(),
-            "containers": {str(item["vmid"]): item for item in self.db.list_container_states()},
+            "containers": {
+                str(item["vmid"]): item for item in self.db.list_container_states()
+            },
         }
 
     def get_state(self, vmid: int) -> dict[str, Any]:
@@ -116,7 +127,10 @@ class OpsService:
         try:
             inspected = self.executor.run("inspect", vmid, timeout=120).get("data", {})
             state.update(inspected)
-            state["health_status"] = inspected.get("health_status", inspected.get("health", "unknown"))
+            state["health_status"] = inspected.get(
+                "health_status",
+                inspected.get("health", "unknown"),
+            )
             state["last_refresh"] = utc_now()
             state["last_error"] = None
         except ExecutorError as exc:
@@ -138,8 +152,8 @@ class OpsService:
         ]
 
     def scan_all(self) -> list[dict[str, Any]]:
-        if not self._scan_lock.acquire(blocking=False):
-            return [{"status": "skipped", "reason": "scan_already_running"}]
+        if not self._scan_all_lock.acquire(blocking=False):
+            return [{"status": "skipped", "reason": "scan_all_already_running"}]
         try:
             return [
                 self.scan_container(vmid)
@@ -147,17 +161,45 @@ class OpsService:
                 if bool(cfg.get("enabled", False))
             ]
         finally:
-            self._scan_lock.release()
+            self._scan_all_lock.release()
 
     def scan_container(self, vmid: int) -> dict[str, Any]:
         cfg = self._container(vmid)
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            return {"vmid": vmid, "status": "skipped", "reason": "scan_already_running"}
+        try:
+            active_job = self.db.get_active_job(vmid)
+            if active_job is not None:
+                return {
+                    "vmid": vmid,
+                    "status": "skipped",
+                    "reason": "job_active",
+                    "job_id": active_job["id"],
+                }
+            return self._scan_container_locked(vmid, cfg)
+        finally:
+            lock.release()
+
+    def _scan_container_locked(self, vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
         if not bool(cfg.get("enabled", False)):
             return {"vmid": vmid, "status": "disabled"}
         if cfg.get("adapter", "apt") != "apt":
-            return {"vmid": vmid, "status": "unsupported_adapter", "adapter": cfg.get("adapter")}
+            return {
+                "vmid": vmid,
+                "status": "unsupported_adapter",
+                "adapter": cfg.get("adapter"),
+            }
+
         state = self.get_state(vmid)
         prior_operation = state["operation_status"]
-        state.update({"update_status": "scanning", "job_stage": "scanning", "last_error": None})
+        state.update(
+            {
+                "update_status": "scanning",
+                "job_stage": "scanning",
+                "last_error": None,
+            }
+        )
         self._save_state(vmid, state)
         try:
             data = self.executor.run("scan", vmid, timeout=300).get("data", {})
@@ -173,7 +215,11 @@ class OpsService:
             )
             self._save_state(vmid, state)
             self._notify_ha(self._notification("scan_failed", vmid, error=str(exc)))
-            return {"vmid": vmid, "status": "error", "error": sanitize_text(exc, limit=2000)}
+            return {
+                "vmid": vmid,
+                "status": "error",
+                "error": sanitize_text(exc, limit=2000),
+            }
 
         count = max(0, int(data.get("pending_count", 0) or 0))
         data = dict(data)
@@ -191,7 +237,13 @@ class OpsService:
         )
         if count == 0:
             self.db.invalidate_active_plans(vmid)
-            state.update({"risk": "none", "active_plan_id": None, "active_plan_status": None})
+            state.update(
+                {
+                    "risk": "none",
+                    "active_plan_id": None,
+                    "active_plan_status": None,
+                }
+            )
             self._save_state(vmid, state)
             return {"vmid": vmid, "status": "up_to_date", "data": data}
 
@@ -204,7 +256,9 @@ class OpsService:
                 fingerprint=fingerprint,
                 risk=_risk_for(cfg, data),
                 payload=data,
-                ttl_minutes=int(self.settings.scheduler.get("approval_ttl_minutes", 1440)),
+                ttl_minutes=int(
+                    self.settings.scheduler.get("approval_ttl_minutes", 1440)
+                ),
             )
             status = "plan_created"
             self._notify_ha(
@@ -284,7 +338,10 @@ class OpsService:
             )
             state = self.get_state(vmid)
             state.update(health)
-            state["health_status"] = health.get("health_status", health.get("health", "healthy"))
+            state["health_status"] = health.get(
+                "health_status",
+                health.get("health", "healthy"),
+            )
             state["last_refresh"] = utc_now()
             self._save_state(vmid, state)
             self._terminal(job, "success", "success", None)
@@ -292,7 +349,10 @@ class OpsService:
             state = self.get_state(vmid)
             if exc.data:
                 state.update(exc.data)
-                state["health_status"] = exc.data.get("health_status", exc.data.get("health", "critical"))
+                state["health_status"] = exc.data.get(
+                    "health_status",
+                    exc.data.get("health", "critical"),
+                )
             self._save_state(vmid, state)
             self._terminal(job, "failed", "manual_intervention", str(exc))
         return self.get_state(vmid)
@@ -321,7 +381,15 @@ class OpsService:
                 self._run_job(job)
             except Exception:
                 LOGGER.exception("Unhandled worker failure for job %s", job.get("id"))
-                self._terminal(job, "failed", "manual_intervention", "Unhandled worker error")
+                try:
+                    self._terminal(
+                        job,
+                        "failed",
+                        "manual_intervention",
+                        "Unhandled worker error",
+                    )
+                except Exception:
+                    LOGGER.exception("Failed to persist terminal state for job %s", job.get("id"))
 
     def _run_job(self, job: dict[str, Any]) -> None:
         vmid = int(job["vmid"])
@@ -330,23 +398,53 @@ class OpsService:
         auto_rollback = bool(cfg.get("automatic_rollback", False))
         snapshot = f"ops-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{job['id'][:6]}"
         emit = self._emitter(job)
-        emit(stage="preflight", progress=5, event_type="job_started", message="Update job started")
+        emit(
+            stage="preflight",
+            progress=5,
+            event_type="job_started",
+            message="Update job started",
+        )
         try:
             preflight = self._execute("preflight", vmid, 300, emit)
-            emit(stage="preflight", progress=15, event_type="preflight_passed", message="Preflight passed")
+            self._validate_approved_plan(job, preflight)
+            emit(
+                stage="preflight",
+                progress=15,
+                event_type="preflight_passed",
+                message="Preflight passed and approved package plan is unchanged",
+            )
             emit(
                 stage="preflight",
                 progress=16,
                 event_type="package_lists_refreshed",
                 message="Package lists refreshed and update plan revalidated",
-                details={"pending_count": preflight.get("data", {}).get("updates", {}).get("pending_count")},
+                details={
+                    "pending_count": preflight.get("data", {})
+                    .get("updates", {})
+                    .get("pending_count")
+                },
             )
             if auto_rollback:
                 self.db.update_job(job["id"], snapshot_name=snapshot)
-                emit(stage="snapshot", progress=20, event_type="snapshot_started", message="Creating rollback snapshot")
+                emit(
+                    stage="snapshot",
+                    progress=20,
+                    event_type="snapshot_started",
+                    message="Creating rollback snapshot",
+                )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
-                emit(stage="snapshot", progress=25, event_type="snapshot_created", message="Rollback snapshot created")
-            emit(stage="updating", progress=30, event_type="update_started", message="Package update started")
+                emit(
+                    stage="snapshot",
+                    progress=25,
+                    event_type="snapshot_created",
+                    message="Rollback snapshot created",
+                )
+            emit(
+                stage="updating",
+                progress=30,
+                event_type="update_started",
+                message="Package update started",
+            )
             update = self._execute("update", vmid, 3900, emit)
             emit(
                 stage="waiting_services",
@@ -370,6 +468,7 @@ class OpsService:
                 event_type="healthcheck_passed",
                 message="Post-update service stabilization passed",
             )
+
             post_scan_error: str | None = None
             try:
                 post_scan = self.executor.run("scan", vmid, timeout=300)
@@ -384,20 +483,36 @@ class OpsService:
                     message="Health passed, but the post-update package scan failed",
                     details={"error": post_scan_error},
                 )
-            result = {"preflight": preflight, "update": update, "healthcheck": health, "post_scan": post_scan}
+            result = {
+                "preflight": preflight,
+                "update": update,
+                "healthcheck": health,
+                "post_scan": post_scan,
+            }
             self.db.update_job(job["id"], result=result)
             self.db.update_plan_status(job["plan_id"], "completed")
             state = self.get_state(vmid)
-            updates = dict(post_scan.get("data", {})) if post_scan.get("ok") else dict(state.get("updates") or {})
+            updates = (
+                dict(post_scan.get("data", {}))
+                if post_scan.get("ok")
+                else dict(state.get("updates") or {})
+            )
             updates["packages"] = list(updates.get("packages") or [])[:200]
             pending = max(0, int(updates.get("pending_count", 0) or 0))
             state.update(health)
             state.update(
                 {
-                    "health_status": health.get("health_status", health.get("health", "healthy")),
+                    "health_status": health.get(
+                        "health_status",
+                        health.get("health", "healthy"),
+                    ),
                     "updates": updates,
                     "pending_updates": pending,
-                    "update_status": "unknown" if post_scan_error else ("update_available" if pending else "up_to_date"),
+                    "update_status": (
+                        "unknown"
+                        if post_scan_error
+                        else ("update_available" if pending else "up_to_date")
+                    ),
                     "active_plan_id": None,
                     "active_plan_status": "completed",
                     "active_job_id": job["id"],
@@ -415,13 +530,45 @@ class OpsService:
             if failed_stage in {"preflight", "snapshot"}:
                 self.db.update_plan_status(job["plan_id"], "blocked")
                 self._terminal(job, "blocked", "failed", str(exc))
-                self._notify_ha(self._notification("job_blocked", vmid, error=str(exc)))
+                self._notify_ha(
+                    self._notification("job_blocked", vmid, error=str(exc))
+                )
             elif auto_rollback:
                 self._rollback(job, str(exc))
             else:
                 self.db.update_plan_status(job["plan_id"], "failed")
                 self._terminal(job, "failed", "manual_intervention", str(exc))
-                self._notify_ha(self._notification("manual_intervention_required", vmid, error=str(exc)))
+                self._notify_ha(
+                    self._notification(
+                        "manual_intervention_required",
+                        vmid,
+                        error=str(exc),
+                    )
+                )
+
+    def _validate_approved_plan(
+        self,
+        job: dict[str, Any],
+        preflight: dict[str, Any],
+    ) -> None:
+        plan = self.db.get_plan(job["plan_id"])
+        updates = dict(preflight.get("data", {}).get("updates") or {})
+        pending = max(0, int(updates.get("pending_count", 0) or 0))
+        fingerprint = str(updates.get("fingerprint") or _fingerprint(updates))
+        if pending <= 0:
+            raise ExecutorError(
+                "Approved update plan is no longer valid: no updates remain; scan again",
+                data={"updates": updates},
+            )
+        if fingerprint != str(plan["fingerprint"]):
+            raise ExecutorError(
+                "Approved update plan changed after approval; scan and approve the new plan",
+                data={
+                    "approved_fingerprint": plan["fingerprint"],
+                    "current_fingerprint": fingerprint,
+                    "updates": updates,
+                },
+            )
 
     def _repair_or_raise(
         self,
@@ -442,8 +589,18 @@ class OpsService:
         )
         if not actions:
             raise cause
-        emit(stage="repair", progress=85, event_type="repair_started", message="Configured repair actions started")
-        self._execute("repair", int(job["vmid"]), int(policy.repair_timeout_seconds), emit)
+        emit(
+            stage="repair",
+            progress=85,
+            event_type="repair_started",
+            message="Configured repair actions started",
+        )
+        self._execute(
+            "repair",
+            int(job["vmid"]),
+            int(policy.repair_timeout_seconds),
+            emit,
+        )
         return self.stabilizer.wait(
             vmid=int(job["vmid"]),
             phase="repair",
@@ -458,9 +615,24 @@ class OpsService:
         cfg = self._container(vmid)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         snapshot = str(self.db.get_job(job["id"]).get("snapshot_name") or "")
+        if not snapshot:
+            self.db.update_plan_status(job["plan_id"], "failed")
+            self._terminal(
+                job,
+                "failed",
+                "manual_intervention",
+                f"{cause}; rollback snapshot is missing",
+            )
+            return
         emit = self._emitter(job)
         try:
-            emit(stage="rollback", progress=88, level="warning", event_type="rollback_started", message="Rollback started")
+            emit(
+                stage="rollback",
+                progress=88,
+                level="warning",
+                event_type="rollback_started",
+                message="Rollback started",
+            )
             self._execute("rollback", vmid, 1200, emit, snapshot)
             emit(
                 stage="rollback_wait",
@@ -481,13 +653,20 @@ class OpsService:
                 event_type="rollback_healthcheck_passed",
                 message="Rollback service stabilization passed",
             )
-            self.db.update_job(job["id"], result={"rollback_healthcheck": health}, error=cause)
+            self.db.update_job(
+                job["id"],
+                result={"rollback_healthcheck": health},
+                error=cause,
+            )
             self.db.update_plan_status(job["plan_id"], "rolled_back")
             state = self.get_state(vmid)
             state.update(health)
             state.update(
                 {
-                    "health_status": health.get("health_status", health.get("health", "healthy")),
+                    "health_status": health.get(
+                        "health_status",
+                        health.get("health", "healthy"),
+                    ),
                     "snapshot_name": snapshot,
                     "last_error": cause,
                     "active_job_id": job["id"],
@@ -500,9 +679,21 @@ class OpsService:
             error = f"Original failure: {cause}; rollback failure: {rollback_error}"
             self.db.update_plan_status(job["plan_id"], "failed")
             self._terminal(job, "failed", "manual_intervention", error)
-            self._notify_ha(self._notification("manual_intervention_required", vmid, error=error))
+            self._notify_ha(
+                self._notification(
+                    "manual_intervention_required",
+                    vmid,
+                    error=error,
+                )
+            )
 
-    def _terminal(self, job: dict[str, Any], job_status: str, result: str, error: str | None) -> None:
+    def _terminal(
+        self,
+        job: dict[str, Any],
+        job_status: str,
+        result: str,
+        error: str | None,
+    ) -> None:
         operation = {
             "success": "success",
             "rolled_back": "rolled_back",
@@ -534,13 +725,21 @@ class OpsService:
                 "job_stage": event["stage"],
                 "job_progress": 100,
                 "last_operation_result": result,
-                "last_error": sanitize_text(error, limit=2000) if error else state.get("last_error"),
+                "last_error": (
+                    sanitize_text(error, limit=2000)
+                    if error
+                    else state.get("last_error")
+                ),
                 "last_job_event": event,
             }
         )
         self._save_state(int(job["vmid"]), state)
         self.mqtt.publish_event(int(job["vmid"]), event)
-        self.mqtt.publish_job(int(job["vmid"]), self.db.get_job(job["id"]), force=True)
+        self.mqtt.publish_job(
+            int(job["vmid"]),
+            self.db.get_job(job["id"]),
+            force=True,
+        )
 
     def _emitter(self, job: dict[str, Any]) -> Callable[..., None]:
         def emit(
@@ -574,7 +773,11 @@ class OpsService:
             )
             self._save_state(int(job["vmid"]), state)
             self.mqtt.publish_event(int(job["vmid"]), event)
-            self.mqtt.publish_job(int(job["vmid"]), self.db.get_job(job["id"]))
+            self.mqtt.publish_job(
+                int(job["vmid"]),
+                self.db.get_job(job["id"]),
+            )
+
         return emit
 
     def _execute(
@@ -594,20 +797,28 @@ class OpsService:
         }.get(action, "idle")
 
         def on_event(item: dict[str, Any]) -> None:
+            raw_details = item.get("details")
             emit(
                 stage=action_stage,
-                progress=int(item.get("progress", STAGE_PROGRESS.get(action, 0))),
+                progress=_safe_int(
+                    item.get("progress"),
+                    STAGE_PROGRESS.get(action_stage, 0),
+                ),
                 level=str(item.get("level", "info")),
                 event_type=str(item.get("event_type", "executor_event")),
                 message=str(item.get("message", "")),
-                details=dict(item.get("details") or {}),
+                details=raw_details if isinstance(raw_details, dict) else {},
             )
-        try:
-            return self.executor.run(action, vmid, argument, timeout, on_event=on_event)
-        except TypeError as exc:
-            if "on_event" not in str(exc):
-                raise
-            return self.executor.run(action, vmid, argument, timeout)
+
+        # Do not retry on TypeError. Retrying a destructive update/rollback action can
+        # execute it twice. The real Executor and all supported fakes accept on_event.
+        return self.executor.run(
+            action,
+            vmid,
+            argument,
+            timeout,
+            on_event=on_event,
+        )
 
     def _save_state(self, vmid: int, state: dict[str, Any]) -> dict[str, Any]:
         state = normalize_state(self._decorate_state(vmid, state))
@@ -627,7 +838,10 @@ class OpsService:
             1
             for name in required
             if by_name.get(str(name), {}).get("running")
-            and (not require_health or by_name[str(name)].get("health") in {"healthy", "none"})
+            and (
+                not require_health
+                or by_name[str(name)].get("health") == "healthy"
+            )
         )
         state["docker"] = docker
         saved = self.db.upsert_container_state(vmid, state)
@@ -644,8 +858,13 @@ class OpsService:
                 "enabled": bool(cfg.get("enabled", False)),
                 "adapter": cfg.get("adapter", "apt"),
                 "criticality": cfg.get("criticality", "medium"),
-                "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                "rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
+                "dashboard_path": cfg.get(
+                    "dashboard_path",
+                    f"/hubinet-ops/ct-{vmid}",
+                ),
+                "rollback_allowed": bool(
+                    cfg.get("manual_rollback_allowed", False)
+                ),
             }
         )
         active_job = self.db.get_active_job(vmid)
@@ -679,12 +898,30 @@ class OpsService:
     def _ensure_initial_states(self) -> None:
         for vmid in self.settings.containers:
             state = self.db.get_container_state(vmid) or self._base_state(vmid)
+            latest = self.db.get_latest_job(vmid)
+            if latest and latest.get("status") == "interrupted":
+                state.update(
+                    {
+                        "active_job_id": latest["id"],
+                        "operation_status": "failed",
+                        "job_stage": "failed",
+                        "job_progress": 100,
+                        "last_operation_result": "failed",
+                        "last_error": latest.get("error")
+                        or "Agent restarted while this job was active",
+                    }
+                )
             self._save_state(vmid, state)
 
     def _scheduler_loop(self) -> None:
-        if self._stop.wait(int(self.settings.scheduler.get("initial_scan_delay_seconds", 60))):
+        if self._stop.wait(
+            int(self.settings.scheduler.get("initial_scan_delay_seconds", 60))
+        ):
             return
-        interval = max(60, int(self.settings.scheduler.get("scan_interval_minutes", 360)) * 60)
+        interval = max(
+            60,
+            int(self.settings.scheduler.get("scan_interval_minutes", 360)) * 60,
+        )
         while not self._stop.is_set():
             try:
                 self.scan_all()
@@ -693,9 +930,14 @@ class OpsService:
             self._stop.wait(interval)
 
     def _telemetry_loop(self) -> None:
-        if self._stop.wait(int(self.settings.scheduler.get("initial_refresh_delay_seconds", 5))):
+        if self._stop.wait(
+            int(self.settings.scheduler.get("initial_refresh_delay_seconds", 5))
+        ):
             return
-        interval = max(10, int(self.settings.scheduler.get("state_refresh_seconds", 30)))
+        interval = max(
+            10,
+            int(self.settings.scheduler.get("state_refresh_seconds", 30)),
+        )
         while not self._stop.is_set():
             try:
                 self.refresh_all()
@@ -710,7 +952,10 @@ class OpsService:
                 "event_type": event_type,
                 "vmid": vmid,
                 "container": cfg.get("name", f"ct-{vmid}"),
-                "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
+                "dashboard_path": cfg.get(
+                    "dashboard_path",
+                    f"/hubinet-ops/ct-{vmid}",
+                ),
                 **extra,
             }
         )
@@ -720,14 +965,25 @@ class OpsService:
         if not url:
             return
         try:
-            with httpx.Client(timeout=float(self.settings.home_assistant.get("request_timeout_seconds", 10))) as client:
+            with httpx.Client(
+                timeout=float(
+                    self.settings.home_assistant.get(
+                        "request_timeout_seconds",
+                        10,
+                    )
+                )
+            ) as client:
                 client.post(url, json=payload).raise_for_status()
         except Exception:
             LOGGER.warning("Home Assistant webhook delivery failed")
 
     def _agent_state(self) -> dict[str, Any]:
         states = self.db.list_container_states()
-        refreshed = [str(item.get("last_refresh")) for item in states if item.get("last_refresh")]
+        refreshed = [
+            str(item.get("last_refresh"))
+            for item in states
+            if item.get("last_refresh")
+        ]
         return {
             "version": VERSION,
             "configured_container_count": len(self.settings.containers),
@@ -735,7 +991,9 @@ class OpsService:
             "last_refresh": max(refreshed) if refreshed else None,
         }
 
-    def _mqtt_snapshot(self) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    def _mqtt_snapshot(
+        self,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         jobs = [
             job
             for vmid in self.settings.containers
@@ -750,13 +1008,24 @@ class OpsService:
             raise KeyError(f"Unknown VMID: {vmid}") from exc
 
 
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _fingerprint(data: dict[str, Any]) -> str:
     blob = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(blob).hexdigest()
 
 
 def _risk_for(cfg: dict[str, Any], data: dict[str, Any]) -> str:
-    packages = {str(item.get("name", "")) for item in data.get("packages", []) if isinstance(item, dict)}
+    packages = {
+        str(item.get("name", ""))
+        for item in data.get("packages", [])
+        if isinstance(item, dict)
+    }
     high_risk = {
         "systemd",
         "libc6",
@@ -767,6 +1036,9 @@ def _risk_for(cfg: dict[str, Any], data: dict[str, Any]) -> str:
         "docker-ce-cli",
         "containerd.io",
     }
-    if str(cfg.get("criticality", "medium")) in {"critical", "high"} or packages & high_risk:
+    if (
+        str(cfg.get("criticality", "medium")) in {"critical", "high"}
+        or packages & high_risk
+    ):
         return "high"
     return "medium" if int(data.get("pending_count", 0)) >= 20 else "low"
