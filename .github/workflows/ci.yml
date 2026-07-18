@@ -34,6 +34,17 @@ jobs:
           path: pytest.log
           if-no-files-found: warn
           retention-days: 7
+      - name: Upload review source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-source-${{ github.run_id }}
+          path: |
+            app
+            tests
+            deploy
+            home-assistant
+          retention-days: 1
       - name: Validate shell syntax
         run: |
           find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
