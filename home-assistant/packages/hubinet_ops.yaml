@@ -135,7 +135,6 @@ automation:
       vmid: "{{ trigger.json.vmid | default('?') }}"
       dashboard_path: "{{ trigger.json.dashboard_path | default('/hubinet-ops/overview') }}"
       job_tag: "hubinet_ops_ct{{ vmid }}_job"
-      plan_tag: "hubinet_ops_ct{{ vmid }}_plan"
     actions:
       - choose:
           - conditions: "{{ event_type == 'approval_required' }}"
@@ -147,7 +146,7 @@ automation:
                     Dostępne aktualizacje: {{ trigger.json.pending_count | default('?') }}.
                     Ryzyko: {{ trigger.json.risk | default('unknown') }}. Otwórz panel i sprawdź plan.
                   data:
-                    tag: "{{ plan_tag }}"
+                    tag: "{{ job_tag }}"
                     group: hubinet_ops
                     channel: "Hubinet Ops"
                     importance: high
@@ -190,7 +189,7 @@ automation:
                     group: hubinet_ops
                     channel: "Hubinet Ops"
                     importance: default
-                    progress: -1
+                    sticky: false
                     timeout: 3600
                     notification_icon: mdi:check-decagram
                     color: "#4CAF50"
@@ -210,7 +209,6 @@ automation:
                     importance: high
                     priority: high
                     ttl: 0
-                    progress: -1
                     sticky: true
                     notification_icon: mdi:backup-restore
                     color: "#FF9800"
@@ -232,7 +230,6 @@ automation:
                     importance: high
                     priority: high
                     ttl: 0
-                    progress: -1
                     sticky: true
                     notification_icon: mdi:alert-octagon
                     color: "#F44336"
@@ -393,6 +390,7 @@ automation:
                 group: hubinet_ops
                 channel: "Hubinet Ops"
                 importance: default
+                sticky: false
                 timeout: 1800
                 notification_icon: mdi:server-security
                 color: "#4CAF50"
