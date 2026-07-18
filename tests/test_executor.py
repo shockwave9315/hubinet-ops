@@ -36,7 +36,7 @@ def executor() -> Executor:
 
 def test_ndjson_events_and_final_result(monkeypatch: pytest.MonkeyPatch) -> None:
     process = FakeProcess(
-        '\n'.join(
+        "\n".join(
             [
                 '{"type":"event","stage":"updating","progress":42,"level":"info","message":"package"}',
                 '{"type":"event","stage":"updating","progress":20,"level":"info","message":"older"}',
@@ -64,6 +64,52 @@ def test_legacy_json_and_malformed_lines(monkeypatch: pytest.MonkeyPatch) -> Non
     assert executor().run("scan", 106)["data"]["pending_count"] == 2
 
 
+def test_malformed_event_fields_are_bounded_and_do_not_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeProcess(
+        "\n".join(
+            [
+                '{"type":"event","progress":"not-a-number","details":[1,2],"message":"event"}',
+                '{"type":"result","ok":true,"data":{}}',
+            ]
+        )
+    )
+    monkeypatch.setattr("app.executor.subprocess.Popen", lambda *args, **kwargs: process)
+    events: list[dict[str, Any]] = []
+    executor().run("update", 106, on_event=events.append)
+    assert events[0]["progress"] == 0
+    assert events[0]["details"] == {}
+
+
+def test_event_callback_failure_does_not_abort_or_repeat_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = FakeProcess(
+        "\n".join(
+            [
+                '{"type":"event","progress":30,"message":"one"}',
+                '{"type":"event","progress":40,"message":"two"}',
+                '{"type":"result","ok":true,"data":{"done":true}}',
+            ]
+        )
+    )
+    calls = 0
+
+    def popen(*args: Any, **kwargs: Any) -> FakeProcess:
+        nonlocal calls
+        calls += 1
+        return process
+
+    def broken_callback(_: dict[str, Any]) -> None:
+        raise RuntimeError("database temporarily unavailable")
+
+    monkeypatch.setattr("app.executor.subprocess.Popen", popen)
+    result = executor().run("update", 106, on_event=broken_callback)
+    assert result["data"]["done"] is True
+    assert calls == 1
+
+
 def test_bounded_stderr_and_error_data(monkeypatch: pytest.MonkeyPatch) -> None:
     process = FakeProcess(
         '{"ok":false,"data":{"docker":{"available":false}},"error":"failed"}\n',
@@ -81,6 +127,10 @@ def test_bounded_stderr_and_error_data(monkeypatch: pytest.MonkeyPatch) -> None:
     ("action", "vmid", "argument"),
     [("shell", 106, None), ("update", 999, None), ("snapshot", 106, "bad;rm")],
 )
-def test_action_vmid_and_argument_injection_are_rejected(action: str, vmid: int, argument: str | None) -> None:
+def test_action_vmid_and_argument_injection_are_rejected(
+    action: str,
+    vmid: int,
+    argument: str | None,
+) -> None:
     with pytest.raises(ExecutorError):
         executor().run(action, vmid, argument)
