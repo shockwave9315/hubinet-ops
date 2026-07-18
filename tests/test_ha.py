@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -9,6 +10,22 @@ from app.mqtt import _ct_entities
 from scripts.validate_yaml import HomeAssistantLoader
 
 ROOT = Path(__file__).parents[1]
+PACKAGE = ROOT / "home-assistant" / "packages" / "hubinet_ops.yaml"
+DASHBOARD = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
+
+
+def _load(path: Path) -> Any:
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=HomeAssistantLoader)
+
+
+def _walk(value: Any):
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk(child)
 
 
 def test_all_repository_yaml_parses() -> None:
@@ -18,44 +35,89 @@ def test_all_repository_yaml_parses() -> None:
         text=True,
     ).splitlines()
     for name in tracked:
-        path = ROOT / name
-        yaml.load(path.read_text(encoding="utf-8"), Loader=HomeAssistantLoader)
+        _load(ROOT / name)
 
 
-def test_notifications_only_contain_navigation_data() -> None:
-    package_path = ROOT / "home-assistant" / "packages" / "hubinet_ops.yaml"
-    data = yaml.load(
-        package_path.read_text(encoding="utf-8"),
-        Loader=HomeAssistantLoader,
-    )
-    automation = data["automation"][0]
-    for choice in automation["actions"][0]["choose"]:
-        notify_data = choice["sequence"][0]["data"]["data"]
-        assert set(notify_data) == {"url", "clickAction"}
-    text = package_path.read_text(encoding="utf-8")
-    assert "authenticationRequired" not in text
-    assert "!secret hubinet_ops_notify_service" in text
-    assert "notify.mobile_app_" not in text
+def test_current_automations_replace_the_legacy_webhook_automation() -> None:
+    data = _load(PACKAGE)
+    automation_ids = {item["id"] for item in data["automation"]}
+
+    assert automation_ids == {
+        "hubinet_ops_webhook_notifications_v022",
+        "hubinet_ops_live_progress_v022",
+        "hubinet_ops_health_watchdog_v022",
+    }
+    assert "hubinet_ops_webhook_v021" not in PACKAGE.read_text(encoding="utf-8")
 
 
-def test_dashboard_paths_and_dashboard_only_approval() -> None:
-    dashboard = (
-        ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
-    ).read_text(encoding="utf-8")
-    package = (
-        ROOT / "home-assistant" / "packages" / "hubinet_ops.yaml"
-    ).read_text(encoding="utf-8")
-    assert "path: ct-101" in dashboard
-    assert "path: ct-106" in dashboard
-    assert "script.hubinet_ops_approve_container" in dashboard
-    notification_section = package.split("automation:", 1)[1]
-    assert "hubinet_ops_approve" not in notification_section
+def test_notifications_are_navigation_only_and_use_private_target() -> None:
+    data = _load(PACKAGE)
+    notification_actions = [
+        item
+        for item in _walk(data["automation"])
+        if isinstance(item, dict)
+        and item.get("action") == "hubinet_ops_notify_service"
+    ]
+
+    assert notification_actions
+    for action in notification_actions:
+        mobile_data = action["data"]["data"]
+        assert mobile_data["url"]
+        assert mobile_data["clickAction"]
+        assert "actions" not in mobile_data
+
+    automation_text = PACKAGE.read_text(encoding="utf-8").split("automation:", 1)[1]
+    assert "script.hubinet_ops_" not in automation_text
+    assert "rest_command." not in automation_text
+    assert "authenticationRequired" not in automation_text
+    assert "notify.mobile_app_" not in PACKAGE.read_text(encoding="utf-8")
+    assert "!secret hubinet_ops_notify_service" in PACKAGE.read_text(encoding="utf-8")
+
+
+def test_live_progress_notification_replaces_one_phone_notification_per_ct() -> None:
+    text = PACKAGE.read_text(encoding="utf-8")
+
+    assert 'seconds: "/10"' in text
+    assert "live_update: true" in text
+    assert "progress_max: 100" in text
+    assert "alert_once: true" in text
+    assert 'tag: "hubinet_ops_ct{{ repeat.item.vmid }}_job"' in text
+    assert "/hubinet-ops/ct-101" in text
+    assert "/hubinet-ops/ct-106" in text
+
+
+def test_dashboard_is_mushroom_sections_with_dashboard_only_approval() -> None:
+    dashboard = _load(DASHBOARD)
+    text = DASHBOARD.read_text(encoding="utf-8")
+
+    assert [view["path"] for view in dashboard["views"]] == [
+        "overview",
+        "ct-101",
+        "ct-106",
+    ]
+    assert all(view["type"] == "sections" for view in dashboard["views"])
+    assert text.count("custom:mushroom-") >= 40
+    assert "action: perform-action" in text
+    assert "call-service" not in text
+    assert "script.hubinet_ops_approve_container" in text
+
+    automation_text = PACKAGE.read_text(encoding="utf-8").split("automation:", 1)[1]
+    assert "hubinet_ops_approve" not in automation_text
+    assert "hubinet_ops_reject" not in automation_text
+
+
+def test_dashboard_has_bounded_reverse_chronological_live_logs_and_packages() -> None:
+    text = DASHBOARD.read_text(encoding="utf-8")
+
+    assert text.count("title: Logi live") == 2
+    assert text.count("recent_job_events") >= 2
+    assert text.count("events[-25:] | reverse") == 2
+    assert text.count("packages[:30]") == 2
+    assert "oraz {{ (packages | count) - 30 }} kolejnych pakietów" in text
 
 
 def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
-    dashboard = (
-        ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
-    ).read_text(encoding="utf-8")
+    dashboard = DASHBOARD.read_text(encoding="utf-8")
     keys = {key for key, _, _, _ in _ct_entities()}
     suffixes = {
         "pending_updates": "pending_update_count",
