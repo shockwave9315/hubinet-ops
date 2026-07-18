@@ -32,8 +32,10 @@ class MqttTelemetry:
         self.config = dict(config or {})
         self.containers = containers
         self.enabled = bool(self.config.get("enabled", False))
-        self.base_topic = str(self.config.get("base_topic", "hubinet/ops")).strip("/")
-        self.discovery_prefix = str(self.config.get("discovery_prefix", "homeassistant")).strip("/")
+        self.base_topic = str(self.config.get("base_topic", "hubinet/ops")).strip("/") or "hubinet/ops"
+        self.discovery_prefix = (
+            str(self.config.get("discovery_prefix", "homeassistant")).strip("/") or "homeassistant"
+        )
         self.retain_state = bool(self.config.get("retain_state", True))
         self._client_factory = client_factory
         self._client: Any = None
@@ -41,18 +43,21 @@ class MqttTelemetry:
         self._cache: dict[str, str] = {}
         self._connected = threading.Event()
         self._stop = threading.Event()
-        self._publisher = threading.Thread(target=self._publisher_loop, name="mqtt-publisher", daemon=True)
+        self._publisher = threading.Thread(
+            target=self._publisher_loop,
+            name="mqtt-publisher",
+            daemon=True,
+        )
         self._state_provider: Callable[[], tuple[Any, ...]] | None = None
+        self._started = False
 
-    def set_state_provider(
-        self,
-        provider: Callable[[], tuple[Any, ...]],
-    ) -> None:
+    def set_state_provider(self, provider: Callable[[], tuple[Any, ...]]) -> None:
         self._state_provider = provider
 
     def start(self) -> None:
-        if not self.enabled:
+        if not self.enabled or self._started:
             return
+        self._started = True
         try:
             self._client = self._new_client()
             username = str(self.config.get("username", ""))
@@ -81,13 +86,17 @@ class MqttTelemetry:
             LOGGER.warning("MQTT startup failed: %s", sanitize_text(exc, limit=500))
 
     def stop(self) -> None:
-        if not self.enabled:
+        if not self.enabled or not self._started:
             return
         self._stop.set()
+        self._connected.set()
         if self._client is not None:
             try:
                 self._client.publish(
-                    f"{self.base_topic}/agent/availability", "offline", qos=1, retain=True
+                    f"{self.base_topic}/agent/availability",
+                    "offline",
+                    qos=1,
+                    retain=True,
                 )
                 self._client.disconnect()
                 self._client.loop_stop()
@@ -98,13 +107,23 @@ class MqttTelemetry:
             self._publisher.join(timeout=5)
 
     def publish_agent_state(self, state: dict[str, Any], *, force: bool = False) -> None:
-        self._publish_json(f"{self.base_topic}/agent/state", state, retain=self.retain_state, force=force)
+        self._publish_json(
+            f"{self.base_topic}/agent/state",
+            state,
+            retain=self.retain_state,
+            force=force,
+        )
 
-    def publish_container_state(self, vmid: int, state: dict[str, Any], *, force: bool = False) -> None:
-        bounded = _bounded_state(state)
+    def publish_container_state(
+        self,
+        vmid: int,
+        state: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> None:
         self._publish_json(
             f"{self.base_topic}/ct/{int(vmid)}/state",
-            bounded,
+            _bounded_state(state),
             retain=self.retain_state,
             force=force,
         )
@@ -118,7 +137,12 @@ class MqttTelemetry:
         )
 
     def publish_event(self, vmid: int, event: dict[str, Any]) -> None:
-        self._publish_json(f"{self.base_topic}/ct/{int(vmid)}/event", event, retain=False, force=True)
+        self._publish_json(
+            f"{self.base_topic}/ct/{int(vmid)}/event",
+            event,
+            retain=False,
+            force=True,
+        )
 
     def publish_discovery(self, *, force: bool = False) -> None:
         if not self.enabled:
@@ -133,14 +157,18 @@ class MqttTelemetry:
             "sw_version": VERSION,
         }
         agent_entities = {
-            "availability": ("Availability", "{{ value }}", f"{self.base_topic}/agent/availability"),
+            "availability": ("Availability", "{{ value }}", availability),
             "version": ("Version", "{{ value_json.version }}", agent_state),
             "configured_container_count": (
                 "Configured container count",
                 "{{ value_json.configured_container_count }}",
                 agent_state,
             ),
-            "active_job_count": ("Active job count", "{{ value_json.active_job_count }}", agent_state),
+            "active_job_count": (
+                "Active job count",
+                "{{ value_json.active_job_count }}",
+                agent_state,
+            ),
             "last_refresh": ("Last refresh", "{{ value_json.last_refresh }}", agent_state),
         }
         for key, (name, template, state_topic) in agent_entities.items():
@@ -173,11 +201,12 @@ class MqttTelemetry:
                     value_template=template,
                     availability_topic=availability,
                     device=device,
-                    attributes_topic=state_topic,
+                    # The dashboard reads rich attributes from this one entity only.
+                    # Attaching the same large JSON payload to every sensor bloats HA state storage.
+                    attributes_topic=state_topic if key == "health_status" else None,
                     extra=extra,
                     force=force,
                 )
-            dashboard = str(cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"))
             self._discovery_sensor(
                 object_id=f"hubinet_ops_ct{vmid}_dashboard_path",
                 unique_id=f"hubinet_ops_ct_{vmid}_dashboard_path",
@@ -234,7 +263,11 @@ class MqttTelemetry:
         if not self.enabled:
             return
         try:
-            payload = json.dumps(sanitize_data(value), ensure_ascii=False, separators=(",", ":"))
+            payload = json.dumps(
+                sanitize_data(value),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
             self._put(PublishItem(topic, payload, retain, force))
         except Exception as exc:
             LOGGER.warning("MQTT payload rejected: %s", sanitize_text(exc, limit=500))
@@ -242,37 +275,84 @@ class MqttTelemetry:
     def _put(self, item: PublishItem | None) -> None:
         try:
             self._queue.put_nowait(item)
+            return
         except queue.Full:
-            LOGGER.warning("MQTT publish queue full; dropping telemetry")
+            pass
+
+        # Non-retained events are recoverable from SQLite and may be dropped when the
+        # bounded transport queue is saturated. A retained state/discovery update is
+        # more important: evict one oldest queued item so the latest truth eventually wins.
+        if item is not None and item.retain:
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(item)
+                LOGGER.warning("MQTT queue full; evicted oldest telemetry for retained state")
+                return
+            except (queue.Empty, queue.Full):
+                pass
+        LOGGER.warning("MQTT publish queue full; dropping telemetry")
 
     def _publisher_loop(self) -> None:
+        pending: PublishItem | None = None
         while not self._stop.is_set():
-            try:
-                item = self._queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if item is None:
-                return
-            if item.retain and not item.force and self._cache.get(item.topic) == item.payload:
-                continue
+            # Never rotate a dequeued message to the back while disconnected. Keeping
+            # it in `pending` preserves FIFO order and prevents the Gemini-reported loss.
             if not self._connected.wait(timeout=0.5):
-                self._put(item)
+                continue
+            if self._stop.is_set():
+                return
+            if pending is None:
+                try:
+                    item = self._queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if item is None:
+                    return
+                pending = item
+
+            item = pending
+            if item.retain and not item.force and self._cache.get(item.topic) == item.payload:
+                pending = None
                 continue
             try:
-                self._client.publish(item.topic, item.payload, qos=1, retain=item.retain)
+                info = self._client.publish(
+                    item.topic,
+                    item.payload,
+                    qos=1,
+                    retain=item.retain,
+                )
+                result_code = getattr(info, "rc", 0)
+                if result_code not in (None, 0):
+                    raise RuntimeError(f"MQTT publish returned rc={result_code}")
                 if item.retain:
                     self._cache[item.topic] = item.payload
+                pending = None
             except Exception as exc:
                 LOGGER.warning("MQTT publish failed: %s", sanitize_text(exc, limit=500))
+                # Keep the same item and retry it before later messages. MQTT is not
+                # authoritative, so this thread waits without affecting update jobs.
+                self._stop.wait(0.5)
 
-    def _on_connect(self, client: Any, userdata: Any, flags: Any, reason_code: Any, properties: Any = None) -> None:
+    def _on_connect(
+        self,
+        client: Any,
+        userdata: Any,
+        flags: Any,
+        reason_code: Any,
+        properties: Any = None,
+    ) -> None:
         if reason_code != 0:
             LOGGER.warning("MQTT connection refused with code %s", reason_code)
             return
         self._connected.set()
         self._cache.clear()
         try:
-            client.publish(f"{self.base_topic}/agent/availability", "online", qos=1, retain=True)
+            client.publish(
+                f"{self.base_topic}/agent/availability",
+                "online",
+                qos=1,
+                retain=True,
+            )
             self.publish_discovery(force=True)
             if self._state_provider is not None:
                 snapshot = self._state_provider()
@@ -284,7 +364,10 @@ class MqttTelemetry:
                 for job in jobs:
                     self.publish_job(int(job["vmid"]), job, force=True)
         except Exception as exc:
-            LOGGER.warning("MQTT reconnect publication failed: %s", sanitize_text(exc, limit=500))
+            LOGGER.warning(
+                "MQTT reconnect publication failed: %s",
+                sanitize_text(exc, limit=500),
+            )
 
     def _on_disconnect(
         self,
@@ -296,11 +379,16 @@ class MqttTelemetry:
     ) -> None:
         self._connected.clear()
         if not self._stop.is_set():
-            LOGGER.warning("MQTT disconnected; client backoff will retry (code %s)", reason_code)
+            LOGGER.warning(
+                "MQTT disconnected; client backoff will retry (code %s)",
+                reason_code,
+            )
 
     def _new_client(self) -> Any:
         if self._client_factory is not None:
-            return self._client_factory(client_id=str(self.config.get("client_id", "hubinet-ops-agent")))
+            return self._client_factory(
+                client_id=str(self.config.get("client_id", "hubinet-ops-agent"))
+            )
         import paho.mqtt.client as mqtt
 
         return mqtt.Client(
