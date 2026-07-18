@@ -125,7 +125,7 @@ def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
         "disk_free_mb": "disk_free",
         "memory_used_percent": "memory_used",
     }
-    displayed = {
+    common = {
         "health_status",
         "health_score",
         "lxc_status",
@@ -138,30 +138,32 @@ def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
         "disk_used_percent",
         "disk_free_mb",
         "memory_used_percent",
-        "docker_required_healthy",
-        "docker_required_total",
-        "active_plan_id",
-        "active_job_id",
         "last_scan",
         "last_update",
         "last_error",
         "last_operation_result",
         "rollback_allowed",
     }
-    assert displayed <= keys
+    per_container = {
+        101: set(),
+        106: {"docker_required_healthy", "docker_required_total"},
+    }
+    assert common | per_container[106] <= keys
 
     for vmid in (101, 106):
-        for key in displayed:
+        expected = common | per_container[vmid]
+        for key in expected:
             suffix = suffixes.get(key, key)
             assert f"sensor.hubinet_ops_ct{vmid}_{suffix}" in dashboard
         for stale in suffixes:
             assert f"sensor.hubinet_ops_ct{vmid}_{stale}" not in dashboard
 
 
-def test_ha_installer_requires_existing_private_notification_secrets() -> None:
+def test_ha_installer_requires_mushroom_and_private_notification_secrets() -> None:
     installer = (ROOT / "deploy" / "install-ha-0.2.1-from-pve.sh").read_text(
         encoding="utf-8"
     )
+    assert "lovelace-mushroom/mushroom.js" in installer
     assert "hubinet_ops_webhook_id" in installer
     assert "hubinet_ops_notify_service" in installer
     assert "notify.mobile_app_poco_x8" not in installer
