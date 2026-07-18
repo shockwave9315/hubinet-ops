@@ -62,13 +62,15 @@ views:
           - sensor.hubinet_ops_ct101_job_progress
           - sensor.hubinet_ops_ct101_pending_updates
           - sensor.hubinet_ops_ct101_risk
-          - sensor.hubinet_ops_ct101_disk_used
-          - sensor.hubinet_ops_ct101_disk_free
-          - sensor.hubinet_ops_ct101_memory_used
+          - sensor.hubinet_ops_ct101_disk_used_percent
+          - sensor.hubinet_ops_ct101_disk_free_mb
+          - sensor.hubinet_ops_ct101_memory_used_percent
           - sensor.hubinet_ops_ct101_docker_required_healthy
           - sensor.hubinet_ops_ct101_docker_required_total
           - sensor.hubinet_ops_ct101_active_plan_id
           - sensor.hubinet_ops_ct101_active_job_id
+          - sensor.hubinet_ops_ct101_last_scan
+          - sensor.hubinet_ops_ct101_last_update
           - sensor.hubinet_ops_ct101_last_error
       - type: horizontal-stack
         cards:
@@ -183,13 +185,15 @@ views:
           - sensor.hubinet_ops_ct106_job_progress
           - sensor.hubinet_ops_ct106_pending_updates
           - sensor.hubinet_ops_ct106_risk
-          - sensor.hubinet_ops_ct106_disk_used
-          - sensor.hubinet_ops_ct106_disk_free
-          - sensor.hubinet_ops_ct106_memory_used
+          - sensor.hubinet_ops_ct106_disk_used_percent
+          - sensor.hubinet_ops_ct106_disk_free_mb
+          - sensor.hubinet_ops_ct106_memory_used_percent
           - sensor.hubinet_ops_ct106_docker_required_healthy
           - sensor.hubinet_ops_ct106_docker_required_total
           - sensor.hubinet_ops_ct106_active_plan_id
           - sensor.hubinet_ops_ct106_active_job_id
+          - sensor.hubinet_ops_ct106_last_scan
+          - sensor.hubinet_ops_ct106_last_update
           - sensor.hubinet_ops_ct106_last_error
       - type: horizontal-stack
         cards:
