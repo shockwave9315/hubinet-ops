@@ -40,78 +40,73 @@ views:
               - type: template
                 icon: mdi:clock-outline
                 content: >-
-                  {{ as_timestamp(states('sensor.hubinet_ops_agent_last_refresh'), none) | timestamp_custom('%H:%M:%S', true, '—') }}
-                icon_color: grey
-                tap_action:
-                  action: more-info
-                  entity: sensor.hubinet_ops_agent_last_refresh
+                  {% set value = states('sensor.hubinet_ops_agent_last_refresh') %}
+                  {{ relative_time(as_datetime(value)) if value not in ['unknown', 'unavailable', 'none', 'None', ''] else 'brak odświeżenia' }}
+                icon_color: blue-grey
           - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_agent_availability
             primary: Agent Hubinet Ops
             secondary: >-
-              {{ 'Online · MQTT działa' if is_state(entity, 'online') else 'Offline · sprawdź CT110 i MQTT' }}
-            icon: mdi:server-security
-            icon_color: >-
+              MQTT: {{ states(entity) }} · wersja {{ states('sensor.hubinet_ops_agent_version') }}
+              · kontenery {{ states('sensor.hubinet_ops_agent_configured_container_count') }}
+            multiline_secondary: true
+            icon: mdi:shield-crown-outline
+            color: >-
               {{ 'green' if is_state(entity, 'online') else 'red' }}
             badge_icon: >-
-              {{ 'mdi:check' if is_state(entity, 'online') else 'mdi:alert' }}
+              {{ 'mdi:check-circle' if is_state(entity, 'online') else 'mdi:alert-circle' }}
             badge_color: >-
               {{ 'green' if is_state(entity, 'online') else 'red' }}
             tap_action:
               action: more-info
-            fill_container: true
-            layout: horizontal
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
             title: Kontenery
-            subtitle: Stan, aktualizacje i aktywne operacje
+            subtitle: Dotknij kafla, aby przejść do sterowania
           - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct101_health_status
-            primary: CT101 · cloudflared
+            primary: CT101 · Cloudflared
             secondary: >-
-              {{ states('sensor.hubinet_ops_ct101_health_status') }} · {{ states('sensor.hubinet_ops_ct101_update_status') }}
-              {% if not is_state('sensor.hubinet_ops_ct101_operation_status', 'idle') %} · {{ states('sensor.hubinet_ops_ct101_operation_status') }} {{ states('sensor.hubinet_ops_ct101_job_progress') }}%{% endif %}
+              Zdrowie: {{ states(entity) }} · aktualizacje: {{ states('sensor.hubinet_ops_ct101_update_status') }}
+              · operacja: {{ states('sensor.hubinet_ops_ct101_operation_status') }}
+              · pakiety: {{ states('sensor.hubinet_ops_ct101_pending_update_count') }}
+            multiline_secondary: true
             icon: mdi:cloud-lock-outline
-            icon_color: >-
-              {% set health = states('sensor.hubinet_ops_ct101_health_status') %}
-              {{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' if health in ['critical', 'offline'] else 'grey' }}
+            color: >-
+              {% set health = states(entity) %}
+              {{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' }}
             badge_icon: >-
-              {% set updates = states('sensor.hubinet_ops_ct101_pending_update_count') | int(0) %}
-              {{ 'mdi:package-up' if updates > 0 else 'mdi:check' }}
+              {% set op = states('sensor.hubinet_ops_ct101_operation_status') %}
+              {{ 'mdi:progress-wrench' if op == 'running' else 'mdi:clock-alert-outline' if op == 'waiting_approval' else 'mdi:check-circle-outline' }}
             badge_color: >-
-              {{ 'amber' if states('sensor.hubinet_ops_ct101_pending_update_count') | int(0) > 0 else 'green' }}
+              {% set op = states('sensor.hubinet_ops_ct101_operation_status') %}
+              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'green' }}
             tap_action:
               action: navigate
               navigation_path: /hubinet-ops/ct-101
-            hold_action:
-              action: more-info
-            multiline_secondary: true
-            fill_container: true
           - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct106_health_status
-            primary: CT106 · weather
+            primary: CT106 · WeatherHub
             secondary: >-
-              {{ states('sensor.hubinet_ops_ct106_health_status') }} · {{ states('sensor.hubinet_ops_ct106_update_status') }}
-              {% if not is_state('sensor.hubinet_ops_ct106_operation_status', 'idle') %} · {{ states('sensor.hubinet_ops_ct106_operation_status') }} {{ states('sensor.hubinet_ops_ct106_job_progress') }}%{% endif %}
-              · Docker {{ states('sensor.hubinet_ops_ct106_docker_required_healthy') }}/{{ states('sensor.hubinet_ops_ct106_docker_required_total') }}
+              Zdrowie: {{ states(entity) }} · aktualizacje: {{ states('sensor.hubinet_ops_ct106_update_status') }}
+              · operacja: {{ states('sensor.hubinet_ops_ct106_operation_status') }}
+              · Docker: {{ states('sensor.hubinet_ops_ct106_docker_required_healthy') }}/{{ states('sensor.hubinet_ops_ct106_docker_required_total') }}
+            multiline_secondary: true
             icon: mdi:docker
-            icon_color: >-
-              {% set health = states('sensor.hubinet_ops_ct106_health_status') %}
-              {{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' if health in ['critical', 'offline'] else 'grey' }}
+            color: >-
+              {% set health = states(entity) %}
+              {{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' }}
             badge_icon: >-
-              {% set updates = states('sensor.hubinet_ops_ct106_pending_update_count') | int(0) %}
-              {{ 'mdi:package-up' if updates > 0 else 'mdi:check' }}
+              {% set op = states('sensor.hubinet_ops_ct106_operation_status') %}
+              {{ 'mdi:progress-wrench' if op == 'running' else 'mdi:clock-alert-outline' if op == 'waiting_approval' else 'mdi:check-circle-outline' }}
             badge_color: >-
-              {{ 'amber' if states('sensor.hubinet_ops_ct106_pending_update_count') | int(0) > 0 else 'green' }}
+              {% set op = states('sensor.hubinet_ops_ct106_operation_status') %}
+              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'green' }}
             tap_action:
               action: navigate
               navigation_path: /hubinet-ops/ct-106
-            hold_action:
-              action: more-info
-            multiline_secondary: true
-            fill_container: true
 
       - type: grid
         cards:
@@ -120,38 +115,40 @@ views:
             subtitle: Bieżący etap i postęp
           - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct101_operation_status
-            primary: CT101 · {{ states(entity) | replace('_', ' ') | title }}
+            primary: "CT101 · {{ states(entity) | replace('_', ' ') }}"
             secondary: >-
-              {{ states('sensor.hubinet_ops_ct101_job_stage') | replace('_', ' ') | title }} · {{ states('sensor.hubinet_ops_ct101_job_progress') }}%
+              Etap {{ states('sensor.hubinet_ops_ct101_job_stage') }} · {{ states('sensor.hubinet_ops_ct101_job_progress') }}%
+              {% set event = state_attr('sensor.hubinet_ops_ct101_health_status', 'last_job_event') or {} %}
+              {% if event.get('message') %}· {{ event.get('message') }}{% endif %}
+            multiline_secondary: true
             icon: mdi:cloud-sync-outline
-            icon_color: >-
+            color: >-
               {% set op = states(entity) %}
-              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'green' if op == 'success' else 'red' if op in ['failed', 'manual_intervention'] else 'grey' }}
-            badge_icon: >-
-              {{ 'mdi:progress-clock' if is_state(entity, 'running') else 'mdi:gesture-tap-button' if is_state(entity, 'waiting_approval') else '' }}
+              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'red' if op in ['failed', 'manual_intervention'] else 'green' }}
+            badge_text: "{{ states('sensor.hubinet_ops_ct101_job_progress') }}%"
             badge_color: >-
-              {{ 'blue' if is_state(entity, 'running') else 'amber' }}
+              {{ 'blue' if is_state(entity, 'running') else 'grey' }}
             tap_action:
               action: navigate
               navigation_path: /hubinet-ops/ct-101
-            fill_container: true
           - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct106_operation_status
-            primary: CT106 · {{ states(entity) | replace('_', ' ') | title }}
+            primary: "CT106 · {{ states(entity) | replace('_', ' ') }}"
             secondary: >-
-              {{ states('sensor.hubinet_ops_ct106_job_stage') | replace('_', ' ') | title }} · {{ states('sensor.hubinet_ops_ct106_job_progress') }}%
+              Etap {{ states('sensor.hubinet_ops_ct106_job_stage') }} · {{ states('sensor.hubinet_ops_ct106_job_progress') }}%
+              {% set event = state_attr('sensor.hubinet_ops_ct106_health_status', 'last_job_event') or {} %}
+              {% if event.get('message') %}· {{ event.get('message') }}{% endif %}
+            multiline_secondary: true
             icon: mdi:docker
-            icon_color: >-
+            color: >-
               {% set op = states(entity) %}
-              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'green' if op == 'success' else 'red' if op in ['failed', 'manual_intervention'] else 'grey' }}
-            badge_icon: >-
-              {{ 'mdi:progress-clock' if is_state(entity, 'running') else 'mdi:gesture-tap-button' if is_state(entity, 'waiting_approval') else '' }}
+              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'red' if op in ['failed', 'manual_intervention'] else 'green' }}
+            badge_text: "{{ states('sensor.hubinet_ops_ct106_job_progress') }}%"
             badge_color: >-
-              {{ 'blue' if is_state(entity, 'running') else 'amber' }}
+              {{ 'blue' if is_state(entity, 'running') else 'grey' }}
             tap_action:
               action: navigate
               navigation_path: /hubinet-ops/ct-106
-            fill_container: true
 
   - title: CT101
     path: ct-101
@@ -162,23 +159,39 @@ views:
       - type: grid
         cards:
           - type: custom:mushroom-title-card
-            title: CT101 · cloudflared
-            subtitle: Tunel Cloudflare i dostęp zdalny
+            title: CT101 · Cloudflared
+            subtitle: Tunel Cloudflare · Debian 12
+          - type: custom:mushroom-template-card
+            entity: sensor.hubinet_ops_ct101_health_status
+            primary: >-
+              {{ 'Wszystko działa' if is_state(entity, 'healthy') else 'Kontener wymaga uwagi' }}
+            secondary: >-
+              LXC {{ states('sensor.hubinet_ops_ct101_lxc_status') }}
+              · wynik {{ states('sensor.hubinet_ops_ct101_last_operation_result') }}
+            multiline_secondary: true
+            icon: mdi:cloud-lock-outline
+            color: >-
+              {% set health = states(entity) %}
+              {{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' }}
+            badge_icon: >-
+              {{ 'mdi:check-circle' if is_state(entity, 'healthy') else 'mdi:alert-circle' }}
+            badge_color: >-
+              {{ 'green' if is_state(entity, 'healthy') else 'red' }}
+            tap_action:
+              action: more-info
           - type: custom:mushroom-chips-card
-            alignment: start
+            alignment: justify
             chips:
               - type: template
                 icon: mdi:heart-pulse
-                content: "{{ states('sensor.hubinet_ops_ct101_health_status') }} · {{ states('sensor.hubinet_ops_ct101_health_score') }}%"
-                icon_color: >-
-                  {% set health = states('sensor.hubinet_ops_ct101_health_status') %}
-                  {{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' }}
+                content: "{{ states('sensor.hubinet_ops_ct101_health_score') }}%"
+                icon_color: green
                 tap_action:
                   action: more-info
-                  entity: sensor.hubinet_ops_ct101_health_status
+                  entity: sensor.hubinet_ops_ct101_health_score
               - type: template
-                icon: mdi:package-variant-closed
-                content: "{{ states('sensor.hubinet_ops_ct101_pending_update_count') }} pakietów"
+                icon: mdi:package-up
+                content: "{{ states('sensor.hubinet_ops_ct101_pending_update_count') }} pak."
                 icon_color: >-
                   {{ 'amber' if states('sensor.hubinet_ops_ct101_pending_update_count') | int(0) > 0 else 'green' }}
                 tap_action:
@@ -186,7 +199,7 @@ views:
                   entity: sensor.hubinet_ops_ct101_pending_update_count
               - type: template
                 icon: mdi:shield-alert-outline
-                content: "ryzyko {{ states('sensor.hubinet_ops_ct101_risk') }}"
+                content: "{{ states('sensor.hubinet_ops_ct101_risk') }}"
                 icon_color: >-
                   {% set risk = states('sensor.hubinet_ops_ct101_risk') %}
                   {{ 'red' if risk == 'high' else 'amber' if risk == 'medium' else 'green' }}
@@ -195,101 +208,75 @@ views:
                   entity: sensor.hubinet_ops_ct101_risk
               - type: template
                 icon: mdi:progress-wrench
-                content: "{{ states('sensor.hubinet_ops_ct101_job_progress') }}%"
+                content: "{{ states('sensor.hubinet_ops_ct101_operation_status') }}"
                 icon_color: >-
-                  {{ 'blue' if is_state('sensor.hubinet_ops_ct101_operation_status', 'running') else 'grey' }}
+                  {{ 'blue' if is_state('sensor.hubinet_ops_ct101_operation_status', 'running') else 'amber' if is_state('sensor.hubinet_ops_ct101_operation_status', 'waiting_approval') else 'green' }}
                 tap_action:
                   action: more-info
-                  entity: sensor.hubinet_ops_ct101_job_progress
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct101_health_status
-            primary: >-
-              {{ 'Wszystko działa' if is_state(entity, 'healthy') else 'Kontener wymaga uwagi' }}
-            secondary: >-
-              LXC {{ states('sensor.hubinet_ops_ct101_lxc_status') }} · aktualizacje {{ states('sensor.hubinet_ops_ct101_update_status') | replace('_', ' ') }} · operacja {{ states('sensor.hubinet_ops_ct101_operation_status') | replace('_', ' ') }}
-            icon: mdi:cloud-lock-outline
-            icon_color: >-
-              {{ 'green' if is_state(entity, 'healthy') else 'red' }}
-            badge_icon: >-
-              {{ 'mdi:check' if is_state(entity, 'healthy') else 'mdi:alert' }}
-            badge_color: >-
-              {{ 'green' if is_state(entity, 'healthy') else 'red' }}
-            tap_action:
-              action: more-info
-            multiline_secondary: true
-            fill_container: true
+                  entity: sensor.hubinet_ops_ct101_operation_status
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
             title: Zasoby
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct101_disk_used
-            primary: Dysk
-            secondary: >-
-              {{ states(entity) }}% użyte · {{ states('sensor.hubinet_ops_ct101_disk_free') }} MiB wolne
-            icon: mdi:harddisk
-            icon_color: >-
-              {% set value = states(entity) | float(0) %}
-              {{ 'red' if value >= 90 else 'amber' if value >= 75 else 'blue' }}
-            tap_action:
-              action: more-info
-            layout: horizontal
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct101_memory_used
-            primary: Pamięć RAM
-            secondary: "{{ states(entity) }}% użyte"
-            icon: mdi:memory
-            icon_color: >-
-              {% set value = states(entity) | float(0) %}
-              {{ 'red' if value >= 90 else 'amber' if value >= 75 else 'purple' }}
-            tap_action:
-              action: more-info
-            layout: horizontal
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct101_lxc_status
-            primary: Kontener LXC
-            secondary: "{{ states(entity) }}"
-            icon: mdi:server
-            icon_color: >-
-              {{ 'green' if is_state(entity, 'running') else 'red' }}
-            tap_action:
-              action: more-info
-            layout: horizontal
+            subtitle: Ostatni pomiar z kontenera
+          - type: grid
+            columns: 2
+            square: false
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct101_disk_used
+                name: Dysk zajęty
+                icon: mdi:harddisk
+                icon_color: blue
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct101_disk_free
+                name: Wolne miejsce
+                icon: mdi:database-arrow-down-outline
+                icon_color: cyan
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct101_memory_used
+                name: Pamięć RAM
+                icon: mdi:memory
+                icon_color: purple
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct101_lxc_status
+                name: Status LXC
+                icon: mdi:server
+                icon_color: green
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
             title: Sterowanie
-            subtitle: Akcje wymagające decyzji mają potwierdzenie
+            subtitle: Operacje wymagające decyzji zawsze pytają o potwierdzenie
           - type: grid
             columns: 2
             square: false
             cards:
               - type: custom:mushroom-template-card
-                primary: Skanuj
-                secondary: Sprawdź dostępne pakiety
-                icon: mdi:magnify-scan
-                icon_color: blue
+                primary: Skanuj aktualizacje
+                secondary: Pobierz aktualną listę pakietów
+                icon: mdi:magnify
+                color: blue
                 tap_action:
                   action: perform-action
                   perform_action: script.hubinet_ops_scan_container
                   data:
                     vmid: 101
                   confirmation:
-                    text: Skanować CT101 w poszukiwaniu aktualizacji?
-                fill_container: true
+                    title: Skan CT101
+                    text: Sprawdzić dostępne aktualizacje?
               - type: custom:mushroom-template-card
-                primary: Odśwież
-                secondary: Odczytaj stan kontenera
+                primary: Odśwież stan
+                secondary: Health, zasoby i usługi
                 icon: mdi:refresh
-                icon_color: cyan
+                color: cyan
                 tap_action:
                   action: perform-action
                   perform_action: script.hubinet_ops_refresh_container
                   data:
                     vmid: 101
-                fill_container: true
           - type: conditional
             conditions:
               - condition: state
@@ -302,30 +289,32 @@ views:
               cards:
                 - type: custom:mushroom-template-card
                   primary: Zatwierdź aktualizację
-                  secondary: Uruchom plan po ponownej walidacji
+                  secondary: Snapshot i bezpieczna aktualizacja
                   icon: mdi:check-decagram
-                  icon_color: green
+                  color: green
                   tap_action:
                     action: perform-action
                     perform_action: script.hubinet_ops_approve_container
                     data:
                       vmid: 101
                     confirmation:
-                      text: Zatwierdzić aktualny plan aktualizacji CT101?
-                  fill_container: true
+                      title: Aktualizacja CT101
+                      text: Zatwierdzić aktualny plan aktualizacji?
+                      confirm_text: Aktualizuj
+                      dismiss_text: Anuluj
                 - type: custom:mushroom-template-card
                   primary: Odrzuć plan
-                  secondary: Usuń oczekującą decyzję
+                  secondary: Nie wykonuj aktualizacji
                   icon: mdi:close-circle-outline
-                  icon_color: red
+                  color: red
                   tap_action:
                     action: perform-action
                     perform_action: script.hubinet_ops_reject_container
                     data:
                       vmid: 101
                     confirmation:
+                      title: Odrzucenie planu
                       text: Odrzucić aktualny plan CT101?
-                  fill_container: true
           - type: conditional
             conditions:
               - condition: state
@@ -334,17 +323,16 @@ views:
             card:
               type: custom:mushroom-template-card
               primary: Ponów healthcheck
-              secondary: Sprawdź usługi bez ponownej aktualizacji
+              secondary: Sprawdź stabilizację usług jeszcze raz
               icon: mdi:heart-pulse
-              icon_color: amber
+              color: amber
               tap_action:
                 action: perform-action
                 perform_action: script.hubinet_ops_retry_healthcheck
                 data:
                   vmid: 101
                 confirmation:
-                  text: Ponowić stabilizowany healthcheck CT101?
-              fill_container: true
+                  text: Ponowić healthcheck CT101?
           - type: conditional
             conditions:
               - condition: state
@@ -358,62 +346,73 @@ views:
               primary: Przywróć snapshot
               secondary: Ręczny rollback ostatniej nieudanej operacji
               icon: mdi:backup-restore
-              icon_color: red
+              color: red
               tap_action:
                 action: perform-action
                 perform_action: script.hubinet_ops_rollback
                 data:
                   vmid: 101
                 confirmation:
-                  text: Przywrócić zapisany snapshot CT101?
-              fill_container: true
+                  title: Rollback CT101
+                  text: Przywrócić zapisany snapshot?
+                  confirm_text: Przywróć
+                  dismiss_text: Anuluj
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
-            title: Bieżąca operacja
+            title: Aktualna operacja
+            subtitle: MQTT aktualizuje etap, postęp i logi na żywo
           - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct101_operation_status
             primary: >-
-              {{ states(entity) | replace('_', ' ') | title }} · {{ states('sensor.hubinet_ops_ct101_job_progress') }}%
+              {{ states(entity) | replace('_', ' ') | title }}
             secondary: >-
-              Etap: {{ states('sensor.hubinet_ops_ct101_job_stage') | replace('_', ' ') }}
+              Etap: {{ states('sensor.hubinet_ops_ct101_job_stage') }}
+              · postęp: {{ states('sensor.hubinet_ops_ct101_job_progress') }}%
               {% set event = state_attr('sensor.hubinet_ops_ct101_health_status', 'last_job_event') or {} %}
-              {% if event.get('message') %} · {{ event.get('message') }}{% endif %}
-            icon: mdi:progress-wrench
-            icon_color: >-
+              {% if event.get('message') %}· {{ event.get('message') }}{% endif %}
+            multiline_secondary: true
+            icon: >-
+              {% set stage = states('sensor.hubinet_ops_ct101_job_stage') %}
+              {{ 'mdi:package-up' if stage == 'updating' else 'mdi:backup-restore' if 'rollback' in stage else 'mdi:heart-pulse' if stage == 'healthcheck' else 'mdi:progress-wrench' }}
+            color: >-
               {% set op = states(entity) %}
-              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'green' if op == 'success' else 'red' if op in ['failed', 'manual_intervention'] else 'grey' }}
-            badge_icon: >-
-              {{ 'mdi:progress-clock' if is_state(entity, 'running') else 'mdi:check' if is_state(entity, 'success') else '' }}
+              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'red' if op in ['failed', 'manual_intervention'] else 'green' }}
+            badge_text: "{{ states('sensor.hubinet_ops_ct101_job_progress') }}%"
             badge_color: >-
-              {{ 'blue' if is_state(entity, 'running') else 'green' }}
+              {{ 'blue' if is_state(entity, 'running') else 'grey' }}
             tap_action:
               action: more-info
-            multiline_secondary: true
-            fill_container: true
           - type: markdown
             title: Logi live
             entity_id:
               - sensor.hubinet_ops_ct101_health_status
+              - sensor.hubinet_ops_ct101_job_progress
+            card_size: 8
             content: >-
               {% set events = state_attr('sensor.hubinet_ops_ct101_health_status', 'recent_job_events') or [] %}
+              {% set icons = {
+                'preflight': '🧪', 'snapshot': '📸', 'updating': '📦',
+                'waiting_services': '⏳', 'healthcheck': '❤️', 'repair': '🛠️',
+                'rollback': '↩️', 'rollback_wait': '⏳', 'rollback_healthcheck': '❤️',
+                'completed': '✅', 'failed': '❌'
+              } %}
               {% if events %}
-              | Czas | Etap | % | Informacja |
+              | Czas | Etap | % | Zdarzenie |
               |:--|:--|--:|:--|
               {% for event in events[-25:] | reverse %}
-              {% set stage = event.stage | default('idle') %}
-              | `{{ as_timestamp(event.created_at | default(none), none) | timestamp_custom('%H:%M:%S', true, '—') }}` | {{ '✅' if stage == 'completed' else '❌' if stage == 'failed' else '↩️' if 'rollback' in stage else '🩺' if stage == 'healthcheck' else '📦' if stage == 'updating' else '⚙️' }} **{{ stage | replace('_', ' ') }}** | {{ event.progress | default(0) }} | {{ event.message | default('') }} |
+              | `{{ as_timestamp(event.created_at, 0) | timestamp_custom('%H:%M:%S', true) }}` | {{ icons.get(event.stage, '•') }} **{{ event.stage | default('idle') }}** | **{{ event.progress | default(0) }}** | {{ event.message | default('') | replace('|', '¦') }} |
               {% endfor %}
               {% else %}
-              _Brak zdarzeń joba. Pierwsza operacja utworzy log live._
+              Brak zdarzeń dla CT101. Pojawią się tutaj podczas skanu, aktualizacji, naprawy albo rollbacku.
               {% endif %}
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
             title: Pakiety
-            subtitle: Lista oczekującego planu
+            subtitle: Plan zatwierdzany ręcznie
           - type: conditional
             conditions:
               - condition: numeric_state
@@ -424,17 +423,20 @@ views:
               entity_id:
                 - sensor.hubinet_ops_ct101_health_status
                 - sensor.hubinet_ops_ct101_pending_update_count
+              card_size: 8
               content: >-
                 {% set updates = state_attr('sensor.hubinet_ops_ct101_health_status', 'updates') or {} %}
                 {% set packages = updates.get('packages', []) %}
-                **{{ packages | count }} pakietów w planie**
+                **{{ packages | count }} pakietów · ryzyko {{ states('sensor.hubinet_ops_ct101_risk') }}**
 
+                | Pakiet | Obecna | Docelowa |
+                |:--|:--|:--|
                 {% for package in packages[:30] %}
-                - `{{ package.name }}` · {{ package.current | default('?') }} → **{{ package.target | default('?') }}**
+                | `{{ package.name }}` | `{{ package.current | default('?') }}` | `{{ package.target | default('?') }}` |
                 {% endfor %}
                 {% if packages | count > 30 %}
 
-                _…oraz {{ (packages | count) - 30 }} kolejnych pakietów._
+                _…oraz {{ packages | count - 30 }} kolejnych pakietów._
                 {% endif %}
           - type: conditional
             conditions:
@@ -443,29 +445,49 @@ views:
                 below: 1
             card:
               type: custom:mushroom-template-card
-              primary: Brak oczekujących aktualizacji
-              secondary: Ostatni skan nie znalazł nowych pakietów
+              primary: System aktualny
+              secondary: Brak oczekujących pakietów
               icon: mdi:package-check
-              icon_color: green
-              fill_container: true
+              color: green
+
+      - type: grid
+        cards:
           - type: custom:mushroom-title-card
             title: Historia i diagnostyka
-          - type: custom:mushroom-entity-card
-            entity: sensor.hubinet_ops_ct101_last_operation_result
-            name: Ostatni wynik
-            icon: mdi:history
-          - type: custom:mushroom-entity-card
-            entity: sensor.hubinet_ops_ct101_last_scan
-            name: Ostatni skan
-            icon: mdi:magnify
-          - type: custom:mushroom-entity-card
-            entity: sensor.hubinet_ops_ct101_last_update
-            name: Ostatnia aktualizacja
-            icon: mdi:update
-          - type: custom:mushroom-entity-card
+          - type: grid
+            columns: 2
+            square: false
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct101_last_scan
+                name: Ostatni skan
+                icon: mdi:magnify-scan
+                icon_color: blue
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct101_last_update
+                name: Ostatnia aktualizacja
+                icon: mdi:update
+                icon_color: green
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct101_active_plan_id
+                name: Aktywny plan
+                icon: mdi:clipboard-text-clock-outline
+                icon_color: amber
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct101_active_job_id
+                name: Aktywny job
+                icon: mdi:identifier
+                icon_color: blue
+          - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct101_last_error
-            name: Ostatni błąd
+            primary: Ostatni błąd
+            secondary: "{{ states(entity) }}"
+            multiline_secondary: true
             icon: mdi:alert-circle-outline
+            color: >-
+              {{ 'green' if states(entity) in ['none', 'unknown', ''] else 'red' }}
+            tap_action:
+              action: more-info
 
   - title: CT106
     path: ct-106
@@ -476,31 +498,47 @@ views:
       - type: grid
         cards:
           - type: custom:mushroom-title-card
-            title: CT106 · weather
-            subtitle: WeatherHub · API, worker i Redis w Dockerze
+            title: CT106 · WeatherHub
+            subtitle: API, worker i Redis w Dockerze · Debian 13
+          - type: custom:mushroom-template-card
+            entity: sensor.hubinet_ops_ct106_health_status
+            primary: >-
+              {{ 'Wszystko działa' if is_state(entity, 'healthy') else 'Kontener wymaga uwagi' }}
+            secondary: >-
+              LXC {{ states('sensor.hubinet_ops_ct106_lxc_status') }} · Docker {{ states('sensor.hubinet_ops_ct106_docker_required_healthy') }}/{{ states('sensor.hubinet_ops_ct106_docker_required_total') }}
+              · wynik {{ states('sensor.hubinet_ops_ct106_last_operation_result') }}
+            multiline_secondary: true
+            icon: mdi:docker
+            color: >-
+              {% set health = states(entity) %}
+              {{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' }}
+            badge_icon: >-
+              {{ 'mdi:check-circle' if is_state(entity, 'healthy') else 'mdi:alert-circle' }}
+            badge_color: >-
+              {{ 'green' if is_state(entity, 'healthy') else 'red' }}
+            tap_action:
+              action: more-info
           - type: custom:mushroom-chips-card
-            alignment: start
+            alignment: justify
             chips:
               - type: template
                 icon: mdi:heart-pulse
-                content: "{{ states('sensor.hubinet_ops_ct106_health_status') }} · {{ states('sensor.hubinet_ops_ct106_health_score') }}%"
-                icon_color: >-
-                  {% set health = states('sensor.hubinet_ops_ct106_health_status') %}
-                  {{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' }}
+                content: "{{ states('sensor.hubinet_ops_ct106_health_score') }}%"
+                icon_color: green
                 tap_action:
                   action: more-info
-                  entity: sensor.hubinet_ops_ct106_health_status
+                  entity: sensor.hubinet_ops_ct106_health_score
               - type: template
                 icon: mdi:docker
-                content: "Docker {{ states('sensor.hubinet_ops_ct106_docker_required_healthy') }}/{{ states('sensor.hubinet_ops_ct106_docker_required_total') }}"
+                content: "{{ states('sensor.hubinet_ops_ct106_docker_required_healthy') }}/{{ states('sensor.hubinet_ops_ct106_docker_required_total') }}"
                 icon_color: >-
                   {{ 'green' if states('sensor.hubinet_ops_ct106_docker_required_healthy') == states('sensor.hubinet_ops_ct106_docker_required_total') else 'amber' }}
                 tap_action:
                   action: more-info
                   entity: sensor.hubinet_ops_ct106_docker_required_healthy
               - type: template
-                icon: mdi:package-variant-closed
-                content: "{{ states('sensor.hubinet_ops_ct106_pending_update_count') }} pakietów"
+                icon: mdi:package-up
+                content: "{{ states('sensor.hubinet_ops_ct106_pending_update_count') }} pak."
                 icon_color: >-
                   {{ 'amber' if states('sensor.hubinet_ops_ct106_pending_update_count') | int(0) > 0 else 'green' }}
                 tap_action:
@@ -508,113 +546,94 @@ views:
                   entity: sensor.hubinet_ops_ct106_pending_update_count
               - type: template
                 icon: mdi:shield-alert-outline
-                content: "ryzyko {{ states('sensor.hubinet_ops_ct106_risk') }}"
+                content: "{{ states('sensor.hubinet_ops_ct106_risk') }}"
                 icon_color: >-
                   {% set risk = states('sensor.hubinet_ops_ct106_risk') %}
                   {{ 'red' if risk == 'high' else 'amber' if risk == 'medium' else 'green' }}
                 tap_action:
                   action: more-info
                   entity: sensor.hubinet_ops_ct106_risk
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct106_health_status
-            primary: >-
-              {{ 'Wszystko działa' if is_state(entity, 'healthy') else 'Kontener wymaga uwagi' }}
-            secondary: >-
-              LXC {{ states('sensor.hubinet_ops_ct106_lxc_status') }} · Docker {{ states('sensor.hubinet_ops_ct106_docker_required_healthy') }}/{{ states('sensor.hubinet_ops_ct106_docker_required_total') }} · aktualizacje {{ states('sensor.hubinet_ops_ct106_update_status') | replace('_', ' ') }}
-            icon: mdi:docker
-            icon_color: >-
-              {{ 'green' if is_state(entity, 'healthy') else 'red' }}
-            badge_icon: >-
-              {{ 'mdi:check' if is_state(entity, 'healthy') else 'mdi:alert' }}
-            badge_color: >-
-              {{ 'green' if is_state(entity, 'healthy') else 'red' }}
-            tap_action:
-              action: more-info
-            multiline_secondary: true
-            fill_container: true
+              - type: template
+                icon: mdi:progress-wrench
+                content: "{{ states('sensor.hubinet_ops_ct106_operation_status') }}"
+                icon_color: >-
+                  {{ 'blue' if is_state('sensor.hubinet_ops_ct106_operation_status', 'running') else 'amber' if is_state('sensor.hubinet_ops_ct106_operation_status', 'waiting_approval') else 'green' }}
+                tap_action:
+                  action: more-info
+                  entity: sensor.hubinet_ops_ct106_operation_status
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
             title: Zasoby i Docker
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct106_disk_used
-            primary: Dysk
-            secondary: >-
-              {{ states(entity) }}% użyte · {{ states('sensor.hubinet_ops_ct106_disk_free') }} MiB wolne
-            icon: mdi:harddisk
-            icon_color: >-
-              {% set value = states(entity) | float(0) %}
-              {{ 'red' if value >= 90 else 'amber' if value >= 75 else 'blue' }}
-            tap_action:
-              action: more-info
-            layout: horizontal
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct106_memory_used
-            primary: Pamięć RAM
-            secondary: "{{ states(entity) }}% użyte"
-            icon: mdi:memory
-            icon_color: >-
-              {% set value = states(entity) | float(0) %}
-              {{ 'red' if value >= 90 else 'amber' if value >= 75 else 'purple' }}
-            tap_action:
-              action: more-info
-            layout: horizontal
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct106_docker_required_healthy
-            primary: Kontenery Docker
-            secondary: >-
-              {{ states(entity) }}/{{ states('sensor.hubinet_ops_ct106_docker_required_total') }} wymaganych zdrowych
-            icon: mdi:docker
-            icon_color: >-
-              {{ 'green' if states(entity) == states('sensor.hubinet_ops_ct106_docker_required_total') else 'amber' }}
-            tap_action:
-              action: more-info
-            layout: horizontal
-          - type: custom:mushroom-template-card
-            entity: sensor.hubinet_ops_ct106_lxc_status
-            primary: Kontener LXC
-            secondary: "{{ states(entity) }}"
-            icon: mdi:server
-            icon_color: >-
-              {{ 'green' if is_state(entity, 'running') else 'red' }}
-            tap_action:
-              action: more-info
-            layout: horizontal
+            subtitle: Ostatni pomiar z kontenera
+          - type: grid
+            columns: 2
+            square: false
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_disk_used
+                name: Dysk zajęty
+                icon: mdi:harddisk
+                icon_color: blue
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_disk_free
+                name: Wolne miejsce
+                icon: mdi:database-arrow-down-outline
+                icon_color: cyan
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_memory_used
+                name: Pamięć RAM
+                icon: mdi:memory
+                icon_color: purple
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_lxc_status
+                name: Status LXC
+                icon: mdi:server
+                icon_color: green
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_docker_required_healthy
+                name: Docker healthy
+                icon: mdi:docker
+                icon_color: green
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_docker_required_total
+                name: Docker wymagane
+                icon: mdi:format-list-checks
+                icon_color: blue
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
             title: Sterowanie
-            subtitle: Aktualizacja czeka na Docker 3/3 i dwa kolejne zdrowe odczyty
+            subtitle: Operacje wymagające decyzji zawsze pytają o potwierdzenie
           - type: grid
             columns: 2
             square: false
             cards:
               - type: custom:mushroom-template-card
-                primary: Skanuj
-                secondary: Sprawdź dostępne pakiety
-                icon: mdi:magnify-scan
-                icon_color: blue
+                primary: Skanuj aktualizacje
+                secondary: Pobierz aktualną listę pakietów
+                icon: mdi:magnify
+                color: blue
                 tap_action:
                   action: perform-action
                   perform_action: script.hubinet_ops_scan_container
                   data:
                     vmid: 106
                   confirmation:
-                    text: Skanować CT106 w poszukiwaniu aktualizacji?
-                fill_container: true
+                    title: Skan CT106
+                    text: Sprawdzić dostępne aktualizacje?
               - type: custom:mushroom-template-card
-                primary: Odśwież
-                secondary: Odczytaj LXC i Docker
+                primary: Odśwież stan
+                secondary: Health, zasoby i usługi
                 icon: mdi:refresh
-                icon_color: cyan
+                color: cyan
                 tap_action:
                   action: perform-action
                   perform_action: script.hubinet_ops_refresh_container
                   data:
                     vmid: 106
-                fill_container: true
           - type: conditional
             conditions:
               - condition: state
@@ -629,28 +648,30 @@ views:
                   primary: Zatwierdź aktualizację
                   secondary: Snapshot, update i stabilizacja Docker
                   icon: mdi:check-decagram
-                  icon_color: green
+                  color: green
                   tap_action:
                     action: perform-action
                     perform_action: script.hubinet_ops_approve_container
                     data:
                       vmid: 106
                     confirmation:
-                      text: Zatwierdzić aktualny plan CT106? Agent utworzy snapshot i poczeka na stabilizację Dockera.
-                  fill_container: true
+                      title: Aktualizacja CT106
+                      text: Zatwierdzić aktualny plan aktualizacji?
+                      confirm_text: Aktualizuj
+                      dismiss_text: Anuluj
                 - type: custom:mushroom-template-card
                   primary: Odrzuć plan
-                  secondary: Usuń oczekującą decyzję
+                  secondary: Nie wykonuj aktualizacji
                   icon: mdi:close-circle-outline
-                  icon_color: red
+                  color: red
                   tap_action:
                     action: perform-action
                     perform_action: script.hubinet_ops_reject_container
                     data:
                       vmid: 106
                     confirmation:
+                      title: Odrzucenie planu
                       text: Odrzucić aktualny plan CT106?
-                  fill_container: true
           - type: conditional
             conditions:
               - condition: state
@@ -659,17 +680,16 @@ views:
             card:
               type: custom:mushroom-template-card
               primary: Ponów healthcheck
-              secondary: Sprawdź Docker bez ponownej aktualizacji
+              secondary: Sprawdź stabilizację usług jeszcze raz
               icon: mdi:heart-pulse
-              icon_color: amber
+              color: amber
               tap_action:
                 action: perform-action
                 perform_action: script.hubinet_ops_retry_healthcheck
                 data:
                   vmid: 106
                 confirmation:
-                  text: Ponowić stabilizowany healthcheck CT106?
-              fill_container: true
+                  text: Ponowić healthcheck CT106?
           - type: conditional
             conditions:
               - condition: state
@@ -683,62 +703,73 @@ views:
               primary: Przywróć snapshot
               secondary: Ręczny rollback ostatniej nieudanej operacji
               icon: mdi:backup-restore
-              icon_color: red
+              color: red
               tap_action:
                 action: perform-action
                 perform_action: script.hubinet_ops_rollback
                 data:
                   vmid: 106
                 confirmation:
-                  text: Przywrócić zapisany snapshot CT106?
-              fill_container: true
+                  title: Rollback CT106
+                  text: Przywrócić zapisany snapshot?
+                  confirm_text: Przywróć
+                  dismiss_text: Anuluj
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
-            title: Bieżąca operacja
+            title: Aktualna operacja
+            subtitle: MQTT aktualizuje etap, postęp i logi na żywo
           - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct106_operation_status
             primary: >-
-              {{ states(entity) | replace('_', ' ') | title }} · {{ states('sensor.hubinet_ops_ct106_job_progress') }}%
+              {{ states(entity) | replace('_', ' ') | title }}
             secondary: >-
-              Etap: {{ states('sensor.hubinet_ops_ct106_job_stage') | replace('_', ' ') }}
+              Etap: {{ states('sensor.hubinet_ops_ct106_job_stage') }}
+              · postęp: {{ states('sensor.hubinet_ops_ct106_job_progress') }}%
               {% set event = state_attr('sensor.hubinet_ops_ct106_health_status', 'last_job_event') or {} %}
-              {% if event.get('message') %} · {{ event.get('message') }}{% endif %}
-            icon: mdi:progress-wrench
-            icon_color: >-
+              {% if event.get('message') %}· {{ event.get('message') }}{% endif %}
+            multiline_secondary: true
+            icon: >-
+              {% set stage = states('sensor.hubinet_ops_ct106_job_stage') %}
+              {{ 'mdi:package-up' if stage == 'updating' else 'mdi:backup-restore' if 'rollback' in stage else 'mdi:heart-pulse' if stage == 'healthcheck' else 'mdi:progress-wrench' }}
+            color: >-
               {% set op = states(entity) %}
-              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'green' if op == 'success' else 'red' if op in ['failed', 'manual_intervention'] else 'grey' }}
-            badge_icon: >-
-              {{ 'mdi:progress-clock' if is_state(entity, 'running') else 'mdi:check' if is_state(entity, 'success') else '' }}
+              {{ 'blue' if op == 'running' else 'amber' if op == 'waiting_approval' else 'red' if op in ['failed', 'manual_intervention'] else 'green' }}
+            badge_text: "{{ states('sensor.hubinet_ops_ct106_job_progress') }}%"
             badge_color: >-
-              {{ 'blue' if is_state(entity, 'running') else 'green' }}
+              {{ 'blue' if is_state(entity, 'running') else 'grey' }}
             tap_action:
               action: more-info
-            multiline_secondary: true
-            fill_container: true
           - type: markdown
             title: Logi live
             entity_id:
               - sensor.hubinet_ops_ct106_health_status
+              - sensor.hubinet_ops_ct106_job_progress
+            card_size: 8
             content: >-
               {% set events = state_attr('sensor.hubinet_ops_ct106_health_status', 'recent_job_events') or [] %}
+              {% set icons = {
+                'preflight': '🧪', 'snapshot': '📸', 'updating': '📦',
+                'waiting_services': '⏳', 'healthcheck': '❤️', 'repair': '🛠️',
+                'rollback': '↩️', 'rollback_wait': '⏳', 'rollback_healthcheck': '❤️',
+                'completed': '✅', 'failed': '❌'
+              } %}
               {% if events %}
-              | Czas | Etap | % | Informacja |
+              | Czas | Etap | % | Zdarzenie |
               |:--|:--|--:|:--|
               {% for event in events[-25:] | reverse %}
-              {% set stage = event.stage | default('idle') %}
-              | `{{ as_timestamp(event.created_at | default(none), none) | timestamp_custom('%H:%M:%S', true, '—') }}` | {{ '✅' if stage == 'completed' else '❌' if stage == 'failed' else '↩️' if 'rollback' in stage else '🩺' if stage == 'healthcheck' else '📦' if stage == 'updating' else '⚙️' }} **{{ stage | replace('_', ' ') }}** | {{ event.progress | default(0) }} | {{ event.message | default('') }} |
+              | `{{ as_timestamp(event.created_at, 0) | timestamp_custom('%H:%M:%S', true) }}` | {{ icons.get(event.stage, '•') }} **{{ event.stage | default('idle') }}** | **{{ event.progress | default(0) }}** | {{ event.message | default('') | replace('|', '¦') }} |
               {% endfor %}
               {% else %}
-              _Brak zdarzeń joba. Pierwsza operacja utworzy log live._
+              Brak zdarzeń dla CT106. Pojawią się tutaj podczas skanu, aktualizacji, naprawy albo rollbacku.
               {% endif %}
 
       - type: grid
         cards:
           - type: custom:mushroom-title-card
             title: Pakiety
-            subtitle: Lista oczekującego planu
+            subtitle: Plan zatwierdzany ręcznie
           - type: conditional
             conditions:
               - condition: numeric_state
@@ -749,17 +780,20 @@ views:
               entity_id:
                 - sensor.hubinet_ops_ct106_health_status
                 - sensor.hubinet_ops_ct106_pending_update_count
+              card_size: 8
               content: >-
                 {% set updates = state_attr('sensor.hubinet_ops_ct106_health_status', 'updates') or {} %}
                 {% set packages = updates.get('packages', []) %}
-                **{{ packages | count }} pakietów w planie**
+                **{{ packages | count }} pakietów · ryzyko {{ states('sensor.hubinet_ops_ct106_risk') }}**
 
+                | Pakiet | Obecna | Docelowa |
+                |:--|:--|:--|
                 {% for package in packages[:30] %}
-                - `{{ package.name }}` · {{ package.current | default('?') }} → **{{ package.target | default('?') }}**
+                | `{{ package.name }}` | `{{ package.current | default('?') }}` | `{{ package.target | default('?') }}` |
                 {% endfor %}
                 {% if packages | count > 30 %}
 
-                _…oraz {{ (packages | count) - 30 }} kolejnych pakietów._
+                _…oraz {{ packages | count - 30 }} kolejnych pakietów._
                 {% endif %}
           - type: conditional
             conditions:
@@ -768,26 +802,46 @@ views:
                 below: 1
             card:
               type: custom:mushroom-template-card
-              primary: Brak oczekujących aktualizacji
-              secondary: Ostatni skan nie znalazł nowych pakietów
+              primary: System aktualny
+              secondary: Brak oczekujących pakietów
               icon: mdi:package-check
-              icon_color: green
-              fill_container: true
+              color: green
+
+      - type: grid
+        cards:
           - type: custom:mushroom-title-card
             title: Historia i diagnostyka
-          - type: custom:mushroom-entity-card
-            entity: sensor.hubinet_ops_ct106_last_operation_result
-            name: Ostatni wynik
-            icon: mdi:history
-          - type: custom:mushroom-entity-card
-            entity: sensor.hubinet_ops_ct106_last_scan
-            name: Ostatni skan
-            icon: mdi:magnify
-          - type: custom:mushroom-entity-card
-            entity: sensor.hubinet_ops_ct106_last_update
-            name: Ostatnia aktualizacja
-            icon: mdi:update
-          - type: custom:mushroom-entity-card
+          - type: grid
+            columns: 2
+            square: false
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_last_scan
+                name: Ostatni skan
+                icon: mdi:magnify-scan
+                icon_color: blue
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_last_update
+                name: Ostatnia aktualizacja
+                icon: mdi:update
+                icon_color: green
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_active_plan_id
+                name: Aktywny plan
+                icon: mdi:clipboard-text-clock-outline
+                icon_color: amber
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_active_job_id
+                name: Aktywny job
+                icon: mdi:identifier
+                icon_color: blue
+          - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct106_last_error
-            name: Ostatni błąd
+            primary: Ostatni błąd
+            secondary: "{{ states(entity) }}"
+            multiline_secondary: true
             icon: mdi:alert-circle-outline
+            color: >-
+              {{ 'green' if states(entity) in ['none', 'unknown', ''] else 'red' }}
+            tap_action:
+              action: more-info
