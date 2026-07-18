@@ -34,6 +34,8 @@ def test_notifications_only_contain_navigation_data() -> None:
         assert set(notify_data) == {"url", "clickAction"}
     text = package_path.read_text(encoding="utf-8")
     assert "authenticationRequired" not in text
+    assert "!secret hubinet_ops_notify_service" in text
+    assert "notify.mobile_app_" not in text
 
 
 def test_dashboard_paths_and_dashboard_only_approval() -> None:
@@ -85,3 +87,12 @@ def test_dashboard_sensor_ids_match_discovery_object_ids() -> None:
     assert "sensor.hubinet_ops_ct106_disk_used\n" not in dashboard
     assert "sensor.hubinet_ops_ct106_disk_free\n" not in dashboard
     assert "sensor.hubinet_ops_ct106_memory_used\n" not in dashboard
+
+
+def test_ha_installer_requires_existing_private_notification_secrets() -> None:
+    installer = (ROOT / "deploy" / "install-ha-0.2.1-from-pve.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "hubinet_ops_webhook_id" in installer
+    assert "hubinet_ops_notify_service" in installer
+    assert "notify.mobile_app_poco_x8" not in installer
