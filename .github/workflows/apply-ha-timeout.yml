@@ -1,0 +1,36 @@
+name: Apply HA timeout patch
+
+on:
+  push:
+    branches:
+      - feat/0.2.1-mqtt-live-logs
+    paths:
+      - scripts/apply_ha_timeout_patch.py
+      - .github/workflows/apply-ha-timeout.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/0.2.1-mqtt-live-logs
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Apply exact patch
+        run: |
+          python scripts/apply_ha_timeout_patch.py
+          python scripts/validate_yaml.py
+      - name: Commit patch and remove one-shot machinery
+        run: |
+          git config user.name "hubinet-ops-review-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git rm scripts/apply_ha_timeout_patch.py .github/workflows/apply-ha-timeout.yml
+          git add config/config.example.yaml home-assistant/packages/hubinet_ops.yaml
+          git commit -m "fix: align Home Assistant operation timeouts"
+          git push origin HEAD:feat/0.2.1-mqtt-live-logs
