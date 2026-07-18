@@ -52,41 +52,48 @@ def test_dashboard_paths_and_dashboard_only_approval() -> None:
     assert "hubinet_ops_approve" not in notification_section
 
 
-def test_dashboard_sensor_ids_match_discovery_object_ids() -> None:
+def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
     dashboard = (
         ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
     ).read_text(encoding="utf-8")
     keys = {key for key, _, _, _ in _ct_entities()}
-    for vmid in (101, 106):
-        for key in keys:
-            if key in {
-                "health_status",
-                "health_score",
-                "lxc_status",
-                "update_status",
-                "operation_status",
-                "job_stage",
-                "job_progress",
-                "pending_updates",
-                "risk",
-                "disk_used_percent",
-                "disk_free_mb",
-                "memory_used_percent",
-                "docker_required_healthy",
-                "docker_required_total",
-                "active_plan_id",
-                "active_job_id",
-                "last_scan",
-                "last_update",
-                "last_error",
-                "last_operation_result",
-                "rollback_allowed",
-            }:
-                assert f"sensor.hubinet_ops_ct{vmid}_{key}" in dashboard
+    suffixes = {
+        "pending_updates": "pending_update_count",
+        "disk_used_percent": "disk_used",
+        "disk_free_mb": "disk_free",
+        "memory_used_percent": "memory_used",
+    }
+    displayed = {
+        "health_status",
+        "health_score",
+        "lxc_status",
+        "update_status",
+        "operation_status",
+        "job_stage",
+        "job_progress",
+        "pending_updates",
+        "risk",
+        "disk_used_percent",
+        "disk_free_mb",
+        "memory_used_percent",
+        "docker_required_healthy",
+        "docker_required_total",
+        "active_plan_id",
+        "active_job_id",
+        "last_scan",
+        "last_update",
+        "last_error",
+        "last_operation_result",
+        "rollback_allowed",
+    }
+    assert displayed <= keys
 
-    assert "sensor.hubinet_ops_ct106_disk_used\n" not in dashboard
-    assert "sensor.hubinet_ops_ct106_disk_free\n" not in dashboard
-    assert "sensor.hubinet_ops_ct106_memory_used\n" not in dashboard
+    for vmid in (101, 106):
+        for key in displayed:
+            suffix = suffixes.get(key, key)
+            assert f"sensor.hubinet_ops_ct{vmid}_{suffix}" in dashboard
+        for stale in suffixes:
+            assert f"sensor.hubinet_ops_ct{vmid}_{stale}" not in dashboard
 
 
 def test_ha_installer_requires_existing_private_notification_secrets() -> None:
