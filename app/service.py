@@ -132,7 +132,10 @@ class OpsService:
                 inspected.get("health", "unknown"),
             )
             state["last_refresh"] = utc_now()
-            state["last_error"] = None
+            # A successful telemetry refresh clears a transient health error, but
+            # must not erase the reason recorded for the last completed operation.
+            if state.get("last_operation_result") is None:
+                state["last_error"] = None
         except ExecutorError as exc:
             state.update(
                 {
@@ -284,23 +287,32 @@ class OpsService:
         return {"vmid": vmid, "status": status, "plan": active}
 
     def approve(self, plan_id: str) -> dict[str, Any]:
-        plan, job = self.db.approve_plan(plan_id)
-        vmid = int(plan["vmid"])
-        state = self.get_state(vmid)
-        state.update(
-            {
-                "active_plan_id": plan_id,
-                "active_plan_status": "approved",
-                "active_job_id": job["id"],
-                "operation_status": "running",
-                "job_stage": "preflight",
-                "job_progress": 1,
-                "last_error": None,
-            }
-        )
-        self._save_state(vmid, state)
-        self._notify_ha(self._notification("job_queued", vmid))
-        return {"plan": plan, "job": job}
+        candidate = self.db.get_plan(plan_id)
+        vmid = int(candidate["vmid"])
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError(
+                "A scan is running for this container; retry approval after it finishes"
+            )
+        try:
+            plan, job = self.db.approve_plan(plan_id)
+            state = self.get_state(vmid)
+            state.update(
+                {
+                    "active_plan_id": plan_id,
+                    "active_plan_status": "approved",
+                    "active_job_id": job["id"],
+                    "operation_status": "running",
+                    "job_stage": "preflight",
+                    "job_progress": 1,
+                    "last_error": None,
+                }
+            )
+            self._save_state(vmid, state)
+            self._notify_ha(self._notification("job_queued", vmid))
+            return {"plan": plan, "job": job}
+        finally:
+            lock.release()
 
     def reject(self, plan_id: str) -> dict[str, Any]:
         plan = self.db.reject_plan(plan_id)
@@ -717,9 +729,20 @@ class OpsService:
             progress=100,
             error=error,
         )
+        plan = self.db.get_plan(job["plan_id"])
+        plan_status = str(plan["status"])
+        if plan_status == "approved":
+            plan_status = {
+                "success": "completed",
+                "rolled_back": "rolled_back",
+                "blocked": "blocked",
+            }.get(job_status, "failed")
+            self.db.update_plan_status(job["plan_id"], plan_status)
         state = self.get_state(int(job["vmid"]))
         state.update(
             {
+                "active_plan_id": None,
+                "active_plan_status": plan_status,
                 "active_job_id": job["id"],
                 "operation_status": operation,
                 "job_stage": event["stage"],
