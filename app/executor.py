@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 import threading
 import time
@@ -13,6 +14,7 @@ from .security import sanitize_data, sanitize_text
 EventCallback = Callable[[dict[str, Any]], None]
 MAX_STDERR = 8_000
 MAX_MALFORMED_LINES = 20
+LOGGER = logging.getLogger("hubinet_ops.executor")
 
 
 class ExecutorError(RuntimeError):
@@ -56,7 +58,11 @@ class Executor:
         key = str(self.config["ssh_key"])
         known_hosts = str(self.config["known_hosts"])
         connect_timeout = int(self.config.get("connect_timeout_seconds", 10))
-        command_timeout = timeout or int(self.config.get("command_timeout_seconds", 3900))
+        command_timeout = int(
+            timeout if timeout is not None else self.config.get("command_timeout_seconds", 3900)
+        )
+        if command_timeout <= 0:
+            raise ExecutorError("Executor timeout must be positive")
 
         remote_command = f"{action} {vmid}"
         if argument is not None:
@@ -109,14 +115,21 @@ class Executor:
                 while stderr_size > MAX_STDERR and stderr_chunks:
                     stderr_size -= len(stderr_chunks.popleft())
 
-        stderr_thread = threading.Thread(target=drain_stderr, name="executor-stderr", daemon=True)
+        stderr_thread = threading.Thread(
+            target=drain_stderr,
+            name="executor-stderr",
+            daemon=True,
+        )
         stderr_thread.start()
         started = time.monotonic()
         timed_out = threading.Event()
 
         def terminate_on_timeout() -> None:
             timed_out.set()
-            process.kill()
+            try:
+                process.kill()
+            except Exception:
+                pass
 
         timer = threading.Timer(timeout, terminate_on_timeout)
         timer.daemon = True
@@ -124,6 +137,7 @@ class Executor:
         final: dict[str, Any] | None = None
         malformed: list[str] = []
         last_progress = 0
+        callback = on_event
 
         assert process.stdout is not None
         try:
@@ -143,8 +157,14 @@ class Executor:
                 if not isinstance(item, dict):
                     continue
                 if item.get("type") == "event":
-                    progress = max(last_progress, min(99, int(item.get("progress", last_progress) or 0)))
+                    try:
+                        requested_progress = int(item.get("progress", last_progress) or 0)
+                    except (TypeError, ValueError):
+                        requested_progress = last_progress
+                    progress = max(last_progress, min(99, max(0, requested_progress)))
                     last_progress = progress
+                    raw_details = item.get("details")
+                    details = raw_details if isinstance(raw_details, dict) else {}
                     event = sanitize_data(
                         {
                             "type": "event",
@@ -153,16 +173,28 @@ class Executor:
                             "level": str(item.get("level", "info"))[:16],
                             "event_type": str(item.get("event_type", "executor_event"))[:64],
                             "message": sanitize_text(item.get("message", ""), limit=1000),
-                            "details": item.get("details", {}),
+                            "details": details,
                         }
                     )
-                    if on_event is not None:
-                        on_event(event)
+                    if callback is not None:
+                        try:
+                            callback(event)
+                        except Exception as exc:
+                            # A telemetry/event persistence callback must never execute a
+                            # destructive action twice or abort a package transaction.
+                            LOGGER.error(
+                                "Executor event callback disabled for %s CT%s: %s",
+                                action,
+                                vmid,
+                                sanitize_text(exc, limit=500),
+                            )
+                            callback = None
                     continue
                 if item.get("type") == "result":
+                    raw_data = item.get("data", {})
                     final = {
                         "ok": bool(item.get("ok", False)),
-                        "data": sanitize_data(item.get("data", {})),
+                        "data": sanitize_data(raw_data if isinstance(raw_data, dict) else {}),
                     }
                     if item.get("error"):
                         final["error"] = sanitize_text(item["error"], limit=2000)
@@ -172,7 +204,8 @@ class Executor:
         finally:
             timer.cancel()
             try:
-                process.wait(timeout=max(1, timeout - int(time.monotonic() - started)))
+                remaining = max(1, timeout - int(time.monotonic() - started))
+                process.wait(timeout=remaining)
             except subprocess.TimeoutExpired as exc:
                 process.kill()
                 process.wait(timeout=5)
@@ -186,7 +219,8 @@ class Executor:
         if final is None:
             detail = f"; malformed output: {malformed[-1]}" if malformed else ""
             raise ExecutorError(
-                f"Host executor returned no valid JSON result (rc={process.returncode}){detail}; stderr: {stderr}"
+                f"Host executor returned no valid JSON result (rc={process.returncode})"
+                f"{detail}; stderr: {stderr}"
             )
         if process.returncode != 0 or not final.get("ok", False):
             message = final.get("error") or stderr or f"Command failed with rc={process.returncode}"
