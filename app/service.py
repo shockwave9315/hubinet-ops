@@ -5,50 +5,64 @@ import json
 import logging
 import threading
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from .config import Settings
 from .database import Database, utc_now
 from .executor import Executor, ExecutorError
+from .mqtt import MqttTelemetry, VERSION
+from .security import sanitize_data, sanitize_text
+from .stabilization import StabilizationPolicy, Stabilizer
+from .state import normalize_state
 
 LOGGER = logging.getLogger("hubinet_ops")
 
 STAGE_PROGRESS = {
     "idle": 0,
-    "queued": 5,
-    "preflight": 15,
-    "snapshot": 30,
-    "updating": 55,
+    "scanning": 2,
+    "preflight": 10,
+    "snapshot": 20,
+    "updating": 30,
+    "waiting_services": 75,
     "healthcheck": 80,
-    "repairing": 85,
-    "rolling_back": 70,
-    "rollback_healthcheck": 90,
+    "repair": 85,
+    "rollback": 88,
+    "rollback_wait": 90,
+    "rollback_healthcheck": 92,
     "completed": 100,
-    "rolled_back": 100,
-    "recovered_without_rollback": 100,
-    "manual_intervention": 100,
-    "interrupted": 100,
+    "failed": 100,
 }
 
 
 class OpsService:
-    def __init__(self, settings: Settings, db: Database, executor: Executor):
+    def __init__(
+        self,
+        settings: Settings,
+        db: Database,
+        executor: Executor,
+        mqtt: MqttTelemetry | None = None,
+        stabilizer: Stabilizer | None = None,
+    ):
         self.settings = settings
         self.db = db
         self.executor = executor
+        self.mqtt = mqtt or MqttTelemetry({"enabled": False}, settings.containers)
         self._stop = threading.Event()
+        self.stabilizer = stabilizer or Stabilizer(executor, self._stop)
         self._scan_lock = threading.Lock()
         self._worker = threading.Thread(target=self._worker_loop, name="ops-worker", daemon=True)
         self._scheduler = threading.Thread(target=self._scheduler_loop, name="ops-scheduler", daemon=True)
         self._telemetry = threading.Thread(target=self._telemetry_loop, name="ops-telemetry", daemon=True)
+        self.mqtt.set_state_provider(self._mqtt_snapshot)
 
     def start(self) -> None:
         self._ensure_initial_states()
+        self.mqtt.start()
         self._worker.start()
         self._telemetry.start()
-        if bool(self.settings.scheduler.get("enabled", True)):
+        if bool(self.settings.scheduler.get("enabled", False)):
             self._scheduler.start()
 
     def stop(self) -> None:
@@ -57,6 +71,7 @@ class OpsService:
         self._telemetry.join(timeout=5)
         if self._scheduler.is_alive():
             self._scheduler.join(timeout=5)
+        self.mqtt.stop()
 
     def list_containers(self) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -69,6 +84,7 @@ class OpsService:
                 "criticality": cfg.get("criticality", "medium"),
                 "approval_mode": cfg.get("approval_mode", "always"),
                 "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
+                "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
                 "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
             }
             state = self.db.get_container_state(vmid)
@@ -79,7 +95,7 @@ class OpsService:
 
     def list_states(self) -> dict[str, Any]:
         return {
-            "version": "0.2.0",
+            "version": VERSION,
             "generated_at": utc_now(),
             "containers": {str(item["vmid"]): item for item in self.db.list_container_states()},
         }
@@ -88,52 +104,48 @@ class OpsService:
         self._container(vmid)
         state = self.db.get_container_state(vmid)
         if state is None:
-            state = self._base_state(vmid)
-            state = self.db.upsert_container_state(vmid, state)
+            state = self._save_state(vmid, self._base_state(vmid))
         return state
 
     def refresh_container(self, vmid: int) -> dict[str, Any]:
         cfg = self._container(vmid)
         state = self.get_state(vmid)
         if not bool(cfg.get("enabled", False)):
-            state.update({"status": "disabled", "health": "unknown", "health_score": 0})
-            return self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-
+            state.update({"health_status": "unknown", "health_score": 0})
+            return self._save_state(vmid, state)
         try:
-            result = self.executor.run("inspect", vmid, timeout=120)
-            inspected = result.get("data", {})
+            inspected = self.executor.run("inspect", vmid, timeout=120).get("data", {})
             state.update(inspected)
+            state["health_status"] = inspected.get("health_status", inspected.get("health", "unknown"))
             state["last_refresh"] = utc_now()
             state["last_error"] = None
         except ExecutorError as exc:
             state.update(
                 {
-                    "health": "critical",
+                    "health_status": "offline",
                     "health_score": 0,
-                    "last_error": str(exc),
+                    "last_error": sanitize_text(exc, limit=2000),
                     "last_refresh": utc_now(),
                 }
             )
-        state = self._decorate_state(vmid, state)
-        return self.db.upsert_container_state(vmid, state)
+        return self._save_state(vmid, state)
 
     def refresh_all(self) -> list[dict[str, Any]]:
-        outcomes = []
-        for vmid, cfg in sorted(self.settings.containers.items()):
-            if bool(cfg.get("enabled", False)):
-                outcomes.append(self.refresh_container(vmid))
-        return outcomes
+        return [
+            self.refresh_container(vmid)
+            for vmid, cfg in sorted(self.settings.containers.items())
+            if bool(cfg.get("enabled", False))
+        ]
 
     def scan_all(self) -> list[dict[str, Any]]:
         if not self._scan_lock.acquire(blocking=False):
             return [{"status": "skipped", "reason": "scan_already_running"}]
         try:
-            outcomes = []
-            for vmid, cfg in sorted(self.settings.containers.items()):
-                if not bool(cfg.get("enabled", False)):
-                    continue
-                outcomes.append(self.scan_container(vmid))
-            return outcomes
+            return [
+                self.scan_container(vmid)
+                for vmid, cfg in sorted(self.settings.containers.items())
+                if bool(cfg.get("enabled", False))
+            ]
         finally:
             self._scan_lock.release()
 
@@ -143,100 +155,79 @@ class OpsService:
             return {"vmid": vmid, "status": "disabled"}
         if cfg.get("adapter", "apt") != "apt":
             return {"vmid": vmid, "status": "unsupported_adapter", "adapter": cfg.get("adapter")}
-
         state = self.get_state(vmid)
-        state.update({"status": "scanning", "last_error": None})
-        self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-
+        prior_operation = state["operation_status"]
+        state.update({"update_status": "scanning", "job_stage": "scanning", "last_error": None})
+        self._save_state(vmid, state)
         try:
-            scan = self.executor.run("scan", vmid, timeout=300)
+            data = self.executor.run("scan", vmid, timeout=300).get("data", {})
         except ExecutorError as exc:
             state.update(
                 {
-                    "status": "scan_failed",
-                    "last_error": str(exc),
+                    "update_status": "unknown",
+                    "job_stage": "idle" if prior_operation == "idle" else state["job_stage"],
+                    "last_error": sanitize_text(exc, limit=2000),
                     "last_scan": utc_now(),
+                    "operation_status": prior_operation,
                 }
             )
-            self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-            event = {
-                "event_type": "scan_failed",
-                "vmid": vmid,
-                "container": cfg.get("name", f"ct-{vmid}"),
-                "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                "error": str(exc),
-            }
-            self._notify_ha(event)
-            return {"vmid": vmid, "status": "error", "error": str(exc)}
+            self._save_state(vmid, state)
+            self._notify_ha(self._notification("scan_failed", vmid, error=str(exc)))
+            return {"vmid": vmid, "status": "error", "error": sanitize_text(exc, limit=2000)}
 
-        data = scan.get("data", {})
-        count = int(data.get("pending_count", 0))
+        count = max(0, int(data.get("pending_count", 0) or 0))
+        data = dict(data)
+        data["packages"] = list(data.get("packages") or [])[:200]
         state.update(
             {
                 "updates": data,
                 "pending_updates": count,
+                "update_status": "update_available" if count else "up_to_date",
+                "job_stage": "idle" if prior_operation == "idle" else state["job_stage"],
                 "last_scan": utc_now(),
                 "last_error": None,
+                "operation_status": prior_operation,
             }
         )
-        if count <= 0:
+        if count == 0:
             self.db.invalidate_active_plans(vmid)
-            state.update(
-                {
-                    "risk": "none",
-                    "active_plan_id": None,
-                    "active_plan_status": None,
-                }
-            )
-            state = self._decorate_state(vmid, state)
-            self.db.upsert_container_state(vmid, state)
+            state.update({"risk": "none", "active_plan_id": None, "active_plan_status": None})
+            self._save_state(vmid, state)
             return {"vmid": vmid, "status": "up_to_date", "data": data}
 
         fingerprint = str(data.get("fingerprint") or _fingerprint(data))
         active = self.db.find_active_plan(vmid, fingerprint)
-        if active:
-            state.update(
-                {
-                    "risk": active["risk"],
-                    "active_plan_id": active["id"],
-                    "active_plan_status": active["status"],
-                }
+        if active is None:
+            active = self.db.create_plan(
+                vmid=vmid,
+                container_name=str(cfg.get("name", f"ct-{vmid}")),
+                fingerprint=fingerprint,
+                risk=_risk_for(cfg, data),
+                payload=data,
+                ttl_minutes=int(self.settings.scheduler.get("approval_ttl_minutes", 1440)),
             )
-            self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-            return {"vmid": vmid, "status": "existing_plan", "plan": active}
-
-        risk = _risk_for(cfg, data)
-        ttl = int(self.settings.scheduler.get("approval_ttl_minutes", 1440))
-        plan = self.db.create_plan(
-            vmid=vmid,
-            container_name=str(cfg.get("name", f"ct-{vmid}")),
-            fingerprint=fingerprint,
-            risk=risk,
-            payload=data,
-            ttl_minutes=ttl,
-        )
+            status = "plan_created"
+            self._notify_ha(
+                self._notification(
+                    "approval_required",
+                    vmid,
+                    pending_count=count,
+                    risk=active["risk"],
+                )
+            )
+        else:
+            status = "existing_plan"
         state.update(
             {
-                "risk": risk,
-                "active_plan_id": plan["id"],
-                "active_plan_status": plan["status"],
+                "risk": active["risk"],
+                "active_plan_id": active["id"],
+                "active_plan_status": active["status"],
+                "operation_status": "waiting_approval",
+                "job_stage": "idle",
             }
         )
-        self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-        self._notify_ha(
-            {
-                "event_type": "approval_required",
-                "plan_id": plan["id"],
-                "vmid": vmid,
-                "container": plan["container_name"],
-                "risk": risk,
-                "pending_count": count,
-                "packages": data.get("packages", [])[:10],
-                "expires_at": plan["expires_at"],
-                "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-            }
-        )
-        return {"vmid": vmid, "status": "plan_created", "plan": plan}
+        self._save_state(vmid, state)
+        return {"vmid": vmid, "status": status, "plan": active}
 
     def approve(self, plan_id: str) -> dict[str, Any]:
         plan, job = self.db.approve_plan(plan_id)
@@ -247,23 +238,14 @@ class OpsService:
                 "active_plan_id": plan_id,
                 "active_plan_status": "approved",
                 "active_job_id": job["id"],
-                "job_status": "queued",
-                "job_stage": "queued",
-                "job_progress": STAGE_PROGRESS["queued"],
+                "operation_status": "running",
+                "job_stage": "preflight",
+                "job_progress": 1,
                 "last_error": None,
             }
         )
-        self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-        self._notify_ha(
-            {
-                "event_type": "job_queued",
-                "plan_id": plan_id,
-                "job_id": job["id"],
-                "vmid": vmid,
-                "container": plan["container_name"],
-                "dashboard_path": self._container(vmid).get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-            }
-        )
+        self._save_state(vmid, state)
+        self._notify_ha(self._notification("job_queued", vmid))
         return {"plan": plan, "job": job}
 
     def reject(self, plan_id: str) -> dict[str, Any]:
@@ -275,313 +257,383 @@ class OpsService:
                 "active_plan_id": None,
                 "active_plan_status": "rejected",
                 "risk": "none",
+                "operation_status": "idle",
+                "job_stage": "idle",
+                "job_progress": 0,
             }
         )
-        self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
+        self._save_state(vmid, state)
         return {"plan": plan}
+
+    def retry_healthcheck(self, vmid: int) -> dict[str, Any]:
+        cfg = self._container(vmid)
+        latest = self.db.get_latest_job(vmid)
+        if latest is None:
+            raise ValueError("No job is available for retry")
+        job = self.db.create_followup_job(latest["id"], stage="healthcheck", progress=80)
+        policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
+        emit = self._emitter(job)
+        try:
+            health = self.stabilizer.wait(
+                vmid=vmid,
+                phase="update",
+                timeout_seconds=policy.repair_timeout_seconds,
+                policy=policy,
+                emit=emit,
+                initial_grace=False,
+            )
+            state = self.get_state(vmid)
+            state.update(health)
+            state["health_status"] = health.get("health_status", health.get("health", "healthy"))
+            state["last_refresh"] = utc_now()
+            self._save_state(vmid, state)
+            self._terminal(job, "success", "success", None)
+        except ExecutorError as exc:
+            state = self.get_state(vmid)
+            if exc.data:
+                state.update(exc.data)
+                state["health_status"] = exc.data.get("health_status", exc.data.get("health", "critical"))
+            self._save_state(vmid, state)
+            self._terminal(job, "failed", "manual_intervention", str(exc))
+        return self.get_state(vmid)
+
+    def manual_rollback(self, vmid: int) -> dict[str, Any]:
+        cfg = self._container(vmid)
+        if not bool(cfg.get("manual_rollback_allowed", False)):
+            raise ValueError("Manual rollback is not allowed by container policy")
+        source = self.db.get_latest_job(vmid)
+        if source is None or not source.get("snapshot_name"):
+            raise ValueError("No rollback snapshot is available")
+        if source["status"] not in {"failed", "blocked", "interrupted"}:
+            raise ValueError("Rollback is only allowed after a failed operation")
+        job = self.db.create_manual_rollback_job(source["id"])
+        self.db.update_job(job["id"], status="running", stage="rollback", progress=1)
+        self._rollback(job, str(source.get("error") or "Manual rollback requested"))
+        return self.db.get_job(job["id"])
 
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             job = self.db.next_queued_job()
             if not job:
-                self._stop.wait(1.0)
+                self._stop.wait(1)
                 continue
             try:
                 self._run_job(job)
             except Exception:
                 LOGGER.exception("Unhandled worker failure for job %s", job.get("id"))
-                self.db.update_job(
-                    job["id"], status="failed", stage="internal_error", error="Unhandled worker error"
-                )
-                self._set_job_state(job, status="failed", stage="internal_error", error="Unhandled worker error")
+                self._terminal(job, "failed", "manual_intervention", "Unhandled worker error")
 
     def _run_job(self, job: dict[str, Any]) -> None:
-        job_id = job["id"]
         vmid = int(job["vmid"])
         cfg = self._container(vmid)
-        container = job["container_name"]
+        policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         auto_rollback = bool(cfg.get("automatic_rollback", False))
-        snapshot_name = f"ops-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{job_id[:6]}"
-
-        self._set_job_state(job, status="running", stage="preflight")
-        self._notify_ha(
-            {
-                "event_type": "job_started",
-                "job_id": job_id,
-                "vmid": vmid,
-                "container": container,
-                "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-            }
-        )
-
+        snapshot = f"ops-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{job['id'][:6]}"
+        emit = self._emitter(job)
+        emit(stage="preflight", progress=5, event_type="job_started", message="Update job started")
         try:
-            self.db.update_job(job_id, stage="preflight")
-            self._set_job_state(job, status="running", stage="preflight")
-            preflight = self.executor.run("preflight", vmid, timeout=300)
-
+            preflight = self._execute("preflight", vmid, 300, emit)
+            emit(stage="preflight", progress=15, event_type="preflight_passed", message="Preflight passed")
+            emit(
+                stage="preflight",
+                progress=16,
+                event_type="package_lists_refreshed",
+                message="Package lists refreshed and update plan revalidated",
+                details={"pending_count": preflight.get("data", {}).get("updates", {}).get("pending_count")},
+            )
             if auto_rollback:
-                self.db.update_job(job_id, stage="snapshot", snapshot_name=snapshot_name)
-                self._set_job_state(job, status="running", stage="snapshot", snapshot_name=snapshot_name)
-                self.executor.run("snapshot", vmid, snapshot_name, timeout=600)
-
-            self.db.update_job(job_id, stage="updating")
-            self._set_job_state(job, status="running", stage="updating")
-            update = self.executor.run("update", vmid, timeout=3900)
-
-            self.db.update_job(job_id, stage="healthcheck")
-            self._set_job_state(job, status="running", stage="healthcheck")
-            health = self.executor.run("healthcheck", vmid, timeout=300)
-            post_scan = self.executor.run("scan", vmid, timeout=300)
-
-            result = {
-                "preflight": preflight,
-                "update": update,
-                "healthcheck": health,
-                "post_scan": post_scan,
-            }
-            self.db.update_job(job_id, status="success", stage="completed", result=result)
+                self.db.update_job(job["id"], snapshot_name=snapshot)
+                emit(stage="snapshot", progress=20, event_type="snapshot_started", message="Creating rollback snapshot")
+                self._execute("snapshot", vmid, 600, emit, snapshot)
+                emit(stage="snapshot", progress=25, event_type="snapshot_created", message="Rollback snapshot created")
+            emit(stage="updating", progress=30, event_type="update_started", message="Package update started")
+            update = self._execute("update", vmid, 3900, emit)
+            emit(
+                stage="waiting_services",
+                progress=75,
+                event_type="waiting_for_services",
+                message="Waiting for systemd and Docker to stabilize",
+            )
+            try:
+                health = self.stabilizer.wait(
+                    vmid=vmid,
+                    phase="update",
+                    timeout_seconds=policy.post_update_timeout_seconds,
+                    policy=policy,
+                    emit=emit,
+                )
+            except ExecutorError as health_error:
+                health = self._repair_or_raise(job, health_error, policy, emit)
+            emit(
+                stage="healthcheck",
+                progress=96,
+                event_type="healthcheck_passed",
+                message="Post-update service stabilization passed",
+            )
+            post_scan_error: str | None = None
+            try:
+                post_scan = self.executor.run("scan", vmid, timeout=300)
+            except ExecutorError as exc:
+                post_scan_error = str(exc)
+                post_scan = {"ok": False, "data": {}, "error": post_scan_error}
+                emit(
+                    stage="healthcheck",
+                    progress=98,
+                    level="warning",
+                    event_type="post_scan_failed",
+                    message="Health passed, but the post-update package scan failed",
+                    details={"error": post_scan_error},
+                )
+            result = {"preflight": preflight, "update": update, "healthcheck": health, "post_scan": post_scan}
+            self.db.update_job(job["id"], result=result)
             self.db.update_plan_status(job["plan_id"], "completed")
             state = self.get_state(vmid)
-            updates = post_scan.get("data", {})
+            updates = dict(post_scan.get("data", {})) if post_scan.get("ok") else dict(state.get("updates") or {})
+            updates["packages"] = list(updates.get("packages") or [])[:200]
+            pending = max(0, int(updates.get("pending_count", 0) or 0))
+            state.update(health)
             state.update(
                 {
-                    **health.get("data", {}),
+                    "health_status": health.get("health_status", health.get("health", "healthy")),
                     "updates": updates,
-                    "pending_updates": int(updates.get("pending_count", 0)),
+                    "pending_updates": pending,
+                    "update_status": "unknown" if post_scan_error else ("update_available" if pending else "up_to_date"),
                     "active_plan_id": None,
                     "active_plan_status": "completed",
-                    "active_job_id": job_id,
-                    "job_status": "success",
-                    "job_stage": "completed",
-                    "job_progress": 100,
+                    "active_job_id": job["id"],
                     "last_update": utc_now(),
-                    "last_error": None,
-                    "snapshot_name": snapshot_name if auto_rollback else None,
+                    "last_error": post_scan_error,
+                    "snapshot_name": snapshot if auto_rollback else None,
                 }
             )
-            self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-            self._notify_ha(
-                {
-                    "event_type": "job_success",
-                    "job_id": job_id,
-                    "vmid": vmid,
-                    "container": container,
-                    "snapshot_name": snapshot_name if auto_rollback else None,
-                    "reboot_required": bool(update.get("data", {}).get("reboot_required", False)),
-                    "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                }
-            )
+            self._save_state(vmid, state)
+            self._terminal(job, "success", "success", None)
+            self._notify_ha(self._notification("job_success", vmid))
         except ExecutorError as exc:
-            failed_stage = self.db.get_job(job_id)["stage"]
-            LOGGER.error("Job %s failed at %s: %s", job_id, failed_stage, exc)
-
+            failed_stage = self.db.get_job(job["id"])["stage"]
+            LOGGER.error("Job %s failed at %s: %s", job["id"], failed_stage, exc)
             if failed_stage in {"preflight", "snapshot"}:
-                self.db.update_job(job_id, status="blocked", stage=failed_stage, error=str(exc))
                 self.db.update_plan_status(job["plan_id"], "blocked")
-                self._set_job_state(job, status="blocked", stage=failed_stage, error=str(exc))
-                self._notify_ha(
-                    {
-                        "event_type": "job_blocked",
-                        "job_id": job_id,
-                        "vmid": vmid,
-                        "container": container,
-                        "stage": failed_stage,
-                        "error": str(exc),
-                        "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                    }
-                )
+                self._terminal(job, "blocked", "failed", str(exc))
+                self._notify_ha(self._notification("job_blocked", vmid, error=str(exc)))
             elif auto_rollback:
-                self._rollback(
-                    job_id,
-                    vmid,
-                    container,
-                    snapshot_name,
-                    str(exc),
-                    allow_repair=(failed_stage == "healthcheck"),
-                )
+                self._rollback(job, str(exc))
             else:
-                self.db.update_job(job_id, status="failed", stage="manual_intervention", error=str(exc))
                 self.db.update_plan_status(job["plan_id"], "failed")
-                self._set_job_state(job, status="failed", stage="manual_intervention", error=str(exc))
-                self._notify_ha(
-                    {
-                        "event_type": "manual_intervention_required",
-                        "job_id": job_id,
-                        "vmid": vmid,
-                        "container": container,
-                        "error": str(exc),
-                        "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                    }
-                )
+                self._terminal(job, "failed", "manual_intervention", str(exc))
+                self._notify_ha(self._notification("manual_intervention_required", vmid, error=str(exc)))
 
-    def _rollback(
+    def _repair_or_raise(
         self,
-        job_id: str,
-        vmid: int,
-        container: str,
-        snapshot_name: str,
-        cause: str,
-        *,
-        allow_repair: bool,
-    ) -> None:
-        cfg = self._container(vmid)
-        job = self.db.get_job(job_id)
-        try:
-            if allow_repair:
-                self.db.update_job(job_id, stage="repairing", error=cause)
-                self._set_job_state(job, status="running", stage="repairing", error=cause)
-                try:
-                    self.executor.run("repair", vmid, timeout=300)
-                    health = self.executor.run("healthcheck", vmid, timeout=300)
-                    self.db.update_job(job_id, status="recovered", stage="recovered_without_rollback")
-                    self.db.update_plan_status(job["plan_id"], "recovered")
-                    state = self.get_state(vmid)
-                    state.update(
-                        {
-                            **health.get("data", {}),
-                            "job_status": "recovered",
-                            "job_stage": "recovered_without_rollback",
-                            "job_progress": 100,
-                            "last_error": cause,
-                        }
-                    )
-                    self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-                    self._notify_ha(
-                        {
-                            "event_type": "job_recovered",
-                            "job_id": job_id,
-                            "vmid": vmid,
-                            "container": container,
-                            "original_error": cause,
-                            "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                        }
-                    )
-                    return
-                except ExecutorError:
-                    pass
+        job: dict[str, Any],
+        cause: ExecutorError,
+        policy: StabilizationPolicy,
+        emit: Callable[..., None],
+    ) -> dict[str, Any]:
+        cfg = self._container(int(job["vmid"]))
+        actions = list(cfg.get("repair_actions") or [])
+        emit(
+            stage="healthcheck",
+            progress=84,
+            level="warning",
+            event_type="stabilization_timeout",
+            message=str(cause),
+            details=cause.data,
+        )
+        if not actions:
+            raise cause
+        emit(stage="repair", progress=85, event_type="repair_started", message="Configured repair actions started")
+        self._execute("repair", int(job["vmid"]), int(policy.repair_timeout_seconds), emit)
+        return self.stabilizer.wait(
+            vmid=int(job["vmid"]),
+            phase="repair",
+            timeout_seconds=policy.repair_timeout_seconds,
+            policy=policy,
+            emit=emit,
+            initial_grace=False,
+        )
 
-            self.db.update_job(job_id, stage="rolling_back")
-            self._set_job_state(job, status="running", stage="rolling_back", error=cause)
-            self.executor.run("rollback", vmid, snapshot_name, timeout=1200)
-            self.db.update_job(job_id, stage="rollback_healthcheck")
-            self._set_job_state(job, status="running", stage="rollback_healthcheck", error=cause)
-            health = self.executor.run("healthcheck", vmid, timeout=300)
-            self.db.update_job(
-                job_id,
-                status="rolled_back",
-                stage="rolled_back",
-                result={"rollback_healthcheck": health},
-                error=cause,
+    def _rollback(self, job: dict[str, Any], cause: str) -> None:
+        vmid = int(job["vmid"])
+        cfg = self._container(vmid)
+        policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
+        snapshot = str(self.db.get_job(job["id"]).get("snapshot_name") or "")
+        emit = self._emitter(job)
+        try:
+            emit(stage="rollback", progress=88, level="warning", event_type="rollback_started", message="Rollback started")
+            self._execute("rollback", vmid, 1200, emit, snapshot)
+            emit(
+                stage="rollback_wait",
+                progress=90,
+                event_type="rollback_wait",
+                message="Waiting for LXC, systemd, and Docker after rollback",
             )
+            health = self.stabilizer.wait(
+                vmid=vmid,
+                phase="rollback",
+                timeout_seconds=policy.post_rollback_timeout_seconds,
+                policy=policy,
+                emit=emit,
+            )
+            emit(
+                stage="rollback_healthcheck",
+                progress=98,
+                event_type="rollback_healthcheck_passed",
+                message="Rollback service stabilization passed",
+            )
+            self.db.update_job(job["id"], result={"rollback_healthcheck": health}, error=cause)
             self.db.update_plan_status(job["plan_id"], "rolled_back")
             state = self.get_state(vmid)
+            state.update(health)
             state.update(
                 {
-                    **health.get("data", {}),
-                    "job_status": "rolled_back",
-                    "job_stage": "rolled_back",
-                    "job_progress": 100,
+                    "health_status": health.get("health_status", health.get("health", "healthy")),
+                    "snapshot_name": snapshot,
                     "last_error": cause,
-                    "snapshot_name": snapshot_name,
+                    "active_job_id": job["id"],
                 }
             )
-            self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
-            self._notify_ha(
-                {
-                    "event_type": "job_rolled_back",
-                    "job_id": job_id,
-                    "vmid": vmid,
-                    "container": container,
-                    "snapshot_name": snapshot_name,
-                    "original_error": cause,
-                    "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                }
-            )
-        except ExecutorError as rollback_exc:
-            error = f"Original failure: {cause}; rollback failure: {rollback_exc}"
-            self.db.update_job(job_id, status="failed", stage="manual_intervention", error=error)
+            self._save_state(vmid, state)
+            self._terminal(job, "rolled_back", "rolled_back", cause)
+            self._notify_ha(self._notification("job_rolled_back", vmid))
+        except ExecutorError as rollback_error:
+            error = f"Original failure: {cause}; rollback failure: {rollback_error}"
             self.db.update_plan_status(job["plan_id"], "failed")
-            self._set_job_state(job, status="failed", stage="manual_intervention", error=error)
-            self._notify_ha(
+            self._terminal(job, "failed", "manual_intervention", error)
+            self._notify_ha(self._notification("manual_intervention_required", vmid, error=error))
+
+    def _terminal(self, job: dict[str, Any], job_status: str, result: str, error: str | None) -> None:
+        operation = {
+            "success": "success",
+            "rolled_back": "rolled_back",
+            "manual_intervention": "manual_intervention",
+            "failed": "failed",
+        }[result]
+        event = self.db.insert_job_event(
+            job_id=job["id"],
+            vmid=int(job["vmid"]),
+            level="error" if result in {"failed", "manual_intervention"} else "info",
+            stage="completed" if result in {"success", "rolled_back"} else "failed",
+            progress=100,
+            event_type=f"job_{result}",
+            message=error or f"Job finished: {result}",
+            terminal=True,
+        )
+        self.db.update_job(
+            job["id"],
+            status=job_status,
+            stage=event["stage"],
+            progress=100,
+            error=error,
+        )
+        state = self.get_state(int(job["vmid"]))
+        state.update(
+            {
+                "active_job_id": job["id"],
+                "operation_status": operation,
+                "job_stage": event["stage"],
+                "job_progress": 100,
+                "last_operation_result": result,
+                "last_error": sanitize_text(error, limit=2000) if error else state.get("last_error"),
+                "last_job_event": event,
+            }
+        )
+        self._save_state(int(job["vmid"]), state)
+        self.mqtt.publish_event(int(job["vmid"]), event)
+        self.mqtt.publish_job(int(job["vmid"]), self.db.get_job(job["id"]), force=True)
+
+    def _emitter(self, job: dict[str, Any]) -> Callable[..., None]:
+        def emit(
+            *,
+            stage: str,
+            progress: int,
+            event_type: str,
+            message: str,
+            level: str = "info",
+            details: dict[str, Any] | None = None,
+        ) -> None:
+            event = self.db.insert_job_event(
+                job_id=job["id"],
+                vmid=int(job["vmid"]),
+                level=level,
+                stage=stage,
+                progress=progress,
+                event_type=event_type,
+                message=message,
+                details=details,
+            )
+            state = self.get_state(int(job["vmid"]))
+            state.update(
                 {
-                    "event_type": "manual_intervention_required",
-                    "job_id": job_id,
-                    "vmid": vmid,
-                    "container": container,
-                    "error": error,
-                    "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
+                    "active_job_id": job["id"],
+                    "operation_status": "running",
+                    "job_stage": event["stage"],
+                    "job_progress": event["progress"],
+                    "last_job_event": event,
                 }
             )
+            self._save_state(int(job["vmid"]), state)
+            self.mqtt.publish_event(int(job["vmid"]), event)
+            self.mqtt.publish_job(int(job["vmid"]), self.db.get_job(job["id"]))
+        return emit
 
-    def _scheduler_loop(self) -> None:
-        initial = int(self.settings.scheduler.get("initial_scan_delay_seconds", 60))
-        if self._stop.wait(initial):
-            return
-        interval = max(60, int(self.settings.scheduler.get("scan_interval_minutes", 360)) * 60)
-        while not self._stop.is_set():
-            try:
-                self.scan_all()
-            except Exception:
-                LOGGER.exception("Scheduled scan failed")
-            if self._stop.wait(interval):
-                return
+    def _execute(
+        self,
+        action: str,
+        vmid: int,
+        timeout: int,
+        emit: Callable[..., None],
+        argument: str | None = None,
+    ) -> dict[str, Any]:
+        action_stage = {
+            "preflight": "preflight",
+            "snapshot": "snapshot",
+            "update": "updating",
+            "repair": "repair",
+            "rollback": "rollback",
+        }.get(action, "idle")
 
-    def _telemetry_loop(self) -> None:
-        initial = int(self.settings.scheduler.get("initial_refresh_delay_seconds", 5))
-        if self._stop.wait(initial):
-            return
-        interval = max(10, int(self.settings.scheduler.get("state_refresh_seconds", 30)))
-        while not self._stop.is_set():
-            try:
-                self.refresh_all()
-            except Exception:
-                LOGGER.exception("Telemetry refresh failed")
-            if self._stop.wait(interval):
-                return
-
-    def _notify_ha(self, payload: dict[str, Any]) -> None:
-        url = str(self.settings.home_assistant.get("webhook_url", "")).strip()
-        if not url:
-            return
-        timeout = float(self.settings.home_assistant.get("request_timeout_seconds", 10))
+        def on_event(item: dict[str, Any]) -> None:
+            emit(
+                stage=action_stage,
+                progress=int(item.get("progress", STAGE_PROGRESS.get(action, 0))),
+                level=str(item.get("level", "info")),
+                event_type=str(item.get("event_type", "executor_event")),
+                message=str(item.get("message", "")),
+                details=dict(item.get("details") or {}),
+            )
         try:
-            with httpx.Client(timeout=timeout) as client:
-                response = client.post(url, json=payload)
-                response.raise_for_status()
-        except Exception as exc:
-            LOGGER.warning("Home Assistant webhook failed: %s", exc)
+            return self.executor.run(action, vmid, argument, timeout, on_event=on_event)
+        except TypeError as exc:
+            if "on_event" not in str(exc):
+                raise
+            return self.executor.run(action, vmid, argument, timeout)
 
-    def _ensure_initial_states(self) -> None:
-        for vmid in self.settings.containers:
-            if self.db.get_container_state(vmid) is None:
-                self.db.upsert_container_state(vmid, self._base_state(vmid))
-
-    def _base_state(self, vmid: int) -> dict[str, Any]:
-        cfg = self._container(vmid)
-        return {
-            "vmid": vmid,
-            "name": cfg.get("name", f"ct-{vmid}"),
-            "enabled": bool(cfg.get("enabled", False)),
-            "adapter": cfg.get("adapter", "apt"),
-            "criticality": cfg.get("criticality", "medium"),
-            "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-            "status": "initializing" if cfg.get("enabled", False) else "disabled",
-            "health": "unknown",
-            "health_score": 0,
-            "pending_updates": 0,
-            "updates": {"pending_count": 0, "packages": []},
-            "risk": "none",
-            "active_plan_id": None,
-            "active_plan_status": None,
-            "active_job_id": None,
-            "job_status": None,
-            "job_stage": "idle",
-            "job_progress": 0,
-            "last_scan": None,
-            "last_refresh": None,
-            "last_update": None,
-            "last_error": None,
+    def _save_state(self, vmid: int, state: dict[str, Any]) -> dict[str, Any]:
+        state = normalize_state(self._decorate_state(vmid, state))
+        events = self.db.list_container_events(vmid, 50)
+        state["recent_job_events"] = events
+        state["last_job_event"] = events[-1] if events else state.get("last_job_event")
+        docker = dict(state.get("docker") or {})
+        required = list(docker.get("required") or [])
+        by_name = {
+            str(item.get("name")): item
+            for item in (docker.get("containers") or [])
+            if isinstance(item, dict)
         }
+        require_health = bool(docker.get("require_health", True))
+        docker["required_total"] = len(required)
+        docker["required_healthy"] = sum(
+            1
+            for name in required
+            if by_name.get(str(name), {}).get("running")
+            and (not require_health or by_name[str(name)].get("health") in {"healthy", "none"})
+        )
+        state["docker"] = docker
+        saved = self.db.upsert_container_state(vmid, state)
+        self.mqtt.publish_container_state(vmid, saved)
+        self.mqtt.publish_agent_state(self._agent_state())
+        return saved
 
     def _decorate_state(self, vmid: int, state: dict[str, Any]) -> dict[str, Any]:
         cfg = self._container(vmid)
@@ -593,71 +645,103 @@ class OpsService:
                 "adapter": cfg.get("adapter", "apt"),
                 "criticality": cfg.get("criticality", "medium"),
                 "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
+                "rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
             }
         )
         active_job = self.db.get_active_job(vmid)
-        active_plan = self.db.find_active_plan(vmid)
         if active_job:
             state.update(
                 {
                     "active_job_id": active_job["id"],
-                    "job_status": active_job["status"],
+                    "operation_status": "running",
                     "job_stage": active_job["stage"],
-                    "job_progress": STAGE_PROGRESS.get(active_job["stage"], 0),
+                    "job_progress": active_job.get("progress", 0),
                 }
             )
-        if active_plan:
-            state.update(
-                {
-                    "active_plan_id": active_plan["id"],
-                    "active_plan_status": active_plan["status"],
-                    "risk": active_plan["risk"],
-                }
-            )
-
-        if not state.get("enabled"):
-            state["status"] = "disabled"
-        elif active_job:
-            state["status"] = active_job["stage"]
-        elif active_plan and active_plan["status"] == "waiting_approval":
-            state["status"] = "waiting_approval"
-        elif state.get("last_error") and state.get("health") == "critical":
-            state["status"] = "error"
-        elif int(state.get("pending_updates", 0) or 0) > 0:
-            state["status"] = "update_available"
-        elif state.get("health") in {"critical", "degraded"}:
-            state["status"] = state.get("health")
-        elif state.get("health") == "offline" or state.get("lxc_status") == "stopped":
-            state["status"] = "offline"
-        elif state.get("health") == "healthy":
-            state["status"] = "healthy"
-        else:
-            state["status"] = state.get("status", "unknown")
         return state
 
-    def _set_job_state(
-        self,
-        job: dict[str, Any],
-        *,
-        status: str,
-        stage: str,
-        error: str | None = None,
-        snapshot_name: str | None = None,
-    ) -> None:
-        vmid = int(job["vmid"])
-        state = self.get_state(vmid)
-        state.update(
+    def _base_state(self, vmid: int) -> dict[str, Any]:
+        return normalize_state(
             {
-                "active_job_id": job["id"],
-                "job_status": status,
-                "job_stage": stage,
-                "job_progress": STAGE_PROGRESS.get(stage, 0),
-                "last_error": error,
+                "vmid": vmid,
+                "health_status": "unknown",
+                "health_score": 0,
+                "update_status": "unknown",
+                "operation_status": "idle",
+                "job_stage": "idle",
+                "job_progress": 0,
+                "last_operation_result": None,
+                "pending_updates": 0,
+                "updates": {"pending_count": 0, "packages": []},
             }
         )
-        if snapshot_name:
-            state["snapshot_name"] = snapshot_name
-        self.db.upsert_container_state(vmid, self._decorate_state(vmid, state))
+
+    def _ensure_initial_states(self) -> None:
+        for vmid in self.settings.containers:
+            state = self.db.get_container_state(vmid) or self._base_state(vmid)
+            self._save_state(vmid, state)
+
+    def _scheduler_loop(self) -> None:
+        if self._stop.wait(int(self.settings.scheduler.get("initial_scan_delay_seconds", 60))):
+            return
+        interval = max(60, int(self.settings.scheduler.get("scan_interval_minutes", 360)) * 60)
+        while not self._stop.is_set():
+            try:
+                self.scan_all()
+            except Exception:
+                LOGGER.exception("Scheduled scan failed")
+            self._stop.wait(interval)
+
+    def _telemetry_loop(self) -> None:
+        if self._stop.wait(int(self.settings.scheduler.get("initial_refresh_delay_seconds", 5))):
+            return
+        interval = max(10, int(self.settings.scheduler.get("state_refresh_seconds", 30)))
+        while not self._stop.is_set():
+            try:
+                self.refresh_all()
+            except Exception:
+                LOGGER.exception("Telemetry refresh failed")
+            self._stop.wait(interval)
+
+    def _notification(self, event_type: str, vmid: int, **extra: Any) -> dict[str, Any]:
+        cfg = self._container(vmid)
+        return sanitize_data(
+            {
+                "event_type": event_type,
+                "vmid": vmid,
+                "container": cfg.get("name", f"ct-{vmid}"),
+                "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
+                **extra,
+            }
+        )
+
+    def _notify_ha(self, payload: dict[str, Any]) -> None:
+        url = str(self.settings.home_assistant.get("webhook_url", "")).strip()
+        if not url:
+            return
+        try:
+            with httpx.Client(timeout=float(self.settings.home_assistant.get("request_timeout_seconds", 10))) as client:
+                client.post(url, json=payload).raise_for_status()
+        except Exception:
+            LOGGER.warning("Home Assistant webhook delivery failed")
+
+    def _agent_state(self) -> dict[str, Any]:
+        states = self.db.list_container_states()
+        refreshed = [str(item.get("last_refresh")) for item in states if item.get("last_refresh")]
+        return {
+            "version": VERSION,
+            "configured_container_count": len(self.settings.containers),
+            "active_job_count": self.db.active_job_count(),
+            "last_refresh": max(refreshed) if refreshed else None,
+        }
+
+    def _mqtt_snapshot(self) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        jobs = [
+            job
+            for vmid in self.settings.containers
+            if (job := self.db.get_latest_job(vmid)) is not None
+        ]
+        return self._agent_state(), self.db.list_container_states(), jobs
 
     def _container(self, vmid: int) -> dict[str, Any]:
         try:
@@ -672,8 +756,7 @@ def _fingerprint(data: dict[str, Any]) -> str:
 
 
 def _risk_for(cfg: dict[str, Any], data: dict[str, Any]) -> str:
-    criticality = str(cfg.get("criticality", "medium"))
-    packages = {str(p.get("name", "")) for p in data.get("packages", []) if isinstance(p, dict)}
+    packages = {str(item.get("name", "")) for item in data.get("packages", []) if isinstance(item, dict)}
     high_risk = {
         "systemd",
         "libc6",
@@ -681,10 +764,9 @@ def _risk_for(cfg: dict[str, Any], data: dict[str, Any]) -> str:
         "openssh-server",
         "proxmox-ve",
         "docker-ce",
+        "docker-ce-cli",
         "containerd.io",
     }
-    if criticality in {"critical", "high"} or packages.intersection(high_risk):
+    if str(cfg.get("criticality", "medium")) in {"critical", "high"} or packages & high_risk:
         return "high"
-    if int(data.get("pending_count", 0)) >= 20:
-        return "medium"
-    return "low"
+    return "medium" if int(data.get("pending_count", 0)) >= 20 else "low"

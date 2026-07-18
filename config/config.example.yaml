@@ -3,7 +3,7 @@ api:
   port: 8787
 
 executor:
-  proxmox_host: 192.168.4.249
+  proxmox_host: proxmox-host.local
   ssh_user: root
   ssh_key: /etc/hubinet-ops/keys/proxmox_ed25519
   known_hosts: /etc/hubinet-ops/ssh_known_hosts
@@ -18,6 +18,20 @@ scheduler:
   state_refresh_seconds: 30
   initial_refresh_delay_seconds: 5
 
+mqtt:
+  enabled: false
+  host: mqtt-broker.local
+  port: 1883
+  username: ""
+  password: ""
+  client_id: hubinet-ops-agent
+  base_topic: hubinet/ops
+  discovery_prefix: homeassistant
+  keepalive_seconds: 60
+  reconnect_min_seconds: 2
+  reconnect_max_seconds: 60
+  retain_state: true
+
 home_assistant:
   webhook_url: ""
   request_timeout_seconds: 10
@@ -30,15 +44,29 @@ containers:
     criticality: medium
     approval_mode: always
     automatic_rollback: true
+    manual_rollback_allowed: false
+    repair_actions: []
     dashboard_path: /hubinet-ops/ct-101
     snapshot_retention_hours: 24
+    stabilization: &default_stabilization
+      post_update_timeout_seconds: 300
+      post_rollback_timeout_seconds: 300
+      repair_timeout_seconds: 180
+      poll_interval_seconds: 10
+      initial_grace_seconds: 10
+      required_consecutive_successes: 2
 
   106:
-    name: pogoda
+    name: weather
     enabled: true
     adapter: apt
     criticality: low
     approval_mode: always
     automatic_rollback: true
+    manual_rollback_allowed: false
+    repair_actions:
+      - restart_services
+      - restart_required_containers
     dashboard_path: /hubinet-ops/ct-106
     snapshot_retention_hours: 24
+    stabilization: *default_stabilization
