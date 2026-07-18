@@ -65,7 +65,7 @@ ssh "${SSH_ARGS[@]}" '
     exit 1
   }
   grep -q "^hubinet_ops_notify_service:" /config/secrets.yaml || {
-    echo "Missing existing hubinet_ops_notify_service secret, for example notify.mobile_app_poco_x8" >&2
+    echo "Missing existing hubinet_ops_notify_service secret, for example notify.mobile_app_your_phone" >&2
     exit 1
   }
 '
