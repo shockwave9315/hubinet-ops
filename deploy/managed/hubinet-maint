@@ -27,6 +27,10 @@ DOCKER_PACKAGES = {
     "docker-compose-plugin",
 }
 
+# APT/dpkg progress parsing relies on the stable English machine output.
+os.environ.setdefault("LC_ALL", "C.UTF-8")
+os.environ.setdefault("LANG", "C.UTF-8")
+
 
 def output(
     ok: bool,
@@ -550,7 +554,16 @@ def update_system() -> dict[str, Any]:
                 )
     finally:
         timer.cancel()
-    process.wait(timeout=30)
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(process)
+        stream_result(
+            False,
+            data={"stdout_tail": tail},
+            error="apt-get did not exit after termination and was force-killed",
+            rc=1,
+        )
     if timed_out.is_set():
         stream_result(
             False,
