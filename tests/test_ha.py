@@ -82,6 +82,9 @@ def test_live_progress_notification_replaces_one_phone_notification_per_ct() -> 
     assert "progress_max: 100" in text
     assert "alert_once: true" in text
     assert 'tag: "hubinet_ops_ct{{ repeat.item.vmid }}_job"' in text
+    assert text.count('tag: "{{ job_tag }}"') >= 5
+    assert "plan_tag" not in text
+    assert "progress: -1" not in text
     assert "/hubinet-ops/ct-101" in text
     assert "/hubinet-ops/ct-106" in text
 
