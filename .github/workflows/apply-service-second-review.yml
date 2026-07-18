@@ -1,0 +1,36 @@
+name: Apply second service review patch
+
+on:
+  push:
+    branches:
+      - feat/0.2.1-mqtt-live-logs
+    paths:
+      - scripts/apply_service_second_review.py
+      - .github/workflows/apply-service-second-review.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/0.2.1-mqtt-live-logs
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Apply exact patch
+        run: |
+          python scripts/apply_service_second_review.py
+          python -m py_compile app/service.py
+      - name: Commit patch and remove one-shot machinery
+        run: |
+          git config user.name "hubinet-ops-review-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git rm scripts/apply_service_second_review.py .github/workflows/apply-service-second-review.yml
+          git add app/service.py
+          git commit -m "fix: preserve fresh state across scans and normalize plan fingerprints"
+          git push origin HEAD:feat/0.2.1-mqtt-live-logs
