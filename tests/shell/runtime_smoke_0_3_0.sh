@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 mkdir -p "$TMP_ROOT/bin"
-PVE_ROOT="$TMP_ROOT/etc-pve"
+export PVE_ROOT="$TMP_ROOT/etc-pve"
 mkdir -p "$PVE_ROOT/nodes/proxmox" "$PVE_ROOT/local"
 export PVE_LOCAL_FIXTURE="$PVE_ROOT/local"
 export PVE_LOCAL_TARGET="$PVE_ROOT/nodes/proxmox"
@@ -69,11 +69,15 @@ printf 'proxmox.local\n'
 SH
 cat > "$TMP_ROOT/bin/readlink" <<'SH'
 #!/usr/bin/env bash
-if [[ "${@: -1}" == "$PVE_LOCAL_FIXTURE" ]]; then
+last_arg="${@: -1}"
+if [[ "$last_arg" == "$PVE_LOCAL_FIXTURE" ]]; then
   printf '%s\n' "$PVE_LOCAL_TARGET"
   exit 0
+elif [[ "$last_arg" == "$PVE_ROOT/nodes" ]]; then
+  printf '%s\n' "$last_arg"
+  exit 0
 fi
-exec /usr/bin/readlink "$@"
+exit 1
 SH
 chmod +x "$TMP_ROOT/bin/"*
 export PATH="$TMP_ROOT/bin:$PATH"
