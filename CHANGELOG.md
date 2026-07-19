@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3
+
+- cap the complete Home Assistant MQTT attribute payload at 10,000 UTF-8 bytes, leaving margin below Recorder's 16,384-byte hard limit;
+- preserve the existing `health_status` attribute contract so the 0.2.2 dashboard and approval scripts keep working without an HA migration;
+- trim package and live-event previews by encoded byte size rather than only by item count;
+- keep up to 200 compact package previews and 50 newest compact job events when they fit, with visible/total/truncated metadata;
+- compact oversized Docker, failed-unit, IP-address, and error details while preserving all scalar Discovery and dashboard-control fields;
+- add regression coverage with long Unicode package names, versions, event messages, nested Docker data, and oversized errors;
+- add a transactional agent-only Proxmox upgrade with backup, rollback, venv permission validation, and a 0.2.3 health check.
+
 ## 0.2.2
 
 - redesigned the Home Assistant UI as a responsive Sections dashboard built with Mushroom cards;
