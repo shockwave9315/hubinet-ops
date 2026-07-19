@@ -32,6 +32,12 @@ write_stub date 'printf "%s\n" "20260719-120000"'
 write_stub python3 '
 printf "<%s>" "$@" >> "$HUBINET_OPS_TEST_LOG_DIR/python3.args"
 printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/python3.args"
+if [[ ${1:-} == - ]]; then
+  shift
+  cat >/dev/null
+  printf "{\"ok\":false,\"error\":\"%s\"}\n" "${1:-wrapper error}"
+  exit 0
+fi
 [[ $# -eq 1 && $1 == */scripts/validate_yaml.py ]]
 '
 write_stub ssh '
@@ -49,6 +55,13 @@ printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/install.args"
 write_stub cp '
 printf "<%s>" "$@" >> "$HUBINET_OPS_TEST_LOG_DIR/cp.args"
 printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/cp.args"
+'
+write_stub touch 'exit 0'
+write_stub logger 'exit 0'
+write_stub timeout '
+while [[ ${1:-} == --* ]]; do shift; done
+[[ ${1:-} =~ ^[0-9]+s$ ]] && shift
+exec "$@"
 '
 write_stub grep '
 for arg in "$@"; do
@@ -102,6 +115,21 @@ fi
 bash "$ROOT/deploy/install-ha-0.2.4-from-pve.sh" ha.test http://agent.test:8787 2222
 bash "$ROOT/deploy/upgrade-0.2.4-from-pve.sh" 110 106
 
+printf "101\n106\n" > "$TMP_ROOT/allowed-vmids"
+printf "106\n" > "$TMP_ROOT/lifecycle-vmids"
+sed \
+  -e "s|^ALLOWLIST=.*|ALLOWLIST=\"$TMP_ROOT/allowed-vmids\"|" \
+  -e "s|^LIFECYCLE_ALLOWLIST=.*|LIFECYCLE_ALLOWLIST=\"$TMP_ROOT/lifecycle-vmids\"|" \
+  "$ROOT/deploy/pve/hubinet-ops-host" > "$TMP_ROOT/hubinet-ops-host"
+chmod +x "$TMP_ROOT/hubinet-ops-host"
+if denied="$(SSH_ORIGINAL_COMMAND='start 101' bash "$TMP_ROOT/hubinet-ops-host" 2>&1)"; then
+  echo "CT101 lifecycle unexpectedly allowed by forced wrapper" >&2
+  exit 1
+fi
+[[ "$denied" == *"VMID not lifecycle allowed"* ]]
+allowed="$(SSH_ORIGINAL_COMMAND='start 106' bash "$TMP_ROOT/hubinet-ops-host")"
+[[ "$allowed" == *'"ok":true'* && "$allowed" == *'"action":"start"'* ]]
+
 mapfile -t scp_calls < "$LOG_DIR/scp.args"
 [[ ${#scp_calls[@]} -eq 3 ]]
 [[ ${scp_calls[0]} == *"<${ROOT}/home-assistant/packages/hubinet_ops.yaml><root@ha.test:/config/packages/hubinet_ops.yaml.new>" ]]
@@ -112,6 +140,7 @@ grep -Fq '<status><101>' "$LOG_DIR/pct.args"
 grep -Fq '<status><106>' "$LOG_DIR/pct.args"
 grep -Fq '<status><110>' "$LOG_DIR/pct.args"
 grep -Fq '<push><110>' "$LOG_DIR/pct.args"
+grep -Fq '<start><106>' "$LOG_DIR/pct.args"
 grep -Fq '<-u><hubinetops><--preserve-environment><--><env><PYTHONPATH=/opt/hubinet-ops></opt/hubinet-ops/.venv/bin/python><-c>' "$LOG_DIR/runuser.args"
 
 printf '%s\n' "0.2.4 installer runtime smoke passed"

@@ -29,9 +29,24 @@ def test_wrapper_has_only_fixed_graceful_lifecycle_verbs() -> None:
     assert "Action does not accept an argument" in text
     assert "timeout --signal=TERM" in text
     assert 'grep -Fxq "$vmid" "$ALLOWLIST"' in text
+    assert 'LIFECYCLE_ALLOWLIST="/etc/hubinet-ops/lifecycle-vmids"' in text
+    assert 'grep -Fxq "$vmid" "$LIFECYCLE_ALLOWLIST"' in text
     assert '[[ -z "${extra:-}" ]]' in text
     for forbidden in ("pct destroy", "pct console", "pct enter", " eval ", "generic-command"):
         assert forbidden not in text
+
+
+def test_production_lifecycle_allowlist_contains_only_ct106() -> None:
+    lifecycle_allowlist = ROOT / "deploy" / "pve" / "lifecycle-vmids"
+    assert lifecycle_allowlist.read_text(encoding="utf-8").splitlines() == ["106"]
+    installer = (ROOT / "deploy" / "pve" / "install-pve-access.sh").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        'install -m 0640 "$SOURCE_DIR/lifecycle-vmids" '
+        "/etc/hubinet-ops/lifecycle-vmids"
+    ) in installer
+    assert '== "106"' in installer
 
 
 def test_managed_verify_is_fixed_and_checks_integrity_services_and_docker() -> None:
@@ -74,6 +89,7 @@ def test_managed_verify_treats_final_repository_failure_as_warning_only(
     assert failures == []
     assert data["final_apt_scan_ok"] is False
     assert data["update_status"] == "unknown"
+    assert data["packages_remaining_count"] is None
     assert "Temporary failure" in data["verification_warning"]
 
 
@@ -86,6 +102,9 @@ def test_upgrade_is_archive_safe_transactional_and_never_runs_managed_actions() 
     assert "ops.db*" in text
     assert "restore_all" in text
     assert "allowed-vmids" in text
+    assert "lifecycle-vmids" in text
+    assert "lifecycle-vmids.absent" in text
+    assert '== "106"' in text
     assert "refusing to broaden" in text
     assert "operator_capabilities" in text
     assert "{name: False for name in all_caps}" in text
@@ -141,6 +160,11 @@ def test_dashboard_policy_controls_verification_recovery_and_navigation_only_pus
         "id: hubinet_ops_health_watchdog_v022", 1
     )[0]
     assert "active_job_id" in progress
+    assert "attribute: active_job_id" in progress
+    assert "sensor.hubinet_ops_ct106_operation_status" not in progress
+    assert "state_attr(state_entity, 'operation_status')" in progress
+    assert "state_attr(state_entity, 'job_stage')" in progress
+    assert "state_attr(state_entity, 'job_progress')" in progress
     assert "['preflight', 'snapshot', 'updating'" in progress
     assert "starting" not in progress
     assert "shutting_down" not in progress
@@ -149,6 +173,8 @@ def test_dashboard_policy_controls_verification_recovery_and_navigation_only_pus
     assert "intentional_shutdown" in watchdog
     assert "lifecycle_status') != 'running'" in watchdog
     assert "LXC działa, weryfikacja usług oczekuje na telemetrię" in package
+    assert "nie udało się sprawdzić" in package
+    assert "verification_warning" in package
     assert "packages_updated_count" in package
     assert "authenticationRequired" not in package
 
@@ -161,7 +187,8 @@ def test_dashboard_policy_controls_verification_recovery_and_navigation_only_pus
 
 
 def test_new_discovery_entity_ids_are_stable_and_existing_keys_remain() -> None:
-    keys = {key for key, _, _, _ in _ct_entities()}
+    entities = {key: value_template for key, _, value_template, _ in _ct_entities()}
+    keys = set(entities)
     assert {
         "health_status",
         "operation_status",
@@ -173,3 +200,8 @@ def test_new_discovery_entity_ids_are_stable_and_existing_keys_remain() -> None:
         "capability_shutdown",
         "capability_reboot",
     } <= keys
+    assert "value_json.reboot_required is none" in entities["reboot_required"]
+    assert (
+        "value_json.packages_remaining_count is none"
+        in entities["packages_remaining_count"]
+    )

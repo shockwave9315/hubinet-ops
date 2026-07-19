@@ -96,7 +96,10 @@ def create_app(
 
     @api.post("/api/v1/scan", dependencies=auth)
     def scan_all() -> list[dict[str, Any]]:
-        return service.scan_all()
+        try:
+            return service.scan_all()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @api.post("/api/v1/containers/{vmid}/scan", dependencies=auth)
     def scan_one(vmid: int) -> dict[str, Any]:

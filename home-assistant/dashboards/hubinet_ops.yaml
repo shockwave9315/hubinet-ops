@@ -535,6 +535,9 @@ views:
                   - condition: state
                     entity: sensor.hubinet_ops_ct106_lifecycle_status
                     state_not: running
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_operation_status
+                    state_not: waiting_approval
                 card:
                   type: custom:mushroom-template-card
                   primary: Uruchom

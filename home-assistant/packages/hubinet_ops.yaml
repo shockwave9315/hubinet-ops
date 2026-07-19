@@ -239,10 +239,11 @@ automation:
                   title: "✅ CT{{ vmid }} {{ container }} — gotowe"
                   message: >-
                     Zaktualizowano: {{ trigger.json.packages_updated_count | default(0) }}
-                    Pozostało: {{ trigger.json.packages_remaining_count | default(0) }}
+                    Pozostało: {{ 'nie udało się sprawdzić' if trigger.json.packages_remaining_count is none else trigger.json.packages_remaining_count | default(0) }}
                     APT/dpkg: {{ 'OK' if trigger.json.apt_check_ok | default(false) and trigger.json.dpkg_audit_ok | default(false) else 'BŁĄD' }}
                     Docker: {{ trigger.json.docker_required_healthy | default(0) }}/{{ trigger.json.docker_required_total | default(0) }} healthy
-                    Restart wymagany: {{ 'tak' if trigger.json.reboot_required | default(false) else 'nie' }}
+                    Restart wymagany: {{ 'nieznany' if trigger.json.reboot_required is none else 'tak' if trigger.json.reboot_required else 'nie' }}
+                    {% if trigger.json.verification_warning | default('', true) %}Ostrzeżenie: {{ trigger.json.verification_warning }}{% endif %}
                   data:
                     tag: "{{ job_tag }}"
                     group: hubinet_ops
@@ -342,22 +343,16 @@ automation:
     max_exceeded: silent
     triggers:
       - trigger: state
-        entity_id: sensor.hubinet_ops_ct101_operation_status
-        to: running
+        entity_id: sensor.hubinet_ops_ct101_health_status
+        attribute: active_job_id
         id: ct101
       - trigger: state
-        entity_id: sensor.hubinet_ops_ct106_operation_status
-        to: running
+        entity_id: sensor.hubinet_ops_ct106_health_status
+        attribute: active_job_id
         id: ct106
     variables:
       vmid: "{{ 101 if trigger.id == 'ct101' else 106 }}"
       container: "{{ 'cloudflared' if trigger.id == 'ct101' else 'weather' }}"
-      operation_entity: >-
-        {{ 'sensor.hubinet_ops_ct101_operation_status' if trigger.id == 'ct101' else 'sensor.hubinet_ops_ct106_operation_status' }}
-      stage_entity: >-
-        {{ 'sensor.hubinet_ops_ct101_job_stage' if trigger.id == 'ct101' else 'sensor.hubinet_ops_ct106_job_stage' }}
-      progress_entity: >-
-        {{ 'sensor.hubinet_ops_ct101_job_progress' if trigger.id == 'ct101' else 'sensor.hubinet_ops_ct106_job_progress' }}
       state_entity: >-
         {{ 'sensor.hubinet_ops_ct101_health_status' if trigger.id == 'ct101' else 'sensor.hubinet_ops_ct106_health_status' }}
       dashboard_path: "{{ '/hubinet-ops/ct-101' if trigger.id == 'ct101' else '/hubinet-ops/ct-106' }}"
@@ -365,19 +360,20 @@ automation:
       - condition: template
         value_template: >-
           {{ state_attr(state_entity, 'active_job_id') not in [none, '', 'unknown', 'unavailable']
-             and states(stage_entity) in ['preflight', 'snapshot', 'updating', 'waiting_services', 'healthcheck', 'verifying', 'repair', 'rollback', 'rollback_wait', 'rollback_healthcheck'] }}
+             and state_attr(state_entity, 'operation_status') == 'running'
+             and state_attr(state_entity, 'job_stage') in ['preflight', 'snapshot', 'updating', 'waiting_services', 'healthcheck', 'verifying', 'repair', 'rollback', 'rollback_wait', 'rollback_healthcheck'] }}
     actions:
       - repeat:
           while:
             - condition: template
               value_template: >-
-                {{ is_state(operation_entity, 'running')
+                {{ state_attr(state_entity, 'operation_status') == 'running'
                    and state_attr(state_entity, 'active_job_id') not in [none, '', 'unknown', 'unavailable']
-                   and states(stage_entity) in ['preflight', 'snapshot', 'updating', 'waiting_services', 'healthcheck', 'verifying', 'repair', 'rollback', 'rollback_wait', 'rollback_healthcheck'] }}
+                   and state_attr(state_entity, 'job_stage') in ['preflight', 'snapshot', 'updating', 'waiting_services', 'healthcheck', 'verifying', 'repair', 'rollback', 'rollback_wait', 'rollback_healthcheck'] }}
           sequence:
             - variables:
-                current_progress: "{{ states(progress_entity) | int(0) }}"
-                current_stage: "{{ states(stage_entity) | replace('_', ' ') }}"
+                current_progress: "{{ state_attr(state_entity, 'job_progress') | int(0) }}"
+                current_stage: "{{ state_attr(state_entity, 'job_stage') | default('idle', true) | replace('_', ' ') }}"
                 current_event: "{{ state_attr(state_entity, 'last_job_event') or {} }}"
             - action: !secret hubinet_ops_notify_service
               data:

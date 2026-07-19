@@ -624,7 +624,7 @@ def verify(config: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     try:
         updates = apt_scan()
     except Exception as exc:
-        updates = {"pending_count": 0, "packages": []}
+        updates = {"pending_count": None, "packages": []}
         final_apt_scan_ok = False
         verification_warning = f"final apt scan failed: {exc}"
     docker = dict(health.get("docker") or {})
@@ -643,7 +643,11 @@ def verify(config: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
             if final_apt_scan_ok
             else "unknown"
         ),
-        "packages_remaining_count": max(0, int(updates.get("pending_count", 0) or 0)),
+        "packages_remaining_count": (
+            max(0, int(updates.get("pending_count", 0) or 0))
+            if final_apt_scan_ok
+            else None
+        ),
         "docker_required_healthy": max(0, int(docker.get("required_healthy", 0) or 0)),
         "docker_required_total": max(0, int(docker.get("required_total", 0) or 0)),
     }

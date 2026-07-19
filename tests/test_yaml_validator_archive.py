@@ -41,7 +41,17 @@ def test_yaml_discovery_is_deterministic_and_ignores_generated_directories(
 ) -> None:
     (tmp_path / "z.yaml").write_text("z: 1\n", encoding="utf-8")
     (tmp_path / "a.yml").write_text("a: 1\n", encoding="utf-8")
-    for directory in (".git", ".venv", "venv", ".tmp", "build", "runtime", "backups", "__pycache__"):
+    for directory in (
+        ".git",
+        ".venv",
+        "venv",
+        ".pytest_tmp",
+        ".tmp",
+        "build",
+        "runtime",
+        "backups",
+        "__pycache__",
+    ):
         target = tmp_path / directory
         target.mkdir()
         (target / "ignored.yaml").write_text("invalid: [\n", encoding="utf-8")

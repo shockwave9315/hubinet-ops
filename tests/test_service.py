@@ -333,7 +333,7 @@ def test_scan_is_blocked_while_job_is_queued_or_running(tmp_path: Path) -> None:
         ttl_minutes=60,
     )
     service.approve(plan["id"])
-    result = service.scan_container(106)
+    result = service.scan_container(106, operator=False)
     assert result["status"] == "skipped"
     assert result["reason"] == "job_active"
     assert "scan" not in executor.actions
@@ -584,6 +584,8 @@ def test_transient_final_apt_scan_failure_is_warning_without_rollback(
     executor = TransientScanFailureExecutor([docker_state(3), docker_state(3)])
     service, db = service_with(tmp_path, executor)
     job = approved_job(service, db)
+    notifications: list[dict[str, Any]] = []
+    service._notify_ha = notifications.append  # type: ignore[method-assign]
     service._run_job(job)
 
     assert db.get_job(job["id"])["status"] == "success"
@@ -591,8 +593,12 @@ def test_transient_final_apt_scan_failure_is_warning_without_rollback(
     state = service.get_state(106)
     assert state["update_status"] == "unknown"
     assert state["verification_status"] == "warning"
+    assert state["packages_remaining_count"] is None
     assert "Temporary failure" in state["verification_error"]
     assert db.find_active_plan(106) is None
+    success = next(item for item in notifications if item["event_type"] == "job_success")
+    assert success["packages_remaining_count"] is None
+    assert "Temporary failure" in success["verification_warning"]
 
 
 def test_malformed_job_timestamp_does_not_change_success_result(tmp_path: Path) -> None:

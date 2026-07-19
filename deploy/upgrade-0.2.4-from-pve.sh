@@ -26,6 +26,14 @@ COMPLETE=0
   echo "Run from a complete Hubinet Ops source archive." >&2
   exit 1
 }
+[[ -f "$SOURCE_DIR/deploy/pve/lifecycle-vmids" ]] || {
+  echo "Missing lifecycle VMID allowlist in source archive." >&2
+  exit 1
+}
+[[ "$(sed '/^[[:space:]]*$/d' "$SOURCE_DIR/deploy/pve/lifecycle-vmids")" == "106" ]] || {
+  echo "0.2.4 lifecycle VMID allowlist must contain only CT106." >&2
+  exit 1
+}
 grep -Fq 'VERSION = "0.2.4"' "$SOURCE_DIR/app/mqtt.py" || {
   echo "Source tree is not Hubinet Ops 0.2.4" >&2
   exit 1
@@ -59,6 +67,11 @@ restore_all() {
   echo "0.2.4 upgrade failed; restoring every modified layer." >&2
   if [[ -f "$HOST_BACKUP/hubinet-ops-host" ]]; then
     install -m 0755 "$HOST_BACKUP/hubinet-ops-host" /usr/local/sbin/hubinet-ops-host || true
+  fi
+  if [[ -f "$HOST_BACKUP/lifecycle-vmids" ]]; then
+    install -m 0640 "$HOST_BACKUP/lifecycle-vmids" /etc/hubinet-ops/lifecycle-vmids || true
+  elif [[ -f "$HOST_BACKUP/lifecycle-vmids.absent" ]]; then
+    rm -f /etc/hubinet-ops/lifecycle-vmids || true
   fi
   for vmid in 101 "$CT106_VMID"; do
     pct exec "$vmid" -- bash -s -- "$STAMP" <<'REMOTE_RESTORE_MANAGED' || true
@@ -95,6 +108,11 @@ trap 'rm -f "$ARCHIVE"' EXIT
 
 install -d -m 0700 "$HOST_BACKUP"
 cp -a /usr/local/sbin/hubinet-ops-host "$HOST_BACKUP/hubinet-ops-host"
+if [[ -f /etc/hubinet-ops/lifecycle-vmids ]]; then
+  cp -a /etc/hubinet-ops/lifecycle-vmids "$HOST_BACKUP/lifecycle-vmids"
+else
+  touch "$HOST_BACKUP/lifecycle-vmids.absent"
+fi
 for vmid in 101 "$CT106_VMID"; do
   pct exec "$vmid" -- bash -s -- "$STAMP" <<'REMOTE_BACKUP_MANAGED'
 set -Eeuo pipefail
@@ -183,6 +201,7 @@ rm -rf "$staging" /root/hubinet-ops-0.2.4.tgz
 REMOTE_INSTALL_AGENT
 
 install -m 0755 "$SOURCE_DIR/deploy/pve/hubinet-ops-host" /usr/local/sbin/hubinet-ops-host
+install -m 0640 "$SOURCE_DIR/deploy/pve/lifecycle-vmids" /etc/hubinet-ops/lifecycle-vmids
 for vmid in 101 "$CT106_VMID"; do
   pct push "$vmid" "$SOURCE_DIR/deploy/managed/hubinet-maint" /usr/local/sbin/hubinet-maint --perms 0755
   pct exec "$vmid" -- python3 -m py_compile /usr/local/sbin/hubinet-maint

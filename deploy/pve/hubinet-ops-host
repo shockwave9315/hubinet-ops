@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 ALLOWLIST="/etc/hubinet-ops/allowed-vmids"
+LIFECYCLE_ALLOWLIST="/etc/hubinet-ops/lifecycle-vmids"
 ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
 
 json_error() {
@@ -28,6 +29,13 @@ read -r action vmid argument extra <<<"$ORIGINAL"
 [[ "$vmid" =~ ^[1-9][0-9]{1,5}$ ]] || fail "Invalid VMID"
 [[ -f "$ALLOWLIST" ]] || fail "Missing VMID allowlist"
 grep -Fxq "$vmid" "$ALLOWLIST" || fail "VMID not allowed"
+
+case "$action" in
+  start|shutdown|reboot)
+    [[ -f "$LIFECYCLE_ALLOWLIST" ]] || fail "Missing lifecycle VMID allowlist"
+    grep -Fxq "$vmid" "$LIFECYCLE_ALLOWLIST" || fail "VMID not lifecycle allowed"
+    ;;
+esac
 
 if [[ -n "${argument:-}" ]]; then
   [[ "$argument" =~ ^[A-Za-z0-9_-]+$ ]] || fail "Unsafe argument"

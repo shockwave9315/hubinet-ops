@@ -223,10 +223,14 @@ class OpsService:
             self._require_capability(vmid, "scan")
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
+            if operator:
+                raise ValueError("scan_already_running")
             return {"vmid": vmid, "status": "skipped", "reason": "scan_already_running"}
         try:
             active_job = self.db.get_active_job(vmid)
             if active_job is not None:
+                if operator:
+                    raise ValueError("job_active")
                 return {
                     "vmid": vmid,
                     "status": "skipped",
@@ -234,6 +238,8 @@ class OpsService:
                     "job_id": active_job["id"],
                 }
             if self.get_state(vmid).get("lifecycle_status") == "running":
+                if operator:
+                    raise ValueError("lifecycle_active")
                 return {
                     "vmid": vmid,
                     "status": "skipped",
@@ -957,10 +963,16 @@ class OpsService:
             verification_data = dict(verification.get("data") or {})
             updates = dict(verification_data.get("updates") or {})
             updates["packages"] = list(updates.get("packages") or [])[:200]
-            pending = max(0, int(updates.get("pending_count", 0) or 0))
             final_apt_scan_ok = bool(
                 verification_data.get("final_apt_scan_ok", True)
             )
+            pending = (
+                max(0, int(updates.get("pending_count", 0) or 0))
+                if final_apt_scan_ok
+                else None
+            )
+            if not final_apt_scan_ok:
+                updates["pending_count"] = None
             verification_warning = (
                 sanitize_text(
                     verification_data.get("verification_warning"),
@@ -973,10 +985,15 @@ class OpsService:
                 0,
                 int(update.get("data", {}).get("package_total", 0) or 0),
             )
-            reboot_required = bool(verification_data.get("reboot_required", False))
+            raw_reboot_required = verification_data.get("reboot_required")
+            reboot_required = (
+                raw_reboot_required
+                if isinstance(raw_reboot_required, bool)
+                else None
+            )
             verification_status = (
                 "warning"
-                if reboot_required or pending or not final_apt_scan_ok
+                if reboot_required is True or bool(pending) or not final_apt_scan_ok
                 else "passed"
             )
             docker = dict(verification_data.get("docker") or health.get("docker") or {})
@@ -1012,7 +1029,7 @@ class OpsService:
                         health.get("health", "healthy"),
                     ),
                     "updates": updates,
-                    "pending_updates": pending,
+                    "pending_updates": pending if pending is not None else 0,
                     "update_status": (
                         "unknown"
                         if not final_apt_scan_ok
@@ -1040,7 +1057,7 @@ class OpsService:
             )
             self._save_state(vmid, state)
             self._terminal(job, "success", "success", None)
-            if pending and final_apt_scan_ok:
+            if final_apt_scan_ok and pending is not None and pending > 0:
                 self._create_followup_plan(vmid, cfg, updates)
             duration = self._best_effort_duration(job)
             self._notify_ha(
@@ -1055,6 +1072,7 @@ class OpsService:
                     docker_required_healthy=docker_healthy,
                     docker_required_total=docker_total,
                     verification_status=verification_status,
+                    verification_warning=verification_warning,
                     duration_seconds=duration,
                 )
             )

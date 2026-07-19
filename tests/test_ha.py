@@ -87,16 +87,26 @@ def test_live_progress_runs_only_for_active_jobs_and_reuses_one_tag() -> None:
     assert progress["mode"] == "parallel"
     assert progress["max"] == 2
     assert {trigger["entity_id"] for trigger in progress["triggers"]} == {
-        "sensor.hubinet_ops_ct101_operation_status",
-        "sensor.hubinet_ops_ct106_operation_status",
+        "sensor.hubinet_ops_ct101_health_status",
+        "sensor.hubinet_ops_ct106_health_status",
     }
-    assert all(trigger["to"] == "running" for trigger in progress["triggers"])
+    assert all(trigger["attribute"] == "active_job_id" for trigger in progress["triggers"])
+    assert all("to" not in trigger for trigger in progress["triggers"])
+    assert "active_job_id" in progress["conditions"][0]["value_template"]
+    assert "job_stage" in progress["conditions"][0]["value_template"]
 
     repeat = progress["actions"][0]["repeat"]
     assert repeat["while"][0]["condition"] == "template"
-    assert "is_state(operation_entity, 'running')" in repeat["while"][0][
+    assert "state_attr(state_entity, 'operation_status') == 'running'" in repeat["while"][0][
         "value_template"
     ]
+    assert "state_attr(state_entity, 'active_job_id')" in repeat["while"][0][
+        "value_template"
+    ]
+    assert all(
+        lifecycle_stage not in progress["conditions"][0]["value_template"]
+        for lifecycle_stage in ("starting", "shutting_down", "rebooting")
+    )
     assert repeat["sequence"][-1]["delay"] == "00:00:10"
 
     assert 'tag: "hubinet_ops_ct{{ vmid }}_job"' in text

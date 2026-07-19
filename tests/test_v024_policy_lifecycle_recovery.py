@@ -342,6 +342,106 @@ def test_api_requires_auth_denies_ct101_and_never_executes_invalid_vmid(
     assert client.post("/api/v1/containers/106/reboot", headers=headers).status_code == 409
 
 
+@pytest.mark.parametrize(
+    "conflict",
+    ["scan_already_running", "job_active", "lifecycle_active"],
+)
+def test_operator_scan_conflicts_are_http_409(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: str,
+) -> None:
+    import_config = tmp_path / "import.yaml"
+    import_config.write_text(
+        "containers:\n  106:\n    enabled: true\nmqtt:\n  enabled: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(import_config))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+
+    executor = FakeExecutor()
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    client = TestClient(main.create_app(cfg, database=db, executor=executor))
+    service = client.app.state.service
+    headers = {"Authorization": f"Bearer {cfg.api_token}"}
+    held_lock = False
+    if conflict == "scan_already_running":
+        held_lock = service._scan_locks[106].acquire(blocking=False)
+        assert held_lock
+    elif conflict == "job_active":
+        plan = db.create_plan(
+            vmid=106,
+            container_name="weather",
+            fingerprint="operator-scan-conflict",
+            risk="low",
+            payload={},
+            ttl_minutes=60,
+        )
+        db.approve_plan(plan["id"])
+    else:
+        state = service.get_state(106)
+        state["lifecycle_status"] = "running"
+        service._save_state(106, state)
+
+    try:
+        response = client.post(
+            "/api/v1/containers/106/scan",
+            headers=headers,
+        )
+    finally:
+        if held_lock:
+            service._scan_locks[106].release()
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == conflict
+    assert not any(action == "scan" for action, _, _ in executor.actions)
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    ["scan_already_running", "job_active", "lifecycle_active"],
+)
+def test_internal_scan_conflicts_remain_skipped(
+    tmp_path: Path,
+    conflict: str,
+) -> None:
+    executor = FakeExecutor()
+    service, db = make_service(tmp_path, executor)
+    held_lock = False
+    if conflict == "scan_already_running":
+        held_lock = service._scan_locks[106].acquire(blocking=False)
+        assert held_lock
+    elif conflict == "job_active":
+        plan = db.create_plan(
+            vmid=106,
+            container_name="weather",
+            fingerprint="internal-scan-conflict",
+            risk="low",
+            payload={},
+            ttl_minutes=60,
+        )
+        db.approve_plan(plan["id"])
+    else:
+        state = service.get_state(106)
+        state["lifecycle_status"] = "running"
+        service._save_state(106, state)
+
+    try:
+        result = service.scan_container(106, operator=False, source="recovery")
+    finally:
+        if held_lock:
+            service._scan_locks[106].release()
+
+    assert result["vmid"] == 106
+    assert result["status"] == "skipped"
+    assert result["reason"] == conflict
+    if conflict == "job_active":
+        assert result["job_id"]
+
+
 def unhealthy(health: str) -> dict[str, Any]:
     return {
         "health_status": health,

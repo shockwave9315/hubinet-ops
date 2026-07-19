@@ -16,6 +16,15 @@ shift
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_IP="${HUBINET_OPS_AGENT_IP:-}"
 
+[[ -f "$SOURCE_DIR/lifecycle-vmids" ]] || {
+  echo "Brak lifecycle-vmids w pakiecie instalacyjnym" >&2
+  exit 1
+}
+[[ "$(sed '/^[[:space:]]*$/d' "$SOURCE_DIR/lifecycle-vmids")" == "106" ]] || {
+  echo "Lista lifecycle wydania 0.2.4 musi zawierać wyłącznie CT106" >&2
+  exit 1
+}
+
 [[ "$PUBLIC_KEY" != *$'\n'* && "$PUBLIC_KEY" != *$'\r'* ]] || {
   echo "Klucz publiczny nie może zawierać nowych linii" >&2
   exit 1
@@ -48,6 +57,7 @@ install -d -m 0700 /root/.ssh
 install -d -m 0750 /etc/hubinet-ops
 install -m 0755 "$SOURCE_DIR/hubinet-ops-host" /usr/local/sbin/hubinet-ops-host
 install -m 0640 "$TMP_ALLOWLIST" /etc/hubinet-ops/allowed-vmids
+install -m 0640 "$SOURCE_DIR/lifecycle-vmids" /etc/hubinet-ops/lifecycle-vmids
 
 AUTHORIZED_KEYS=/root/.ssh/authorized_keys
 touch "$AUTHORIZED_KEYS"
@@ -68,3 +78,5 @@ install -m 0600 "$TMP_AUTHORIZED" "$AUTHORIZED_KEYS"
 
 echo "Gotowe. Agent może wykonywać tylko wrapper, a wrapper tylko akcje z allowlisty:"
 cat /etc/hubinet-ops/allowed-vmids
+echo "Akcje lifecycle są dodatkowo ograniczone do:"
+cat /etc/hubinet-ops/lifecycle-vmids

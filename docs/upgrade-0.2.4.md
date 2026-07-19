@@ -8,6 +8,7 @@ Start and reboot report success only for the bounded LXC action and confirmed `r
 
 - CT101 Cloudflared is observation-only. Every operator capability is false in backend configuration and no dashboard control is rendered.
 - CT106 WeatherHub is the only lifecycle and live rollout target. Its rollback capability remains coupled to manual_rollback_allowed.
+- The PVE forced-command wrapper requires lifecycle VMIDs in both the existing general allowlist and `/etc/hubinet-ops/lifecycle-vmids`; the 0.2.4 lifecycle list contains only `106`, so CT101 is denied even if the wrapper is invoked directly over SSH.
 - MQTT remains telemetry/discovery only. The 10,000-byte UTF-8 state budget is unchanged.
 - No upgrade script scans, updates, starts, shuts down, reboots, repairs, or rolls back a managed CT.
 - The backend and SQLite remain authoritative; Home Assistant only invokes fixed authenticated REST endpoints.
@@ -16,11 +17,11 @@ Start and reboot report success only for the bounded LXC action and confirmed `r
 
 The PVE upgrade script backs up:
 
-1. the PVE forced-command wrapper;
+1. the PVE forced-command wrapper and the dedicated lifecycle VMID allowlist;
 2. hubinet-maint and its protected config in CT101 and CT106;
 3. agent code, requirements, systemd unit, protected agent config, and ops.db files in CT110.
 
-The CT110 service is stopped before SQLite is copied. Any failed install, import, compile, or health/version check restores all modified layers and restarts the previous agent. Tokens, MQTT credentials, SSH keys, VMID allowlists, and environment files are never replaced.
+The CT110 service is stopped before SQLite is copied. Any failed install, import, compile, or health/version check restores all modified layers and restarts the previous agent. Tokens, MQTT credentials, SSH keys, the existing general VMID allowlist, and environment files are never replaced. The dedicated lifecycle allowlist is backed up and restored transactionally, and the upgrade refuses any source list other than exactly CT106.
 
 The separate HA installer backs up the package, dashboard, and secrets.yaml. It preserves the existing webhook, notify target, bearer authorization, and every existing secret. It appends only missing lifecycle URL secrets, runs ha core check, and restores the backup on failure. It does not restart Home Assistant.
 
