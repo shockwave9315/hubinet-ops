@@ -1,4 +1,4 @@
-# Hubinet Ops 0.2.2: Mushroom dashboard, live progress notifications, authenticated REST actions.
+# Hubinet Ops 0.2.4: policy-controlled REST actions and navigation-only notifications.
 
 rest_command:
   hubinet_ops_scan_container:
@@ -47,7 +47,61 @@ rest_command:
       {"plan_id": "{{ plan_id }}"}
     timeout: 20
 
+  hubinet_ops_start_container:
+    url: !secret hubinet_ops_start_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: "{}"
+    timeout: 210
+
+  hubinet_ops_shutdown_container:
+    url: !secret hubinet_ops_shutdown_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: "{}"
+    timeout: 210
+
+  hubinet_ops_reboot_container:
+    url: !secret hubinet_ops_reboot_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: "{}"
+    timeout: 210
+
 script:
+  hubinet_ops_start_container:
+    alias: "Hubinet Ops — uruchom kontener"
+    mode: single
+    fields: &lifecycle_vmid_field
+      vmid:
+        required: true
+        selector:
+          number:
+            min: 1
+            max: 999999
+    sequence:
+      - action: rest_command.hubinet_ops_start_container
+        data:
+          vmid: "{{ vmid | int }}"
+
+  hubinet_ops_shutdown_container:
+    alias: "Hubinet Ops — wyłącz kontener łagodnie"
+    mode: single
+    fields: *lifecycle_vmid_field
+    sequence:
+      - action: rest_command.hubinet_ops_shutdown_container
+        data:
+          vmid: "{{ vmid | int }}"
+
+  hubinet_ops_reboot_container:
+    alias: "Hubinet Ops — uruchom kontener ponownie"
+    mode: single
+    fields: *lifecycle_vmid_field
+    sequence:
+      - action: rest_command.hubinet_ops_reboot_container
+        data:
+          vmid: "{{ vmid | int }}"
+
   hubinet_ops_scan_container:
     alias: "Hubinet Ops — skanuj kontener"
     mode: parallel
@@ -142,7 +196,7 @@ automation:
               - action: !secret hubinet_ops_notify_service
                 data:
                   title: "⚠️ CT{{ vmid }} {{ container }} — decyzja"
-                  message: >-
+                  message: |-
                     Dostępne aktualizacje: {{ trigger.json.pending_count | default('?') }}.
                     Ryzyko: {{ trigger.json.risk | default('unknown') }}. Otwórz panel i sprawdź plan.
                   data:
@@ -183,7 +237,12 @@ automation:
               - action: !secret hubinet_ops_notify_service
                 data:
                   title: "✅ CT{{ vmid }} {{ container }} — gotowe"
-                  message: "Aktualizacja i stabilizacja usług zakończone pomyślnie."
+                  message: >-
+                    Zaktualizowano: {{ trigger.json.packages_updated_count | default(0) }}
+                    Pozostało: {{ trigger.json.packages_remaining_count | default(0) }}
+                    APT/dpkg: {{ 'OK' if trigger.json.apt_check_ok | default(false) and trigger.json.dpkg_audit_ok | default(false) else 'BŁĄD' }}
+                    Docker: {{ trigger.json.docker_required_healthy | default(0) }}/{{ trigger.json.docker_required_total | default(0) }} healthy
+                    Restart wymagany: {{ 'tak' if trigger.json.reboot_required | default(false) else 'nie' }}
                   data:
                     tag: "{{ job_tag }}"
                     group: hubinet_ops
@@ -232,6 +291,42 @@ automation:
                     ttl: 0
                     sticky: true
                     notification_icon: mdi:alert-octagon
+                    color: "#F44336"
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
+          - conditions: "{{ event_type == 'lifecycle_success' }}"
+            sequence:
+              - action: !secret hubinet_ops_notify_service
+                data:
+                  title: "✅ CT{{ vmid }} {{ container }} — operacja zakończona"
+                  message: >-
+                    {% set labels = {'start': 'Uruchomienie', 'shutdown': 'Łagodne wyłączenie', 'reboot': 'Ponowne uruchomienie'} %}
+                    {{ labels.get(trigger.json.action, 'Operacja lifecycle') }} zakończone pomyślnie.
+                  data:
+                    tag: "hubinet_ops_ct{{ vmid }}_lifecycle"
+                    group: hubinet_ops
+                    channel: "Hubinet Ops"
+                    importance: default
+                    notification_icon: mdi:server-check
+                    color: "#4CAF50"
+                    url: "{{ dashboard_path }}"
+                    clickAction: "{{ dashboard_path }}"
+
+          - conditions: "{{ event_type == 'lifecycle_failed' }}"
+            sequence:
+              - action: !secret hubinet_ops_notify_service
+                data:
+                  title: "🚨 CT{{ vmid }} {{ container }} — błąd lifecycle"
+                  message: "{{ trigger.json.error | default('Operacja lifecycle nie powiodła się.') }}"
+                  data:
+                    tag: "hubinet_ops_ct{{ vmid }}_lifecycle"
+                    group: hubinet_ops
+                    channel: "Hubinet Ops alerts"
+                    importance: high
+                    priority: high
+                    ttl: 0
+                    notification_icon: mdi:server-off
                     color: "#F44336"
                     url: "{{ dashboard_path }}"
                     clickAction: "{{ dashboard_path }}"
@@ -347,6 +442,11 @@ automation:
         value_template: >-
           {{ not trigger.id.endswith('_recovery')
              or (trigger.from_state is not none and trigger.from_state.state in ['critical', 'offline', 'degraded']) }}
+      - condition: template
+        value_template: >-
+          {{ not trigger.id.endswith('_recovery')
+             or trigger.id.startswith('agent_')
+             or as_timestamp(state_attr(trigger.entity_id, 'recovery_notification_suppressed_until'), 0) <= as_timestamp(now()) }}
     variables:
       is_problem: "{{ trigger.id.endswith('_problem') }}"
       is_agent: "{{ trigger.id.startswith('agent_') }}"

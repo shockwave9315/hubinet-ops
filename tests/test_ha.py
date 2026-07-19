@@ -172,11 +172,10 @@ def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
         "last_update",
         "last_error",
         "last_operation_result",
-        "rollback_allowed",
     }
     per_container = {
         101: set(),
-        106: {"docker_required_healthy", "docker_required_total"},
+        106: {"docker_required_healthy", "docker_required_total", "rollback_allowed"},
     }
     assert common | per_container[106] <= keys
 

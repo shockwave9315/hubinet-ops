@@ -64,7 +64,7 @@ views:
         cards:
           - type: custom:mushroom-title-card
             title: Kontenery
-            subtitle: Dotknij kafla, aby przejść do sterowania
+            subtitle: Dotknij kafla, aby przejść do szczegółów
           - type: custom:mushroom-template-card
             entity: sensor.hubinet_ops_ct101_health_status
             primary: CT101 · Cloudflared
@@ -249,114 +249,16 @@ views:
         cards:
           - type: custom:mushroom-title-card
             title: Sterowanie
-            subtitle: Operacje wymagające decyzji zawsze pytają o potwierdzenie
-          - type: grid
-            columns: 2
-            square: false
-            cards:
-              - type: custom:mushroom-template-card
-                primary: Skanuj aktualizacje
-                secondary: Pobierz aktualną listę pakietów
-                icon: mdi:magnify
-                color: blue
-                tap_action:
-                  action: perform-action
-                  perform_action: script.hubinet_ops_scan_container
-                  data:
-                    vmid: 101
-                  confirmation:
-                    title: Skan CT101
-                    text: Sprawdzić dostępne aktualizacje?
-              - type: custom:mushroom-template-card
-                primary: Odśwież stan
-                secondary: Health, zasoby i usługi
-                icon: mdi:refresh
-                color: cyan
-                tap_action:
-                  action: perform-action
-                  perform_action: script.hubinet_ops_refresh_container
-                  data:
-                    vmid: 101
-          - type: conditional
-            conditions:
-              - condition: state
-                entity: sensor.hubinet_ops_ct101_operation_status
-                state: waiting_approval
-            card:
-              type: grid
-              columns: 2
-              square: false
-              cards:
-                - type: custom:mushroom-template-card
-                  primary: Zatwierdź aktualizację
-                  secondary: Snapshot i bezpieczna aktualizacja
-                  icon: mdi:check-decagram
-                  color: green
-                  tap_action:
-                    action: perform-action
-                    perform_action: script.hubinet_ops_approve_container
-                    data:
-                      vmid: 101
-                    confirmation:
-                      title: Aktualizacja CT101
-                      text: Zatwierdzić aktualny plan aktualizacji?
-                      confirm_text: Aktualizuj
-                      dismiss_text: Anuluj
-                - type: custom:mushroom-template-card
-                  primary: Odrzuć plan
-                  secondary: Nie wykonuj aktualizacji
-                  icon: mdi:close-circle-outline
-                  color: red
-                  tap_action:
-                    action: perform-action
-                    perform_action: script.hubinet_ops_reject_container
-                    data:
-                      vmid: 101
-                    confirmation:
-                      title: Odrzucenie planu
-                      text: Odrzucić aktualny plan CT101?
-          - type: conditional
-            conditions:
-              - condition: state
-                entity: sensor.hubinet_ops_ct101_health_status
-                state: critical
-            card:
-              type: custom:mushroom-template-card
-              primary: Ponów healthcheck
-              secondary: Sprawdź stabilizację usług jeszcze raz
-              icon: mdi:heart-pulse
-              color: amber
-              tap_action:
-                action: perform-action
-                perform_action: script.hubinet_ops_retry_healthcheck
-                data:
-                  vmid: 101
-                confirmation:
-                  text: Ponowić healthcheck CT101?
-          - type: conditional
-            conditions:
-              - condition: state
-                entity: sensor.hubinet_ops_ct101_operation_status
-                state: manual_intervention
-              - condition: state
-                entity: sensor.hubinet_ops_ct101_rollback_allowed
-                state: allowed
-            card:
-              type: custom:mushroom-template-card
-              primary: Przywróć snapshot
-              secondary: Ręczny rollback ostatniej nieudanej operacji
-              icon: mdi:backup-restore
-              color: red
-              tap_action:
-                action: perform-action
-                perform_action: script.hubinet_ops_rollback
-                data:
-                  vmid: 101
-                confirmation:
-                  title: Rollback CT101
-                  text: Przywrócić zapisany snapshot?
-                  confirm_text: Przywróć
-                  dismiss_text: Anuluj
+            subtitle: Tryb obserwacji
+          - type: custom:mushroom-template-card
+            entity: sensor.hubinet_ops_ct101_health_status
+            primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+            secondary: Telemetria, zasoby, health, aktualizacje i historia pozostają dostępne.
+            multiline_secondary: true
+            icon: mdi:eye-lock-outline
+            color: blue-grey
+            tap_action:
+              action: more-info
 
       - type: grid
         cards:
@@ -616,6 +518,104 @@ views:
             title: Sterowanie
             subtitle: Operacje wymagające decyzji zawsze pytają o potwierdzenie
           - type: grid
+            columns: 3
+            square: false
+            cards:
+              - type: conditional
+                conditions:
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_lxc_status
+                    state: stopped
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_capability_start
+                    state: allowed
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_active_job_id
+                    state: none
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_lifecycle_status
+                    state_not: running
+                card:
+                  type: custom:mushroom-template-card
+                  primary: Uruchom
+                  secondary: Start CT106
+                  icon: mdi:play-circle-outline
+                  color: green
+                  tap_action:
+                    action: perform-action
+                    perform_action: script.hubinet_ops_start_container
+                    data:
+                      vmid: 106
+                    confirmation:
+                      title: Uruchom CT106
+                      text: Uruchomić kontener CT106?
+              - type: conditional
+                conditions:
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_lxc_status
+                    state: running
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_capability_shutdown
+                    state: allowed
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_active_job_id
+                    state: none
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_lifecycle_status
+                    state_not: running
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_operation_status
+                    state_not: waiting_approval
+                card:
+                  type: custom:mushroom-template-card
+                  primary: Wyłącz łagodnie
+                  secondary: Graceful shutdown CT106
+                  icon: mdi:power
+                  color: red
+                  tap_action:
+                    action: perform-action
+                    perform_action: script.hubinet_ops_shutdown_container
+                    data:
+                      vmid: 106
+                    confirmation:
+                      title: Wyłącz łagodnie CT106
+                      text: Łagodnie wyłączyć kontener CT106? Usługi przestaną być dostępne.
+                      confirm_text: Wyłącz CT106
+                      dismiss_text: Anuluj
+              - type: conditional
+                conditions:
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_lxc_status
+                    state: running
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_capability_reboot
+                    state: allowed
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_active_job_id
+                    state: none
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_lifecycle_status
+                    state_not: running
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_operation_status
+                    state_not: waiting_approval
+                card:
+                  type: custom:mushroom-template-card
+                  primary: Uruchom ponownie
+                  secondary: Graceful reboot CT106
+                  icon: mdi:restart
+                  color: amber
+                  tap_action:
+                    action: perform-action
+                    perform_action: script.hubinet_ops_reboot_container
+                    data:
+                      vmid: 106
+                    confirmation:
+                      title: Uruchom ponownie CT106
+                      text: Łagodnie zrestartować kontener CT106? Usługi będą chwilowo niedostępne.
+                      confirm_text: Restartuj CT106
+                      dismiss_text: Anuluj
+          - type: grid
             columns: 2
             square: false
             cards:
@@ -624,6 +624,19 @@ views:
                 secondary: Pobierz aktualną listę pakietów
                 icon: mdi:magnify
                 color: blue
+                visibility:
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_lxc_status
+                    state: running
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_active_job_id
+                    state: none
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_capability_scan
+                    state: allowed
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_lifecycle_status
+                    state_not: running
                 tap_action:
                   action: perform-action
                   perform_action: script.hubinet_ops_scan_container
@@ -637,6 +650,10 @@ views:
                 secondary: Health, zasoby i usługi
                 icon: mdi:refresh
                 color: cyan
+                visibility:
+                  - condition: state
+                    entity: sensor.hubinet_ops_ct106_capability_refresh
+                    state: allowed
                 tap_action:
                   action: perform-action
                   perform_action: script.hubinet_ops_refresh_container
@@ -657,6 +674,10 @@ views:
                   secondary: Snapshot, update i stabilizacja Docker
                   icon: mdi:check-decagram
                   color: green
+                  visibility:
+                    - condition: state
+                      entity: sensor.hubinet_ops_ct106_capability_approve
+                      state: allowed
                   tap_action:
                     action: perform-action
                     perform_action: script.hubinet_ops_approve_container
@@ -672,6 +693,10 @@ views:
                   secondary: Nie wykonuj aktualizacji
                   icon: mdi:close-circle-outline
                   color: red
+                  visibility:
+                    - condition: state
+                      entity: sensor.hubinet_ops_ct106_capability_reject
+                      state: allowed
                   tap_action:
                     action: perform-action
                     perform_action: script.hubinet_ops_reject_container
@@ -691,6 +716,13 @@ views:
               secondary: Sprawdź stabilizację usług jeszcze raz
               icon: mdi:heart-pulse
               color: amber
+              visibility:
+                - condition: state
+                  entity: sensor.hubinet_ops_ct106_capability_retry_healthcheck
+                  state: allowed
+                - condition: state
+                  entity: sensor.hubinet_ops_ct106_active_job_id
+                  state: none
               tap_action:
                 action: perform-action
                 perform_action: script.hubinet_ops_retry_healthcheck
@@ -722,6 +754,76 @@ views:
                   text: Przywrócić zapisany snapshot?
                   confirm_text: Przywróć
                   dismiss_text: Anuluj
+
+      - type: grid
+        cards:
+          - type: custom:mushroom-title-card
+            title: Weryfikacja końcowa
+            subtitle: Integralność pakietów i wymagane usługi po aktualizacji
+          - type: grid
+            columns: 2
+            square: false
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_verification_status
+                name: Wynik
+                icon: mdi:check-decagram-outline
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_last_verification
+                name: Ostatnia weryfikacja
+                icon: mdi:clock-check-outline
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_apt_check
+                name: APT
+                icon: mdi:package-check
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_dpkg_audit
+                name: dpkg
+                icon: mdi:shield-check-outline
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_reboot_required
+                name: Restart wymagany
+                icon: mdi:restart-alert
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_packages_remaining
+                name: Pozostałe pakiety
+                icon: mdi:package-variant
+              - type: custom:mushroom-template-card
+                entity: sensor.hubinet_ops_ct106_docker_required_healthy
+                primary: Docker
+                secondary: >-
+                  {{ states('sensor.hubinet_ops_ct106_docker_required_healthy') }}/{{ states('sensor.hubinet_ops_ct106_docker_required_total') }} healthy
+                icon: mdi:docker
+                color: green
+
+      - type: grid
+        cards:
+          - type: custom:mushroom-title-card
+            title: Recovery scan
+            subtitle: Jednorazowy skan po rzeczywistym odzyskaniu CT106
+          - type: grid
+            columns: 2
+            square: false
+            cards:
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_recovery_scan_status
+                name: Status
+                icon: mdi:progress-clock
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_last_recovery_scan
+                name: Ostatnie uruchomienie
+                icon: mdi:calendar-refresh
+              - type: custom:mushroom-entity-card
+                entity: sensor.hubinet_ops_ct106_last_recovery_scan_result
+                name: Ostatni wynik
+                icon: mdi:text-box-check-outline
+              - type: custom:mushroom-template-card
+                entity: sensor.hubinet_ops_ct106_health_status
+                primary: Włączony
+                secondary: >-
+                  {{ 'tak' if state_attr(entity, 'recovery_scan_enabled') else 'nie' }}
+                icon: mdi:toggle-switch
+                color: blue
 
       - type: grid
         cards:
