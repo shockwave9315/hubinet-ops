@@ -1,8 +1,8 @@
-# Hubinet Ops 0.2.1
+# Hubinet Ops 0.2.3
 
 Hubinet Ops is a safety-focused operations agent for approved APT updates in allowlisted Proxmox LXC containers. The FastAPI agent runs in a dedicated container, reaches the Proxmox host through a forced-command SSH wrapper, and delegates a fixed action set to `hubinet-maint` inside managed containers.
 
-Version 0.2.1 adds optional MQTT telemetry and Home Assistant Discovery, persistent live job events, incremental update output, and stabilization windows that prevent Docker startup latency from causing an immediate rollback failure.
+Version 0.2.3 keeps the 0.2.1 update/stabilization engine and 0.2.2 Mushroom operator dashboard, while bounding the complete Home Assistant MQTT attribute payload to 10,000 UTF-8 bytes so Recorder does not reject oversized rich state.
 
 ## Safety model
 
@@ -22,7 +22,9 @@ See [architecture](docs/architecture.md), [state model](docs/state-model.md), an
 - `deploy/pve/`: forced-command Proxmox wrapper and access installer.
 - `deploy/managed/`: fixed-action managed-container executor and profiles.
 - `home-assistant/`: package, MQTT-backed dashboard, and example secrets.
-- `deploy/upgrade-0.2.1-from-pve.sh`: backed-up 0.2.0 to 0.2.1 agent upgrade.
+- `deploy/upgrade-0.2.1-from-pve.sh`: backed-up 0.2.0 to 0.2.1 platform upgrade.
+- `deploy/upgrade-0.2.3-from-pve.sh`: transactional agent-only MQTT payload upgrade.
+- `deploy/install-ha-dashboard-0.2.3-from-pve.sh`: backed-up dashboard-only 0.2.3 deployment.
 - `tests/`: fake-only unit and integration workflow tests.
 
 ## API
@@ -62,6 +64,8 @@ stabilization:
 
 Progress is best-effort, stage-weighted, monotonic, and capped at 99 until a terminal event. Package output may not map one-to-one to APT's internal work.
 
+Home Assistant rich attributes are encoded with a strict 10,000-byte budget. Scalar Discovery entities remain complete; package and recent-event previews carry authoritative total/visible/truncated metadata when details must be shortened.
+
 ## Development validation
 
 Use Python 3.13 and do not point tests at infrastructure:
@@ -78,4 +82,4 @@ Validate every `.sh` file and `deploy/pve/hubinet-ops-host` with `bash -n`. CI p
 
 ## Deployment
 
-Deployment is intentionally not automatic. Follow [deployment](docs/deployment.md) and [Home Assistant installation](docs/home-assistant.md). The 0.2.1 upgrade backs up code, config, keys, environment, and SQLite state; migrates with `/opt/hubinet-ops/.venv/bin/python`; validates before restart; and performs no scan or update.
+Deployment is intentionally not automatic. Follow [deployment](docs/deployment.md), [Home Assistant installation](docs/home-assistant.md), and the [0.2.3 upgrade guide](docs/upgrade-0.2.3.md). Upgrade scripts back up the components they replace, validate before declaring success, and perform no managed-container scan or package update.
