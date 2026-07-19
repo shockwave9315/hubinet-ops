@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -44,61 +44,3 @@ jobs:
         run: python scripts/validate_yaml.py
       - name: Reject tracked runtime files
         run: python scripts/check_tracked_files.py
-
-  fold-v023-into-core-mqtt:
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'fix/0.2.3-mqtt-attribute-budget'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: fix/0.2.3-mqtt-attribute-budget
-          fetch-depth: 0
-
-      - name: Fold the byte budget into app mqtt
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("app/mqtt.py")
-          text = path.read_text(encoding="utf-8")
-
-          security_import = "from .security import sanitize_data, sanitize_text\n"
-          budget_import = "from .mqtt_budget import bounded_state\n"
-          if text.count(security_import) != 1:
-              raise SystemExit("Unexpected security import structure")
-          if budget_import not in text:
-              text = text.replace(security_import, security_import + budget_import, 1)
-
-          if text.count('VERSION = "0.2.1"') != 1:
-              raise SystemExit("Expected exactly one legacy VERSION")
-          text = text.replace('VERSION = "0.2.1"', 'VERSION = "0.2.3"', 1)
-
-          if text.count("_bounded_state(state)") != 1:
-              raise SystemExit("Expected exactly one legacy bounded-state call")
-          text = text.replace("_bounded_state(state)", "bounded_state(state)", 1)
-
-          start_marker = "\ndef _bounded_state(value: dict[str, Any]) -> dict[str, Any]:\n"
-          end_marker = "\ndef _ct_entities() -> list[tuple[str, str, str, dict[str, Any]]]:\n"
-          if text.count(start_marker) != 1 or text.count(end_marker) != 1:
-              raise SystemExit("Unexpected legacy bounded-state function structure")
-          start = text.index(start_marker)
-          end = text.index(end_marker, start)
-          text = text[:start] + "\n" + text[end:]
-
-          path.write_text(text, encoding="utf-8", newline="\n")
-          PY
-
-      - name: Remove compatibility entrypoints and restore standard service
-        run: |
-          rm app/main_v023.py app/mqtt_v023.py
-          git show origin/main:deploy/hubinet-ops.service > deploy/hubinet-ops.service
-          git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
-          git config user.name "hubinet-ops-automation"
-          git config user.email "actions@users.noreply.github.com"
-          git add app/mqtt.py app/main_v023.py app/mqtt_v023.py deploy/hubinet-ops.service .github/workflows/ci.yml
-          git diff --cached --check
-          git commit -m "[automation] Integrate 0.2.3 budget into core MQTT"
-          git push origin HEAD:fix/0.2.3-mqtt-attribute-budget
