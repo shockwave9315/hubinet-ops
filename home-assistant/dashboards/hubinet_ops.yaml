@@ -11,133 +11,222 @@ views:
     - type: custom:mushroom-title-card
       title: Hubinet Ops
       subtitle: Pełne inventory Proxmox · backend jest źródłem prawdy
-    - type: entities
-      title: Agent
-      entities:
-      - sensor.hubinet_ops_agent_availability
-      - sensor.hubinet_ops_agent_version
-      - sensor.hubinet_ops_agent_configured_resource_count
-      - sensor.hubinet_ops_agent_configured_lxc_count
-      - sensor.hubinet_ops_agent_configured_qemu_count
-      - sensor.hubinet_ops_agent_active_job_count
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_agent_availability
+        icon: mdi:mqtt
+        content: '{{ states(entity) }}'
+        icon_color: '{{ ''green'' if is_state(entity, ''online'') else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_agent_version
+        icon: mdi:tag-outline
+        content: '{{ states(entity) }}'
+        icon_color: blue
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_agent_configured_resource_count
+        icon: mdi:server-network
+        content: '{{ states(entity) }} zasobów'
+        icon_color: blue
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_agent_active_job_count
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }} zadań'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_agent_last_refresh
+        icon: mdi:clock-outline
+        content: '{{ states(entity) }}'
+        icon_color: blue-grey
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: VM100–CT103
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_vm100_health_status
       primary: VM100 · Home Assistant
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_vm100_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_vm100_runtime_status'') }} · Guest Agent: {{ states(''sensor.hubinet_ops_vm100_guest_agent'')
+        }}'
       multiline_secondary: true
       icon: mdi:home-assistant
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/vm-100
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct101_health_status
       primary: CT101 · Cloudflared
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct101_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct101_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct101_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct101_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:cloud-lock-outline
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-101
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct102_health_status
       primary: CT102 · MariaDB
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct102_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct102_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct102_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct102_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:database
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-102
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct103_health_status
       primary: CT103 · MQTT
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct103_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct103_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct103_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct103_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:access-point-network
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-103
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: CT104–CT107
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct104_health_status
       primary: CT104 · Nextcloud
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct104_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct104_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct104_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct104_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:cloud
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-104
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct105_health_status
       primary: CT105 · AdGuard Home
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct105_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct105_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct105_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct105_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:shield-check-outline
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-105
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct106_health_status
       primary: CT106 · WeatherHub
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct106_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct106_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct106_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct106_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:weather-partly-cloudy
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-106
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct107_health_status
       primary: CT107 · Immich
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct107_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct107_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct107_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct107_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:image-multiple-outline
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-107
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: CT108–CT110
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct108_health_status
       primary: CT108 · DDNS
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct108_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct108_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct108_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct108_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:dns-outline
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-108
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct109_health_status
       primary: CT109 · Pompa
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct109_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct109_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct109_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct109_pending_update_count'') }}'
       multiline_secondary: true
       icon: mdi:water-pump
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-109
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct110_health_status
       primary: CT110 · Hubinet Ops
-      secondary: 'Zdrowie: {{ states(entity) }} · status: {{ states(''sensor.hubinet_ops_ct110_runtime_status'') }}'
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct110_runtime_status'') }} · usługa: {{ states(''sensor.hubinet_ops_ct110_service_status'')
+        }} · API: {{ states(''sensor.hubinet_ops_ct110_api_health'') }}'
       multiline_secondary: true
       icon: mdi:shield-crown-outline
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-110
@@ -151,34 +240,157 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: VM100 · Home Assistant
-      subtitle: 'Adapter: haos · critical'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_vm100_health_status
-      - sensor.hubinet_ops_vm100_health_score
-      - sensor.hubinet_ops_vm100_runtime_status
-      - sensor.hubinet_ops_vm100_uptime_seconds
-      - sensor.hubinet_ops_vm100_last_refresh
-      - sensor.hubinet_ops_vm100_last_error
-      - sensor.hubinet_ops_vm100_cpu_usage
-      - sensor.hubinet_ops_vm100_cpu_load_1m
-      - sensor.hubinet_ops_vm100_cpu_cores
-      - sensor.hubinet_ops_vm100_memory_used_bytes
-      - sensor.hubinet_ops_vm100_memory_total_bytes
-      - sensor.hubinet_ops_vm100_disk_used_bytes
-      - sensor.hubinet_ops_vm100_disk_total_bytes
-      - sensor.hubinet_ops_vm100_network_in_bytes
-      - sensor.hubinet_ops_vm100_network_out_bytes
-    - type: entities
+      subtitle: HAOS · obserwacja QEMU
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_vm100_health_status
+      primary: VM100 · Home Assistant
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_vm100_runtime_status'') }} · Guest Agent: {{ states(''sensor.hubinet_ops_vm100_guest_agent'')
+        }}'
+      multiline_secondary: true
+      icon: mdi:home-assistant
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_vm100_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_vm100_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_vm100_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_vm100_guest_agent
+        icon: mdi:lan-connect
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''available'' else ''red'' if value == ''unavailable''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: CPU i pamięć
+      subtitle: Metryki dostarczane przez Proxmox
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_cpu_usage
+        name: CPU
+        icon: mdi:cpu-64-bit
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_cpu_cores
+        name: Rdzenie CPU
+        icon: mdi:chip
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_memory_used
+        name: RAM użyta
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_memory_total
+        name: RAM łącznie
+        icon: mdi:memory
+        icon_color: purple
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Dysk i sieć
+      subtitle: Liczniki QEMU
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_disk_used
+        name: Dysk użyty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_disk_total
+        name: Dysk łącznie
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_network_received
+        name: Sieć odebrana
+        icon: mdi:download-network
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_network_sent
+        name: Sieć wysłana
+        icon: mdi:upload-network
+        icon_color: cyan
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: QEMU Guest Agent
-      entities:
-      - sensor.hubinet_ops_vm100_qemu_status
-      - sensor.hubinet_ops_vm100_guest_agent_status
-      - sensor.hubinet_ops_vm100_ip_addresses
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+      subtitle: Adres główny nie przekracza limitu stanu HA
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_qemu_status
+        name: Status QEMU
+        icon: mdi:monitor
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_guest_agent
+        name: Guest Agent
+        icon: mdi:lan-connect
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_ip_addresses
+        name: Primary IP
+        icon: mdi:ip-network
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_vm100_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_vm100_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT101
   path: ct-101
   icon: mdi:cloud-lock-outline
@@ -189,46 +401,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT101 · Cloudflared
-      subtitle: 'Adapter: apt · high'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct101_health_status
-      - sensor.hubinet_ops_ct101_health_score
-      - sensor.hubinet_ops_ct101_runtime_status
-      - sensor.hubinet_ops_ct101_uptime_seconds
-      - sensor.hubinet_ops_ct101_last_refresh
-      - sensor.hubinet_ops_ct101_last_error
-      - sensor.hubinet_ops_ct101_lxc_status
-      - sensor.hubinet_ops_ct101_operation_status
-      - sensor.hubinet_ops_ct101_job_stage
-      - sensor.hubinet_ops_ct101_job_progress
-      - sensor.hubinet_ops_ct101_risk
-      - sensor.hubinet_ops_ct101_disk_used
-      - sensor.hubinet_ops_ct101_disk_free
-      - sensor.hubinet_ops_ct101_memory_used
-      - sensor.hubinet_ops_ct101_active_plan_id
-      - sensor.hubinet_ops_ct101_active_job_id
-      - sensor.hubinet_ops_ct101_last_scan
-      - sensor.hubinet_ops_ct101_last_update
-      - sensor.hubinet_ops_ct101_last_operation_result
-      - sensor.hubinet_ops_ct101_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · high
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct101_health_status
+      primary: CT101 · Cloudflared
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct101_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct101_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct101_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:cloud-lock-outline
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct101_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct101_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct101_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct101_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct101_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct101_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct101_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct101_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct101_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct101_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct101_update_status
-      - sensor.hubinet_ops_ct101_pending_update_count
-      - sensor.hubinet_ops_ct101_verification_status
-      - sensor.hubinet_ops_ct101_apt_check_ok
-      - sensor.hubinet_ops_ct101_dpkg_audit_ok
-      - sensor.hubinet_ops_ct101_reboot_required
-      - sensor.hubinet_ops_ct101_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct101_recovery_scan_status
-      - sensor.hubinet_ops_ct101_last_recovery_scan
-      - sensor.hubinet_ops_ct101_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct101_health_status'', ''updates'') or {} %}
@@ -248,11 +656,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -263,9 +671,20 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct101_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT102
   path: ct-102
   icon: mdi:database
@@ -276,46 +695,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT102 · MariaDB
-      subtitle: 'Adapter: apt · critical'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct102_health_status
-      - sensor.hubinet_ops_ct102_health_score
-      - sensor.hubinet_ops_ct102_runtime_status
-      - sensor.hubinet_ops_ct102_uptime_seconds
-      - sensor.hubinet_ops_ct102_last_refresh
-      - sensor.hubinet_ops_ct102_last_error
-      - sensor.hubinet_ops_ct102_lxc_status
-      - sensor.hubinet_ops_ct102_operation_status
-      - sensor.hubinet_ops_ct102_job_stage
-      - sensor.hubinet_ops_ct102_job_progress
-      - sensor.hubinet_ops_ct102_risk
-      - sensor.hubinet_ops_ct102_disk_used
-      - sensor.hubinet_ops_ct102_disk_free
-      - sensor.hubinet_ops_ct102_memory_used
-      - sensor.hubinet_ops_ct102_active_plan_id
-      - sensor.hubinet_ops_ct102_active_job_id
-      - sensor.hubinet_ops_ct102_last_scan
-      - sensor.hubinet_ops_ct102_last_update
-      - sensor.hubinet_ops_ct102_last_operation_result
-      - sensor.hubinet_ops_ct102_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · critical
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct102_health_status
+      primary: CT102 · MariaDB
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct102_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct102_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct102_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:database
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct102_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct102_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct102_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct102_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct102_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct102_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct102_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct102_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct102_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct102_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct102_update_status
-      - sensor.hubinet_ops_ct102_pending_update_count
-      - sensor.hubinet_ops_ct102_verification_status
-      - sensor.hubinet_ops_ct102_apt_check_ok
-      - sensor.hubinet_ops_ct102_dpkg_audit_ok
-      - sensor.hubinet_ops_ct102_reboot_required
-      - sensor.hubinet_ops_ct102_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct102_recovery_scan_status
-      - sensor.hubinet_ops_ct102_last_recovery_scan
-      - sensor.hubinet_ops_ct102_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct102_health_status'', ''updates'') or {} %}
@@ -335,11 +950,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -350,9 +965,20 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct102_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT103
   path: ct-103
   icon: mdi:access-point-network
@@ -363,46 +989,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT103 · MQTT
-      subtitle: 'Adapter: apt · critical'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct103_health_status
-      - sensor.hubinet_ops_ct103_health_score
-      - sensor.hubinet_ops_ct103_runtime_status
-      - sensor.hubinet_ops_ct103_uptime_seconds
-      - sensor.hubinet_ops_ct103_last_refresh
-      - sensor.hubinet_ops_ct103_last_error
-      - sensor.hubinet_ops_ct103_lxc_status
-      - sensor.hubinet_ops_ct103_operation_status
-      - sensor.hubinet_ops_ct103_job_stage
-      - sensor.hubinet_ops_ct103_job_progress
-      - sensor.hubinet_ops_ct103_risk
-      - sensor.hubinet_ops_ct103_disk_used
-      - sensor.hubinet_ops_ct103_disk_free
-      - sensor.hubinet_ops_ct103_memory_used
-      - sensor.hubinet_ops_ct103_active_plan_id
-      - sensor.hubinet_ops_ct103_active_job_id
-      - sensor.hubinet_ops_ct103_last_scan
-      - sensor.hubinet_ops_ct103_last_update
-      - sensor.hubinet_ops_ct103_last_operation_result
-      - sensor.hubinet_ops_ct103_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · critical
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct103_health_status
+      primary: CT103 · MQTT
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct103_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct103_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct103_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:access-point-network
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct103_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct103_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct103_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct103_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct103_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct103_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct103_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct103_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct103_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct103_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct103_update_status
-      - sensor.hubinet_ops_ct103_pending_update_count
-      - sensor.hubinet_ops_ct103_verification_status
-      - sensor.hubinet_ops_ct103_apt_check_ok
-      - sensor.hubinet_ops_ct103_dpkg_audit_ok
-      - sensor.hubinet_ops_ct103_reboot_required
-      - sensor.hubinet_ops_ct103_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct103_recovery_scan_status
-      - sensor.hubinet_ops_ct103_last_recovery_scan
-      - sensor.hubinet_ops_ct103_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct103_health_status'', ''updates'') or {} %}
@@ -422,11 +1244,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -437,9 +1259,20 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct103_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT104
   path: ct-104
   icon: mdi:cloud
@@ -450,46 +1283,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT104 · Nextcloud
-      subtitle: 'Adapter: apt · critical'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct104_health_status
-      - sensor.hubinet_ops_ct104_health_score
-      - sensor.hubinet_ops_ct104_runtime_status
-      - sensor.hubinet_ops_ct104_uptime_seconds
-      - sensor.hubinet_ops_ct104_last_refresh
-      - sensor.hubinet_ops_ct104_last_error
-      - sensor.hubinet_ops_ct104_lxc_status
-      - sensor.hubinet_ops_ct104_operation_status
-      - sensor.hubinet_ops_ct104_job_stage
-      - sensor.hubinet_ops_ct104_job_progress
-      - sensor.hubinet_ops_ct104_risk
-      - sensor.hubinet_ops_ct104_disk_used
-      - sensor.hubinet_ops_ct104_disk_free
-      - sensor.hubinet_ops_ct104_memory_used
-      - sensor.hubinet_ops_ct104_active_plan_id
-      - sensor.hubinet_ops_ct104_active_job_id
-      - sensor.hubinet_ops_ct104_last_scan
-      - sensor.hubinet_ops_ct104_last_update
-      - sensor.hubinet_ops_ct104_last_operation_result
-      - sensor.hubinet_ops_ct104_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · critical
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct104_health_status
+      primary: CT104 · Nextcloud
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct104_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct104_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct104_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:cloud
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct104_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct104_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct104_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct104_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct104_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct104_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct104_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct104_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct104_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct104_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct104_update_status
-      - sensor.hubinet_ops_ct104_pending_update_count
-      - sensor.hubinet_ops_ct104_verification_status
-      - sensor.hubinet_ops_ct104_apt_check_ok
-      - sensor.hubinet_ops_ct104_dpkg_audit_ok
-      - sensor.hubinet_ops_ct104_reboot_required
-      - sensor.hubinet_ops_ct104_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct104_recovery_scan_status
-      - sensor.hubinet_ops_ct104_last_recovery_scan
-      - sensor.hubinet_ops_ct104_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct104_health_status'', ''updates'') or {} %}
@@ -509,11 +1538,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -524,9 +1553,20 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct104_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT105
   path: ct-105
   icon: mdi:shield-check-outline
@@ -537,46 +1577,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT105 · AdGuard Home
-      subtitle: 'Adapter: apt · critical'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct105_health_status
-      - sensor.hubinet_ops_ct105_health_score
-      - sensor.hubinet_ops_ct105_runtime_status
-      - sensor.hubinet_ops_ct105_uptime_seconds
-      - sensor.hubinet_ops_ct105_last_refresh
-      - sensor.hubinet_ops_ct105_last_error
-      - sensor.hubinet_ops_ct105_lxc_status
-      - sensor.hubinet_ops_ct105_operation_status
-      - sensor.hubinet_ops_ct105_job_stage
-      - sensor.hubinet_ops_ct105_job_progress
-      - sensor.hubinet_ops_ct105_risk
-      - sensor.hubinet_ops_ct105_disk_used
-      - sensor.hubinet_ops_ct105_disk_free
-      - sensor.hubinet_ops_ct105_memory_used
-      - sensor.hubinet_ops_ct105_active_plan_id
-      - sensor.hubinet_ops_ct105_active_job_id
-      - sensor.hubinet_ops_ct105_last_scan
-      - sensor.hubinet_ops_ct105_last_update
-      - sensor.hubinet_ops_ct105_last_operation_result
-      - sensor.hubinet_ops_ct105_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · critical
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct105_health_status
+      primary: CT105 · AdGuard Home
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct105_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct105_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct105_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:shield-check-outline
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct105_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct105_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct105_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct105_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct105_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct105_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct105_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct105_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct105_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct105_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct105_update_status
-      - sensor.hubinet_ops_ct105_pending_update_count
-      - sensor.hubinet_ops_ct105_verification_status
-      - sensor.hubinet_ops_ct105_apt_check_ok
-      - sensor.hubinet_ops_ct105_dpkg_audit_ok
-      - sensor.hubinet_ops_ct105_reboot_required
-      - sensor.hubinet_ops_ct105_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct105_recovery_scan_status
-      - sensor.hubinet_ops_ct105_last_recovery_scan
-      - sensor.hubinet_ops_ct105_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct105_health_status'', ''updates'') or {} %}
@@ -596,11 +1832,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -611,9 +1847,20 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct105_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT106
   path: ct-106
   icon: mdi:weather-partly-cloudy
@@ -624,46 +1871,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT106 · WeatherHub
-      subtitle: 'Adapter: apt · low'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct106_health_status
-      - sensor.hubinet_ops_ct106_health_score
-      - sensor.hubinet_ops_ct106_runtime_status
-      - sensor.hubinet_ops_ct106_uptime_seconds
-      - sensor.hubinet_ops_ct106_last_refresh
-      - sensor.hubinet_ops_ct106_last_error
-      - sensor.hubinet_ops_ct106_lxc_status
-      - sensor.hubinet_ops_ct106_operation_status
-      - sensor.hubinet_ops_ct106_job_stage
-      - sensor.hubinet_ops_ct106_job_progress
-      - sensor.hubinet_ops_ct106_risk
-      - sensor.hubinet_ops_ct106_disk_used
-      - sensor.hubinet_ops_ct106_disk_free
-      - sensor.hubinet_ops_ct106_memory_used
-      - sensor.hubinet_ops_ct106_active_plan_id
-      - sensor.hubinet_ops_ct106_active_job_id
-      - sensor.hubinet_ops_ct106_last_scan
-      - sensor.hubinet_ops_ct106_last_update
-      - sensor.hubinet_ops_ct106_last_operation_result
-      - sensor.hubinet_ops_ct106_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · low
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct106_health_status
+      primary: CT106 · WeatherHub
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct106_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct106_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct106_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:weather-partly-cloudy
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct106_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct106_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct106_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct106_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct106_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct106_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct106_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct106_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct106_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct106_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct106_update_status
-      - sensor.hubinet_ops_ct106_pending_update_count
-      - sensor.hubinet_ops_ct106_verification_status
-      - sensor.hubinet_ops_ct106_apt_check_ok
-      - sensor.hubinet_ops_ct106_dpkg_audit_ok
-      - sensor.hubinet_ops_ct106_reboot_required
-      - sensor.hubinet_ops_ct106_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct106_recovery_scan_status
-      - sensor.hubinet_ops_ct106_last_recovery_scan
-      - sensor.hubinet_ops_ct106_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct106_health_status'', ''updates'') or {} %}
@@ -683,11 +2126,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -698,147 +2141,268 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Docker
-      content: '**Required healthy:** {{ states(''sensor.hubinet_ops_ct106_docker_required_healthy'') }}/{{ states(''sensor.hubinet_ops_ct106_docker_required_total'')
-        }}
-
-
-        Wykryte kontenery: `{{ state_attr(''sensor.hubinet_ops_ct106_health_status'', ''docker'') }}`'
-    - type: conditional
-      conditions:
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: running
-      card:
-        type: custom:mushroom-template-card
-        primary: Odśwież stan
-        icon: mdi:shield-check-outline
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_refresh_container
-          data:
-            vmid: 106
-          confirmation:
-            text: Potwierdź akcję „Odśwież stan” dla CT106.
-    - type: conditional
-      conditions:
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: running
-      - entity: sensor.hubinet_ops_ct106_runtime_status
-        state: running
-      card:
-        type: custom:mushroom-template-card
-        primary: Sprawdź aktualizacje
-        icon: mdi:shield-check-outline
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_scan_container
-          data:
-            vmid: 106
-          confirmation:
-            text: Potwierdź akcję „Sprawdź aktualizacje” dla CT106.
-    - type: conditional
-      conditions:
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state: waiting_approval
-      card:
-        type: custom:mushroom-template-card
-        primary: Zatwierdź plan
-        icon: mdi:shield-check-outline
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_approve_container
-          data:
-            vmid: 106
-          confirmation:
-            text: Potwierdź akcję „Zatwierdź plan” dla CT106.
-    - type: conditional
-      conditions:
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state: waiting_approval
-      card:
-        type: custom:mushroom-template-card
-        primary: Odrzuć plan
-        icon: mdi:shield-check-outline
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_reject_container
-          data:
-            vmid: 106
-          confirmation:
-            text: Potwierdź akcję „Odrzuć plan” dla CT106.
-    - type: conditional
-      conditions:
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: running
-      card:
-        type: custom:mushroom-template-card
-        primary: Ponów healthcheck
-        icon: mdi:shield-check-outline
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_retry_healthcheck
-          data:
-            vmid: 106
-          confirmation:
-            text: Potwierdź akcję „Ponów healthcheck” dla CT106.
-    - type: conditional
-      conditions:
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: running
-      - entity: sensor.hubinet_ops_ct106_runtime_status
-        state: stopped
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: waiting_approval
-      card:
-        type: custom:mushroom-template-card
-        primary: Uruchom
-        icon: mdi:play
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_start_container
-          data:
-            vmid: 106
-          confirmation:
-            text: Potwierdź akcję „Uruchom” dla CT106.
-    - type: conditional
-      conditions:
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: running
-      - entity: sensor.hubinet_ops_ct106_runtime_status
-        state: running
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: waiting_approval
-      card:
-        type: custom:mushroom-template-card
-        primary: Wyłącz łagodnie
-        icon: mdi:power
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_shutdown_container
-          data:
-            vmid: 106
-          confirmation:
-            text: Potwierdź akcję „Wyłącz łagodnie” dla CT106.
-    - type: conditional
-      conditions:
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: running
-      - entity: sensor.hubinet_ops_ct106_runtime_status
-        state: running
-      - entity: sensor.hubinet_ops_ct106_operation_status
-        state_not: waiting_approval
-      card:
-        type: custom:mushroom-template-card
-        primary: Uruchom ponownie
-        icon: mdi:restart
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_reboot_container
-          data:
-            vmid: 106
-          confirmation:
-            text: Potwierdź akcję „Uruchom ponownie” dla CT106.
+      subtitle: Tylko skonfigurowane kontenery
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_docker_required_healthy
+        name: Wymagane healthy
+        icon: mdi:docker
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_docker_required_total
+        name: Wymagane łącznie
+        icon: mdi:format-list-checks
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Każda akcja wymaga potwierdzenia
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_capability_refresh
+          state: allowed
+        card:
+          type: custom:mushroom-template-card
+          primary: Odśwież stan
+          secondary: Health, zasoby i usługi
+          icon: mdi:refresh
+          color: cyan
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_refresh_container
+            data:
+              vmid: 106
+            confirmation:
+              title: Odśwież stan CT106
+              text: Pobrać aktualny stan CT106?
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lxc_status
+          state: running
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_capability_scan
+          state: allowed
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_active_job_id
+          state: none
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lifecycle_status
+          state_not: running
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state_not: running
+        card:
+          type: custom:mushroom-template-card
+          primary: Sprawdź aktualizacje
+          secondary: Pobierz aktualną listę pakietów
+          icon: mdi:magnify-scan
+          color: blue
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_scan_container
+            data:
+              vmid: 106
+            confirmation:
+              title: Skan CT106
+              text: Sprawdzić dostępne aktualizacje dla CT106?
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state: waiting_approval
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_capability_approve
+          state: allowed
+        card:
+          type: custom:mushroom-template-card
+          primary: Zatwierdź plan
+          secondary: Snapshot, update i stabilizacja usług
+          icon: mdi:check-decagram
+          color: green
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_approve_container
+            data:
+              vmid: 106
+            confirmation:
+              title: Aktualizacja CT106
+              text: Zatwierdzić aktualny plan aktualizacji CT106?
+              confirm_text: Aktualizuj
+              dismiss_text: Anuluj
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state: waiting_approval
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_capability_reject
+          state: allowed
+        card:
+          type: custom:mushroom-template-card
+          primary: Odrzuć plan
+          secondary: Nie wykonuj aktualizacji
+          icon: mdi:close-octagon-outline
+          color: red
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_reject_container
+            data:
+              vmid: 106
+            confirmation:
+              title: Odrzucenie planu CT106
+              text: Odrzucić aktualny plan CT106?
+              confirm_text: Odrzuć plan
+              dismiss_text: Anuluj
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_health_status
+          state: critical
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_capability_retry_healthcheck
+          state: allowed
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_active_job_id
+          state: none
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lifecycle_status
+          state_not: running
+        card:
+          type: custom:mushroom-template-card
+          primary: Ponów healthcheck
+          secondary: Sprawdź stabilizację usług jeszcze raz
+          icon: mdi:heart-pulse
+          color: amber
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_retry_healthcheck
+            data:
+              vmid: 106
+            confirmation:
+              title: Ponów healthcheck CT106
+              text: Ponowić healthcheck CT106?
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lxc_status
+          state: stopped
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_capability_start
+          state: allowed
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_active_job_id
+          state: none
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lifecycle_status
+          state_not: running
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state_not: waiting_approval
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state_not: running
+        card:
+          type: custom:mushroom-template-card
+          primary: Uruchom
+          secondary: Start CT106
+          icon: mdi:play
+          color: green
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_start_container
+            data:
+              vmid: 106
+            confirmation:
+              title: Uruchom CT106
+              text: Uruchomić kontener CT106?
+              confirm_text: Uruchom CT106
+              dismiss_text: Anuluj
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lxc_status
+          state: running
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_capability_shutdown
+          state: allowed
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_active_job_id
+          state: none
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lifecycle_status
+          state_not: running
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state_not: waiting_approval
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state_not: running
+        card:
+          type: custom:mushroom-template-card
+          primary: Wyłącz łagodnie
+          secondary: Graceful shutdown CT106
+          icon: mdi:power
+          color: red
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_shutdown_container
+            data:
+              vmid: 106
+            confirmation:
+              title: Wyłącz łagodnie CT106
+              text: Łagodnie wyłączyć kontener CT106? Usługi przestaną być dostępne.
+              confirm_text: Wyłącz CT106
+              dismiss_text: Anuluj
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lxc_status
+          state: running
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_capability_reboot
+          state: allowed
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_active_job_id
+          state: none
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_lifecycle_status
+          state_not: running
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state_not: waiting_approval
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_operation_status
+          state_not: running
+        card:
+          type: custom:mushroom-template-card
+          primary: Uruchom ponownie
+          secondary: Graceful reboot CT106
+          icon: mdi:restart
+          color: amber
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_reboot_container
+            data:
+              vmid: 106
+            confirmation:
+              title: Uruchom ponownie CT106
+              text: Łagodnie zrestartować kontener CT106? Usługi będą chwilowo niedostępne.
+              confirm_text: Restartuj CT106
+              dismiss_text: Anuluj
 - title: CT107
   path: ct-107
   icon: mdi:image-multiple-outline
@@ -849,46 +2413,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT107 · Immich
-      subtitle: 'Adapter: apt · high'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct107_health_status
-      - sensor.hubinet_ops_ct107_health_score
-      - sensor.hubinet_ops_ct107_runtime_status
-      - sensor.hubinet_ops_ct107_uptime_seconds
-      - sensor.hubinet_ops_ct107_last_refresh
-      - sensor.hubinet_ops_ct107_last_error
-      - sensor.hubinet_ops_ct107_lxc_status
-      - sensor.hubinet_ops_ct107_operation_status
-      - sensor.hubinet_ops_ct107_job_stage
-      - sensor.hubinet_ops_ct107_job_progress
-      - sensor.hubinet_ops_ct107_risk
-      - sensor.hubinet_ops_ct107_disk_used
-      - sensor.hubinet_ops_ct107_disk_free
-      - sensor.hubinet_ops_ct107_memory_used
-      - sensor.hubinet_ops_ct107_active_plan_id
-      - sensor.hubinet_ops_ct107_active_job_id
-      - sensor.hubinet_ops_ct107_last_scan
-      - sensor.hubinet_ops_ct107_last_update
-      - sensor.hubinet_ops_ct107_last_operation_result
-      - sensor.hubinet_ops_ct107_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · high
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct107_health_status
+      primary: CT107 · Immich
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct107_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct107_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct107_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:image-multiple-outline
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct107_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct107_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct107_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct107_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct107_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct107_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct107_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct107_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct107_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct107_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct107_update_status
-      - sensor.hubinet_ops_ct107_pending_update_count
-      - sensor.hubinet_ops_ct107_verification_status
-      - sensor.hubinet_ops_ct107_apt_check_ok
-      - sensor.hubinet_ops_ct107_dpkg_audit_ok
-      - sensor.hubinet_ops_ct107_reboot_required
-      - sensor.hubinet_ops_ct107_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct107_recovery_scan_status
-      - sensor.hubinet_ops_ct107_last_recovery_scan
-      - sensor.hubinet_ops_ct107_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct107_health_status'', ''updates'') or {} %}
@@ -908,11 +2668,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -923,9 +2683,20 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct107_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT108
   path: ct-108
   icon: mdi:dns-outline
@@ -936,46 +2707,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT108 · DDNS
-      subtitle: 'Adapter: apt · medium'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct108_health_status
-      - sensor.hubinet_ops_ct108_health_score
-      - sensor.hubinet_ops_ct108_runtime_status
-      - sensor.hubinet_ops_ct108_uptime_seconds
-      - sensor.hubinet_ops_ct108_last_refresh
-      - sensor.hubinet_ops_ct108_last_error
-      - sensor.hubinet_ops_ct108_lxc_status
-      - sensor.hubinet_ops_ct108_operation_status
-      - sensor.hubinet_ops_ct108_job_stage
-      - sensor.hubinet_ops_ct108_job_progress
-      - sensor.hubinet_ops_ct108_risk
-      - sensor.hubinet_ops_ct108_disk_used
-      - sensor.hubinet_ops_ct108_disk_free
-      - sensor.hubinet_ops_ct108_memory_used
-      - sensor.hubinet_ops_ct108_active_plan_id
-      - sensor.hubinet_ops_ct108_active_job_id
-      - sensor.hubinet_ops_ct108_last_scan
-      - sensor.hubinet_ops_ct108_last_update
-      - sensor.hubinet_ops_ct108_last_operation_result
-      - sensor.hubinet_ops_ct108_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · medium
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct108_health_status
+      primary: CT108 · DDNS
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct108_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct108_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct108_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:dns-outline
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct108_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct108_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct108_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct108_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct108_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct108_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct108_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct108_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct108_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct108_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct108_update_status
-      - sensor.hubinet_ops_ct108_pending_update_count
-      - sensor.hubinet_ops_ct108_verification_status
-      - sensor.hubinet_ops_ct108_apt_check_ok
-      - sensor.hubinet_ops_ct108_dpkg_audit_ok
-      - sensor.hubinet_ops_ct108_reboot_required
-      - sensor.hubinet_ops_ct108_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct108_recovery_scan_status
-      - sensor.hubinet_ops_ct108_last_recovery_scan
-      - sensor.hubinet_ops_ct108_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct108_health_status'', ''updates'') or {} %}
@@ -995,11 +2962,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -1010,9 +2977,20 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct108_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT109
   path: ct-109
   icon: mdi:water-pump
@@ -1023,46 +3001,242 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT109 · Pompa
-      subtitle: 'Adapter: apt · critical'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct109_health_status
-      - sensor.hubinet_ops_ct109_health_score
-      - sensor.hubinet_ops_ct109_runtime_status
-      - sensor.hubinet_ops_ct109_uptime_seconds
-      - sensor.hubinet_ops_ct109_last_refresh
-      - sensor.hubinet_ops_ct109_last_error
-      - sensor.hubinet_ops_ct109_lxc_status
-      - sensor.hubinet_ops_ct109_operation_status
-      - sensor.hubinet_ops_ct109_job_stage
-      - sensor.hubinet_ops_ct109_job_progress
-      - sensor.hubinet_ops_ct109_risk
-      - sensor.hubinet_ops_ct109_disk_used
-      - sensor.hubinet_ops_ct109_disk_free
-      - sensor.hubinet_ops_ct109_memory_used
-      - sensor.hubinet_ops_ct109_active_plan_id
-      - sensor.hubinet_ops_ct109_active_job_id
-      - sensor.hubinet_ops_ct109_last_scan
-      - sensor.hubinet_ops_ct109_last_update
-      - sensor.hubinet_ops_ct109_last_operation_result
-      - sensor.hubinet_ops_ct109_rollback_allowed
-    - type: entities
+      subtitle: Adapter APT · critical
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct109_health_status
+      primary: CT109 · Pompa
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct109_runtime_status'') }} · aktualizacje: {{ states(''sensor.hubinet_ops_ct109_update_status'')
+        }} · pakiety: {{ states(''sensor.hubinet_ops_ct109_pending_update_count'') }}'
+      multiline_secondary: true
+      icon: mdi:water-pump
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct109_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct109_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct109_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct109_update_status
+        icon: mdi:package-up
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct109_operation_status
+        icon: mdi:progress-wrench
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct109_risk
+        icon: mdi:shield-alert-outline
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct109_pending_update_count
+        icon: mdi:format-list-numbered
+        content: '{{ states(entity) }} pak.'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: green
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct109_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct109_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct109_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Weryfikacja końcowa
-      entities:
-      - sensor.hubinet_ops_ct109_update_status
-      - sensor.hubinet_ops_ct109_pending_update_count
-      - sensor.hubinet_ops_ct109_verification_status
-      - sensor.hubinet_ops_ct109_apt_check_ok
-      - sensor.hubinet_ops_ct109_dpkg_audit_ok
-      - sensor.hubinet_ops_ct109_reboot_required
-      - sensor.hubinet_ops_ct109_packages_remaining_count
-    - type: entities
+      subtitle: APT, dpkg i wynik operacji
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_verification_status
+        name: Weryfikacja
+        icon: mdi:check-decagram
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_apt_check_ok
+        name: APT check
+        icon: mdi:package-check
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_dpkg_audit_ok
+        name: dpkg audit
+        icon: mdi:shield-check-outline
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_reboot_required
+        name: Restart wymagany
+        icon: mdi:restart-alert
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_packages_remaining_count
+        name: Pakiety pozostałe
+        icon: mdi:package-variant
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Recovery scan
-      entities:
-      - sensor.hubinet_ops_ct109_recovery_scan_status
-      - sensor.hubinet_ops_ct109_last_recovery_scan
-      - sensor.hubinet_ops_ct109_last_recovery_scan_result
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i diagnostyka
+      subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
       content: '{% set updates = state_attr(''sensor.hubinet_ops_ct109_health_status'', ''updates'') or {} %}
@@ -1082,11 +3256,11 @@ views:
 
         {% endfor %}{% if visible > 30 %}
 
-        … {{ visible - 30 }} kolejnych widocznych pakietów.
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
 
         {% endif %}{% if meta.get(''truncated'') %}
 
-        Podgląd ogranicza limit atrybutów 10 KB.
+        _Podgląd ogranicza limit atrybutów 10 KB._
 
         {% endif %}'
     - type: markdown
@@ -1097,16 +3271,39 @@ views:
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-    - type: markdown
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Docker
-      content: '**Required healthy:** {{ states(''sensor.hubinet_ops_ct109_docker_required_healthy'') }}/{{ states(''sensor.hubinet_ops_ct109_docker_required_total'')
-        }}
-
-
-        Wykryte kontenery: `{{ state_attr(''sensor.hubinet_ops_ct109_health_status'', ''docker'') }}`'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+      subtitle: Tylko skonfigurowane kontenery
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_docker_required_healthy
+        name: Wymagane healthy
+        icon: mdi:docker
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_docker_required_total
+        name: Wymagane łącznie
+        icon: mdi:format-list-checks
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct109_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
 - title: CT110
   path: ct-110
   icon: mdi:shield-crown-outline
@@ -1117,41 +3314,184 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: CT110 · Hubinet Ops
-      subtitle: 'Adapter: agent_self · high'
-    - type: entities
-      title: Stan zasobu
-      entities:
-      - sensor.hubinet_ops_ct110_health_status
-      - sensor.hubinet_ops_ct110_health_score
-      - sensor.hubinet_ops_ct110_runtime_status
-      - sensor.hubinet_ops_ct110_uptime_seconds
-      - sensor.hubinet_ops_ct110_last_refresh
-      - sensor.hubinet_ops_ct110_last_error
-      - sensor.hubinet_ops_ct110_lxc_status
-      - sensor.hubinet_ops_ct110_cpu_usage
-      - sensor.hubinet_ops_ct110_cpu_load_1m
-      - sensor.hubinet_ops_ct110_cpu_cores
-      - sensor.hubinet_ops_ct110_memory_used_bytes
-      - sensor.hubinet_ops_ct110_memory_total_bytes
-      - sensor.hubinet_ops_ct110_disk_used_bytes
-      - sensor.hubinet_ops_ct110_disk_total_bytes
-      - sensor.hubinet_ops_ct110_network_in_bytes
-      - sensor.hubinet_ops_ct110_network_out_bytes
-    - type: entities
-      title: Self-health agenta
-      entities:
-      - sensor.hubinet_ops_ct110_service_status
-      - sensor.hubinet_ops_ct110_api_health
-      - sensor.hubinet_ops_ct110_agent_version
-      - sensor.hubinet_ops_agent_active_job_count
-      - sensor.hubinet_ops_agent_configured_resource_count
+      subtitle: Self-health agenta
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct110_health_status
+      primary: CT110 · Hubinet Ops
+      secondary: 'Runtime: {{ states(''sensor.hubinet_ops_ct110_runtime_status'') }} · usługa: {{ states(''sensor.hubinet_ops_ct110_service_status'')
+        }} · API: {{ states(''sensor.hubinet_ops_ct110_api_health'') }}'
+      multiline_secondary: true
+      icon: mdi:shield-crown-outline
+      color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
+        else ''red'' }}'
+      badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
+      tap_action:
+        action: more-info
+    - type: custom:mushroom-chips-card
+      alignment: justify
+      chips:
+      - type: template
+        entity: sensor.hubinet_ops_ct110_health_status
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct110_health_score
+        icon: mdi:heart-pulse
+        content: '{{ states(entity) }}%'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
+          else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct110_runtime_status
+        icon: mdi:server
+        content: '{{ states(entity) }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct110_service_status
+        icon: mdi:application-cog
+        content: '{{ states(entity) }}'
+        icon_color: '{{ ''green'' if is_state(entity, ''active'') else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct110_api_health
+        icon: mdi:api
+        content: '{{ states(entity) }}'
+        icon_color: '{{ ''green'' if states(entity) in [''healthy'', ''ok''] else ''red'' }}'
+        tap_action:
+          action: more-info
+      - type: template
+        entity: sensor.hubinet_ops_ct110_agent_version
+        icon: mdi:tag-outline
+        content: '{{ states(entity) }}'
+        icon_color: blue
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Usługa i API
+      subtitle: Lokalna kontrola CT110
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_service_status
+        name: Usługa
+        icon: mdi:application-cog
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_api_health
+        name: API health
+        icon: mdi:api
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_agent_version
+        name: Wersja
+        icon: mdi:tag-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_uptime
+        name: Uptime
+        icon: mdi:timer-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: CPU i pamięć
+      subtitle: Bez nieobsługiwanych liczników sieci
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_cpu_load_1m
+        name: Load 1m
+        icon: mdi:gauge
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_cpu_cores
+        name: Rdzenie CPU
+        icon: mdi:chip
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_memory_used
+        name: RAM użyta
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_memory_total
+        name: RAM łącznie
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_memory_available
+        name: RAM dostępna
+        icon: mdi:memory-arrow-down
+        icon_color: cyan
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Dysk
+      subtitle: Lokalny system plików agenta
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_disk_used
+        name: Dysk użyty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_disk_total
+        name: Dysk łącznie
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct110_disk_free
+        name: Dysk wolny
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Ostatnie ostrzeżenia
+      subtitle: Maksymalnie 20 bezpiecznie zredagowanych wpisów
+    - type: custom:mushroom-entity-card
+      entity: sensor.hubinet_ops_ct110_recent_warnings
+      name: Liczba ostrzeżeń
+      icon: mdi:alert-outline
+      icon_color: amber
     - type: markdown
-      title: Ostatnie warning/error
+      title: Podgląd techniczny
       content: '{% set warnings = state_attr(''sensor.hubinet_ops_ct110_health_status'', ''recent_warnings'') or [] %}
 
         {% for warning in warnings[-20:] | reverse %}- {{ warning | replace(''|'', ''¦'') }}
 
-        {% endfor %}'
-    - type: markdown
-      title: Tryb obserwacji
-      content: Tryb obserwacji — sterowanie zablokowane przez politykę backendu.
+        {% endfor %}{% if not warnings %}Brak ostatnich ostrzeżeń.{% endif %}'
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct110_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info

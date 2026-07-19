@@ -74,8 +74,10 @@ class SelfInspector:
         except OSError as exc:
             LOGGER.warning("Local disk inspection failed: %s", sanitize_text(exc, limit=300))
             disk_data = {}
+        service_active = service_status == "active"
         return {
-            "health_status": "healthy" if service_status == "active" else "degraded",
+            "health_status": "healthy" if service_active else "degraded",
+            "health_score": 100 if service_active else 25,
             "service_status": service_status,
             "api_health": "ok",
             "agent_version": VERSION,

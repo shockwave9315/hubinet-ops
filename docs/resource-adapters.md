@@ -6,7 +6,7 @@ Uses PVE `pct status`, the fixed `hubinet-maint` actions, LXC snapshots, stabili
 
 ## `haos` / QEMU
 
-Read-only in 0.3.0. The PVE wrapper uses `qm status`, `pvesh .../status/current`, and the fixed `qm guest cmd VMID network-get-interfaces` request. It reports runtime, CPU, RAM, disk, network, uptime, name, Guest Agent availability, and bounded IP addresses. Missing Guest Agent is a field value (`unavailable`), not a VM health failure. No Home Assistant Core, Supervisor, or HAOS update API is implemented.
+Read-only in 0.3.1. The PVE wrapper uses `qm status`, `pvesh .../status/current`, and the fixed `qm guest cmd VMID network-get-interfaces` request. It reports runtime, CPU, RAM, disk, network, uptime, name, Guest Agent availability, and bounded IP addresses. Missing Guest Agent is a field value (`unavailable`), not a VM health failure. No Home Assistant Core, Supervisor, or HAOS update API is implemented.
 
 ## `agent_self` / CT110
 

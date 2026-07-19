@@ -70,6 +70,12 @@ def config(**overrides: Any) -> dict[str, Any]:
     return value
 
 
+def apt_resource(**overrides: Any) -> dict[str, Any]:
+    value = {"resource_type": "lxc", "adapter": "apt"}
+    value.update(overrides)
+    return value
+
+
 def wait_for(predicate, timeout: float = 3) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -83,7 +89,7 @@ def test_topics_retention_discovery_lwt_and_stable_ids() -> None:
     client = FakeClient("agent")
     telemetry = MqttTelemetry(
         config(),
-        {106: {"dashboard_path": "/hubinet-ops/ct-106"}},
+        {106: apt_resource(dashboard_path="/hubinet-ops/ct-106")},
         client_factory=lambda **kwargs: client,
     )
     telemetry.set_state_provider(
@@ -180,7 +186,9 @@ def test_resource_discovery_uses_type_specific_ids_models_and_agent_counts() -> 
 
 def test_unchanged_retained_state_is_not_republished() -> None:
     client = FakeClient("agent")
-    telemetry = MqttTelemetry(config(), {}, client_factory=lambda **kwargs: client)
+    telemetry = MqttTelemetry(
+        config(), {106: apt_resource()}, client_factory=lambda **kwargs: client
+    )
     telemetry.set_state_provider(lambda: ({"version": "0.2.1"}, []))
     telemetry.start()
     state = {"vmid": 106, "health_status": "healthy"}
@@ -220,7 +228,15 @@ def test_credentials_are_redacted_from_startup_errors(caplog) -> None:
 
 def test_reconnect_republishes_discovery_and_full_state() -> None:
     client = FakeClient("agent")
-    telemetry = MqttTelemetry(config(), {106: {}}, client_factory=lambda **kwargs: client)
+    telemetry = MqttTelemetry(
+        config(),
+        {
+            100: {"resource_type": "qemu", "adapter": "haos"},
+            106: apt_resource(),
+            110: {"resource_type": "lxc", "adapter": "agent_self"},
+        },
+        client_factory=lambda **kwargs: client,
+    )
     telemetry.set_state_provider(
         lambda: (
             {"version": "0.2.1"},
@@ -237,12 +253,26 @@ def test_reconnect_republishes_discovery_and_full_state() -> None:
     wait_for(
         lambda: sum(1 for item in client.published if item[0] == discovery_topic) >= 2
     )
+    obsolete_topics = {
+        "homeassistant/sensor/hubinet_ops_vm100_cpu_load_1m/config",
+        "homeassistant/sensor/hubinet_ops_ct110_cpu_usage/config",
+        "homeassistant/sensor/hubinet_ops_ct110_network_in_bytes/config",
+        "homeassistant/sensor/hubinet_ops_ct110_network_out_bytes/config",
+    }
+    wait_for(
+        lambda: all(
+            sum(1 for topic, payload, _, retain in client.published if topic == expected and payload == "" and retain) >= 2
+            for expected in obsolete_topics
+        )
+    )
     telemetry.stop()
 
 
 def test_state_attributes_are_bounded() -> None:
     client = FakeClient("agent")
-    telemetry = MqttTelemetry(config(), {}, client_factory=lambda **kwargs: client)
+    telemetry = MqttTelemetry(
+        config(), {106: apt_resource()}, client_factory=lambda **kwargs: client
+    )
     telemetry.set_state_provider(lambda: ({"version": "0.2.1"}, []))
     telemetry.start()
     telemetry.publish_container_state(
@@ -263,7 +293,9 @@ def test_state_attributes_are_bounded() -> None:
 
 def test_disconnected_publisher_preserves_fifo_without_queue_rotation() -> None:
     client = FakeClient("agent", auto_connect=False)
-    telemetry = MqttTelemetry(config(), {}, client_factory=lambda **kwargs: client)
+    telemetry = MqttTelemetry(
+        config(), {106: apt_resource()}, client_factory=lambda **kwargs: client
+    )
     telemetry.start()
     telemetry.publish_container_state(106, {"sequence": 1})
     telemetry.publish_container_state(106, {"sequence": 2}, force=True)

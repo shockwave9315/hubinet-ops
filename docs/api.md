@@ -1,4 +1,4 @@
-# REST API 0.3.0
+# REST API 0.3.1
 
 Every `/api/v1` route requires `Authorization: Bearer …`. A policy, adapter, state, or concurrency conflict returns HTTP 409; unknown resources return 404.
 

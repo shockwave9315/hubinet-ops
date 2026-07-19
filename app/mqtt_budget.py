@@ -73,10 +73,21 @@ def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
             compact[key] = sanitize_text(item, limit=2000 if key == "last_error" else 512)
 
     for key, fields in {
-        "disk": ("used_percent", "free_mb"),
-        "memory": ("used_percent",),
+        "disk": (
+            "used_percent",
+            "free_mb",
+            "used_bytes",
+            "total_bytes",
+            "free_bytes",
+        ),
+        "memory": (
+            "used_percent",
+            "used_bytes",
+            "total_bytes",
+            "available_bytes",
+        ),
         "docker": ("enabled", "available", "required_healthy", "required_total"),
-        "cpu": ("usage", "cores", "load_1m"),
+        "cpu": ("usage", "usage_percent", "cores", "load_1m"),
         "network": ("in_bytes", "out_bytes"),
     }.items():
         source = _mapping(state.get(key))

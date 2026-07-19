@@ -65,6 +65,11 @@ exec "$@"
 '
 write_stub grep '
 for arg in "$@"; do
+  if [[ "$arg" == '\''VERSION = "0.2.4"'\'' ]]; then
+    # This legacy installer smoke runs from a newer checkout. Its purpose is to
+    # exercise the fixed remote command flow, not to downgrade the source tree.
+    exit 0
+  fi
   if [[ "$arg" == "/etc/hubinet-ops/allowed-vmids" ]]; then
     [[ " $* " == *" 101 "* || " $* " == *" 106 "* ]]
     exit
@@ -117,9 +122,11 @@ bash "$ROOT/deploy/upgrade-0.2.4-from-pve.sh" 110 106
 
 printf "101\n106\n" > "$TMP_ROOT/allowed-vmids"
 printf "106\n" > "$TMP_ROOT/lifecycle-vmids"
+printf "101 lxc\n106 lxc\n" > "$TMP_ROOT/resource-types"
 sed \
-  -e "s|^ALLOWLIST=.*|ALLOWLIST=\"$TMP_ROOT/allowed-vmids\"|" \
+  -e "s|^OBSERVATION_ALLOWLIST=.*|OBSERVATION_ALLOWLIST=\"$TMP_ROOT/allowed-vmids\"|" \
   -e "s|^LIFECYCLE_ALLOWLIST=.*|LIFECYCLE_ALLOWLIST=\"$TMP_ROOT/lifecycle-vmids\"|" \
+  -e "s|^RESOURCE_TYPES=.*|RESOURCE_TYPES=\"$TMP_ROOT/resource-types\"|" \
   "$ROOT/deploy/pve/hubinet-ops-host" > "$TMP_ROOT/hubinet-ops-host"
 chmod +x "$TMP_ROOT/hubinet-ops-host"
 if denied="$(SSH_ORIGINAL_COMMAND='start 101' bash "$TMP_ROOT/hubinet-ops-host" 2>&1)"; then
