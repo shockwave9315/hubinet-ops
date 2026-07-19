@@ -122,10 +122,16 @@ def _minimal_state(state: dict[str, Any]) -> dict[str, Any]:
 
 def bounded_state(value: dict[str, Any]) -> dict[str, Any]:
     sanitized = sanitize_data(value)
+    updates_source = dict(sanitized.get("updates") or {})
     packages_source = [
         _package_preview(item)
-        for item in list(dict(sanitized.get("updates") or {}).get("packages") or [])[:200]
+        for item in list(updates_source.get("packages") or [])[:200]
     ]
+    packages_total = max(
+        len(packages_source),
+        _safe_int(sanitized.get("pending_updates"), 0),
+        _safe_int(updates_source.get("pending_count"), 0),
+    )
     events_source = [
         _event_preview(item)
         for item in list(sanitized.get("recent_job_events") or [])[-50:]
@@ -138,7 +144,7 @@ def bounded_state(value: dict[str, Any]) -> dict[str, Any]:
     state["recent_job_events"] = []
     state["attribute_payload"] = {
         "budget_bytes": HA_ATTRIBUTE_BUDGET_BYTES,
-        "packages_total": len(packages_source),
+        "packages_total": packages_total,
         "packages_visible": 0,
         "events_total": len(events_source),
         "events_visible": 0,
@@ -151,11 +157,11 @@ def bounded_state(value: dict[str, Any]) -> dict[str, Any]:
         state["recent_job_events"] = []
         state["attribute_payload"] = {
             "budget_bytes": HA_ATTRIBUTE_BUDGET_BYTES,
-            "packages_total": len(packages_source),
+            "packages_total": packages_total,
             "packages_visible": 0,
             "events_total": len(events_source),
             "events_visible": 0,
-            "truncated": bool(packages_source or events_source),
+            "truncated": bool(packages_total or events_source),
         }
 
     package_index = 0
