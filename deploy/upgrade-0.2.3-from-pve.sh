@@ -22,7 +22,7 @@ COMPLETE=0
   echo "Run this script from a complete 0.2.3 source tree." >&2
   exit 1
 }
-grep -Fq 'VERSION = "0.2.3"' "$SOURCE_DIR/app/mqtt_v023.py" || {
+grep -Fq 'VERSION = "0.2.3"' "$SOURCE_DIR/app/mqtt.py" || {
   echo "Source tree is not Hubinet Ops 0.2.3" >&2
   exit 1
 }
