@@ -108,7 +108,8 @@ class Stabilizer:
             inspect_timeout = max(1, min(120, int(math.ceil(remaining)) or 1))
             try:
                 result = self.executor.run("inspect", vmid, timeout=inspect_timeout)
-                last_data = dict(result.get("data", {}))
+                raw_data = result.get("data") if isinstance(result, dict) else None
+                last_data = dict(raw_data) if isinstance(raw_data, dict) else {}
                 last_error = None
                 ok = self._is_stable(last_data)
             except ExecutorError as exc:

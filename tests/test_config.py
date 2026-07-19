@@ -215,6 +215,57 @@ def test_legacy_containers_are_exposed_as_lxc_resources_without_file_rewrite(
     assert "resources" not in raw
 
 
+def test_legacy_recovery_scan_uses_same_monitoring_default_during_validation_and_load(
+    tmp_path: Path,
+) -> None:
+    raw = {
+        "containers": {
+            106: {
+                "enabled": True,
+                "operator_capabilities": {"scan": False},
+                "recovery_scan": {
+                    "enabled": True,
+                    "delay_seconds": 90,
+                    "cooldown_seconds": 900,
+                },
+            }
+        },
+        "mqtt": {"enabled": False},
+    }
+
+    validate_config(raw)
+    loaded = Settings(
+        raw=raw,
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "ops.db",
+        api_token="x" * 64,
+    )
+
+    assert loaded.resources[106]["monitoring"] == {
+        "inspect": True,
+        "update_scan": True,
+    }
+
+
+def test_production_monitoring_scheduler_is_enabled_for_observation_scans() -> None:
+    import yaml
+    from pathlib import Path
+
+    raw = yaml.safe_load(Path("config/config.example.yaml").read_text(encoding="utf-8"))
+    validate_config(raw)
+
+    assert raw["monitoring_scheduler"] == {
+        "enabled": True,
+        "scan_interval_minutes": 360,
+        "initial_scan_delay_seconds": 60,
+    }
+    for vmid in (101, 102, 103, 104, 105, 107, 108, 109):
+        assert raw["resources"][vmid]["monitoring"]["update_scan"] is True
+        assert raw["resources"][vmid]["operator_capabilities"]["scan"] is False
+    assert raw["resources"][100]["monitoring"]["update_scan"] is False
+    assert raw["resources"][110]["monitoring"]["update_scan"] is False
+
+
 def test_resources_and_containers_conflict_fails_closed() -> None:
     with pytest.raises(RuntimeError, match="cannot be configured together"):
         validate_config({"resources": {101: {}}, "containers": {101: {}}})

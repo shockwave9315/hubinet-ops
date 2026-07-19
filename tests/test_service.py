@@ -11,7 +11,7 @@ from app.config import Settings
 from app.database import Database
 from app.executor import ExecutorError
 from app.service import OpsService
-from app.stabilization import Stabilizer
+from app.stabilization import StabilizationPolicy, Stabilizer
 
 
 class FakeClock:
@@ -257,6 +257,45 @@ def test_observation_scan_reports_updates_without_creating_unapprovable_plan(
     assert db.find_active_plan(101) is None
 
 
+def test_production_periodic_scan_targets_only_apt_lxc_resources(
+    tmp_path: Path,
+) -> None:
+    import yaml
+
+    raw = yaml.safe_load(Path("config/config.example.yaml").read_text(encoding="utf-8"))
+    cfg = Settings(
+        raw=raw,
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "inventory.db",
+        api_token="t" * 64,
+    )
+
+    class InventoryExecutor(WorkflowExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.vmids: list[int] = []
+
+        def run(self, action: str, vmid: int, **kwargs: Any) -> dict[str, Any]:
+            if action == "scan":
+                self.vmids.append(vmid)
+            return super().run(action, vmid, **kwargs)
+
+    executor = InventoryExecutor()
+    service = OpsService(cfg, Database(cfg.db_path), executor)
+
+    results = service.scan_all(operator=False)
+
+    assert cfg.monitoring_scheduler["enabled"] is True
+    assert executor.vmids == list(range(101, 110))
+    assert len(results) == 9
+    assert all(item["status"] == "up_to_date" for item in results)
+    assert 100 not in executor.vmids
+    assert 110 not in executor.vmids
+    for vmid in (101, 102, 103, 104, 105, 107, 108, 109):
+        with pytest.raises(ValueError, match="scan.*blocked"):
+            service.scan_container(vmid, operator=True)
+
+
 def test_agent_self_state_adds_inventory_jobs_and_mqtt_without_secrets(
     tmp_path: Path,
 ) -> None:
@@ -347,6 +386,166 @@ def approved_job(service: OpsService, db: Database) -> dict[str, Any]:
     job = db.next_queued_job()
     assert job is not None
     return job
+
+
+def test_get_resource_builds_only_requested_item_with_one_state_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = Settings(
+        raw={
+            "resources": {
+                vmid: {
+                    "resource_type": "lxc",
+                    "adapter": "apt",
+                    "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": False},
+                    "operator_capabilities": {},
+                }
+                for vmid in (101, 102, 103)
+            },
+            "mqtt": {"enabled": False},
+        },
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "single-resource.db",
+        api_token="x" * 64,
+    )
+    db = Database(cfg.db_path)
+    service = OpsService(cfg, db, WorkflowExecutor())
+    calls: list[int] = []
+    original = db.get_resource_state
+
+    def counted(vmid: int) -> dict[str, Any] | None:
+        calls.append(vmid)
+        return original(vmid)
+
+    monkeypatch.setattr(db, "get_resource_state", counted)
+
+    item = service.get_resource(102)
+
+    assert item["vmid"] == 102
+    assert calls == [102]
+
+
+def test_executor_data_null_is_safe_across_refresh_scan_and_lifecycle(
+    tmp_path: Path,
+) -> None:
+    class NullDataExecutor(WorkflowExecutor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.status_calls = 0
+
+        def run(self, action: str, vmid: int, **kwargs: Any) -> dict[str, Any]:
+            if action in {"inspect", "scan"}:
+                self.actions.append(action)
+                return {"ok": True, "data": None}
+            if action == "status":
+                self.status_calls += 1
+                if self.status_calls == 1:
+                    return {"ok": True, "data": {"lxc_status": "running"}}
+                return {"ok": True, "data": None}
+            if action == "reboot":
+                return {"ok": True, "data": None}
+            return super().run(action, vmid, **kwargs)
+
+    service, _ = service_with(tmp_path, NullDataExecutor())
+
+    assert service.refresh_container(106)["health_status"] == "unknown"
+    assert service.scan_container(106)["status"] == "up_to_date"
+    with pytest.raises(ValueError, match="expected running, got unknown"):
+        service.lifecycle_container(106, "reboot")
+
+    class NullInitialStatusExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, **kwargs: Any) -> dict[str, Any]:
+            if action == "status":
+                return {"ok": True, "data": None}
+            return super().run(action, vmid, **kwargs)
+
+    initial_status_path = tmp_path / "initial-status"
+    initial_status_path.mkdir()
+    second, _ = service_with(
+        initial_status_path,
+        NullInitialStatusExecutor(),
+    )
+    with pytest.raises(ValueError, match="current state is unknown"):
+        second.lifecycle_container(106, "start")
+
+
+def test_null_preflight_data_blocks_job_without_type_error(tmp_path: Path) -> None:
+    class NullPreflightExecutor(WorkflowExecutor):
+        def run(
+            self,
+            action: str,
+            vmid: int,
+            argument: Any = None,
+            timeout: Any = None,
+            on_event: Any = None,
+        ) -> dict[str, Any]:
+            if action == "preflight":
+                return {"ok": True, "data": None}
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    service, db = service_with(tmp_path, NullPreflightExecutor())
+    job = approved_job(service, db)
+
+    service._run_job(job)
+
+    assert db.get_job(job["id"])["status"] == "blocked"
+
+
+def test_null_update_and_verify_data_do_not_change_success_to_worker_error(
+    tmp_path: Path,
+) -> None:
+    class NullUpdateVerifyExecutor(WorkflowExecutor):
+        def run(
+            self,
+            action: str,
+            vmid: int,
+            argument: Any = None,
+            timeout: Any = None,
+            on_event: Any = None,
+        ) -> dict[str, Any]:
+            if action in {"update", "verify"}:
+                return {"ok": True, "data": None}
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    service, db = service_with(tmp_path, NullUpdateVerifyExecutor())
+    job = approved_job(service, db)
+
+    service._run_job(job)
+
+    completed = db.get_job(job["id"])
+    assert completed["status"] == "success"
+    assert service.get_state(106)["packages_updated_count"] == 0
+
+
+def test_stabilization_treats_null_executor_data_as_unhealthy_not_type_error() -> None:
+    class NullInspectExecutor:
+        def run(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return {"ok": True, "data": None}
+
+    clock = FakeClock()
+    stabilizer = Stabilizer(
+        NullInspectExecutor(),  # type: ignore[arg-type]
+        threading.Event(),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    policy = StabilizationPolicy(
+        post_update_timeout_seconds=1,
+        poll_interval_seconds=1,
+        initial_grace_seconds=0,
+        required_consecutive_successes=1,
+    )
+
+    with pytest.raises(ExecutorError, match="stabilization timed out"):
+        stabilizer.wait(
+            vmid=106,
+            phase="update",
+            timeout_seconds=1,
+            policy=policy,
+            emit=lambda **kwargs: None,
+        )
 
 
 def test_refresh_preserves_failed_operation_state(tmp_path: Path) -> None:

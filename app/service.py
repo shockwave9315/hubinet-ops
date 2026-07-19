@@ -97,7 +97,13 @@ class OpsService:
         self._worker.start()
         self._telemetry.start()
         self._recovery_worker.start()
-        if bool(self.settings.scheduler.get("enabled", False)):
+        monitoring_scheduler = self.settings.monitoring_scheduler
+        if bool(
+            monitoring_scheduler.get(
+                "enabled",
+                self.settings.scheduler.get("enabled", False),
+            )
+        ):
             self._scheduler.start()
 
     def stop(self) -> None:
@@ -117,33 +123,35 @@ class OpsService:
         ]
 
     def list_resources(self) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        for vmid, cfg in sorted(self.settings.resources.items()):
-            item = {
-                "vmid": vmid,
-                "resource_type": cfg.get("resource_type", "lxc"),
-                "name": cfg.get("name", f"resource-{vmid}"),
-                "display_name": cfg.get("display_name", cfg.get("name", f"resource-{vmid}")),
-                "enabled": bool(cfg.get("enabled", False)),
-                "adapter": cfg.get("adapter", "apt"),
-                "criticality": cfg.get("criticality", "medium"),
-                "ip_address": cfg.get("ip_address"),
-                "guest_agent": bool(cfg.get("guest_agent", False)),
-                "approval_mode": cfg.get("approval_mode", "always"),
-                "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
-                "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
-                "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                "operator_capabilities": self._capabilities(vmid),
-                "monitoring": self._monitoring(vmid),
-            }
-            state = self.db.get_resource_state(vmid)
-            item["state"] = state or {}
-            result.append(item)
-        return result
+        return [
+            self._resource_item(vmid, cfg)
+            for vmid, cfg in sorted(self.settings.resources.items())
+        ]
 
     def get_resource(self, vmid: int) -> dict[str, Any]:
-        self._resource(vmid)
-        return next(item for item in self.list_resources() if item["vmid"] == int(vmid))
+        normalized_vmid = int(vmid)
+        return self._resource_item(normalized_vmid, self._resource(normalized_vmid))
+
+    def _resource_item(self, vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+        item = {
+            "vmid": vmid,
+            "resource_type": cfg.get("resource_type", "lxc"),
+            "name": cfg.get("name", f"resource-{vmid}"),
+            "display_name": cfg.get("display_name", cfg.get("name", f"resource-{vmid}")),
+            "enabled": bool(cfg.get("enabled", False)),
+            "adapter": cfg.get("adapter", "apt"),
+            "criticality": cfg.get("criticality", "medium"),
+            "ip_address": cfg.get("ip_address"),
+            "guest_agent": bool(cfg.get("guest_agent", False)),
+            "approval_mode": cfg.get("approval_mode", "always"),
+            "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
+            "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
+            "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
+            "operator_capabilities": self._capabilities(vmid),
+            "monitoring": self._monitoring(vmid),
+            "state": self.db.get_resource_state(vmid) or {},
+        }
+        return item
 
     def list_states(self) -> dict[str, Any]:
         resources = {
@@ -180,7 +188,7 @@ class OpsService:
             self._observe_health(vmid, str(saved.get("health_status", "unknown")))
             return saved
         try:
-            inspected = self.executor.run("inspect", vmid, timeout=120).get("data", {})
+            inspected = _executor_data(self.executor.run("inspect", vmid, timeout=120))
             # Inspect may take long enough for a job to reach a terminal state.
             # Re-read the latest DB state after I/O so telemetry cannot resurrect
             # stale operation/plan/job fields captured before that transition.
@@ -310,7 +318,7 @@ class OpsService:
             state["last_error"] = None
         self._save_state(vmid, state)
         try:
-            data = self.executor.run("scan", vmid, timeout=700).get("data", {})
+            data = _executor_data(self.executor.run("scan", vmid, timeout=700))
         except ExecutorError as exc:
             state = self.get_state(vmid)
             state.update(
@@ -558,7 +566,7 @@ class OpsService:
 
             try:
                 status_result = self.executor.run("status", vmid, timeout=30)
-                status_data = status_result.get("data", {})
+                status_data = _executor_data(status_result)
                 lxc_status = str(
                     status_data.get("lxc_status")
                     or status_data.get("runtime_status")
@@ -600,7 +608,7 @@ class OpsService:
             try:
                 self.executor.run(action, vmid, timeout=180)
                 verified = self.executor.run("status", vmid, timeout=30)
-                verified_data = verified.get("data", {})
+                verified_data = _executor_data(verified)
                 final_lxc = str(
                     verified_data.get("lxc_status")
                     or verified_data.get("runtime_status")
@@ -938,6 +946,7 @@ class OpsService:
         try:
             preflight = self._execute("preflight", vmid, 700, emit)
             self._validate_approved_plan(job, preflight)
+            preflight_updates = dict(_executor_data(preflight).get("updates") or {})
             emit(
                 stage="preflight",
                 progress=15,
@@ -950,9 +959,7 @@ class OpsService:
                 event_type="package_lists_refreshed",
                 message="Package lists refreshed and update plan revalidated",
                 details={
-                    "pending_count": preflight.get("data", {})
-                    .get("updates", {})
-                    .get("pending_count")
+                    "pending_count": preflight_updates.get("pending_count")
                 },
             )
             if auto_rollback:
@@ -1029,7 +1036,7 @@ class OpsService:
                 )
                 self._save_state(vmid, state)
                 raise
-            verification_data = dict(verification.get("data") or {})
+            verification_data = _executor_data(verification)
             updates = dict(verification_data.get("updates") or {})
             updates["packages"] = list(updates.get("packages") or [])[:200]
             final_apt_scan_ok = bool(
@@ -1052,7 +1059,7 @@ class OpsService:
             )
             packages_updated = max(
                 0,
-                int(update.get("data", {}).get("package_total", 0) or 0),
+                int(_executor_data(update).get("package_total", 0) or 0),
             )
             raw_reboot_required = verification_data.get("reboot_required")
             reboot_required = (
@@ -1182,7 +1189,7 @@ class OpsService:
         preflight: dict[str, Any],
     ) -> None:
         plan = self.db.get_plan(job["plan_id"])
-        updates = dict(preflight.get("data", {}).get("updates") or {})
+        updates = dict(_executor_data(preflight).get("updates") or {})
         pending = max(0, int(updates.get("pending_count", 0) or 0))
         fingerprint = str(updates.get("fingerprint") or _fingerprint(updates))
         if pending <= 0:
@@ -1691,13 +1698,25 @@ class OpsService:
             self._save_state(vmid, state)
 
     def _scheduler_loop(self) -> None:
+        scheduler = self.settings.monitoring_scheduler
         if self._stop.wait(
-            int(self.settings.scheduler.get("initial_scan_delay_seconds", 60))
+            int(
+                scheduler.get(
+                    "initial_scan_delay_seconds",
+                    self.settings.scheduler.get("initial_scan_delay_seconds", 60),
+                )
+            )
         ):
             return
         interval = max(
             60,
-            int(self.settings.scheduler.get("scan_interval_minutes", 360)) * 60,
+            int(
+                scheduler.get(
+                    "scan_interval_minutes",
+                    self.settings.scheduler.get("scan_interval_minutes", 360),
+                )
+            )
+            * 60,
         )
         while not self._stop.is_set():
             try:
@@ -1837,6 +1856,13 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return int(default)
+
+
+def _executor_data(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    data = result.get("data")
+    return dict(data) if isinstance(data, dict) else {}
 
 
 def _fingerprint(data: dict[str, Any]) -> str:

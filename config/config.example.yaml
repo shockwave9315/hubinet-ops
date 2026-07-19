@@ -12,11 +12,16 @@ executor:
 
 scheduler:
   enabled: false
-  scan_interval_minutes: 360
-  initial_scan_delay_seconds: 60
   approval_ttl_minutes: 1440
   state_refresh_seconds: 30
   initial_refresh_delay_seconds: 5
+
+# Read-only APT availability checks are intentionally independent from manual
+# operator scan/update permissions. They never approve or install packages.
+monitoring_scheduler:
+  enabled: true
+  scan_interval_minutes: 360
+  initial_scan_delay_seconds: 60
 
 mqtt:
   enabled: false

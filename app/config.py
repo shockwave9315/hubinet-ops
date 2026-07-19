@@ -69,6 +69,10 @@ class Settings:
         return self.raw.get("scheduler", {})
 
     @property
+    def monitoring_scheduler(self) -> dict[str, Any]:
+        return self.raw.get("monitoring_scheduler", {})
+
+    @property
     def home_assistant(self) -> dict[str, Any]:
         return self.raw.get("home_assistant", {})
 
@@ -204,14 +208,7 @@ def validate_config(raw: dict[str, Any]) -> None:
                     f"Resource {vmid} operator_capabilities.{capability} must be a boolean"
                 )
 
-        monitoring_default = {
-            "inspect": True,
-            "update_scan": bool(capabilities.get("scan", False))
-            or bool(
-                isinstance(value.get("recovery_scan"), dict)
-                and value.get("recovery_scan", {}).get("enabled", False)
-            ),
-        }
+        monitoring_default = _legacy_monitoring_default(value)
         monitoring = value.get("monitoring", monitoring_default if legacy else None)
         if not isinstance(monitoring, dict):
             raise RuntimeError(f"Resource {vmid} monitoring must be an object")
@@ -397,6 +394,34 @@ def validate_config(raw: dict[str, Any]) -> None:
     if reconnect_min > reconnect_max:
         raise RuntimeError("mqtt.reconnect_min_seconds cannot exceed reconnect_max_seconds")
 
+    monitoring_scheduler = raw.get("monitoring_scheduler", {})
+    if not isinstance(monitoring_scheduler, dict):
+        raise RuntimeError("monitoring_scheduler must be an object")
+    unknown_scheduler = set(monitoring_scheduler) - {
+        "enabled",
+        "scan_interval_minutes",
+        "initial_scan_delay_seconds",
+    }
+    if unknown_scheduler:
+        raise RuntimeError(
+            "monitoring_scheduler contains unknown settings: "
+            f"{', '.join(sorted(str(item) for item in unknown_scheduler))}"
+        )
+    if "enabled" in monitoring_scheduler and not isinstance(
+        monitoring_scheduler["enabled"], bool
+    ):
+        raise RuntimeError("monitoring_scheduler.enabled must be a boolean")
+    for key, default in (
+        ("scan_interval_minutes", 360),
+        ("initial_scan_delay_seconds", 60),
+    ):
+        value = _strict_int(
+            monitoring_scheduler.get(key, default),
+            f"monitoring_scheduler.{key}",
+        )
+        if value < 1:
+            raise RuntimeError(f"monitoring_scheduler.{key} must be positive")
+
 
 def _normalized_resources(raw: dict[str, Any]) -> dict[int, dict[str, Any]]:
     if "resources" in raw and "containers" in raw:
@@ -411,17 +436,23 @@ def _normalized_resources(raw: dict[str, Any]) -> dict[int, dict[str, Any]]:
         cfg = dict(raw_cfg) if isinstance(raw_cfg, dict) else {}
         cfg.setdefault("resource_type", "lxc")
         cfg.setdefault("adapter", "apt")
-        capabilities = cfg.get("operator_capabilities")
-        capability_map = capabilities if isinstance(capabilities, dict) else {}
-        cfg.setdefault(
-            "monitoring",
-            {
-                "inspect": True,
-                "update_scan": bool(capability_map.get("scan", False)),
-            },
-        )
+        if legacy:
+            cfg.setdefault("monitoring", _legacy_monitoring_default(cfg))
         normalized[vmid] = cfg
     return normalized
+
+
+def _legacy_monitoring_default(resource: dict[str, Any]) -> dict[str, bool]:
+    capabilities = resource.get("operator_capabilities")
+    capability_map = capabilities if isinstance(capabilities, dict) else {}
+    recovery = resource.get("recovery_scan")
+    recovery_enabled = bool(
+        isinstance(recovery, dict) and recovery.get("enabled", False)
+    )
+    return {
+        "inspect": True,
+        "update_scan": bool(capability_map.get("scan", False)) or recovery_enabled,
+    }
 
 
 def _finite_float(value: Any, name: str) -> float:

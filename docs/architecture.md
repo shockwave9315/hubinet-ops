@@ -5,13 +5,13 @@
 ## Data flow
 
 1. The telemetry loop calls `inspect` only when `monitoring.inspect` is enabled.
-2. The scheduler and recovery worker call APT scan only when `monitoring.update_scan` is enabled.
+2. The independent `monitoring_scheduler` and recovery worker call APT scan only when `monitoring.update_scan` is enabled. Operator scan capability is not consulted for these read-only checks.
 3. REST operator requests independently require the matching `operator_capabilities` flag.
 4. `ResourceExecutor` selects a validated adapter: LXC/APT, QEMU/HAOS read-only, or CT110 self-inspection.
 5. The PVE forced-command wrapper revalidates action, VMID, resource type, observation access, managed-read access, maintenance access, lifecycle access, and optional snapshot names.
 6. SQLite stores plans, jobs, events, and normalized resource state. MQTT and Home Assistant are projections.
 
-Observation-only APT resources therefore continue to collect telemetry and update availability without creating an unapprovable plan. CT106 retains the manually approved update lifecycle:
+Observation-only APT resources therefore continue to collect telemetry and update availability without creating an unapprovable plan. Scheduled scans are informational: they never create an update job or install packages. VM100 (`haos`) and CT110 (`agent_self`) have `monitoring.update_scan: false` and are never routed to APT. CT106 retains the manually approved update lifecycle:
 
 `scan → waiting approval → preflight → snapshot (policy) → update → stabilization → verification → terminal result`
 
