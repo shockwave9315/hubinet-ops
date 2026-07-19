@@ -74,7 +74,7 @@ def test_large_container_attributes_fit_home_assistant_recorder_budget() -> None
     assert payload["docker"] == {"required_healthy": 3, "required_total": 3}
     assert metadata["budget_bytes"] == HA_ATTRIBUTE_BUDGET_BYTES
     assert metadata["packages_total"] == 250
-    assert metadata["events_total"] == 50
+    assert metadata["events_total"] == 60
     assert metadata["packages_visible"] == len(payload["updates"]["packages"])
     assert metadata["events_visible"] == len(payload["recent_job_events"])
     assert metadata["packages_visible"] > 0
@@ -86,8 +86,10 @@ def test_large_container_attributes_fit_home_assistant_recorder_budget() -> None
 def test_small_items_keep_existing_200_package_and_50_event_caps() -> None:
     payload = bounded_state(
         {
-            "updates": {"packages": [{"name": str(index)} for index in range(250)]},
-            "recent_job_events": [{"id": index} for index in range(60)],
+            "updates": {"packages": [{"name": str(index)} for index in range(200)]},
+            "recent_job_events": [
+                {"progress": index, "message": str(index)} for index in range(50)
+            ],
         }
     )
 
@@ -95,7 +97,31 @@ def test_small_items_keep_existing_200_package_and_50_event_caps() -> None:
     assert len(payload["updates"]["packages"]) == 200
     assert len(payload["recent_job_events"]) == 50
     assert payload["attribute_payload"]["packages_total"] == 200
+    assert payload["attribute_payload"]["events_total"] == 50
     assert payload["attribute_payload"]["truncated"] is False
+
+
+def test_malformed_collection_shapes_do_not_break_publication() -> None:
+    payload = bounded_state(
+        {
+            "updates": "unexpected",
+            "recent_job_events": {"message": "single event"},
+            "failed_units": "none",
+            "ip_addresses": 1234,
+            "disk": "unexpected",
+            "memory": None,
+            "docker": 42,
+        }
+    )
+
+    assert _encoded_size(payload) <= HA_ATTRIBUTE_BUDGET_BYTES
+    assert payload["updates"]["packages"] == []
+    assert payload["recent_job_events"] == [{"message": "single event"}]
+    assert payload["failed_units"] == ["none"]
+    assert payload["ip_addresses"] == ["1234"]
+    assert payload["disk"] == {}
+    assert payload["memory"] == {}
+    assert payload["docker"] == {}
 
 
 def test_0_2_3_transport_keeps_existing_mqtt_class_contract() -> None:
