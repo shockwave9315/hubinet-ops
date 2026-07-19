@@ -271,7 +271,9 @@ install -m 0640 "$SOURCE_DIR/deploy/pve/maintenance-vmids" /etc/hubinet-ops/main
 install -m 0640 "$SOURCE_DIR/deploy/pve/lifecycle-vmids" /etc/hubinet-ops/lifecycle-vmids
 install -m 0640 "$SOURCE_DIR/deploy/pve/resource-types" /etc/hubinet-ops/resource-types
 for vmid in $(seq 101 109); do
-  "$SOURCE_DIR/deploy/managed/install-managed.sh" "$vmid"
+  # git archive and extracted release bundles do not guarantee executable mode
+  # preservation. Invoke the fixed installer through Bash explicitly.
+  bash "$SOURCE_DIR/deploy/managed/install-managed.sh" "$vmid"
 done
 
 pct exec "$AGENT_VMID" -- systemctl start hubinet-ops
