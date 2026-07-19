@@ -21,8 +21,20 @@ def _json_bytes(value: Any) -> int:
     )
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _sequence(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
 def _package_preview(value: Any) -> dict[str, Any]:
-    package = dict(value or {}) if isinstance(value, dict) else {"name": value}
+    package = value if isinstance(value, dict) else {"name": value}
     preview: dict[str, Any] = {}
     for key in ("name", "current", "target"):
         if key in package:
@@ -31,7 +43,7 @@ def _package_preview(value: Any) -> dict[str, Any]:
 
 
 def _event_preview(value: Any) -> dict[str, Any]:
-    event = dict(value or {}) if isinstance(value, dict) else {"message": value}
+    event = value if isinstance(value, dict) else {"message": value}
     preview: dict[str, Any] = {}
     for key, limit in (
         ("created_at", 64),
@@ -62,25 +74,26 @@ def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
         "memory": ("used_percent",),
         "docker": ("required_healthy", "required_total"),
     }.items():
-        source = dict(state.get(key) or {})
+        source = _mapping(state.get(key))
         compact[key] = {field: source.get(field) for field in fields if field in source}
 
-    updates = dict(state.get("updates") or {})
+    updates = _mapping(state.get("updates"))
     compact["updates"] = {
         field: updates.get(field)
         for field in ("pending_count", "fingerprint")
         if field in updates
     }
-    last_event = dict(state.get("last_job_event") or {})
+    last_event = _mapping(state.get("last_job_event"))
     if last_event:
         compact["last_job_event"] = _event_preview(last_event)
+
     compact["failed_units"] = [
         sanitize_text(item, limit=256)
-        for item in list(state.get("failed_units") or [])[:20]
+        for item in _sequence(state.get("failed_units"))[:20]
     ]
     compact["ip_addresses"] = [
         sanitize_text(item, limit=64)
-        for item in list(state.get("ip_addresses") or [])[:20]
+        for item in _sequence(state.get("ip_addresses"))[:20]
     ]
     return compact
 
@@ -121,47 +134,44 @@ def _minimal_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def bounded_state(value: dict[str, Any]) -> dict[str, Any]:
-    sanitized = sanitize_data(value)
-    updates_source = dict(sanitized.get("updates") or {})
-    packages_source = [
-        _package_preview(item)
-        for item in list(updates_source.get("packages") or [])[:200]
-    ]
+    sanitized_raw = sanitize_data(value)
+    sanitized = sanitized_raw if isinstance(sanitized_raw, dict) else {}
+    updates_source = _mapping(sanitized.get("updates"))
+    package_values = _sequence(updates_source.get("packages"))
+    packages_source = [_package_preview(item) for item in package_values[:200]]
     packages_total = max(
-        len(packages_source),
+        len(package_values),
         _safe_int(sanitized.get("pending_updates"), 0),
         _safe_int(updates_source.get("pending_count"), 0),
     )
-    events_source = [
-        _event_preview(item)
-        for item in list(sanitized.get("recent_job_events") or [])[-50:]
-    ]
+
+    event_values = _sequence(sanitized.get("recent_job_events"))
+    events_source = [_event_preview(item) for item in event_values[-50:]]
+    events_total = len(event_values)
 
     state = _compact_state_base(sanitized)
-    updates = dict(state.get("updates") or {})
-    updates["packages"] = []
-    state["updates"] = updates
+    state["updates"] = {**_mapping(state.get("updates")), "packages": []}
     state["recent_job_events"] = []
     state["attribute_payload"] = {
         "budget_bytes": HA_ATTRIBUTE_BUDGET_BYTES,
         "packages_total": packages_total,
         "packages_visible": 0,
-        "events_total": len(events_source),
+        "events_total": events_total,
         "events_visible": 0,
         "truncated": False,
     }
 
     if _json_bytes(state) > HA_ATTRIBUTE_BUDGET_BYTES:
         state = _minimal_state(state)
-        state["updates"] = {**dict(state.get("updates") or {}), "packages": []}
+        state["updates"] = {**_mapping(state.get("updates")), "packages": []}
         state["recent_job_events"] = []
         state["attribute_payload"] = {
             "budget_bytes": HA_ATTRIBUTE_BUDGET_BYTES,
             "packages_total": packages_total,
             "packages_visible": 0,
-            "events_total": len(events_source),
+            "events_total": events_total,
             "events_visible": 0,
-            "truncated": bool(packages_total or events_source),
+            "truncated": bool(packages_total or events_total),
         }
 
     package_index = 0
@@ -169,9 +179,19 @@ def bounded_state(value: dict[str, Any]) -> dict[str, Any]:
     while package_index < len(packages_source) or event_index >= 0:
         changed = False
         if package_index < len(packages_source):
-            candidate = sanitize_data(state)
-            candidate["updates"]["packages"].append(packages_source[package_index])
-            candidate["attribute_payload"]["packages_visible"] += 1
+            candidate = {
+                **state,
+                "updates": {
+                    **state["updates"],
+                    "packages": state["updates"]["packages"]
+                    + [packages_source[package_index]],
+                },
+                "attribute_payload": {
+                    **state["attribute_payload"],
+                    "packages_visible": state["attribute_payload"]["packages_visible"]
+                    + 1,
+                },
+            }
             if _json_bytes(candidate) <= HA_ATTRIBUTE_BUDGET_BYTES:
                 state = candidate
                 package_index += 1
@@ -180,9 +200,16 @@ def bounded_state(value: dict[str, Any]) -> dict[str, Any]:
                 package_index = len(packages_source)
 
         if event_index >= 0:
-            candidate = sanitize_data(state)
-            candidate["recent_job_events"].insert(0, events_source[event_index])
-            candidate["attribute_payload"]["events_visible"] += 1
+            candidate = {
+                **state,
+                "recent_job_events": [events_source[event_index]]
+                + state["recent_job_events"],
+                "attribute_payload": {
+                    **state["attribute_payload"],
+                    "events_visible": state["attribute_payload"]["events_visible"]
+                    + 1,
+                },
+            }
             if _json_bytes(candidate) <= HA_ATTRIBUTE_BUDGET_BYTES:
                 state = candidate
                 event_index -= 1
