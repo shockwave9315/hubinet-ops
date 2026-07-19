@@ -22,6 +22,8 @@ The script:
 
 The agent restart republishes retained MQTT Discovery and container state. The complete state used as `health_status` attributes is capped at 10,000 UTF-8 bytes, leaving margin below Home Assistant Recorder's 16,384-byte maximum.
 
+Existing Recorder warning entries remain visible in historical logs. After Home Assistant receives the retained 0.2.3 state, no new oversized-attribute warning should be created. A managed-container scan or package update is not required to publish the corrected payload.
+
 The path to the rollback backup is written to `/root/hubinet-ops-last-upgrade-backup` inside CT110 and printed at the end.
 
 ## 2. Install the 0.2.3 dashboard view
