@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 
 from app.mqtt_budget import HA_ATTRIBUTE_BUDGET_BYTES, bounded_state
@@ -124,10 +125,12 @@ def test_malformed_collection_shapes_do_not_break_publication() -> None:
     assert payload["docker"] == {}
 
 
-def test_0_2_3_transport_keeps_existing_mqtt_class_contract() -> None:
-    from app import mqtt as legacy_mqtt
-    from app.mqtt_v023 import MqttTelemetry, VERSION
+def test_core_mqtt_uses_the_0_2_3_byte_budget() -> None:
+    from app import mqtt
 
-    assert VERSION == "0.2.3"
-    assert issubclass(MqttTelemetry, legacy_mqtt.MqttTelemetry)
-    assert legacy_mqtt.VERSION == "0.2.3"
+    source = inspect.getsource(mqtt.MqttTelemetry.publish_container_state)
+
+    assert mqtt.VERSION == "0.2.3"
+    assert mqtt.bounded_state is bounded_state
+    assert "bounded_state(state)" in source
+    assert "_bounded_state" not in source
