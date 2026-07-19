@@ -88,9 +88,18 @@ def test_020_database_migrates_without_data_loss(tmp_path: Path) -> None:
     assert db.get_plan("plan1")["status"] == "completed"
     assert db.get_job("job1")["snapshot_name"] == "snap1"
     with sqlite3.connect(path) as migrated:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 201
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 300
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(jobs)")}
         assert "progress" in columns
+
+    assert state["resource_type"] == "lxc"
+    assert state["adapter"] == "apt"
+
+    # Reopening performs the migration idempotently and preserves history.
+    reopened = Database(path)
+    assert reopened.get_plan("plan1")["status"] == "completed"
+    assert reopened.get_job("job1")["snapshot_name"] == "snap1"
+    assert reopened.get_resource_state(106)["resource_type"] == "lxc"
 
 
 def test_events_are_ordered_bounded_monotonic_and_redacted(tmp_path: Path) -> None:

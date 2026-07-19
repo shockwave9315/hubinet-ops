@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ALLOWLIST="/etc/hubinet-ops/allowed-vmids"
+OBSERVATION_ALLOWLIST="/etc/hubinet-ops/observation-vmids"
+MANAGED_ALLOWLIST="/etc/hubinet-ops/managed-vmids"
+MAINTENANCE_ALLOWLIST="/etc/hubinet-ops/maintenance-vmids"
 LIFECYCLE_ALLOWLIST="/etc/hubinet-ops/lifecycle-vmids"
+RESOURCE_TYPES="/etc/hubinet-ops/resource-types"
 ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
 
 json_error() {
@@ -18,8 +21,12 @@ fail() {
   exit 1
 }
 
+listed() {
+  local value="$1" file="$2"
+  [[ -f "$file" ]] && grep -Fxq "$value" "$file"
+}
+
 if [[ -z "$ORIGINAL" ]]; then
-  # Allows a local wrapper smoke test as root while preserving the same parser.
   ORIGINAL="$*"
 fi
 
@@ -27,20 +34,17 @@ read -r action vmid argument extra <<<"$ORIGINAL"
 [[ -z "${extra:-}" ]] || fail "Too many arguments"
 [[ "$action" =~ ^(status|inspect|scan|preflight|snapshot|update|healthcheck|repair|rollback|delete-snapshot|verify|start|shutdown|reboot)$ ]] || fail "Action not allowed"
 [[ "$vmid" =~ ^[1-9][0-9]{1,5}$ ]] || fail "Invalid VMID"
-[[ -f "$ALLOWLIST" ]] || fail "Missing VMID allowlist"
-grep -Fxq "$vmid" "$ALLOWLIST" || fail "VMID not allowed"
+listed "$vmid" "$OBSERVATION_ALLOWLIST" || fail "VMID not observation allowed"
+[[ -f "$RESOURCE_TYPES" ]] || fail "Missing resource type map"
 
-case "$action" in
-  start|shutdown|reboot)
-    [[ -f "$LIFECYCLE_ALLOWLIST" ]] || fail "Missing lifecycle VMID allowlist"
-    grep -Fxq "$vmid" "$LIFECYCLE_ALLOWLIST" || fail "VMID not lifecycle allowed"
-    ;;
-esac
+map_count="$(awk -v id="$vmid" '$1 == id {count++} END {print count+0}' "$RESOURCE_TYPES")"
+[[ "$map_count" == "1" ]] || fail "VMID must have exactly one resource type"
+resource_type="$(awk -v id="$vmid" '$1 == id {print $2}' "$RESOURCE_TYPES")"
+[[ "$resource_type" =~ ^(lxc|qemu)$ ]] || fail "Invalid resource type"
 
 if [[ -n "${argument:-}" ]]; then
   [[ "$argument" =~ ^[A-Za-z0-9_-]+$ ]] || fail "Unsafe argument"
 fi
-
 case "$action" in
   snapshot|rollback|delete-snapshot)
     [[ -n "${argument:-}" ]] || fail "Snapshot name required"
@@ -50,72 +54,159 @@ case "$action" in
     ;;
 esac
 
-logger -t hubinet-ops-host "action=$action vmid=$vmid"
+case "$action" in
+  start|shutdown|reboot)
+    [[ "$resource_type" == "lxc" ]] || fail "Lifecycle is supported only for LXC"
+    listed "$vmid" "$LIFECYCLE_ALLOWLIST" || fail "VMID not lifecycle allowed"
+    ;;
+  inspect)
+    if [[ "$resource_type" == "lxc" ]]; then
+      listed "$vmid" "$MANAGED_ALLOWLIST" || fail "VMID not managed-executor allowed"
+    fi
+    ;;
+  scan|preflight|healthcheck|verify)
+    [[ "$resource_type" == "lxc" ]] || fail "Managed action is supported only for LXC"
+    listed "$vmid" "$MANAGED_ALLOWLIST" || fail "VMID not managed-executor allowed"
+    ;;
+  snapshot|update|repair|rollback|delete-snapshot)
+    [[ "$resource_type" == "lxc" ]] || fail "Managed action is supported only for LXC"
+    listed "$vmid" "$MANAGED_ALLOWLIST" || fail "VMID not managed-executor allowed"
+    listed "$vmid" "$MAINTENANCE_ALLOWLIST" || fail "VMID not maintenance allowed"
+    ;;
+esac
+
+logger -t hubinet-ops-host "action=$action vmid=$vmid resource_type=$resource_type"
+
+status_lxc() {
+  local raw state
+  if ! raw="$(timeout --signal=TERM --kill-after=5s 30s pct status "$vmid" 2>&1)"; then
+    fail "pct status failed or timed out: $raw"
+  fi
+  state="$(awk '{print $2}' <<<"$raw")"
+  printf '%s' "$state"
+}
+
+status_qemu() {
+  local raw state
+  if ! raw="$(timeout --signal=TERM --kill-after=5s 30s qm status "$vmid" 2>&1)"; then
+    fail "qm status failed or timed out: $raw"
+  fi
+  state="$(awk '{print $2}' <<<"$raw")"
+  printf '%s' "$state"
+}
 
 case "$action" in
   status)
-    if ! raw="$(timeout --signal=TERM --kill-after=5s 30s pct status "$vmid" 2>&1)"; then
-      fail "pct status failed or timed out: $raw"
+    if [[ "$resource_type" == "lxc" ]]; then
+      state="$(status_lxc)"
+      printf '{"ok":true,"data":{"runtime_status":"%s","lxc_status":"%s"}}\n' "$state" "$state"
+    else
+      state="$(status_qemu)"
+      printf '{"ok":true,"data":{"runtime_status":"%s","qemu_status":"%s"}}\n' "$state" "$state"
     fi
-    state="$(awk '{print $2}' <<<"$raw")"
-    printf '{"ok":true,"data":{"status":"%s"}}\n' "$state"
     ;;
   inspect)
-    if ! raw="$(timeout --signal=TERM --kill-after=5s 30s pct status "$vmid" 2>&1)"; then
-      fail "pct status failed or timed out: $raw"
-    fi
-    state="$(awk '{print $2}' <<<"$raw")"
-    if [[ "$state" != "running" ]]; then
-      printf '{"ok":true,"data":{"lxc_status":"%s","health":"offline","health_score":0}}\n' "$state"
+    if [[ "$resource_type" == "lxc" ]]; then
+      state="$(status_lxc)"
+      if [[ "$state" != "running" ]]; then
+        printf '{"ok":true,"data":{"runtime_status":"%s","lxc_status":"%s","health_status":"offline","health_score":0}}\n' "$state" "$state"
+        exit 0
+      fi
+      timeout --signal=TERM --kill-after=10s 180s \
+        pct exec "$vmid" -- /usr/local/sbin/hubinet-maint inspect
       exit 0
     fi
-    timeout --signal=TERM --kill-after=10s 180s \
-      pct exec "$vmid" -- /usr/local/sbin/hubinet-maint inspect
+
+    state="$(status_qemu)"
+    if ! current="$(timeout --signal=TERM --kill-after=5s 30s \
+      pvesh get "/nodes/$(hostname)/qemu/$vmid/status/current" --output-format json 2>&1)"; then
+      fail "QEMU current status failed or timed out: $current"
+    fi
+    guest_status="unknown"
+    guest='[]'
+    if [[ "$state" == "running" ]]; then
+      if guest="$(timeout --signal=TERM --kill-after=5s 30s \
+        qm guest cmd "$vmid" network-get-interfaces 2>/dev/null)"; then
+        guest_status="available"
+      else
+        guest_status="unavailable"
+        guest='[]'
+      fi
+    fi
+    python3 - "$state" "$guest_status" "$current" "$guest" <<'PY'
+import json, sys
+
+state, guest_status, current_raw, guest_raw = sys.argv[1:]
+try:
+    current = json.loads(current_raw)
+except (TypeError, ValueError):
+    current = {}
+try:
+    guest = json.loads(guest_raw)
+except (TypeError, ValueError):
+    guest = []
+if isinstance(guest, dict):
+    guest = guest.get("result", guest.get("data", []))
+addresses = []
+for interface in guest if isinstance(guest, list) else []:
+    for address in interface.get("ip-addresses", []) if isinstance(interface, dict) else []:
+        value = address.get("ip-address") if isinstance(address, dict) else None
+        if value and value not in {"127.0.0.1", "::1"}:
+            addresses.append(str(value)[:128])
+data = {
+    "runtime_status": state,
+    "qemu_status": state,
+    "health_status": "healthy" if state == "running" else "offline",
+    "health_score": 100 if state == "running" else 0,
+    "name": str(current.get("name", ""))[:255],
+    "uptime_seconds": max(0, int(current.get("uptime", 0) or 0)),
+    "cpu": {"usage": current.get("cpu"), "cores": current.get("cpus")},
+    "memory": {"used_bytes": current.get("mem"), "total_bytes": current.get("maxmem")},
+    "disk": {"used_bytes": current.get("disk"), "total_bytes": current.get("maxdisk")},
+    "network": {"in_bytes": current.get("netin"), "out_bytes": current.get("netout")},
+    "guest_agent_status": guest_status,
+    "ip_addresses": addresses[:32],
+}
+print(json.dumps({"ok": True, "data": data}, ensure_ascii=False, separators=(",", ":")))
+PY
     ;;
   scan)
-    timeout --signal=TERM --kill-after=15s 650s \
-      pct exec "$vmid" -- /usr/local/sbin/hubinet-maint check-updates
+    timeout --signal=TERM --kill-after=15s 650s pct exec "$vmid" -- /usr/local/sbin/hubinet-maint check-updates
     ;;
   preflight)
-    timeout --signal=TERM --kill-after=15s 650s \
-      pct exec "$vmid" -- /usr/local/sbin/hubinet-maint preflight
+    timeout --signal=TERM --kill-after=15s 650s pct exec "$vmid" -- /usr/local/sbin/hubinet-maint preflight
     ;;
   update)
-    timeout --signal=TERM --kill-after=30s 4400s \
-      pct exec "$vmid" -- /usr/local/sbin/hubinet-maint update
+    timeout --signal=TERM --kill-after=30s 4400s pct exec "$vmid" -- /usr/local/sbin/hubinet-maint update
     ;;
   healthcheck)
-    timeout --signal=TERM --kill-after=10s 180s \
-      pct exec "$vmid" -- /usr/local/sbin/hubinet-maint healthcheck
+    timeout --signal=TERM --kill-after=10s 180s pct exec "$vmid" -- /usr/local/sbin/hubinet-maint healthcheck
     ;;
   repair)
-    timeout --signal=TERM --kill-after=30s 850s \
-      pct exec "$vmid" -- /usr/local/sbin/hubinet-maint repair
+    timeout --signal=TERM --kill-after=30s 850s pct exec "$vmid" -- /usr/local/sbin/hubinet-maint repair
     ;;
   verify)
-    timeout --signal=TERM --kill-after=15s 650s \
-      pct exec "$vmid" -- /usr/local/sbin/hubinet-maint verify
+    timeout --signal=TERM --kill-after=15s 650s pct exec "$vmid" -- /usr/local/sbin/hubinet-maint verify
     ;;
   start)
     if ! raw="$(timeout --signal=TERM --kill-after=10s 120s pct start "$vmid" 2>&1)"; then
-      fail "container start failed or timed out: $raw"
+      fail "graceful start failed or timed out: $raw"
     fi
     printf '{"ok":true,"data":{"action":"start"}}\n'
     ;;
   shutdown)
     if ! raw="$(timeout --signal=TERM --kill-after=10s 120s pct shutdown "$vmid" 2>&1)"; then
-      fail "graceful container shutdown failed or timed out: $raw"
+      fail "graceful shutdown failed or timed out: $raw"
     fi
     printf '{"ok":true,"data":{"action":"shutdown"}}\n'
     ;;
   reboot)
     if ! raw="$(timeout --signal=TERM --kill-after=10s 120s pct reboot "$vmid" 2>&1)"; then
-      fail "graceful container reboot failed or timed out: $raw"
+      fail "graceful reboot failed or timed out: $raw"
     fi
     printf '{"ok":true,"data":{"action":"reboot"}}\n'
     ;;
   snapshot)
-    [[ -n "${argument:-}" ]] || fail "Snapshot name required"
     if ! raw="$(timeout --signal=TERM --kill-after=30s 550s \
       pct snapshot "$vmid" "$argument" --description "Hubinet Ops pre-update snapshot" 2>&1)"; then
       fail "snapshot failed or timed out: $raw"
@@ -123,11 +214,8 @@ case "$action" in
     printf '{"ok":true,"data":{"snapshot":"%s"}}\n' "$argument"
     ;;
   rollback)
-    [[ -n "${argument:-}" ]] || fail "Snapshot name required"
-    timeout --signal=TERM --kill-after=15s 120s \
-      pct stop "$vmid" --timeout 90 >/dev/null 2>&1 || true
-    if ! raw="$(timeout --signal=TERM --kill-after=30s 900s \
-      pct rollback "$vmid" "$argument" 2>&1)"; then
+    timeout --signal=TERM --kill-after=15s 120s pct stop "$vmid" --timeout 90 >/dev/null 2>&1 || true
+    if ! raw="$(timeout --signal=TERM --kill-after=30s 900s pct rollback "$vmid" "$argument" 2>&1)"; then
       fail "rollback failed or timed out: $raw"
     fi
     if ! raw="$(timeout --signal=TERM --kill-after=15s 120s pct start "$vmid" 2>&1)"; then
@@ -136,9 +224,7 @@ case "$action" in
     printf '{"ok":true,"data":{"rolled_back_to":"%s"}}\n' "$argument"
     ;;
   delete-snapshot)
-    [[ -n "${argument:-}" ]] || fail "Snapshot name required"
-    if ! raw="$(timeout --signal=TERM --kill-after=15s 300s \
-      pct delsnapshot "$vmid" "$argument" 2>&1)"; then
+    if ! raw="$(timeout --signal=TERM --kill-after=15s 300s pct delsnapshot "$vmid" "$argument" 2>&1)"; then
       fail "snapshot deletion failed or timed out: $raw"
     fi
     printf '{"ok":true,"data":{"deleted_snapshot":"%s"}}\n' "$argument"

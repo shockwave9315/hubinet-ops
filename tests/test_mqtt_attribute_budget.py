@@ -72,7 +72,9 @@ def test_large_container_attributes_fit_home_assistant_recorder_budget() -> None
     assert _encoded_size(payload) <= HA_ATTRIBUTE_BUDGET_BYTES
     assert payload["health_status"] == "healthy"
     assert payload["active_plan_id"] == "a" * 32
-    assert payload["docker"] == {"required_healthy": 3, "required_total": 3}
+    assert payload["docker"]["required_healthy"] == 3
+    assert payload["docker"]["required_total"] == 3
+    assert 0 < len(payload["docker"]["containers"]) <= 10
     assert metadata["budget_bytes"] == HA_ATTRIBUTE_BUDGET_BYTES
     assert metadata["packages_total"] == 250
     assert metadata["events_total"] == 60
@@ -125,14 +127,14 @@ def test_malformed_collection_shapes_do_not_break_publication() -> None:
     assert payload["docker"] == {}
 
 
-def test_core_mqtt_uses_the_0_2_4_byte_budget() -> None:
+def test_core_mqtt_uses_the_0_3_0_byte_budget() -> None:
     from app import mqtt
 
     source = inspect.getsource(mqtt.MqttTelemetry.publish_container_state)
 
-    assert mqtt.VERSION == "0.2.4"
+    assert mqtt.VERSION == "0.3.0"
     assert mqtt.bounded_state is bounded_state
-    assert "bounded_state(state)" in source
+    assert "publish_resource_state" in source
     assert "_bounded_state" not in source
 
 
@@ -152,7 +154,7 @@ def test_unknown_pending_count_survives_retained_mqtt_budgeting() -> None:
     assert payload["updates"]["pending_count"] is None
 
 
-def test_0_2_4_scalars_survive_unicode_package_event_and_docker_truncation() -> None:
+def test_resource_scalars_survive_unicode_package_event_and_docker_truncation() -> None:
     capabilities = {
         "refresh": True,
         "scan": True,
@@ -231,3 +233,25 @@ def test_0_2_4_scalars_survive_unicode_package_event_and_docker_truncation() -> 
     assert payload["packages_remaining_count"] == 2
     assert payload["recovery_scan_status"] == "completed"
     assert payload["last_terminal_at"] == "2026-07-19T12:01:00+00:00"
+
+
+def test_resource_payload_redacts_self_journal_and_never_exposes_secret_fields() -> None:
+    payload = bounded_state(
+        {
+            "vmid": 110,
+            "resource_type": "lxc",
+            "adapter": "agent_self",
+            "recent_warnings": [
+                "Authorization: Bearer top-secret",
+                "mqtt_password=also-secret",
+            ],
+            "api_token": "raw-secret",
+            "cpu": {"cores": 2, "load_1m": 0.25},
+        }
+    )
+    raw = json.dumps(payload, ensure_ascii=False)
+
+    assert "top-secret" not in raw
+    assert "also-secret" not in raw
+    assert "raw-secret" not in raw
+    assert payload["cpu"]["load_1m"] == 0.25

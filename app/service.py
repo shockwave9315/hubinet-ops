@@ -62,13 +62,13 @@ class OpsService:
         self.settings = settings
         self.db = db
         self.executor = executor
-        self.mqtt = mqtt or MqttTelemetry({"enabled": False}, settings.containers)
+        self.mqtt = mqtt or MqttTelemetry({"enabled": False}, settings.resources)
         self._stop = threading.Event()
         self._monotonic = monotonic
         self._now = now or (lambda: datetime.now(UTC))
         self.stabilizer = stabilizer or Stabilizer(executor, self._stop)
         self._scan_all_lock = threading.Lock()
-        self._scan_locks = {vmid: threading.Lock() for vmid in settings.containers}
+        self._scan_locks = {vmid: threading.Lock() for vmid in settings.resources}
         self._recovery_lock = threading.RLock()
         self._recovery_wakeup = threading.Event()
         self._recovery_due: dict[int, float] = {}
@@ -97,7 +97,13 @@ class OpsService:
         self._worker.start()
         self._telemetry.start()
         self._recovery_worker.start()
-        if bool(self.settings.scheduler.get("enabled", False)):
+        monitoring_scheduler = self.settings.monitoring_scheduler
+        if bool(
+            monitoring_scheduler.get(
+                "enabled",
+                self.settings.scheduler.get("enabled", False),
+            )
+        ):
             self._scheduler.start()
 
     def stop(self) -> None:
@@ -111,46 +117,70 @@ class OpsService:
         self.mqtt.stop()
 
     def list_containers(self) -> list[dict[str, Any]]:
-        result: list[dict[str, Any]] = []
-        for vmid, cfg in sorted(self.settings.containers.items()):
-            item = {
-                "vmid": vmid,
-                "name": cfg.get("name", f"ct-{vmid}"),
-                "enabled": bool(cfg.get("enabled", False)),
-                "adapter": cfg.get("adapter", "apt"),
-                "criticality": cfg.get("criticality", "medium"),
-                "approval_mode": cfg.get("approval_mode", "always"),
-                "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
-                "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
-                "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
-                "operator_capabilities": self._capabilities(vmid),
-            }
-            state = self.db.get_container_state(vmid)
-            if state:
-                item["state"] = state
-            result.append(item)
-        return result
+        return [
+            item for item in self.list_resources()
+            if item["resource_type"] == "lxc"
+        ]
+
+    def list_resources(self) -> list[dict[str, Any]]:
+        return [
+            self._resource_item(vmid, cfg)
+            for vmid, cfg in sorted(self.settings.resources.items())
+        ]
+
+    def get_resource(self, vmid: int) -> dict[str, Any]:
+        normalized_vmid = int(vmid)
+        return self._resource_item(normalized_vmid, self._resource(normalized_vmid))
+
+    def _resource_item(self, vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+        item = {
+            "vmid": vmid,
+            "resource_type": cfg.get("resource_type", "lxc"),
+            "name": cfg.get("name", f"resource-{vmid}"),
+            "display_name": cfg.get("display_name", cfg.get("name", f"resource-{vmid}")),
+            "enabled": bool(cfg.get("enabled", False)),
+            "adapter": cfg.get("adapter", "apt"),
+            "criticality": cfg.get("criticality", "medium"),
+            "ip_address": cfg.get("ip_address"),
+            "guest_agent": bool(cfg.get("guest_agent", False)),
+            "approval_mode": cfg.get("approval_mode", "always"),
+            "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
+            "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
+            "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
+            "operator_capabilities": self._capabilities(vmid),
+            "monitoring": self._monitoring(vmid),
+            "state": self.db.get_resource_state(vmid) or {},
+        }
+        return item
 
     def list_states(self) -> dict[str, Any]:
+        resources = {
+            str(item["vmid"]): item for item in self.db.list_resource_states()
+        }
         return {
             "version": VERSION,
             "generated_at": utc_now(),
+            "resources": resources,
             "containers": {
-                str(item["vmid"]): item for item in self.db.list_container_states()
+                vmid: item
+                for vmid, item in resources.items()
+                if item.get("resource_type", "lxc") == "lxc"
             },
         }
 
     def get_state(self, vmid: int) -> dict[str, Any]:
-        self._container(vmid)
-        state = self.db.get_container_state(vmid)
+        self._resource(vmid)
+        state = self.db.get_resource_state(vmid)
         if state is None:
             state = self._save_state(vmid, self._base_state(vmid))
         return state
 
     def refresh_container(self, vmid: int, *, operator: bool = False) -> dict[str, Any]:
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         if operator:
             self._require_capability(vmid, "refresh")
+        elif not self._monitoring(vmid)["inspect"]:
+            return self.get_state(vmid)
         if not bool(cfg.get("enabled", False)):
             state = self.get_state(vmid)
             state.update({"health_status": "unknown", "health_score": 0})
@@ -158,7 +188,7 @@ class OpsService:
             self._observe_health(vmid, str(saved.get("health_status", "unknown")))
             return saved
         try:
-            inspected = self.executor.run("inspect", vmid, timeout=120).get("data", {})
+            inspected = _executor_data(self.executor.run("inspect", vmid, timeout=120))
             # Inspect may take long enough for a job to reach a terminal state.
             # Re-read the latest DB state after I/O so telemetry cannot resurrect
             # stale operation/plan/job fields captured before that transition.
@@ -168,7 +198,7 @@ class OpsService:
                 "health_status",
                 inspected.get("health", "unknown"),
             )
-            if inspected.get("lxc_status") == "running":
+            if inspected.get("runtime_status") == "running" or inspected.get("lxc_status") == "running":
                 state["intentional_shutdown"] = False
                 state["lifecycle_health_pending"] = False
                 if state.get("lifecycle_status") != "running":
@@ -193,9 +223,13 @@ class OpsService:
     def refresh_all(self, *, operator: bool = False) -> list[dict[str, Any]]:
         return [
             self.refresh_container(vmid, operator=operator)
-            for vmid, cfg in sorted(self.settings.containers.items())
+            for vmid, cfg in sorted(self.settings.resources.items())
             if bool(cfg.get("enabled", False))
-            and (not operator or self._capabilities(vmid)["refresh"])
+            and (
+                self._capabilities(vmid)["refresh"]
+                if operator
+                else self._monitoring(vmid)["inspect"]
+            )
         ]
 
     def scan_all(self, *, operator: bool = True) -> list[dict[str, Any]]:
@@ -204,9 +238,13 @@ class OpsService:
         try:
             return [
                 self.scan_container(vmid, operator=operator)
-                for vmid, cfg in sorted(self.settings.containers.items())
+                for vmid, cfg in sorted(self.settings.resources.items())
                 if bool(cfg.get("enabled", False))
-                and (not operator or self._capabilities(vmid)["scan"])
+                and (
+                    self._capabilities(vmid)["scan"]
+                    if operator
+                    else self._monitoring(vmid)["update_scan"]
+                )
             ]
         finally:
             self._scan_all_lock.release()
@@ -218,9 +256,11 @@ class OpsService:
         operator: bool = True,
         source: str = "operator",
     ) -> dict[str, Any]:
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         if operator:
             self._require_capability(vmid, "scan")
+        elif not self._monitoring(vmid)["update_scan"]:
+            return {"vmid": vmid, "status": "skipped", "reason": "monitoring_scan_disabled"}
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
             if operator:
@@ -258,7 +298,7 @@ class OpsService:
     ) -> dict[str, Any]:
         if not bool(cfg.get("enabled", False)):
             return {"vmid": vmid, "status": "disabled"}
-        if cfg.get("adapter", "apt") != "apt":
+        if cfg.get("adapter", "apt") != "apt" or cfg.get("resource_type", "lxc") != "lxc":
             return {
                 "vmid": vmid,
                 "status": "unsupported_adapter",
@@ -278,7 +318,7 @@ class OpsService:
             state["last_error"] = None
         self._save_state(vmid, state)
         try:
-            data = self.executor.run("scan", vmid, timeout=700).get("data", {})
+            data = _executor_data(self.executor.run("scan", vmid, timeout=700))
         except ExecutorError as exc:
             state = self.get_state(vmid)
             state.update(
@@ -323,6 +363,27 @@ class OpsService:
             )
             self._save_state(vmid, state)
             return {"vmid": vmid, "status": "up_to_date", "data": data, "source": source}
+
+        # Observation-only resources report available updates but never create a
+        # plan that cannot be approved by policy.
+        if not self._capabilities(vmid)["approve"]:
+            self.db.invalidate_active_plans(vmid)
+            state.update(
+                {
+                    "risk": _risk_for(cfg, data),
+                    "active_plan_id": None,
+                    "active_plan_status": None,
+                    "operation_status": "idle",
+                    "job_stage": "idle",
+                }
+            )
+            self._save_state(vmid, state)
+            return {
+                "vmid": vmid,
+                "status": "updates_observed",
+                "data": data,
+                "source": source,
+            }
 
         fingerprint = str(data.get("fingerprint") or _fingerprint(data))
         active = self.db.find_active_plan(vmid, fingerprint)
@@ -410,14 +471,14 @@ class OpsService:
         return {"plan": plan}
 
     def retry_healthcheck(self, vmid: int) -> dict[str, Any]:
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         self._require_capability(vmid, "retry_healthcheck")
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
-            raise ValueError("Another scan or manual operation is active for this container")
+            raise ValueError("Another scan or manual operation is active for this resource")
         try:
             if self.db.get_active_job(vmid) is not None:
-                raise ValueError("Another job is already active for this container")
+                raise ValueError("Another job is already active for this resource")
             latest = self.db.get_latest_job(vmid)
             if latest is None:
                 raise ValueError("No job is available for retry")
@@ -459,16 +520,16 @@ class OpsService:
             lock.release()
 
     def manual_rollback(self, vmid: int) -> dict[str, Any]:
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         self._require_capability(vmid, "rollback")
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
-            raise ValueError("Another scan or manual operation is active for this container")
+            raise ValueError("Another scan or manual operation is active for this resource")
         try:
             if not bool(cfg.get("manual_rollback_allowed", False)):
-                raise ValueError("Manual rollback is not allowed by container policy")
+                raise ValueError("Manual rollback is not allowed by resource policy")
             if self.db.get_active_job(vmid) is not None:
-                raise ValueError("Another job is already active for this container")
+                raise ValueError("Another job is already active for this resource")
             source = self.db.get_latest_job(vmid)
             if source is None or not source.get("snapshot_name"):
                 raise ValueError("No rollback snapshot is available")
@@ -484,15 +545,17 @@ class OpsService:
     def lifecycle_container(self, vmid: int, action: str) -> dict[str, Any]:
         if action not in {"start", "shutdown", "reboot"}:
             raise ValueError("Unsupported lifecycle action")
-        self._container(vmid)
+        cfg = self._resource(vmid)
+        if cfg.get("resource_type", "lxc") != "lxc" or cfg.get("adapter", "apt") != "apt":
+            raise ValueError("Lifecycle is not supported by this resource adapter")
         self._require_capability(vmid, action)
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
-            raise ValueError("Another scan or lifecycle operation is active for this container")
+            raise ValueError("Another scan or lifecycle operation is active for this resource")
         started_at = self._now().isoformat()
         try:
             if self.db.get_active_job(vmid) is not None:
-                raise ValueError("Another job is already active for this container")
+                raise ValueError("Another job is already active for this resource")
             state = self.get_state(vmid)
             if state.get("lifecycle_status") == "running":
                 raise ValueError("Another lifecycle operation is already active")
@@ -503,7 +566,12 @@ class OpsService:
 
             try:
                 status_result = self.executor.run("status", vmid, timeout=30)
-                lxc_status = str(status_result.get("data", {}).get("status", "unknown"))
+                status_data = _executor_data(status_result)
+                lxc_status = str(
+                    status_data.get("lxc_status")
+                    or status_data.get("runtime_status")
+                    or status_data.get("status", "unknown")
+                )
             except ExecutorError as exc:
                 raise ValueError(f"Cannot read current LXC state: {exc}") from exc
             if action == "start" and lxc_status != "stopped":
@@ -540,7 +608,12 @@ class OpsService:
             try:
                 self.executor.run(action, vmid, timeout=180)
                 verified = self.executor.run("status", vmid, timeout=30)
-                final_lxc = str(verified.get("data", {}).get("status", "unknown"))
+                verified_data = _executor_data(verified)
+                final_lxc = str(
+                    verified_data.get("lxc_status")
+                    or verified_data.get("runtime_status")
+                    or verified_data.get("status", "unknown")
+                )
                 expected = "stopped" if action == "shutdown" else "running"
                 if final_lxc != expected:
                     raise ExecutorError(
@@ -624,18 +697,18 @@ class OpsService:
             try:
                 self._cancel_recovery_scan(vmid, "health_changed")
             except Exception as exc:
-                LOGGER.exception("Failed to cancel recovery scan for CT%s", vmid)
+                LOGGER.exception("Failed to cancel recovery scan for resource %s", vmid)
                 self._record_recovery_failure(vmid, exc, status="failed")
             return
         if previous in {"offline", "critical", "degraded"}:
             try:
                 self._schedule_recovery_scan(vmid)
             except Exception as exc:
-                LOGGER.exception("Failed to schedule recovery scan for CT%s", vmid)
+                LOGGER.exception("Failed to schedule recovery scan for resource %s", vmid)
                 self._record_recovery_failure(vmid, exc, status="failed")
 
     def _recovery_settings(self, vmid: int) -> tuple[bool, int, int]:
-        raw = self._container(vmid).get("recovery_scan") or {}
+        raw = self._resource(vmid).get("recovery_scan") or {}
         if not isinstance(raw, dict):
             raise TypeError("recovery_scan must be an object")
         delay = max(1, _safe_int(raw.get("delay_seconds"), 90))
@@ -645,7 +718,7 @@ class OpsService:
 
     def _schedule_recovery_scan(self, vmid: int) -> None:
         enabled, delay, _ = self._recovery_settings(vmid)
-        if not enabled or not self._capabilities(vmid)["scan"]:
+        if not enabled or not self._monitoring(vmid)["update_scan"]:
             return
         with self._recovery_lock:
             self._recovery_due[vmid] = self._monotonic() + delay
@@ -726,8 +799,8 @@ class OpsService:
             for vmid in due:
                 self._recovery_due.pop(vmid, None)
         for vmid, exc in invalid:
-            LOGGER.warning("Discarding malformed recovery deadline for CT%s: %s", vmid, exc)
-            if vmid in self.settings.containers:
+            LOGGER.warning("Discarding malformed recovery deadline for resource %s: %s", vmid, exc)
+            if vmid in self.settings.resources:
                 self._record_recovery_failure(vmid, exc, status="failed")
         for vmid in sorted(due):
             if self._stop.is_set():
@@ -735,7 +808,7 @@ class OpsService:
             try:
                 self._run_recovery_scan(vmid)
             except Exception as exc:
-                LOGGER.exception("Unhandled recovery scan failure for CT%s", vmid)
+                LOGGER.exception("Unhandled recovery scan failure for resource %s", vmid)
                 self._record_recovery_failure(vmid, exc, status="failed")
 
     def _record_recovery_failure(
@@ -756,7 +829,7 @@ class OpsService:
             )
             self._save_state(vmid, state)
         except Exception:
-            LOGGER.exception("Failed to persist recovery failure for CT%s", vmid)
+            LOGGER.exception("Failed to persist recovery failure for resource %s", vmid)
 
     def _run_recovery_scan(self, vmid: int) -> None:
         enabled, _, cooldown = self._recovery_settings(vmid)
@@ -764,8 +837,8 @@ class OpsService:
         reason: str | None = None
         if not enabled:
             reason = "disabled"
-        elif not self._capabilities(vmid)["scan"]:
-            reason = "scan_not_allowed"
+        elif not self._monitoring(vmid)["update_scan"]:
+            reason = "monitoring_scan_disabled"
         elif state.get("health_status") != "healthy" or state.get("lxc_status") != "running":
             reason = "container_not_healthy_running"
         elif self.db.get_active_job(vmid) is not None:
@@ -807,7 +880,11 @@ class OpsService:
             result_status = str(result.get("status", "unknown"))
             final_status = "completed" if result_status not in {"error", "skipped"} else "failed"
         except Exception as exc:
-            LOGGER.warning("Recovery scan failed for CT%s: %s", vmid, sanitize_text(exc, limit=500))
+            LOGGER.warning(
+                "Recovery scan failed for resource %s: %s",
+                vmid,
+                sanitize_text(exc, limit=500),
+            )
             result_status = sanitize_text(exc, limit=500)
             final_status = "failed"
         state = self.get_state(vmid)
@@ -855,7 +932,7 @@ class OpsService:
 
     def _run_job(self, job: dict[str, Any]) -> None:
         vmid = int(job["vmid"])
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         auto_rollback = bool(cfg.get("automatic_rollback", False))
         snapshot = f"ops-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{job['id'][:6]}"
@@ -869,6 +946,7 @@ class OpsService:
         try:
             preflight = self._execute("preflight", vmid, 700, emit)
             self._validate_approved_plan(job, preflight)
+            preflight_updates = dict(_executor_data(preflight).get("updates") or {})
             emit(
                 stage="preflight",
                 progress=15,
@@ -881,9 +959,7 @@ class OpsService:
                 event_type="package_lists_refreshed",
                 message="Package lists refreshed and update plan revalidated",
                 details={
-                    "pending_count": preflight.get("data", {})
-                    .get("updates", {})
-                    .get("pending_count")
+                    "pending_count": preflight_updates.get("pending_count")
                 },
             )
             if auto_rollback:
@@ -960,7 +1036,7 @@ class OpsService:
                 )
                 self._save_state(vmid, state)
                 raise
-            verification_data = dict(verification.get("data") or {})
+            verification_data = _executor_data(verification)
             updates = dict(verification_data.get("updates") or {})
             updates["packages"] = list(updates.get("packages") or [])[:200]
             final_apt_scan_ok = bool(
@@ -983,7 +1059,7 @@ class OpsService:
             )
             packages_updated = max(
                 0,
-                int(update.get("data", {}).get("package_total", 0) or 0),
+                int(_executor_data(update).get("package_total", 0) or 0),
             )
             raw_reboot_required = verification_data.get("reboot_required")
             reboot_required = (
@@ -1113,7 +1189,7 @@ class OpsService:
         preflight: dict[str, Any],
     ) -> None:
         plan = self.db.get_plan(job["plan_id"])
-        updates = dict(preflight.get("data", {}).get("updates") or {})
+        updates = dict(_executor_data(preflight).get("updates") or {})
         pending = max(0, int(updates.get("pending_count", 0) or 0))
         fingerprint = str(updates.get("fingerprint") or _fingerprint(updates))
         if pending <= 0:
@@ -1138,7 +1214,7 @@ class OpsService:
         policy: StabilizationPolicy,
         emit: Callable[..., None],
     ) -> dict[str, Any]:
-        cfg = self._container(int(job["vmid"]))
+        cfg = self._resource(int(job["vmid"]))
         actions = list(cfg.get("repair_actions") or [])
         emit(
             stage="healthcheck",
@@ -1214,7 +1290,7 @@ class OpsService:
 
     def _rollback(self, job: dict[str, Any], cause: str) -> None:
         vmid = int(job["vmid"])
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         snapshot = str(self.db.get_job(job["id"]).get("snapshot_name") or "")
         if not snapshot:
@@ -1496,17 +1572,19 @@ class OpsService:
             )
         )
         state["docker"] = docker
-        saved = self.db.upsert_container_state(vmid, state)
-        self.mqtt.publish_container_state(vmid, saved)
+        saved = self.db.upsert_resource_state(vmid, state)
+        self.mqtt.publish_resource_state(vmid, saved)
         self.mqtt.publish_agent_state(self._agent_state())
         return saved
 
     def _decorate_state(self, vmid: int, state: dict[str, Any]) -> dict[str, Any]:
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         state.update(
             {
                 "vmid": vmid,
-                "name": cfg.get("name", f"ct-{vmid}"),
+                "resource_type": cfg.get("resource_type", "lxc"),
+                "name": cfg.get("name", f"resource-{vmid}"),
+                "display_name": cfg.get("display_name", cfg.get("name", f"resource-{vmid}")),
                 "enabled": bool(cfg.get("enabled", False)),
                 "adapter": cfg.get("adapter", "apt"),
                 "criticality": cfg.get("criticality", "medium"),
@@ -1518,6 +1596,7 @@ class OpsService:
                     cfg.get("manual_rollback_allowed", False)
                 ) and self._capabilities(vmid)["rollback"],
                 "operator_capabilities": self._capabilities(vmid),
+                "monitoring": self._monitoring(vmid),
                 "recovery_scan_enabled": bool(
                     (cfg.get("recovery_scan") or {}).get("enabled", False)
                 ),
@@ -1533,12 +1612,19 @@ class OpsService:
                     "job_progress": active_job.get("progress", 0),
                 }
             )
+        if cfg.get("adapter") == "agent_self":
+            state.update(self._agent_state())
+            state["mqtt_availability"] = self.mqtt.availability
         return state
 
     def _base_state(self, vmid: int) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        apt = cfg.get("adapter", "apt") == "apt"
         return normalize_state(
             {
                 "vmid": vmid,
+                "resource_type": cfg.get("resource_type", "lxc"),
+                "adapter": cfg.get("adapter", "apt"),
                 "health_status": "unknown",
                 "health_score": 0,
                 "update_status": "unknown",
@@ -1546,18 +1632,19 @@ class OpsService:
                 "job_stage": "idle",
                 "job_progress": 0,
                 "last_operation_result": None,
-                "pending_updates": 0,
-                "updates": {"pending_count": 0, "packages": []},
+                "pending_updates": 0 if apt else None,
+                "updates": {"pending_count": 0 if apt else None, "packages": []},
                 "operator_capabilities": self._capabilities(vmid),
+                "monitoring": self._monitoring(vmid),
                 "lifecycle_status": "idle",
                 "verification_status": "unknown",
                 "recovery_scan_enabled": bool(
-                    (self._container(vmid).get("recovery_scan") or {}).get("enabled", False)
+                    (cfg.get("recovery_scan") or {}).get("enabled", False)
                 ),
                 "recovery_scan_status": (
                     "idle"
                     if bool(
-                        (self._container(vmid).get("recovery_scan") or {}).get("enabled", False)
+                        (cfg.get("recovery_scan") or {}).get("enabled", False)
                     )
                     else "disabled"
                 ),
@@ -1565,8 +1652,8 @@ class OpsService:
         )
 
     def _ensure_initial_states(self) -> None:
-        for vmid in self.settings.containers:
-            state = self.db.get_container_state(vmid) or self._base_state(vmid)
+        for vmid in self.settings.resources:
+            state = self.db.get_resource_state(vmid) or self._base_state(vmid)
             if state.get("lifecycle_status") == "running":
                 state.update(
                     {
@@ -1611,17 +1698,29 @@ class OpsService:
             self._save_state(vmid, state)
 
     def _scheduler_loop(self) -> None:
+        scheduler = self.settings.monitoring_scheduler
         if self._stop.wait(
-            int(self.settings.scheduler.get("initial_scan_delay_seconds", 60))
+            int(
+                scheduler.get(
+                    "initial_scan_delay_seconds",
+                    self.settings.scheduler.get("initial_scan_delay_seconds", 60),
+                )
+            )
         ):
             return
         interval = max(
             60,
-            int(self.settings.scheduler.get("scan_interval_minutes", 360)) * 60,
+            int(
+                scheduler.get(
+                    "scan_interval_minutes",
+                    self.settings.scheduler.get("scan_interval_minutes", 360),
+                )
+            )
+            * 60,
         )
         while not self._stop.is_set():
             try:
-                self.scan_all(operator=True)
+                self.scan_all(operator=False)
             except Exception:
                 LOGGER.exception("Scheduled scan failed")
             self._stop.wait(interval)
@@ -1643,12 +1742,12 @@ class OpsService:
             self._stop.wait(interval)
 
     def _notification(self, event_type: str, vmid: int, **extra: Any) -> dict[str, Any]:
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         return sanitize_data(
             {
                 "event_type": event_type,
                 "vmid": vmid,
-                "container": cfg.get("name", f"ct-{vmid}"),
+                "container": cfg.get("name", f"resource-{vmid}"),
                 "dashboard_path": cfg.get(
                     "dashboard_path",
                     f"/hubinet-ops/ct-{vmid}",
@@ -1675,7 +1774,7 @@ class OpsService:
             LOGGER.warning("Home Assistant webhook delivery failed")
 
     def _agent_state(self) -> dict[str, Any]:
-        states = self.db.list_container_states()
+        states = self.db.list_resource_states()
         refreshed = [
             str(item.get("last_refresh"))
             for item in states
@@ -1683,8 +1782,16 @@ class OpsService:
         ]
         return {
             "version": VERSION,
+            "configured_resource_count": len(self.settings.resources),
+            "configured_lxc_count": len(self.settings.containers),
+            "configured_qemu_count": sum(
+                1
+                for cfg in self.settings.resources.values()
+                if cfg.get("resource_type") == "qemu"
+            ),
             "configured_container_count": len(self.settings.containers),
             "active_job_count": self.db.active_job_count(),
+            "mqtt_availability": self.mqtt.availability,
             "last_refresh": max(refreshed) if refreshed else None,
         }
 
@@ -1693,19 +1800,26 @@ class OpsService:
     ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         jobs = [
             job
-            for vmid in self.settings.containers
+            for vmid in self.settings.resources
             if (job := self.db.get_latest_job(vmid)) is not None
         ]
-        return self._agent_state(), self.db.list_container_states(), jobs
+        return self._agent_state(), self.db.list_resource_states(), jobs
 
-    def _container(self, vmid: int) -> dict[str, Any]:
+    def _resource(self, vmid: int) -> dict[str, Any]:
         try:
-            return self.settings.containers[int(vmid)]
+            return self.settings.resources[int(vmid)]
         except KeyError as exc:
             raise KeyError(f"Unknown VMID: {vmid}") from exc
 
+    def _container(self, vmid: int) -> dict[str, Any]:
+        """Compatibility helper for callers that require an LXC resource."""
+        resource = self._resource(vmid)
+        if resource.get("resource_type", "lxc") != "lxc":
+            raise KeyError(f"VMID {vmid} is not an LXC resource")
+        return resource
+
     def _capabilities(self, vmid: int) -> dict[str, bool]:
-        cfg = self._container(vmid)
+        cfg = self._resource(vmid)
         configured = cfg.get("operator_capabilities") or {}
         names = (
             "refresh",
@@ -1726,8 +1840,15 @@ class OpsService:
     def _require_capability(self, vmid: int, capability: str) -> None:
         if not self._capabilities(vmid).get(capability, False):
             raise ValueError(
-                f"Operator action {capability} is blocked by policy for CT{vmid}"
+                f"Operator action {capability} is blocked by policy for resource {vmid}"
             )
+
+    def _monitoring(self, vmid: int) -> dict[str, bool]:
+        configured = self._resource(vmid).get("monitoring") or {}
+        return {
+            "inspect": bool(configured.get("inspect", True)),
+            "update_scan": bool(configured.get("update_scan", False)),
+        }
 
 
 def _safe_int(value: Any, default: int) -> int:
@@ -1735,6 +1856,13 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return int(default)
+
+
+def _executor_data(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    data = result.get("data")
+    return dict(data) if isinstance(data, dict) else {}
 
 
 def _fingerprint(data: dict[str, Any]) -> str:

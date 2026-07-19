@@ -171,3 +171,57 @@ def test_running_operation_preserves_active_job() -> None:
     assert state["active_job_id"] == "active-job"
     assert state["job_stage"] == "updating"
     assert state["job_progress"] == 42
+
+
+def test_legacy_state_defaults_to_lxc_apt_contract() -> None:
+    state = normalize_state({"lxc_status": "running", "hostname": "legacy"})
+
+    assert state["resource_type"] == "lxc"
+    assert state["adapter"] == "apt"
+    assert state["runtime_status"] == "running"
+    assert state["lxc_status"] == "running"
+    assert state["hostname"] == "legacy"
+    assert state["pending_updates"] == 0
+
+
+def test_qemu_state_uses_common_contract_without_fake_apt_values() -> None:
+    state = normalize_state(
+        {
+            "resource_type": "qemu",
+            "adapter": "haos",
+            "qemu_status": "running",
+            "guest_agent_status": "available",
+            "ip_addresses": ["192.0.2.10"],
+        }
+    )
+
+    assert state["runtime_status"] == "running"
+    assert state["qemu_status"] == "running"
+    assert state["pending_updates"] is None
+    assert state["updates"]["pending_count"] is None
+    assert state["packages_remaining_count"] is None
+    assert state["guest_agent_status"] == "available"
+
+
+def test_common_resource_values_are_bounded_and_fail_closed() -> None:
+    state = normalize_state(
+        {
+            "resource_type": "unsafe",
+            "adapter": "shell",
+            "runtime_status": "destroyed",
+            "uptime_seconds": -8,
+            "ip_addresses": "not-a-list",
+            "cpu": [],
+            "monitoring": {"inspect": True, "bad": "yes"},
+            "guest_agent_status": "broken",
+        }
+    )
+
+    assert state["resource_type"] == "lxc"
+    assert state["adapter"] == "apt"
+    assert state["runtime_status"] == "unknown"
+    assert state["uptime_seconds"] == 0
+    assert state["ip_addresses"] == []
+    assert state["cpu"] == {}
+    assert state["monitoring"] == {"inspect": True}
+    assert state["guest_agent_status"] == "unknown"

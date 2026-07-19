@@ -108,6 +108,7 @@ def test_topics_retention_discovery_lwt_and_stable_ids() -> None:
     }
     assert by_topic["hubinet/ops/agent/state"][1] is True
     assert by_topic["hubinet/ops/ct/106/state"][1] is True
+    assert by_topic["hubinet/ops/resource/106/state"][1] is True
     assert by_topic["hubinet/ops/ct/106/job"][1] is True
     assert by_topic["hubinet/ops/ct/106/event"][1] is False
     discovery = by_topic[
@@ -115,11 +116,65 @@ def test_topics_retention_discovery_lwt_and_stable_ids() -> None:
     ][0]
     assert discovery["unique_id"] == "hubinet_ops_ct_106_health_status"
     assert discovery["device"]["identifiers"] == ["hubinet_ops_ct_106"]
-    assert discovery["json_attributes_topic"] == "hubinet/ops/ct/106/state"
+    assert discovery["json_attributes_topic"] == "hubinet/ops/resource/106/state"
     progress_discovery = by_topic[
         "homeassistant/sensor/hubinet_ops_ct106_job_progress/config"
     ][0]
     assert "json_attributes_topic" not in progress_discovery
+    telemetry.stop()
+
+
+def test_resource_discovery_uses_type_specific_ids_models_and_agent_counts() -> None:
+    client = FakeClient("agent")
+    telemetry = MqttTelemetry(
+        config(),
+        {
+            100: {"resource_type": "qemu", "adapter": "haos"},
+            101: {"resource_type": "lxc", "adapter": "apt"},
+            110: {"resource_type": "lxc", "adapter": "agent_self"},
+        },
+        client_factory=lambda **kwargs: client,
+    )
+    telemetry.set_state_provider(
+        lambda: (
+            {
+                "version": "0.3.0",
+                "configured_container_count": 2,
+                "configured_resource_count": 3,
+                "configured_lxc_count": 2,
+                "configured_qemu_count": 1,
+            },
+            [
+                {"vmid": 100, "resource_type": "qemu", "qemu_status": "running"},
+                {"vmid": 101, "resource_type": "lxc", "lxc_status": "running"},
+                {"vmid": 110, "resource_type": "lxc", "adapter": "agent_self"},
+            ],
+        )
+    )
+    telemetry.start()
+    wait_for(
+        lambda: any(
+            topic == "homeassistant/sensor/hubinet_ops_ct110_health_status/config"
+            for topic, *_ in client.published
+        )
+    )
+    by_topic = {
+        topic: json.loads(payload)
+        for topic, payload, _, _ in client.published
+        if payload.startswith("{")
+    }
+
+    vm = by_topic["homeassistant/sensor/hubinet_ops_vm100_health_status/config"]
+    ct = by_topic["homeassistant/sensor/hubinet_ops_ct101_health_status/config"]
+    agent = by_topic["homeassistant/sensor/hubinet_ops_ct110_health_status/config"]
+    assert vm["unique_id"] == "hubinet_ops_vm_100_health_status"
+    assert vm["device"]["model"] == "Observed Proxmox QEMU"
+    assert ct["device"]["model"] == "Managed Proxmox LXC"
+    assert agent["device"]["model"] == "Hubinet Ops Agent"
+    assert "homeassistant/sensor/hubinet_ops_vm100_pending_updates/config" not in by_topic
+    for key in ("configured_resource_count", "configured_lxc_count", "configured_qemu_count"):
+        assert f"homeassistant/sensor/hubinet_ops_agent_{key}/config" in by_topic
+    assert "homeassistant/sensor/hubinet_ops_agent_configured_container_count/config" in by_topic
     telemetry.stop()
 
 
@@ -250,7 +305,7 @@ def test_publish_failure_retries_same_item_before_later_items() -> None:
     telemetry.publish_event(106, {"message": "second"})
     telemetry._connected.set()
     wait_for(lambda: client.attempts.count("first") >= 2 and "second" in client.attempts)
-    assert client.attempts[:3] == ["first", "first", "second"]
+    assert client.attempts[:4] == ["first", "first", "first", "second"]
     telemetry.stop()
 
 

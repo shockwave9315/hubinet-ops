@@ -62,7 +62,10 @@ def _event_preview(value: Any) -> dict[str, Any]:
 def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for key, item in state.items():
-        if key in {"recent_job_events", "updates", "failed_units", "ip_addresses"}:
+        if key in {
+            "recent_job_events", "updates", "failed_units", "ip_addresses",
+            "recent_warnings",
+        }:
             continue
         if item is None or isinstance(item, (bool, int, float)):
             compact[key] = item
@@ -72,14 +75,41 @@ def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
     for key, fields in {
         "disk": ("used_percent", "free_mb"),
         "memory": ("used_percent",),
-        "docker": ("required_healthy", "required_total"),
+        "docker": ("enabled", "available", "required_healthy", "required_total"),
+        "cpu": ("usage", "cores", "load_1m"),
+        "network": ("in_bytes", "out_bytes"),
     }.items():
         source = _mapping(state.get(key))
         compact[key] = {field: source.get(field) for field in fields if field in source}
 
+    services = _mapping(state.get("services"))
+    compact["services"] = {
+        sanitize_text(key, limit=128): sanitize_text(value, limit=128)
+        for key, value in list(services.items())[:50]
+    }
+    docker_source = _mapping(state.get("docker"))
+    if "containers" in docker_source:
+        compact["docker"]["containers"] = [
+            {
+                key: (
+                    bool(item.get(key))
+                    if key == "running"
+                    else sanitize_text(item.get(key), limit=128)
+                )
+                for key in ("name", "running", "health")
+                if key in item
+            }
+            for item in _sequence(docker_source.get("containers"))[:10]
+            if isinstance(item, dict)
+        ]
+
     capabilities = _mapping(state.get("operator_capabilities"))
     compact["operator_capabilities"] = {
         str(key): bool(value) for key, value in capabilities.items()
+    }
+    monitoring = _mapping(state.get("monitoring"))
+    compact["monitoring"] = {
+        str(key): bool(value) for key, value in monitoring.items()
     }
 
     updates = _mapping(state.get("updates"))
@@ -100,15 +130,30 @@ def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
         sanitize_text(item, limit=64)
         for item in _sequence(state.get("ip_addresses"))[:20]
     ]
+    compact["recent_warnings"] = [
+        sanitize_text(item, limit=500)
+        for item in _sequence(state.get("recent_warnings"))[-20:]
+    ]
     return compact
 
 
 def _minimal_state(state: dict[str, Any]) -> dict[str, Any]:
     required = (
         "vmid",
+        "resource_type",
+        "adapter",
+        "runtime_status",
         "health_status",
         "health_score",
         "lxc_status",
+        "qemu_status",
+        "guest_agent_status",
+        "hostname",
+        "os",
+        "uptime_seconds",
+        "service_status",
+        "api_health",
+        "agent_version",
         "update_status",
         "operation_status",
         "job_stage",
@@ -151,7 +196,11 @@ def _minimal_state(state: dict[str, Any]) -> dict[str, Any]:
         "recovery_notification_suppressed_until",
     )
     minimal = {key: state.get(key) for key in required if key in state}
-    for key in ("disk", "memory", "docker", "updates", "last_job_event", "operator_capabilities"):
+    for key in (
+        "cpu", "disk", "memory", "network", "services", "docker", "updates",
+        "last_job_event", "operator_capabilities", "monitoring", "ip_addresses",
+        "recent_warnings",
+    ):
         if key in state:
             minimal[key] = state[key]
     if _json_bytes(minimal) <= HA_ATTRIBUTE_BUDGET_BYTES:

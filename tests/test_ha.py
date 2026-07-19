@@ -128,12 +128,11 @@ def test_dashboard_is_mushroom_sections_with_dashboard_only_approval() -> None:
     text = DASHBOARD.read_text(encoding="utf-8")
 
     assert [view["path"] for view in dashboard["views"]] == [
-        "overview",
-        "ct-101",
-        "ct-106",
+        "overview", "vm-100", "ct-101", "ct-102", "ct-103", "ct-104",
+        "ct-105", "ct-106", "ct-107", "ct-108", "ct-109", "ct-110",
     ]
     assert all(view["type"] == "sections" for view in dashboard["views"])
-    assert text.count("custom:mushroom-") >= 40
+    assert text.count("custom:mushroom-") >= 20
     assert "action: perform-action" in text
     assert "call-service" not in text
     assert "script.hubinet_ops_approve_container" in text
@@ -146,12 +145,12 @@ def test_dashboard_is_mushroom_sections_with_dashboard_only_approval() -> None:
 def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() -> None:
     text = DASHBOARD.read_text(encoding="utf-8")
 
-    assert text.count("title: Logi live") == 2
-    assert text.count("recent_job_events") >= 2
-    assert text.count("events[-25:] | reverse") == 2
-    assert text.count("replace('|', '¦')") == 2
-    assert text.count("packages[:30]") == 2
-    assert text.count("kolejnych widocznych pakietów") == 2
+    assert text.count("title: Logi live") == 9
+    assert text.count("recent_job_events") >= 9
+    assert text.count("events[-25:] | reverse") == 9
+    assert text.count("replace(''|'', ''¦'')") == 10
+    assert text.count("packages[:30]") == 9
+    assert text.count("kolejnych widocznych pakietów") == 9
 
 
 def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:

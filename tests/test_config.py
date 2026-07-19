@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from app.config import validate_config
+from app.config import Settings, validate_config
 
 
 def base_config() -> dict[str, Any]:
@@ -88,7 +88,7 @@ def test_enabled_mqtt_requires_host_and_valid_reconnect_range() -> None:
 def test_duplicate_normalized_vmids_are_rejected() -> None:
     config = base_config()
     config["containers"] = {106: {"enabled": True}, "106": {"enabled": True}}
-    with pytest.raises(RuntimeError, match="Duplicate container VMID"):
+    with pytest.raises(RuntimeError, match="Duplicate resource VMID"):
         validate_config(config)
 
 
@@ -166,19 +166,138 @@ def test_recovery_delay_above_default_cooldown_uses_safe_dynamic_default() -> No
     validate_config(config)
 
 
-def test_example_policy_keeps_ct101_denied_and_ct106_enabled() -> None:
+def test_example_policy_keeps_ct101_denied_and_ct106_managed() -> None:
     import yaml
     from pathlib import Path
 
     raw = yaml.safe_load(Path("config/config.example.yaml").read_text(encoding="utf-8"))
     validate_config(raw)
-    ct101 = raw["containers"][101]["operator_capabilities"]
-    ct106 = raw["containers"][106]["operator_capabilities"]
+    ct101 = raw["resources"][101]["operator_capabilities"]
+    ct106 = raw["resources"][106]["operator_capabilities"]
     assert ct101 and not any(ct101.values())
-    assert ct106 and all(ct106.values())
-    assert raw["containers"][101]["recovery_scan"]["enabled"] is False
-    assert raw["containers"][106]["recovery_scan"] == {
+    assert ct106 and all(value for key, value in ct106.items() if key != "rollback")
+    assert ct106["rollback"] is False
+    assert raw["resources"][101]["recovery_scan"]["enabled"] is False
+    assert raw["resources"][106]["recovery_scan"] == {
         "enabled": True,
         "delay_seconds": 90,
         "cooldown_seconds": 900,
     }
+
+
+def resource_config(**overrides: Any) -> dict[str, Any]:
+    resource = {
+        "resource_type": "lxc",
+        "adapter": "apt",
+        "enabled": True,
+        "monitoring": {"inspect": True, "update_scan": True},
+        "operator_capabilities": {},
+    }
+    resource.update(overrides)
+    return {"resources": {101: resource}, "mqtt": {"enabled": False}}
+
+
+def test_legacy_containers_are_exposed_as_lxc_resources_without_file_rewrite(
+    tmp_path: Path,
+) -> None:
+    raw = {"containers": {101: {"enabled": True}}, "mqtt": {"enabled": False}}
+    validate_config(raw)
+    settings = Settings(
+        raw=raw,
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "ops.db",
+        api_token="x" * 64,
+    )
+
+    assert settings.resources[101]["resource_type"] == "lxc"
+    assert settings.resources[101]["adapter"] == "apt"
+    assert settings.containers == settings.resources
+    assert "resources" not in raw
+
+
+def test_legacy_recovery_scan_uses_same_monitoring_default_during_validation_and_load(
+    tmp_path: Path,
+) -> None:
+    raw = {
+        "containers": {
+            106: {
+                "enabled": True,
+                "operator_capabilities": {"scan": False},
+                "recovery_scan": {
+                    "enabled": True,
+                    "delay_seconds": 90,
+                    "cooldown_seconds": 900,
+                },
+            }
+        },
+        "mqtt": {"enabled": False},
+    }
+
+    validate_config(raw)
+    loaded = Settings(
+        raw=raw,
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "ops.db",
+        api_token="x" * 64,
+    )
+
+    assert loaded.resources[106]["monitoring"] == {
+        "inspect": True,
+        "update_scan": True,
+    }
+
+
+def test_production_monitoring_scheduler_is_enabled_for_observation_scans() -> None:
+    import yaml
+    from pathlib import Path
+
+    raw = yaml.safe_load(Path("config/config.example.yaml").read_text(encoding="utf-8"))
+    validate_config(raw)
+
+    assert raw["monitoring_scheduler"] == {
+        "enabled": True,
+        "scan_interval_minutes": 360,
+        "initial_scan_delay_seconds": 60,
+    }
+    for vmid in (101, 102, 103, 104, 105, 107, 108, 109):
+        assert raw["resources"][vmid]["monitoring"]["update_scan"] is True
+        assert raw["resources"][vmid]["operator_capabilities"]["scan"] is False
+    assert raw["resources"][100]["monitoring"]["update_scan"] is False
+    assert raw["resources"][110]["monitoring"]["update_scan"] is False
+
+
+def test_resources_and_containers_conflict_fails_closed() -> None:
+    with pytest.raises(RuntimeError, match="cannot be configured together"):
+        validate_config({"resources": {101: {}}, "containers": {101: {}}})
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"resource_type": "container"}, "resource_type"),
+        ({"resource_type": "qemu", "adapter": "apt"}, "only for LXC"),
+        ({"resource_type": "lxc", "adapter": "haos"}, "only for QEMU"),
+        ({"guest_agent": True}, "only for QEMU"),
+        ({"resource_type": "qemu", "adapter": "haos", "monitoring": {"inspect": True, "update_scan": False}, "required_services": ["x"]}, "required_services"),
+        ({"resource_type": "qemu", "adapter": "haos", "monitoring": {"inspect": True, "update_scan": False}, "docker": {"enabled": True}}, "Docker"),
+        ({"ip_address": "not-an-ip"}, "ip_address"),
+        ({"criticality": "urgent"}, "criticality"),
+        ({"approval_mode": "automatic"}, "approval_mode"),
+        ({"dashboard_path": "/other/path"}, "dashboard_path"),
+    ],
+)
+def test_resource_type_adapter_combinations_fail_closed(
+    overrides: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        validate_config(resource_config(**overrides))
+
+
+def test_recovery_scan_requires_monitoring_update_scan() -> None:
+    config = resource_config(
+        monitoring={"inspect": True, "update_scan": False},
+        recovery_scan={"enabled": True, "delay_seconds": 90, "cooldown_seconds": 900},
+    )
+    with pytest.raises(RuntimeError, match="requires monitoring.update_scan"):
+        validate_config(config)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from ipaddress import ip_address
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,31 @@ OPERATOR_CAPABILITIES = {
     "reboot",
 }
 RECOVERY_SCAN_KEYS = {"enabled", "delay_seconds", "cooldown_seconds"}
+MONITORING_KEYS = {"inspect", "update_scan"}
+RESOURCE_TYPES = {"lxc", "qemu"}
+RESOURCE_ADAPTERS = {"apt", "haos", "agent_self"}
+RESOURCE_KEYS = {
+    "resource_type",
+    "adapter",
+    "name",
+    "display_name",
+    "enabled",
+    "criticality",
+    "ip_address",
+    "guest_agent",
+    "monitoring",
+    "operator_capabilities",
+    "approval_mode",
+    "automatic_rollback",
+    "manual_rollback_allowed",
+    "recovery_scan",
+    "repair_actions",
+    "dashboard_path",
+    "stabilization",
+    "required_services",
+    "docker",
+    "os",
+}
 
 
 @dataclass(frozen=True)
@@ -43,6 +69,10 @@ class Settings:
         return self.raw.get("scheduler", {})
 
     @property
+    def monitoring_scheduler(self) -> dict[str, Any]:
+        return self.raw.get("monitoring_scheduler", {})
+
+    @property
     def home_assistant(self) -> dict[str, Any]:
         return self.raw.get("home_assistant", {})
 
@@ -51,9 +81,17 @@ class Settings:
         return self.raw.get("mqtt", {})
 
     @property
+    def resources(self) -> dict[int, dict[str, Any]]:
+        return _normalized_resources(self.raw)
+
+    @property
     def containers(self) -> dict[int, dict[str, Any]]:
-        source = self.raw.get("containers", {})
-        return {int(k): dict(v) for k, v in source.items()}
+        """0.3.x compatibility alias exposing only Proxmox LXC resources."""
+        return {
+            vmid: cfg
+            for vmid, cfg in self.resources.items()
+            if cfg.get("resource_type") == "lxc"
+        }
 
 
 def load_settings() -> Settings:
@@ -74,82 +112,232 @@ def load_settings() -> Settings:
         raise RuntimeError("Top-level YAML config must be an object")
 
     validate_config(raw)
+    normalized_raw = dict(raw)
+    normalized_raw.pop("containers", None)
+    normalized_raw["resources"] = _normalized_resources(raw)
 
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    return Settings(raw=raw, config_path=config_path, db_path=db_path, api_token=api_token)
+    return Settings(
+        raw=normalized_raw,
+        config_path=config_path,
+        db_path=db_path,
+        api_token=api_token,
+    )
 
 
 def validate_config(raw: dict[str, Any]) -> None:
-    containers = raw.get("containers", {})
-    if not isinstance(containers, dict) or not containers:
-        raise RuntimeError("containers must be a non-empty object")
+    if "resources" in raw and "containers" in raw:
+        raise RuntimeError("resources and legacy containers cannot be configured together")
+    legacy = "containers" in raw
+    source_name = "containers" if legacy else "resources"
+    resources = raw.get(source_name, {})
+    if not isinstance(resources, dict) or not resources:
+        raise RuntimeError("resources must be a non-empty object")
 
     normalized_vmids: set[int] = set()
-    for raw_vmid, value in containers.items():
+    for raw_vmid, value in resources.items():
         try:
-            vmid = _strict_int(raw_vmid, "Container VMID")
+            vmid = _strict_int(raw_vmid, "Resource VMID")
         except RuntimeError as exc:
-            raise RuntimeError("Container VMIDs must be integers") from exc
+            raise RuntimeError("Resource VMIDs must be integers") from exc
         if vmid <= 0 or not isinstance(value, dict):
-            raise RuntimeError(f"Invalid container configuration for VMID {raw_vmid}")
+            raise RuntimeError(f"Invalid resource configuration for VMID {raw_vmid}")
         if vmid in normalized_vmids:
-            raise RuntimeError(f"Duplicate container VMID after normalization: {vmid}")
+            raise RuntimeError(f"Duplicate resource VMID after normalization: {vmid}")
         normalized_vmids.add(vmid)
 
-        actions_raw = value.get("repair_actions") or []
-        if not isinstance(actions_raw, list):
-            raise RuntimeError(f"CT{vmid} repair_actions must be a list")
-        actions = {str(action) for action in actions_raw}
-        if not actions <= ALLOWED_REPAIR_ACTIONS:
-            raise RuntimeError(f"CT{vmid} contains an unsupported repair action")
+        unknown_keys = set(value) - RESOURCE_KEYS
+        if unknown_keys:
+            raise RuntimeError(
+                f"Resource {vmid} contains unknown settings: "
+                f"{', '.join(sorted(str(item) for item in unknown_keys))}"
+            )
+
+        resource_type = str(value.get("resource_type", "lxc" if legacy else ""))
+        adapter = str(value.get("adapter", "apt" if legacy else ""))
+        if resource_type not in RESOURCE_TYPES:
+            raise RuntimeError(f"Resource {vmid} has unsupported resource_type: {resource_type}")
+        if adapter not in RESOURCE_ADAPTERS:
+            raise RuntimeError(f"Resource {vmid} has unsupported adapter: {adapter}")
+        if adapter == "apt" and resource_type != "lxc":
+            raise RuntimeError(f"Resource {vmid}: apt adapter is supported only for LXC")
+        if adapter == "haos" and resource_type != "qemu":
+            raise RuntimeError(f"Resource {vmid}: haos adapter is supported only for QEMU")
+        if adapter == "agent_self" and (resource_type != "lxc" or vmid != 110):
+            raise RuntimeError(
+                "Resource adapter agent_self is allowed only for the agent resource VMID 110"
+            )
+        for key in ("name", "display_name"):
+            if key in value and (
+                not isinstance(value[key], str) or not value[key].strip()
+            ):
+                raise RuntimeError(f"Resource {vmid} {key} must be a non-empty string")
+        if value.get("criticality", "medium") not in {"critical", "high", "medium", "low"}:
+            raise RuntimeError(f"Resource {vmid} criticality is unsupported")
+        if value.get("approval_mode", "always") != "always":
+            raise RuntimeError(f"Resource {vmid} approval_mode must be always")
+        if "ip_address" in value:
+            try:
+                ip_address(str(value["ip_address"]))
+            except ValueError as exc:
+                raise RuntimeError(f"Resource {vmid} ip_address is invalid") from exc
+        if "dashboard_path" in value and (
+            not isinstance(value["dashboard_path"], str)
+            or not value["dashboard_path"].startswith("/hubinet-ops/")
+        ):
+            raise RuntimeError(f"Resource {vmid} dashboard_path is invalid")
+        if "enabled" in value and not isinstance(value["enabled"], bool):
+            raise RuntimeError(f"Resource {vmid} enabled must be a boolean")
+        if "guest_agent" in value and not isinstance(value["guest_agent"], bool):
+            raise RuntimeError(f"Resource {vmid} guest_agent must be a boolean")
+        if resource_type != "qemu" and "guest_agent" in value:
+            raise RuntimeError(f"Resource {vmid} guest_agent is supported only for QEMU")
 
         capabilities = value.get("operator_capabilities", {})
         if not isinstance(capabilities, dict):
-            raise RuntimeError(f"CT{vmid} operator_capabilities must be an object")
+            raise RuntimeError(f"Resource {vmid} operator_capabilities must be an object")
         unknown_capabilities = set(capabilities) - OPERATOR_CAPABILITIES
         if unknown_capabilities:
             raise RuntimeError(
-                f"CT{vmid} contains unknown operator capabilities: "
+                f"Resource {vmid} contains unknown operator capabilities: "
                 f"{', '.join(sorted(str(item) for item in unknown_capabilities))}"
             )
         for capability, allowed in capabilities.items():
             if not isinstance(allowed, bool):
                 raise RuntimeError(
-                    f"CT{vmid} operator_capabilities.{capability} must be a boolean"
+                    f"Resource {vmid} operator_capabilities.{capability} must be a boolean"
                 )
+
+        monitoring_default = _legacy_monitoring_default(value)
+        monitoring = value.get("monitoring", monitoring_default if legacy else None)
+        if not isinstance(monitoring, dict):
+            raise RuntimeError(f"Resource {vmid} monitoring must be an object")
+        unknown_monitoring = set(monitoring) - MONITORING_KEYS
+        if unknown_monitoring:
+            raise RuntimeError(
+                f"Resource {vmid} contains unknown monitoring settings: "
+                f"{', '.join(sorted(str(item) for item in unknown_monitoring))}"
+            )
+        for key in MONITORING_KEYS:
+            if key not in monitoring and not legacy:
+                raise RuntimeError(f"Resource {vmid} monitoring.{key} is required")
+            if key in monitoring and not isinstance(monitoring[key], bool):
+                raise RuntimeError(f"Resource {vmid} monitoring.{key} must be a boolean")
+
+        if adapter in {"haos", "agent_self"}:
+            forbidden = {
+                name
+                for name in (
+                    "scan",
+                    "approve",
+                    "reject",
+                    "retry_healthcheck",
+                    "rollback",
+                    "start",
+                    "shutdown",
+                    "reboot",
+                )
+                if bool(capabilities.get(name, False))
+            }
+            if forbidden:
+                raise RuntimeError(
+                    f"Resource {vmid} adapter {adapter} does not support operator actions: "
+                    f"{', '.join(sorted(forbidden))}"
+                )
+            if bool(monitoring.get("update_scan", False)):
+                raise RuntimeError(
+                    f"Resource {vmid} adapter {adapter} does not support APT update scans"
+                )
+        if adapter == "agent_self" and any(bool(value) for value in capabilities.values()):
+            raise RuntimeError("Resource 110 agent_self must deny every operator capability")
+
+        actions_raw = value.get("repair_actions") or []
+        if not isinstance(actions_raw, list):
+            raise RuntimeError(f"Resource {vmid} repair_actions must be a list")
+        actions = {str(action) for action in actions_raw}
+        if not actions <= ALLOWED_REPAIR_ACTIONS:
+            raise RuntimeError(f"Resource {vmid} contains an unsupported repair action")
+        if adapter != "apt" and actions:
+            raise RuntimeError(f"Resource {vmid} adapter {adapter} cannot configure repair_actions")
+
+        required_services = value.get("required_services", [])
+        if not isinstance(required_services, list) or not all(
+            isinstance(item, str) and item.strip() for item in required_services
+        ):
+            raise RuntimeError(f"Resource {vmid} required_services must be a list of names")
+        docker = value.get("docker", {})
+        if not isinstance(docker, dict):
+            raise RuntimeError(f"Resource {vmid} docker must be an object")
+        unknown_docker = set(docker) - {"enabled", "require_health", "required"}
+        if unknown_docker:
+            raise RuntimeError(f"Resource {vmid} contains unknown docker settings")
+        for key in ("enabled", "require_health"):
+            if key in docker and not isinstance(docker[key], bool):
+                raise RuntimeError(f"Resource {vmid} docker.{key} must be a boolean")
+        required_docker = docker.get("required", [])
+        if not isinstance(required_docker, list) or not all(
+            isinstance(item, str) and item.strip() for item in required_docker
+        ):
+            raise RuntimeError(f"Resource {vmid} docker.required must be a list of names")
+        if resource_type == "qemu" and required_services:
+            raise RuntimeError(f"Resource {vmid} QEMU cannot configure required_services")
+        if adapter != "apt" and bool(docker.get("enabled", False)):
+            raise RuntimeError(f"Resource {vmid} adapter {adapter} cannot enable Docker checks")
 
         recovery = value.get("recovery_scan", {})
         if not isinstance(recovery, dict):
-            raise RuntimeError(f"CT{vmid} recovery_scan must be an object")
+            raise RuntimeError(f"Resource {vmid} recovery_scan must be an object")
         unknown_recovery = set(recovery) - RECOVERY_SCAN_KEYS
         if unknown_recovery:
             raise RuntimeError(
-                f"CT{vmid} contains unknown recovery_scan settings: "
+                f"Resource {vmid} contains unknown recovery_scan settings: "
                 f"{', '.join(sorted(str(item) for item in unknown_recovery))}"
             )
         enabled = recovery.get("enabled", False)
         if not isinstance(enabled, bool):
-            raise RuntimeError(f"CT{vmid} recovery_scan.enabled must be a boolean")
+            raise RuntimeError(f"Resource {vmid} recovery_scan.enabled must be a boolean")
+        if enabled and not bool(monitoring.get("update_scan", False)):
+            raise RuntimeError(
+                f"Resource {vmid} recovery_scan.enabled requires monitoring.update_scan"
+            )
         delay = _strict_int(
             recovery.get("delay_seconds", 90),
-            f"CT{vmid} recovery_scan.delay_seconds",
+            f"Resource {vmid} recovery_scan.delay_seconds",
         )
         cooldown = _strict_int(
             recovery.get("cooldown_seconds", max(900, delay)),
-            f"CT{vmid} recovery_scan.cooldown_seconds",
+            f"Resource {vmid} recovery_scan.cooldown_seconds",
         )
         if delay < 1 or delay > 3600:
             raise RuntimeError(
-                f"CT{vmid} recovery_scan.delay_seconds must be between 1 and 3600"
+                f"Resource {vmid} recovery_scan.delay_seconds must be between 1 and 3600"
             )
         if cooldown < delay or cooldown > 604800:
             raise RuntimeError(
-                f"CT{vmid} recovery_scan.cooldown_seconds must be between delay_seconds and 604800"
+                f"Resource {vmid} recovery_scan.cooldown_seconds must be between delay_seconds and 604800"
+            )
+
+        for key in ("automatic_rollback", "manual_rollback_allowed"):
+            if key in value and not isinstance(value[key], bool):
+                raise RuntimeError(f"Resource {vmid} {key} must be a boolean")
+        if bool(capabilities.get("rollback", False)) and not bool(
+            value.get("manual_rollback_allowed", False)
+        ):
+            raise RuntimeError(
+                f"Resource {vmid} rollback capability requires manual_rollback_allowed"
+            )
+        if adapter != "apt" and (
+            bool(value.get("automatic_rollback", False))
+            or bool(value.get("manual_rollback_allowed", False))
+            or enabled
+        ):
+            raise RuntimeError(
+                f"Resource {vmid} adapter {adapter} cannot use update recovery or rollback"
             )
 
         stabilization = value.get("stabilization") or {}
         if not isinstance(stabilization, dict):
-            raise RuntimeError(f"CT{vmid} stabilization must be an object")
+            raise RuntimeError(f"Resource {vmid} stabilization must be an object")
         for key in (
             "post_update_timeout_seconds",
             "post_rollback_timeout_seconds",
@@ -157,24 +345,30 @@ def validate_config(raw: dict[str, Any]) -> None:
             "poll_interval_seconds",
         ):
             if key in stabilization:
-                number = _finite_float(stabilization[key], f"CT{vmid} stabilization.{key}")
+                number = _finite_float(
+                    stabilization[key], f"Resource {vmid} stabilization.{key}"
+                )
                 if number <= 0:
-                    raise RuntimeError(f"CT{vmid} stabilization.{key} must be positive")
+                    raise RuntimeError(
+                        f"Resource {vmid} stabilization.{key} must be positive"
+                    )
         if "initial_grace_seconds" in stabilization:
             grace = _finite_float(
                 stabilization["initial_grace_seconds"],
-                f"CT{vmid} stabilization.initial_grace_seconds",
+                f"Resource {vmid} stabilization.initial_grace_seconds",
             )
             if grace < 0:
-                raise RuntimeError(f"CT{vmid} stabilization.initial_grace_seconds cannot be negative")
+                raise RuntimeError(
+                    f"Resource {vmid} stabilization.initial_grace_seconds cannot be negative"
+                )
         if "required_consecutive_successes" in stabilization:
             successes = _strict_int(
                 stabilization["required_consecutive_successes"],
-                f"CT{vmid} stabilization.required_consecutive_successes",
+                f"Resource {vmid} stabilization.required_consecutive_successes",
             )
             if successes <= 0:
                 raise RuntimeError(
-                    f"CT{vmid} stabilization.required_consecutive_successes must be positive"
+                    f"Resource {vmid} stabilization.required_consecutive_successes must be positive"
                 )
 
     mqtt = raw.get("mqtt") or {}
@@ -199,6 +393,66 @@ def validate_config(raw: dict[str, Any]) -> None:
         raise RuntimeError("MQTT reconnect delays must be positive")
     if reconnect_min > reconnect_max:
         raise RuntimeError("mqtt.reconnect_min_seconds cannot exceed reconnect_max_seconds")
+
+    monitoring_scheduler = raw.get("monitoring_scheduler", {})
+    if not isinstance(monitoring_scheduler, dict):
+        raise RuntimeError("monitoring_scheduler must be an object")
+    unknown_scheduler = set(monitoring_scheduler) - {
+        "enabled",
+        "scan_interval_minutes",
+        "initial_scan_delay_seconds",
+    }
+    if unknown_scheduler:
+        raise RuntimeError(
+            "monitoring_scheduler contains unknown settings: "
+            f"{', '.join(sorted(str(item) for item in unknown_scheduler))}"
+        )
+    if "enabled" in monitoring_scheduler and not isinstance(
+        monitoring_scheduler["enabled"], bool
+    ):
+        raise RuntimeError("monitoring_scheduler.enabled must be a boolean")
+    for key, default in (
+        ("scan_interval_minutes", 360),
+        ("initial_scan_delay_seconds", 60),
+    ):
+        value = _strict_int(
+            monitoring_scheduler.get(key, default),
+            f"monitoring_scheduler.{key}",
+        )
+        if value < 1:
+            raise RuntimeError(f"monitoring_scheduler.{key} must be positive")
+
+
+def _normalized_resources(raw: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    if "resources" in raw and "containers" in raw:
+        raise RuntimeError("resources and legacy containers cannot be configured together")
+    legacy = "containers" in raw
+    source = raw.get("containers" if legacy else "resources", {})
+    if not isinstance(source, dict):
+        return {}
+    normalized: dict[int, dict[str, Any]] = {}
+    for raw_vmid, raw_cfg in source.items():
+        vmid = _strict_int(raw_vmid, "Resource VMID")
+        cfg = dict(raw_cfg) if isinstance(raw_cfg, dict) else {}
+        cfg.setdefault("resource_type", "lxc")
+        cfg.setdefault("adapter", "apt")
+        if legacy:
+            cfg.setdefault("monitoring", _legacy_monitoring_default(cfg))
+        normalized[vmid] = cfg
+    return normalized
+
+
+def _legacy_monitoring_default(resource: dict[str, Any]) -> dict[str, bool]:
+    capabilities = resource.get("operator_capabilities")
+    capability_map = capabilities if isinstance(capabilities, dict) else {}
+    recovery = resource.get("recovery_scan")
+    recovery_enabled = bool(
+        isinstance(recovery, dict) and recovery.get("enabled", False)
+    )
+    return {
+        "inspect": True,
+        "update_scan": bool(capability_map.get("scan", False)) or recovery_enabled,
+    }
 
 
 def _finite_float(value: Any, name: str) -> float:

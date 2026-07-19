@@ -1,93 +1,45 @@
-# Hubinet Ops 0.2.4
+# Hubinet Ops 0.3.0
 
-Hubinet Ops is a safety-focused operations agent for approved APT updates in allowlisted Proxmox LXC containers. The FastAPI agent runs in a dedicated container, reaches the Proxmox host through a forced-command SSH wrapper, and delegates a fixed action set to `hubinet-maint` inside managed containers.
+Hubinet Ops is a policy-controlled Proxmox inventory, telemetry, and manually approved APT maintenance service. Version 0.3.0 models LXC, QEMU/HAOS, and the agent itself as explicit resources while preserving the 0.2.4 update, rollback, lifecycle, SQLite, MQTT, and Home Assistant safety contracts.
 
-Version 0.2.4 adds backend-authoritative per-container capabilities, fixed graceful LXC lifecycle actions, delayed recovery scans, and explicit post-update APT/dpkg/service/Docker verification. The complete Home Assistant MQTT attribute payload remains bounded to 10,000 UTF-8 bytes.
+The production inventory contains VM/CT 100–110. VM100 (HAOS), CT101–105, CT107–110 are observation-only. CT106 WeatherHub is the only lifecycle-enabled and live-test target. Observation-only policy does not disable internal telemetry or scheduled APT scans.
 
 ## Safety model
 
-- REST state-changing endpoints require a bearer token.
-- Updates require a plan and manual dashboard approval.
-- MQTT publishes telemetry and discovery only; it has no command topics or buttons.
-- SSH remains a forced command with explicit action, VMID, and snapshot-name validation.
-- Automatic and manual rollback are separate per-container policies.
-- Home Assistant is presentation and controlled input; SQLite and the agent are authoritative.
-- The scheduler and MQTT are disabled by default.
-- CT101 is observation-only; CT106 is the initial lifecycle and recovery-scan target.
+- Every `/api/v1` endpoint uses bearer authentication.
+- The backend and SQLite are authoritative; Home Assistant only presents state and requests fixed actions.
+- Updates still require a fingerprinted plan and explicit approval.
+- MQTT is telemetry/discovery only and has no command topics.
+- The PVE SSH key is restricted to `deploy/pve/hubinet-ops-host`; no shell or command text is accepted.
+- Observation, managed-read, maintenance, lifecycle, and resource-type files are separate fail-closed controls.
+- Lifecycle contains exactly CT106. VM100 and CT110 cannot be managed through the wrapper.
+- Rich retained state remains bounded to 10,000 UTF-8 bytes.
 
-See [architecture](docs/architecture.md), [state model](docs/state-model.md), and [recovery](docs/recovery.md) for the full contract.
+## Repository map
 
-## Repository layout
+- `app/`: API, resource policy/service, adapters, SQLite, MQTT, and state normalization.
+- `config/config.example.yaml`: complete production-shaped resource inventory without credentials.
+- `deploy/pve/`: forced-command wrapper and versioned allowlists/type map.
+- `deploy/managed/`: fixed LXC executor, transactional installer, and CT101–109 profiles.
+- `home-assistant/`: package, generated dashboard, and secret examples.
+- `scripts/generate_ha_dashboard.py`: deterministic inventory-driven Lovelace generator.
+- `deploy/upgrade-0.3.0-from-pve.sh`: transactional 0.2.4 → 0.3.0 upgrade.
+- `deploy/install-ha-0.3.0-from-pve.sh`: backed-up HA file installer; validates but never restarts HA.
 
-- `app/`: FastAPI, SQLite, executor, state machine, stabilization, and MQTT.
-- `deploy/pve/`: forced-command Proxmox wrapper and access installer.
-- `deploy/managed/`: fixed-action managed-container executor and profiles.
-- `home-assistant/`: package, MQTT-backed dashboard, and example secrets.
-- `deploy/upgrade-0.2.1-from-pve.sh`: backed-up 0.2.0 to 0.2.1 platform upgrade.
-- `deploy/upgrade-0.2.3-from-pve.sh`: transactional agent-only MQTT payload upgrade.
-- `deploy/install-ha-dashboard-0.2.3-from-pve.sh`: backed-up dashboard-only 0.2.3 deployment.
-- `deploy/upgrade-0.2.4-from-pve.sh`: transactional agent, wrapper, and managed-executor upgrade.
-- `deploy/install-ha-0.2.4-from-pve.sh`: transactional HA package/dashboard/URL-secret installer.
-- `tests/`: fake-only unit and integration workflow tests.
+## Local validation
 
-## API
-
-All `/api/v1` endpoints require `Authorization: Bearer ...`.
-
-- `GET /health`
-- `GET /api/v1/state`
-- `GET /api/v1/containers`
-- `GET /api/v1/containers/{vmid}/state`
-- `GET /api/v1/containers/{vmid}/events?limit=50`
-- `GET /api/v1/jobs/{job_id}/events?limit=50`
-- `POST /api/v1/containers/{vmid}/refresh`
-- `POST /api/v1/containers/{vmid}/scan`
-- `POST /api/v1/containers/{vmid}/retry-healthcheck`
-- `POST /api/v1/containers/{vmid}/rollback`
-- `POST /api/v1/containers/{vmid}/start`
-- `POST /api/v1/containers/{vmid}/shutdown`
-- `POST /api/v1/containers/{vmid}/reboot`
-- `POST /api/v1/plans/approve`
-- `POST /api/v1/plans/reject`
-
-Rollback is rejected unless policy and recorded state permit it. No endpoint accepts command text.
-
-## Configuration
-
-Copy values from `config/config.example.yaml` into the protected runtime config. MQTT remains disabled until `mqtt.enabled: true` is set with a reachable broker. Paho MQTT `2.1.0` is pinned for Python 3.13.
-
-Every container explicitly configures `operator_capabilities`. A missing capability defaults to deny. `recovery_scan` is independent of the periodic scheduler and never approves or executes an update.
-
-The per-container stabilization defaults are:
-
-```yaml
-stabilization:
-  post_update_timeout_seconds: 300
-  post_rollback_timeout_seconds: 300
-  repair_timeout_seconds: 180
-  poll_interval_seconds: 10
-  initial_grace_seconds: 10
-  required_consecutive_successes: 2
-```
-
-Progress is best-effort, stage-weighted, monotonic, and capped at 99 until a terminal event. Package output may not map one-to-one to APT's internal work.
-
-Home Assistant rich attributes are encoded with a strict 10,000-byte budget. Scalar Discovery entities remain complete; package and recent-event previews carry authoritative total/visible/truncated metadata when details must be shortened.
-
-## Development validation
-
-Use Python 3.13 and do not point tests at infrastructure:
-
-```text
-python -m pip install -r requirements.txt -r requirements-dev.txt
-python -m compileall app
+```bash
+python -m compileall -q app tests
 pytest -q
+python -m py_compile deploy/managed/hubinet-maint
 python scripts/validate_yaml.py
+python scripts/generate_ha_dashboard.py --check
+bash -n deploy/upgrade-0.3.0-from-pve.sh
+bash -n deploy/install-ha-0.3.0-from-pve.sh
+bash -n deploy/pve/hubinet-ops-host
 python scripts/check_tracked_files.py
 ```
 
-Validate every `.sh` file and `deploy/pve/hubinet-ops-host` with `bash -n`. CI performs the same checks.
+Repository tests use fake executors, fake clocks, temporary SQLite databases, and stub commands. They do not contact Proxmox, guests, Home Assistant, or MQTT.
 
-## Deployment
-
-Deployment is intentionally not automatic. Follow [deployment](docs/deployment.md), [Home Assistant installation](docs/home-assistant.md), and the [0.2.4 upgrade guide](docs/upgrade-0.2.4.md). Upgrade scripts back up the components they replace, validate before declaring success, and perform no managed-container action.
+See [architecture](docs/architecture.md), [API](docs/api.md), [security](docs/security.md), [resource adapters](docs/resource-adapters.md), [production inventory](docs/production-inventory.md), [MQTT](docs/mqtt.md), [Home Assistant](docs/home-assistant.md), and the [0.3.0 upgrade guide](docs/upgrade-0.3.0.md).

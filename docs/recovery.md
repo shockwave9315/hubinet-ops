@@ -19,7 +19,7 @@ Set `mqtt.enabled: false`, validate the config with the agent virtualenv, and re
 
 The upgrade writes its backup path to `/root/hubinet-ops-last-upgrade-backup` inside the agent CT. Stop the agent, restore the backed-up `/opt/hubinet-ops`, `/etc/hubinet-ops`, and `ops.db*` files, restore ownership, reload systemd, and start the previous service. Do not restore only the database after the new code has resumed jobs; restore one consistent backup set.
 
-The upgrade does not replace `agent.env` or SSH keys and does not enable MQTT/scheduler, scan, approve, or update.
+The upgrade does not replace `agent.env` or SSH keys and does not enable MQTT, operator scan, approval, or update. Version 0.3.0 intentionally enables the separate read-only `monitoring_scheduler` for APT resources whose `monitoring.update_scan` is true; observation-only results cannot create an approvable plan.
 
 ## Observe CT106 without updating it
 

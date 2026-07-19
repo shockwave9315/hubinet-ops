@@ -1,24 +1,15 @@
-# Home Assistant installation
+# Home Assistant
 
-Prerequisites are:
+`scripts/generate_ha_dashboard.py` reads the versioned inventory and deterministically generates `home-assistant/dashboards/hubinet_ops.yaml`. CI checks that the generated file is current.
 
-- Home Assistant MQTT integration connected to the broker;
-- Mushroom installed through HACS and registered as a Lovelace resource;
-- a private `hubinet_ops_webhook_id` already present in `secrets.yaml`;
-- `hubinet_ops_notify_service` pointing to the operator's mobile app notification service.
+The dashboard contains Centrum plus VM/CT 100–110 views. It keeps `/hubinet-ops/ct-101` and `/hubinet-ops/ct-106`; new paths follow `/hubinet-ops/vm-100` or `/hubinet-ops/ct-NNN`. Adapter-specific cards prevent HAOS/self resources from displaying APT. Docker appears only when configured; VM100 shows Guest Agent; CT110 shows self-health. Only true backend capabilities generate controls, so CT106 is the only controlled view.
 
-Run `deploy/install-ha-from-pve.sh HA_HOST AGENT_BASE_URL AGENT_VMID [HA_SSH_PORT]` only after reviewing its SSH target. The script requires a registered Mushroom browser resource before changing HA, backs up configuration, installs the package/dashboard, merges fixed REST URLs and the existing agent token, and runs `ha core check`. It never creates or replaces the private phone target or webhook ID.
+The package uses authenticated fixed REST actions and navigation-only notifications. It never sends command text and does not put approve/reject/lifecycle buttons in notifications.
 
-Restart Home Assistant after replacing the package so the automation set is reloaded. Normal state, discovery, logs, progress, and package changes arrive through MQTT and do not use REST polling.
+Install separately from the agent upgrade:
 
-The source-controlled YAML dashboard uses Home Assistant Sections and Mushroom cards. Views are `/hubinet-ops/overview`, `/hubinet-ops/ct-101`, and `/hubinet-ops/ct-106`. The CT views include health/resources, guarded REST controls, a reverse-chronological live job log, and a bounded pending-package list.
+```bash
+bash deploy/install-ha-0.3.0-from-pve.sh 192.168.4.168 http://192.168.4.200:8787 22
+```
 
-The package owns exactly three Hubinet Ops automations:
-
-1. webhook notifications for approval, job start, success, rollback, and failures;
-2. a state-triggered phone progress loop that exists only while a CT job is running and updates one tagged notification every 10 seconds;
-3. an availability/health watchdog for the agent and both managed containers.
-
-Notification tags replace earlier Hubinet Ops messages instead of creating a new phone notification for every progress sample. Critical/offline alerts use high-priority delivery; recovery and success replace the same tagged alert.
-
-Approval, rejection, retry, and rollback remain authenticated REST actions available only from the CT dashboard. Push notifications contain navigation data only. Tapping a notification opens the relevant CT view and cannot approve an update.
+Those addresses document the current environment and are arguments, not repository runtime defaults. The installer backs up package/dashboard/secrets, preserves existing private values, adds only missing URL secrets, runs `ha core check`, rolls files back on error, and never restarts Home Assistant automatically.

@@ -95,7 +95,7 @@ class Database:
             if "progress" not in job_columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
             self._migrate_container_states(conn)
-            conn.execute("PRAGMA user_version=201")
+            conn.execute("PRAGMA user_version=300")
             # Po restarcie nie udajemy, że przerwane zadanie dalej działa.
             now = utc_now()
             conn.execute(
@@ -405,6 +405,10 @@ class Database:
             )
         return payload
 
+    def upsert_resource_state(self, vmid: int, payload: dict[str, Any]) -> dict[str, Any]:
+        """Canonical 0.3 state API; the existing table remains migration-safe."""
+        return self.upsert_container_state(vmid, payload)
+
     def get_container_state(self, vmid: int) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute(
@@ -412,12 +416,18 @@ class Database:
             ).fetchone()
         return normalize_state(json.loads(row["payload"])) if row else None
 
+    def get_resource_state(self, vmid: int) -> dict[str, Any] | None:
+        return self.get_container_state(vmid)
+
     def list_container_states(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT payload FROM container_states ORDER BY vmid ASC"
             ).fetchall()
         return [normalize_state(json.loads(row["payload"])) for row in rows]
+
+    def list_resource_states(self) -> list[dict[str, Any]]:
+        return self.list_container_states()
 
     def insert_job_event(
         self,
@@ -497,6 +507,9 @@ class Database:
                 (int(vmid), bounded),
             ).fetchall()
         return [_decode_event(row) for row in reversed(rows)]
+
+    def list_resource_events(self, vmid: int, limit: int = 50) -> list[dict[str, Any]]:
+        return self.list_container_events(vmid, limit)
 
 
 def utc_now() -> str:
