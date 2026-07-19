@@ -9,7 +9,7 @@ User=hubinetops
 Group=hubinetops
 EnvironmentFile=/etc/hubinet-ops/agent.env
 WorkingDirectory=/opt/hubinet-ops
-ExecStart=/opt/hubinet-ops/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8787 --proxy-headers
+ExecStart=/opt/hubinet-ops/.venv/bin/uvicorn app.main_v023:app --host 0.0.0.0 --port 8787 --proxy-headers
 Restart=on-failure
 RestartSec=5
 
