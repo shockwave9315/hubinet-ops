@@ -46,7 +46,11 @@ def yaml_paths(root: Path) -> list[Path]:
         (
             path
             for path in candidates
-            if not any(part.lower() in IGNORED_DIRECTORIES for part in path.relative_to(root).parts)
+            if not any(
+                part.lower() in IGNORED_DIRECTORIES
+                or part.lower().startswith(".pytest-")
+                for part in path.relative_to(root).parts
+            )
         ),
         key=lambda path: path.relative_to(root).as_posix(),
     )

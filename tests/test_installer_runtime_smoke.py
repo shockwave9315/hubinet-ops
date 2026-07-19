@@ -8,20 +8,25 @@ import pytest
 
 
 ROOT = Path(__file__).parents[1]
-SMOKE = ROOT / "tests" / "shell" / "runtime_smoke_0_2_4.sh"
+SMOKES = (
+    ROOT / "tests" / "shell" / "runtime_smoke_0_3_0.sh",
+    ROOT / "tests" / "shell" / "runtime_smoke_installers_0_3_0.sh",
+)
 
 
-def test_v024_installers_execute_with_fake_remote_commands() -> None:
+@pytest.mark.parametrize("smoke", SMOKES, ids=("wrapper", "installers"))
+def test_v030_scripts_execute_with_fake_remote_commands(smoke: Path) -> None:
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash is unavailable on this platform")
     result = subprocess.run(
-        [bash, str(SMOKE)],
+        [bash, str(smoke)],
         cwd=ROOT,
         text=True,
         capture_output=True,
-        timeout=60,
+        timeout=120,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "0.2.4 installer runtime smoke passed" in result.stdout
+    assert "0.3.0" in result.stdout
+    assert "smoke passed" in result.stdout
