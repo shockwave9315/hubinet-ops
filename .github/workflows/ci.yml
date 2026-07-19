@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -44,98 +44,3 @@ jobs:
         run: python scripts/validate_yaml.py
       - name: Reject tracked runtime files
         run: python scripts/check_tracked_files.py
-
-  apply-dashboard-patch:
-    if: >-
-      (github.event_name == 'push' &&
-       github.ref == 'refs/heads/fix/0.2.3-mqtt-attribute-budget' &&
-       !startsWith(github.event.head_commit.message, '[automation]')) ||
-      (github.event_name == 'pull_request' &&
-       github.event.pull_request.head.repo.full_name == github.repository &&
-       github.event.pull_request.head.ref == 'fix/0.2.3-mqtt-attribute-budget')
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: fix/0.2.3-mqtt-attribute-budget
-          fetch-depth: 0
-
-      - name: Patch package preview counters
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("home-assistant/dashboards/hubinet_ops.yaml")
-          lines = path.read_text(encoding="utf-8").splitlines()
-          result: list[str] = []
-          vmids = iter((101, 106))
-          current_vmid: int | None = None
-          counts = {"set": 0, "header": 0, "condition": 0, "tail": 0}
-
-          for line in lines:
-              stripped = line.strip()
-              indent = line[: len(line) - len(line.lstrip())]
-
-              if stripped == "{% set packages = updates.get('packages', []) %}":
-                  current_vmid = next(vmids, None)
-                  if current_vmid is None:
-                      raise SystemExit("Found more than two package sections")
-                  counts["set"] += 1
-                  result.append(line)
-                  result.extend(
-                      [
-                          f"{indent}{{% set meta = state_attr('sensor.hubinet_ops_ct{current_vmid}_health_status', 'attribute_payload') or {{}} %}}",
-                          f"{indent}{{% set total = meta.get('packages_total', states('sensor.hubinet_ops_ct{current_vmid}_pending_update_count') | int(0)) | int(0) %}}",
-                          f"{indent}{{% set visible = packages | count %}}",
-                      ]
-                  )
-                  continue
-
-              if stripped.startswith("**{{ packages | count }} pakietów · ryzyko"):
-                  if current_vmid is None:
-                      raise SystemExit("Package header found before package section")
-                  counts["header"] += 1
-                  result.append(
-                      f"{indent}**{{{{ total }}}} pakietów · ryzyko {{{{ states('sensor.hubinet_ops_ct{current_vmid}_risk') }}}}**"
-                  )
-                  result.extend(
-                      [
-                          "",
-                          f"{indent}{{% if meta.get('truncated') and visible < total %}}",
-                          f"{indent}_Podgląd MQTT zawiera {{{{ visible }}}} z {{{{ total }}}} pakietów (limit atrybutów 10 KB)._",
-                          "",
-                          f"{indent}{{% endif %}}",
-                      ]
-                  )
-                  continue
-
-              if stripped == "{% if packages | count > 30 %}":
-                  counts["condition"] += 1
-                  result.append(f"{indent}{{% if visible > 30 %}}")
-                  continue
-
-              if stripped == "_…oraz {{ packages | count - 30 }} kolejnych pakietów._":
-                  counts["tail"] += 1
-                  result.append(
-                      f"{indent}_…oraz {{{{ visible - 30 }}}} kolejnych widocznych pakietów._"
-                  )
-                  continue
-
-              result.append(line)
-
-          if counts != {"set": 2, "header": 2, "condition": 2, "tail": 2}:
-              raise SystemExit(f"Unexpected dashboard package structure: {counts}")
-
-          path.write_text("\n".join(result) + "\n", encoding="utf-8", newline="\n")
-          PY
-
-      - name: Commit patch and restore workflows
-        run: |
-          rm -f .github/workflows/apply-v023-dashboard-patch.yml
-          git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
-          git config user.name "hubinet-ops-automation"
-          git config user.email "actions@users.noreply.github.com"
-          git add home-assistant/dashboards/hubinet_ops.yaml .github/workflows
-          git diff --cached --check
-          git commit -m "[automation] Show package totals after MQTT truncation"
-          git push origin HEAD:fix/0.2.3-mqtt-attribute-budget

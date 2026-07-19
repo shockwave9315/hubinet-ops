@@ -427,16 +427,24 @@ views:
               content: >-
                 {% set updates = state_attr('sensor.hubinet_ops_ct101_health_status', 'updates') or {} %}
                 {% set packages = updates.get('packages', []) %}
-                **{{ packages | count }} pakietów · ryzyko {{ states('sensor.hubinet_ops_ct101_risk') }}**
+                {% set meta = state_attr('sensor.hubinet_ops_ct101_health_status', 'attribute_payload') or {} %}
+                {% set total = meta.get('packages_total', states('sensor.hubinet_ops_ct101_pending_update_count') | int(0)) | int(0) %}
+                {% set visible = packages | count %}
+                **{{ total }} pakietów · ryzyko {{ states('sensor.hubinet_ops_ct101_risk') }}**
+
+                {% if meta.get('truncated') and visible < total %}
+                _Podgląd MQTT zawiera {{ visible }} z {{ total }} pakietów (limit atrybutów 10 KB)._
+
+                {% endif %}
 
                 | Pakiet | Obecna | Docelowa |
                 |:--|:--|:--|
                 {% for package in packages[:30] %}
                 | `{{ package.name }}` | `{{ package.current | default('?') }}` | `{{ package.target | default('?') }}` |
                 {% endfor %}
-                {% if packages | count > 30 %}
+                {% if visible > 30 %}
 
-                _…oraz {{ packages | count - 30 }} kolejnych pakietów._
+                _…oraz {{ visible - 30 }} kolejnych widocznych pakietów._
                 {% endif %}
           - type: conditional
             conditions:
@@ -784,16 +792,24 @@ views:
               content: >-
                 {% set updates = state_attr('sensor.hubinet_ops_ct106_health_status', 'updates') or {} %}
                 {% set packages = updates.get('packages', []) %}
-                **{{ packages | count }} pakietów · ryzyko {{ states('sensor.hubinet_ops_ct106_risk') }}**
+                {% set meta = state_attr('sensor.hubinet_ops_ct106_health_status', 'attribute_payload') or {} %}
+                {% set total = meta.get('packages_total', states('sensor.hubinet_ops_ct106_pending_update_count') | int(0)) | int(0) %}
+                {% set visible = packages | count %}
+                **{{ total }} pakietów · ryzyko {{ states('sensor.hubinet_ops_ct106_risk') }}**
+
+                {% if meta.get('truncated') and visible < total %}
+                _Podgląd MQTT zawiera {{ visible }} z {{ total }} pakietów (limit atrybutów 10 KB)._
+
+                {% endif %}
 
                 | Pakiet | Obecna | Docelowa |
                 |:--|:--|:--|
                 {% for package in packages[:30] %}
                 | `{{ package.name }}` | `{{ package.current | default('?') }}` | `{{ package.target | default('?') }}` |
                 {% endfor %}
-                {% if packages | count > 30 %}
+                {% if visible > 30 %}
 
-                _…oraz {{ packages | count - 30 }} kolejnych pakietów._
+                _…oraz {{ visible - 30 }} kolejnych widocznych pakietów._
                 {% endif %}
           - type: conditional
             conditions:
