@@ -11,7 +11,7 @@ from .security import sanitize_data, sanitize_text
 from .mqtt_budget import bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.2.4"
+VERSION = "0.3.0"
 
 
 @dataclass(frozen=True)
@@ -26,12 +26,13 @@ class MqttTelemetry:
     def __init__(
         self,
         config: dict[str, Any] | None,
-        containers: dict[int, dict[str, Any]],
+        resources: dict[int, dict[str, Any]],
         *,
         client_factory: Callable[..., Any] | None = None,
     ):
         self.config = dict(config or {})
-        self.containers = containers
+        self.resources = resources
+        self.containers = resources  # Compatibility attribute for 0.2.x callers.
         self.enabled = bool(self.config.get("enabled", False))
         self.base_topic = str(self.config.get("base_topic", "hubinet/ops")).strip("/") or "hubinet/ops"
         self.discovery_prefix = (
@@ -54,6 +55,12 @@ class MqttTelemetry:
 
     def set_state_provider(self, provider: Callable[[], tuple[Any, ...]]) -> None:
         self._state_provider = provider
+
+    @property
+    def availability(self) -> str:
+        if not self.enabled:
+            return "disabled"
+        return "online" if self._connected.is_set() else "offline"
 
     def start(self) -> None:
         if not self.enabled or self._started:
@@ -122,28 +129,59 @@ class MqttTelemetry:
         *,
         force: bool = False,
     ) -> None:
+        self.publish_resource_state(vmid, state, force=force)
+
+    def publish_resource_state(
+        self,
+        vmid: int,
+        state: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> None:
+        payload = bounded_state(state)
         self._publish_json(
-            f"{self.base_topic}/ct/{int(vmid)}/state",
-            bounded_state(state),
+            f"{self.base_topic}/resource/{int(vmid)}/state",
+            payload,
             retain=self.retain_state,
             force=force,
         )
+        if self._is_lxc(vmid):
+            self._publish_json(
+                f"{self.base_topic}/ct/{int(vmid)}/state",
+                payload,
+                retain=self.retain_state,
+                force=force,
+            )
 
     def publish_job(self, vmid: int, job: dict[str, Any], *, force: bool = False) -> None:
         self._publish_json(
-            f"{self.base_topic}/ct/{int(vmid)}/job",
+            f"{self.base_topic}/resource/{int(vmid)}/job",
             job,
             retain=self.retain_state,
             force=force,
         )
+        if self._is_lxc(vmid):
+            self._publish_json(
+                f"{self.base_topic}/ct/{int(vmid)}/job",
+                job,
+                retain=self.retain_state,
+                force=force,
+            )
 
     def publish_event(self, vmid: int, event: dict[str, Any]) -> None:
         self._publish_json(
-            f"{self.base_topic}/ct/{int(vmid)}/event",
+            f"{self.base_topic}/resource/{int(vmid)}/event",
             event,
             retain=False,
             force=True,
         )
+        if self._is_lxc(vmid):
+            self._publish_json(
+                f"{self.base_topic}/ct/{int(vmid)}/event",
+                event,
+                retain=False,
+                force=True,
+            )
 
     def publish_discovery(self, *, force: bool = False) -> None:
         if not self.enabled:
@@ -165,6 +203,21 @@ class MqttTelemetry:
                 "{{ value_json.configured_container_count }}",
                 agent_state,
             ),
+            "configured_resource_count": (
+                "Configured resource count",
+                "{{ value_json.configured_resource_count }}",
+                agent_state,
+            ),
+            "configured_lxc_count": (
+                "Configured LXC count",
+                "{{ value_json.configured_lxc_count }}",
+                agent_state,
+            ),
+            "configured_qemu_count": (
+                "Configured QEMU count",
+                "{{ value_json.configured_qemu_count }}",
+                agent_state,
+            ),
             "active_job_count": (
                 "Active job count",
                 "{{ value_json.active_job_count }}",
@@ -184,19 +237,25 @@ class MqttTelemetry:
                 force=force,
             )
 
-        for vmid, cfg in sorted(self.containers.items()):
-            state_topic = f"{self.base_topic}/ct/{vmid}/state"
+        for vmid, cfg in sorted(self.resources.items()):
+            resource_type = str(cfg.get("resource_type", "lxc"))
+            prefix = "vm" if resource_type == "qemu" else "ct"
+            identifier = f"hubinet_ops_{prefix}_{vmid}"
+            state_topic = f"{self.base_topic}/resource/{vmid}/state"
+            model = "Observed Proxmox QEMU" if resource_type == "qemu" else "Managed Proxmox LXC"
+            if cfg.get("adapter") == "agent_self":
+                model = "Hubinet Ops Agent"
             device = {
-                "identifiers": [f"hubinet_ops_ct_{vmid}"],
-                "name": f"Hubinet Ops CT{vmid}",
+                "identifiers": [identifier],
+                "name": f"Hubinet Ops {prefix.upper()}{vmid}",
                 "manufacturer": "Hubinet",
-                "model": "Managed Proxmox LXC",
+                "model": model,
                 "via_device": "hubinet_ops_agent",
             }
-            for key, name, template, extra in _ct_entities():
+            for key, name, template, extra in _resource_entities(cfg):
                 self._discovery_sensor(
-                    object_id=f"hubinet_ops_ct{vmid}_{key}",
-                    unique_id=f"hubinet_ops_ct_{vmid}_{key}",
+                    object_id=f"hubinet_ops_{prefix}{vmid}_{key}",
+                    unique_id=f"hubinet_ops_{prefix}_{vmid}_{key}",
                     name=name,
                     state_topic=state_topic,
                     value_template=template,
@@ -209,8 +268,8 @@ class MqttTelemetry:
                     force=force,
                 )
             self._discovery_sensor(
-                object_id=f"hubinet_ops_ct{vmid}_dashboard_path",
-                unique_id=f"hubinet_ops_ct_{vmid}_dashboard_path",
+                object_id=f"hubinet_ops_{prefix}{vmid}_dashboard_path",
+                unique_id=f"hubinet_ops_{prefix}_{vmid}_dashboard_path",
                 name="Dashboard path",
                 state_topic=state_topic,
                 value_template="{{ value_json.dashboard_path }}",
@@ -218,6 +277,10 @@ class MqttTelemetry:
                 device=device,
                 force=force,
             )
+
+    def _is_lxc(self, vmid: int) -> bool:
+        cfg = self.resources.get(int(vmid), {})
+        return str(cfg.get("resource_type", "lxc")) == "lxc"
 
     def _discovery_sensor(
         self,
@@ -405,6 +468,8 @@ def _ct_entities() -> list[tuple[str, str, str, dict[str, Any]]]:
         ("health_status", "Health status", "{{ value_json.health_status }}", {}),
         ("health_score", "Health score", "{{ value_json.health_score }}", {"unit_of_measurement": "%"}),
         ("lxc_status", "LXC status", "{{ value_json.lxc_status | default('unknown') }}", {}),
+        ("runtime_status", "Runtime status", "{{ value_json.runtime_status | default('unknown') }}", {}),
+        ("uptime_seconds", "Uptime", "{{ value_json.uptime_seconds | default(0) }}", {"unit_of_measurement": "s"}),
         ("update_status", "Update status", "{{ value_json.update_status }}", {}),
         ("operation_status", "Operation status", "{{ value_json.operation_status }}", {}),
         ("job_stage", "Job stage", "{{ value_json.job_stage }}", {}),
@@ -444,4 +509,43 @@ def _ct_entities() -> list[tuple[str, str, str, dict[str, Any]]]:
         ("capability_reject", "Capability reject", "{{ 'allowed' if value_json.operator_capabilities.reject else 'blocked' }}", {}),
         ("capability_retry_healthcheck", "Capability retry healthcheck", "{{ 'allowed' if value_json.operator_capabilities.retry_healthcheck else 'blocked' }}", {}),
         ("capability_rollback", "Capability rollback", "{{ 'allowed' if value_json.operator_capabilities.rollback else 'blocked' }}", {}),
+    ]
+
+
+def _resource_entities(
+    cfg: dict[str, Any],
+) -> list[tuple[str, str, str, dict[str, Any]]]:
+    resource_type = str(cfg.get("resource_type", "lxc"))
+    adapter = str(cfg.get("adapter", "apt"))
+    if resource_type == "lxc" and adapter == "apt":
+        return _ct_entities()
+
+    common = [
+        ("health_status", "Health status", "{{ value_json.health_status }}", {}),
+        ("health_score", "Health score", "{{ value_json.health_score }}", {"unit_of_measurement": "%"}),
+        ("runtime_status", "Runtime status", "{{ value_json.runtime_status | default('unknown') }}", {}),
+        ("uptime_seconds", "Uptime", "{{ value_json.uptime_seconds | default(0) }}", {"unit_of_measurement": "s"}),
+        ("last_refresh", "Last refresh", "{{ value_json.last_refresh | default('unknown', true) }}", {}),
+        ("last_error", "Last error", "{{ value_json.last_error | default('none', true) }}", {}),
+        ("cpu_usage", "CPU usage", "{{ value_json.cpu.usage | default('unknown') }}", {}),
+        ("cpu_load_1m", "CPU load 1m", "{{ value_json.cpu.load_1m | default('unknown') }}", {}),
+        ("cpu_cores", "CPU cores", "{{ value_json.cpu.cores | default('unknown') }}", {}),
+        ("memory_used_bytes", "Memory used", "{{ value_json.memory.used_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
+        ("memory_total_bytes", "Memory total", "{{ value_json.memory.total_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
+        ("disk_used_bytes", "Disk used", "{{ value_json.disk.used_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
+        ("disk_total_bytes", "Disk total", "{{ value_json.disk.total_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
+        ("network_in_bytes", "Network received", "{{ value_json.network.in_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
+        ("network_out_bytes", "Network sent", "{{ value_json.network.out_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
+    ]
+    if resource_type == "qemu":
+        return common + [
+            ("qemu_status", "QEMU status", "{{ value_json.qemu_status | default('unknown') }}", {}),
+            ("guest_agent_status", "Guest Agent", "{{ value_json.guest_agent_status | default('unknown') }}", {}),
+            ("ip_addresses", "IP addresses", "{{ value_json.ip_addresses | default([]) | join(', ') }}", {}),
+        ]
+    return common + [
+        ("lxc_status", "LXC status", "{{ value_json.lxc_status | default('unknown') }}", {}),
+        ("service_status", "Service status", "{{ value_json.service_status | default('unknown') }}", {}),
+        ("api_health", "API health", "{{ value_json.api_health | default('unknown') }}", {}),
+        ("agent_version", "Agent version", "{{ value_json.agent_version | default('unknown') }}", {}),
     ]

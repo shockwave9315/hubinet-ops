@@ -12,6 +12,7 @@ from .config import Settings, load_settings
 from .database import Database
 from .executor import Executor
 from .mqtt import MqttTelemetry, VERSION
+from .resource_adapters import ResourceExecutor
 from .service import OpsService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -31,9 +32,12 @@ def create_app(
     db = database or Database(app_settings.db_path)
     if executor is None:
         executor_config = dict(app_settings.executor)
-        executor_config["allowed_vmids"] = sorted(app_settings.containers)
-        executor = Executor(executor_config)
-    mqtt = mqtt or MqttTelemetry(app_settings.mqtt, app_settings.containers)
+        executor_config["allowed_vmids"] = sorted(app_settings.resources)
+        executor = ResourceExecutor(
+            Executor(executor_config),
+            app_settings.resources,
+        )
+    mqtt = mqtt or MqttTelemetry(app_settings.mqtt, app_settings.resources)
     service = OpsService(app_settings, db, executor, mqtt)
 
     @asynccontextmanager
@@ -70,23 +74,54 @@ def create_app(
     def containers() -> list[dict[str, Any]]:
         return service.list_containers()
 
+    @api.get("/api/v1/resources", dependencies=auth)
+    def resources() -> list[dict[str, Any]]:
+        return service.list_resources()
+
+    @api.get("/api/v1/resources/{vmid}", dependencies=auth)
+    def resource(vmid: int) -> dict[str, Any]:
+        try:
+            return service.get_resource(vmid)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+
     @api.get("/api/v1/state", dependencies=auth)
     def states() -> dict[str, Any]:
         return service.list_states()
 
     @api.get("/api/v1/containers/{vmid}/state", dependencies=auth)
     def container_state(vmid: int) -> dict[str, Any]:
+        if vmid not in app_settings.containers:
+            raise HTTPException(status_code=404, detail="Container not found")
         try:
             return service.get_state(vmid)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Container not found") from exc
 
+    @api.get("/api/v1/resources/{vmid}/state", dependencies=auth)
+    def resource_state(vmid: int) -> dict[str, Any]:
+        try:
+            return service.get_state(vmid)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+
     @api.post("/api/v1/containers/{vmid}/refresh", dependencies=auth)
     def refresh_one(vmid: int) -> dict[str, Any]:
+        if vmid not in app_settings.containers:
+            raise HTTPException(status_code=404, detail="Container not found")
         try:
             return service.refresh_container(vmid, operator=True)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Container not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/refresh", dependencies=auth)
+    def refresh_resource(vmid: int) -> dict[str, Any]:
+        try:
+            return service.refresh_container(vmid, operator=True)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -103,10 +138,21 @@ def create_app(
 
     @api.post("/api/v1/containers/{vmid}/scan", dependencies=auth)
     def scan_one(vmid: int) -> dict[str, Any]:
+        if vmid not in app_settings.containers:
+            raise HTTPException(status_code=404, detail="Container not found")
         try:
             return service.scan_container(vmid)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Container not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/scan", dependencies=auth)
+    def scan_resource(vmid: int) -> dict[str, Any]:
+        try:
+            return service.scan_container(vmid)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -118,16 +164,33 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    def lifecycle_container_alias(vmid: int, action: str) -> dict[str, Any]:
+        if vmid not in app_settings.containers:
+            raise HTTPException(status_code=404, detail="Container not found")
+        return lifecycle(vmid, action)
+
     @api.post("/api/v1/containers/{vmid}/start", dependencies=auth)
     def start_container(vmid: int) -> dict[str, Any]:
-        return lifecycle(vmid, "start")
+        return lifecycle_container_alias(vmid, "start")
 
     @api.post("/api/v1/containers/{vmid}/shutdown", dependencies=auth)
     def shutdown_container(vmid: int) -> dict[str, Any]:
-        return lifecycle(vmid, "shutdown")
+        return lifecycle_container_alias(vmid, "shutdown")
 
     @api.post("/api/v1/containers/{vmid}/reboot", dependencies=auth)
     def reboot_container(vmid: int) -> dict[str, Any]:
+        return lifecycle_container_alias(vmid, "reboot")
+
+    @api.post("/api/v1/resources/{vmid}/start", dependencies=auth)
+    def start_resource(vmid: int) -> dict[str, Any]:
+        return lifecycle(vmid, "start")
+
+    @api.post("/api/v1/resources/{vmid}/shutdown", dependencies=auth)
+    def shutdown_resource(vmid: int) -> dict[str, Any]:
+        return lifecycle(vmid, "shutdown")
+
+    @api.post("/api/v1/resources/{vmid}/reboot", dependencies=auth)
+    def reboot_resource(vmid: int) -> dict[str, Any]:
         return lifecycle(vmid, "reboot")
 
     @api.post("/api/v1/containers/{vmid}/retry-healthcheck", dependencies=auth)
@@ -202,6 +265,15 @@ def create_app(
         if vmid not in app_settings.containers:
             raise HTTPException(status_code=404, detail="Container not found")
         return db.list_container_events(vmid, limit)
+
+    @api.get("/api/v1/resources/{vmid}/events", dependencies=auth)
+    def resource_events(
+        vmid: int,
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    ) -> list[dict[str, Any]]:
+        if vmid not in app_settings.resources:
+            raise HTTPException(status_code=404, detail="Resource not found")
+        return db.list_resource_events(vmid, limit)
 
     return api
 

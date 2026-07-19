@@ -43,8 +43,26 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     legacy_status = str(state.pop("status", "") or "")
     legacy_health = str(state.pop("health", "") or "")
 
+    resource_type = str(state.get("resource_type") or "lxc").lower()
+    if resource_type not in {"lxc", "qemu"}:
+        resource_type = "lxc"
+    adapter = str(state.get("adapter") or ("haos" if resource_type == "qemu" else "apt"))
+    if adapter not in {"apt", "haos", "agent_self"}:
+        adapter = "apt" if resource_type == "lxc" else "haos"
+    state["resource_type"] = resource_type
+    state["adapter"] = adapter
+
+    type_status_key = "qemu_status" if resource_type == "qemu" else "lxc_status"
+    runtime_status = str(
+        state.get(type_status_key) or state.get("runtime_status") or "unknown"
+    ).lower()
+    if runtime_status not in {"running", "stopped", "unknown"}:
+        runtime_status = "unknown"
+    state["runtime_status"] = runtime_status
+    state[type_status_key] = runtime_status
+
     health = str(state.get("health_status") or legacy_health or "unknown")
-    if state.get("lxc_status") == "stopped":
+    if runtime_status == "stopped":
         health = "offline"
     state["health_status"] = health if health in HEALTH_STATUSES else "unknown"
 
@@ -60,7 +78,7 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     elif "pending_count" in updates:
         raw_pending = updates.get("pending_count")
     else:
-        raw_pending = 0
+        raw_pending = 0 if adapter == "apt" else None
     pending = None if raw_pending is None else max(0, _safe_int(raw_pending, 0))
     update = str(state.get("update_status") or "")
     if pending is None:
@@ -115,6 +133,30 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("last_refresh", None)
     state.setdefault("last_update", None)
     state.setdefault("last_error", None)
+    state["hostname"] = str(state.get("hostname") or "")[:255]
+    state["os"] = str(state.get("os") or "")[:255]
+    state["uptime_seconds"] = max(0, _safe_int(state.get("uptime_seconds"), 0))
+    addresses = state.get("ip_addresses")
+    state["ip_addresses"] = (
+        [str(value)[:128] for value in addresses[:32]]
+        if isinstance(addresses, list)
+        else []
+    )
+    for key in ("cpu", "memory", "disk", "network", "services", "docker"):
+        value = state.get(key)
+        state[key] = dict(value) if isinstance(value, dict) else {}
+    guest_agent = str(state.get("guest_agent_status") or "unknown")
+    state["guest_agent_status"] = (
+        guest_agent
+        if guest_agent in {"available", "unavailable", "unknown"}
+        else "unknown"
+    )
+    monitoring = state.get("monitoring")
+    state["monitoring"] = (
+        {str(key): value for key, value in monitoring.items() if isinstance(value, bool)}
+        if isinstance(monitoring, dict)
+        else {}
+    )
     capabilities = state.get("operator_capabilities")
     state["operator_capabilities"] = (
         {str(key): bool(value) for key, value in capabilities.items()}
@@ -145,7 +187,7 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
         ("dpkg_audit_ok", None),
         ("reboot_required", None),
         ("packages_updated_count", 0),
-        ("packages_remaining_count", 0),
+        ("packages_remaining_count", 0 if adapter == "apt" else None),
         ("docker_required_healthy", 0),
         ("docker_required_total", 0),
         ("verification_error", None),

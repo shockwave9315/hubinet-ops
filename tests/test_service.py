@@ -174,6 +174,144 @@ def settings(
     )
 
 
+def observation_settings(tmp_path: Path) -> Settings:
+    denied = {
+        name: False
+        for name in (
+            "refresh", "scan", "approve", "reject", "retry_healthcheck",
+            "rollback", "start", "shutdown", "reboot",
+        )
+    }
+    return Settings(
+        raw={
+            "scheduler": {"enabled": False, "approval_ttl_minutes": 60},
+            "home_assistant": {},
+            "mqtt": {"enabled": False},
+            "resources": {
+                101: {
+                    "name": "cloudflared",
+                    "resource_type": "lxc",
+                    "adapter": "apt",
+                    "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": True},
+                    "operator_capabilities": denied,
+                }
+            },
+        },
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "observation.db",
+        api_token="t" * 64,
+    )
+
+
+def test_observation_only_monitoring_is_independent_from_operator_policy(
+    tmp_path: Path,
+) -> None:
+    executor = WorkflowExecutor()
+    cfg = observation_settings(tmp_path)
+    db = Database(cfg.db_path)
+    service = OpsService(cfg, db, executor)
+
+    refreshed = service.refresh_container(101, operator=False)
+    scanned = service.scan_container(101, operator=False, source="scheduler")
+
+    assert refreshed["health_status"] == "healthy"
+    assert scanned["status"] == "up_to_date"
+    assert executor.actions == ["inspect", "scan"]
+    assert db.find_active_plan(101) is None
+    with pytest.raises(ValueError, match="refresh.*blocked"):
+        service.refresh_container(101, operator=True)
+    with pytest.raises(ValueError, match="scan.*blocked"):
+        service.scan_container(101, operator=True)
+
+
+def test_observation_scan_reports_updates_without_creating_unapprovable_plan(
+    tmp_path: Path,
+) -> None:
+    class PendingExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, **kwargs: Any) -> dict[str, Any]:
+            if action == "scan":
+                self.actions.append(action)
+                return {
+                    "ok": True,
+                    "data": {
+                        "pending_count": 4,
+                        "packages": [{"name": "openssl"}],
+                        "fingerprint": "observed",
+                    },
+                }
+            return super().run(action, vmid, **kwargs)
+
+    executor = PendingExecutor()
+    cfg = observation_settings(tmp_path)
+    db = Database(cfg.db_path)
+    service = OpsService(cfg, db, executor)
+
+    result = service.scan_container(101, operator=False, source="scheduler")
+    state = service.get_state(101)
+
+    assert result["status"] == "updates_observed"
+    assert state["pending_updates"] == 4
+    assert state["operation_status"] == "idle"
+    assert state["active_plan_id"] is None
+    assert db.find_active_plan(101) is None
+
+
+def test_agent_self_state_adds_inventory_jobs_and_mqtt_without_secrets(
+    tmp_path: Path,
+) -> None:
+    denied = {
+        name: False
+        for name in (
+            "refresh", "scan", "approve", "reject", "retry_healthcheck",
+            "rollback", "start", "shutdown", "reboot",
+        )
+    }
+    cfg = Settings(
+        raw={
+            "scheduler": {"enabled": False},
+            "home_assistant": {},
+            "mqtt": {"enabled": False, "password": "do-not-publish"},
+            "resources": {
+                100: {
+                    "resource_type": "qemu", "adapter": "haos", "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": False},
+                    "operator_capabilities": denied,
+                },
+                110: {
+                    "resource_type": "lxc", "adapter": "agent_self", "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": False},
+                    "operator_capabilities": denied,
+                },
+            },
+        },
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "self.db",
+        api_token="t" * 64,
+    )
+    executor = WorkflowExecutor(
+        [
+            {
+                "lxc_status": "running",
+                "health_status": "healthy",
+                "service_status": "active",
+                "api_health": "ok",
+                "recent_warnings": ["bounded warning"],
+            }
+        ]
+    )
+    service = OpsService(cfg, Database(cfg.db_path), executor)
+
+    state = service.refresh_container(110)
+
+    assert state["configured_resource_count"] == 2
+    assert state["configured_lxc_count"] == 1
+    assert state["configured_qemu_count"] == 1
+    assert state["active_job_count"] == 0
+    assert state["mqtt_availability"] == "disabled"
+    assert "do-not-publish" not in str(state)
+
+
 def service_with(
     tmp_path: Path,
     executor: WorkflowExecutor,

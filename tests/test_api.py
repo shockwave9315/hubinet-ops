@@ -50,3 +50,81 @@ def test_event_endpoints_require_auth_and_bound_limits(tmp_path: Path, monkeypat
     assert client.get("/api/v1/containers/106/events?limit=201", headers=headers).status_code == 422
     assert client.get("/api/v1/containers/999/events", headers=headers).status_code == 404
     assert client.get("/api/v1/jobs/missing/events", headers=headers).status_code == 404
+
+
+def test_canonical_resources_include_qemu_and_container_alias_filters_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "resources-import.yaml"
+    config_path.write_text(
+        "scheduler:\n  enabled: false\ncontainers:\n  106:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "resources-import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+    denied = {
+        name: False
+        for name in (
+            "refresh", "scan", "approve", "reject", "retry_healthcheck",
+            "rollback", "start", "shutdown", "reboot",
+        )
+    }
+    cfg = Settings(
+        raw={
+            "scheduler": {"enabled": False},
+            "mqtt": {"enabled": False},
+            "home_assistant": {},
+            "resources": {
+                100: {
+                    "name": "home-assistant",
+                    "display_name": "Home Assistant",
+                    "resource_type": "qemu",
+                    "adapter": "haos",
+                    "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": False},
+                    "operator_capabilities": denied,
+                },
+                101: {
+                    "name": "cloudflared",
+                    "resource_type": "lxc",
+                    "adapter": "apt",
+                    "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": True},
+                    "operator_capabilities": denied,
+                },
+                110: {
+                    "name": "hubinet-ops",
+                    "resource_type": "lxc",
+                    "adapter": "agent_self",
+                    "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": False},
+                    "operator_capabilities": denied,
+                },
+            },
+        },
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "resources.db",
+        api_token="t" * 64,
+    )
+    client = TestClient(main.create_app(cfg, executor=FakeExecutor()))
+    headers = {"Authorization": f"Bearer {cfg.api_token}"}
+
+    resources = client.get("/api/v1/resources", headers=headers)
+    containers = client.get("/api/v1/containers", headers=headers)
+
+    assert resources.status_code == 200
+    assert client.get("/api/v1/resources").status_code == 401
+    assert [item["vmid"] for item in resources.json()] == [100, 101, 110]
+    assert resources.json()[0]["resource_type"] == "qemu"
+    assert [item["vmid"] for item in containers.json()] == [101, 110]
+    assert client.get("/api/v1/resources/100", headers=headers).json()["adapter"] == "haos"
+    assert client.get("/api/v1/containers/100/state", headers=headers).status_code == 404
+    assert client.post("/api/v1/resources/100/scan", headers=headers).status_code == 409
+    assert client.post("/api/v1/resources/100/start", headers=headers).status_code == 409
+    assert client.post("/api/v1/resources/101/refresh", headers=headers).status_code == 409
+    assert client.post("/api/v1/resources/101/scan", headers=headers).status_code == 409
+    assert client.post("/api/v1/resources/110/scan", headers=headers).status_code == 409
+    assert client.post("/api/v1/resources/110/reboot", headers=headers).status_code == 409

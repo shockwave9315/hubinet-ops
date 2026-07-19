@@ -36,16 +36,19 @@ home_assistant:
   webhook_url: ""
   request_timeout_seconds: 10
 
-containers:
-  101:
-    name: cloudflared
+resources:
+  100:
+    name: home-assistant
+    display_name: Home Assistant
+    resource_type: qemu
+    adapter: haos
     enabled: true
-    adapter: apt
-    criticality: medium
-    approval_mode: always
-    automatic_rollback: true
-    manual_rollback_allowed: false
-    operator_capabilities:
+    criticality: critical
+    ip_address: 192.168.4.168
+    guest_agent: true
+    os: HAOS 16.0
+    monitoring: {inspect: true, update_scan: false}
+    operator_capabilities: &deny_all
       refresh: false
       scan: false
       approve: false
@@ -55,13 +58,154 @@ containers:
       start: false
       shutdown: false
       reboot: false
-    recovery_scan:
-      enabled: false
-      delay_seconds: 90
-      cooldown_seconds: 900
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
+    required_services: []
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/vm-100
+    stabilization: {}
+
+  101:
+    name: cloudflared
+    display_name: Cloudflared
+    resource_type: lxc
+    adapter: apt
+    enabled: true
+    criticality: high
+    ip_address: 192.168.4.153
+    os: Debian 12
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services: [cloudflared.service]
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
     dashboard_path: /hubinet-ops/ct-101
-    stabilization: &default_stabilization
+    stabilization: {}
+
+  102:
+    name: mariadb
+    display_name: MariaDB
+    resource_type: lxc
+    adapter: apt
+    enabled: true
+    criticality: critical
+    ip_address: 192.168.4.233
+    os: Debian 12
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services: [apache2.service, mariadb.service]
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-102
+    stabilization: {}
+
+  103:
+    name: mqtt
+    display_name: MQTT
+    resource_type: lxc
+    adapter: apt
+    enabled: true
+    criticality: critical
+    ip_address: 192.168.4.112
+    os: Debian 12
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services: [mosquitto.service]
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-103
+    stabilization: {}
+
+  104:
+    name: nextcloud
+    display_name: Nextcloud
+    resource_type: lxc
+    adapter: apt
+    enabled: true
+    criticality: critical
+    ip_address: 192.168.4.113
+    os: Debian 13
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services:
+      - apache2.service
+      - php8.4-fpm.service
+      - postgresql@17-main.service
+      - redis-server.service
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-104
+    stabilization: {}
+
+  105:
+    name: adguard-home
+    display_name: AdGuard Home
+    resource_type: lxc
+    adapter: apt
+    enabled: true
+    criticality: critical
+    ip_address: 192.168.4.80
+    os: Debian 13
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services: []
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-105
+    stabilization: {}
+
+  106:
+    name: weather
+    display_name: WeatherHub
+    resource_type: lxc
+    adapter: apt
+    enabled: true
+    criticality: low
+    ip_address: 192.168.40.106
+    os: Debian 13
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities:
+      refresh: true
+      scan: true
+      approve: true
+      reject: true
+      retry_healthcheck: true
+      rollback: false
+      start: true
+      shutdown: true
+      reboot: true
+    recovery_scan: {enabled: true, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: [restart_services, restart_required_containers]
+    required_services: [containerd.service, docker.service]
+    docker:
+      enabled: true
+      require_health: true
+      required:
+        - weatherhub-weather-api-1
+        - weatherhub-weather-worker-1
+        - weatherhub-redis-1
+    approval_mode: always
+    automatic_rollback: true
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-106
+    stabilization: &managed_stabilization
       post_update_timeout_seconds: 300
       post_rollback_timeout_seconds: 300
       repair_timeout_seconds: 180
@@ -69,30 +213,82 @@ containers:
       initial_grace_seconds: 10
       required_consecutive_successes: 2
 
-  106:
-    name: weather
-    enabled: true
+  107:
+    name: immich
+    display_name: Immich
+    resource_type: lxc
     adapter: apt
-    criticality: low
-    approval_mode: always
-    automatic_rollback: true
-    manual_rollback_allowed: true
-    operator_capabilities:
-      refresh: true
-      scan: true
-      approve: true
-      reject: true
-      retry_healthcheck: true
-      rollback: true
-      start: true
-      shutdown: true
-      reboot: true
-    recovery_scan:
-      enabled: true
-      delay_seconds: 90
-      cooldown_seconds: 900
-    repair_actions:
-      - restart_services
-      - restart_required_containers
-    dashboard_path: /hubinet-ops/ct-106
-    stabilization: *default_stabilization
+    enabled: true
+    criticality: high
+    ip_address: 192.168.4.128
+    os: Debian 13
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services: [postgresql@16-main.service, redis-server.service]
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-107
+    stabilization: {}
+
+  108:
+    name: ddns
+    display_name: DDNS
+    resource_type: lxc
+    adapter: apt
+    enabled: true
+    criticality: medium
+    ip_address: 192.168.4.184
+    os: Debian 13
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services: []
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-108
+    stabilization: {}
+
+  109:
+    name: pompa
+    display_name: Pompa
+    resource_type: lxc
+    adapter: apt
+    enabled: true
+    criticality: critical
+    ip_address: 192.168.4.60
+    os: Debian 13
+    monitoring: {inspect: true, update_scan: true}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services: []
+    docker: {enabled: true, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-109
+    stabilization: {}
+
+  110:
+    name: hubinet-ops
+    display_name: Hubinet Ops
+    resource_type: lxc
+    adapter: agent_self
+    enabled: true
+    criticality: high
+    ip_address: 192.168.4.200
+    os: Debian 13
+    monitoring: {inspect: true, update_scan: false}
+    operator_capabilities: *deny_all
+    recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
+    repair_actions: []
+    required_services: [hubinet-ops.service]
+    docker: {enabled: false, require_health: false, required: []}
+    automatic_rollback: false
+    manual_rollback_allowed: false
+    dashboard_path: /hubinet-ops/ct-110
+    stabilization: {}
