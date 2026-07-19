@@ -129,4 +129,4 @@ for attempt in $(seq 1 30); do
 done
 
 echo "Agent 0.2.3 health validation failed" >&2
-exit 1
+restore_agent 1
