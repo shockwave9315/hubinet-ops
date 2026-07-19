@@ -67,6 +67,9 @@ def test_malformed_legacy_values_fall_back_without_crashing() -> None:
             "updates": ["not", "a", "mapping"],
             "recent_job_events": "not-a-list",
             "last_job_event": "bad",
+            "expected_lxc_status": "destroyed",
+            "intentional_shutdown": "false",
+            "lifecycle_health_pending": 1,
         }
     )
     assert state["pending_updates"] == 0
@@ -75,6 +78,9 @@ def test_malformed_legacy_values_fall_back_without_crashing() -> None:
     assert state["updates"] == {"pending_count": 0, "packages": []}
     assert state["recent_job_events"] == []
     assert state["last_job_event"] is None
+    assert state["expected_lxc_status"] is None
+    assert state["intentional_shutdown"] is False
+    assert state["lifecycle_health_pending"] is False
 
 
 def test_waiting_approval_clears_stale_job_runtime_fields() -> None:

@@ -2,6 +2,8 @@
 
 Hubinet Ops 0.2.4 adds backend-authoritative operator capabilities, fixed Proxmox lifecycle actions, delayed recovery scans, explicit post-update verification, notification deduplication, and archive-safe YAML validation. It does not add command text, a terminal, MQTT command topics, or unattended approval.
 
+Start and reboot report success only for the bounded LXC action and confirmed `running` state; service health remains explicitly pending until the next inspect. A confirmed graceful shutdown is marked intentional so the Home Assistant watchdog does not emit a false offline alert. Final APT refresh/scan repository failures are verification warnings (`update_status: unknown`) and do not trigger rollback when APT/dpkg and required services remain healthy.
+
 ## Safety boundary
 
 - CT101 Cloudflared is observation-only. Every operator capability is false in backend configuration and no dashboard control is rendered.

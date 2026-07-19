@@ -557,6 +557,126 @@ def test_verification_reboot_warning_and_success_webhook_summary(tmp_path: Path)
     ).total_seconds() == 180
 
 
+def test_transient_final_apt_scan_failure_is_warning_without_rollback(
+    tmp_path: Path,
+) -> None:
+    class TransientScanFailureExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "verify":
+                self.actions.append(action)
+                return {
+                    "ok": True,
+                    "data": {
+                        "apt_check_ok": True,
+                        "dpkg_audit_ok": True,
+                        "reboot_required": False,
+                        "final_apt_scan_ok": False,
+                        "verification_warning": (
+                            "final apt scan failed: Temporary failure resolving repository"
+                        ),
+                        "update_status": "unknown",
+                        "updates": {"pending_count": 0, "packages": []},
+                        "docker": {"required_healthy": 3, "required_total": 3},
+                    },
+                }
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = TransientScanFailureExecutor([docker_state(3), docker_state(3)])
+    service, db = service_with(tmp_path, executor)
+    job = approved_job(service, db)
+    service._run_job(job)
+
+    assert db.get_job(job["id"])["status"] == "success"
+    assert "rollback" not in executor.actions
+    state = service.get_state(106)
+    assert state["update_status"] == "unknown"
+    assert state["verification_status"] == "warning"
+    assert "Temporary failure" in state["verification_error"]
+    assert db.find_active_plan(106) is None
+
+
+def test_malformed_job_timestamp_does_not_change_success_result(tmp_path: Path) -> None:
+    service, db = service_with(
+        tmp_path,
+        WorkflowExecutor([docker_state(3), docker_state(3)]),
+    )
+    job = approved_job(service, db)
+    job["created_at"] = "not-a-timestamp"
+    notifications: list[dict[str, Any]] = []
+    service._notify_ha = notifications.append  # type: ignore[method-assign]
+
+    service._run_job(job)
+
+    assert db.get_job(job["id"])["status"] == "success"
+    success = next(item for item in notifications if item["event_type"] == "job_success")
+    assert success["duration_seconds"] is None
+
+
+@pytest.mark.parametrize(
+    "post_terminal_error",
+    [
+        RuntimeError("webhook failed after terminal success"),
+        ExecutorError("executor-style failure after terminal success"),
+    ],
+)
+def test_worker_errors_preserve_existing_terminal_and_followup_plan(
+    tmp_path: Path,
+    post_terminal_error: Exception,
+) -> None:
+    class FollowupExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "verify":
+                self.actions.append(action)
+                return {
+                    "ok": True,
+                    "data": {
+                        "apt_check_ok": True,
+                        "dpkg_audit_ok": True,
+                        "reboot_required": False,
+                        "updates": {
+                            "pending_count": 1,
+                            "packages": [
+                                {"name": "curl", "current": "1", "target": "2"}
+                            ],
+                            "fingerprint": "followup-after-success",
+                        },
+                        "docker": {"required_healthy": 3, "required_total": 3},
+                    },
+                }
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    service, db = service_with(
+        tmp_path,
+        FollowupExecutor([docker_state(3), docker_state(3)]),
+    )
+    job = approved_job(service, db)
+
+    def fail_after_followup(payload: dict[str, Any]) -> None:
+        if payload["event_type"] == "approval_required":
+            raise post_terminal_error
+
+    service._notify_ha = fail_after_followup  # type: ignore[method-assign]
+    if isinstance(post_terminal_error, ExecutorError):
+        service._run_job(job)
+    else:
+        with pytest.raises(RuntimeError, match="after terminal success"):
+            service._run_job(job)
+        service._handle_unhandled_worker_failure(job)
+
+    assert db.get_job(job["id"])["status"] == "success"
+    followup = db.find_active_plan(106, "followup-after-success")
+    assert followup is not None
+    state = service.get_state(106)
+    assert state["active_plan_id"] == followup["id"]
+    assert state["operation_status"] == "waiting_approval"
+    terminal_events = [
+        event
+        for event in db.list_job_events(job["id"])
+        if event["event_type"] in {"job_success", "job_failed", "job_rolled_back"}
+    ]
+    assert len(terminal_events) == 1
+
+
 def test_remaining_packages_create_new_waiting_plan_without_duplicate(tmp_path: Path) -> None:
     class RemainingExecutor(WorkflowExecutor):
         def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):

@@ -119,6 +119,12 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("lifecycle_started_at", None)
     state.setdefault("lifecycle_finished_at", None)
     state.setdefault("lifecycle_error", None)
+    expected_lxc = str(state.get("expected_lxc_status") or "")
+    state["expected_lxc_status"] = (
+        expected_lxc if expected_lxc in {"running", "stopped"} else None
+    )
+    state["intentional_shutdown"] = state.get("intentional_shutdown") is True
+    state["lifecycle_health_pending"] = state.get("lifecycle_health_pending") is True
     verification = str(state.get("verification_status") or "unknown")
     state["verification_status"] = (
         verification if verification in VERIFICATION_STATUSES else "unknown"

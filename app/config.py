@@ -135,7 +135,7 @@ def validate_config(raw: dict[str, Any]) -> None:
             f"CT{vmid} recovery_scan.delay_seconds",
         )
         cooldown = _strict_int(
-            recovery.get("cooldown_seconds", 900),
+            recovery.get("cooldown_seconds", max(900, delay)),
             f"CT{vmid} recovery_scan.cooldown_seconds",
         )
         if delay < 1 or delay > 3600:

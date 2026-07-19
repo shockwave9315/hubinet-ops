@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+import runpy
+import sys
 
+import pytest
 import yaml
 
 from app.mqtt import _ct_entities
@@ -40,6 +44,37 @@ def test_managed_verify_is_fixed_and_checks_integrity_services_and_docker() -> N
     assert "collect_health(config)" in text
     assert 'if action == "verify"' in text
     assert "Exactly one action is required" in text
+
+
+def test_managed_verify_treats_final_repository_failure_as_warning_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform == "win32":
+        monkeypatch.setitem(sys.modules, "fcntl", SimpleNamespace())
+    namespace = runpy.run_path(str(ROOT / "deploy" / "managed" / "hubinet-maint"))
+    managed_globals = namespace["verify"].__globals__
+    managed_globals["run"] = lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+    managed_globals["collect_health"] = lambda _config: (
+        {
+            "health_status": "healthy",
+            "docker": {"required_healthy": 3, "required_total": 3},
+        },
+        [],
+    )
+
+    def failed_scan() -> dict[str, object]:
+        raise RuntimeError("Temporary failure resolving repository")
+
+    managed_globals["apt_scan"] = failed_scan
+    data, failures = namespace["verify"]({})
+    assert failures == []
+    assert data["final_apt_scan_ok"] is False
+    assert data["update_status"] == "unknown"
+    assert "Temporary failure" in data["verification_warning"]
 
 
 def test_upgrade_is_archive_safe_transactional_and_never_runs_managed_actions() -> None:
@@ -102,6 +137,18 @@ def test_dashboard_policy_controls_verification_recovery_and_navigation_only_pus
     assert "confirmation:" in ct106
     assert "recovery_notification_suppressed_until" in package
     assert "state_attr(trigger.entity_id, 'recovery_notification_suppressed_until')" in package
+    progress = package.split("id: hubinet_ops_live_progress_v022", 1)[1].split(
+        "id: hubinet_ops_health_watchdog_v022", 1
+    )[0]
+    assert "active_job_id" in progress
+    assert "['preflight', 'snapshot', 'updating'" in progress
+    assert "starting" not in progress
+    assert "shutting_down" not in progress
+    assert "rebooting" not in progress
+    watchdog = package.split("id: hubinet_ops_health_watchdog_v022", 1)[1]
+    assert "intentional_shutdown" in watchdog
+    assert "lifecycle_status') != 'running'" in watchdog
+    assert "LXC działa, weryfikacja usług oczekuje na telemetrię" in package
     assert "packages_updated_count" in package
     assert "authenticationRequired" not in package
 

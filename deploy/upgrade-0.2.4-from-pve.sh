@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-if [[ ${EUID} -ne 0 ]]; then
+if [[ ${EUID} -ne 0 && ${HUBINET_OPS_TEST_MODE:-0} != 1 ]]; then
   echo "Run on the Proxmox host as root." >&2
   exit 1
 fi
@@ -176,7 +176,7 @@ chmod 0640 /etc/hubinet-ops/config.yaml
 set -a
 source /etc/hubinet-ops/agent.env
 set +a
-runuser -u hubinetops --preserve-environment -- env PYTHONPATH=/opt/hubinet-ops +  /opt/hubinet-ops/.venv/bin/python -c +  'from app.config import load_settings; from app.database import Database; s=load_settings(); Database(s.db_path)'
+runuser -u hubinetops --preserve-environment -- env PYTHONPATH=/opt/hubinet-ops /opt/hubinet-ops/.venv/bin/python -c 'from app.config import load_settings; from app.database import Database; s=load_settings(); Database(s.db_path)'
 runuser -u hubinetops -- /opt/hubinet-ops/.venv/bin/python -m compileall -q /opt/hubinet-ops/app
 systemctl daemon-reload
 rm -rf "$staging" /root/hubinet-ops-0.2.4.tgz

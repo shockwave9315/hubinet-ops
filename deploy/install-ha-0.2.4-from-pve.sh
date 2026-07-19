@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 umask 077
 
-if [[ ${EUID} -ne 0 ]]; then
+if [[ ${EUID} -ne 0 && ${HUBINET_OPS_TEST_MODE:-0} != 1 ]]; then
   echo "Run on the administration host as root." >&2
   exit 1
 fi
@@ -66,7 +66,7 @@ ssh "${SSH_ARGS[@]}" '
       exit 1
     }
   done
-  grep -Rqs "lovelace-mushroom/mushroom.js" +    /config/.storage/lovelace_resources /config/configuration.yaml 2>/dev/null
+  grep -Rqs "lovelace-mushroom/mushroom.js" /config/.storage/lovelace_resources /config/configuration.yaml 2>/dev/null
 '
 
 ssh "${SSH_ARGS[@]}" "set -e
@@ -81,15 +81,15 @@ ssh "${SSH_ARGS[@]}" "set -e
   fi
   touch '$BACKUP_DIR/backup.complete'"
 
-scp -P "$HA_PORT" -i /root/.ssh/id_ed25519 +  "$SOURCE_DIR/home-assistant/packages/hubinet_ops.yaml" +  "root@$HA_HOST:/config/packages/hubinet_ops.yaml.new"
-scp -P "$HA_PORT" -i /root/.ssh/id_ed25519 +  "$SOURCE_DIR/home-assistant/dashboards/hubinet_ops.yaml" +  "root@$HA_HOST:/config/dashboards/hubinet_ops.yaml.new"
+scp -P "$HA_PORT" -i /root/.ssh/id_ed25519 "$SOURCE_DIR/home-assistant/packages/hubinet_ops.yaml" "root@$HA_HOST:/config/packages/hubinet_ops.yaml.new"
+scp -P "$HA_PORT" -i /root/.ssh/id_ed25519 "$SOURCE_DIR/home-assistant/dashboards/hubinet_ops.yaml" "root@$HA_HOST:/config/dashboards/hubinet_ops.yaml.new"
 
 cat > "$URL_FILE" <<EOF
 hubinet_ops_start_url: "$AGENT_BASE_URL/api/v1/containers/{{ vmid }}/start"
 hubinet_ops_shutdown_url: "$AGENT_BASE_URL/api/v1/containers/{{ vmid }}/shutdown"
 hubinet_ops_reboot_url: "$AGENT_BASE_URL/api/v1/containers/{{ vmid }}/reboot"
 EOF
-scp -P "$HA_PORT" -i /root/.ssh/id_ed25519 +  "$URL_FILE" "root@$HA_HOST:/tmp/hubinet-ops-0.2.4-urls"
+scp -P "$HA_PORT" -i /root/.ssh/id_ed25519 "$URL_FILE" "root@$HA_HOST:/tmp/hubinet-ops-0.2.4-urls"
 
 ssh "${SSH_ARGS[@]}" '
   set -e

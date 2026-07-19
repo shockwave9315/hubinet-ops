@@ -158,6 +158,9 @@ def test_0_2_4_scalars_survive_unicode_package_event_and_docker_truncation() -> 
             "lifecycle_status": "success",
             "lifecycle_started_at": "2026-07-19T12:00:00+00:00",
             "lifecycle_finished_at": "2026-07-19T12:00:05+00:00",
+            "expected_lxc_status": "running",
+            "intentional_shutdown": False,
+            "lifecycle_health_pending": True,
             "verification_status": "warning",
             "last_verification": "2026-07-19T12:01:00+00:00",
             "apt_check_ok": True,
@@ -203,6 +206,9 @@ def test_0_2_4_scalars_survive_unicode_package_event_and_docker_truncation() -> 
     assert payload["operator_capabilities"] == capabilities
     assert payload["lifecycle_action"] == "reboot"
     assert payload["lifecycle_status"] == "success"
+    assert payload["expected_lxc_status"] == "running"
+    assert payload["intentional_shutdown"] is False
+    assert payload["lifecycle_health_pending"] is True
     assert payload["verification_status"] == "warning"
     assert payload["apt_check_ok"] is True
     assert payload["dpkg_audit_ok"] is True

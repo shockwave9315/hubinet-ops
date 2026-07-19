@@ -157,6 +157,15 @@ def test_invalid_recovery_scan_settings_are_rejected(
         validate_config(config)
 
 
+def test_recovery_delay_above_default_cooldown_uses_safe_dynamic_default() -> None:
+    config = base_config()
+    config["containers"][106]["recovery_scan"] = {
+        "enabled": True,
+        "delay_seconds": 1200,
+    }
+    validate_config(config)
+
+
 def test_example_policy_keeps_ct101_denied_and_ct106_enabled() -> None:
     import yaml
     from pathlib import Path

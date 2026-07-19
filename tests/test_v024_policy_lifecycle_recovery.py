@@ -143,6 +143,10 @@ def test_lifecycle_uses_only_fixed_verbs_and_records_terminal_state(tmp_path: Pa
     assert state["lifecycle_action"] == "start"
     assert state["lifecycle_status"] == "success"
     assert state["lxc_status"] == "running"
+    assert state["health_status"] == "unknown"
+    assert state["lifecycle_health_pending"] is True
+    assert state["intentional_shutdown"] is False
+    assert state["recovery_notification_suppressed_until"]
     assert state["lifecycle_started_at"]
     assert state["lifecycle_finished_at"]
     assert state["lifecycle_error"] is None
@@ -170,6 +174,45 @@ def test_ct106_graceful_lifecycle_actions_are_allowed(
     assert state["lifecycle_action"] == action
     assert state["lifecycle_status"] == "success"
     assert [item[0] for item in executor.actions] == ["status", action, "status"]
+    if action == "shutdown":
+        assert state["intentional_shutdown"] is True
+        assert state["expected_lxc_status"] == "stopped"
+        assert state["lifecycle_health_pending"] is False
+    else:
+        assert state["health_status"] == "unknown"
+        assert state["lifecycle_health_pending"] is True
+
+
+def test_intentional_shutdown_clears_after_running_telemetry_and_later_offline_is_real(
+    tmp_path: Path,
+) -> None:
+    class InspectExecutor(FakeExecutor):
+        fail_inspect = False
+
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "inspect" and self.fail_inspect:
+                self.actions.append((action, vmid, argument))
+                raise ExecutorError("container unexpectedly unavailable")
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = InspectExecutor()
+    executor.statuses = ["running", "stopped"]
+    executor.inspect_states[106] = [healthy()]
+    service, _ = make_service(tmp_path, executor)
+
+    shutdown = service.lifecycle_container(106, "shutdown")
+    assert shutdown["intentional_shutdown"] is True
+    assert shutdown["health_status"] == "offline"
+
+    recovered = service.refresh_container(106)
+    assert recovered["intentional_shutdown"] is False
+    assert recovered["expected_lxc_status"] is None
+    assert recovered["health_status"] == "healthy"
+
+    executor.fail_inspect = True
+    offline = service.refresh_container(106)
+    assert offline["health_status"] == "offline"
+    assert offline["intentional_shutdown"] is False
 
 
 def test_lifecycle_failure_is_persisted_and_notified(tmp_path: Path) -> None:
@@ -403,6 +446,129 @@ def test_recovery_active_plan_job_cooldown_and_ct101_policy_block(tmp_path: Path
     clock.advance(90)
     service._run_due_recovery_scans(clock.monotonic())
     assert service.get_state(106)["last_recovery_scan_result"] == "cooldown_active"
+
+
+def test_recovery_timestamp_parser_accepts_naive_and_blocks_malformed_values(
+    tmp_path: Path,
+) -> None:
+    executor = FakeExecutor()
+    clock = Clock()
+    service, _ = make_service(tmp_path, executor, clock)
+    state = service.get_state(106)
+    state.update(
+        {
+            "health_status": "healthy",
+            "lxc_status": "running",
+            "last_recovery_scan": "2026-07-19T11:55:00",
+        }
+    )
+    service._save_state(106, state)
+    service._run_recovery_scan(106)
+    assert service.get_state(106)["last_recovery_scan_result"] == "cooldown_active"
+
+    state = service.get_state(106)
+    state["last_recovery_scan"] = "malformed"
+    service._save_state(106, state)
+    service._run_recovery_scan(106)
+    assert (
+        service.get_state(106)["last_recovery_scan_result"]
+        == "invalid_previous_recovery_timestamp"
+    )
+
+
+@pytest.mark.parametrize("bad_deadline", ["bad-deadline", float("nan"), True])
+def test_recovery_deadline_type_error_isolated_from_other_containers(
+    tmp_path: Path,
+    bad_deadline: object,
+) -> None:
+    executor = FakeExecutor()
+    clock = Clock()
+    service, _ = make_service(tmp_path, executor, clock)
+    state = service.get_state(106)
+    state.update({"health_status": "healthy", "lxc_status": "running"})
+    service._save_state(106, state)
+    service._recovery_due = {101: bad_deadline, 106: 0.0}  # type: ignore[dict-item]
+
+    service._run_due_recovery_scans(clock.monotonic())
+
+    assert service.get_state(101)["recovery_scan_status"] == "failed"
+    assert any(action == "scan" and vmid == 106 for action, vmid, _ in executor.actions)
+
+
+def test_recovery_db_error_for_one_vmid_does_not_stop_next_vmid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = FakeExecutor()
+    clock = Clock()
+    service, db = make_service(tmp_path, executor, clock)
+    service.settings.raw["containers"][101]["operator_capabilities"]["scan"] = True
+    service.settings.raw["containers"][101]["recovery_scan"]["enabled"] = True
+    for vmid in (101, 106):
+        state = service.get_state(vmid)
+        state.update({"health_status": "healthy", "lxc_status": "running"})
+        service._save_state(vmid, state)
+
+    original = db.get_active_job
+    failed_once = False
+
+    def flaky_get_active_job(vmid: int):
+        nonlocal failed_once
+        if vmid == 101 and not failed_once:
+            failed_once = True
+            raise RuntimeError("temporary sqlite read failure")
+        return original(vmid)
+
+    monkeypatch.setattr(db, "get_active_job", flaky_get_active_job)
+    service._recovery_due = {101: 0.0, 106: 0.0}
+
+    service._run_due_recovery_scans(clock.monotonic())
+
+    assert "temporary sqlite" in service.get_state(101)["last_recovery_scan_result"]
+    assert service.get_state(101)["recovery_scan_status"] == "failed"
+    assert any(action == "scan" and vmid == 106 for action, vmid, _ in executor.actions)
+
+
+def test_recovery_loop_survives_iteration_type_error_and_processes_next_cycle(
+    tmp_path: Path,
+) -> None:
+    executor = FakeExecutor()
+    service, _ = make_service(tmp_path, executor)
+    state = service.get_state(106)
+    state.update({"health_status": "healthy", "lxc_status": "running"})
+    service._save_state(106, state)
+    service._recovery_due = {106: 0.0}
+    monotonic_calls = 0
+
+    def flaky_monotonic() -> float:
+        nonlocal monotonic_calls
+        monotonic_calls += 1
+        if monotonic_calls == 1:
+            raise TypeError("malformed clock state")
+        return 0.0
+
+    class Wakeup:
+        waits = 0
+
+        def wait(self, _timeout: float) -> bool:
+            self.waits += 1
+            if self.waits == 2:
+                service._stop.set()
+            return False
+
+        def clear(self) -> None:
+            return None
+
+        def set(self) -> None:
+            return None
+
+    service._monotonic = flaky_monotonic
+    service._recovery_wakeup = Wakeup()  # type: ignore[assignment]
+
+    service._recovery_loop()
+
+    assert monotonic_calls >= 2
+    assert any(action == "scan" and vmid == 106 for action, vmid, _ in executor.actions)
 
 
 def test_recovery_scan_is_blocked_by_active_job(tmp_path: Path) -> None:
