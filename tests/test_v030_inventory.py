@@ -100,13 +100,25 @@ def test_managed_profiles_exist_only_for_apt_lxc_inventory() -> None:
 
 def test_upgrade_is_transactional_archive_safe_and_read_only_for_resources() -> None:
     text = UPGRADE.read_text(encoding="utf-8")
+    agent_backup = (ROOT / "deploy" / "agent" / "backup-0.3.0.sh").read_text(
+        encoding="utf-8"
+    )
+    agent_restore = (ROOT / "deploy" / "agent" / "restore-0.3.0.sh").read_text(
+        encoding="utf-8"
+    )
+    transaction = "\n".join((text, agent_backup, agent_restore))
     assert 'VERSION = "0.3.0"' in text
-    assert "systemctl stop hubinet-ops" in text
-    assert "ops.db*" in text
+    assert "service_action stop" in agent_backup
+    assert "test -s \"$backup/ops.db\"" in agent_backup
+    assert "PRAGMA quick_check" in agent_backup
+    assert "backup.complete" in agent_backup
+    assert "preserving current ops.db" in agent_restore
     assert "restore_all" in text
     assert "observation-vmids" in text
     assert "managed-vmids" in text
     assert "resource-types" in text
+    assert 'monitoring_scheduler["enabled"] = True' in text
+    assert 'old.get("monitoring_scheduler") or old.get("scheduler")' in text
     assert "GET /api/v1/resources" not in text  # curl uses the literal path, never a command field.
     assert "/api/v1/resources" in text
     assert "git ls-files" not in text
@@ -121,7 +133,7 @@ def test_upgrade_is_transactional_archive_safe_and_read_only_for_resources() -> 
         "hubinet-ops-host reboot",
         "hubinet-ops-host rollback",
     ):
-        assert forbidden not in text
+        assert forbidden not in transaction
 
 
 def test_ha_installer_preserves_secrets_checks_yaml_and_never_restarts() -> None:

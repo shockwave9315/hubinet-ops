@@ -11,10 +11,16 @@ ROOT = Path(__file__).parents[1]
 SMOKES = (
     ROOT / "tests" / "shell" / "runtime_smoke_0_3_0.sh",
     ROOT / "tests" / "shell" / "runtime_smoke_installers_0_3_0.sh",
+    ROOT / "tests" / "shell" / "runtime_smoke_managed_safety_0_3_0.sh",
+    ROOT / "tests" / "shell" / "runtime_smoke_agent_backup_0_3_0.sh",
 )
 
 
-@pytest.mark.parametrize("smoke", SMOKES, ids=("wrapper", "installers"))
+@pytest.mark.parametrize(
+    "smoke",
+    SMOKES,
+    ids=("wrapper", "installers", "managed-safety", "agent-backup"),
+)
 def test_v030_scripts_execute_with_fake_remote_commands(smoke: Path) -> None:
     bash = shutil.which("bash")
     if bash is None:

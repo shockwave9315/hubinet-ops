@@ -5,7 +5,7 @@ No deployment is automatic. Release 0.3.0 has two separately reviewed transactio
 1. `deploy/upgrade-0.3.0-from-pve.sh` on PVE updates the wrapper/maps, CT101–109 managed executors, and CT110 agent.
 2. `deploy/install-ha-0.3.0-from-pve.sh HA_HOST AGENT_BASE_URL [PORT]` updates Home Assistant files.
 
-The PVE script accepts no VMID override, validates VM/QEMU 100 and LXC 101–110 existence, and accepts stopped resources. It does not scan, update, start, stop, reboot, snapshot, repair, or roll back any managed resource. It stops only the CT110 agent service to back up SQLite consistently, then validates `/health` version 0.3.0 and the authenticated 11-resource inventory.
+The PVE script accepts no VMID override, validates VM/QEMU 100 and LXC 101–110 existence, and accepts stopped resources. It does not scan, update, start, stop, reboot, snapshot, repair, or roll back any managed resource. It stops only the CT110 agent service to copy the mandatory SQLite database consistently, verifies that copy is non-empty, and runs `PRAGMA quick_check` when Python sqlite3 is available. `backup.complete` is written only after every mandatory artifact is verified; rollback never removes the current database when the marker or database copy is incomplete. The script then validates `/health` version 0.3.0 and the authenticated 11-resource inventory.
 
 Backups cover agent code/config/env/SQLite/unit, wrapper, old/general and new allowlists/type map, and every managed executor/profile. Any failure invokes the full restore path. Home Assistant installation is separate and has its own backup/rollback.
 

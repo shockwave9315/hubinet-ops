@@ -31,19 +31,23 @@ NEW_CONFIG="/etc/.hubinet-maint.hubinet-ops-new.json"
 had_executor=false
 had_config=false
 committed=false
+changes_started=false
+mounted=false
 mountpoint=""
 
 cleanup() {
-  if [[ -n "$mountpoint" ]]; then
+  if [[ "$mounted" == true ]]; then
     pct unmount "$VMID" >/dev/null 2>&1 || true
+    mounted=false
     mountpoint=""
   fi
   rm -rf "$BACKUP"
 }
 
 rollback() {
-  local rc=$?
-  if [[ "$committed" != true ]]; then
+  local rc="${1:-1}"
+  trap - ERR INT TERM
+  if [[ "$committed" != true && "$changes_started" == true ]]; then
     if [[ "$status" == "running" ]]; then
       if [[ "$had_executor" == true ]]; then
         pct push "$VMID" "$BACKUP/hubinet-maint" /usr/local/sbin/hubinet-maint --perms 0755 || true
@@ -72,16 +76,49 @@ rollback() {
   cleanup
   exit "$rc"
 }
-trap rollback ERR INT TERM
+trap 'rollback $?' ERR
+trap 'rollback 130' INT
+trap 'rollback 143' TERM
 trap cleanup EXIT
 
+backup_running_file() {
+  local remote_path="$1" backup_path="$2" absent_path="$3" result
+  if pct exec "$VMID" -- test -e "$remote_path" >/dev/null 2>&1; then
+    result=0
+  else
+    result=$?
+  fi
+  case "$result" in
+    0)
+      pct pull "$VMID" "$remote_path" "$backup_path" >/dev/null
+      [[ -s "$backup_path" ]] || {
+        echo "Backup of CT$VMID:$remote_path is empty or missing" >&2
+        return 1
+      }
+      ;;
+    1)
+      : > "$absent_path"
+      ;;
+    *)
+      echo "Could not determine whether CT$VMID:$remote_path exists" >&2
+      return 1
+      ;;
+  esac
+}
+
 if [[ "$status" == "running" ]]; then
-  if pct pull "$VMID" /usr/local/sbin/hubinet-maint "$BACKUP/hubinet-maint" >/dev/null 2>&1; then
+  backup_running_file /usr/local/sbin/hubinet-maint \
+    "$BACKUP/hubinet-maint" "$BACKUP/hubinet-maint.absent"
+  if [[ -s "$BACKUP/hubinet-maint" ]]; then
     had_executor=true
   fi
-  if pct pull "$VMID" /etc/hubinet-maint.json "$BACKUP/hubinet-maint.json" >/dev/null 2>&1; then
+  backup_running_file /etc/hubinet-maint.json \
+    "$BACKUP/hubinet-maint.json" "$BACKUP/hubinet-maint.json.absent"
+  if [[ -s "$BACKUP/hubinet-maint.json" ]]; then
     had_config=true
   fi
+  : > "$BACKUP/backup.complete"
+  changes_started=true
   pct push "$VMID" "$EXECUTOR_SOURCE" "$NEW_EXECUTOR" --perms 0755
   pct push "$VMID" "$CONFIG_SOURCE" "$NEW_CONFIG" --perms 0644
   pct exec "$VMID" -- python3 -m py_compile "$NEW_EXECUTOR"
@@ -90,6 +127,7 @@ if [[ "$status" == "running" ]]; then
   pct exec "$VMID" -- /usr/local/sbin/hubinet-maint inspect
 else
   mount_output="$(pct mount "$VMID")"
+  mounted=true
   mountpoint="$(sed -n "s/.*'\([^']*\)'.*/\1/p" <<<"$mount_output")"
   [[ -n "$mountpoint" && "$mountpoint" == /* && -d "$mountpoint" ]] || {
     echo "Could not determine a safe CT mountpoint" >&2
@@ -97,12 +135,16 @@ else
   }
   if [[ -f "$mountpoint/usr/local/sbin/hubinet-maint" ]]; then
     cp -a "$mountpoint/usr/local/sbin/hubinet-maint" "$BACKUP/hubinet-maint"
+    [[ -s "$BACKUP/hubinet-maint" ]]
     had_executor=true
   fi
   if [[ -f "$mountpoint/etc/hubinet-maint.json" ]]; then
     cp -a "$mountpoint/etc/hubinet-maint.json" "$BACKUP/hubinet-maint.json"
+    [[ -s "$BACKUP/hubinet-maint.json" ]]
     had_config=true
   fi
+  : > "$BACKUP/backup.complete"
+  changes_started=true
   install -d -m 0755 "$mountpoint/usr/local/sbin" "$mountpoint/etc"
   install -m 0755 "$EXECUTOR_SOURCE" "$mountpoint$NEW_EXECUTOR"
   install -m 0644 "$CONFIG_SOURCE" "$mountpoint$NEW_CONFIG"

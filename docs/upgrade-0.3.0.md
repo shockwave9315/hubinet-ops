@@ -8,6 +8,7 @@ This release adds the full Proxmox resource inventory and explicit adapters. It 
 - VM100 and CT110 are observation-only.
 - CT102/103/104/105/107/109 are critical/high production resources and observation-only; CT101 and CT108 are also observation-only.
 - Upgrade performs no scan, update, lifecycle, snapshot, repair, or rollback action on resources.
+- Upgrade intentionally enables the independent read-only `monitoring_scheduler`; legacy scan intervals are retained, while legacy `scheduler.enabled` does not grant operator actions.
 - HA is validated but never restarted automatically.
 
 ## Preflight and local validation
@@ -31,7 +32,7 @@ Build from a clean archive-safe checkout and run the repository checks in README
    `bash deploy/install-ha-0.3.0-from-pve.sh 192.168.4.168 http://192.168.4.200:8787 22`.
 6. Review `ha core check`; schedule any HA restart as a separate operator decision.
 
-The upgrade stops the CT110 service before SQLite copy, installs profiles only in CT101–109, and performs a safe `inspect` smoke only for already-running APT guests. Stopped guests are not started; their smoke is deferred.
+The upgrade stops the CT110 service before SQLite copy. `/var/lib/hubinet-ops/ops.db` is mandatory and must copy as a non-empty file; WAL/SHM are copied only when present. Any copy, validation, inventory-count, mount, or installation failure invokes the complete rollback and starts the old agent. A stopped CT mounted for backup or restore is tracked independently from mountpoint parsing and is unmounted on error, exit, `INT`, or `TERM`. Profiles are installed only in CT101–109, and a safe `inspect` smoke runs only for already-running APT guests. Stopped guests are not started; their smoke is deferred.
 
 ## Rollback
 
