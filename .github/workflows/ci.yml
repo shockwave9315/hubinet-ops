@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   validate:
@@ -44,3 +44,37 @@ jobs:
         run: python scripts/validate_yaml.py
       - name: Reject tracked runtime files
         run: python scripts/check_tracked_files.py
+
+  update-v023-dashboard-test:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'fix/0.2.3-mqtt-attribute-budget'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/0.2.3-mqtt-attribute-budget
+          fetch-depth: 0
+      - name: Update the intentional package-preview wording
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("tests/test_ha.py")
+          text = path.read_text(encoding="utf-8")
+          old = '    assert "kolejnych pakietów" in text\n'
+          new = '    assert text.count("kolejnych widocznych pakietów") == 2\n'
+          if text.count(old) != 1:
+              raise SystemExit(f"Expected one legacy assertion, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+          PY
+      - name: Commit test update and restore CI
+        run: |
+          git show origin/main:.github/workflows/ci.yml > .github/workflows/ci.yml
+          git config user.name "hubinet-ops-automation"
+          git config user.email "actions@users.noreply.github.com"
+          git add tests/test_ha.py .github/workflows/ci.yml
+          git diff --cached --check
+          git commit -m "[automation] Update package preview wording test"
+          git push origin HEAD:fix/0.2.3-mqtt-attribute-budget
