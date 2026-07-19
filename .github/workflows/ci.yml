@@ -66,42 +66,67 @@ jobs:
           from pathlib import Path
 
           path = Path("home-assistant/dashboards/hubinet_ops.yaml")
-          text = path.read_text(encoding="utf-8")
+          lines = path.read_text(encoding="utf-8").splitlines()
+          result: list[str] = []
+          vmids = iter((101, 106))
+          current_vmid: int | None = None
+          counts = {"set": 0, "header": 0, "condition": 0, "tail": 0}
 
-          for vmid in (101, 106):
-              old_header = f"""                {{% set packages = updates.get('packages', []) %}}
-                **{{{{ packages | count }}}} pakietów · ryzyko {{{{ states('sensor.hubinet_ops_ct{vmid}_risk') }}}}**
+          for line in lines:
+              stripped = line.strip()
+              indent = line[: len(line) - len(line.lstrip())]
 
-                | Pakiet | Obecna | Docelowa |"""
-              new_header = f"""                {{% set packages = updates.get('packages', []) %}}
-                {{% set meta = state_attr('sensor.hubinet_ops_ct{vmid}_health_status', 'attribute_payload') or {{}} %}}
-                {{% set total = meta.get('packages_total', states('sensor.hubinet_ops_ct{vmid}_pending_update_count') | int(0)) | int(0) %}}
-                {{% set visible = packages | count %}}
-                **{{{{ total }}}} pakietów · ryzyko {{{{ states('sensor.hubinet_ops_ct{vmid}_risk') }}}}**
+              if stripped == "{% set packages = updates.get('packages', []) %}":
+                  current_vmid = next(vmids, None)
+                  if current_vmid is None:
+                      raise SystemExit("Found more than two package sections")
+                  counts["set"] += 1
+                  result.append(line)
+                  result.extend(
+                      [
+                          f"{indent}{{% set meta = state_attr('sensor.hubinet_ops_ct{current_vmid}_health_status', 'attribute_payload') or {{}} %}}",
+                          f"{indent}{{% set total = meta.get('packages_total', states('sensor.hubinet_ops_ct{current_vmid}_pending_update_count') | int(0)) | int(0) %}}",
+                          f"{indent}{{% set visible = packages | count %}}",
+                      ]
+                  )
+                  continue
 
-                {{% if meta.get('truncated') and visible < total %}}
-                _Podgląd MQTT zawiera {{{{ visible }}}} z {{{{ total }}}} pakietów (limit atrybutów 10 KB)._
+              if stripped.startswith("**{{ packages | count }} pakietów · ryzyko"):
+                  if current_vmid is None:
+                      raise SystemExit("Package header found before package section")
+                  counts["header"] += 1
+                  result.append(
+                      f"{indent}**{{{{ total }}}} pakietów · ryzyko {{{{ states('sensor.hubinet_ops_ct{current_vmid}_risk') }}}}**"
+                  )
+                  result.extend(
+                      [
+                          "",
+                          f"{indent}{{% if meta.get('truncated') and visible < total %}}",
+                          f"{indent}_Podgląd MQTT zawiera {{{{ visible }}}} z {{{{ total }}}} pakietów (limit atrybutów 10 KB)._",
+                          "",
+                          f"{indent}{{% endif %}}",
+                      ]
+                  )
+                  continue
 
-                {{% endif %}}
-                | Pakiet | Obecna | Docelowa |"""
+              if stripped == "{% if packages | count > 30 %}":
+                  counts["condition"] += 1
+                  result.append(f"{indent}{{% if visible > 30 %}}")
+                  continue
 
-              old_tail = """                {% if packages | count > 30 %}
+              if stripped == "_…oraz {{ packages | count - 30 }} kolejnych pakietów._":
+                  counts["tail"] += 1
+                  result.append(
+                      f"{indent}_…oraz {{{{ visible - 30 }}}} kolejnych widocznych pakietów._"
+                  )
+                  continue
 
-                _…oraz {{ packages | count - 30 }} kolejnych pakietów._
-                {% endif %}"""
-              new_tail = """                {% if visible > 30 %}
+              result.append(line)
 
-                _…oraz {{ visible - 30 }} kolejnych widocznych pakietów._
-                {% endif %}"""
+          if counts != {"set": 2, "header": 2, "condition": 2, "tail": 2}:
+              raise SystemExit(f"Unexpected dashboard package structure: {counts}")
 
-              if text.count(old_header) != 1:
-                  raise SystemExit(f"CT{vmid}: expected one package header, found {text.count(old_header)}")
-              text = text.replace(old_header, new_header, 1)
-              if old_tail not in text:
-                  raise SystemExit(f"CT{vmid}: package tail not found")
-              text = text.replace(old_tail, new_tail, 1)
-
-          path.write_text(text, encoding="utf-8", newline="\n")
+          path.write_text("\n".join(result) + "\n", encoding="utf-8", newline="\n")
           PY
 
       - name: Commit patch and restore workflows
