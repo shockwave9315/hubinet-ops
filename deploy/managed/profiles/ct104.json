@@ -1,0 +1,1 @@
+{"services":["apache2.service","php8.4-fpm.service","postgresql@17-main.service","redis-server.service"],"health_urls":[],"min_free_mb":2048,"ignore_failed_units":[],"repair_actions":[],"docker":{"enabled":false}}

@@ -1,0 +1,1 @@
+{"services":["docker.service"],"health_urls":[],"min_free_mb":2048,"ignore_failed_units":[],"repair_actions":[],"docker":{"enabled":true,"require_health":false,"required_containers":[]}}
