@@ -1,34 +1,29 @@
 # Architecture and trust boundaries
 
-## Components
+`Settings.resources` is the canonical inventory. A legacy 0.2.4 `containers` mapping is converted in memory to LXC/APT resources; the file is not rewritten. Supplying both keys fails validation. `Settings.containers` remains a temporary LXC-only compatibility view for 0.3.x.
 
-1. Home Assistant displays MQTT Discovery entities and invokes a small set of authenticated REST actions.
-2. The FastAPI agent validates VMIDs and plan IDs, owns policy, stores state/jobs/events in SQLite, and runs one update worker.
-3. The SSH client invokes a single remote command string assembled from an internal action enum, allowlisted VMID, and validated snapshot name.
-4. `hubinet-ops-host` is the SSH forced command on Proxmox. It repeats action, VMID, and argument validation and consults `/etc/hubinet-ops/allowed-vmids`.
-5. `hubinet-maint` exposes only inspect, scan, preflight, update, healthcheck, verify, and configured repair behavior inside a managed CT.
-6. MQTT carries availability, state, discovery, current job, and events. It carries no commands.
+## Data flow
 
-## Trust boundaries
+1. The telemetry loop calls `inspect` only when `monitoring.inspect` is enabled.
+2. The scheduler and recovery worker call APT scan only when `monitoring.update_scan` is enabled.
+3. REST operator requests independently require the matching `operator_capabilities` flag.
+4. `ResourceExecutor` selects a validated adapter: LXC/APT, QEMU/HAOS read-only, or CT110 self-inspection.
+5. The PVE forced-command wrapper revalidates action, VMID, resource type, observation access, managed-read access, maintenance access, lifecycle access, and optional snapshot names.
+6. SQLite stores plans, jobs, events, and normalized resource state. MQTT and Home Assistant are projections.
 
-- The REST bearer token crosses only HA-to-agent requests. It is never included in MQTT or events.
-- MQTT credentials are read from protected agent config and are never logged or published.
-- The SSH private key remains in `/etc/hubinet-ops/keys`; the Proxmox account does not receive a general shell.
-- A Home Assistant user can request a configured action but cannot supply command text. Backend validation remains authoritative.
-- Webhook payloads are outbound notification hints. HA cannot use them to approve an update.
+Observation-only APT resources therefore continue to collect telemetry and update availability without creating an unapprovable plan. CT106 retains the manually approved update lifecycle:
 
-## Update lifecycle
+`scan → waiting approval → preflight → snapshot (policy) → update → stabilization → verification → terminal result`
 
-`scan -> waiting approval -> preflight -> snapshot (policy) -> update -> wait services -> stabilized healthcheck -> verify -> success`
+The recovery worker uses observed in-process unhealthy→healthy transitions, a single bounded worker, delay/cooldown, and active-work checks. It never approves or updates.
 
-APT update output may emit NDJSON events. The SSH wrapper passes them unchanged; the agent parses each line, persists sanitized events, updates job progress, and enqueues MQTT publication. A malformed line is bounded and ignored. The final result remains mandatory.
+## Concurrency
 
-If stabilization times out, only configured repair actions run. A second stabilization window follows. Rollback is considered only after repair fails and only if `automatic_rollback` created a snapshot. Rollback completion means the CT started and passed consecutive systemd/Docker polls, not merely that `pct start` returned.
+The existing per-VMID scan/manual-operation lock serializes scan, approval, rollback, and lifecycle for a resource. Update jobs remain single-worker and terminal-state writes are ordered before follow-up observations. Telemetry I/O for one resource does not hold the locks of another resource. CT110 self-inspection never recursively invokes SSH or the Hubinet Ops API.
 
-Operator requests are checked against per-container capabilities. Internal telemetry refresh is a separate path and remains active for observation-only CTs. Start, graceful shutdown, and graceful reboot share the per-VMID scan/manual-operation lock and are rejected while a job, scan, plan, or lifecycle operation conflicts.
+## Compatibility
 
-One bounded recovery worker observes real in-process unhealthy-to-healthy transitions. It schedules at most one delayed scan per VMID, cancels on renewed failure, enforces cooldown and active-work checks, and never approves a plan.
-
-## Data ownership
-
-SQLite stores plans, jobs, container state, and job events. Retained MQTT state is a projection for fast HA recovery. HA entity state never overwrites SQLite.
+- `/api/v1/containers` and its LXC action aliases remain for 0.3.x.
+- `container_states` remains the SQLite table name; canonical database methods are aliases over it.
+- old states without type normalize to `resource_type=lxc`, `adapter=apt`.
+- CT101/CT106 MQTT entity IDs and legacy `hubinet/ops/ct/...` topics remain.

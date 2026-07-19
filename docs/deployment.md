@@ -1,29 +1,12 @@
-# Deployment and upgrade
+# Deployment
 
-No deployment script is run by CI or tests. Review every target and backup location before using these scripts on an administration host.
+No deployment is automatic. Release 0.3.0 has two separately reviewed transactional steps:
 
-## Upgrade 0.2.3 to 0.2.4
+1. `deploy/upgrade-0.3.0-from-pve.sh` on PVE updates the wrapper/maps, CT101–109 managed executors, and CT110 agent.
+2. `deploy/install-ha-0.3.0-from-pve.sh HA_HOST AGENT_BASE_URL [PORT]` updates Home Assistant files.
 
-Follow [the 0.2.4 upgrade guide](upgrade-0.2.4.md). The source may be a git archive without .git metadata. The PVE upgrade and HA installation are separate transactional steps; live lifecycle testing is limited to CT106.
+The PVE script accepts no VMID override, validates VM/QEMU 100 and LXC 101–110 existence, and accepts stopped resources. It does not scan, update, start, stop, reboot, snapshot, repair, or roll back any managed resource. It stops only the CT110 agent service to back up SQLite consistently, then validates `/health` version 0.3.0 and the authenticated 11-resource inventory.
 
-## Upgrade 0.2.0 to 0.2.1
+Backups cover agent code/config/env/SQLite/unit, wrapper, old/general and new allowlists/type map, and every managed executor/profile. Any failure invokes the full restore path. Home Assistant installation is separate and has its own backup/rollback.
 
-Run the syntax check first, then invoke `deploy/upgrade-0.2.1-from-pve.sh AGENT_VMID CT106_VMID` from an unpacked release on the Proxmox host.
-
-The script:
-
-1. backs up `/opt/hubinet-ops`, `/etc/hubinet-ops`, and `ops.db*` inside the agent CT;
-2. refuses to broaden the Proxmox VMID allowlist automatically;
-3. updates the forced wrapper and fixed managed executors;
-4. installs Python dependencies into the existing virtualenv;
-5. adds only missing MQTT/stabilization/config keys;
-6. uses `/opt/hubinet-ops/.venv/bin/python` for YAML validation and SQLite migration;
-7. starts the API and checks only its local `/health` endpoint.
-
-It performs no managed-container inspect, scan, approval, update, repair, or rollback. It preserves `agent.env`, the API token, SSH keys, configured CT101/CT106 values, and the scheduler's existing disabled state. MQTT is added disabled unless it already existed.
-
-The script prints rollback commands and records the backup directory. Follow [recovery](recovery.md) rather than mixing old code with a migrated live database.
-
-## Fresh install
-
-`deploy/install-agent.sh` is intended for a new isolated agent CT and installs operating-system packages. It is not an upgrade script. After installation, edit protected config, set up the forced SSH key, validate config, and start the service manually. Never use example host names or tokens unchanged.
+See [the exact 0.3.0 procedure](upgrade-0.3.0.md).
