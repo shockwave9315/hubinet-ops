@@ -18,30 +18,67 @@ service_action() {
   systemctl "$1" hubinet-ops
 }
 
+restore_started=false
+agent_stopped=false
+
 restore_failed() {
   local rc="${1:-1}"
   trap - ERR INT TERM
-  rm -f "$(root_path /var/lib/hubinet-ops/.ops.db.restore)"
-  service_action start || true
+  if [[ "$restore_started" == true ]]; then
+    rm -f "$(root_path /var/lib/hubinet-ops/.ops.db.restore)"
+  fi
+  if [[ "$agent_stopped" == true ]]; then
+    service_action start || echo "Failed to restart the existing hubinet-ops service after aborted restore" >&2
+  fi
   exit "$rc"
 }
 trap 'restore_failed $?' ERR
 trap 'restore_failed 130' INT
 trap 'restore_failed 143' TERM
 
-service_action stop 2>/dev/null || true
-if [[ ! -f "$backup/backup.complete" ]]; then
-  echo "Agent backup is incomplete; preserving current agent files and ops.db" >&2
+required_artifacts=(
+  app requirements.txt hubinet-ops.service config.yaml agent.env backup.complete
+)
+for artifact in "${required_artifacts[@]}"; do
+  if [[ "$artifact" == app ]]; then
+    [[ -d "$backup/$artifact" ]] || {
+      echo "Agent backup is incomplete: missing app/; preserving current agent files and ops.db" >&2
+      restore_failed 1
+    }
+  else
+    [[ -f "$backup/$artifact" ]] || {
+      echo "Agent backup is incomplete: missing $artifact; preserving current agent files and ops.db" >&2
+      restore_failed 1
+    }
+  fi
+done
+[[ -s "$backup/ops.db" ]] || {
+  echo "Agent backup is incomplete: ops.db is missing or empty; preserving current ops.db and agent files" >&2
   restore_failed 1
+}
+
+stop_rc=0
+service_action stop || stop_rc=$?
+service_state_rc=0
+service_state="$(systemctl is-active hubinet-ops 2>/dev/null)" || service_state_rc=$?
+case "$service_state" in
+  inactive|failed)
+    [[ "$service_state_rc" -eq 3 ]] && agent_stopped=true
+    ;;
+esac
+if [[ "$stop_rc" -ne 0 ]]; then
+  echo "Cannot restore Hubinet Ops: systemctl stop hubinet-ops failed; no agent files or ops.db were modified" >&2
+  restore_failed "$stop_rc"
 fi
-if [[ ! -s "$backup/ops.db" ]]; then
-  echo "Rollback DB backup is missing or empty; preserving current ops.db" >&2
+if [[ "$agent_stopped" != true ]]; then
+  echo "Cannot restore Hubinet Ops: hubinet-ops is still active or its inactive state could not be confirmed; no agent files or ops.db were modified" >&2
   restore_failed 1
 fi
 
 database_dir="$(root_path /var/lib/hubinet-ops)"
 database="$database_dir/ops.db"
 database_stage="$database_dir/.ops.db.restore"
+restore_started=true
 install -d -m 0750 "$database_dir"
 install -m 0600 "$backup/ops.db" "$database_stage"
 test -s "$database_stage"

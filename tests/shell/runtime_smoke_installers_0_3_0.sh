@@ -7,12 +7,15 @@ export TMP_ROOT
 FAKE_BIN="$TMP_ROOT/bin"
 LOG_DIR="$TMP_ROOT/logs"
 CT_ROOT="$TMP_ROOT/stopped-ct"
-mkdir -p "$FAKE_BIN" "$LOG_DIR" "$CT_ROOT/usr/local/sbin" "$CT_ROOT/etc"
+HOST_ROOT="$TMP_ROOT/host"
+mkdir -p "$FAKE_BIN" "$LOG_DIR" "$CT_ROOT/usr/local/sbin" "$CT_ROOT/etc" \
+  "$HOST_ROOT/usr/local/sbin" "$HOST_ROOT/etc/hubinet-ops"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 export HUBINET_OPS_TEST_MODE=1
 export HUBINET_OPS_TEST_LOG_DIR="$LOG_DIR"
 export HUBINET_OPS_HOST_BACKUP_BASE="$TMP_ROOT/backups"
 export HUBINET_OPS_FAKE_CT_ROOT="$CT_ROOT"
+export HUBINET_OPS_TEST_HOST_ROOT="$HOST_ROOT"
 export PATH="$FAKE_BIN:$PATH"
 
 for script in \
@@ -52,13 +55,23 @@ printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/scp.args"
 write_stub install '
 printf "<%s>" "$@" >> "$HUBINET_OPS_TEST_LOG_DIR/install.args"
 printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/install.args"
-if [[ " $* " == *" -d "* ]]; then mkdir -p "${@: -1}"; fi
+if [[ " $* " == *" -d "* ]]; then
+  mkdir -p "${@: -1}"
+  exit 0
+fi
+if [[ "${@: -1}" == "$HUBINET_OPS_FAKE_CT_ROOT"/* ]]; then
+  exec /usr/bin/install "$@"
+fi
 '
 write_stub cp '
 if [[ -n ${HUBINET_OPS_FAKE_MOUNT_SIGNAL:-} && "${2:-}" == "$HUBINET_OPS_FAKE_CT_ROOT"/* ]]; then
   printf '%s\n' "$HUBINET_OPS_FAKE_MOUNT_SIGNAL" >> "$HUBINET_OPS_TEST_LOG_DIR/mount-signals.log"
   kill -"$HUBINET_OPS_FAKE_MOUNT_SIGNAL" "$PPID"
   sleep 1
+fi
+if [[ -n ${HUBINET_OPS_FAKE_BACKUP_CP_FAILURE:-} && "${2:-}" == "$HUBINET_OPS_FAKE_BACKUP_CP_FAILURE" ]]; then
+  printf 'partial-backup\n' > "${@: -1}"
+  exit 1
 fi
 exec /usr/bin/cp "$@"
 '
@@ -97,14 +110,30 @@ case "${1:-}" in
       printf "mounted on \047%s\047\n" "$HUBINET_OPS_FAKE_CT_ROOT"
     fi
     ;;
-  unmount) exit 0 ;;
+  unmount)
+    count_file="$HUBINET_OPS_TEST_LOG_DIR/unmount-${2:-unknown}.count"
+    count=0
+    [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    if [[ ${2:-} == "${HUBINET_OPS_FAKE_UNMOUNT_VMID:-none}" ]] \
+      && ((count <= ${HUBINET_OPS_FAKE_UNMOUNT_FAILURES:-0})); then
+      exit 1
+    fi
+    ;;
   pull)
     if [[ -n ${HUBINET_OPS_FAKE_PULL_FAILURE:-} && "$3" == "$HUBINET_OPS_FAKE_PULL_FAILURE" ]]; then
       exit 1
     fi
     printf "existing-%s\n" "${3##*/}" > "$4"
     ;;
-  push) exit 0 ;;
+  push)
+    if [[ ${2:-} == "${HUBINET_OPS_FAKE_RESTORE_PUSH_FAIL_VMID:-none}" \
+      && "${3:-}" == */managed/"${2:-}"/* ]]; then
+      exit 1
+    fi
+    exit 0
+    ;;
   exec)
     if [[ " $* " == *" bash -s "* ]]; then
       count_file="$HUBINET_OPS_TEST_LOG_DIR/bash-s-count"
@@ -125,6 +154,13 @@ case "${1:-}" in
       printf "{\"status\":\"ok\",\"version\":\"0.3.0\"}\n"
     elif [[ " $* " == *" hubinet-maint inspect"* ]]; then
       printf "{\"ok\":true,\"data\":{\"health_status\":\"healthy\"}}\n"
+    elif [[ " ${*:3} " == *" sh -c "* ]]; then
+      case "${HUBINET_OPS_FAKE_PROBE:-present}" in
+        present) printf "present\n" ;;
+        absent) printf "absent\n" ;;
+        exec-fail) exit 1 ;;
+        ambiguous) printf "absent\nnoise\n" ;;
+      esac
     fi
     ;;
 esac
@@ -132,6 +168,9 @@ esac
 
 bash "$ROOT/deploy/install-ha-0.3.0-from-pve.sh" ha.test http://agent.test:8787 2222
 bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh"
+
+[[ -s "$HUBINET_OPS_HOST_BACKUP_BASE/20260719-120000-before-0.3.0/managed/101/hubinet-maint" ]]
+[[ -s "$HUBINET_OPS_HOST_BACKUP_BASE/20260719-120000-before-0.3.0/managed/101/hubinet-maint.json" ]]
 
 mapfile -t scp_calls < "$LOG_DIR/scp.args"
 [[ ${#scp_calls[@]} -eq 3 ]]
@@ -161,11 +200,12 @@ rm -f "$LOG_DIR/bash-s-count"
 : > "$LOG_DIR/pct.args"
 : > "$LOG_DIR/install.args"
 export HUBINET_OPS_FAKE_RESOURCE_COUNT=10
-if bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh"; then
+if rollback_output="$(bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh" 2>&1)"; then
   echo "Inventory mismatch unexpectedly succeeded" >&2
   exit 1
 fi
 unset HUBINET_OPS_FAKE_RESOURCE_COUNT
+[[ "$rollback_output" == *'Rollback completed'* ]]
 
 grep -Fq '<exec><110><--><bash><-s><--></root/hubinet-ops-backups/20260719-120000-before-0.3.0>' "$LOG_DIR/pct.args"
 for restored in \
@@ -191,6 +231,25 @@ for target in \
   grep -Fq "$target" "$LOG_DIR/rm.args"
 done
 
+# A failed CT101 rollback layer is reported but does not prevent CT102-109 or
+# the CT110 agent restore from being attempted.
+rm -f "$LOG_DIR/bash-s-count"
+: > "$LOG_DIR/pct.args"
+export HUBINET_OPS_FAKE_STAMP=20260719-120050
+export HUBINET_OPS_FAKE_RESOURCE_COUNT=10
+export HUBINET_OPS_FAKE_RESTORE_PUSH_FAIL_VMID=101
+if rollback_output="$(bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh" 2>&1)"; then
+  echo 'Incomplete managed rollback unexpectedly succeeded' >&2
+  exit 1
+fi
+unset HUBINET_OPS_FAKE_STAMP HUBINET_OPS_FAKE_RESOURCE_COUNT HUBINET_OPS_FAKE_RESTORE_PUSH_FAIL_VMID
+[[ "$rollback_output" == *'ROLLBACK INCOMPLETE'* ]]
+[[ "$rollback_output" == *'CT101 managed executor'* ]]
+for vmid in $(seq 102 109); do
+  grep -Eq "^<push><$vmid><.*managed/$vmid/hubinet-maint></usr/local/sbin/hubinet-maint>" "$LOG_DIR/pct.args"
+done
+grep -Fq '<exec><110><--><bash><-s><--></root/hubinet-ops-backups/20260719-120050-before-0.3.0>' "$LOG_DIR/pct.args"
+
 # A partial backup of managed files is never marked complete and no production
 # layer is modified when a confirmed-existing file cannot be pulled.
 rm -f "$LOG_DIR/bash-s-count"
@@ -207,6 +266,81 @@ partial="$HUBINET_OPS_HOST_BACKUP_BASE/20260719-120100-before-0.3.0/managed/101"
 [[ ! -e "$partial/backup.complete" ]]
 if grep -Fq '<push>' "$LOG_DIR/pct.args"; then
   echo "Upgrade modified a layer after partial managed backup" >&2
+  exit 1
+fi
+
+# A partial host backup is never used as a restore source before changes begin.
+printf 'wrapper-before\n' > "$HOST_ROOT/usr/local/sbin/hubinet-ops-host"
+printf 'allowlist-before\n' > "$HOST_ROOT/etc/hubinet-ops/allowed-vmids"
+: > "$LOG_DIR/pct.args"
+: > "$LOG_DIR/install.args"
+: > "$LOG_DIR/rm.args"
+export HUBINET_OPS_FAKE_STAMP=20260719-120110
+export HUBINET_OPS_FAKE_BACKUP_CP_FAILURE="$HOST_ROOT/usr/local/sbin/hubinet-ops-host"
+if host_backup_output="$(bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh" 2>&1)"; then
+  echo 'Partial host backup unexpectedly succeeded' >&2
+  exit 1
+fi
+unset HUBINET_OPS_FAKE_STAMP HUBINET_OPS_FAKE_BACKUP_CP_FAILURE
+grep -Fxq 'wrapper-before' "$HOST_ROOT/usr/local/sbin/hubinet-ops-host"
+grep -Fxq 'allowlist-before' "$HOST_ROOT/etc/hubinet-ops/allowed-vmids"
+host_partial="$HUBINET_OPS_HOST_BACKUP_BASE/20260719-120110-before-0.3.0"
+[[ -s "$host_partial/hubinet-ops-host" ]]
+[[ ! -e "$host_partial/backup.complete" ]]
+if grep -Fq '<push>' "$LOG_DIR/pct.args" || grep -Fq '<bash><-s><--></root/hubinet-ops-backups/' "$LOG_DIR/pct.args"; then
+  echo 'Pre-change host backup failure attempted a production restore' >&2
+  exit 1
+fi
+
+# The running-CT probe accepts only exact present/absent markers. Only an exact
+# absent result creates .absent backup markers.
+rm -f "$LOG_DIR/bash-s-count"
+: > "$LOG_DIR/pct.args"
+export HUBINET_OPS_FAKE_STAMP=20260719-120120 HUBINET_OPS_FAKE_PROBE=absent
+bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh"
+absent_backup="$HUBINET_OPS_HOST_BACKUP_BASE/20260719-120120-before-0.3.0/managed/101"
+[[ -f "$absent_backup/hubinet-maint.absent" && -f "$absent_backup/hubinet-maint.json.absent" ]]
+[[ ! -e "$absent_backup/hubinet-maint" && ! -e "$absent_backup/hubinet-maint.json" ]]
+unset HUBINET_OPS_FAKE_STAMP HUBINET_OPS_FAKE_PROBE
+
+for probe in exec-fail ambiguous; do
+  rm -f "$LOG_DIR/bash-s-count"
+  : > "$LOG_DIR/pct.args"
+  export HUBINET_OPS_FAKE_STAMP="20260719-12013${probe:0:1}" HUBINET_OPS_FAKE_PROBE="$probe"
+  if bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh"; then
+    echo "$probe upgrader probe unexpectedly succeeded" >&2
+    exit 1
+  fi
+  probe_backup="$HUBINET_OPS_HOST_BACKUP_BASE/${HUBINET_OPS_FAKE_STAMP}-before-0.3.0/managed/101"
+  [[ ! -e "$probe_backup/hubinet-maint.absent" ]]
+  [[ ! -e "$probe_backup/backup.complete" ]]
+done
+unset HUBINET_OPS_FAKE_STAMP HUBINET_OPS_FAKE_PROBE
+
+# Upgrader mount tracking also retries transient unmount errors and retains the
+# logical mounted state through persistent failures.
+rm -f "$LOG_DIR/bash-s-count" "$LOG_DIR/unmount-101.count"
+: > "$LOG_DIR/pct.args"
+export HUBINET_OPS_FAKE_STAMP=20260719-120140 HUBINET_OPS_FAKE_STOPPED_VMID=101
+export HUBINET_OPS_FAKE_UNMOUNT_VMID=101 HUBINET_OPS_FAKE_UNMOUNT_FAILURES=1
+bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh"
+[[ "$(cat "$LOG_DIR/unmount-101.count")" -ge 2 ]]
+unset HUBINET_OPS_FAKE_STAMP HUBINET_OPS_FAKE_STOPPED_VMID HUBINET_OPS_FAKE_UNMOUNT_VMID HUBINET_OPS_FAKE_UNMOUNT_FAILURES
+
+rm -f "$LOG_DIR/bash-s-count" "$LOG_DIR/unmount-101.count"
+: > "$LOG_DIR/pct.args"
+export HUBINET_OPS_FAKE_STAMP=20260719-120150 HUBINET_OPS_FAKE_STOPPED_VMID=101
+export HUBINET_OPS_FAKE_UNMOUNT_VMID=101 HUBINET_OPS_FAKE_UNMOUNT_FAILURES=99
+if unmount_output="$(bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh" 2>&1)"; then
+  echo 'Persistent upgrader pct unmount failure unexpectedly succeeded' >&2
+  exit 1
+fi
+unset HUBINET_OPS_FAKE_STAMP HUBINET_OPS_FAKE_STOPPED_VMID HUBINET_OPS_FAKE_UNMOUNT_VMID HUBINET_OPS_FAKE_UNMOUNT_FAILURES
+[[ "$unmount_output" != *'installed transactionally'* ]]
+[[ "$unmount_output" == *'CT101 remains mounted; manual intervention required: pct unmount 101'* ]]
+[[ "$(cat "$LOG_DIR/unmount-101.count")" -ge 4 ]]
+if grep -Fq '<push>' "$LOG_DIR/pct.args"; then
+  echo 'Persistent pre-change unmount failure modified a production layer' >&2
   exit 1
 fi
 

@@ -30,7 +30,7 @@ def test_v030_scripts_execute_with_fake_remote_commands(smoke: Path) -> None:
         cwd=ROOT,
         text=True,
         capture_output=True,
-        timeout=120,
+        timeout=240,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr

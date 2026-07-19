@@ -31,23 +31,48 @@ NEW_CONFIG="/etc/.hubinet-maint.hubinet-ops-new.json"
 had_executor=false
 had_config=false
 committed=false
+content_installed=false
 changes_started=false
 mounted=false
 mountpoint=""
 
-cleanup() {
+unmount_ct_once() {
   if [[ "$mounted" == true ]]; then
-    pct unmount "$VMID" >/dev/null 2>&1 || true
-    mounted=false
-    mountpoint=""
+    if pct unmount "$VMID" >/dev/null 2>&1; then
+      mounted=false
+      mountpoint=""
+      return 0
+    fi
+    return 1
+  fi
+}
+
+unmount_ct_with_retry() {
+  [[ "$mounted" == true ]] || return 0
+  if unmount_ct_once; then
+    return 0
+  fi
+  echo "Failed to unmount CT$VMID; retrying pct unmount $VMID" >&2
+  if unmount_ct_once; then
+    return 0
+  fi
+  echo "CT$VMID remains mounted; manual intervention required: pct unmount $VMID" >&2
+  return 1
+}
+
+cleanup() {
+  local cleanup_rc=0
+  if ! unmount_ct_with_retry; then
+    cleanup_rc=1
   fi
   rm -rf "$BACKUP"
+  return "$cleanup_rc"
 }
 
 rollback() {
   local rc="${1:-1}"
-  trap - ERR INT TERM
-  if [[ "$committed" != true && "$changes_started" == true ]]; then
+  trap - ERR INT TERM EXIT
+  if [[ "$committed" != true && "$content_installed" != true && "$changes_started" == true ]]; then
     if [[ "$status" == "running" ]]; then
       if [[ "$had_executor" == true ]]; then
         pct push "$VMID" "$BACKUP/hubinet-maint" /usr/local/sbin/hubinet-maint --perms 0755 || true
@@ -73,7 +98,9 @@ rollback() {
       fi
     fi
   fi
-  cleanup
+  if ! cleanup; then
+    rc=1
+  fi
   exit "$rc"
 }
 trap 'rollback $?' ERR
@@ -82,25 +109,33 @@ trap 'rollback 143' TERM
 trap cleanup EXIT
 
 backup_running_file() {
-  local remote_path="$1" backup_path="$2" absent_path="$3" result
-  if pct exec "$VMID" -- test -e "$remote_path" >/dev/null 2>&1; then
-    result=0
-  else
-    result=$?
+  local remote_path="$1" backup_path="$2" absent_path="$3" probe
+  case "$remote_path" in
+    /usr/local/sbin/hubinet-maint|/etc/hubinet-maint.json) ;;
+    *)
+      echo "Refusing unsafe managed-file probe path: $remote_path" >&2
+      return 1
+      ;;
+  esac
+  if ! probe="$(pct exec "$VMID" -- sh -c \
+    'if test -e "$1"; then printf "present\n"; else printf "absent\n"; fi' \
+    sh "$remote_path")"; then
+    echo "Could not determine whether CT$VMID:$remote_path exists: pct exec failed" >&2
+    return 1
   fi
-  case "$result" in
-    0)
+  case "$probe" in
+    present)
       pct pull "$VMID" "$remote_path" "$backup_path" >/dev/null
       [[ -s "$backup_path" ]] || {
         echo "Backup of CT$VMID:$remote_path is empty or missing" >&2
         return 1
       }
       ;;
-    1)
+    absent)
       : > "$absent_path"
       ;;
     *)
-      echo "Could not determine whether CT$VMID:$remote_path exists" >&2
+      echo "Could not determine whether CT$VMID:$remote_path exists: ambiguous probe output" >&2
       return 1
       ;;
   esac
@@ -125,6 +160,7 @@ if [[ "$status" == "running" ]]; then
   pct exec "$VMID" -- mv -f "$NEW_EXECUTOR" /usr/local/sbin/hubinet-maint
   pct exec "$VMID" -- mv -f "$NEW_CONFIG" /etc/hubinet-maint.json
   pct exec "$VMID" -- /usr/local/sbin/hubinet-maint inspect
+  content_installed=true
 else
   mount_output="$(pct mount "$VMID")"
   mounted=true
@@ -150,9 +186,11 @@ else
   install -m 0644 "$CONFIG_SOURCE" "$mountpoint$NEW_CONFIG"
   mv -f "$mountpoint$NEW_EXECUTOR" "$mountpoint/usr/local/sbin/hubinet-maint"
   mv -f "$mountpoint$NEW_CONFIG" "$mountpoint/etc/hubinet-maint.json"
+  content_installed=true
   echo "CT$VMID is stopped; safe inspect smoke is deferred until it is running."
 fi
 
+unmount_ct_with_retry
 committed=true
 trap - ERR INT TERM
 echo "CT$VMID managed executor installed atomically; no update or service restart was run."

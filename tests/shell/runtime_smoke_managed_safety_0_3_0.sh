@@ -33,10 +33,23 @@ case "${1:-}" in
     fi
     ;;
   unmount)
+    count_file="$HUBINET_OPS_MANAGED_TEST_LOG.unmount-count"
+    count=0
+    [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
+    count=$((count + 1))
+    printf '%s' "$count" > "$count_file"
+    if ((count <= ${MANAGED_TEST_UNMOUNT_FAILURES:-0})); then
+      exit 1
+    fi
     ;;
   exec)
-    if [[ " ${*:3} " == *' test -e '* ]]; then
-      [[ ${MANAGED_TEST_EXISTS:-yes} == yes ]]
+    if [[ " ${*:3} " == *' sh -c '* ]]; then
+      case "${MANAGED_TEST_PROBE:-present}" in
+        present) printf 'present\n' ;;
+        absent) printf 'absent\n' ;;
+        exec-fail) exit 1 ;;
+        ambiguous) printf 'present\nnoise\n' ;;
+      esac
     fi
     ;;
   pull)
@@ -71,6 +84,7 @@ chmod +x "$FAKE_BIN/install"
 
 reset_ct() {
   : > "$LOG"
+  /usr/bin/rm -f "$LOG.unmount-count"
   /usr/bin/rm -rf "$CT_ROOT/usr" "$CT_ROOT/etc"
   mkdir -p "$CT_ROOT/usr/local/sbin" "$CT_ROOT/etc"
   printf 'executor-before\n' > "$CT_ROOT/usr/local/sbin/hubinet-maint"
@@ -113,7 +127,7 @@ done
 
 # Confirmed absence creates no pull requirement and installation may proceed.
 : > "$LOG"
-export MANAGED_TEST_STATUS=running MANAGED_TEST_EXISTS=no
+export MANAGED_TEST_STATUS=running MANAGED_TEST_PROBE=absent
 bash "$ROOT/deploy/managed/install-managed.sh" 101
 if grep -Fq '<pull>' "$LOG"; then
   echo 'Absent managed file was unexpectedly pulled' >&2
@@ -123,7 +137,7 @@ grep -Fq '<push><101>' "$LOG"
 
 # Existing files must both be pulled successfully before any mutation starts.
 : > "$LOG"
-export MANAGED_TEST_EXISTS=yes MANAGED_TEST_PULL_FAIL=no
+export MANAGED_TEST_PROBE=present MANAGED_TEST_PULL_FAIL=no
 bash "$ROOT/deploy/managed/install-managed.sh" 101
 [[ "$(grep -Fc '<pull><101>' "$LOG")" -eq 2 ]]
 
@@ -141,5 +155,38 @@ if grep -Fq '<rm><-f></usr/local/sbin/hubinet-maint>' "$LOG"; then
   echo 'Original executor was removed after an incomplete backup' >&2
   exit 1
 fi
+
+for probe in exec-fail ambiguous; do
+  : > "$LOG"
+  export MANAGED_TEST_PROBE="$probe" MANAGED_TEST_PULL_FAIL=no
+  if bash "$ROOT/deploy/managed/install-managed.sh" 101; then
+    echo "$probe managed-file probe unexpectedly succeeded" >&2
+    exit 1
+  fi
+  if grep -Fq '<pull><101>' "$LOG" || grep -Fq '<push><101>' "$LOG"; then
+    echo "$probe managed-file probe was interpreted as a file state" >&2
+    exit 1
+  fi
+done
+unset MANAGED_TEST_PROBE
+
+# The mount flag survives a failed unmount. A transient failure is retried and
+# confirmed before success; persistent failures never print an install success.
+reset_ct
+export MANAGED_TEST_STATUS=stopped MANAGED_TEST_UNMOUNT_FAILURES=1
+output="$(bash "$ROOT/deploy/managed/install-managed.sh" 101 2>&1)"
+[[ "$output" == *'installed atomically'* ]]
+[[ "$(cat "$LOG.unmount-count")" -eq 2 ]]
+
+reset_ct
+export MANAGED_TEST_UNMOUNT_FAILURES=99
+if output="$(bash "$ROOT/deploy/managed/install-managed.sh" 101 2>&1)"; then
+  echo 'Persistent pct unmount failure unexpectedly succeeded' >&2
+  exit 1
+fi
+[[ "$output" != *'installed atomically'* ]]
+[[ "$output" == *'CT101 remains mounted; manual intervention required: pct unmount 101'* ]]
+[[ "$(cat "$LOG.unmount-count")" -ge 4 ]]
+unset MANAGED_TEST_UNMOUNT_FAILURES
 
 echo '0.3.0 managed mount and backup safety smoke passed'

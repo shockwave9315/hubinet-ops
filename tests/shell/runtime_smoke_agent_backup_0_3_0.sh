@@ -33,6 +33,21 @@ cat > "$FAKE_BIN/systemctl" <<'SH'
 #!/usr/bin/env bash
 printf '<%s>' "$@" >> "$HUBINET_OPS_AGENT_TEST_LOG"
 printf '\n' >> "$HUBINET_OPS_AGENT_TEST_LOG"
+case "${1:-}" in
+  stop)
+    if [[ ${HUBINET_OPS_AGENT_TEST_STOP_FAIL:-no} == yes ]]; then
+      exit 1
+    fi
+    ;;
+  is-active)
+    if [[ ${HUBINET_OPS_AGENT_TEST_STAYS_ACTIVE:-no} == yes ]]; then
+      printf 'active\n'
+      exit 0
+    fi
+    printf 'inactive\n'
+    exit 3
+    ;;
+esac
 SH
 chmod +x "$FAKE_BIN/systemctl"
 cat > "$FAKE_BIN/chown" <<'SH'
@@ -121,6 +136,46 @@ if bash "$ROOT/deploy/agent/restore-0.3.0.sh" "$incomplete"; then
   exit 1
 fi
 grep -Fxq 'current-db-must-survive' "$AGENT_ROOT/var/lib/hubinet-ops/ops.db"
-grep -Fq '<start><hubinet-ops>' "$LOG"
+if grep -Fq '<stop><hubinet-ops>' "$LOG"; then
+  echo 'Restore stopped the agent before validating all mandatory artifacts' >&2
+  exit 1
+fi
+
+assert_agent_unchanged() {
+  local snapshot="$1"
+  diff -ru "$snapshot/app" "$AGENT_ROOT/opt/hubinet-ops/app"
+  cmp "$snapshot/requirements.txt" "$AGENT_ROOT/opt/hubinet-ops/requirements.txt"
+  cmp "$snapshot/hubinet-ops.service" "$AGENT_ROOT/etc/systemd/system/hubinet-ops.service"
+  cmp "$snapshot/config.yaml" "$AGENT_ROOT/etc/hubinet-ops/config.yaml"
+  cmp "$snapshot/agent.env" "$AGENT_ROOT/etc/hubinet-ops/agent.env"
+  cmp "$snapshot/ops.db" "$AGENT_ROOT/var/lib/hubinet-ops/ops.db"
+}
+
+prepare_agent
+snapshot="$TMP_ROOT/current-agent-snapshot"
+mkdir -p "$snapshot"
+/usr/bin/cp -a "$AGENT_ROOT/opt/hubinet-ops/app" "$snapshot/app"
+/usr/bin/cp "$AGENT_ROOT/opt/hubinet-ops/requirements.txt" "$snapshot/requirements.txt"
+/usr/bin/cp "$AGENT_ROOT/etc/systemd/system/hubinet-ops.service" "$snapshot/hubinet-ops.service"
+/usr/bin/cp "$AGENT_ROOT/etc/hubinet-ops/config.yaml" "$snapshot/config.yaml"
+/usr/bin/cp "$AGENT_ROOT/etc/hubinet-ops/agent.env" "$snapshot/agent.env"
+/usr/bin/cp "$AGENT_ROOT/var/lib/hubinet-ops/ops.db" "$snapshot/ops.db"
+
+export HUBINET_OPS_AGENT_TEST_STOP_FAIL=yes
+if bash "$ROOT/deploy/agent/restore-0.3.0.sh" "$backup_with"; then
+  echo 'Restore unexpectedly succeeded after systemctl stop failure' >&2
+  exit 1
+fi
+unset HUBINET_OPS_AGENT_TEST_STOP_FAIL
+assert_agent_unchanged "$snapshot"
+
+export HUBINET_OPS_AGENT_TEST_STAYS_ACTIVE=yes
+if bash "$ROOT/deploy/agent/restore-0.3.0.sh" "$backup_with"; then
+  echo 'Restore unexpectedly succeeded while hubinet-ops remained active' >&2
+  exit 1
+fi
+unset HUBINET_OPS_AGENT_TEST_STAYS_ACTIVE
+assert_agent_unchanged "$snapshot"
+grep -Fq '<is-active><hubinet-ops>' "$LOG"
 
 echo '0.3.0 agent SQLite backup and restore safety smoke passed'

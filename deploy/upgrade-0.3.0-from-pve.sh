@@ -15,35 +15,72 @@ HOST_BACKUP_BASE="${HUBINET_OPS_HOST_BACKUP_BASE:-/root/hubinet-ops-upgrade-back
 HOST_BACKUP="$HOST_BACKUP_BASE/${STAMP}-before-0.3.0"
 AGENT_BACKUP="/root/hubinet-ops-backups/${STAMP}-before-0.3.0"
 AGENT_VMID=110
+host_root="${HUBINET_OPS_TEST_HOST_ROOT:-}"
+if [[ -n "$host_root" && ${HUBINET_OPS_TEST_MODE:-0} != 1 ]]; then
+  echo "Test host root override requires HUBINET_OPS_TEST_MODE=1" >&2
+  exit 2
+fi
+
+host_path() {
+  printf '%s%s' "$host_root" "$1"
+}
+
 complete=false
 changes_started=false
-agent_backup_started=false
+agent_backup_complete=false
+agent_backup_attempted=false
+agent_archive_push_attempted=false
 declare -A mounted_cts=()
 mounted_path=""
 
 unmount_ct() {
   local vmid="$1"
   if [[ "${mounted_cts[$vmid]:-false}" == true ]]; then
-    pct unmount "$vmid" >/dev/null 2>&1 || true
-    unset 'mounted_cts[$vmid]'
+    if pct unmount "$vmid" >/dev/null 2>&1; then
+      unset 'mounted_cts[$vmid]'
+      return 0
+    fi
+    return 1
   fi
 }
 
+unmount_ct_with_retry() {
+  local vmid="$1"
+  [[ "${mounted_cts[$vmid]:-false}" == true ]] || return 0
+  if unmount_ct "$vmid"; then
+    return 0
+  fi
+  echo "Failed to unmount CT$vmid; retrying pct unmount $vmid" >&2
+  if unmount_ct "$vmid"; then
+    return 0
+  fi
+  echo "CT$vmid remains mounted; manual intervention required: pct unmount $vmid" >&2
+  return 1
+}
+
 cleanup_mounts() {
-  local vmid
+  local vmid cleanup_rc=0
   for vmid in "${!mounted_cts[@]}"; do
-    unmount_ct "$vmid"
+    if ! unmount_ct_with_retry "$vmid"; then
+      cleanup_rc=1
+    fi
   done
+  return "$cleanup_rc"
 }
 
 mount_ct() {
   local vmid="$1" purpose="$2" output candidate
-  output="$(pct mount "$vmid")"
+  if ! output="$(pct mount "$vmid")"; then
+    echo "Failed to mount CT$vmid for $purpose" >&2
+    return 1
+  fi
   mounted_cts[$vmid]=true
   candidate="$(sed -n "s/.*'\([^']*\)'.*/\1/p" <<<"$output")"
   if [[ -z "$candidate" || "$candidate" != /* || ! -d "$candidate" ]]; then
     echo "Could not determine a safe CT$vmid mountpoint for $purpose" >&2
-    unmount_ct "$vmid"
+    if ! unmount_ct_with_retry "$vmid"; then
+      : # The mount flag remains set so the outer cleanup can try again.
+    fi
     return 1
   fi
   mounted_path="$candidate"
@@ -102,9 +139,12 @@ backup_optional() {
 restore_optional() {
   local target="$1" name="$2" mode="$3"
   if [[ -e "$HOST_BACKUP/$name" ]]; then
-    install -m "$mode" "$HOST_BACKUP/$name" "$target" || true
+    install -m "$mode" "$HOST_BACKUP/$name" "$target"
   elif [[ -e "$HOST_BACKUP/$name.absent" ]]; then
-    rm -f "$target" || true
+    rm -f "$target"
+  else
+    echo "Host rollback artifact is missing: $name" >&2
+    return 1
   fi
 }
 
@@ -140,138 +180,269 @@ backup_managed() {
   else
     : > "$target/hubinet-maint.json.absent"
   fi
-  unmount_ct "$vmid"
+  unmount_ct_with_retry "$vmid"
   : > "$target/backup.complete"
 }
 
 backup_running_managed_file() {
-  local vmid="$1" remote_path="$2" backup_path="$3" absent_path="$4" result
-  if pct exec "$vmid" -- test -e "$remote_path" >/dev/null 2>&1; then
-    result=0
-  else
-    result=$?
+  local vmid="$1" remote_path="$2" backup_path="$3" absent_path="$4" probe
+  case "$remote_path" in
+    /usr/local/sbin/hubinet-maint|/etc/hubinet-maint.json) ;;
+    *)
+      echo "Refusing unsafe managed-file probe path: $remote_path" >&2
+      return 1
+      ;;
+  esac
+  if ! probe="$(pct exec "$vmid" -- sh -c \
+    'if test -e "$1"; then printf "present\n"; else printf "absent\n"; fi' \
+    sh "$remote_path")"; then
+    echo "Could not determine whether CT$vmid:$remote_path exists: pct exec failed" >&2
+    return 1
   fi
-  case "$result" in
-    0)
+  case "$probe" in
+    present)
       pct pull "$vmid" "$remote_path" "$backup_path" >/dev/null
       [[ -s "$backup_path" ]] || {
         echo "Backup of CT$vmid:$remote_path is empty or missing" >&2
         return 1
       }
       ;;
-    1)
+    absent)
       : > "$absent_path"
       ;;
     *)
-      echo "Could not determine whether CT$vmid:$remote_path exists" >&2
+      echo "Could not determine whether CT$vmid:$remote_path exists: ambiguous probe output" >&2
       return 1
       ;;
   esac
 }
 
-remove_ct_file() {
-  local vmid="$1" path="$2" status mountpoint
-  status="$(pct status "$vmid" | awk '{print $2}')"
-  if [[ "$status" == running ]]; then
-    pct exec "$vmid" -- rm -f "$path" || true
-    return
-  fi
-  [[ "$status" == stopped ]] || return
-  mount_ct "$vmid" rollback-removal || return
-  mountpoint="$mounted_path"
-  rm -f "$mountpoint$path" || true
-  unmount_ct "$vmid"
-}
-
 restore_managed() {
-  local vmid="$1" source="$HOST_BACKUP/managed/$1" status mountpoint
-  [[ -f "$source/backup.complete" ]] || return
-  status="$(pct status "$vmid" | awk '{print $2}')"
+  local vmid="$1" source="$HOST_BACKUP/managed/$1" raw status mountpoint layer_rc=0
+  [[ -f "$source/backup.complete" ]] || {
+    echo "Managed rollback backup for CT$vmid is incomplete" >&2
+    return 1
+  }
+  if ! raw="$(pct status "$vmid")"; then
+    echo "Could not read CT$vmid status during rollback" >&2
+    return 1
+  fi
+  status="$(awk '{print $2}' <<<"$raw")"
   if [[ "$status" == running ]]; then
     if [[ -f "$source/hubinet-maint" ]]; then
-      pct push "$vmid" "$source/hubinet-maint" /usr/local/sbin/hubinet-maint --perms 0755 || true
+      if ! pct push "$vmid" "$source/hubinet-maint" /usr/local/sbin/hubinet-maint --perms 0755; then
+        echo "Failed to restore CT$vmid:/usr/local/sbin/hubinet-maint" >&2
+        layer_rc=1
+      fi
     elif [[ -f "$source/hubinet-maint.absent" ]]; then
-      remove_ct_file "$vmid" /usr/local/sbin/hubinet-maint
+      if ! pct exec "$vmid" -- rm -f /usr/local/sbin/hubinet-maint; then
+        echo "Failed to remove CT$vmid:/usr/local/sbin/hubinet-maint during rollback" >&2
+        layer_rc=1
+      fi
+    else
+      echo "Managed executor rollback artifact for CT$vmid is missing" >&2
+      layer_rc=1
     fi
     if [[ -f "$source/hubinet-maint.json" ]]; then
-      pct push "$vmid" "$source/hubinet-maint.json" /etc/hubinet-maint.json --perms 0644 || true
+      if ! pct push "$vmid" "$source/hubinet-maint.json" /etc/hubinet-maint.json --perms 0644; then
+        echo "Failed to restore CT$vmid:/etc/hubinet-maint.json" >&2
+        layer_rc=1
+      fi
     elif [[ -f "$source/hubinet-maint.json.absent" ]]; then
-      remove_ct_file "$vmid" /etc/hubinet-maint.json
+      if ! pct exec "$vmid" -- rm -f /etc/hubinet-maint.json; then
+        echo "Failed to remove CT$vmid:/etc/hubinet-maint.json during rollback" >&2
+        layer_rc=1
+      fi
+    else
+      echo "Managed config rollback artifact for CT$vmid is missing" >&2
+      layer_rc=1
     fi
-    return
+    return "$layer_rc"
   fi
-  [[ "$status" == stopped ]] || return
-  mount_ct "$vmid" rollback-restore || return
+  [[ "$status" == stopped ]] || {
+    echo "CT$vmid has unsupported rollback state: $status" >&2
+    return 1
+  }
+  if ! mount_ct "$vmid" rollback-restore; then
+    return 1
+  fi
   mountpoint="$mounted_path"
   if [[ -f "$source/hubinet-maint" ]]; then
-    install -m 0755 "$source/hubinet-maint" "$mountpoint/usr/local/sbin/hubinet-maint" || true
+    if ! install -m 0755 "$source/hubinet-maint" "$mountpoint/usr/local/sbin/hubinet-maint"; then
+      echo "Failed to restore stopped CT$vmid managed executor" >&2
+      layer_rc=1
+    fi
   elif [[ -f "$source/hubinet-maint.absent" ]]; then
-    rm -f "$mountpoint/usr/local/sbin/hubinet-maint" || true
+    if ! rm -f "$mountpoint/usr/local/sbin/hubinet-maint"; then
+      echo "Failed to remove stopped CT$vmid managed executor" >&2
+      layer_rc=1
+    fi
+  else
+    echo "Managed executor rollback artifact for CT$vmid is missing" >&2
+    layer_rc=1
   fi
   if [[ -f "$source/hubinet-maint.json" ]]; then
-    install -m 0644 "$source/hubinet-maint.json" "$mountpoint/etc/hubinet-maint.json" || true
+    if ! install -m 0644 "$source/hubinet-maint.json" "$mountpoint/etc/hubinet-maint.json"; then
+      echo "Failed to restore stopped CT$vmid managed config" >&2
+      layer_rc=1
+    fi
   elif [[ -f "$source/hubinet-maint.json.absent" ]]; then
-    rm -f "$mountpoint/etc/hubinet-maint.json" || true
+    if ! rm -f "$mountpoint/etc/hubinet-maint.json"; then
+      echo "Failed to remove stopped CT$vmid managed config" >&2
+      layer_rc=1
+    fi
+  else
+    echo "Managed config rollback artifact for CT$vmid is missing" >&2
+    layer_rc=1
   fi
-  unmount_ct "$vmid"
+  if ! unmount_ct_with_retry "$vmid"; then
+    layer_rc=1
+  fi
+  return "$layer_rc"
+}
+
+declare -a rollback_errors=()
+
+record_rollback_error() {
+  rollback_errors+=("$1")
 }
 
 restore_all() {
-  local rc="${1:-$?}"
-  trap - ERR INT TERM
-  cleanup_mounts
+  local rc="${1:-$?}" vmid target name mode
+  trap - ERR INT TERM EXIT
+  rollback_errors=()
   if [[ "$complete" == true ]]; then
     rm -f "$ARCHIVE"
     return 0
   fi
   echo "0.3.0 upgrade failed; restoring every modified layer" >&2
-  restore_optional /usr/local/sbin/hubinet-ops-host hubinet-ops-host 0755
-  restore_optional /etc/hubinet-ops/allowed-vmids allowed-vmids 0640
-  restore_optional /etc/hubinet-ops/observation-vmids observation-vmids 0640
-  restore_optional /etc/hubinet-ops/managed-vmids managed-vmids 0640
-  restore_optional /etc/hubinet-ops/maintenance-vmids maintenance-vmids 0640
-  restore_optional /etc/hubinet-ops/lifecycle-vmids lifecycle-vmids 0640
-  restore_optional /etc/hubinet-ops/resource-types resource-types 0640
-  for vmid in $(seq 101 109); do restore_managed "$vmid"; done
-  if [[ "$agent_backup_started" == true ]]; then
-    pct exec "$AGENT_VMID" -- bash -s -- "$AGENT_BACKUP" \
-      < "$SOURCE_DIR/deploy/agent/restore-0.3.0.sh" || true
+  if ! cleanup_mounts; then
+    for vmid in "${!mounted_cts[@]}"; do
+      record_rollback_error "CT$vmid unmount (run: pct unmount $vmid)"
+    done
+  fi
+  if [[ -f "$HOST_BACKUP/backup.complete" ]]; then
+    while read -r target name mode; do
+      target="$(host_path "$target")"
+      if ! restore_optional "$target" "$name" "$mode"; then
+        record_rollback_error "host $name"
+      fi
+    done <<'HOST_RESTORE_TARGETS'
+/usr/local/sbin/hubinet-ops-host hubinet-ops-host 0755
+/etc/hubinet-ops/allowed-vmids allowed-vmids 0640
+/etc/hubinet-ops/observation-vmids observation-vmids 0640
+/etc/hubinet-ops/managed-vmids managed-vmids 0640
+/etc/hubinet-ops/maintenance-vmids maintenance-vmids 0640
+/etc/hubinet-ops/lifecycle-vmids lifecycle-vmids 0640
+/etc/hubinet-ops/resource-types resource-types 0640
+HOST_RESTORE_TARGETS
+    for vmid in $(seq 101 109); do
+      if ! restore_managed "$vmid"; then
+        record_rollback_error "CT$vmid managed executor"
+      fi
+    done
+  else
+    record_rollback_error "verified host backup marker"
+  fi
+  if [[ "$agent_backup_complete" == true ]]; then
+    if ! pct exec "$AGENT_VMID" -- bash -s -- "$AGENT_BACKUP" \
+      < "$SOURCE_DIR/deploy/agent/restore-0.3.0.sh"; then
+      record_rollback_error "CT$AGENT_VMID agent"
+    fi
+  else
+    record_rollback_error "CT$AGENT_VMID agent backup"
+  fi
+  if ! cleanup_mounts; then
+    for vmid in "${!mounted_cts[@]}"; do
+      record_rollback_error "CT$vmid final unmount (run: pct unmount $vmid)"
+    done
   fi
   rm -f "$ARCHIVE"
+  if ((${#rollback_errors[@]} == 0)); then
+    echo "Rollback completed" >&2
+    [[ "$rc" -ne 0 ]] || rc=1
+    exit "$rc"
+  fi
+  echo "ROLLBACK INCOMPLETE" >&2
+  printf ' - %s\n' "${rollback_errors[@]}" >&2
+  exit 1
+}
+
+abort_before_changes() {
+  local rc="${1:-1}" cleanup_failed=false
+  trap - ERR INT TERM EXIT
+  if ! cleanup_mounts; then
+    cleanup_failed=true
+  fi
+  rm -f "$ARCHIVE"
+  if [[ "$agent_archive_push_attempted" == true ]]; then
+    if ! pct exec "$AGENT_VMID" -- rm -f /root/hubinet-ops-0.3.0.tgz; then
+      echo "Failed to remove the CT$AGENT_VMID staging archive after pre-change abort" >&2
+      cleanup_failed=true
+    fi
+  fi
+  if [[ "$agent_backup_attempted" == true ]]; then
+    if ! pct exec "$AGENT_VMID" -- systemctl start hubinet-ops; then
+      echo "Failed to restart the unchanged CT$AGENT_VMID agent after pre-change abort" >&2
+      cleanup_failed=true
+    fi
+  fi
+  if [[ "$cleanup_failed" == true ]]; then
+    echo "Pre-change cleanup incomplete; see manual unmount/restart instructions above" >&2
+  fi
   exit "$rc"
+}
+
+handle_failure() {
+  local rc="${1:-1}"
+  if [[ "$changes_started" == true ]]; then
+    restore_all "$rc"
+  else
+    abort_before_changes "$rc"
+  fi
 }
 
 fail_upgrade() {
   local message="$1"
   echo "$message" >&2
-  if [[ "$changes_started" == true ]]; then
-    restore_all 1
-  fi
-  exit 1
+  handle_failure 1
 }
 
-trap 'restore_all $?' ERR
-trap 'restore_all 130' INT
-trap 'restore_all 143' TERM
-trap 'cleanup_mounts; rm -f "$ARCHIVE"' EXIT
+exit_cleanup() {
+  local rc="$1"
+  trap - EXIT
+  if ! cleanup_mounts; then
+    rc=1
+  fi
+  rm -f "$ARCHIVE"
+  exit "$rc"
+}
+
+trap 'handle_failure $?' ERR
+trap 'handle_failure 130' INT
+trap 'handle_failure 143' TERM
+trap 'exit_cleanup $?' EXIT
 
 install -d -m 0700 "$HOST_BACKUP/managed"
-backup_optional /usr/local/sbin/hubinet-ops-host hubinet-ops-host
-backup_optional /etc/hubinet-ops/allowed-vmids allowed-vmids
-backup_optional /etc/hubinet-ops/observation-vmids observation-vmids
-backup_optional /etc/hubinet-ops/managed-vmids managed-vmids
-backup_optional /etc/hubinet-ops/maintenance-vmids maintenance-vmids
-backup_optional /etc/hubinet-ops/lifecycle-vmids lifecycle-vmids
-backup_optional /etc/hubinet-ops/resource-types resource-types
+backup_optional "$(host_path /usr/local/sbin/hubinet-ops-host)" hubinet-ops-host
+backup_optional "$(host_path /etc/hubinet-ops/allowed-vmids)" allowed-vmids
+backup_optional "$(host_path /etc/hubinet-ops/observation-vmids)" observation-vmids
+backup_optional "$(host_path /etc/hubinet-ops/managed-vmids)" managed-vmids
+backup_optional "$(host_path /etc/hubinet-ops/maintenance-vmids)" maintenance-vmids
+backup_optional "$(host_path /etc/hubinet-ops/lifecycle-vmids)" lifecycle-vmids
+backup_optional "$(host_path /etc/hubinet-ops/resource-types)" resource-types
 for vmid in $(seq 101 109); do backup_managed "$vmid"; done
+: > "$HOST_BACKUP/backup.complete"
 
 tar -C "$SOURCE_DIR" -czf "$ARCHIVE" \
   app requirements.txt config/config.example.yaml deploy/hubinet-ops.service
-agent_backup_started=true
+agent_backup_attempted=true
 pct exec "$AGENT_VMID" -- bash -s -- "$AGENT_BACKUP" \
   < "$SOURCE_DIR/deploy/agent/backup-0.3.0.sh"
-changes_started=true
+agent_backup_complete=true
+agent_archive_push_attempted=true
 pct push "$AGENT_VMID" "$ARCHIVE" /root/hubinet-ops-0.3.0.tgz --perms 0600
+changes_started=true
 
 pct exec "$AGENT_VMID" -- bash -s <<'REMOTE_INSTALL_AGENT'
 set -Eeuo pipefail
@@ -316,13 +487,13 @@ systemctl daemon-reload
 rm -rf "$staging" /root/hubinet-ops-0.3.0.tgz
 REMOTE_INSTALL_AGENT
 
-install -m 0755 "$SOURCE_DIR/deploy/pve/hubinet-ops-host" /usr/local/sbin/hubinet-ops-host
-install -m 0640 "$SOURCE_DIR/deploy/pve/observation-vmids" /etc/hubinet-ops/observation-vmids
-install -m 0640 "$SOURCE_DIR/deploy/pve/observation-vmids" /etc/hubinet-ops/allowed-vmids
-install -m 0640 "$SOURCE_DIR/deploy/pve/managed-vmids" /etc/hubinet-ops/managed-vmids
-install -m 0640 "$SOURCE_DIR/deploy/pve/maintenance-vmids" /etc/hubinet-ops/maintenance-vmids
-install -m 0640 "$SOURCE_DIR/deploy/pve/lifecycle-vmids" /etc/hubinet-ops/lifecycle-vmids
-install -m 0640 "$SOURCE_DIR/deploy/pve/resource-types" /etc/hubinet-ops/resource-types
+install -m 0755 "$SOURCE_DIR/deploy/pve/hubinet-ops-host" "$(host_path /usr/local/sbin/hubinet-ops-host)"
+install -m 0640 "$SOURCE_DIR/deploy/pve/observation-vmids" "$(host_path /etc/hubinet-ops/observation-vmids)"
+install -m 0640 "$SOURCE_DIR/deploy/pve/observation-vmids" "$(host_path /etc/hubinet-ops/allowed-vmids)"
+install -m 0640 "$SOURCE_DIR/deploy/pve/managed-vmids" "$(host_path /etc/hubinet-ops/managed-vmids)"
+install -m 0640 "$SOURCE_DIR/deploy/pve/maintenance-vmids" "$(host_path /etc/hubinet-ops/maintenance-vmids)"
+install -m 0640 "$SOURCE_DIR/deploy/pve/lifecycle-vmids" "$(host_path /etc/hubinet-ops/lifecycle-vmids)"
+install -m 0640 "$SOURCE_DIR/deploy/pve/resource-types" "$(host_path /etc/hubinet-ops/resource-types)"
 for vmid in $(seq 101 109); do
   # git archive and extracted release bundles do not guarantee executable mode
   # preservation. Invoke the fixed installer through Bash explicitly.
@@ -345,6 +516,9 @@ REMOTE_CHECK_RESOURCES
     count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' <<<"$resources")"
     if [[ "$count" != 11 ]]; then
       fail_upgrade "Resource inventory count is $count, expected 11"
+    fi
+    if ! cleanup_mounts; then
+      fail_upgrade "Final CT unmount verification failed; upgrade cannot be marked complete"
     fi
     complete=true
     trap - ERR INT TERM
