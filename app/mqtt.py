@@ -7,11 +7,19 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .ha_entities import (
+    AGENT_ENTITY_SPECS,
+    AGENT_SELF_OBSOLETE_KEYS,
+    APT_ENTITY_SPECS,
+    resource_entity_id,
+    resource_entity_specs,
+    resource_prefix,
+)
 from .security import sanitize_data, sanitize_text
 from .mqtt_budget import bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 
 @dataclass(frozen=True)
@@ -195,45 +203,18 @@ class MqttTelemetry:
             "model": "Ops Agent",
             "sw_version": VERSION,
         }
-        agent_entities = {
-            "availability": ("Availability", "{{ value }}", availability),
-            "version": ("Version", "{{ value_json.version }}", agent_state),
-            "configured_container_count": (
-                "Configured container count",
-                "{{ value_json.configured_container_count }}",
-                agent_state,
-            ),
-            "configured_resource_count": (
-                "Configured resource count",
-                "{{ value_json.configured_resource_count }}",
-                agent_state,
-            ),
-            "configured_lxc_count": (
-                "Configured LXC count",
-                "{{ value_json.configured_lxc_count }}",
-                agent_state,
-            ),
-            "configured_qemu_count": (
-                "Configured QEMU count",
-                "{{ value_json.configured_qemu_count }}",
-                agent_state,
-            ),
-            "active_job_count": (
-                "Active job count",
-                "{{ value_json.active_job_count }}",
-                agent_state,
-            ),
-            "last_refresh": ("Last refresh", "{{ value_json.last_refresh }}", agent_state),
-        }
-        for key, (name, template, state_topic) in agent_entities.items():
+        for spec in AGENT_ENTITY_SPECS:
+            state_topic = availability if spec.key == "availability" else agent_state
             self._discovery_sensor(
-                object_id=f"hubinet_ops_agent_{key}",
-                unique_id=f"hubinet_ops_agent_{key}",
-                name=name,
+                object_id=f"hubinet_ops_agent_{spec.key}",
+                unique_id=f"hubinet_ops_agent_{spec.key}",
+                default_entity_id=f"sensor.hubinet_ops_agent_{spec.suffix}",
+                name=spec.name,
                 state_topic=state_topic,
-                value_template=template,
-                availability_topic=availability if key != "availability" else None,
+                value_template=spec.value_template,
+                availability_topic=availability if spec.key != "availability" else None,
                 device=agent_device,
+                extra=dict(spec.extra),
                 force=force,
             )
 
@@ -252,24 +233,26 @@ class MqttTelemetry:
                 "model": model,
                 "via_device": "hubinet_ops_agent",
             }
-            for key, name, template, extra in _resource_entities(cfg):
+            for spec in resource_entity_specs(cfg):
                 self._discovery_sensor(
-                    object_id=f"hubinet_ops_{prefix}{vmid}_{key}",
-                    unique_id=f"hubinet_ops_{prefix}_{vmid}_{key}",
-                    name=name,
+                    object_id=f"hubinet_ops_{prefix}{vmid}_{spec.key}",
+                    unique_id=f"hubinet_ops_{prefix}_{vmid}_{spec.key}",
+                    default_entity_id=resource_entity_id(vmid, cfg, spec.key),
+                    name=spec.name,
                     state_topic=state_topic,
-                    value_template=template,
+                    value_template=spec.value_template,
                     availability_topic=availability,
                     device=device,
                     # The dashboard reads rich attributes from this one entity only.
                     # Attaching the same large JSON payload to every sensor bloats HA state storage.
-                    attributes_topic=state_topic if key == "health_status" else None,
-                    extra=extra,
+                    attributes_topic=state_topic if spec.key == "health_status" else None,
+                    extra=dict(spec.extra),
                     force=force,
                 )
             self._discovery_sensor(
                 object_id=f"hubinet_ops_{prefix}{vmid}_dashboard_path",
                 unique_id=f"hubinet_ops_{prefix}_{vmid}_dashboard_path",
+                default_entity_id=f"sensor.hubinet_ops_{resource_prefix(vmid, cfg)}_dashboard_path",
                 name="Dashboard path",
                 state_topic=state_topic,
                 value_template="{{ value_json.dashboard_path }}",
@@ -277,6 +260,14 @@ class MqttTelemetry:
                 device=device,
                 force=force,
             )
+            if cfg.get("adapter") == "agent_self":
+                for key in AGENT_SELF_OBSOLETE_KEYS:
+                    self._publish_raw(
+                        f"{self.discovery_prefix}/sensor/hubinet_ops_{prefix}{vmid}_{key}/config",
+                        "",
+                        retain=True,
+                        force=force,
+                    )
 
     def _is_lxc(self, vmid: int) -> bool:
         cfg = self.resources.get(int(vmid), {})
@@ -287,6 +278,7 @@ class MqttTelemetry:
         *,
         object_id: str,
         unique_id: str,
+        default_entity_id: str,
         name: str,
         state_topic: str,
         value_template: str,
@@ -300,6 +292,7 @@ class MqttTelemetry:
             "name": name,
             "object_id": object_id,
             "unique_id": unique_id,
+            "default_entity_id": default_entity_id,
             "state_topic": state_topic,
             "value_template": value_template,
             "device": device,
@@ -322,6 +315,10 @@ class MqttTelemetry:
             retain=True,
             force=force,
         )
+
+    def _publish_raw(self, topic: str, payload: str, *, retain: bool, force: bool) -> None:
+        if self.enabled:
+            self._put(PublishItem(topic, payload, retain, force))
 
     def _publish_json(self, topic: str, value: Any, *, retain: bool, force: bool) -> None:
         if not self.enabled:
@@ -465,87 +462,15 @@ class MqttTelemetry:
 
 def _ct_entities() -> list[tuple[str, str, str, dict[str, Any]]]:
     return [
-        ("health_status", "Health status", "{{ value_json.health_status }}", {}),
-        ("health_score", "Health score", "{{ value_json.health_score }}", {"unit_of_measurement": "%"}),
-        ("lxc_status", "LXC status", "{{ value_json.lxc_status | default('unknown') }}", {}),
-        ("runtime_status", "Runtime status", "{{ value_json.runtime_status | default('unknown') }}", {}),
-        ("uptime_seconds", "Uptime", "{{ value_json.uptime_seconds | default(0) }}", {"unit_of_measurement": "s"}),
-        ("update_status", "Update status", "{{ value_json.update_status }}", {}),
-        ("operation_status", "Operation status", "{{ value_json.operation_status }}", {}),
-        ("job_stage", "Job stage", "{{ value_json.job_stage }}", {}),
-        ("job_progress", "Job progress", "{{ value_json.job_progress }}", {"unit_of_measurement": "%"}),
-        ("pending_updates", "Pending update count", "{{ 'unknown' if value_json.pending_updates is none else value_json.pending_updates | default(0) }}", {}),
-        ("risk", "Risk", "{{ value_json.risk }}", {}),
-        ("disk_used_percent", "Disk used", "{{ value_json.disk.used_percent | default(0) }}", {"unit_of_measurement": "%"}),
-        ("disk_free_mb", "Disk free", "{{ value_json.disk.free_mb | default(0) }}", {"unit_of_measurement": "MiB"}),
-        ("memory_used_percent", "Memory used", "{{ value_json.memory.used_percent | default(0) }}", {"unit_of_measurement": "%"}),
-        ("docker_required_healthy", "Docker required healthy", "{{ value_json.docker.required_healthy | default(0) }}", {}),
-        ("docker_required_total", "Docker required total", "{{ value_json.docker.required_total | default(0) }}", {}),
-        ("active_plan_id", "Active plan ID", "{{ value_json.active_plan_id | default('none', true) }}", {}),
-        ("active_job_id", "Active job ID", "{{ value_json.active_job_id | default('none', true) }}", {}),
-        ("last_scan", "Last scan", "{{ value_json.last_scan | default('unknown', true) }}", {}),
-        ("last_update", "Last update", "{{ value_json.last_update | default('unknown', true) }}", {}),
-        ("last_error", "Last error", "{{ value_json.last_error | default('none', true) }}", {}),
-        ("last_operation_result", "Last operation result", "{{ value_json.last_operation_result | default('none', true) }}", {}),
-        ("rollback_allowed", "Rollback allowed", "{{ 'allowed' if value_json.rollback_allowed else 'blocked' }}", {}),
-        ("last_job_event", "Last job event", "{{ value_json.last_job_event.message | default('none') }}", {}),
-        ("lifecycle_status", "Lifecycle status", "{{ value_json.lifecycle_status | default('idle') }}", {}),
-        ("lifecycle_action", "Lifecycle action", "{{ value_json.lifecycle_action | default('none', true) }}", {}),
-        ("verification_status", "Verification status", "{{ value_json.verification_status | default('unknown') }}", {}),
-        ("last_verification", "Last verification", "{{ value_json.last_verification | default('unknown', true) }}", {}),
-        ("apt_check_ok", "APT check", "{{ 'unknown' if value_json.apt_check_ok is none else 'ok' if value_json.apt_check_ok else 'failed' }}", {}),
-        ("dpkg_audit_ok", "dpkg audit", "{{ 'unknown' if value_json.dpkg_audit_ok is none else 'ok' if value_json.dpkg_audit_ok else 'failed' }}", {}),
-        ("reboot_required", "Reboot required", "{{ 'unknown' if value_json.reboot_required is none else 'yes' if value_json.reboot_required else 'no' }}", {}),
-        ("packages_remaining_count", "Packages remaining", "{{ 'unknown' if value_json.packages_remaining_count is none else value_json.packages_remaining_count | default(0) }}", {}),
-        ("recovery_scan_status", "Recovery scan status", "{{ value_json.recovery_scan_status | default('disabled') }}", {}),
-        ("last_recovery_scan", "Last recovery scan", "{{ value_json.last_recovery_scan | default('unknown', true) }}", {}),
-        ("last_recovery_scan_result", "Last recovery scan result", "{{ value_json.last_recovery_scan_result | default('none', true) }}", {}),
-        ("capability_start", "Capability start", "{{ 'allowed' if value_json.operator_capabilities.start else 'blocked' }}", {}),
-        ("capability_shutdown", "Capability shutdown", "{{ 'allowed' if value_json.operator_capabilities.shutdown else 'blocked' }}", {}),
-        ("capability_reboot", "Capability reboot", "{{ 'allowed' if value_json.operator_capabilities.reboot else 'blocked' }}", {}),
-        ("capability_refresh", "Capability refresh", "{{ 'allowed' if value_json.operator_capabilities.refresh else 'blocked' }}", {}),
-        ("capability_scan", "Capability scan", "{{ 'allowed' if value_json.operator_capabilities.scan else 'blocked' }}", {}),
-        ("capability_approve", "Capability approve", "{{ 'allowed' if value_json.operator_capabilities.approve else 'blocked' }}", {}),
-        ("capability_reject", "Capability reject", "{{ 'allowed' if value_json.operator_capabilities.reject else 'blocked' }}", {}),
-        ("capability_retry_healthcheck", "Capability retry healthcheck", "{{ 'allowed' if value_json.operator_capabilities.retry_healthcheck else 'blocked' }}", {}),
-        ("capability_rollback", "Capability rollback", "{{ 'allowed' if value_json.operator_capabilities.rollback else 'blocked' }}", {}),
+        (spec.key, spec.name, spec.value_template, dict(spec.extra))
+        for spec in APT_ENTITY_SPECS
     ]
 
 
 def _resource_entities(
     cfg: dict[str, Any],
 ) -> list[tuple[str, str, str, dict[str, Any]]]:
-    resource_type = str(cfg.get("resource_type", "lxc"))
-    adapter = str(cfg.get("adapter", "apt"))
-    if resource_type == "lxc" and adapter == "apt":
-        return _ct_entities()
-
-    common = [
-        ("health_status", "Health status", "{{ value_json.health_status }}", {}),
-        ("health_score", "Health score", "{{ value_json.health_score }}", {"unit_of_measurement": "%"}),
-        ("runtime_status", "Runtime status", "{{ value_json.runtime_status | default('unknown') }}", {}),
-        ("uptime_seconds", "Uptime", "{{ value_json.uptime_seconds | default(0) }}", {"unit_of_measurement": "s"}),
-        ("last_refresh", "Last refresh", "{{ value_json.last_refresh | default('unknown', true) }}", {}),
-        ("last_error", "Last error", "{{ value_json.last_error | default('none', true) }}", {}),
-        ("cpu_usage", "CPU usage", "{{ value_json.cpu.usage | default('unknown') }}", {}),
-        ("cpu_load_1m", "CPU load 1m", "{{ value_json.cpu.load_1m | default('unknown') }}", {}),
-        ("cpu_cores", "CPU cores", "{{ value_json.cpu.cores | default('unknown') }}", {}),
-        ("memory_used_bytes", "Memory used", "{{ value_json.memory.used_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
-        ("memory_total_bytes", "Memory total", "{{ value_json.memory.total_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
-        ("disk_used_bytes", "Disk used", "{{ value_json.disk.used_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
-        ("disk_total_bytes", "Disk total", "{{ value_json.disk.total_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
-        ("network_in_bytes", "Network received", "{{ value_json.network.in_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
-        ("network_out_bytes", "Network sent", "{{ value_json.network.out_bytes | default('unknown') }}", {"unit_of_measurement": "B"}),
-    ]
-    if resource_type == "qemu":
-        return common + [
-            ("qemu_status", "QEMU status", "{{ value_json.qemu_status | default('unknown') }}", {}),
-            ("guest_agent_status", "Guest Agent", "{{ value_json.guest_agent_status | default('unknown') }}", {}),
-            ("ip_addresses", "IP addresses", "{{ value_json.ip_addresses | default([]) | join(', ') }}", {}),
-        ]
-    return common + [
-        ("lxc_status", "LXC status", "{{ value_json.lxc_status | default('unknown') }}", {}),
-        ("service_status", "Service status", "{{ value_json.service_status | default('unknown') }}", {}),
-        ("api_health", "API health", "{{ value_json.api_health | default('unknown') }}", {}),
-        ("agent_version", "Agent version", "{{ value_json.agent_version | default('unknown') }}", {}),
+    return [
+        (spec.key, spec.name, spec.value_template, dict(spec.extra))
+        for spec in resource_entity_specs(cfg)
     ]

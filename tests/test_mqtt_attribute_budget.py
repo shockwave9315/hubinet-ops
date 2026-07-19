@@ -3,6 +3,8 @@ from __future__ import annotations
 import inspect
 import json
 
+import pytest
+
 from app.mqtt_budget import HA_ATTRIBUTE_BUDGET_BYTES, bounded_state
 
 
@@ -127,12 +129,12 @@ def test_malformed_collection_shapes_do_not_break_publication() -> None:
     assert payload["docker"] == {}
 
 
-def test_core_mqtt_uses_the_0_3_0_byte_budget() -> None:
+def test_core_mqtt_uses_the_0_3_1_byte_budget() -> None:
     from app import mqtt
 
     source = inspect.getsource(mqtt.MqttTelemetry.publish_container_state)
 
-    assert mqtt.VERSION == "0.3.0"
+    assert mqtt.VERSION == "0.3.1"
     assert mqtt.bounded_state is bounded_state
     assert "publish_resource_state" in source
     assert "_bounded_state" not in source
@@ -255,3 +257,80 @@ def test_resource_payload_redacts_self_journal_and_never_exposes_secret_fields()
     assert "also-secret" not in raw
     assert "raw-secret" not in raw
     assert payload["cpu"]["load_1m"] == 0.25
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {
+            "resource_type": "qemu",
+            "adapter": "haos",
+            "disk": {"used_bytes": 11, "total_bytes": 22, "free_bytes": 33},
+            "memory": {"used_bytes": 44, "total_bytes": 55, "available_bytes": 66},
+            "network": {"in_bytes": 77, "out_bytes": 88},
+        },
+        {
+            "resource_type": "lxc",
+            "adapter": "agent_self",
+            "disk": {"used_bytes": 11, "total_bytes": 22, "free_bytes": 33},
+            "memory": {"used_bytes": 44, "total_bytes": 55, "available_bytes": 66},
+        },
+        {
+            "resource_type": "lxc",
+            "adapter": "apt",
+            "disk": {
+                "used_percent": 25,
+                "free_mb": 512,
+                "used_bytes": 11,
+                "total_bytes": 22,
+                "free_bytes": 33,
+            },
+            "memory": {
+                "used_percent": 50,
+                "used_bytes": 44,
+                "total_bytes": 55,
+                "available_bytes": 66,
+            },
+            "network": {"in_bytes": 77, "out_bytes": 88},
+        },
+    ],
+    ids=("qemu", "agent-self", "apt-lxc"),
+)
+def test_byte_metrics_survive_when_payload_fits_budget(state: dict) -> None:
+    payload = bounded_state(state)
+
+    assert payload["disk"]["used_bytes"] == 11
+    assert payload["disk"]["total_bytes"] == 22
+    assert payload["disk"]["free_bytes"] == 33
+    assert payload["memory"]["used_bytes"] == 44
+    assert payload["memory"]["total_bytes"] == 55
+    assert payload["memory"]["available_bytes"] == 66
+    if "network" in state:
+        assert payload["network"] == {"in_bytes": 77, "out_bytes": 88}
+
+
+def test_large_mixed_payload_keeps_byte_metrics_within_budget() -> None:
+    payload = bounded_state(
+        {
+            "resource_type": "qemu",
+            "adapter": "haos",
+            "disk": {"used_bytes": 11, "total_bytes": 22, "free_bytes": 33},
+            "memory": {"used_bytes": 44, "total_bytes": 55, "available_bytes": 66},
+            "network": {"in_bytes": 77, "out_bytes": 88},
+            "updates": {
+                "packages": [
+                    {"name": f"package-{index}-" + "x" * 500}
+                    for index in range(200)
+                ]
+            },
+            "recent_job_events": [
+                {"message": f"event-{index}-" + "y" * 500}
+                for index in range(50)
+            ],
+        }
+    )
+
+    assert _encoded_size(payload) <= HA_ATTRIBUTE_BUDGET_BYTES
+    assert payload["disk"]["used_bytes"] == 11
+    assert payload["memory"]["available_bytes"] == 66
+    assert payload["network"] == {"in_bytes": 77, "out_bytes": 88}

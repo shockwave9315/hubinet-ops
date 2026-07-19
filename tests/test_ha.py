@@ -181,6 +181,7 @@ def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
         "last_update",
         "last_error",
         "last_operation_result",
+        "last_refresh",
     }
     per_container = {
         101: set(),

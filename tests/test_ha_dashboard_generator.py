@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -17,6 +17,16 @@ def _view(data: dict, path: str) -> dict:
 
 def _text(value: object) -> str:
     return yaml.safe_dump(value, allow_unicode=True, sort_keys=False)
+
+
+def _walk(value: Any):
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _walk(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk(child)
 
 
 def test_dashboard_generator_is_deterministic_and_checked_in() -> None:
@@ -45,17 +55,51 @@ def test_dashboard_contains_full_inventory_and_legacy_paths() -> None:
         assert label in overview
 
 
-def test_vm100_has_guest_agent_but_no_apt_or_lifecycle() -> None:
+def test_overview_and_details_use_multiple_mushroom_sections() -> None:
+    data = _dashboard()
+    overview = _view(data, "overview")
+    assert len(overview["sections"]) == 4
+    assert "custom:mushroom-chips-card" in _text(overview)
+    assert _text(overview).count("custom:mushroom-template-card") >= 11
+
+    for view in data["views"][1:]:
+        assert len(view["sections"]) >= 5
+        assert all(section["type"] == "grid" for section in view["sections"])
+        mega_entities = [
+            item for item in _walk(view)
+            if isinstance(item, dict) and item.get("type") == "entities"
+        ]
+        assert mega_entities == []
+
+
+def test_vm100_has_qemu_metrics_but_no_apt_or_controls() -> None:
     text = _text(_view(_dashboard(), "vm-100"))
 
     assert "QEMU Guest Agent" in text
-    assert "guest_agent_status" in text
-    assert "APT i weryfikacja" not in text
+    assert "sensor.hubinet_ops_vm100_guest_agent" in text
+    assert "sensor.hubinet_ops_vm100_ip_addresses" in text
+    assert "pending_update_count" not in text
+    assert "Pakiety APT" not in text
     assert "perform-action" not in text
     assert "Tryb obserwacji" in text
 
 
-def test_ct106_is_only_view_with_controls_and_start_hides_for_waiting_plan() -> None:
+def test_ct110_has_only_supported_self_metrics() -> None:
+    text = _text(_view(_dashboard(), "ct-110"))
+
+    for suffix in (
+        "service_status", "api_health", "agent_version", "cpu_load_1m",
+        "cpu_cores", "memory_used", "memory_total", "memory_available",
+        "disk_used", "disk_total", "disk_free", "recent_warnings",
+    ):
+        assert f"sensor.hubinet_ops_ct110_{suffix}" in text
+    for unsupported in ("cpu_usage", "network_received", "network_sent"):
+        assert f"sensor.hubinet_ops_ct110_{unsupported}" not in text
+    assert "pending_update_count" not in text
+    assert "perform-action" not in text
+
+
+def test_ct106_is_only_view_with_capability_control_cards() -> None:
     data = _dashboard()
     ct106 = _text(_view(data, "ct-106"))
 
@@ -65,9 +109,11 @@ def test_ct106_is_only_view_with_controls_and_start_hides_for_waiting_plan() -> 
         "Ponów healthcheck",
     ):
         assert name in ct106
-    assert "name: Rollback" not in ct106
+    assert "primary: Rollback" not in ct106
     assert "state_not: waiting_approval" in ct106
     assert "confirmation:" in ct106
+    assert ct106.count("perform-action") == 8
+
     for path in (
         "vm-100", "ct-101", "ct-102", "ct-103", "ct-104", "ct-105",
         "ct-107", "ct-108", "ct-109", "ct-110",
@@ -77,12 +123,14 @@ def test_ct106_is_only_view_with_controls_and_start_hides_for_waiting_plan() -> 
         assert "Tryb obserwacji — sterowanie zablokowane przez politykę backendu" in view_text
 
 
-def test_adapter_specific_cards_are_generated() -> None:
+def test_apt_views_have_resources_updates_verification_packages_and_optional_docker() -> None:
     data = _dashboard()
-
+    apt = _text(_view(data, "ct-101"))
+    for title in (
+        "Zasoby", "Aktualizacje", "Weryfikacja końcowa",
+        "Historia i diagnostyka", "Pakiety i diagnostyka", "Logi live",
+    ):
+        assert title in apt
+    assert "Docker" not in apt
+    assert "Docker" in _text(_view(data, "ct-106"))
     assert "Docker" in _text(_view(data, "ct-109"))
-    assert "Weryfikacja końcowa" in _text(_view(data, "ct-101"))
-    self_text = _text(_view(data, "ct-110"))
-    assert "Self-health agenta" in self_text
-    assert "configured_resource_count" in self_text
-    assert "APT i weryfikacja" not in self_text

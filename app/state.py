@@ -142,6 +142,21 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(addresses, list)
         else []
     )
+    primary_ip = str(state.get("primary_ip_address") or "").strip()
+    if not primary_ip:
+        primary_ip = next(
+            (
+                value
+                for value in state["ip_addresses"]
+                if value
+                and value != "::1"
+                and not value.startswith("127.")
+                and not value.lower().startswith("fe80:")
+                and not value.startswith("172.30.")
+            ),
+            "",
+        )
+    state["primary_ip_address"] = primary_ip[:254]
     for key in ("cpu", "memory", "disk", "network", "services", "docker"):
         value = state.get(key)
         state[key] = dict(value) if isinstance(value, dict) else {}

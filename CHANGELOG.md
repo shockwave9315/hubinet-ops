@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- unify MQTT discovery and dashboard entity IDs in one adapter-aware contract while preserving existing unique IDs;
+- publish numeric unknown values as `None`, keep byte metrics inside the 10 KB state budget, and use one bounded primary IP state;
+- correct CT110 self-health scoring and remove unsupported QEMU/network discovery from the self adapter;
+- clear only the exact retained CT110 discovery topics retired by this release;
+- restore a responsive, deterministic Mushroom dashboard for the complete VM/CT 100–110 inventory;
+- add transactional CT110-only and Home Assistant-only patch installers with rollback and no automatic HA restart.
+
 ## 0.2.3
 
 - cap the complete Home Assistant MQTT attribute payload at 10,000 UTF-8 bytes, leaving margin below Recorder's 16,384-byte hard limit;

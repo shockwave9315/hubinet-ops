@@ -1588,6 +1588,7 @@ class OpsService:
                 "enabled": bool(cfg.get("enabled", False)),
                 "adapter": cfg.get("adapter", "apt"),
                 "criticality": cfg.get("criticality", "medium"),
+                "primary_ip_address": cfg.get("ip_address"),
                 "dashboard_path": cfg.get(
                     "dashboard_path",
                     f"/hubinet-ops/ct-{vmid}",

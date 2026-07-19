@@ -38,6 +38,15 @@ write_stub() {
 }
 
 write_stub date 'printf "%s\n" "${HUBINET_OPS_FAKE_STAMP:-20260719-120000}"'
+write_stub grep '
+for arg in "$@"; do
+  if [[ "$arg" == '\''VERSION = "0.3.0"'\'' ]]; then
+    # Exercise the historical 0.3.0 installer from the current patch checkout.
+    exit 0
+  fi
+done
+exec /usr/bin/grep "$@"
+'
 write_stub python3 '
 printf "<%s>" "$@" >> "$HUBINET_OPS_TEST_LOG_DIR/python3.args"
 printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/python3.args"

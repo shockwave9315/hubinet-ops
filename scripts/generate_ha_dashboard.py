@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.ha_entities import agent_entity_id, resource_entity_id
+
 DEFAULT_CONFIG = ROOT / "config" / "config.example.yaml"
 DEFAULT_OUTPUT = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
 
@@ -26,64 +32,176 @@ ICONS = {
 }
 
 
-def _prefix(vmid: int, cfg: dict[str, Any]) -> str:
-    return f"vm{vmid}" if cfg["resource_type"] == "qemu" else f"ct{vmid}"
-
-
 def _label(vmid: int, cfg: dict[str, Any]) -> str:
     kind = "VM" if cfg["resource_type"] == "qemu" else "CT"
     return f"{kind}{vmid} · {cfg['display_name']}"
 
 
 def _entity(vmid: int, cfg: dict[str, Any], key: str) -> str:
-    compatibility_suffixes = {
-        "pending_updates": "pending_update_count",
-        "disk_used_percent": "disk_used",
-        "disk_free_mb": "disk_free",
-        "memory_used_percent": "memory_used",
-    }
-    return (
-        f"sensor.hubinet_ops_{_prefix(vmid, cfg)}_"
-        f"{compatibility_suffixes.get(key, key)}"
-    )
+    return resource_entity_id(vmid, cfg, key)
 
 
-def _title_card(title: str, subtitle: str) -> dict[str, Any]:
+def _title(title: str, subtitle: str = "") -> dict[str, Any]:
+    return {"type": "custom:mushroom-title-card", "title": title, "subtitle": subtitle}
+
+
+def _section(*cards: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "grid", "cards": list(cards)}
+
+
+def _entity_card(
+    entity: str,
+    name: str,
+    icon: str,
+    color: str = "blue",
+) -> dict[str, Any]:
     return {
-        "type": "custom:mushroom-title-card",
-        "title": title,
-        "subtitle": subtitle,
+        "type": "custom:mushroom-entity-card",
+        "entity": entity,
+        "name": name,
+        "icon": icon,
+        "icon_color": color,
     }
 
 
-def _overview_card(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+def _entity_grid(cards: Iterable[dict[str, Any]], columns: int = 2) -> dict[str, Any]:
+    return {
+        "type": "grid",
+        "columns": columns,
+        "square": False,
+        "cards": list(cards),
+    }
+
+
+def _chip(entity: str, icon: str, content: str | None = None) -> dict[str, Any]:
+    return {
+        "type": "template",
+        "entity": entity,
+        "icon": icon,
+        "content": content or "{{ states(entity) }}",
+        "icon_color": (
+            "{% set value = states(entity) %} "
+            "{{ 'green' if value in ['healthy', 'running', 'active', 'ok', 'online', 'up_to_date'] "
+            "else 'amber' if value in ['degraded', 'waiting_approval', 'update_available'] else 'red' }}"
+        ),
+        "tap_action": {"action": "more-info"},
+    }
+
+
+def _chips(chips: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "type": "custom:mushroom-chips-card",
+        "alignment": "justify",
+        "chips": list(chips),
+    }
+
+
+def _resource_status(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
     health = _entity(vmid, cfg, "health_status")
+    runtime = _entity(vmid, cfg, "runtime_status")
+    secondary_parts = [f"Runtime: {{{{ states('{runtime}') }}}}"]
+    if cfg["adapter"] == "apt":
+        secondary_parts.extend(
+            [
+                f"aktualizacje: {{{{ states('{_entity(vmid, cfg, 'update_status')}') }}}}",
+                f"pakiety: {{{{ states('{_entity(vmid, cfg, 'pending_updates')}') }}}}",
+            ]
+        )
+    elif cfg["resource_type"] == "qemu":
+        secondary_parts.append(
+            f"Guest Agent: {{{{ states('{_entity(vmid, cfg, 'guest_agent_status')}') }}}}"
+        )
+    else:
+        secondary_parts.extend(
+            [
+                f"usługa: {{{{ states('{_entity(vmid, cfg, 'service_status')}') }}}}",
+                f"API: {{{{ states('{_entity(vmid, cfg, 'api_health')}') }}}}",
+            ]
+        )
     return {
         "type": "custom:mushroom-template-card",
         "entity": health,
         "primary": _label(vmid, cfg),
-        "secondary": (
-            "Zdrowie: {{ states(entity) }} · status: "
-            f"{{{{ states('{_entity(vmid, cfg, 'runtime_status')}') }}}}"
-        ),
+        "secondary": " · ".join(secondary_parts),
         "multiline_secondary": True,
         "icon": ICONS.get(vmid, "mdi:server"),
         "color": (
             "{% set health = states(entity) %} "
             "{{ 'green' if health == 'healthy' else 'amber' if health == 'degraded' else 'red' }}"
         ),
-        "tap_action": {
-            "action": "navigate",
-            "navigation_path": str(cfg["dashboard_path"]),
-        },
+        "badge_icon": (
+            "{{ 'mdi:check-circle' if is_state(entity, 'healthy') else 'mdi:alert-circle' }}"
+        ),
+        "badge_color": "{{ 'green' if is_state(entity, 'healthy') else 'red' }}",
+        "tap_action": {"action": "more-info"},
     }
 
 
-def _entities_card(title: str, entities: list[str]) -> dict[str, Any]:
-    return {"type": "entities", "title": title, "entities": entities}
+def _overview_card(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    card = _resource_status(vmid, cfg)
+    card["tap_action"] = {
+        "action": "navigate",
+        "navigation_path": str(cfg["dashboard_path"]),
+    }
+    return card
 
 
-def _control_card(vmid: int, cfg: dict[str, Any], action: str) -> dict[str, Any]:
+def _resource_chips(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    items = [
+        _chip(_entity(vmid, cfg, "health_status"), "mdi:heart-pulse"),
+        _chip(
+            _entity(vmid, cfg, "health_score"),
+            "mdi:heart-pulse",
+            "{{ states(entity) }}%",
+        ),
+        _chip(_entity(vmid, cfg, "runtime_status"), "mdi:server"),
+    ]
+    if cfg["adapter"] == "apt":
+        items.extend(
+            [
+                _chip(_entity(vmid, cfg, "update_status"), "mdi:package-up"),
+                _chip(
+                    _entity(vmid, cfg, "operation_status"),
+                    "mdi:progress-wrench",
+                ),
+                _chip(_entity(vmid, cfg, "risk"), "mdi:shield-alert-outline"),
+                _chip(
+                    _entity(vmid, cfg, "pending_updates"),
+                    "mdi:format-list-numbered",
+                    "{{ states(entity) }} pak.",
+                ),
+            ]
+        )
+    elif cfg["resource_type"] == "qemu":
+        items.append(_chip(_entity(vmid, cfg, "guest_agent_status"), "mdi:lan-connect"))
+    else:
+        items.extend(
+            [
+                _chip(_entity(vmid, cfg, "service_status"), "mdi:application-cog"),
+                _chip(_entity(vmid, cfg, "api_health"), "mdi:api"),
+                _chip(_entity(vmid, cfg, "agent_version"), "mdi:tag-outline"),
+            ]
+        )
+    return _chips(items)
+
+
+def _observation_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    return _section(
+        _title("Sterowanie", "Polityka backendu jest źródłem prawdy"),
+        {
+            "type": "custom:mushroom-template-card",
+            "entity": _entity(vmid, cfg, "health_status"),
+            "primary": "Tryb obserwacji — sterowanie zablokowane przez politykę backendu",
+            "secondary": "Telemetria i diagnostyka pozostają dostępne.",
+            "multiline_secondary": True,
+            "icon": "mdi:eye-lock-outline",
+            "color": "blue-grey",
+            "tap_action": {"action": "more-info"},
+        },
+    )
+
+
+def _control_card(vmid: int, action: str) -> dict[str, Any]:
     names = {
         "start": "Uruchom",
         "shutdown": "Wyłącz łagodnie",
@@ -101,7 +219,6 @@ def _control_card(vmid: int, cfg: dict[str, Any], action: str) -> dict[str, Any]
         "retry_healthcheck": "script.hubinet_ops_retry_healthcheck",
         "rollback": "script.hubinet_ops_rollback",
     }
-    service = service_names.get(action, f"script.hubinet_ops_{action}_container")
     name = names[action]
     return {
         "type": "custom:mushroom-template-card",
@@ -110,19 +227,26 @@ def _control_card(vmid: int, cfg: dict[str, Any], action: str) -> dict[str, Any]
             "start": "mdi:play",
             "shutdown": "mdi:power",
             "reboot": "mdi:restart",
-        }.get(action, "mdi:shield-check-outline"),
+            "refresh": "mdi:refresh",
+            "scan": "mdi:magnify-scan",
+            "approve": "mdi:check-decagram",
+            "reject": "mdi:close-octagon-outline",
+            "retry_healthcheck": "mdi:heart-pulse",
+        }.get(action, "mdi:backup-restore"),
         "tap_action": {
             "action": "perform-action",
-            "perform_action": service,
+            "perform_action": service_names.get(
+                action, f"script.hubinet_ops_{action}_container"
+            ),
             "data": {"vmid": vmid},
-            "confirmation": {
-                "text": f"Potwierdź akcję „{name}” dla CT{vmid}."
-            },
+            "confirmation": {"text": f"Potwierdź akcję „{name}” dla CT{vmid}."},
         },
     }
 
 
-def _control_conditions(vmid: int, cfg: dict[str, Any], action: str) -> list[dict[str, Any]]:
+def _control_conditions(
+    vmid: int, cfg: dict[str, Any], action: str
+) -> list[dict[str, Any]]:
     runtime = _entity(vmid, cfg, "runtime_status")
     operation = _entity(vmid, cfg, "operation_status")
     conditions = [{"entity": operation, "state_not": "running"}]
@@ -142,211 +266,295 @@ def _control_conditions(vmid: int, cfg: dict[str, Any], action: str) -> list[dic
     return conditions
 
 
-def _resource_view(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
-    prefix = _prefix(vmid, cfg)
-    common = [
-        _entity(vmid, cfg, "health_status"),
-        _entity(vmid, cfg, "health_score"),
-        _entity(vmid, cfg, "runtime_status"),
-        _entity(vmid, cfg, "uptime_seconds"),
-        _entity(vmid, cfg, "last_refresh"),
-        _entity(vmid, cfg, "last_error"),
+def _controls_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    actions = [name for name, enabled in cfg["operator_capabilities"].items() if enabled]
+    controls = [
+        {
+            "type": "conditional",
+            "conditions": _control_conditions(vmid, cfg, action),
+            "card": _control_card(vmid, action),
+        }
+        for action in actions
     ]
-    if cfg["resource_type"] == "lxc":
-        common.append(_entity(vmid, cfg, "lxc_status"))
-    if cfg["adapter"] != "apt":
-        common.extend(
-            [
-                _entity(vmid, cfg, "cpu_usage"),
-                _entity(vmid, cfg, "cpu_load_1m"),
-                _entity(vmid, cfg, "cpu_cores"),
-                _entity(vmid, cfg, "memory_used_bytes"),
-                _entity(vmid, cfg, "memory_total_bytes"),
-                _entity(vmid, cfg, "disk_used_bytes"),
-                _entity(vmid, cfg, "disk_total_bytes"),
-                _entity(vmid, cfg, "network_in_bytes"),
-                _entity(vmid, cfg, "network_out_bytes"),
-            ]
-        )
-    cards: list[dict[str, Any]] = [
-        _title_card(_label(vmid, cfg), f"Adapter: {cfg['adapter']} · {cfg['criticality']}"),
-        _entities_card("Stan zasobu", common),
+    return _section(
+        _title("Sterowanie", "Każda akcja wymaga potwierdzenia"),
+        _entity_grid(controls, columns=2),
+    )
+
+
+def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    health = _entity(vmid, cfg, "health_status")
+    resources = _entity_grid(
+        [
+            _entity_card(_entity(vmid, cfg, "disk_used_percent"), "Dysk zajęty", "mdi:harddisk"),
+            _entity_card(_entity(vmid, cfg, "disk_free_mb"), "Wolne miejsce", "mdi:database-arrow-down-outline", "cyan"),
+            _entity_card(_entity(vmid, cfg, "memory_used_percent"), "Pamięć RAM", "mdi:memory", "purple"),
+            _entity_card(_entity(vmid, cfg, "lxc_status"), "Status LXC", "mdi:server", "green"),
+            _entity_card(_entity(vmid, cfg, "uptime_seconds"), "Uptime", "mdi:timer-outline", "green"),
+        ]
+    )
+    operation = {
+        "type": "custom:mushroom-template-card",
+        "entity": _entity(vmid, cfg, "operation_status"),
+        "primary": "{{ states(entity) | replace('_', ' ') | title }}",
+        "secondary": (
+            f"Etap: {{{{ states('{_entity(vmid, cfg, 'job_stage')}') }}}} · "
+            f"postęp: {{{{ states('{_entity(vmid, cfg, 'job_progress')}') }}}}%"
+        ),
+        "multiline_secondary": True,
+        "icon": "mdi:progress-wrench",
+        "color": "{{ 'blue' if is_state(entity, 'running') else 'amber' if is_state(entity, 'waiting_approval') else 'green' }}",
+        "tap_action": {"action": "more-info"},
+    }
+    verification = _entity_grid(
+        [
+            _entity_card(_entity(vmid, cfg, "verification_status"), "Weryfikacja", "mdi:check-decagram"),
+            _entity_card(_entity(vmid, cfg, "apt_check_ok"), "APT check", "mdi:package-check", "green"),
+            _entity_card(_entity(vmid, cfg, "dpkg_audit_ok"), "dpkg audit", "mdi:shield-check-outline", "green"),
+            _entity_card(_entity(vmid, cfg, "reboot_required"), "Restart wymagany", "mdi:restart-alert", "amber"),
+            _entity_card(_entity(vmid, cfg, "packages_remaining_count"), "Pakiety pozostałe", "mdi:package-variant"),
+            _entity_card(_entity(vmid, cfg, "last_operation_result"), "Ostatni wynik", "mdi:history"),
+        ]
+    )
+    diagnostics = _entity_grid(
+        [
+            _entity_card(_entity(vmid, cfg, "last_refresh"), "Ostatnie odświeżenie", "mdi:refresh"),
+            _entity_card(_entity(vmid, cfg, "last_scan"), "Ostatni skan", "mdi:magnify-scan"),
+            _entity_card(_entity(vmid, cfg, "last_update"), "Ostatnia aktualizacja", "mdi:update", "green"),
+            _entity_card(_entity(vmid, cfg, "active_plan_id"), "Aktywny plan", "mdi:clipboard-text-clock-outline", "amber"),
+            _entity_card(_entity(vmid, cfg, "active_job_id"), "Aktywny job", "mdi:identifier"),
+            _entity_card(_entity(vmid, cfg, "rollback_allowed"), "Rollback", "mdi:backup-restore", "amber"),
+            _entity_card(_entity(vmid, cfg, "last_error"), "Ostatni błąd", "mdi:alert-circle-outline", "red"),
+        ]
+    )
+    package_card = {
+        "type": "markdown",
+        "title": "Pakiety APT",
+        "content": (
+            f"{{% set updates = state_attr('{health}', 'updates') or {{}} %}}\n"
+            "{% set packages = updates.get('packages', []) %}\n"
+            f"{{% set meta = state_attr('{health}', 'attribute_payload') or {{}} %}}\n"
+            "{% set total = meta.get('packages_total', packages | count) %}\n"
+            "{% set visible = packages | count %}\n"
+            "**Łącznie: {{ total }} · widoczne: {{ visible }}**\n\n"
+            "{% for package in packages[:30] %}- `{{ package.get('name', '?') }}`\n{% endfor %}"
+            "{% if visible > 30 %}\n_… {{ visible - 30 }} kolejnych widocznych pakietów._\n{% endif %}"
+            "{% if meta.get('truncated') %}\n_Podgląd ogranicza limit atrybutów 10 KB._\n{% endif %}"
+        ),
+    }
+    logs_card = {
+        "type": "markdown",
+        "title": "Logi live",
+        "content": (
+            f"{{% set events = state_attr('{health}', 'recent_job_events') or [] %}}\n"
+            "{% for event in events[-25:] | reverse %}"
+            "- `{{ event.get('created_at', '') }}` **{{ event.get('stage', '') }}** "
+            "{{ event.get('message', '') | replace('|', '¦') }}\n"
+            "{% endfor %}"
+        ),
+    }
+    sections = [
+        _section(
+            _title(_label(vmid, cfg), f"Adapter APT · {cfg['criticality']}"),
+            _resource_status(vmid, cfg),
+            _resource_chips(vmid, cfg),
+        ),
+        _section(_title("Zasoby", "Ostatni pomiar z kontenera"), resources),
+        _section(_title("Aktualizacje", "Stan operacji i planu"), operation),
+        _section(_title("Weryfikacja końcowa", "APT, dpkg i wynik operacji"), verification),
+        _section(
+            _title("Recovery scan", "Stan bezpiecznego skanu odzyskiwania"),
+            _entity_grid(
+                [
+                    _entity_card(_entity(vmid, cfg, "recovery_scan_status"), "Status", "mdi:shield-sync-outline"),
+                    _entity_card(_entity(vmid, cfg, "last_recovery_scan"), "Ostatni skan", "mdi:history"),
+                    _entity_card(_entity(vmid, cfg, "last_recovery_scan_result"), "Ostatni wynik", "mdi:shield-check-outline"),
+                ]
+            ),
+        ),
+        _section(_title("Historia i diagnostyka", "Ostatnie operacje oraz błędy"), diagnostics),
+        _section(_title("Pakiety i diagnostyka", "Ograniczony podgląd MQTT"), package_card, logs_card),
     ]
-    if cfg["adapter"] == "apt":
-        common.extend(
-            [
-                _entity(vmid, cfg, "operation_status"),
-                _entity(vmid, cfg, "job_stage"),
-                _entity(vmid, cfg, "job_progress"),
-                _entity(vmid, cfg, "risk"),
-                _entity(vmid, cfg, "disk_used_percent"),
-                _entity(vmid, cfg, "disk_free_mb"),
-                _entity(vmid, cfg, "memory_used_percent"),
-                _entity(vmid, cfg, "active_plan_id"),
-                _entity(vmid, cfg, "active_job_id"),
-                _entity(vmid, cfg, "last_scan"),
-                _entity(vmid, cfg, "last_update"),
-                _entity(vmid, cfg, "last_operation_result"),
-                _entity(vmid, cfg, "rollback_allowed"),
-            ]
-        )
-        cards[1] = _entities_card("Stan zasobu", common)
-        cards.append(
-            _entities_card(
-                "Weryfikacja końcowa",
-                [
-                    _entity(vmid, cfg, "update_status"),
-                    _entity(vmid, cfg, "pending_updates"),
-                    _entity(vmid, cfg, "verification_status"),
-                    _entity(vmid, cfg, "apt_check_ok"),
-                    _entity(vmid, cfg, "dpkg_audit_ok"),
-                    _entity(vmid, cfg, "reboot_required"),
-                    _entity(vmid, cfg, "packages_remaining_count"),
-                ],
-            )
-        )
-        cards.append(
-            _entities_card(
-                "Recovery scan",
-                [
-                    _entity(vmid, cfg, "recovery_scan_status"),
-                    _entity(vmid, cfg, "last_recovery_scan"),
-                    _entity(vmid, cfg, "last_recovery_scan_result"),
-                ],
-            )
-        )
-        health_entity = _entity(vmid, cfg, "health_status")
-        cards.append(
-            {
-                "type": "markdown",
-                "title": "Pakiety APT",
-                "content": (
-                    f"{{% set updates = state_attr('{health_entity}', 'updates') or {{}} %}}\n"
-                    "{% set packages = updates.get('packages', []) %}\n"
-                    f"{{% set meta = state_attr('{health_entity}', 'attribute_payload') or {{}} %}}\n"
-                    "{% set total = meta.get('packages_total', packages | count) %}\n"
-                    "{% set visible = packages | count %}\n"
-                    "**Łącznie: {{ total }} · widoczne: {{ visible }}**\n\n"
-                    "{% for package in packages[:30] %}- `{{ package.get('name', '?') }}`\n{% endfor %}"
-                    "{% if visible > 30 %}\n… {{ visible - 30 }} kolejnych widocznych pakietów.\n{% endif %}"
-                    "{% if meta.get('truncated') %}\nPodgląd ogranicza limit atrybutów 10 KB.\n{% endif %}"
-                ),
-            }
-        )
-        cards.append(
-            {
-                "type": "markdown",
-                "title": "Logi live",
-                "content": (
-                    f"{{% set events = state_attr('{health_entity}', 'recent_job_events') or [] %}}\n"
-                    "{% for event in events[-25:] | reverse %}"
-                    "- `{{ event.get('created_at', '') }}` **{{ event.get('stage', '') }}** "
-                    "{{ event.get('message', '') | replace('|', '¦') }}\n"
-                    "{% endfor %}"
-                ),
-            }
-        )
     docker = cfg.get("docker") or {}
     if docker.get("enabled"):
-        cards.append(
-            {
-                "type": "markdown",
-                "title": "Docker",
-                "content": (
-                    f"**Required healthy:** {{{{ states('{_entity(vmid, cfg, 'docker_required_healthy')}') }}}}/"
-                    f"{{{{ states('{_entity(vmid, cfg, 'docker_required_total')}') }}}}\n\n"
-                    f"Wykryte kontenery: `{{{{ state_attr('{_entity(vmid, cfg, 'health_status')}', 'docker') }}}}`"
+        sections.append(
+            _section(
+                _title("Docker", "Tylko skonfigurowane kontenery"),
+                _entity_grid(
+                    [
+                        _entity_card(_entity(vmid, cfg, "docker_required_healthy"), "Wymagane healthy", "mdi:docker", "green"),
+                        _entity_card(_entity(vmid, cfg, "docker_required_total"), "Wymagane łącznie", "mdi:format-list-checks"),
+                    ]
                 ),
-            }
-        )
-    if cfg["resource_type"] == "qemu":
-        cards.append(
-            _entities_card(
-                "QEMU Guest Agent",
-                [
-                    _entity(vmid, cfg, "qemu_status"),
-                    _entity(vmid, cfg, "guest_agent_status"),
-                    _entity(vmid, cfg, "ip_addresses"),
-                ],
             )
         )
-    if cfg["adapter"] == "agent_self":
-        cards.append(
-            _entities_card(
-                "Self-health agenta",
+    sections.append(
+        _controls_section(vmid, cfg)
+        if any(cfg["operator_capabilities"].values())
+        else _observation_section(vmid, cfg)
+    )
+    return sections
+
+
+def _qemu_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _section(
+            _title(_label(vmid, cfg), "HAOS · obserwacja QEMU"),
+            _resource_status(vmid, cfg),
+            _resource_chips(vmid, cfg),
+        ),
+        _section(
+            _title("CPU i pamięć", "Metryki dostarczane przez Proxmox"),
+            _entity_grid(
                 [
-                    _entity(vmid, cfg, "service_status"),
-                    _entity(vmid, cfg, "api_health"),
-                    _entity(vmid, cfg, "agent_version"),
-                    "sensor.hubinet_ops_agent_active_job_count",
-                    "sensor.hubinet_ops_agent_configured_resource_count",
-                ],
-            )
-        )
-        cards.append(
+                    _entity_card(_entity(vmid, cfg, "cpu_usage"), "CPU", "mdi:cpu-64-bit"),
+                    _entity_card(_entity(vmid, cfg, "cpu_cores"), "Rdzenie CPU", "mdi:chip"),
+                    _entity_card(_entity(vmid, cfg, "memory_used_bytes"), "RAM użyta", "mdi:memory", "purple"),
+                    _entity_card(_entity(vmid, cfg, "memory_total_bytes"), "RAM łącznie", "mdi:memory", "purple"),
+                ]
+            ),
+        ),
+        _section(
+            _title("Dysk i sieć", "Liczniki QEMU"),
+            _entity_grid(
+                [
+                    _entity_card(_entity(vmid, cfg, "disk_used_bytes"), "Dysk użyty", "mdi:harddisk"),
+                    _entity_card(_entity(vmid, cfg, "disk_total_bytes"), "Dysk łącznie", "mdi:harddisk"),
+                    _entity_card(_entity(vmid, cfg, "network_in_bytes"), "Sieć odebrana", "mdi:download-network", "cyan"),
+                    _entity_card(_entity(vmid, cfg, "network_out_bytes"), "Sieć wysłana", "mdi:upload-network", "cyan"),
+                ]
+            ),
+        ),
+        _section(
+            _title("QEMU Guest Agent", "Adres główny nie przekracza limitu stanu HA"),
+            _entity_grid(
+                [
+                    _entity_card(_entity(vmid, cfg, "qemu_status"), "Status QEMU", "mdi:monitor"),
+                    _entity_card(_entity(vmid, cfg, "guest_agent_status"), "Guest Agent", "mdi:lan-connect", "green"),
+                    _entity_card(_entity(vmid, cfg, "ip_addresses"), "Primary IP", "mdi:ip-network", "cyan"),
+                    _entity_card(_entity(vmid, cfg, "uptime_seconds"), "Uptime", "mdi:timer-outline", "green"),
+                ]
+            ),
+        ),
+        _observation_section(vmid, cfg),
+    ]
+
+
+def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    health = _entity(vmid, cfg, "health_status")
+    return [
+        _section(
+            _title(_label(vmid, cfg), "Self-health agenta"),
+            _resource_status(vmid, cfg),
+            _resource_chips(vmid, cfg),
+        ),
+        _section(
+            _title("Usługa i API", "Lokalna kontrola CT110"),
+            _entity_grid(
+                [
+                    _entity_card(_entity(vmid, cfg, "service_status"), "Usługa", "mdi:application-cog", "green"),
+                    _entity_card(_entity(vmid, cfg, "api_health"), "API health", "mdi:api", "green"),
+                    _entity_card(_entity(vmid, cfg, "agent_version"), "Wersja", "mdi:tag-outline"),
+                    _entity_card(_entity(vmid, cfg, "uptime_seconds"), "Uptime", "mdi:timer-outline"),
+                ]
+            ),
+        ),
+        _section(
+            _title("CPU i pamięć", "Bez nieobsługiwanych liczników sieci"),
+            _entity_grid(
+                [
+                    _entity_card(_entity(vmid, cfg, "cpu_load_1m"), "Load 1m", "mdi:gauge"),
+                    _entity_card(_entity(vmid, cfg, "cpu_cores"), "Rdzenie CPU", "mdi:chip"),
+                    _entity_card(_entity(vmid, cfg, "memory_used_bytes"), "RAM użyta", "mdi:memory", "purple"),
+                    _entity_card(_entity(vmid, cfg, "memory_total_bytes"), "RAM łącznie", "mdi:memory", "purple"),
+                    _entity_card(_entity(vmid, cfg, "memory_available_bytes"), "RAM dostępna", "mdi:memory-arrow-down", "cyan"),
+                ]
+            ),
+        ),
+        _section(
+            _title("Dysk", "Lokalny system plików agenta"),
+            _entity_grid(
+                [
+                    _entity_card(_entity(vmid, cfg, "disk_used_bytes"), "Dysk użyty", "mdi:harddisk"),
+                    _entity_card(_entity(vmid, cfg, "disk_total_bytes"), "Dysk łącznie", "mdi:harddisk"),
+                    _entity_card(_entity(vmid, cfg, "disk_free_bytes"), "Dysk wolny", "mdi:database-arrow-down-outline", "cyan"),
+                ]
+            ),
+        ),
+        _section(
+            _title("Ostatnie ostrzeżenia", "Maksymalnie 20 bezpiecznie zredagowanych wpisów"),
+            _entity_card(_entity(vmid, cfg, "recent_warnings"), "Liczba ostrzeżeń", "mdi:alert-outline", "amber"),
             {
                 "type": "markdown",
-                "title": "Ostatnie warning/error",
+                "title": "Podgląd techniczny",
                 "content": (
-                    f"{{% set warnings = state_attr('{_entity(vmid, cfg, 'health_status')}', 'recent_warnings') or [] %}}\n"
+                    f"{{% set warnings = state_attr('{health}', 'recent_warnings') or [] %}}\n"
                     "{% for warning in warnings[-20:] | reverse %}- {{ warning | replace('|', '¦') }}\n{% endfor %}"
+                    "{% if not warnings %}Brak ostatnich ostrzeżeń.{% endif %}"
                 ),
-            }
-        )
+            },
+        ),
+        _observation_section(vmid, cfg),
+    ]
 
-    capabilities = cfg["operator_capabilities"]
-    enabled_actions = [name for name, enabled in capabilities.items() if enabled]
-    if not enabled_actions:
-        cards.append(
-            {
-                "type": "markdown",
-                "title": "Tryb obserwacji",
-                "content": "Tryb obserwacji — sterowanie zablokowane przez politykę backendu.",
-            }
-        )
+
+def _resource_view(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    if cfg["adapter"] == "apt":
+        sections = _apt_sections(vmid, cfg)
+    elif cfg["resource_type"] == "qemu":
+        sections = _qemu_sections(vmid, cfg)
     else:
-        for action in enabled_actions:
-            cards.append(
-                {
-                    "type": "conditional",
-                    "conditions": _control_conditions(vmid, cfg, action),
-                    "card": _control_card(vmid, cfg, action),
-                }
-            )
-
+        sections = _agent_self_sections(vmid, cfg)
     return {
         "title": f"{'VM' if cfg['resource_type'] == 'qemu' else 'CT'}{vmid}",
         "path": str(cfg["dashboard_path"]).rsplit("/", 1)[-1],
         "icon": ICONS.get(vmid, "mdi:server"),
         "type": "sections",
         "max_columns": 4,
-        "sections": [{"type": "grid", "cards": cards}],
+        "sections": sections,
     }
 
 
 def build_dashboard(resources: dict[int, dict[str, Any]]) -> dict[str, Any]:
-    overview_cards = [
-        _title_card("Hubinet Ops", "Pełne inventory Proxmox · backend jest źródłem prawdy"),
-        _entities_card(
-            "Agent",
-            [
-                "sensor.hubinet_ops_agent_availability",
-                "sensor.hubinet_ops_agent_version",
-                "sensor.hubinet_ops_agent_configured_resource_count",
-                "sensor.hubinet_ops_agent_configured_lxc_count",
-                "sensor.hubinet_ops_agent_configured_qemu_count",
-                "sensor.hubinet_ops_agent_active_job_count",
-            ],
-        ),
-        *[_overview_card(vmid, cfg) for vmid, cfg in sorted(resources.items())],
+    agent_chips = _chips(
+        [
+            _chip(agent_entity_id("availability"), "mdi:mqtt"),
+            _chip(agent_entity_id("version"), "mdi:tag-outline"),
+            _chip(
+                agent_entity_id("configured_resource_count"),
+                "mdi:server-network",
+                "{{ states(entity) }} zasobów",
+            ),
+            _chip(
+                agent_entity_id("active_job_count"),
+                "mdi:progress-wrench",
+                "{{ states(entity) }} zadań",
+            ),
+            _chip(agent_entity_id("last_refresh"), "mdi:clock-outline"),
+        ]
+    )
+    items = sorted(resources.items())
+    overview_sections = [
+        _section(
+            _title("Hubinet Ops", "Pełne inventory Proxmox · backend jest źródłem prawdy"),
+            agent_chips,
+        )
     ]
+    for index in range(0, len(items), 4):
+        chunk = items[index : index + 4]
+        overview_sections.append(
+            _section(
+                _title("Zasoby", f"{_label(chunk[0][0], chunk[0][1]).split(' · ')[0]}–{_label(chunk[-1][0], chunk[-1][1]).split(' · ')[0]}"),
+                *[_overview_card(vmid, cfg) for vmid, cfg in chunk],
+            )
+        )
     overview = {
         "title": "Centrum",
         "path": "overview",
         "icon": "mdi:server-network",
         "type": "sections",
         "max_columns": 4,
-        "sections": [{"type": "grid", "cards": overview_cards}],
+        "sections": overview_sections,
     }
     return {
         "title": "Hubinet Ops",
