@@ -6,6 +6,8 @@ MANAGED_ALLOWLIST="/etc/hubinet-ops/managed-vmids"
 MAINTENANCE_ALLOWLIST="/etc/hubinet-ops/maintenance-vmids"
 LIFECYCLE_ALLOWLIST="/etc/hubinet-ops/lifecycle-vmids"
 RESOURCE_TYPES="/etc/hubinet-ops/resource-types"
+PVE_LOCAL_PATH="/etc/pve/local"
+PVE_NODES_PATH="/etc/pve/nodes"
 ORIGINAL="${SSH_ORIGINAL_COMMAND:-}"
 
 json_error() {
@@ -95,6 +97,18 @@ status_qemu() {
   printf '%s' "$state"
 }
 
+resolve_local_pve_node() {
+  local resolved nodes_root node
+  [[ -e "$PVE_LOCAL_PATH" ]] || return 1
+  resolved="$(readlink -f -- "$PVE_LOCAL_PATH" 2>/dev/null)" || return 1
+  nodes_root="$(readlink -f -- "$PVE_NODES_PATH" 2>/dev/null)" || return 1
+  [[ -d "$resolved" && -d "$nodes_root" ]] || return 1
+  node="$(basename -- "$resolved")" || return 1
+  [[ "$node" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+  [[ "$resolved" == "$nodes_root/$node" ]] || return 1
+  printf '%s' "$node"
+}
+
 case "$action" in
   status)
     if [[ "$resource_type" == "lxc" ]]; then
@@ -118,8 +132,11 @@ case "$action" in
     fi
 
     state="$(status_qemu)"
+    if ! pve_node="$(resolve_local_pve_node)"; then
+      fail "Local PVE node could not be resolved from /etc/pve/local"
+    fi
     if ! current="$(timeout --signal=TERM --kill-after=5s 30s \
-      pvesh get "/nodes/$(hostname)/qemu/$vmid/status/current" --output-format json 2>&1)"; then
+      pvesh get "/nodes/$pve_node/qemu/$vmid/status/current" --output-format json 2>&1)"; then
       fail "QEMU current status failed or timed out: $current"
     fi
     guest_status="unknown"

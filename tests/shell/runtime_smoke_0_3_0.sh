@@ -5,6 +5,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 mkdir -p "$TMP_ROOT/bin"
+PVE_ROOT="$TMP_ROOT/etc-pve"
+mkdir -p "$PVE_ROOT/nodes/proxmox" "$PVE_ROOT/local"
+export PVE_LOCAL_FIXTURE="$PVE_ROOT/local"
+export PVE_LOCAL_TARGET="$PVE_ROOT/nodes/proxmox"
 cp "$ROOT/deploy/pve/observation-vmids" "$TMP_ROOT/observation-vmids"
 cp "$ROOT/deploy/pve/managed-vmids" "$TMP_ROOT/managed-vmids"
 cp "$ROOT/deploy/pve/maintenance-vmids" "$TMP_ROOT/maintenance-vmids"
@@ -17,6 +21,8 @@ sed \
   -e "s|^MAINTENANCE_ALLOWLIST=.*|MAINTENANCE_ALLOWLIST=\"$TMP_ROOT/maintenance-vmids\"|" \
   -e "s|^LIFECYCLE_ALLOWLIST=.*|LIFECYCLE_ALLOWLIST=\"$TMP_ROOT/lifecycle-vmids\"|" \
   -e "s|^RESOURCE_TYPES=.*|RESOURCE_TYPES=\"$TMP_ROOT/resource-types\"|" \
+  -e "s|^PVE_LOCAL_PATH=.*|PVE_LOCAL_PATH=\"$PVE_ROOT/local\"|" \
+  -e "s|^PVE_NODES_PATH=.*|PVE_NODES_PATH=\"$PVE_ROOT/nodes\"|" \
   "$ROOT/deploy/pve/hubinet-ops-host" > "$TMP_ROOT/hubinet-ops-host"
 chmod +x "$TMP_ROOT/hubinet-ops-host"
 
@@ -59,7 +65,15 @@ printf '{"name":"haos16.0","uptime":10,"cpu":0.1,"cpus":2,"mem":1024,"maxmem":20
 SH
 cat > "$TMP_ROOT/bin/hostname" <<'SH'
 #!/usr/bin/env bash
-printf 'pve\n'
+printf 'proxmox.local\n'
+SH
+cat > "$TMP_ROOT/bin/readlink" <<'SH'
+#!/usr/bin/env bash
+if [[ "${@: -1}" == "$PVE_LOCAL_FIXTURE" ]]; then
+  printf '%s\n' "$PVE_LOCAL_TARGET"
+  exit 0
+fi
+exec /usr/bin/readlink "$@"
 SH
 chmod +x "$TMP_ROOT/bin/"*
 export PATH="$TMP_ROOT/bin:$PATH"
@@ -73,6 +87,28 @@ done
 qemu="$(SSH_ORIGINAL_COMMAND='inspect 100' "$TMP_ROOT/hubinet-ops-host")"
 [[ "$qemu" == *'"qemu_status":"running"'* ]]
 [[ "$qemu" == *'"guest_agent_status":"available"'* ]]
+grep -Fxq 'get /nodes/proxmox/qemu/100/status/current --output-format json' "$SMOKE_LOG"
+if grep -Fq '/nodes/proxmox.local/' "$SMOKE_LOG"; then
+  echo 'QEMU inspect used the system hostname instead of the local PVE node' >&2
+  exit 1
+fi
+
+rm -rf "$PVE_ROOT/local"
+if node_error="$(SSH_ORIGINAL_COMMAND='inspect 100' "$TMP_ROOT/hubinet-ops-host")"; then
+  echo 'QEMU inspect unexpectedly succeeded without /etc/pve/local' >&2
+  exit 1
+fi
+[[ "$node_error" == *'"ok": false'* ]]
+[[ "$node_error" == *'Local PVE node could not be resolved'* ]]
+mkdir -p "$PVE_ROOT/not-a-node"
+mkdir -p "$PVE_ROOT/local"
+export PVE_LOCAL_TARGET="$PVE_ROOT/not-a-node"
+if node_error="$(SSH_ORIGINAL_COMMAND='inspect 100' "$TMP_ROOT/hubinet-ops-host")"; then
+  echo 'QEMU inspect unexpectedly succeeded with invalid /etc/pve/local target' >&2
+  exit 1
+fi
+[[ "$node_error" == *'"ok": false'* ]]
+[[ "$node_error" == *'Local PVE node could not be resolved'* ]]
 
 if SSH_ORIGINAL_COMMAND='start 100' "$TMP_ROOT/hubinet-ops-host" >/dev/null 2>&1; then
   echo "VM100 lifecycle unexpectedly allowed" >&2
