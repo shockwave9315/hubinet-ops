@@ -307,6 +307,27 @@ record_rollback_error() {
   rollback_errors+=("$1")
 }
 
+stop_agent_for_rollback() {
+  local stop_failed=false probe
+  if ! pct exec "$AGENT_VMID" -- systemctl stop hubinet-ops; then
+    echo "Failed to stop CT$AGENT_VMID hubinet-ops before infrastructure rollback" >&2
+    stop_failed=true
+  fi
+  if ! probe="$(pct exec "$AGENT_VMID" -- sh -c \
+    'state=$(systemctl is-active hubinet-ops 2>/dev/null); rc=$?; printf "%s:%s\n" "$state" "$rc"; exit 0')"; then
+    echo "Could not verify CT$AGENT_VMID hubinet-ops state before infrastructure rollback" >&2
+    return 1
+  fi
+  case "$probe" in
+    inactive:3|failed:3) ;;
+    *)
+      echo "CT$AGENT_VMID hubinet-ops was not confirmed inactive before infrastructure rollback" >&2
+      return 1
+      ;;
+  esac
+  [[ "$stop_failed" == false ]]
+}
+
 restore_all() {
   local rc="${1:-$?}" vmid target name mode
   trap - ERR INT TERM EXIT
@@ -316,6 +337,9 @@ restore_all() {
     return 0
   fi
   echo "0.3.0 upgrade failed; restoring every modified layer" >&2
+  if ! stop_agent_for_rollback; then
+    record_rollback_error "CT$AGENT_VMID pre-rollback stop verification"
+  fi
   if ! cleanup_mounts; then
     for vmid in "${!mounted_cts[@]}"; do
       record_rollback_error "CT$vmid unmount (run: pct unmount $vmid)"

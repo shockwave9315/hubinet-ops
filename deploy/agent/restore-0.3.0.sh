@@ -20,6 +20,7 @@ service_action() {
 
 restore_started=false
 agent_stopped=false
+stop_attempted=false
 
 restore_failed() {
   local rc="${1:-1}"
@@ -27,7 +28,7 @@ restore_failed() {
   if [[ "$restore_started" == true ]]; then
     rm -f "$(root_path /var/lib/hubinet-ops/.ops.db.restore)"
   fi
-  if [[ "$agent_stopped" == true ]]; then
+  if [[ "$stop_attempted" == true ]]; then
     service_action start || echo "Failed to restart the existing hubinet-ops service after aborted restore" >&2
   fi
   exit "$rc"
@@ -58,6 +59,7 @@ done
 }
 
 stop_rc=0
+stop_attempted=true
 service_action stop || stop_rc=$?
 service_state_rc=0
 service_state="$(systemctl is-active hubinet-ops 2>/dev/null)" || service_state_rc=$?
@@ -105,4 +107,36 @@ chown -R hubinetops:hubinetops \
   "$(root_path /opt/hubinet-ops/requirements.txt)"
 systemctl daemon-reload
 service_action start
+
+health_attempts=10
+health_delay=1
+if [[ ${HUBINET_OPS_TEST_MODE:-0} == 1 ]]; then
+  health_attempts="${HUBINET_OPS_TEST_RESTORE_HEALTH_ATTEMPTS:-2}"
+  health_delay="${HUBINET_OPS_TEST_RESTORE_HEALTH_DELAY:-0}"
+  [[ "$health_attempts" =~ ^[1-9][0-9]*$ && "$health_delay" =~ ^[0-9]+$ ]] || {
+    echo "Invalid restore health retry test override" >&2
+    restore_failed 1
+  }
+fi
+
+restored_agent_healthy=false
+for attempt in $(seq 1 "$health_attempts"); do
+  active_rc=0
+  active_state="$(systemctl is-active hubinet-ops 2>/dev/null)" || active_rc=$?
+  if [[ "$active_rc" -eq 0 && "$active_state" == active ]]; then
+    health_rc=0
+    health="$(curl -fsS --max-time 2 http://127.0.0.1:8787/health 2>/dev/null)" || health_rc=$?
+    if [[ "$health_rc" -eq 0 && -n "$health" ]]; then
+      restored_agent_healthy=true
+      break
+    fi
+  fi
+  if [[ "$attempt" -lt "$health_attempts" ]]; then
+    sleep "$health_delay"
+  fi
+done
+if [[ "$restored_agent_healthy" != true ]]; then
+  echo "Restored hubinet-ops service failed bounded active/health verification" >&2
+  restore_failed 1
+fi
 trap - ERR INT TERM

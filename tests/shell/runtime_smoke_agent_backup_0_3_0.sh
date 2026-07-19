@@ -6,6 +6,7 @@ TMP_ROOT="$(mktemp -d)"
 FAKE_BIN="$TMP_ROOT/bin"
 AGENT_ROOT="$TMP_ROOT/agent"
 LOG="$TMP_ROOT/systemctl.log"
+STATE="$TMP_ROOT/service.state"
 REAL_PYTHON="$(command -v python3 || command -v python)"
 mkdir -p "$FAKE_BIN"
 trap '/usr/bin/rm -rf "$TMP_ROOT"' EXIT
@@ -13,6 +14,9 @@ export HUBINET_OPS_TEST_MODE=1
 export HUBINET_OPS_TEST_AGENT_ROOT="$AGENT_ROOT"
 export HUBINET_OPS_AGENT_TEST_LOG="$LOG"
 export HUBINET_OPS_AGENT_TEST_PYTHON="$REAL_PYTHON"
+export HUBINET_OPS_AGENT_TEST_STATE="$STATE"
+export HUBINET_OPS_TEST_RESTORE_HEALTH_ATTEMPTS=2
+export HUBINET_OPS_TEST_RESTORE_HEALTH_DELAY=0
 export PATH="$FAKE_BIN:$PATH"
 
 cat > "$FAKE_BIN/python3" <<'SH'
@@ -38,18 +42,42 @@ case "${1:-}" in
     if [[ ${HUBINET_OPS_AGENT_TEST_STOP_FAIL:-no} == yes ]]; then
       exit 1
     fi
+    if [[ ${HUBINET_OPS_AGENT_TEST_STOP_STAYS_ACTIVE:-no} == yes ]]; then
+      printf 'active\n' > "$HUBINET_OPS_AGENT_TEST_STATE"
+    else
+      printf 'inactive\n' > "$HUBINET_OPS_AGENT_TEST_STATE"
+    fi
+    ;;
+  start)
+    if [[ ${HUBINET_OPS_AGENT_TEST_START_STAYS_INACTIVE:-no} == yes ]]; then
+      printf 'inactive\n' > "$HUBINET_OPS_AGENT_TEST_STATE"
+    else
+      printf 'active\n' > "$HUBINET_OPS_AGENT_TEST_STATE"
+    fi
     ;;
   is-active)
-    if [[ ${HUBINET_OPS_AGENT_TEST_STAYS_ACTIVE:-no} == yes ]]; then
-      printf 'active\n'
-      exit 0
+    if [[ ${HUBINET_OPS_AGENT_TEST_STATE_UNCERTAIN:-no} == yes ]]; then
+      printf 'unknown\n'
+      exit 4
     fi
-    printf 'inactive\n'
-    exit 3
+    state="$(cat "$HUBINET_OPS_AGENT_TEST_STATE")"
+    printf '%s\n' "$state"
+    [[ "$state" == active ]] || exit 3
     ;;
 esac
 SH
 chmod +x "$FAKE_BIN/systemctl"
+cat > "$FAKE_BIN/curl" <<'SH'
+#!/usr/bin/env bash
+printf '<curl>' >> "$HUBINET_OPS_AGENT_TEST_LOG"
+printf '<%s>' "$@" >> "$HUBINET_OPS_AGENT_TEST_LOG"
+printf '\n' >> "$HUBINET_OPS_AGENT_TEST_LOG"
+if [[ ${HUBINET_OPS_AGENT_TEST_HEALTH_FAIL:-no} == yes ]]; then
+  exit 22
+fi
+printf '{"status":"ok"}\n'
+SH
+chmod +x "$FAKE_BIN/curl"
 cat > "$FAKE_BIN/chown" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -83,6 +111,7 @@ prepare_agent() {
   printf 'env\n' > "$AGENT_ROOT/etc/hubinet-ops/agent.env"
   "$REAL_PYTHON" -c 'import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute("create table safety(value)"); db.commit(); db.close()' \
     "$AGENT_ROOT/var/lib/hubinet-ops/ops.db"
+  printf 'active\n' > "$STATE"
   : > "$LOG"
 }
 
@@ -106,6 +135,7 @@ cmp "$backup_with/ops.db" "$AGENT_ROOT/var/lib/hubinet-ops/ops.db"
 cmp "$backup_with/ops.db-wal" "$AGENT_ROOT/var/lib/hubinet-ops/ops.db-wal"
 cmp "$backup_with/ops.db-shm" "$AGENT_ROOT/var/lib/hubinet-ops/ops.db-shm"
 grep -Fq '<start><hubinet-ops>' "$LOG"
+grep -Fq '<curl><-fsS><--max-time><2><http://127.0.0.1:8787/health>' "$LOG"
 
 prepare_agent
 cat > "$FAKE_BIN/cp" <<'SH'
@@ -152,6 +182,12 @@ assert_agent_unchanged() {
 }
 
 prepare_agent
+printf 'current-app\n' > "$AGENT_ROOT/opt/hubinet-ops/app/main.py"
+printf 'current-requirements\n' > "$AGENT_ROOT/opt/hubinet-ops/requirements.txt"
+printf 'current-unit\n' > "$AGENT_ROOT/etc/systemd/system/hubinet-ops.service"
+printf 'current-config\n' > "$AGENT_ROOT/etc/hubinet-ops/config.yaml"
+printf 'current-env\n' > "$AGENT_ROOT/etc/hubinet-ops/agent.env"
+printf 'current-db\n' > "$AGENT_ROOT/var/lib/hubinet-ops/ops.db"
 snapshot="$TMP_ROOT/current-agent-snapshot"
 mkdir -p "$snapshot"
 /usr/bin/cp -a "$AGENT_ROOT/opt/hubinet-ops/app" "$snapshot/app"
@@ -168,14 +204,49 @@ if bash "$ROOT/deploy/agent/restore-0.3.0.sh" "$backup_with"; then
 fi
 unset HUBINET_OPS_AGENT_TEST_STOP_FAIL
 assert_agent_unchanged "$snapshot"
+grep -Fq '<start><hubinet-ops>' "$LOG"
 
-export HUBINET_OPS_AGENT_TEST_STAYS_ACTIVE=yes
+: > "$LOG"
+export HUBINET_OPS_AGENT_TEST_STOP_STAYS_ACTIVE=yes
 if bash "$ROOT/deploy/agent/restore-0.3.0.sh" "$backup_with"; then
   echo 'Restore unexpectedly succeeded while hubinet-ops remained active' >&2
   exit 1
 fi
-unset HUBINET_OPS_AGENT_TEST_STAYS_ACTIVE
+unset HUBINET_OPS_AGENT_TEST_STOP_STAYS_ACTIVE
 assert_agent_unchanged "$snapshot"
 grep -Fq '<is-active><hubinet-ops>' "$LOG"
+grep -Fq '<start><hubinet-ops>' "$LOG"
+
+: > "$LOG"
+export HUBINET_OPS_AGENT_TEST_STATE_UNCERTAIN=yes
+if bash "$ROOT/deploy/agent/restore-0.3.0.sh" "$backup_with"; then
+  echo 'Restore unexpectedly succeeded with an uncertain post-stop service state' >&2
+  exit 1
+fi
+unset HUBINET_OPS_AGENT_TEST_STATE_UNCERTAIN
+assert_agent_unchanged "$snapshot"
+grep -Fq '<start><hubinet-ops>' "$LOG"
+
+prepare_agent
+export HUBINET_OPS_AGENT_TEST_START_STAYS_INACTIVE=yes
+if bash "$ROOT/deploy/agent/restore-0.3.0.sh" "$backup_with"; then
+  echo 'Restore unexpectedly succeeded while the restored service stayed inactive' >&2
+  exit 1
+fi
+unset HUBINET_OPS_AGENT_TEST_START_STAYS_INACTIVE
+grep -Fq '<start><hubinet-ops>' "$LOG"
+if grep -Fq '<curl>' "$LOG"; then
+  echo 'Health endpoint was probed while the restored service was inactive' >&2
+  exit 1
+fi
+
+prepare_agent
+export HUBINET_OPS_AGENT_TEST_HEALTH_FAIL=yes
+if bash "$ROOT/deploy/agent/restore-0.3.0.sh" "$backup_with"; then
+  echo 'Restore unexpectedly succeeded while the health endpoint was unavailable' >&2
+  exit 1
+fi
+unset HUBINET_OPS_AGENT_TEST_HEALTH_FAIL
+[[ "$(grep -Fc '<curl>' "$LOG")" -eq 2 ]]
 
 echo '0.3.0 agent SQLite backup and restore safety smoke passed'

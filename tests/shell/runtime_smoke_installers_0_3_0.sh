@@ -55,6 +55,10 @@ printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/scp.args"
 write_stub install '
 printf "<%s>" "$@" >> "$HUBINET_OPS_TEST_LOG_DIR/install.args"
 printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/install.args"
+if [[ ${HUBINET_OPS_FAKE_ROLLBACK_ORDER:-no} == yes \
+  && "${@: -2:1}" == "$HUBINET_OPS_HOST_BACKUP_BASE"/* ]]; then
+  printf "host-restore\n" >> "$HUBINET_OPS_TEST_LOG_DIR/rollback-order.log"
+fi
 if [[ " $* " == *" -d "* ]]; then
   mkdir -p "${@: -1}"
   exit 0
@@ -80,6 +84,10 @@ write_stub rm '
 printf "<%s>" "$@" >> "$HUBINET_OPS_TEST_LOG_DIR/rm.args"
 printf "\n" >> "$HUBINET_OPS_TEST_LOG_DIR/rm.args"
 for value in "$@"; do
+  if [[ ${HUBINET_OPS_FAKE_ROLLBACK_ORDER:-no} == yes \
+    && "$value" == "$HUBINET_OPS_TEST_HOST_ROOT"/* ]]; then
+    printf "host-restore\n" >> "$HUBINET_OPS_TEST_LOG_DIR/rollback-order.log"
+  fi
   if [[ "$value" == "$TMP_ROOT"/* || "$value" == /tmp/hubinet-ops-0.3.0-* ]]; then
     exec /usr/bin/rm "$@"
   fi
@@ -128,6 +136,10 @@ case "${1:-}" in
     printf "existing-%s\n" "${3##*/}" > "$4"
     ;;
   push)
+    if [[ ${HUBINET_OPS_FAKE_ROLLBACK_ORDER:-no} == yes \
+      && "${3:-}" == "$HUBINET_OPS_HOST_BACKUP_BASE"/*/managed/"${2:-}"/* ]]; then
+      printf "managed-restore-%s\n" "${2:-}" >> "$HUBINET_OPS_TEST_LOG_DIR/rollback-order.log"
+    fi
     if [[ ${2:-} == "${HUBINET_OPS_FAKE_RESTORE_PUSH_FAIL_VMID:-none}" \
       && "${3:-}" == */managed/"${2:-}"/* ]]; then
       exit 1
@@ -135,13 +147,36 @@ case "${1:-}" in
     exit 0
     ;;
   exec)
-    if [[ " $* " == *" bash -s "* ]]; then
+    if [[ ${4:-} == systemctl && ${5:-} == stop && ${6:-} == hubinet-ops ]]; then
+      if [[ ${HUBINET_OPS_FAKE_ROLLBACK_ORDER:-no} == yes ]]; then
+        printf "new-agent-stop\n" >> "$HUBINET_OPS_TEST_LOG_DIR/rollback-order.log"
+      fi
+      [[ ${HUBINET_OPS_FAKE_ROLLBACK_AGENT_STOP_FAIL:-no} != yes ]]
+    elif [[ ${4:-} == sh && ${5:-} == -c \
+      && ${6:-} == *"systemctl is-active hubinet-ops"* ]]; then
+      case "${HUBINET_OPS_FAKE_ROLLBACK_AGENT_STATE:-inactive}" in
+        inactive) printf "inactive:3\n" ;;
+        ambiguous) printf "activating:0\n" ;;
+        exec-fail) exit 1 ;;
+      esac
+    elif [[ " $* " == *" bash -s "* ]]; then
       count_file="$HUBINET_OPS_TEST_LOG_DIR/bash-s-count"
       count=0
       [[ ! -f "$count_file" ]] || count="$(cat "$count_file")"
       count=$((count + 1))
       printf "%s" "$count" > "$count_file"
       cat > "$HUBINET_OPS_TEST_LOG_DIR/bash-s-$count.body"
+      if [[ $count -eq 4 ]]; then
+        if [[ ${HUBINET_OPS_FAKE_ROLLBACK_ORDER:-no} == yes ]]; then
+          printf "agent-restore-110\n" >> "$HUBINET_OPS_TEST_LOG_DIR/rollback-order.log"
+        fi
+        if [[ ${HUBINET_OPS_FAKE_AGENT_RESTORE_FAIL:-no} == yes ]]; then
+          exit 1
+        fi
+        if [[ ${HUBINET_OPS_FAKE_ROLLBACK_ORDER:-no} == yes ]]; then
+          printf "old-agent-start-110\n" >> "$HUBINET_OPS_TEST_LOG_DIR/rollback-order.log"
+        fi
+      fi
       if [[ $count -eq 3 ]]; then
         printf "["
         for vmid in $(seq 100 110); do
@@ -197,15 +232,28 @@ fi
 # A post-install inventory mismatch must traverse the full rollback rather than
 # relying on ERR propagation from an explicit exit.
 rm -f "$LOG_DIR/bash-s-count"
+rm -f "$LOG_DIR/rollback-order.log"
 : > "$LOG_DIR/pct.args"
 : > "$LOG_DIR/install.args"
-export HUBINET_OPS_FAKE_RESOURCE_COUNT=10
+export HUBINET_OPS_FAKE_RESOURCE_COUNT=10 HUBINET_OPS_FAKE_ROLLBACK_ORDER=yes
 if rollback_output="$(bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh" 2>&1)"; then
   echo "Inventory mismatch unexpectedly succeeded" >&2
   exit 1
 fi
-unset HUBINET_OPS_FAKE_RESOURCE_COUNT
+unset HUBINET_OPS_FAKE_RESOURCE_COUNT HUBINET_OPS_FAKE_ROLLBACK_ORDER
 [[ "$rollback_output" == *'Rollback completed'* ]]
+
+stop_line="$(grep -n '^new-agent-stop$' "$LOG_DIR/rollback-order.log" | head -n 1 | cut -d: -f1)"
+host_line="$(grep -n '^host-restore$' "$LOG_DIR/rollback-order.log" | head -n 1 | cut -d: -f1)"
+managed_first_line="$(grep -n '^managed-restore-101$' "$LOG_DIR/rollback-order.log" | head -n 1 | cut -d: -f1)"
+managed_last_line="$(grep -n '^managed-restore-109$' "$LOG_DIR/rollback-order.log" | tail -n 1 | cut -d: -f1)"
+agent_restore_line="$(grep -n '^agent-restore-110$' "$LOG_DIR/rollback-order.log" | head -n 1 | cut -d: -f1)"
+old_agent_start_line="$(grep -n '^old-agent-start-110$' "$LOG_DIR/rollback-order.log" | head -n 1 | cut -d: -f1)"
+[[ "$stop_line" -lt "$host_line" ]]
+[[ "$host_line" -lt "$managed_first_line" ]]
+[[ "$managed_last_line" -lt "$agent_restore_line" ]]
+[[ "$agent_restore_line" -lt "$old_agent_start_line" ]]
+[[ "$(tail -n 1 "$LOG_DIR/rollback-order.log")" == old-agent-start-110 ]]
 
 grep -Fq '<exec><110><--><bash><-s><--></root/hubinet-ops-backups/20260719-120000-before-0.3.0>' "$LOG_DIR/pct.args"
 for restored in \
@@ -249,6 +297,39 @@ for vmid in $(seq 102 109); do
   grep -Eq "^<push><$vmid><.*managed/$vmid/hubinet-maint></usr/local/sbin/hubinet-maint>" "$LOG_DIR/pct.args"
 done
 grep -Fq '<exec><110><--><bash><-s><--></root/hubinet-ops-backups/20260719-120050-before-0.3.0>' "$LOG_DIR/pct.args"
+
+# An uncertain CT110 service state makes rollback incomplete, but host,
+# managed, and final agent restore layers are still attempted.
+rm -f "$LOG_DIR/bash-s-count"
+: > "$LOG_DIR/pct.args"
+export HUBINET_OPS_FAKE_STAMP=20260719-120060
+export HUBINET_OPS_FAKE_RESOURCE_COUNT=10
+export HUBINET_OPS_FAKE_ROLLBACK_AGENT_STATE=ambiguous
+if rollback_output="$(bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh" 2>&1)"; then
+  echo 'Rollback with uncertain CT110 service state unexpectedly succeeded' >&2
+  exit 1
+fi
+unset HUBINET_OPS_FAKE_STAMP HUBINET_OPS_FAKE_RESOURCE_COUNT HUBINET_OPS_FAKE_ROLLBACK_AGENT_STATE
+[[ "$rollback_output" == *'ROLLBACK INCOMPLETE'* ]]
+[[ "$rollback_output" == *'CT110 pre-rollback stop verification'* ]]
+grep -Eq '^<push><109><.*managed/109/hubinet-maint></usr/local/sbin/hubinet-maint>' "$LOG_DIR/pct.args"
+grep -Fq '<exec><110><--><bash><-s><--></root/hubinet-ops-backups/20260719-120060-before-0.3.0>' "$LOG_DIR/pct.args"
+
+# Agent restore failure (including bounded active/health verification failure)
+# is propagated by the outer rollback as an incomplete CT110 layer.
+rm -f "$LOG_DIR/bash-s-count"
+: > "$LOG_DIR/pct.args"
+export HUBINET_OPS_FAKE_STAMP=20260719-120070
+export HUBINET_OPS_FAKE_RESOURCE_COUNT=10
+export HUBINET_OPS_FAKE_AGENT_RESTORE_FAIL=yes
+if rollback_output="$(bash "$ROOT/deploy/upgrade-0.3.0-from-pve.sh" 2>&1)"; then
+  echo 'Rollback with failed CT110 agent restore unexpectedly succeeded' >&2
+  exit 1
+fi
+unset HUBINET_OPS_FAKE_STAMP HUBINET_OPS_FAKE_RESOURCE_COUNT HUBINET_OPS_FAKE_AGENT_RESTORE_FAIL
+[[ "$rollback_output" == *'ROLLBACK INCOMPLETE'* ]]
+[[ "$rollback_output" == *'CT110 agent'* ]]
+grep -Eq '^<push><109><.*managed/109/hubinet-maint></usr/local/sbin/hubinet-maint>' "$LOG_DIR/pct.args"
 
 # A partial backup of managed files is never marked complete and no production
 # layer is modified when a confirmed-existing file cannot be pulled.
