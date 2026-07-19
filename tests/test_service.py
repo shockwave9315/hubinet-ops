@@ -594,6 +594,8 @@ def test_transient_final_apt_scan_failure_is_warning_without_rollback(
     assert state["update_status"] == "unknown"
     assert state["verification_status"] == "warning"
     assert state["packages_remaining_count"] is None
+    assert state["pending_updates"] is None
+    assert state["updates"]["pending_count"] is None
     assert "Temporary failure" in state["verification_error"]
     assert db.find_active_plan(106) is None
     success = next(item for item in notifications if item["event_type"] == "job_success")

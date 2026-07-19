@@ -409,7 +409,7 @@ def _ct_entities() -> list[tuple[str, str, str, dict[str, Any]]]:
         ("operation_status", "Operation status", "{{ value_json.operation_status }}", {}),
         ("job_stage", "Job stage", "{{ value_json.job_stage }}", {}),
         ("job_progress", "Job progress", "{{ value_json.job_progress }}", {"unit_of_measurement": "%"}),
-        ("pending_updates", "Pending update count", "{{ value_json.pending_updates }}", {}),
+        ("pending_updates", "Pending update count", "{{ 'unknown' if value_json.pending_updates is none else value_json.pending_updates | default(0) }}", {}),
         ("risk", "Risk", "{{ value_json.risk }}", {}),
         ("disk_used_percent", "Disk used", "{{ value_json.disk.used_percent | default(0) }}", {"unit_of_measurement": "%"}),
         ("disk_free_mb", "Disk free", "{{ value_json.disk.free_mb | default(0) }}", {"unit_of_measurement": "MiB"}),

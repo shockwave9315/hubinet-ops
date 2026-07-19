@@ -83,6 +83,42 @@ def test_malformed_legacy_values_fall_back_without_crashing() -> None:
     assert state["lifecycle_health_pending"] is False
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({}, 0),
+        ({"updates": {"pending_count": 7}}, 7),
+        (
+            {
+                "pending_updates": None,
+                "update_status": "up_to_date",
+                "updates": {"pending_count": 0},
+            },
+            None,
+        ),
+        ({"updates": {"pending_count": None}}, None),
+        ({"pending_updates": 0, "updates": {"pending_count": None}}, None),
+        ({"pending_updates": "not-a-number"}, 0),
+        ({"pending_updates": True}, 0),
+        ({"pending_updates": -4}, 0),
+        ({"pending_updates": "5"}, 5),
+    ],
+)
+def test_pending_update_count_normalization_is_consistent(
+    payload: dict,
+    expected: int | None,
+) -> None:
+    state = normalize_state(payload)
+
+    if expected is None:
+        assert state["pending_updates"] is None
+        assert state["updates"]["pending_count"] is None
+        assert state["update_status"] == "unknown"
+    else:
+        assert state["pending_updates"] == expected
+        assert state["updates"]["pending_count"] == expected
+
+
 def test_waiting_approval_clears_stale_job_runtime_fields() -> None:
     state = normalize_state(
         {

@@ -48,12 +48,27 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
         health = "offline"
     state["health_status"] = health if health in HEALTH_STATUSES else "unknown"
 
-    pending = max(0, _safe_int(state.get("pending_updates"), 0))
+    raw_updates = state.get("updates")
+    updates = dict(raw_updates) if isinstance(raw_updates, dict) else {}
+    explicit_unknown = (
+        "pending_updates" in state and state.get("pending_updates") is None
+    ) or ("pending_count" in updates and updates.get("pending_count") is None)
+    if explicit_unknown:
+        raw_pending = None
+    elif "pending_updates" in state:
+        raw_pending = state.get("pending_updates")
+    elif "pending_count" in updates:
+        raw_pending = updates.get("pending_count")
+    else:
+        raw_pending = 0
+    pending = None if raw_pending is None else max(0, _safe_int(raw_pending, 0))
     update = str(state.get("update_status") or "")
-    if update not in UPDATE_STATUSES:
+    if pending is None:
+        update = "unknown"
+    elif update not in UPDATE_STATUSES:
         if legacy_status == "scanning":
             update = "scanning"
-        elif pending > 0 or legacy_status == "update_available":
+        elif (pending is not None and pending > 0) or legacy_status == "update_available":
             update = "update_available"
         elif state.get("last_scan"):
             update = "up_to_date"
@@ -87,12 +102,7 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     )
     state["pending_updates"] = pending
 
-    raw_updates = state.get("updates")
-    updates = dict(raw_updates) if isinstance(raw_updates, dict) else {}
-    updates["pending_count"] = max(
-        0,
-        _safe_int(updates.get("pending_count"), pending),
-    )
+    updates["pending_count"] = pending
     packages = updates.get("packages")
     updates["packages"] = list(packages)[:200] if isinstance(packages, list) else []
     state["updates"] = updates

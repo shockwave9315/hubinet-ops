@@ -201,6 +201,10 @@ def test_new_discovery_entity_ids_are_stable_and_existing_keys_remain() -> None:
         "capability_reboot",
     } <= keys
     assert "value_json.reboot_required is none" in entities["reboot_required"]
+    assert entities["pending_updates"] == (
+        "{{ 'unknown' if value_json.pending_updates is none "
+        "else value_json.pending_updates | default(0) }}"
+    )
     assert (
         "value_json.packages_remaining_count is none"
         in entities["packages_remaining_count"]

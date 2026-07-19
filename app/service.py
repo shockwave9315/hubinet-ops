@@ -1029,7 +1029,7 @@ class OpsService:
                         health.get("health", "healthy"),
                     ),
                     "updates": updates,
-                    "pending_updates": pending if pending is not None else 0,
+                    "pending_updates": pending,
                     "update_status": (
                         "unknown"
                         if not final_apt_scan_ok

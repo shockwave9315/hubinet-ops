@@ -136,6 +136,22 @@ def test_core_mqtt_uses_the_0_2_4_byte_budget() -> None:
     assert "_bounded_state" not in source
 
 
+def test_unknown_pending_count_survives_retained_mqtt_budgeting() -> None:
+    payload = bounded_state(
+        {
+            "update_status": "unknown",
+            "pending_updates": None,
+            "packages_remaining_count": None,
+            "updates": {"pending_count": None, "packages": []},
+        }
+    )
+
+    assert payload["update_status"] == "unknown"
+    assert payload["pending_updates"] is None
+    assert payload["packages_remaining_count"] is None
+    assert payload["updates"]["pending_count"] is None
+
+
 def test_0_2_4_scalars_survive_unicode_package_event_and_docker_truncation() -> None:
     capabilities = {
         "refresh": True,
