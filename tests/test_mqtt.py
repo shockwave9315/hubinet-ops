@@ -154,7 +154,7 @@ def test_resource_discovery_uses_type_specific_ids_models_and_agent_counts() -> 
     telemetry.start()
     wait_for(
         lambda: any(
-            topic == "homeassistant/sensor/hubinet_ops_vm100_health_status/config"
+            topic == "homeassistant/sensor/hubinet_ops_ct110_health_status/config"
             for topic, *_ in client.published
         )
     )
