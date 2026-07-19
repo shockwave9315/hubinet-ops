@@ -20,6 +20,8 @@ Discovery uses `homeassistant/sensor/<object_id>/config` by default. Stable iden
 
 Agent entities include availability, version, configured container count, active job count, and last refresh. CT entities include health/status dimensions, score/progress, LXC, packages/risk, disk/RAM, Docker required counts, plan/job IDs, timestamps, error, rollback policy, and last event. There are no MQTT buttons or command topics.
 
+Version 0.2.4 also publishes the complete operator-capability map and compact lifecycle, verification, recovery-scan, and terminal-event suppression fields. New scalar Discovery entities use stable field-derived IDs; pre-existing IDs are unchanged.
+
 The retained CT state is also the attributes source for IP addresses, OS, services, failed units, package details, Docker details, recent events, and dashboard path.
 
 ## Bounds and redaction
