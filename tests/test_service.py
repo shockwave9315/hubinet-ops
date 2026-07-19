@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -92,6 +93,21 @@ class WorkflowExecutor:
                     "fingerprint": "none",
                 },
             }
+        if action == "verify":
+            return {
+                "ok": True,
+                "data": {
+                    "apt_check_ok": True,
+                    "dpkg_audit_ok": True,
+                    "reboot_required": False,
+                    "updates": {
+                        "pending_count": 0,
+                        "packages": [],
+                        "fingerprint": "none",
+                    },
+                    "docker": {"required_healthy": 3, "required_total": 3},
+                },
+            }
         if action == "update" and on_event:
             on_event(
                 {
@@ -123,6 +139,22 @@ def settings(
                     "criticality": "low",
                     "automatic_rollback": True,
                     "manual_rollback_allowed": True,
+                    "operator_capabilities": {
+                        "refresh": True,
+                        "scan": True,
+                        "approve": True,
+                        "reject": True,
+                        "retry_healthcheck": True,
+                        "rollback": True,
+                        "start": True,
+                        "shutdown": True,
+                        "reboot": True,
+                    },
+                    "recovery_scan": {
+                        "enabled": True,
+                        "delay_seconds": 90,
+                        "cooldown_seconds": 900,
+                    },
                     "repair_actions": ["restart_services"] if repair else [],
                     "dashboard_path": "/hubinet-ops/ct-106",
                     "stabilization": {
@@ -242,7 +274,10 @@ def test_repair_failure_invokes_rollback_and_waits_for_0_3_3(tmp_path: Path) -> 
     assert db.get_job(job["id"])["status"] == "rolled_back"
     assert "repair" in executor.actions
     assert "rollback" in executor.actions
-    assert service.get_state(106)["last_operation_result"] == "rolled_back"
+    state = service.get_state(106)
+    assert state["last_operation_result"] == "rolled_back"
+    assert state["last_terminal_event"] == "job_rolled_back"
+    assert state["recovery_notification_suppressed_until"]
 
 
 def test_rollback_timeout_becomes_manual_intervention(tmp_path: Path) -> None:
@@ -443,11 +478,10 @@ def test_notification_uses_configured_dashboard_path(tmp_path: Path) -> None:
     }
 
 
-def test_post_health_scan_failure_does_not_trigger_rollback(tmp_path: Path) -> None:
-    class PostScanFailureExecutor(WorkflowExecutor):
+def test_post_update_verification_failure_triggers_rollback(tmp_path: Path) -> None:
+    class VerificationFailureExecutor(WorkflowExecutor):
         def __init__(self) -> None:
             super().__init__([docker_state(3), docker_state(3)])
-            self.scan_count = 0
 
         def run(
             self,
@@ -457,18 +491,141 @@ def test_post_health_scan_failure_does_not_trigger_rollback(tmp_path: Path) -> N
             timeout=None,
             on_event=None,
         ) -> dict[str, Any]:
-            if action == "scan":
-                self.scan_count += 1
-                if self.scan_count >= 1:
-                    raise ExecutorError("post scan unavailable")
+            if action == "verify":
+                raise ExecutorError(
+                    "apt-get check failed",
+                    data={"apt_check_ok": False, "dpkg_audit_ok": True},
+                )
             return super().run(action, vmid, argument, timeout, on_event)
 
-    executor = PostScanFailureExecutor()
+    executor = VerificationFailureExecutor()
     service, db = service_with(tmp_path, executor, post_update_timeout=2)
     job = approved_job(service, db)
     service._run_job(job)
-    assert db.get_job(job["id"])["status"] == "success"
-    assert "rollback" not in executor.actions
+    assert db.get_job(job["id"])["status"] == "rolled_back"
+    assert "rollback" in executor.actions
     state = service.get_state(106)
-    assert state["update_status"] == "unknown"
-    assert state["last_error"] == "post scan unavailable"
+    assert state["verification_status"] == "failed"
+    assert state["apt_check_ok"] is False
+
+
+def test_verification_reboot_warning_and_success_webhook_summary(tmp_path: Path) -> None:
+    class WarningExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "verify":
+                self.actions.append(action)
+                return {
+                    "ok": True,
+                    "data": {
+                        "apt_check_ok": True,
+                        "dpkg_audit_ok": True,
+                        "reboot_required": True,
+                        "updates": {
+                            "pending_count": 0,
+                            "packages": [],
+                            "fingerprint": "none",
+                        },
+                        "docker": {"required_healthy": 3, "required_total": 3},
+                    },
+                }
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = WarningExecutor([docker_state(3), docker_state(3)])
+    service, db = service_with(tmp_path, executor)
+    job = approved_job(service, db)
+    notifications: list[dict[str, Any]] = []
+    service._notify_ha = notifications.append  # type: ignore[method-assign]
+    service._run_job(job)
+
+    state = service.get_state(106)
+    assert state["verification_status"] == "warning"
+    assert state["reboot_required"] is True
+    assert state["apt_check_ok"] is True
+    assert state["dpkg_audit_ok"] is True
+    success = next(item for item in notifications if item["event_type"] == "job_success")
+    assert success["packages_updated_count"] == 0
+    assert success["packages_remaining_count"] == 0
+    assert success["docker_required_healthy"] == 3
+    assert success["docker_required_total"] == 3
+    assert success["verification_status"] == "warning"
+    assert success["duration_seconds"] >= 0
+    assert state["last_terminal_event"] == "job_success"
+    assert state["recovery_notification_suppressed_until"]
+    assert (
+        datetime.fromisoformat(state["recovery_notification_suppressed_until"])
+        - datetime.fromisoformat(state["last_terminal_at"])
+    ).total_seconds() == 180
+
+
+def test_remaining_packages_create_new_waiting_plan_without_duplicate(tmp_path: Path) -> None:
+    class RemainingExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "verify":
+                self.actions.append(action)
+                return {
+                    "ok": True,
+                    "data": {
+                        "apt_check_ok": True,
+                        "dpkg_audit_ok": True,
+                        "reboot_required": False,
+                        "updates": {
+                            "pending_count": 1,
+                            "packages": [{"name": "curl", "current": "1", "target": "2"}],
+                            "fingerprint": "remaining",
+                        },
+                        "docker": {"required_healthy": 3, "required_total": 3},
+                    },
+                }
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    service, db = service_with(tmp_path, RemainingExecutor([docker_state(3), docker_state(3)]))
+    job = approved_job(service, db)
+    service._run_job(job)
+    assert db.get_job(job["id"])["status"] == "success"
+    state = service.get_state(106)
+    assert state["packages_remaining_count"] == 1
+    assert state["verification_status"] == "warning"
+    assert state["operation_status"] == "waiting_approval"
+    followup = db.find_active_plan(106, "remaining")
+    assert followup is not None
+    assert service._create_followup_plan(
+        106,
+        service.settings.containers[106],
+        followup["payload"],
+    )["id"] == followup["id"]
+
+
+@pytest.mark.parametrize(
+    ("message", "data"),
+    [
+        ("dpkg audit failed", {"apt_check_ok": True, "dpkg_audit_ok": False}),
+        (
+            "required docker container is unhealthy",
+            {
+                "apt_check_ok": True,
+                "dpkg_audit_ok": True,
+                "docker_required_healthy": 2,
+                "docker_required_total": 3,
+            },
+        ),
+    ],
+)
+def test_integrity_or_docker_verification_failure_follows_rollback_policy(
+    tmp_path: Path,
+    message: str,
+    data: dict[str, Any],
+) -> None:
+    class FailedExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "verify":
+                self.actions.append(action)
+                raise ExecutorError(message, data=data)
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = FailedExecutor([docker_state(3), docker_state(3), docker_state(3), docker_state(3)])
+    service, db = service_with(tmp_path, executor)
+    job = approved_job(service, db)
+    service._run_job(job)
+    assert db.get_job(job["id"])["status"] == "rolled_back"
+    assert "rollback" in executor.actions
+    assert service.get_state(106)["verification_status"] == "failed"

@@ -24,6 +24,22 @@ def settings(tmp_path: Path) -> Settings:
                     "adapter": "apt",
                     "automatic_rollback": False,
                     "manual_rollback_allowed": False,
+                    "operator_capabilities": {
+                        "refresh": True,
+                        "scan": True,
+                        "approve": True,
+                        "reject": True,
+                        "retry_healthcheck": True,
+                        "rollback": True,
+                        "start": True,
+                        "shutdown": True,
+                        "reboot": True,
+                    },
+                    "recovery_scan": {
+                        "enabled": True,
+                        "delay_seconds": 90,
+                        "cooldown_seconds": 900,
+                    },
                     "repair_actions": [],
                     "dashboard_path": "/hubinet-ops/ct-106",
                     "stabilization": {
@@ -74,6 +90,16 @@ class Executor:
             return {
                 "ok": True,
                 "data": {"pending_count": 0, "packages": [], "fingerprint": "none"},
+            }
+        if action == "verify":
+            return {
+                "ok": True,
+                "data": {
+                    "apt_check_ok": True,
+                    "dpkg_audit_ok": True,
+                    "reboot_required": False,
+                    "updates": {"pending_count": 0, "packages": [], "fingerprint": "none"},
+                },
             }
         return {"ok": True, "data": {}}
 

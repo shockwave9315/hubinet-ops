@@ -134,3 +134,24 @@ def test_action_vmid_and_argument_injection_are_rejected(
 ) -> None:
     with pytest.raises(ExecutorError):
         executor().run(action, vmid, argument)
+
+
+@pytest.mark.parametrize("action", ["start", "shutdown", "reboot", "verify"])
+def test_fixed_lifecycle_and_verify_actions_have_no_extra_argument(
+    action: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+    process = FakeProcess('{"ok":true,"data":{}}\n')
+
+    def popen(cmd: list[str], **kwargs: Any) -> FakeProcess:
+        captured.extend(cmd)
+        return process
+
+    monkeypatch.setattr("app.executor.subprocess.Popen", popen)
+    executor().run(action, 106)
+    assert captured[-1] == f"{action} 106"
+    assert captured[-2] == "root@proxmox.test"
+
+    with pytest.raises(ExecutorError, match="does not accept"):
+        executor().run(action, 106, "extra")

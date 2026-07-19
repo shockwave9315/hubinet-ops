@@ -46,6 +46,10 @@ class Executor:
             "repair",
             "rollback",
             "delete-snapshot",
+            "verify",
+            "start",
+            "shutdown",
+            "reboot",
         }
         if action not in allowed_actions:
             raise ExecutorError(f"Action not allowed by agent: {action}")
@@ -64,6 +68,8 @@ class Executor:
         if command_timeout <= 0:
             raise ExecutorError("Executor timeout must be positive")
 
+        if action in {"start", "shutdown", "reboot", "verify"} and argument is not None:
+            raise ExecutorError(f"Action {action} does not accept an argument")
         remote_command = f"{action} {vmid}"
         if argument is not None:
             if not argument.replace("-", "").replace("_", "").isalnum():

@@ -45,6 +45,20 @@ containers:
     approval_mode: always
     automatic_rollback: true
     manual_rollback_allowed: false
+    operator_capabilities:
+      refresh: false
+      scan: false
+      approve: false
+      reject: false
+      retry_healthcheck: false
+      rollback: false
+      start: false
+      shutdown: false
+      reboot: false
+    recovery_scan:
+      enabled: false
+      delay_seconds: 90
+      cooldown_seconds: 900
     repair_actions: []
     dashboard_path: /hubinet-ops/ct-101
     stabilization: &default_stabilization
@@ -62,7 +76,21 @@ containers:
     criticality: low
     approval_mode: always
     automatic_rollback: true
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
+    operator_capabilities:
+      refresh: true
+      scan: true
+      approve: true
+      reject: true
+      retry_healthcheck: true
+      rollback: true
+      start: true
+      shutdown: true
+      reboot: true
+    recovery_scan:
+      enabled: true
+      delay_seconds: 90
+      cooldown_seconds: 900
     repair_actions:
       - restart_services
       - restart_required_containers

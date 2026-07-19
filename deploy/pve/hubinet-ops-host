@@ -24,7 +24,7 @@ fi
 
 read -r action vmid argument extra <<<"$ORIGINAL"
 [[ -z "${extra:-}" ]] || fail "Too many arguments"
-[[ "$action" =~ ^(status|inspect|scan|preflight|snapshot|update|healthcheck|repair|rollback|delete-snapshot)$ ]] || fail "Action not allowed"
+[[ "$action" =~ ^(status|inspect|scan|preflight|snapshot|update|healthcheck|repair|rollback|delete-snapshot|verify|start|shutdown|reboot)$ ]] || fail "Action not allowed"
 [[ "$vmid" =~ ^[1-9][0-9]{1,5}$ ]] || fail "Invalid VMID"
 [[ -f "$ALLOWLIST" ]] || fail "Missing VMID allowlist"
 grep -Fxq "$vmid" "$ALLOWLIST" || fail "VMID not allowed"
@@ -32,6 +32,15 @@ grep -Fxq "$vmid" "$ALLOWLIST" || fail "VMID not allowed"
 if [[ -n "${argument:-}" ]]; then
   [[ "$argument" =~ ^[A-Za-z0-9_-]+$ ]] || fail "Unsafe argument"
 fi
+
+case "$action" in
+  snapshot|rollback|delete-snapshot)
+    [[ -n "${argument:-}" ]] || fail "Snapshot name required"
+    ;;
+  *)
+    [[ -z "${argument:-}" ]] || fail "Action does not accept an argument"
+    ;;
+esac
 
 logger -t hubinet-ops-host "action=$action vmid=$vmid"
 
@@ -74,6 +83,28 @@ case "$action" in
   repair)
     timeout --signal=TERM --kill-after=30s 850s \
       pct exec "$vmid" -- /usr/local/sbin/hubinet-maint repair
+    ;;
+  verify)
+    timeout --signal=TERM --kill-after=15s 650s \
+      pct exec "$vmid" -- /usr/local/sbin/hubinet-maint verify
+    ;;
+  start)
+    if ! raw="$(timeout --signal=TERM --kill-after=10s 120s pct start "$vmid" 2>&1)"; then
+      fail "container start failed or timed out: $raw"
+    fi
+    printf '{"ok":true,"data":{"action":"start"}}\n'
+    ;;
+  shutdown)
+    if ! raw="$(timeout --signal=TERM --kill-after=10s 120s pct shutdown "$vmid" 2>&1)"; then
+      fail "graceful container shutdown failed or timed out: $raw"
+    fi
+    printf '{"ok":true,"data":{"action":"shutdown"}}\n'
+    ;;
+  reboot)
+    if ! raw="$(timeout --signal=TERM --kill-after=10s 120s pct reboot "$vmid" 2>&1)"; then
+      fail "graceful container reboot failed or timed out: $raw"
+    fi
+    printf '{"ok":true,"data":{"action":"reboot"}}\n'
     ;;
   snapshot)
     [[ -n "${argument:-}" ]] || fail "Snapshot name required"

@@ -77,6 +77,11 @@ def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
         source = _mapping(state.get(key))
         compact[key] = {field: source.get(field) for field in fields if field in source}
 
+    capabilities = _mapping(state.get("operator_capabilities"))
+    compact["operator_capabilities"] = {
+        str(key): bool(value) for key, value in capabilities.items()
+    }
+
     updates = _mapping(state.get("updates"))
     compact["updates"] = {
         field: updates.get(field)
@@ -118,9 +123,32 @@ def _minimal_state(state: dict[str, Any]) -> dict[str, Any]:
         "last_operation_result",
         "rollback_allowed",
         "dashboard_path",
+        "lifecycle_action",
+        "lifecycle_status",
+        "lifecycle_started_at",
+        "lifecycle_finished_at",
+        "lifecycle_error",
+        "verification_status",
+        "last_verification",
+        "apt_check_ok",
+        "dpkg_audit_ok",
+        "reboot_required",
+        "packages_updated_count",
+        "packages_remaining_count",
+        "docker_required_healthy",
+        "docker_required_total",
+        "verification_error",
+        "recovery_scan_enabled",
+        "recovery_scan_status",
+        "recovery_scan_due_at",
+        "last_recovery_scan",
+        "last_recovery_scan_result",
+        "last_terminal_event",
+        "last_terminal_at",
+        "recovery_notification_suppressed_until",
     )
     minimal = {key: state.get(key) for key in required if key in state}
-    for key in ("disk", "memory", "docker", "updates", "last_job_event"):
+    for key in ("disk", "memory", "docker", "updates", "last_job_event", "operator_capabilities"):
         if key in state:
             minimal[key] = state[key]
     if _json_bytes(minimal) <= HA_ATTRIBUTE_BUDGET_BYTES:
