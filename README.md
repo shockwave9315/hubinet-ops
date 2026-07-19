@@ -1,8 +1,8 @@
-# Hubinet Ops 0.2.3
+# Hubinet Ops 0.2.4
 
 Hubinet Ops is a safety-focused operations agent for approved APT updates in allowlisted Proxmox LXC containers. The FastAPI agent runs in a dedicated container, reaches the Proxmox host through a forced-command SSH wrapper, and delegates a fixed action set to `hubinet-maint` inside managed containers.
 
-Version 0.2.3 keeps the 0.2.1 update/stabilization engine and 0.2.2 Mushroom operator dashboard, while bounding the complete Home Assistant MQTT attribute payload to 10,000 UTF-8 bytes so Recorder does not reject oversized rich state.
+Version 0.2.4 adds backend-authoritative per-container capabilities, fixed graceful LXC lifecycle actions, delayed recovery scans, and explicit post-update APT/dpkg/service/Docker verification. The complete Home Assistant MQTT attribute payload remains bounded to 10,000 UTF-8 bytes.
 
 ## Safety model
 
@@ -13,6 +13,7 @@ Version 0.2.3 keeps the 0.2.1 update/stabilization engine and 0.2.2 Mushroom ope
 - Automatic and manual rollback are separate per-container policies.
 - Home Assistant is presentation and controlled input; SQLite and the agent are authoritative.
 - The scheduler and MQTT are disabled by default.
+- CT101 is observation-only; CT106 is the initial lifecycle and recovery-scan target.
 
 See [architecture](docs/architecture.md), [state model](docs/state-model.md), and [recovery](docs/recovery.md) for the full contract.
 
@@ -25,6 +26,8 @@ See [architecture](docs/architecture.md), [state model](docs/state-model.md), an
 - `deploy/upgrade-0.2.1-from-pve.sh`: backed-up 0.2.0 to 0.2.1 platform upgrade.
 - `deploy/upgrade-0.2.3-from-pve.sh`: transactional agent-only MQTT payload upgrade.
 - `deploy/install-ha-dashboard-0.2.3-from-pve.sh`: backed-up dashboard-only 0.2.3 deployment.
+- `deploy/upgrade-0.2.4-from-pve.sh`: transactional agent, wrapper, and managed-executor upgrade.
+- `deploy/install-ha-0.2.4-from-pve.sh`: transactional HA package/dashboard/URL-secret installer.
 - `tests/`: fake-only unit and integration workflow tests.
 
 ## API
@@ -41,6 +44,9 @@ All `/api/v1` endpoints require `Authorization: Bearer ...`.
 - `POST /api/v1/containers/{vmid}/scan`
 - `POST /api/v1/containers/{vmid}/retry-healthcheck`
 - `POST /api/v1/containers/{vmid}/rollback`
+- `POST /api/v1/containers/{vmid}/start`
+- `POST /api/v1/containers/{vmid}/shutdown`
+- `POST /api/v1/containers/{vmid}/reboot`
 - `POST /api/v1/plans/approve`
 - `POST /api/v1/plans/reject`
 
@@ -49,6 +55,8 @@ Rollback is rejected unless policy and recorded state permit it. No endpoint acc
 ## Configuration
 
 Copy values from `config/config.example.yaml` into the protected runtime config. MQTT remains disabled until `mqtt.enabled: true` is set with a reachable broker. Paho MQTT `2.1.0` is pinned for Python 3.13.
+
+Every container explicitly configures `operator_capabilities`. A missing capability defaults to deny. `recovery_scan` is independent of the periodic scheduler and never approves or executes an update.
 
 The per-container stabilization defaults are:
 
@@ -82,4 +90,4 @@ Validate every `.sh` file and `deploy/pve/hubinet-ops-host` with `bash -n`. CI p
 
 ## Deployment
 
-Deployment is intentionally not automatic. Follow [deployment](docs/deployment.md), [Home Assistant installation](docs/home-assistant.md), and the [0.2.3 upgrade guide](docs/upgrade-0.2.3.md). Upgrade scripts back up the components they replace, validate before declaring success, and perform no managed-container scan or package update.
+Deployment is intentionally not automatic. Follow [deployment](docs/deployment.md), [Home Assistant installation](docs/home-assistant.md), and the [0.2.4 upgrade guide](docs/upgrade-0.2.4.md). Upgrade scripts back up the components they replace, validate before declaring success, and perform no managed-container action.

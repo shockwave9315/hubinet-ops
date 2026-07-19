@@ -9,6 +9,18 @@ from typing import Any
 import yaml
 
 ALLOWED_REPAIR_ACTIONS = {"restart_services", "restart_required_containers"}
+OPERATOR_CAPABILITIES = {
+    "refresh",
+    "scan",
+    "approve",
+    "reject",
+    "retry_healthcheck",
+    "rollback",
+    "start",
+    "shutdown",
+    "reboot",
+}
+RECOVERY_SCAN_KEYS = {"enabled", "delay_seconds", "cooldown_seconds"}
 
 
 @dataclass(frozen=True)
@@ -75,8 +87,8 @@ def validate_config(raw: dict[str, Any]) -> None:
     normalized_vmids: set[int] = set()
     for raw_vmid, value in containers.items():
         try:
-            vmid = int(raw_vmid)
-        except (TypeError, ValueError) as exc:
+            vmid = _strict_int(raw_vmid, "Container VMID")
+        except RuntimeError as exc:
             raise RuntimeError("Container VMIDs must be integers") from exc
         if vmid <= 0 or not isinstance(value, dict):
             raise RuntimeError(f"Invalid container configuration for VMID {raw_vmid}")
@@ -90,6 +102,50 @@ def validate_config(raw: dict[str, Any]) -> None:
         actions = {str(action) for action in actions_raw}
         if not actions <= ALLOWED_REPAIR_ACTIONS:
             raise RuntimeError(f"CT{vmid} contains an unsupported repair action")
+
+        capabilities = value.get("operator_capabilities", {})
+        if not isinstance(capabilities, dict):
+            raise RuntimeError(f"CT{vmid} operator_capabilities must be an object")
+        unknown_capabilities = set(capabilities) - OPERATOR_CAPABILITIES
+        if unknown_capabilities:
+            raise RuntimeError(
+                f"CT{vmid} contains unknown operator capabilities: "
+                f"{', '.join(sorted(str(item) for item in unknown_capabilities))}"
+            )
+        for capability, allowed in capabilities.items():
+            if not isinstance(allowed, bool):
+                raise RuntimeError(
+                    f"CT{vmid} operator_capabilities.{capability} must be a boolean"
+                )
+
+        recovery = value.get("recovery_scan", {})
+        if not isinstance(recovery, dict):
+            raise RuntimeError(f"CT{vmid} recovery_scan must be an object")
+        unknown_recovery = set(recovery) - RECOVERY_SCAN_KEYS
+        if unknown_recovery:
+            raise RuntimeError(
+                f"CT{vmid} contains unknown recovery_scan settings: "
+                f"{', '.join(sorted(str(item) for item in unknown_recovery))}"
+            )
+        enabled = recovery.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise RuntimeError(f"CT{vmid} recovery_scan.enabled must be a boolean")
+        delay = _strict_int(
+            recovery.get("delay_seconds", 90),
+            f"CT{vmid} recovery_scan.delay_seconds",
+        )
+        cooldown = _strict_int(
+            recovery.get("cooldown_seconds", max(900, delay)),
+            f"CT{vmid} recovery_scan.cooldown_seconds",
+        )
+        if delay < 1 or delay > 3600:
+            raise RuntimeError(
+                f"CT{vmid} recovery_scan.delay_seconds must be between 1 and 3600"
+            )
+        if cooldown < delay or cooldown > 604800:
+            raise RuntimeError(
+                f"CT{vmid} recovery_scan.cooldown_seconds must be between delay_seconds and 604800"
+            )
 
         stabilization = value.get("stabilization") or {}
         if not isinstance(stabilization, dict):

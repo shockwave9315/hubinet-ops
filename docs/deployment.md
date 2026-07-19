@@ -2,6 +2,10 @@
 
 No deployment script is run by CI or tests. Review every target and backup location before using these scripts on an administration host.
 
+## Upgrade 0.2.3 to 0.2.4
+
+Follow [the 0.2.4 upgrade guide](upgrade-0.2.4.md). The source may be a git archive without .git metadata. The PVE upgrade and HA installation are separate transactional steps; live lifecycle testing is limited to CT106.
+
 ## Upgrade 0.2.0 to 0.2.1
 
 Run the syntax check first, then invoke `deploy/upgrade-0.2.1-from-pve.sh AGENT_VMID CT106_VMID` from an unpacked release on the Proxmox host.

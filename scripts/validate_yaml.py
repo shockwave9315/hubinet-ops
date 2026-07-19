@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +21,40 @@ def _unknown_tag(loader: HomeAssistantLoader, suffix: str, node: yaml.Node) -> A
 
 HomeAssistantLoader.add_multi_constructor("!", _unknown_tag)
 
+IGNORED_DIRECTORIES = {
+    ".git",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".pytest_tmp",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tmp",
+    "node_modules",
+    "build",
+    "dist",
+    "cache",
+    "runtime",
+    "backups",
+}
+
+
+def yaml_paths(root: Path) -> list[Path]:
+    candidates = list(root.rglob("*.yaml")) + list(root.rglob("*.yml"))
+    return sorted(
+        (
+            path
+            for path in candidates
+            if not any(part.lower() in IGNORED_DIRECTORIES for part in path.relative_to(root).parts)
+        ),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+
 
 def main() -> int:
-    tracked = subprocess.check_output(
-        ["git", "ls-files", "*.yaml", "*.yml"], text=True
-    ).splitlines()
-    paths = [Path(value) for value in tracked]
+    root = Path(__file__).resolve().parents[1]
+    paths = yaml_paths(root)
     for path in paths:
         with path.open("r", encoding="utf-8") as handle:
             yaml.load(handle, Loader=HomeAssistantLoader)

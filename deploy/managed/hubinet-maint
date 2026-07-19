@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_PATH = Path("/etc/hubinet-maint.json")
-VERSION = "0.2.1"
+VERSION = "0.2.4"
 DOCKER_PACKAGES = {
     "docker-ce",
     "docker-ce-cli",
@@ -605,6 +605,55 @@ def inspect(config: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def verify(config: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    apt_check = run(["apt-get", "check"], timeout=300)
+    audit = run(["dpkg", "--audit"], timeout=60)
+    health, health_failures = collect_health(config)
+    failures = list(health_failures)
+    apt_check_ok = apt_check.returncode == 0
+    dpkg_audit_ok = audit.returncode == 0 and not audit.stdout.strip()
+    if not apt_check_ok:
+        failures.append(
+            f"apt-get check failed: {(apt_check.stderr or apt_check.stdout)[-1000:]}"
+        )
+    if not dpkg_audit_ok:
+        audit_detail = (audit.stderr or audit.stdout or "dpkg audit reported an error")[-1000:]
+        failures.append(f"dpkg audit failed: {audit_detail}")
+    final_apt_scan_ok = True
+    verification_warning = None
+    try:
+        updates = apt_scan()
+    except Exception as exc:
+        updates = {"pending_count": None, "packages": []}
+        final_apt_scan_ok = False
+        verification_warning = f"final apt scan failed: {exc}"
+    docker = dict(health.get("docker") or {})
+    data = {
+        **health,
+        "apt_check_ok": apt_check_ok,
+        "dpkg_audit_ok": dpkg_audit_ok,
+        "reboot_required": Path("/var/run/reboot-required").exists(),
+        "updates": updates,
+        "final_apt_scan_ok": final_apt_scan_ok,
+        "verification_warning": verification_warning,
+        "update_status": (
+            "update_available"
+            if final_apt_scan_ok and int(updates.get("pending_count", 0) or 0) > 0
+            else "up_to_date"
+            if final_apt_scan_ok
+            else "unknown"
+        ),
+        "packages_remaining_count": (
+            max(0, int(updates.get("pending_count", 0) or 0))
+            if final_apt_scan_ok
+            else None
+        ),
+        "docker_required_healthy": max(0, int(docker.get("required_healthy", 0) or 0)),
+        "docker_required_total": max(0, int(docker.get("required_total", 0) or 0)),
+    }
+    return data, failures
+
+
 def repair(config: dict[str, Any]) -> dict[str, Any]:
     restarted_services: list[str] = []
     restarted_containers: list[str] = []
@@ -682,6 +731,11 @@ def main() -> None:
             output(True, inspect(config))
         if action == "repair":
             output(True, repair(config))
+        if action == "verify":
+            data, failures = verify(config)
+            if failures:
+                output(False, data, "; ".join(failures), rc=1)
+            output(True, data)
         output(False, error="Action not allowed", rc=1)
     except SystemExit:
         raise

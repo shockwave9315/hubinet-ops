@@ -9,6 +9,12 @@ Hubinet Ops does not expose one overloaded status. Each container state has inde
 | `operation_status` | `idle`, `waiting_approval`, `running`, `success`, `failed`, `rolled_back`, `manual_intervention` | Current or last operator workflow |
 | `job_stage` | `idle`, `scanning`, `preflight`, `snapshot`, `updating`, `waiting_services`, `healthcheck`, `repair`, `rollback`, `rollback_wait`, `rollback_healthcheck`, `completed`, `failed` | Detailed job phase |
 | `last_operation_result` | `success`, `failed`, `rolled_back`, `manual_intervention`, `null` | Durable outcome independent of later scans |
+| `lifecycle_status` | `idle`, `running`, `success`, `failed` | Fixed start/shutdown/reboot operation |
+| `verification_status` | `unknown`, `running`, `passed`, `warning`, `failed` | Final APT/dpkg/service/Docker verification |
+| `expected_lxc_status` | `running`, `stopped`, `null` | Expected result of the most recent lifecycle operation |
+| `intentional_shutdown` | boolean | Suppresses only the availability alert caused by a confirmed graceful shutdown |
+| `lifecycle_health_pending` | boolean | Start/reboot reached `running`, but service health still awaits telemetry |
+| `recovery_scan_status` | `disabled`, `idle`, `scheduled`, `running`, `completed`, `blocked`, `cancelled`, `failed` | Delayed recovery scan state |
 
 Examples:
 

@@ -84,17 +84,22 @@ def create_app(
     @api.post("/api/v1/containers/{vmid}/refresh", dependencies=auth)
     def refresh_one(vmid: int) -> dict[str, Any]:
         try:
-            return service.refresh_container(vmid)
+            return service.refresh_container(vmid, operator=True)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Container not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @api.post("/api/v1/refresh", dependencies=auth)
     def refresh_all() -> list[dict[str, Any]]:
-        return service.refresh_all()
+        return service.refresh_all(operator=True)
 
     @api.post("/api/v1/scan", dependencies=auth)
     def scan_all() -> list[dict[str, Any]]:
-        return service.scan_all()
+        try:
+            return service.scan_all()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @api.post("/api/v1/containers/{vmid}/scan", dependencies=auth)
     def scan_one(vmid: int) -> dict[str, Any]:
@@ -102,6 +107,28 @@ def create_app(
             return service.scan_container(vmid)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Container not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def lifecycle(vmid: int, action: str) -> dict[str, Any]:
+        try:
+            return service.lifecycle_container(vmid, action)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Container not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/containers/{vmid}/start", dependencies=auth)
+    def start_container(vmid: int) -> dict[str, Any]:
+        return lifecycle(vmid, "start")
+
+    @api.post("/api/v1/containers/{vmid}/shutdown", dependencies=auth)
+    def shutdown_container(vmid: int) -> dict[str, Any]:
+        return lifecycle(vmid, "shutdown")
+
+    @api.post("/api/v1/containers/{vmid}/reboot", dependencies=auth)
+    def reboot_container(vmid: int) -> dict[str, Any]:
+        return lifecycle(vmid, "reboot")
 
     @api.post("/api/v1/containers/{vmid}/retry-healthcheck", dependencies=auth)
     def retry_healthcheck(vmid: int) -> dict[str, Any]:

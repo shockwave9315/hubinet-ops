@@ -10,6 +10,7 @@ from typing import Any
 
 from .security import bounded_json, sanitize_data, sanitize_text
 from .state import JOB_STAGES, normalize_state
+from .time_utils import parse_utc_timestamp
 
 
 class Database:
@@ -207,7 +208,8 @@ class Database:
             if plan["status"] != "waiting_approval":
                 conn.execute("ROLLBACK")
                 raise ValueError(f"Plan status is {plan['status']}, not waiting_approval")
-            if datetime.fromisoformat(plan["expires_at"]) <= now:
+            expires_at = parse_utc_timestamp(plan.get("expires_at"))
+            if expires_at is None or expires_at <= now:
                 conn.execute("UPDATE plans SET status='expired' WHERE id=?", (plan_id,))
                 conn.execute("COMMIT")
                 raise ValueError("Plan expired")

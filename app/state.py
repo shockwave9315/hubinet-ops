@@ -4,6 +4,9 @@ from typing import Any
 
 HEALTH_STATUSES = {"healthy", "degraded", "critical", "unknown", "offline"}
 UPDATE_STATUSES = {"unknown", "scanning", "up_to_date", "update_available"}
+LIFECYCLE_STATUSES = {"idle", "running", "success", "failed"}
+VERIFICATION_STATUSES = {"unknown", "running", "passed", "warning", "failed"}
+RECOVERY_SCAN_STATUSES = {"disabled", "idle", "scheduled", "running", "completed", "blocked", "cancelled", "failed"}
 OPERATION_STATUSES = {
     "idle",
     "waiting_approval",
@@ -21,6 +24,10 @@ JOB_STAGES = {
     "updating",
     "waiting_services",
     "healthcheck",
+    "verifying",
+    "starting",
+    "shutting_down",
+    "rebooting",
     "repair",
     "rollback",
     "rollback_wait",
@@ -41,12 +48,27 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
         health = "offline"
     state["health_status"] = health if health in HEALTH_STATUSES else "unknown"
 
-    pending = max(0, _safe_int(state.get("pending_updates"), 0))
+    raw_updates = state.get("updates")
+    updates = dict(raw_updates) if isinstance(raw_updates, dict) else {}
+    explicit_unknown = (
+        "pending_updates" in state and state.get("pending_updates") is None
+    ) or ("pending_count" in updates and updates.get("pending_count") is None)
+    if explicit_unknown:
+        raw_pending = None
+    elif "pending_updates" in state:
+        raw_pending = state.get("pending_updates")
+    elif "pending_count" in updates:
+        raw_pending = updates.get("pending_count")
+    else:
+        raw_pending = 0
+    pending = None if raw_pending is None else max(0, _safe_int(raw_pending, 0))
     update = str(state.get("update_status") or "")
-    if update not in UPDATE_STATUSES:
+    if pending is None:
+        update = "unknown"
+    elif update not in UPDATE_STATUSES:
         if legacy_status == "scanning":
             update = "scanning"
-        elif pending > 0 or legacy_status == "update_available":
+        elif (pending is not None and pending > 0) or legacy_status == "update_available":
             update = "update_available"
         elif state.get("last_scan"):
             update = "up_to_date"
@@ -80,12 +102,7 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     )
     state["pending_updates"] = pending
 
-    raw_updates = state.get("updates")
-    updates = dict(raw_updates) if isinstance(raw_updates, dict) else {}
-    updates["pending_count"] = max(
-        0,
-        _safe_int(updates.get("pending_count"), pending),
-    )
+    updates["pending_count"] = pending
     packages = updates.get("packages")
     updates["packages"] = list(packages)[:200] if isinstance(packages, list) else []
     state["updates"] = updates
@@ -98,6 +115,53 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("last_refresh", None)
     state.setdefault("last_update", None)
     state.setdefault("last_error", None)
+    capabilities = state.get("operator_capabilities")
+    state["operator_capabilities"] = (
+        {str(key): bool(value) for key, value in capabilities.items()}
+        if isinstance(capabilities, dict)
+        else {}
+    )
+    lifecycle_status = str(state.get("lifecycle_status") or "idle")
+    state["lifecycle_status"] = (
+        lifecycle_status if lifecycle_status in LIFECYCLE_STATUSES else "idle"
+    )
+    state.setdefault("lifecycle_action", None)
+    state.setdefault("lifecycle_started_at", None)
+    state.setdefault("lifecycle_finished_at", None)
+    state.setdefault("lifecycle_error", None)
+    expected_lxc = str(state.get("expected_lxc_status") or "")
+    state["expected_lxc_status"] = (
+        expected_lxc if expected_lxc in {"running", "stopped"} else None
+    )
+    state["intentional_shutdown"] = state.get("intentional_shutdown") is True
+    state["lifecycle_health_pending"] = state.get("lifecycle_health_pending") is True
+    verification = str(state.get("verification_status") or "unknown")
+    state["verification_status"] = (
+        verification if verification in VERIFICATION_STATUSES else "unknown"
+    )
+    for key, default in (
+        ("last_verification", None),
+        ("apt_check_ok", None),
+        ("dpkg_audit_ok", None),
+        ("reboot_required", None),
+        ("packages_updated_count", 0),
+        ("packages_remaining_count", 0),
+        ("docker_required_healthy", 0),
+        ("docker_required_total", 0),
+        ("verification_error", None),
+    ):
+        state.setdefault(key, default)
+    recovery = str(state.get("recovery_scan_status") or "disabled")
+    state["recovery_scan_status"] = (
+        recovery if recovery in RECOVERY_SCAN_STATUSES else "disabled"
+    )
+    state.setdefault("recovery_scan_enabled", False)
+    state.setdefault("recovery_scan_due_at", None)
+    state.setdefault("last_recovery_scan", None)
+    state.setdefault("last_recovery_scan_result", None)
+    state.setdefault("last_terminal_event", None)
+    state.setdefault("last_terminal_at", None)
+    state.setdefault("recovery_notification_suppressed_until", None)
     recent = state.get("recent_job_events")
     state["recent_job_events"] = list(recent)[-50:] if isinstance(recent, list) else []
     if not isinstance(state.get("last_job_event"), (dict, type(None))):

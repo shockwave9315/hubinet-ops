@@ -11,7 +11,7 @@ from .security import sanitize_data, sanitize_text
 from .mqtt_budget import bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 
 @dataclass(frozen=True)
@@ -409,7 +409,7 @@ def _ct_entities() -> list[tuple[str, str, str, dict[str, Any]]]:
         ("operation_status", "Operation status", "{{ value_json.operation_status }}", {}),
         ("job_stage", "Job stage", "{{ value_json.job_stage }}", {}),
         ("job_progress", "Job progress", "{{ value_json.job_progress }}", {"unit_of_measurement": "%"}),
-        ("pending_updates", "Pending update count", "{{ value_json.pending_updates }}", {}),
+        ("pending_updates", "Pending update count", "{{ 'unknown' if value_json.pending_updates is none else value_json.pending_updates | default(0) }}", {}),
         ("risk", "Risk", "{{ value_json.risk }}", {}),
         ("disk_used_percent", "Disk used", "{{ value_json.disk.used_percent | default(0) }}", {"unit_of_measurement": "%"}),
         ("disk_free_mb", "Disk free", "{{ value_json.disk.free_mb | default(0) }}", {"unit_of_measurement": "MiB"}),
@@ -424,4 +424,24 @@ def _ct_entities() -> list[tuple[str, str, str, dict[str, Any]]]:
         ("last_operation_result", "Last operation result", "{{ value_json.last_operation_result | default('none', true) }}", {}),
         ("rollback_allowed", "Rollback allowed", "{{ 'allowed' if value_json.rollback_allowed else 'blocked' }}", {}),
         ("last_job_event", "Last job event", "{{ value_json.last_job_event.message | default('none') }}", {}),
+        ("lifecycle_status", "Lifecycle status", "{{ value_json.lifecycle_status | default('idle') }}", {}),
+        ("lifecycle_action", "Lifecycle action", "{{ value_json.lifecycle_action | default('none', true) }}", {}),
+        ("verification_status", "Verification status", "{{ value_json.verification_status | default('unknown') }}", {}),
+        ("last_verification", "Last verification", "{{ value_json.last_verification | default('unknown', true) }}", {}),
+        ("apt_check_ok", "APT check", "{{ 'unknown' if value_json.apt_check_ok is none else 'ok' if value_json.apt_check_ok else 'failed' }}", {}),
+        ("dpkg_audit_ok", "dpkg audit", "{{ 'unknown' if value_json.dpkg_audit_ok is none else 'ok' if value_json.dpkg_audit_ok else 'failed' }}", {}),
+        ("reboot_required", "Reboot required", "{{ 'unknown' if value_json.reboot_required is none else 'yes' if value_json.reboot_required else 'no' }}", {}),
+        ("packages_remaining_count", "Packages remaining", "{{ 'unknown' if value_json.packages_remaining_count is none else value_json.packages_remaining_count | default(0) }}", {}),
+        ("recovery_scan_status", "Recovery scan status", "{{ value_json.recovery_scan_status | default('disabled') }}", {}),
+        ("last_recovery_scan", "Last recovery scan", "{{ value_json.last_recovery_scan | default('unknown', true) }}", {}),
+        ("last_recovery_scan_result", "Last recovery scan result", "{{ value_json.last_recovery_scan_result | default('none', true) }}", {}),
+        ("capability_start", "Capability start", "{{ 'allowed' if value_json.operator_capabilities.start else 'blocked' }}", {}),
+        ("capability_shutdown", "Capability shutdown", "{{ 'allowed' if value_json.operator_capabilities.shutdown else 'blocked' }}", {}),
+        ("capability_reboot", "Capability reboot", "{{ 'allowed' if value_json.operator_capabilities.reboot else 'blocked' }}", {}),
+        ("capability_refresh", "Capability refresh", "{{ 'allowed' if value_json.operator_capabilities.refresh else 'blocked' }}", {}),
+        ("capability_scan", "Capability scan", "{{ 'allowed' if value_json.operator_capabilities.scan else 'blocked' }}", {}),
+        ("capability_approve", "Capability approve", "{{ 'allowed' if value_json.operator_capabilities.approve else 'blocked' }}", {}),
+        ("capability_reject", "Capability reject", "{{ 'allowed' if value_json.operator_capabilities.reject else 'blocked' }}", {}),
+        ("capability_retry_healthcheck", "Capability retry healthcheck", "{{ 'allowed' if value_json.operator_capabilities.retry_healthcheck else 'blocked' }}", {}),
+        ("capability_rollback", "Capability rollback", "{{ 'allowed' if value_json.operator_capabilities.rollback else 'blocked' }}", {}),
     ]

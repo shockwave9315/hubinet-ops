@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import threading
-from datetime import UTC, datetime
+import time
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 import httpx
@@ -16,6 +18,7 @@ from .mqtt import MqttTelemetry, VERSION
 from .security import sanitize_data, sanitize_text
 from .stabilization import StabilizationPolicy, Stabilizer
 from .state import normalize_state
+from .time_utils import parse_utc_timestamp
 
 LOGGER = logging.getLogger("hubinet_ops")
 
@@ -27,12 +30,21 @@ STAGE_PROGRESS = {
     "updating": 30,
     "waiting_services": 75,
     "healthcheck": 80,
+    "verifying": 97,
     "repair": 85,
     "rollback": 88,
     "rollback_wait": 90,
     "rollback_healthcheck": 92,
     "completed": 100,
     "failed": 100,
+}
+TERMINAL_JOB_STATUSES = {
+    "blocked",
+    "failed",
+    "interrupted",
+    "recovered",
+    "rolled_back",
+    "success",
 }
 
 
@@ -44,15 +56,23 @@ class OpsService:
         executor: Executor,
         mqtt: MqttTelemetry | None = None,
         stabilizer: Stabilizer | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] | None = None,
     ):
         self.settings = settings
         self.db = db
         self.executor = executor
         self.mqtt = mqtt or MqttTelemetry({"enabled": False}, settings.containers)
         self._stop = threading.Event()
+        self._monotonic = monotonic
+        self._now = now or (lambda: datetime.now(UTC))
         self.stabilizer = stabilizer or Stabilizer(executor, self._stop)
         self._scan_all_lock = threading.Lock()
         self._scan_locks = {vmid: threading.Lock() for vmid in settings.containers}
+        self._recovery_lock = threading.RLock()
+        self._recovery_wakeup = threading.Event()
+        self._recovery_due: dict[int, float] = {}
+        self._observed_health: dict[int, str] = {}
         self._worker = threading.Thread(target=self._worker_loop, name="ops-worker", daemon=True)
         self._scheduler = threading.Thread(
             target=self._scheduler_loop,
@@ -64,6 +84,11 @@ class OpsService:
             name="ops-telemetry",
             daemon=True,
         )
+        self._recovery_worker = threading.Thread(
+            target=self._recovery_loop,
+            name="ops-recovery-scan",
+            daemon=True,
+        )
         self.mqtt.set_state_provider(self._mqtt_snapshot)
 
     def start(self) -> None:
@@ -71,13 +96,16 @@ class OpsService:
         self.mqtt.start()
         self._worker.start()
         self._telemetry.start()
+        self._recovery_worker.start()
         if bool(self.settings.scheduler.get("enabled", False)):
             self._scheduler.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._recovery_wakeup.set()
         self._worker.join(timeout=5)
         self._telemetry.join(timeout=5)
+        self._recovery_worker.join(timeout=5)
         if self._scheduler.is_alive():
             self._scheduler.join(timeout=5)
         self.mqtt.stop()
@@ -95,6 +123,7 @@ class OpsService:
                 "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
                 "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
                 "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
+                "operator_capabilities": self._capabilities(vmid),
             }
             state = self.db.get_container_state(vmid)
             if state:
@@ -118,12 +147,16 @@ class OpsService:
             state = self._save_state(vmid, self._base_state(vmid))
         return state
 
-    def refresh_container(self, vmid: int) -> dict[str, Any]:
+    def refresh_container(self, vmid: int, *, operator: bool = False) -> dict[str, Any]:
         cfg = self._container(vmid)
+        if operator:
+            self._require_capability(vmid, "refresh")
         if not bool(cfg.get("enabled", False)):
             state = self.get_state(vmid)
             state.update({"health_status": "unknown", "health_score": 0})
-            return self._save_state(vmid, state)
+            saved = self._save_state(vmid, state)
+            self._observe_health(vmid, str(saved.get("health_status", "unknown")))
+            return saved
         try:
             inspected = self.executor.run("inspect", vmid, timeout=120).get("data", {})
             # Inspect may take long enough for a job to reach a terminal state.
@@ -135,6 +168,11 @@ class OpsService:
                 "health_status",
                 inspected.get("health", "unknown"),
             )
+            if inspected.get("lxc_status") == "running":
+                state["intentional_shutdown"] = False
+                state["lifecycle_health_pending"] = False
+                if state.get("lifecycle_status") != "running":
+                    state["expected_lxc_status"] = None
             state["last_refresh"] = utc_now()
             if state.get("last_operation_result") is None:
                 state["last_error"] = None
@@ -148,46 +186,76 @@ class OpsService:
                     "last_refresh": utc_now(),
                 }
             )
-        return self._save_state(vmid, state)
+        saved = self._save_state(vmid, state)
+        self._observe_health(vmid, str(saved.get("health_status", "unknown")))
+        return saved
 
-    def refresh_all(self) -> list[dict[str, Any]]:
+    def refresh_all(self, *, operator: bool = False) -> list[dict[str, Any]]:
         return [
-            self.refresh_container(vmid)
+            self.refresh_container(vmid, operator=operator)
             for vmid, cfg in sorted(self.settings.containers.items())
             if bool(cfg.get("enabled", False))
+            and (not operator or self._capabilities(vmid)["refresh"])
         ]
 
-    def scan_all(self) -> list[dict[str, Any]]:
+    def scan_all(self, *, operator: bool = True) -> list[dict[str, Any]]:
         if not self._scan_all_lock.acquire(blocking=False):
             return [{"status": "skipped", "reason": "scan_all_already_running"}]
         try:
             return [
-                self.scan_container(vmid)
+                self.scan_container(vmid, operator=operator)
                 for vmid, cfg in sorted(self.settings.containers.items())
                 if bool(cfg.get("enabled", False))
+                and (not operator or self._capabilities(vmid)["scan"])
             ]
         finally:
             self._scan_all_lock.release()
 
-    def scan_container(self, vmid: int) -> dict[str, Any]:
+    def scan_container(
+        self,
+        vmid: int,
+        *,
+        operator: bool = True,
+        source: str = "operator",
+    ) -> dict[str, Any]:
         cfg = self._container(vmid)
+        if operator:
+            self._require_capability(vmid, "scan")
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
+            if operator:
+                raise ValueError("scan_already_running")
             return {"vmid": vmid, "status": "skipped", "reason": "scan_already_running"}
         try:
             active_job = self.db.get_active_job(vmid)
             if active_job is not None:
+                if operator:
+                    raise ValueError("job_active")
                 return {
                     "vmid": vmid,
                     "status": "skipped",
                     "reason": "job_active",
                     "job_id": active_job["id"],
                 }
-            return self._scan_container_locked(vmid, cfg)
+            if self.get_state(vmid).get("lifecycle_status") == "running":
+                if operator:
+                    raise ValueError("lifecycle_active")
+                return {
+                    "vmid": vmid,
+                    "status": "skipped",
+                    "reason": "lifecycle_active",
+                }
+            return self._scan_container_locked(vmid, cfg, source=source)
         finally:
             lock.release()
 
-    def _scan_container_locked(self, vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    def _scan_container_locked(
+        self,
+        vmid: int,
+        cfg: dict[str, Any],
+        *,
+        source: str = "operator",
+    ) -> dict[str, Any]:
         if not bool(cfg.get("enabled", False)):
             return {"vmid": vmid, "status": "disabled"}
         if cfg.get("adapter", "apt") != "apt":
@@ -254,7 +322,7 @@ class OpsService:
                 }
             )
             self._save_state(vmid, state)
-            return {"vmid": vmid, "status": "up_to_date", "data": data}
+            return {"vmid": vmid, "status": "up_to_date", "data": data, "source": source}
 
         fingerprint = str(data.get("fingerprint") or _fingerprint(data))
         active = self.db.find_active_plan(vmid, fingerprint)
@@ -290,11 +358,12 @@ class OpsService:
             }
         )
         self._save_state(vmid, state)
-        return {"vmid": vmid, "status": status, "plan": active}
+        return {"vmid": vmid, "status": status, "plan": active, "source": source}
 
     def approve(self, plan_id: str) -> dict[str, Any]:
         candidate = self.db.get_plan(plan_id)
         vmid = int(candidate["vmid"])
+        self._require_capability(vmid, "approve")
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
             raise ValueError(
@@ -322,6 +391,8 @@ class OpsService:
             lock.release()
 
     def reject(self, plan_id: str) -> dict[str, Any]:
+        candidate = self.db.get_plan(plan_id)
+        self._require_capability(int(candidate["vmid"]), "reject")
         plan = self.db.reject_plan(plan_id)
         vmid = int(plan["vmid"])
         state = self.get_state(vmid)
@@ -340,6 +411,7 @@ class OpsService:
 
     def retry_healthcheck(self, vmid: int) -> dict[str, Any]:
         cfg = self._container(vmid)
+        self._require_capability(vmid, "retry_healthcheck")
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
             raise ValueError("Another scan or manual operation is active for this container")
@@ -388,6 +460,7 @@ class OpsService:
 
     def manual_rollback(self, vmid: int) -> dict[str, Any]:
         cfg = self._container(vmid)
+        self._require_capability(vmid, "rollback")
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
             raise ValueError("Another scan or manual operation is active for this container")
@@ -408,6 +481,346 @@ class OpsService:
         finally:
             lock.release()
 
+    def lifecycle_container(self, vmid: int, action: str) -> dict[str, Any]:
+        if action not in {"start", "shutdown", "reboot"}:
+            raise ValueError("Unsupported lifecycle action")
+        self._container(vmid)
+        self._require_capability(vmid, action)
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("Another scan or lifecycle operation is active for this container")
+        started_at = self._now().isoformat()
+        try:
+            if self.db.get_active_job(vmid) is not None:
+                raise ValueError("Another job is already active for this container")
+            state = self.get_state(vmid)
+            if state.get("lifecycle_status") == "running":
+                raise ValueError("Another lifecycle operation is already active")
+            if state.get("update_status") == "scanning":
+                raise ValueError("An update scan is already active")
+            if self.db.find_active_plan(vmid) is not None:
+                raise ValueError("An active update plan must be resolved before lifecycle control")
+
+            try:
+                status_result = self.executor.run("status", vmid, timeout=30)
+                lxc_status = str(status_result.get("data", {}).get("status", "unknown"))
+            except ExecutorError as exc:
+                raise ValueError(f"Cannot read current LXC state: {exc}") from exc
+            if action == "start" and lxc_status != "stopped":
+                raise ValueError(f"Start requires a stopped container; current state is {lxc_status}")
+            if action in {"shutdown", "reboot"} and lxc_status != "running":
+                raise ValueError(
+                    f"{action.capitalize()} requires a running container; current state is {lxc_status}"
+                )
+
+            stage = {
+                "start": "starting",
+                "shutdown": "shutting_down",
+                "reboot": "rebooting",
+            }[action]
+            expected_lxc = "stopped" if action == "shutdown" else "running"
+            state.update(
+                {
+                    "lifecycle_action": action,
+                    "lifecycle_status": "running",
+                    "lifecycle_started_at": started_at,
+                    "lifecycle_finished_at": None,
+                    "lifecycle_error": None,
+                    "operation_status": "running",
+                    "job_stage": stage,
+                    "job_progress": 10,
+                    "last_operation_result": None,
+                    "active_job_id": None,
+                    "expected_lxc_status": expected_lxc,
+                    "intentional_shutdown": False,
+                    "lifecycle_health_pending": action in {"start", "reboot"},
+                }
+            )
+            self._save_state(vmid, state)
+            try:
+                self.executor.run(action, vmid, timeout=180)
+                verified = self.executor.run("status", vmid, timeout=30)
+                final_lxc = str(verified.get("data", {}).get("status", "unknown"))
+                expected = "stopped" if action == "shutdown" else "running"
+                if final_lxc != expected:
+                    raise ExecutorError(
+                        f"Lifecycle verification expected {expected}, got {final_lxc}"
+                    )
+            except ExecutorError as exc:
+                state = self.get_state(vmid)
+                state.update(
+                    {
+                        "lifecycle_status": "failed",
+                        "lifecycle_finished_at": self._now().isoformat(),
+                        "lifecycle_error": sanitize_text(exc, limit=2000),
+                        "operation_status": "failed",
+                        "job_stage": "failed",
+                        "job_progress": 100,
+                        "last_operation_result": "failed",
+                        "last_error": sanitize_text(exc, limit=2000),
+                        "expected_lxc_status": None,
+                        "intentional_shutdown": False,
+                        "lifecycle_health_pending": False,
+                    }
+                )
+                self._save_state(vmid, state)
+                self._notify_ha(
+                    self._notification(
+                        "lifecycle_failed",
+                        vmid,
+                        action=action,
+                        error=str(exc),
+                    )
+                )
+                raise ValueError(str(exc)) from exc
+
+            state = self.get_state(vmid)
+            terminal_at = self._now()
+            health_pending = action in {"start", "reboot"}
+            state.update(
+                {
+                    "lxc_status": final_lxc,
+                    "health_status": "offline" if final_lxc == "stopped" else "unknown",
+                    "lifecycle_status": "success",
+                    "lifecycle_finished_at": terminal_at.isoformat(),
+                    "lifecycle_error": None,
+                    "operation_status": "success",
+                    "job_stage": "completed",
+                    "job_progress": 100,
+                    "last_operation_result": "success",
+                    "last_error": None,
+                    "expected_lxc_status": expected_lxc,
+                    "intentional_shutdown": action == "shutdown",
+                    "lifecycle_health_pending": health_pending,
+                    "last_terminal_event": f"lifecycle_{action}",
+                    "last_terminal_at": terminal_at.isoformat(),
+                    "recovery_notification_suppressed_until": (
+                        (terminal_at + timedelta(seconds=180)).isoformat()
+                        if health_pending
+                        else state.get("recovery_notification_suppressed_until")
+                    ),
+                }
+            )
+            saved = self._save_state(vmid, state)
+            self._notify_ha(
+                self._notification(
+                    "lifecycle_success",
+                    vmid,
+                    action=action,
+                    lxc_status=final_lxc,
+                    health_pending=health_pending,
+                )
+            )
+            return saved
+        finally:
+            lock.release()
+
+    def _observe_health(self, vmid: int, health: str) -> None:
+        previous = self._observed_health.get(vmid)
+        self._observed_health[vmid] = health
+        if previous is None:
+            return
+        if health != "healthy":
+            try:
+                self._cancel_recovery_scan(vmid, "health_changed")
+            except Exception as exc:
+                LOGGER.exception("Failed to cancel recovery scan for CT%s", vmid)
+                self._record_recovery_failure(vmid, exc, status="failed")
+            return
+        if previous in {"offline", "critical", "degraded"}:
+            try:
+                self._schedule_recovery_scan(vmid)
+            except Exception as exc:
+                LOGGER.exception("Failed to schedule recovery scan for CT%s", vmid)
+                self._record_recovery_failure(vmid, exc, status="failed")
+
+    def _recovery_settings(self, vmid: int) -> tuple[bool, int, int]:
+        raw = self._container(vmid).get("recovery_scan") or {}
+        if not isinstance(raw, dict):
+            raise TypeError("recovery_scan must be an object")
+        delay = max(1, _safe_int(raw.get("delay_seconds"), 90))
+        cooldown_default = max(900, delay)
+        cooldown = max(delay, _safe_int(raw.get("cooldown_seconds"), cooldown_default))
+        return bool(raw.get("enabled", False)), delay, cooldown
+
+    def _schedule_recovery_scan(self, vmid: int) -> None:
+        enabled, delay, _ = self._recovery_settings(vmid)
+        if not enabled or not self._capabilities(vmid)["scan"]:
+            return
+        with self._recovery_lock:
+            self._recovery_due[vmid] = self._monotonic() + delay
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "recovery_scan_status": "scheduled",
+                "recovery_scan_due_at": (self._now() + timedelta(seconds=delay)).isoformat(),
+                "last_recovery_scan_result": None,
+            }
+        )
+        self._save_state(vmid, state)
+        self._recovery_wakeup.set()
+
+    def _cancel_recovery_scan(self, vmid: int, reason: str) -> None:
+        with self._recovery_lock:
+            existed = self._recovery_due.pop(vmid, None) is not None
+        if not existed:
+            return
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "recovery_scan_status": "cancelled",
+                "recovery_scan_due_at": None,
+                "last_recovery_scan_result": reason,
+            }
+        )
+        self._save_state(vmid, state)
+        self._recovery_wakeup.set()
+
+    def _recovery_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                now_monotonic = self._monotonic()
+                if not math.isfinite(now_monotonic):
+                    raise ValueError("monotonic clock must be finite")
+                self._run_due_recovery_scans(now_monotonic)
+                with self._recovery_lock:
+                    deadlines = [
+                        float(value)
+                        for value in self._recovery_due.values()
+                        if isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and math.isfinite(float(value))
+                    ]
+                next_due = min(deadlines, default=None)
+                timeout = (
+                    60.0
+                    if next_due is None
+                    else max(0.0, next_due - self._monotonic())
+                )
+            except Exception:
+                LOGGER.exception("Unhandled recovery-loop iteration failure")
+                timeout = 1.0
+            try:
+                self._recovery_wakeup.wait(min(timeout, 60.0))
+                self._recovery_wakeup.clear()
+            except Exception:
+                LOGGER.exception("Recovery-loop wait failed")
+
+    def _run_due_recovery_scans(self, now_monotonic: float) -> None:
+        due: list[int] = []
+        invalid: list[tuple[int, Exception]] = []
+        with self._recovery_lock:
+            for raw_vmid, deadline in list(self._recovery_due.items()):
+                try:
+                    vmid = int(raw_vmid)
+                    if isinstance(deadline, bool):
+                        raise TypeError("recovery deadline must be numeric")
+                    parsed_deadline = float(deadline)
+                    if not math.isfinite(parsed_deadline):
+                        raise ValueError("recovery deadline must be finite")
+                    if parsed_deadline <= now_monotonic:
+                        due.append(vmid)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    invalid.append((_safe_int(raw_vmid, 0), exc))
+                    self._recovery_due.pop(raw_vmid, None)
+            for vmid in due:
+                self._recovery_due.pop(vmid, None)
+        for vmid, exc in invalid:
+            LOGGER.warning("Discarding malformed recovery deadline for CT%s: %s", vmid, exc)
+            if vmid in self.settings.containers:
+                self._record_recovery_failure(vmid, exc, status="failed")
+        for vmid in sorted(due):
+            if self._stop.is_set():
+                return
+            try:
+                self._run_recovery_scan(vmid)
+            except Exception as exc:
+                LOGGER.exception("Unhandled recovery scan failure for CT%s", vmid)
+                self._record_recovery_failure(vmid, exc, status="failed")
+
+    def _record_recovery_failure(
+        self,
+        vmid: int,
+        error: object,
+        *,
+        status: str,
+    ) -> None:
+        try:
+            state = self.get_state(vmid)
+            state.update(
+                {
+                    "recovery_scan_status": status,
+                    "recovery_scan_due_at": None,
+                    "last_recovery_scan_result": sanitize_text(error, limit=500),
+                }
+            )
+            self._save_state(vmid, state)
+        except Exception:
+            LOGGER.exception("Failed to persist recovery failure for CT%s", vmid)
+
+    def _run_recovery_scan(self, vmid: int) -> None:
+        enabled, _, cooldown = self._recovery_settings(vmid)
+        state = self.get_state(vmid)
+        reason: str | None = None
+        if not enabled:
+            reason = "disabled"
+        elif not self._capabilities(vmid)["scan"]:
+            reason = "scan_not_allowed"
+        elif state.get("health_status") != "healthy" or state.get("lxc_status") != "running":
+            reason = "container_not_healthy_running"
+        elif self.db.get_active_job(vmid) is not None:
+            reason = "job_active"
+        elif state.get("update_status") == "scanning":
+            reason = "scan_active"
+        elif state.get("lifecycle_status") == "running":
+            reason = "lifecycle_active"
+        elif self.db.find_active_plan(vmid) is not None:
+            reason = "plan_active"
+        last_scan = state.get("last_recovery_scan")
+        if reason is None and last_scan:
+            parsed_last_scan = parse_utc_timestamp(last_scan)
+            parsed_now = parse_utc_timestamp(self._now())
+            if parsed_last_scan is None or parsed_now is None:
+                reason = "invalid_previous_recovery_timestamp"
+            elif (parsed_now - parsed_last_scan).total_seconds() < cooldown:
+                reason = "cooldown_active"
+        if reason is not None:
+            state.update(
+                {
+                    "recovery_scan_status": "blocked",
+                    "recovery_scan_due_at": None,
+                    "last_recovery_scan_result": reason,
+                }
+            )
+            self._save_state(vmid, state)
+            return
+
+        state.update(
+            {
+                "recovery_scan_status": "running",
+                "recovery_scan_due_at": None,
+            }
+        )
+        self._save_state(vmid, state)
+        try:
+            result = self.scan_container(vmid, operator=False, source="recovery")
+            result_status = str(result.get("status", "unknown"))
+            final_status = "completed" if result_status not in {"error", "skipped"} else "failed"
+        except Exception as exc:
+            LOGGER.warning("Recovery scan failed for CT%s: %s", vmid, sanitize_text(exc, limit=500))
+            result_status = sanitize_text(exc, limit=500)
+            final_status = "failed"
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "recovery_scan_status": final_status,
+                "last_recovery_scan": self._now().isoformat(),
+                "last_recovery_scan_result": result_status,
+                "recovery_scan_due_at": None,
+            }
+        )
+        self._save_state(vmid, state)
+
     def _worker_loop(self) -> None:
         while not self._stop.is_set():
             job = self.db.next_queued_job()
@@ -418,15 +831,27 @@ class OpsService:
                 self._run_job(job)
             except Exception:
                 LOGGER.exception("Unhandled worker failure for job %s", job.get("id"))
-                try:
-                    self._terminal(
-                        job,
-                        "failed",
-                        "manual_intervention",
-                        "Unhandled worker error",
-                    )
-                except Exception:
-                    LOGGER.exception("Failed to persist terminal state for job %s", job.get("id"))
+                self._handle_unhandled_worker_failure(job)
+
+    def _handle_unhandled_worker_failure(self, job: dict[str, Any]) -> None:
+        try:
+            current = self.db.get_job(str(job["id"]))
+            if str(current.get("status")) in TERMINAL_JOB_STATUSES:
+                LOGGER.warning(
+                    "Worker exception occurred after terminal job %s (%s); "
+                    "terminal state is preserved",
+                    job.get("id"),
+                    current.get("status"),
+                )
+                return
+            self._terminal(
+                current,
+                "failed",
+                "manual_intervention",
+                "Unhandled worker error",
+            )
+        except Exception:
+            LOGGER.exception("Failed to persist terminal state for job %s", job.get("id"))
 
     def _run_job(self, job: dict[str, Any]) -> None:
         vmid = int(job["vmid"])
@@ -506,36 +931,96 @@ class OpsService:
                 message="Post-update service stabilization passed",
             )
 
-            post_scan_error: str | None = None
+            emit(
+                stage="verifying",
+                progress=97,
+                event_type="verification_started",
+                message="Final package and service verification started",
+            )
+            state = self.get_state(vmid)
+            state.update(
+                {
+                    "verification_status": "running",
+                    "verification_error": None,
+                }
+            )
+            self._save_state(vmid, state)
             try:
-                post_scan = self.executor.run("scan", vmid, timeout=700)
+                verification = self._execute("verify", vmid, 700, emit)
             except ExecutorError as exc:
-                post_scan_error = str(exc)
-                post_scan = {"ok": False, "data": {}, "error": post_scan_error}
-                emit(
-                    stage="healthcheck",
-                    progress=98,
-                    level="warning",
-                    event_type="post_scan_failed",
-                    message="Health passed, but the post-update package scan failed",
-                    details={"error": post_scan_error},
+                failed_verification = dict(exc.data or {})
+                state = self.get_state(vmid)
+                state.update(failed_verification)
+                state.update(
+                    {
+                        "verification_status": "failed",
+                        "last_verification": self._now().isoformat(),
+                        "verification_error": sanitize_text(exc, limit=2000),
+                    }
                 )
+                self._save_state(vmid, state)
+                raise
+            verification_data = dict(verification.get("data") or {})
+            updates = dict(verification_data.get("updates") or {})
+            updates["packages"] = list(updates.get("packages") or [])[:200]
+            final_apt_scan_ok = bool(
+                verification_data.get("final_apt_scan_ok", True)
+            )
+            pending = (
+                max(0, int(updates.get("pending_count", 0) or 0))
+                if final_apt_scan_ok
+                else None
+            )
+            if not final_apt_scan_ok:
+                updates["pending_count"] = None
+            verification_warning = (
+                sanitize_text(
+                    verification_data.get("verification_warning"),
+                    limit=2000,
+                )
+                if verification_data.get("verification_warning")
+                else None
+            )
+            packages_updated = max(
+                0,
+                int(update.get("data", {}).get("package_total", 0) or 0),
+            )
+            raw_reboot_required = verification_data.get("reboot_required")
+            reboot_required = (
+                raw_reboot_required
+                if isinstance(raw_reboot_required, bool)
+                else None
+            )
+            verification_status = (
+                "warning"
+                if reboot_required is True or bool(pending) or not final_apt_scan_ok
+                else "passed"
+            )
+            docker = dict(verification_data.get("docker") or health.get("docker") or {})
+            docker_healthy = max(0, int(docker.get("required_healthy", 0) or 0))
+            docker_total = max(0, int(docker.get("required_total", 0) or 0))
+            emit(
+                stage="verifying",
+                progress=99,
+                level="warning" if verification_status == "warning" else "info",
+                event_type=f"verification_{verification_status}",
+                message="Final verification completed",
+                details={
+                    "packages_remaining_count": pending,
+                    "reboot_required": reboot_required,
+                    "docker_required_healthy": docker_healthy,
+                    "docker_required_total": docker_total,
+                },
+            )
             result = {
                 "preflight": preflight,
                 "update": update,
                 "healthcheck": health,
-                "post_scan": post_scan,
+                "verification": verification,
             }
             self.db.update_job(job["id"], result=result)
             self.db.update_plan_status(job["plan_id"], "completed")
             state = self.get_state(vmid)
-            updates = (
-                dict(post_scan.get("data", {}))
-                if post_scan.get("ok")
-                else dict(state.get("updates") or {})
-            )
-            updates["packages"] = list(updates.get("packages") or [])[:200]
-            pending = max(0, int(updates.get("pending_count", 0) or 0))
             state.update(health)
             state.update(
                 {
@@ -547,22 +1032,61 @@ class OpsService:
                     "pending_updates": pending,
                     "update_status": (
                         "unknown"
-                        if post_scan_error
-                        else ("update_available" if pending else "up_to_date")
+                        if not final_apt_scan_ok
+                        else "update_available"
+                        if pending
+                        else "up_to_date"
                     ),
                     "active_plan_id": None,
                     "active_plan_status": "completed",
                     "active_job_id": job["id"],
                     "last_update": utc_now(),
-                    "last_error": post_scan_error,
+                    "last_error": None,
                     "snapshot_name": snapshot if auto_rollback else None,
+                    "verification_status": verification_status,
+                    "last_verification": self._now().isoformat(),
+                    "apt_check_ok": bool(verification_data.get("apt_check_ok", False)),
+                    "dpkg_audit_ok": bool(verification_data.get("dpkg_audit_ok", False)),
+                    "reboot_required": reboot_required,
+                    "packages_updated_count": packages_updated,
+                    "packages_remaining_count": pending,
+                    "docker_required_healthy": docker_healthy,
+                    "docker_required_total": docker_total,
+                    "verification_error": verification_warning,
                 }
             )
             self._save_state(vmid, state)
             self._terminal(job, "success", "success", None)
-            self._notify_ha(self._notification("job_success", vmid))
+            if final_apt_scan_ok and pending is not None and pending > 0:
+                self._create_followup_plan(vmid, cfg, updates)
+            duration = self._best_effort_duration(job)
+            self._notify_ha(
+                self._notification(
+                    "job_success",
+                    vmid,
+                    packages_updated_count=packages_updated,
+                    packages_remaining_count=pending,
+                    reboot_required=reboot_required,
+                    apt_check_ok=bool(verification_data.get("apt_check_ok", False)),
+                    dpkg_audit_ok=bool(verification_data.get("dpkg_audit_ok", False)),
+                    docker_required_healthy=docker_healthy,
+                    docker_required_total=docker_total,
+                    verification_status=verification_status,
+                    verification_warning=verification_warning,
+                    duration_seconds=duration,
+                )
+            )
         except ExecutorError as exc:
-            failed_stage = self.db.get_job(job["id"])["stage"]
+            current_job = self.db.get_job(job["id"])
+            if str(current_job.get("status")) in TERMINAL_JOB_STATUSES:
+                LOGGER.warning(
+                    "Executor-style exception occurred after terminal job %s (%s); "
+                    "terminal state is preserved",
+                    job.get("id"),
+                    current_job.get("status"),
+                )
+                return
+            failed_stage = current_job["stage"]
             LOGGER.error("Job %s failed at %s: %s", job["id"], failed_stage, exc)
             if failed_stage in {"preflight", "snapshot"}:
                 self.db.update_plan_status(job["plan_id"], "blocked")
@@ -646,6 +1170,47 @@ class OpsService:
             emit=emit,
             initial_grace=False,
         )
+
+    def _create_followup_plan(
+        self,
+        vmid: int,
+        cfg: dict[str, Any],
+        updates: dict[str, Any],
+    ) -> dict[str, Any]:
+        fingerprint = str(updates.get("fingerprint") or _fingerprint(updates))
+        active = self.db.find_active_plan(vmid, fingerprint)
+        created = active is None
+        if active is None:
+            active = self.db.create_plan(
+                vmid=vmid,
+                container_name=str(cfg.get("name", f"ct-{vmid}")),
+                fingerprint=fingerprint,
+                risk=_risk_for(cfg, updates),
+                payload=updates,
+                ttl_minutes=int(self.settings.scheduler.get("approval_ttl_minutes", 1440)),
+            )
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "risk": active["risk"],
+                "active_plan_id": active["id"],
+                "active_plan_status": active["status"],
+                "operation_status": "waiting_approval",
+                "job_stage": "idle",
+                "job_progress": 0,
+            }
+        )
+        self._save_state(vmid, state)
+        if created:
+            self._notify_ha(
+                self._notification(
+                    "approval_required",
+                    vmid,
+                    pending_count=max(0, int(updates.get("pending_count", 0) or 0)),
+                    risk=active["risk"],
+                )
+            )
+        return active
 
     def _rollback(self, job: dict[str, Any], cause: str) -> None:
         vmid = int(job["vmid"])
@@ -731,6 +1296,15 @@ class OpsService:
         result: str,
         error: str | None,
     ) -> None:
+        current = self.db.get_job(str(job["id"]))
+        if str(current.get("status")) in TERMINAL_JOB_STATUSES:
+            LOGGER.warning(
+                "Ignoring duplicate terminal transition for job %s already in %s",
+                job.get("id"),
+                current.get("status"),
+            )
+            return
+        job = current
         operation = {
             "success": "success",
             "rolled_back": "rolled_back",
@@ -764,6 +1338,8 @@ class OpsService:
             }.get(job_status, "failed")
             self.db.update_plan_status(job["plan_id"], plan_status)
         state = self.get_state(int(job["vmid"]))
+        terminal_at = self._now()
+        suppress_recovery = result in {"success", "rolled_back"}
         state.update(
             {
                 "active_plan_id": None,
@@ -779,6 +1355,13 @@ class OpsService:
                     else state.get("last_error")
                 ),
                 "last_job_event": event,
+                "last_terminal_event": f"job_{result}",
+                "last_terminal_at": terminal_at.isoformat(),
+                "recovery_notification_suppressed_until": (
+                    (terminal_at + timedelta(seconds=180)).isoformat()
+                    if suppress_recovery
+                    else state.get("recovery_notification_suppressed_until")
+                ),
             }
         )
         self._save_state(int(job["vmid"]), state)
@@ -788,6 +1371,24 @@ class OpsService:
             self.db.get_job(job["id"]),
             force=True,
         )
+
+    def _best_effort_duration(self, job: dict[str, Any]) -> int | None:
+        created_at = parse_utc_timestamp(job.get("created_at"))
+        finished_at = parse_utc_timestamp(self._now())
+        if created_at is None or finished_at is None:
+            LOGGER.warning(
+                "Cannot calculate duration for job %s: malformed timestamp",
+                job.get("id"),
+            )
+            return None
+        try:
+            return max(0, int((finished_at - created_at).total_seconds()))
+        except (TypeError, ValueError, OverflowError):
+            LOGGER.warning(
+                "Cannot calculate duration for job %s: incompatible timestamp",
+                job.get("id"),
+            )
+            return None
 
     def _emitter(self, job: dict[str, Any]) -> Callable[..., None]:
         def emit(
@@ -844,6 +1445,7 @@ class OpsService:
             "update": "updating",
             "repair": "repair",
             "rollback": "rollback",
+            "verify": "verifying",
         }.get(action, "idle")
 
         def on_event(item: dict[str, Any]) -> None:
@@ -914,6 +1516,10 @@ class OpsService:
                 ),
                 "rollback_allowed": bool(
                     cfg.get("manual_rollback_allowed", False)
+                ) and self._capabilities(vmid)["rollback"],
+                "operator_capabilities": self._capabilities(vmid),
+                "recovery_scan_enabled": bool(
+                    (cfg.get("recovery_scan") or {}).get("enabled", False)
                 ),
             }
         )
@@ -942,12 +1548,53 @@ class OpsService:
                 "last_operation_result": None,
                 "pending_updates": 0,
                 "updates": {"pending_count": 0, "packages": []},
+                "operator_capabilities": self._capabilities(vmid),
+                "lifecycle_status": "idle",
+                "verification_status": "unknown",
+                "recovery_scan_enabled": bool(
+                    (self._container(vmid).get("recovery_scan") or {}).get("enabled", False)
+                ),
+                "recovery_scan_status": (
+                    "idle"
+                    if bool(
+                        (self._container(vmid).get("recovery_scan") or {}).get("enabled", False)
+                    )
+                    else "disabled"
+                ),
             }
         )
 
     def _ensure_initial_states(self) -> None:
         for vmid in self.settings.containers:
             state = self.db.get_container_state(vmid) or self._base_state(vmid)
+            if state.get("lifecycle_status") == "running":
+                state.update(
+                    {
+                        "lifecycle_status": "failed",
+                        "lifecycle_finished_at": self._now().isoformat(),
+                        "lifecycle_error": "Agent restarted during lifecycle operation",
+                        "operation_status": "failed",
+                        "job_stage": "failed",
+                        "job_progress": 100,
+                        "last_operation_result": "failed",
+                        "last_error": "Agent restarted during lifecycle operation",
+                        "expected_lxc_status": None,
+                        "intentional_shutdown": False,
+                        "lifecycle_health_pending": False,
+                    }
+                )
+            if state.get("recovery_scan_status") in {"scheduled", "running"}:
+                state.update(
+                    {
+                        "recovery_scan_status": "cancelled",
+                        "recovery_scan_due_at": None,
+                        "last_recovery_scan_result": "agent_restarted",
+                    }
+                )
+            if state.get("update_status") == "scanning":
+                state["update_status"] = "unknown"
+                if state.get("job_stage") == "scanning":
+                    state["job_stage"] = "idle"
             latest = self.db.get_latest_job(vmid)
             if latest and latest.get("status") == "interrupted":
                 state.update(
@@ -974,7 +1621,7 @@ class OpsService:
         )
         while not self._stop.is_set():
             try:
-                self.scan_all()
+                self.scan_all(operator=True)
             except Exception:
                 LOGGER.exception("Scheduled scan failed")
             self._stop.wait(interval)
@@ -990,7 +1637,7 @@ class OpsService:
         )
         while not self._stop.is_set():
             try:
-                self.refresh_all()
+                self.refresh_all(operator=False)
             except Exception:
                 LOGGER.exception("Telemetry refresh failed")
             self._stop.wait(interval)
@@ -1056,6 +1703,31 @@ class OpsService:
             return self.settings.containers[int(vmid)]
         except KeyError as exc:
             raise KeyError(f"Unknown VMID: {vmid}") from exc
+
+    def _capabilities(self, vmid: int) -> dict[str, bool]:
+        cfg = self._container(vmid)
+        configured = cfg.get("operator_capabilities") or {}
+        names = (
+            "refresh",
+            "scan",
+            "approve",
+            "reject",
+            "retry_healthcheck",
+            "rollback",
+            "start",
+            "shutdown",
+            "reboot",
+        )
+        return {
+            name: bool(configured.get(name, False))
+            for name in names
+        }
+
+    def _require_capability(self, vmid: int, capability: str) -> None:
+        if not self._capabilities(vmid).get(capability, False):
+            raise ValueError(
+                f"Operator action {capability} is blocked by policy for CT{vmid}"
+            )
 
 
 def _safe_int(value: Any, default: int) -> int:

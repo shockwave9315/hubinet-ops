@@ -125,12 +125,109 @@ def test_malformed_collection_shapes_do_not_break_publication() -> None:
     assert payload["docker"] == {}
 
 
-def test_core_mqtt_uses_the_0_2_3_byte_budget() -> None:
+def test_core_mqtt_uses_the_0_2_4_byte_budget() -> None:
     from app import mqtt
 
     source = inspect.getsource(mqtt.MqttTelemetry.publish_container_state)
 
-    assert mqtt.VERSION == "0.2.3"
+    assert mqtt.VERSION == "0.2.4"
     assert mqtt.bounded_state is bounded_state
     assert "bounded_state(state)" in source
     assert "_bounded_state" not in source
+
+
+def test_unknown_pending_count_survives_retained_mqtt_budgeting() -> None:
+    payload = bounded_state(
+        {
+            "update_status": "unknown",
+            "pending_updates": None,
+            "packages_remaining_count": None,
+            "updates": {"pending_count": None, "packages": []},
+        }
+    )
+
+    assert payload["update_status"] == "unknown"
+    assert payload["pending_updates"] is None
+    assert payload["packages_remaining_count"] is None
+    assert payload["updates"]["pending_count"] is None
+
+
+def test_0_2_4_scalars_survive_unicode_package_event_and_docker_truncation() -> None:
+    capabilities = {
+        "refresh": True,
+        "scan": True,
+        "approve": True,
+        "reject": True,
+        "retry_healthcheck": True,
+        "rollback": True,
+        "start": True,
+        "shutdown": True,
+        "reboot": True,
+    }
+    payload = bounded_state(
+        {
+            "vmid": 106,
+            "health_status": "healthy",
+            "lxc_status": "running",
+            "operator_capabilities": capabilities,
+            "lifecycle_action": "reboot",
+            "lifecycle_status": "success",
+            "lifecycle_started_at": "2026-07-19T12:00:00+00:00",
+            "lifecycle_finished_at": "2026-07-19T12:00:05+00:00",
+            "expected_lxc_status": "running",
+            "intentional_shutdown": False,
+            "lifecycle_health_pending": True,
+            "verification_status": "warning",
+            "last_verification": "2026-07-19T12:01:00+00:00",
+            "apt_check_ok": True,
+            "dpkg_audit_ok": True,
+            "reboot_required": True,
+            "packages_updated_count": 80,
+            "packages_remaining_count": 2,
+            "docker_required_healthy": 3,
+            "docker_required_total": 3,
+            "recovery_scan_enabled": True,
+            "recovery_scan_status": "completed",
+            "last_recovery_scan": "2026-07-19T11:00:00+00:00",
+            "last_recovery_scan_result": "existing_plan",
+            "last_terminal_at": "2026-07-19T12:01:00+00:00",
+            "docker": {
+                "required_healthy": 3,
+                "required_total": 3,
+                "containers": [{"name": "żółć-" + "界" * 2000} for _ in range(20)],
+            },
+            "updates": {
+                "pending_count": 200,
+                "packages": [
+                    {
+                        "name": f"pakiet-{index}-" + "ą界" * 1000,
+                        "current": "wersja-" + "ż" * 500,
+                        "target": "wersja-" + "ź" * 500,
+                    }
+                    for index in range(200)
+                ],
+            },
+            "recent_job_events": [
+                {
+                    "stage": "verifying",
+                    "progress": index,
+                    "message": "zdarzenie-" + "ę界" * 1000,
+                }
+                for index in range(50)
+            ],
+        }
+    )
+
+    assert _encoded_size(payload) <= 10_000
+    assert payload["operator_capabilities"] == capabilities
+    assert payload["lifecycle_action"] == "reboot"
+    assert payload["lifecycle_status"] == "success"
+    assert payload["expected_lxc_status"] == "running"
+    assert payload["intentional_shutdown"] is False
+    assert payload["lifecycle_health_pending"] is True
+    assert payload["verification_status"] == "warning"
+    assert payload["apt_check_ok"] is True
+    assert payload["dpkg_audit_ok"] is True
+    assert payload["packages_remaining_count"] == 2
+    assert payload["recovery_scan_status"] == "completed"
+    assert payload["last_terminal_at"] == "2026-07-19T12:01:00+00:00"
