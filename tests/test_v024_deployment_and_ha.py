@@ -28,9 +28,12 @@ def test_wrapper_has_only_fixed_graceful_lifecycle_verbs() -> None:
     assert 'pct reboot "$vmid"' in text
     assert "Action does not accept an argument" in text
     assert "timeout --signal=TERM" in text
-    assert 'grep -Fxq "$vmid" "$ALLOWLIST"' in text
+    assert 'listed "$vmid" "$OBSERVATION_ALLOWLIST"' in text
     assert 'LIFECYCLE_ALLOWLIST="/etc/hubinet-ops/lifecycle-vmids"' in text
-    assert 'grep -Fxq "$vmid" "$LIFECYCLE_ALLOWLIST"' in text
+    assert 'listed "$vmid" "$LIFECYCLE_ALLOWLIST"' in text
+    assert 'MANAGED_ALLOWLIST="/etc/hubinet-ops/managed-vmids"' in text
+    assert 'MAINTENANCE_ALLOWLIST="/etc/hubinet-ops/maintenance-vmids"' in text
+    assert 'RESOURCE_TYPES="/etc/hubinet-ops/resource-types"' in text
     assert '[[ -z "${extra:-}" ]]' in text
     for forbidden in ("pct destroy", "pct console", "pct enter", " eval ", "generic-command"):
         assert forbidden not in text
@@ -51,7 +54,7 @@ def test_production_lifecycle_allowlist_contains_only_ct106() -> None:
 
 def test_managed_verify_is_fixed_and_checks_integrity_services_and_docker() -> None:
     text = (ROOT / "deploy" / "managed" / "hubinet-maint").read_text(encoding="utf-8")
-    assert 'VERSION = "0.2.4"' in text
+    assert 'VERSION = "0.3.0"' in text
     assert 'run(["apt-get", "check"]' in text
     assert 'run(["dpkg", "--audit"]' in text
     assert 'Path("/var/run/reboot-required").exists()' in text
@@ -142,8 +145,13 @@ def test_ha_installer_preserves_private_secrets_and_does_not_restart() -> None:
 def test_dashboard_policy_controls_verification_recovery_and_navigation_only_push() -> None:
     dashboard = DASHBOARD.read_text(encoding="utf-8")
     package = PACKAGE.read_text(encoding="utf-8")
-    ct101 = dashboard.split("path: ct-101", 1)[1].split("path: ct-106", 1)[0]
-    ct106 = dashboard.split("path: ct-106", 1)[1]
+    loaded_dashboard = yaml.safe_load(dashboard)
+    views = {
+        view["path"]: yaml.safe_dump(view, allow_unicode=True)
+        for view in loaded_dashboard["views"]
+    }
+    ct101 = views["ct-101"]
+    ct106 = views["ct-106"]
 
     assert "Tryb obserwacji — sterowanie zablokowane przez politykę backendu" in ct101
     assert "perform_action:" not in ct101

@@ -12,11 +12,11 @@ DASHBOARD_INSTALLER = ROOT / "deploy" / "install-ha-dashboard-0.2.3-from-pve.sh"
 def test_dashboard_reports_authoritative_package_total_and_preview_truncation() -> None:
     text = DASHBOARD.read_text(encoding="utf-8")
 
-    assert text.count("{% set meta = state_attr(") == 2
-    assert text.count("{% set total = meta.get('packages_total'") == 2
-    assert text.count("{% set visible = packages | count %}") == 2
-    assert text.count("limit atrybutów 10 KB") == 2
-    assert text.count("kolejnych widocznych pakietów") == 2
+    assert text.count("{% set meta = state_attr(") == 9
+    assert text.count("{% set total = meta.get(''packages_total''") == 9
+    assert text.count("{% set visible = packages | count %}") == 9
+    assert text.count("limit atrybutów 10 KB") == 9
+    assert text.count("kolejnych widocznych pakietów") == 9
     assert "**{{ packages | count }} pakietów" not in text
     assert "packages | count - 30" not in text
 

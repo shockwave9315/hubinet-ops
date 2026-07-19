@@ -1,4 +1,4 @@
-# Hubinet Ops 0.2.4: policy-controlled REST actions and navigation-only notifications.
+# Hubinet Ops 0.3.0: resource REST aliases and navigation-only notifications.
 
 rest_command:
   hubinet_ops_scan_container:
