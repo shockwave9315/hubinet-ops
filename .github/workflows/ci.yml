@@ -47,9 +47,12 @@ jobs:
 
   apply-dashboard-patch:
     if: >-
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/fix/0.2.3-mqtt-attribute-budget' &&
-      !startsWith(github.event.head_commit.message, '[automation]')
+      (github.event_name == 'push' &&
+       github.ref == 'refs/heads/fix/0.2.3-mqtt-attribute-budget' &&
+       !startsWith(github.event.head_commit.message, '[automation]')) ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.head.ref == 'fix/0.2.3-mqtt-attribute-budget')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
