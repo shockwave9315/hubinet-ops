@@ -87,7 +87,7 @@ def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
             "available_bytes",
         ),
         "docker": ("enabled", "available", "required_healthy", "required_total"),
-        "cpu": ("usage", "cores", "load_1m"),
+        "cpu": ("usage", "usage_percent", "cores", "load_1m"),
         "network": ("in_bytes", "out_bytes"),
     }.items():
         source = _mapping(state.get(key))

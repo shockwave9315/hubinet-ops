@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import yaml
 
@@ -12,7 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.ha_entities import agent_entity_id, resource_entity_id
+from app.ha_entities import (
+    agent_entity_id,
+    normalize_resource_identity,
+    resource_entity_id,
+)
 
 DEFAULT_CONFIG = ROOT / "config" / "config.example.yaml"
 DEFAULT_OUTPUT = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
@@ -33,7 +37,7 @@ ICONS = {
 
 
 def _label(vmid: int, cfg: dict[str, Any]) -> str:
-    kind = "VM" if cfg["resource_type"] == "qemu" else "CT"
+    kind = "VM" if normalize_resource_identity(cfg).resource_type == "qemu" else "CT"
     return f"{kind}{vmid} · {cfg['display_name']}"
 
 
@@ -73,17 +77,19 @@ def _entity_grid(cards: Iterable[dict[str, Any]], columns: int = 2) -> dict[str,
     }
 
 
-def _chip(entity: str, icon: str, content: str | None = None) -> dict[str, Any]:
+def _chip(
+    entity: str,
+    icon: str,
+    *,
+    icon_color: str,
+    content: str | None = None,
+) -> dict[str, Any]:
     return {
         "type": "template",
         "entity": entity,
         "icon": icon,
         "content": content or "{{ states(entity) }}",
-        "icon_color": (
-            "{% set value = states(entity) %} "
-            "{{ 'green' if value in ['healthy', 'running', 'active', 'ok', 'online', 'up_to_date'] "
-            "else 'amber' if value in ['degraded', 'waiting_approval', 'update_available'] else 'red' }}"
-        ),
+        "icon_color": icon_color,
         "tap_action": {"action": "more-info"},
     }
 
@@ -97,17 +103,18 @@ def _chips(chips: Iterable[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _resource_status(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    identity = normalize_resource_identity(cfg)
     health = _entity(vmid, cfg, "health_status")
     runtime = _entity(vmid, cfg, "runtime_status")
     secondary_parts = [f"Runtime: {{{{ states('{runtime}') }}}}"]
-    if cfg["adapter"] == "apt":
+    if identity.adapter == "apt":
         secondary_parts.extend(
             [
                 f"aktualizacje: {{{{ states('{_entity(vmid, cfg, 'update_status')}') }}}}",
                 f"pakiety: {{{{ states('{_entity(vmid, cfg, 'pending_updates')}') }}}}",
             ]
         )
-    elif cfg["resource_type"] == "qemu":
+    elif identity.resource_type == "qemu":
         secondary_parts.append(
             f"Guest Agent: {{{{ states('{_entity(vmid, cfg, 'guest_agent_status')}') }}}}"
         )
@@ -132,7 +139,10 @@ def _resource_status(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
         "badge_icon": (
             "{{ 'mdi:check-circle' if is_state(entity, 'healthy') else 'mdi:alert-circle' }}"
         ),
-        "badge_color": "{{ 'green' if is_state(entity, 'healthy') else 'red' }}",
+        "badge_color": (
+            "{{ 'green' if is_state(entity, 'healthy') else "
+            "'amber' if is_state(entity, 'degraded') else 'red' }}"
+        ),
         "tap_action": {"action": "more-info"},
     }
 
@@ -147,39 +157,104 @@ def _overview_card(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resource_chips(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    identity = normalize_resource_identity(cfg)
     items = [
-        _chip(_entity(vmid, cfg, "health_status"), "mdi:heart-pulse"),
+        _chip(
+            _entity(vmid, cfg, "health_status"),
+            "mdi:heart-pulse",
+            icon_color=(
+                "{% set value = states(entity) %} "
+                "{{ 'green' if value == 'healthy' else 'amber' if value == 'degraded' "
+                "else 'red' if value in ['critical', 'offline'] else 'grey' }}"
+            ),
+        ),
         _chip(
             _entity(vmid, cfg, "health_score"),
             "mdi:heart-pulse",
-            "{{ states(entity) }}%",
+            content="{{ states(entity) }}%",
+            icon_color=(
+                "{% set value = states(entity) | int(-1) %} "
+                "{{ 'green' if value >= 90 else 'amber' if value >= 70 else 'red' }}"
+            ),
         ),
-        _chip(_entity(vmid, cfg, "runtime_status"), "mdi:server"),
+        _chip(
+            _entity(vmid, cfg, "runtime_status"),
+            "mdi:server",
+            icon_color=(
+                "{% set value = states(entity) %} "
+                "{{ 'green' if value == 'running' else 'grey' if value == 'stopped' else 'amber' }}"
+            ),
+        ),
     ]
-    if cfg["adapter"] == "apt":
+    if identity.adapter == "apt":
         items.extend(
             [
-                _chip(_entity(vmid, cfg, "update_status"), "mdi:package-up"),
+                _chip(
+                    _entity(vmid, cfg, "update_status"),
+                    "mdi:package-up",
+                    icon_color=(
+                        "{% set value = states(entity) %} "
+                        "{{ 'green' if value == 'up_to_date' else 'blue' if value == 'scanning' "
+                        "else 'amber' if value == 'update_available' else 'grey' }}"
+                    ),
+                ),
                 _chip(
                     _entity(vmid, cfg, "operation_status"),
                     "mdi:progress-wrench",
+                    icon_color=(
+                        "{% set value = states(entity) %} "
+                        "{{ 'green' if value in ['idle', 'success'] else 'blue' if value == 'running' "
+                        "else 'amber' if value in ['waiting_approval', 'rolled_back'] else 'red' }}"
+                    ),
                 ),
-                _chip(_entity(vmid, cfg, "risk"), "mdi:shield-alert-outline"),
+                _chip(
+                    _entity(vmid, cfg, "risk"),
+                    "mdi:shield-alert-outline",
+                    icon_color=(
+                        "{% set value = states(entity) %} "
+                        "{{ 'green' if value in ['none', 'low'] else 'amber' if value == 'medium' else 'red' }}"
+                    ),
+                ),
                 _chip(
                     _entity(vmid, cfg, "pending_updates"),
                     "mdi:format-list-numbered",
-                    "{{ states(entity) }} pak.",
+                    content="{{ states(entity) }} pak.",
+                    icon_color=(
+                        "{% set value = states(entity) | int(-1) %} "
+                        "{{ 'green' if value == 0 else 'amber' if value > 0 else 'grey' }}"
+                    ),
                 ),
             ]
         )
-    elif cfg["resource_type"] == "qemu":
-        items.append(_chip(_entity(vmid, cfg, "guest_agent_status"), "mdi:lan-connect"))
+    elif identity.resource_type == "qemu":
+        items.append(
+            _chip(
+                _entity(vmid, cfg, "guest_agent_status"),
+                "mdi:lan-connect",
+                icon_color=(
+                    "{% set value = states(entity) %} "
+                    "{{ 'green' if value == 'available' else 'red' if value == 'unavailable' else 'amber' }}"
+                ),
+            )
+        )
     else:
         items.extend(
             [
-                _chip(_entity(vmid, cfg, "service_status"), "mdi:application-cog"),
-                _chip(_entity(vmid, cfg, "api_health"), "mdi:api"),
-                _chip(_entity(vmid, cfg, "agent_version"), "mdi:tag-outline"),
+                _chip(
+                    _entity(vmid, cfg, "service_status"),
+                    "mdi:application-cog",
+                    icon_color="{{ 'green' if is_state(entity, 'active') else 'red' }}",
+                ),
+                _chip(
+                    _entity(vmid, cfg, "api_health"),
+                    "mdi:api",
+                    icon_color="{{ 'green' if states(entity) in ['healthy', 'ok'] else 'red' }}",
+                ),
+                _chip(
+                    _entity(vmid, cfg, "agent_version"),
+                    "mdi:tag-outline",
+                    icon_color="blue",
+                ),
             ]
         )
     return _chips(items)
@@ -499,14 +574,15 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
 
 
 def _resource_view(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
-    if cfg["adapter"] == "apt":
+    identity = normalize_resource_identity(cfg)
+    if identity.adapter == "apt":
         sections = _apt_sections(vmid, cfg)
-    elif cfg["resource_type"] == "qemu":
+    elif identity.resource_type == "qemu":
         sections = _qemu_sections(vmid, cfg)
     else:
         sections = _agent_self_sections(vmid, cfg)
     return {
-        "title": f"{'VM' if cfg['resource_type'] == 'qemu' else 'CT'}{vmid}",
+        "title": f"{'VM' if identity.resource_type == 'qemu' else 'CT'}{vmid}",
         "path": str(cfg["dashboard_path"]).rsplit("/", 1)[-1],
         "icon": ICONS.get(vmid, "mdi:server"),
         "type": "sections",
@@ -516,21 +592,39 @@ def _resource_view(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_dashboard(resources: dict[int, dict[str, Any]]) -> dict[str, Any]:
+    resources = normalize_dashboard_resources(resources)
     agent_chips = _chips(
         [
-            _chip(agent_entity_id("availability"), "mdi:mqtt"),
-            _chip(agent_entity_id("version"), "mdi:tag-outline"),
+            _chip(
+                agent_entity_id("availability"),
+                "mdi:mqtt",
+                icon_color="{{ 'green' if is_state(entity, 'online') else 'red' }}",
+            ),
+            _chip(
+                agent_entity_id("version"),
+                "mdi:tag-outline",
+                icon_color="blue",
+            ),
             _chip(
                 agent_entity_id("configured_resource_count"),
                 "mdi:server-network",
-                "{{ states(entity) }} zasobów",
+                content="{{ states(entity) }} zasobów",
+                icon_color="blue",
             ),
             _chip(
                 agent_entity_id("active_job_count"),
                 "mdi:progress-wrench",
-                "{{ states(entity) }} zadań",
+                content="{{ states(entity) }} zadań",
+                icon_color=(
+                    "{% set value = states(entity) | int(-1) %} "
+                    "{{ 'green' if value == 0 else 'amber' if value > 0 else 'grey' }}"
+                ),
             ),
-            _chip(agent_entity_id("last_refresh"), "mdi:clock-outline"),
+            _chip(
+                agent_entity_id("last_refresh"),
+                "mdi:clock-outline",
+                icon_color="blue-grey",
+            ),
         ]
     )
     items = sorted(resources.items())
@@ -563,12 +657,34 @@ def build_dashboard(resources: dict[int, dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def normalize_dashboard_resources(
+    resources: Mapping[int, Mapping[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    normalized: dict[int, dict[str, Any]] = {}
+    for raw_vmid, raw_cfg in resources.items():
+        try:
+            vmid = int(raw_vmid)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid resource VMID: {raw_vmid!r}") from exc
+        if not isinstance(raw_cfg, Mapping):
+            raise RuntimeError(f"Resource {vmid} must be a mapping")
+        try:
+            identity = normalize_resource_identity(raw_cfg)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid resource identity for VMID {vmid}: {exc}") from exc
+        cfg = dict(raw_cfg)
+        cfg["resource_type"] = identity.resource_type
+        cfg["adapter"] = identity.adapter
+        normalized[vmid] = cfg
+    return normalized
+
+
 def load_resources(path: Path) -> dict[int, dict[str, Any]]:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     resources = raw.get("resources")
     if not isinstance(resources, dict):
         raise RuntimeError("Configuration must contain resources")
-    return {int(vmid): dict(cfg) for vmid, cfg in resources.items()}
+    return normalize_dashboard_resources(resources)
 
 
 def render(config_path: Path = DEFAULT_CONFIG) -> str:

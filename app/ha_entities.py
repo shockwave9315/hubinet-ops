@@ -15,6 +15,14 @@ class EntitySpec:
     extra: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ResourceIdentity:
+    """Canonical resource identity used by the Home Assistant contract."""
+
+    resource_type: str
+    adapter: str
+
+
 def _numeric(
     key: str,
     suffix: str,
@@ -128,7 +136,7 @@ QEMU_ENTITY_SPECS = (
     EntitySpec("runtime_status", "runtime_status", "Runtime status", "{{ value_json.runtime_status | default('unknown') }}"),
     EntitySpec("qemu_status", "qemu_status", "QEMU status", "{{ value_json.qemu_status | default('unknown') }}"),
     _numeric("uptime_seconds", "uptime", "Uptime", "value_json.uptime_seconds", "s"),
-    _numeric("cpu_usage", "cpu_usage", "CPU usage", "value_json.cpu.usage", "%"),
+    _numeric("cpu_usage", "cpu_usage", "CPU usage", "value_json.cpu.usage_percent", "%"),
     EntitySpec("cpu_cores", "cpu_cores", "CPU cores", "{{ value_json.cpu.cores | default(none) }}"),
     _numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes", "B"),
     _numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes", "B"),
@@ -166,24 +174,61 @@ AGENT_SELF_ENTITY_SPECS = (
 )
 
 
-# These exact 0.3.0 CT110 topics were retained but have no agent_self source.
-AGENT_SELF_OBSOLETE_KEYS = ("cpu_usage", "network_in_bytes", "network_out_bytes")
+SUPPORTED_RESOURCE_IDENTITIES = frozenset(
+    {
+        ("lxc", "apt"),
+        ("lxc", "agent_self"),
+        ("qemu", "haos"),
+    }
+)
+
+# These exact 0.3.0 discovery keys are retained but have no 0.3.1 data source.
+OBSOLETE_DISCOVERY_KEYS = {
+    ("qemu", "haos"): ("cpu_load_1m",),
+    ("lxc", "agent_self"): ("cpu_usage", "network_in_bytes", "network_out_bytes"),
+}
+
+
+def normalize_resource_identity(cfg: Mapping[str, Any]) -> ResourceIdentity:
+    """Return a canonical, supported identity without changing invalid input."""
+
+    missing = [key for key in ("resource_type", "adapter") if cfg.get(key) is None]
+    if missing:
+        raise ValueError(f"Missing resource identity field(s): {', '.join(missing)}")
+
+    resource_type = str(cfg["resource_type"]).strip().lower()
+    adapter = str(cfg["adapter"]).strip().lower()
+    identity = (resource_type, adapter)
+    if identity not in SUPPORTED_RESOURCE_IDENTITIES:
+        raise ValueError(
+            "Unsupported resource entity contract: "
+            f"resource_type={resource_type!r}, adapter={adapter!r}"
+        )
+    return ResourceIdentity(resource_type=resource_type, adapter=adapter)
 
 
 def resource_entity_specs(cfg: Mapping[str, Any]) -> tuple[EntitySpec, ...]:
-    resource_type = str(cfg.get("resource_type", "lxc"))
-    adapter = str(cfg.get("adapter", "apt"))
-    if resource_type == "qemu" and adapter == "haos":
+    identity = normalize_resource_identity(cfg)
+    if identity == ResourceIdentity("qemu", "haos"):
         return QEMU_ENTITY_SPECS
-    if resource_type == "lxc" and adapter == "agent_self":
+    if identity == ResourceIdentity("lxc", "agent_self"):
         return AGENT_SELF_ENTITY_SPECS
-    if resource_type == "lxc" and adapter == "apt":
+    if identity == ResourceIdentity("lxc", "apt"):
         return APT_ENTITY_SPECS
-    raise ValueError("Unsupported resource entity contract")
+    raise AssertionError("Supported resource identity has no entity specification")
 
 
 def resource_prefix(vmid: int, cfg: Mapping[str, Any]) -> str:
-    return f"vm{int(vmid)}" if str(cfg.get("resource_type")) == "qemu" else f"ct{int(vmid)}"
+    identity = normalize_resource_identity(cfg)
+    return f"vm{int(vmid)}" if identity.resource_type == "qemu" else f"ct{int(vmid)}"
+
+
+def obsolete_discovery_keys(cfg: Mapping[str, Any]) -> tuple[str, ...]:
+    identity = normalize_resource_identity(cfg)
+    return OBSOLETE_DISCOVERY_KEYS.get(
+        (identity.resource_type, identity.adapter),
+        (),
+    )
 
 
 def resource_entity_id(vmid: int, cfg: Mapping[str, Any], key: str) -> str:

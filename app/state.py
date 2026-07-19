@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 HEALTH_STATUSES = {"healthy", "degraded", "critical", "unknown", "offline"}
@@ -160,6 +161,14 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     for key in ("cpu", "memory", "disk", "network", "services", "docker"):
         value = state.get(key)
         state[key] = dict(value) if isinstance(value, dict) else {}
+    if resource_type == "qemu" and adapter == "haos":
+        # Proxmox QEMU status/current defines cpu as a utilization share (0..1).
+        # Preserve the raw diagnostic value and expose an explicit HA percentage.
+        raw_cpu_usage = state["cpu"].get("usage")
+        cpu_share = _safe_float(raw_cpu_usage)
+        state["cpu"]["usage_percent"] = (
+            None if cpu_share is None else round(max(0.0, min(1.0, cpu_share)) * 100, 3)
+        )
     guest_agent = str(state.get("guest_agent_status") or "unknown")
     state["guest_agent_status"] = (
         guest_agent
@@ -257,6 +266,16 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if isinstance(value, bool):
+            return None
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _legacy_stage(stage: str) -> str:

@@ -18,45 +18,36 @@ views:
         entity: sensor.hubinet_ops_agent_availability
         icon: mdi:mqtt
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{{ ''green'' if is_state(entity, ''online'') else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_agent_version
         icon: mdi:tag-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: blue
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_agent_configured_resource_count
         icon: mdi:server-network
         content: '{{ states(entity) }} zasobów'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: blue
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_agent_active_job_count
         icon: mdi:progress-wrench
         content: '{{ states(entity) }} zadań'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_agent_last_refresh
         icon: mdi:clock-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: blue-grey
         tap_action:
           action: more-info
   - type: grid
@@ -74,7 +65,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/vm-100
@@ -88,7 +80,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-101
@@ -102,7 +95,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-102
@@ -116,7 +110,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-103
@@ -135,7 +130,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-104
@@ -149,7 +145,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-105
@@ -163,7 +160,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-106
@@ -177,7 +175,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-107
@@ -196,7 +195,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-108
@@ -210,7 +210,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-109
@@ -224,7 +225,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: navigate
         navigation_path: /hubinet-ops/ct-110
@@ -249,7 +251,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -259,17 +262,15 @@ views:
         entity: sensor.hubinet_ops_vm100_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_vm100_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -277,18 +278,16 @@ views:
         entity: sensor.hubinet_ops_vm100_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_vm100_guest_agent
         icon: mdi:lan-connect
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''available'' else ''red'' if value == ''unavailable''
+          else ''amber'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -413,7 +412,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -423,17 +423,15 @@ views:
         entity: sensor.hubinet_ops_ct101_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct101_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -441,45 +439,40 @@ views:
         entity: sensor.hubinet_ops_ct101_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct101_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct101_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct101_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct101_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -713,7 +706,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -723,17 +717,15 @@ views:
         entity: sensor.hubinet_ops_ct102_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct102_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -741,45 +733,40 @@ views:
         entity: sensor.hubinet_ops_ct102_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct102_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct102_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct102_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct102_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -1013,7 +1000,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -1023,17 +1011,15 @@ views:
         entity: sensor.hubinet_ops_ct103_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct103_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -1041,45 +1027,40 @@ views:
         entity: sensor.hubinet_ops_ct103_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct103_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct103_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct103_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct103_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -1313,7 +1294,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -1323,17 +1305,15 @@ views:
         entity: sensor.hubinet_ops_ct104_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct104_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -1341,45 +1321,40 @@ views:
         entity: sensor.hubinet_ops_ct104_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct104_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct104_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct104_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct104_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -1613,7 +1588,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -1623,17 +1599,15 @@ views:
         entity: sensor.hubinet_ops_ct105_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct105_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -1641,45 +1615,40 @@ views:
         entity: sensor.hubinet_ops_ct105_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct105_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct105_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct105_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct105_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -1913,7 +1882,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -1923,17 +1893,15 @@ views:
         entity: sensor.hubinet_ops_ct106_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct106_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -1941,45 +1909,40 @@ views:
         entity: sensor.hubinet_ops_ct106_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct106_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct106_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct106_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct106_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -2361,7 +2324,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -2371,17 +2335,15 @@ views:
         entity: sensor.hubinet_ops_ct107_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct107_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -2389,45 +2351,40 @@ views:
         entity: sensor.hubinet_ops_ct107_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct107_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct107_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct107_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct107_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -2661,7 +2618,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -2671,17 +2629,15 @@ views:
         entity: sensor.hubinet_ops_ct108_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct108_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -2689,45 +2645,40 @@ views:
         entity: sensor.hubinet_ops_ct108_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct108_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct108_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct108_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct108_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -2961,7 +2912,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -2971,17 +2923,15 @@ views:
         entity: sensor.hubinet_ops_ct109_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct109_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -2989,45 +2939,40 @@ views:
         entity: sensor.hubinet_ops_ct109_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct109_update_status
         icon: mdi:package-up
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''up_to_date'' else ''blue'' if value == ''scanning''
+          else ''amber'' if value == ''update_available'' else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct109_operation_status
         icon: mdi:progress-wrench
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''idle'', ''success''] else ''blue'' if value
+          == ''running'' else ''amber'' if value in [''waiting_approval'', ''rolled_back''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct109_risk
         icon: mdi:shield-alert-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''none'', ''low''] else ''amber'' if value
+          == ''medium'' else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct109_pending_update_count
         icon: mdi:format-list-numbered
         content: '{{ states(entity) }} pak.'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value == 0 else ''amber'' if value > 0 else
+          ''grey'' }}'
         tap_action:
           action: more-info
   - type: grid
@@ -3280,7 +3225,8 @@ views:
       color: '{% set health = states(entity) %} {{ ''green'' if health == ''healthy'' else ''amber'' if health == ''degraded''
         else ''red'' }}'
       badge_icon: '{{ ''mdi:check-circle'' if is_state(entity, ''healthy'') else ''mdi:alert-circle'' }}'
-      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''red'' }}'
+      badge_color: '{{ ''green'' if is_state(entity, ''healthy'') else ''amber'' if is_state(entity, ''degraded'') else ''red''
+        }}'
       tap_action:
         action: more-info
     - type: custom:mushroom-chips-card
@@ -3290,17 +3236,15 @@ views:
         entity: sensor.hubinet_ops_ct110_health_status
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''healthy'' else ''amber'' if value == ''degraded''
+          else ''red'' if value in [''critical'', ''offline''] else ''grey'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct110_health_score
         icon: mdi:heart-pulse
         content: '{{ states(entity) }}%'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
+        icon_color: '{% set value = states(entity) | int(-1) %} {{ ''green'' if value >= 90 else ''amber'' if value >= 70
           else ''red'' }}'
         tap_action:
           action: more-info
@@ -3308,36 +3252,29 @@ views:
         entity: sensor.hubinet_ops_ct110_runtime_status
         icon: mdi:server
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{% set value = states(entity) %} {{ ''green'' if value == ''running'' else ''grey'' if value == ''stopped''
+          else ''amber'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct110_service_status
         icon: mdi:application-cog
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{{ ''green'' if is_state(entity, ''active'') else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct110_api_health
         icon: mdi:api
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: '{{ ''green'' if states(entity) in [''healthy'', ''ok''] else ''red'' }}'
         tap_action:
           action: more-info
       - type: template
         entity: sensor.hubinet_ops_ct110_agent_version
         icon: mdi:tag-outline
         content: '{{ states(entity) }}'
-        icon_color: '{% set value = states(entity) %} {{ ''green'' if value in [''healthy'', ''running'', ''active'', ''ok'',
-          ''online'', ''up_to_date''] else ''amber'' if value in [''degraded'', ''waiting_approval'', ''update_available'']
-          else ''red'' }}'
+        icon_color: blue
         tap_action:
           action: more-info
   - type: grid

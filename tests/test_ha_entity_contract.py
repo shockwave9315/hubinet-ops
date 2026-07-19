@@ -8,11 +8,17 @@ from pathlib import Path
 import pytest
 import yaml
 
-from app.ha_entities import AGENT_SELF_OBSOLETE_KEYS
+from app.ha_entities import (
+    ResourceIdentity,
+    normalize_resource_identity,
+    obsolete_discovery_keys,
+    resource_entity_specs,
+    resource_prefix,
+)
 from app.mqtt import MqttTelemetry
 from app.mqtt_budget import bounded_state
 from app.state import normalize_state
-from scripts.generate_ha_dashboard import DEFAULT_CONFIG, render
+from scripts.generate_ha_dashboard import DEFAULT_CONFIG, build_dashboard, render
 
 
 def _resources() -> dict[int, dict]:
@@ -159,16 +165,109 @@ def test_vm100_primary_ip_replaces_479_character_state_without_losing_attributes
     assert "join" not in ip_sensor["value_template"]
 
 
-def test_obsolete_agent_self_discovery_is_cleared_with_exact_retained_topics() -> None:
+def test_qemu_cpu_share_is_exposed_as_an_explicit_ha_percentage() -> None:
+    state = bounded_state(
+        normalize_state(
+            {
+                "resource_type": "qemu",
+                "adapter": "haos",
+                "qemu_status": "running",
+                "cpu": {"usage": 0.125, "cores": 4},
+            }
+        )
+    )
+    assert state["cpu"]["usage"] == 0.125
+    assert state["cpu"]["usage_percent"] == 12.5
+
+    configs, _ = _discovery()
+    cpu_sensor = configs[
+        "homeassistant/sensor/hubinet_ops_vm100_cpu_usage/config"
+    ]
+    assert cpu_sensor["unit_of_measurement"] == "%"
+    assert cpu_sensor["value_template"] == (
+        "{{ value_json.cpu.usage_percent | default(none) }}"
+    )
+
+
+def test_resource_identity_is_canonical_and_shared() -> None:
+    lower = {"resource_type": "qemu", "adapter": "haos"}
+    mixed = {"resource_type": "QeMu", "adapter": "HaOs"}
+
+    assert normalize_resource_identity(lower) == ResourceIdentity("qemu", "haos")
+    assert normalize_resource_identity(mixed) == ResourceIdentity("qemu", "haos")
+    assert resource_entity_specs(mixed) == resource_entity_specs(lower)
+    assert resource_prefix(100, mixed) == "vm100"
+    assert obsolete_discovery_keys(mixed) == ("cpu_load_1m",)
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        {"resource_type": None, "adapter": "haos"},
+        {"resource_type": "qemu", "adapter": None},
+        {"adapter": "haos"},
+        {"resource_type": "qemu"},
+    ],
+)
+def test_resource_identity_rejects_none_and_missing_fields(cfg: dict) -> None:
+    with pytest.raises(ValueError, match="Missing resource identity field"):
+        normalize_resource_identity(cfg)
+
+
+def test_resource_identity_rejects_unsupported_combination_without_fallback() -> None:
+    with pytest.raises(ValueError, match="Unsupported resource entity contract"):
+        normalize_resource_identity({"resource_type": "qemu", "adapter": "apt"})
+
+
+def test_dashboard_reports_controlled_resource_identity_error() -> None:
+    with pytest.raises(RuntimeError, match="Invalid resource identity for VMID 100"):
+        build_dashboard({100: {"resource_type": "qemu"}})
+
+
+def test_obsolete_030_discovery_is_cleared_with_exact_retained_topics() -> None:
     _, raw = _discovery()
     expected = {
-        f"homeassistant/sensor/hubinet_ops_ct110_{key}/config"
-        for key in AGENT_SELF_OBSOLETE_KEYS
+        "homeassistant/sensor/hubinet_ops_vm100_cpu_load_1m/config",
+        "homeassistant/sensor/hubinet_ops_ct110_cpu_usage/config",
+        "homeassistant/sensor/hubinet_ops_ct110_network_in_bytes/config",
+        "homeassistant/sensor/hubinet_ops_ct110_network_out_bytes/config",
     }
     cleared = {topic for topic, payload in raw.items() if payload == ""}
 
     assert cleared == expected
-    assert not any("vm100" in topic or "ct101" in topic for topic in cleared)
+    assert not any("ct101" in topic for topic in cleared)
+
+
+def test_cleanup_exactly_matches_030_discovery_minus_031_discovery() -> None:
+    legacy_common = {
+        "health_status", "health_score", "runtime_status", "uptime_seconds",
+        "last_refresh", "last_error", "cpu_usage", "cpu_load_1m", "cpu_cores",
+        "memory_used_bytes", "memory_total_bytes", "disk_used_bytes",
+        "disk_total_bytes", "network_in_bytes", "network_out_bytes",
+    }
+    legacy_by_vmid = {
+        100: legacy_common | {"qemu_status", "guest_agent_status", "ip_addresses"},
+        110: legacy_common | {"lxc_status", "service_status", "api_health", "agent_version"},
+    }
+    resources = _resources()
+    retired_topics = set()
+    for vmid, legacy_keys in legacy_by_vmid.items():
+        current_keys = {spec.key for spec in resource_entity_specs(resources[vmid])}
+        prefix = resource_prefix(vmid, resources[vmid])
+        retired_topics.update(
+            f"homeassistant/sensor/hubinet_ops_{prefix}_{key}/config"
+            for key in legacy_keys - current_keys
+        )
+
+    _, raw = _discovery()
+    cleared_topics = {topic for topic, payload in raw.items() if payload == ""}
+    assert retired_topics == {
+        "homeassistant/sensor/hubinet_ops_vm100_cpu_load_1m/config",
+        "homeassistant/sensor/hubinet_ops_ct110_cpu_usage/config",
+        "homeassistant/sensor/hubinet_ops_ct110_network_in_bytes/config",
+        "homeassistant/sensor/hubinet_ops_ct110_network_out_bytes/config",
+    }
+    assert cleared_topics == retired_topics
 
 
 def test_obsolete_discovery_cleanup_is_idempotent_and_retained() -> None:
@@ -188,8 +287,10 @@ def test_obsolete_discovery_cleanup_is_idempotent_and_retained() -> None:
             cleared.append(item)
 
     expected_topics = {
-        f"homeassistant/sensor/hubinet_ops_ct110_{key}/config"
-        for key in AGENT_SELF_OBSOLETE_KEYS
+        "homeassistant/sensor/hubinet_ops_vm100_cpu_load_1m/config",
+        "homeassistant/sensor/hubinet_ops_ct110_cpu_usage/config",
+        "homeassistant/sensor/hubinet_ops_ct110_network_in_bytes/config",
+        "homeassistant/sensor/hubinet_ops_ct110_network_out_bytes/config",
     }
     assert {item.topic for item in cleared} == expected_topics
     assert len(cleared) == 2 * len(expected_topics)

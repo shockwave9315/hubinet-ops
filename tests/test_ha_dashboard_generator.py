@@ -72,6 +72,57 @@ def test_overview_and_details_use_multiple_mushroom_sections() -> None:
         assert mega_entities == []
 
 
+def test_mushroom_chips_use_semantic_colors_without_generic_red_fallback() -> None:
+    data = _dashboard()
+    overview = _view(data, "overview")
+    overview_chips = next(
+        item["chips"]
+        for item in _walk(overview)
+        if isinstance(item, dict) and item.get("type") == "custom:mushroom-chips-card"
+    )
+    overview_by_entity = {chip["entity"]: chip for chip in overview_chips}
+    assert overview_by_entity["sensor.hubinet_ops_agent_version"]["icon_color"] == "blue"
+    assert overview_by_entity[
+        "sensor.hubinet_ops_agent_configured_resource_count"
+    ]["icon_color"] == "blue"
+    assert overview_by_entity["sensor.hubinet_ops_agent_last_refresh"]["icon_color"] == "blue-grey"
+    active_jobs = overview_by_entity["sensor.hubinet_ops_agent_active_job_count"][
+        "icon_color"
+    ]
+    assert "value == 0" in active_jobs and "green" in active_jobs
+
+    ct101 = _view(data, "ct-101")
+    resource_chips = next(
+        item["chips"]
+        for item in _walk(ct101)
+        if isinstance(item, dict) and item.get("type") == "custom:mushroom-chips-card"
+    )
+    by_entity = {chip["entity"]: chip for chip in resource_chips}
+    health_score = by_entity["sensor.hubinet_ops_ct101_health_score"]["icon_color"]
+    pending = by_entity[
+        "sensor.hubinet_ops_ct101_pending_update_count"
+    ]["icon_color"]
+    operation = by_entity[
+        "sensor.hubinet_ops_ct101_operation_status"
+    ]["icon_color"]
+    risk = by_entity["sensor.hubinet_ops_ct101_risk"]["icon_color"]
+    assert "value >= 90" in health_score and "green" in health_score
+    assert "value == 0" in pending and "green" in pending
+    assert "['idle', 'success']" in operation and "green" in operation
+    assert "['none', 'low']" in risk and "green" in risk
+
+    status_card = next(
+        item
+        for item in _walk(ct101)
+        if isinstance(item, dict)
+        and item.get("type") == "custom:mushroom-template-card"
+        and item.get("entity") == "sensor.hubinet_ops_ct101_health_status"
+        and "badge_color" in item
+    )
+    assert "degraded" in status_card["badge_color"]
+    assert "amber" in status_card["badge_color"]
+
+
 def test_vm100_has_qemu_metrics_but_no_apt_or_controls() -> None:
     text = _text(_view(_dashboard(), "vm-100"))
 

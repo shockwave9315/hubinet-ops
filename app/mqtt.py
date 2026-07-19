@@ -9,8 +9,9 @@ from typing import Any, Callable
 
 from .ha_entities import (
     AGENT_ENTITY_SPECS,
-    AGENT_SELF_OBSOLETE_KEYS,
     APT_ENTITY_SPECS,
+    normalize_resource_identity,
+    obsolete_discovery_keys,
     resource_entity_id,
     resource_entity_specs,
     resource_prefix,
@@ -219,12 +220,16 @@ class MqttTelemetry:
             )
 
         for vmid, cfg in sorted(self.resources.items()):
-            resource_type = str(cfg.get("resource_type", "lxc"))
-            prefix = "vm" if resource_type == "qemu" else "ct"
+            identity = normalize_resource_identity(cfg)
+            prefix = "vm" if identity.resource_type == "qemu" else "ct"
             identifier = f"hubinet_ops_{prefix}_{vmid}"
             state_topic = f"{self.base_topic}/resource/{vmid}/state"
-            model = "Observed Proxmox QEMU" if resource_type == "qemu" else "Managed Proxmox LXC"
-            if cfg.get("adapter") == "agent_self":
+            model = (
+                "Observed Proxmox QEMU"
+                if identity.resource_type == "qemu"
+                else "Managed Proxmox LXC"
+            )
+            if identity.adapter == "agent_self":
                 model = "Hubinet Ops Agent"
             device = {
                 "identifiers": [identifier],
@@ -260,18 +265,21 @@ class MqttTelemetry:
                 device=device,
                 force=force,
             )
-            if cfg.get("adapter") == "agent_self":
-                for key in AGENT_SELF_OBSOLETE_KEYS:
-                    self._publish_raw(
-                        f"{self.discovery_prefix}/sensor/hubinet_ops_{prefix}{vmid}_{key}/config",
-                        "",
-                        retain=True,
-                        force=force,
-                    )
+            for key in obsolete_discovery_keys(cfg):
+                self._publish_raw(
+                    f"{self.discovery_prefix}/sensor/hubinet_ops_{prefix}{vmid}_{key}/config",
+                    "",
+                    retain=True,
+                    force=force,
+                )
 
     def _is_lxc(self, vmid: int) -> bool:
-        cfg = self.resources.get(int(vmid), {})
-        return str(cfg.get("resource_type", "lxc")) == "lxc"
+        cfg = self.resources.get(int(vmid))
+        if cfg is None:
+            # Preserve the legacy CT compatibility topic for callers publishing
+            # state before an inventory entry is available.
+            return True
+        return normalize_resource_identity(cfg).resource_type == "lxc"
 
     def _discovery_sensor(
         self,
