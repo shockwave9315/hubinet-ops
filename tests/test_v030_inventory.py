@@ -79,7 +79,11 @@ def test_wrapper_routes_fixed_qemu_reads_and_blocks_managed_qemu_actions() -> No
     text = WRAPPER.read_text(encoding="utf-8")
     assert 'qm status "$vmid"' in text
     assert 'qm guest cmd "$vmid" network-get-interfaces' in text
-    assert 'pvesh get "/nodes/$(hostname)/qemu/$vmid/status/current"' in text
+    assert 'readlink -f -- "$PVE_LOCAL_PATH"' in text
+    assert 'pvesh get "/nodes/$pve_node/qemu/$vmid/status/current"' in text
+    assert "$(hostname)" not in text
+    assert "hostname -s" not in text
+    assert "hostname -f" not in text
     assert '[[ "$resource_type" == "lxc" ]] || fail "Managed action is supported only for LXC"' in text
     assert 'listed "$vmid" "$MAINTENANCE_ALLOWLIST"' in text
     assert "VMID must have exactly one resource type" in text
@@ -96,6 +100,8 @@ def test_managed_profiles_exist_only_for_apt_lxc_inventory() -> None:
         data = json.loads(path.read_text(encoding="utf-8"))
         assert isinstance(data["services"], list)
         assert isinstance(data["docker"], dict)
+    ct103 = json.loads((profiles / "ct103.json").read_text(encoding="utf-8"))
+    assert ct103["min_free_mb"] == 512
 
 
 def test_upgrade_is_transactional_archive_safe_and_read_only_for_resources() -> None:
