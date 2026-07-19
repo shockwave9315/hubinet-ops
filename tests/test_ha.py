@@ -141,7 +141,7 @@ def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() ->
     assert text.count("events[-25:] | reverse") == 2
     assert text.count("replace('|', '¦')") == 2
     assert text.count("packages[:30]") == 2
-    assert "kolejnych pakietów" in text
+    assert text.count("kolejnych widocznych pakietów") == 2
 
 
 def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:

@@ -8,9 +8,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .security import sanitize_data, sanitize_text
+from .mqtt_budget import bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.2.1"
+VERSION = "0.2.3"
 
 
 @dataclass(frozen=True)
@@ -123,7 +124,7 @@ class MqttTelemetry:
     ) -> None:
         self._publish_json(
             f"{self.base_topic}/ct/{int(vmid)}/state",
-            _bounded_state(state),
+            bounded_state(state),
             retain=self.retain_state,
             force=force,
         )
@@ -397,17 +398,6 @@ class MqttTelemetry:
             protocol=mqtt.MQTTv311,
         )
 
-
-def _bounded_state(value: dict[str, Any]) -> dict[str, Any]:
-    state = sanitize_data(value)
-    updates = dict(state.get("updates") or {})
-    updates["packages"] = list(updates.get("packages") or [])[:200]
-    state["updates"] = updates
-    state["recent_job_events"] = list(state.get("recent_job_events") or [])[-50:]
-    state["failed_units"] = list(state.get("failed_units") or [])[:100]
-    state["ip_addresses"] = list(state.get("ip_addresses") or [])[:20]
-    state["last_error"] = sanitize_text(state.get("last_error"), limit=2000) or None
-    return state
 
 
 def _ct_entities() -> list[tuple[str, str, str, dict[str, Any]]]:
