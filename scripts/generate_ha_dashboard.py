@@ -294,10 +294,83 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
         "retry_healthcheck": "script.hubinet_ops_retry_healthcheck",
         "rollback": "script.hubinet_ops_rollback",
     }
+    secondary = {
+        "start": f"Start CT{vmid}",
+        "shutdown": f"Graceful shutdown CT{vmid}",
+        "reboot": f"Graceful reboot CT{vmid}",
+        "refresh": "Health, zasoby i usługi",
+        "scan": "Pobierz aktualną listę pakietów",
+        "approve": "Snapshot, update i stabilizacja usług",
+        "reject": "Nie wykonuj aktualizacji",
+        "retry_healthcheck": "Sprawdź stabilizację usług jeszcze raz",
+        "rollback": "Ręczny rollback ostatniej nieudanej operacji",
+    }
+    colors = {
+        "start": "green",
+        "shutdown": "red",
+        "reboot": "amber",
+        "refresh": "cyan",
+        "scan": "blue",
+        "approve": "green",
+        "reject": "red",
+        "retry_healthcheck": "amber",
+        "rollback": "red",
+    }
+    confirmations = {
+        "start": {
+            "title": f"Uruchom CT{vmid}",
+            "text": f"Uruchomić kontener CT{vmid}?",
+            "confirm_text": f"Uruchom CT{vmid}",
+            "dismiss_text": "Anuluj",
+        },
+        "shutdown": {
+            "title": f"Wyłącz łagodnie CT{vmid}",
+            "text": f"Łagodnie wyłączyć kontener CT{vmid}? Usługi przestaną być dostępne.",
+            "confirm_text": f"Wyłącz CT{vmid}",
+            "dismiss_text": "Anuluj",
+        },
+        "reboot": {
+            "title": f"Uruchom ponownie CT{vmid}",
+            "text": f"Łagodnie zrestartować kontener CT{vmid}? Usługi będą chwilowo niedostępne.",
+            "confirm_text": f"Restartuj CT{vmid}",
+            "dismiss_text": "Anuluj",
+        },
+        "refresh": {
+            "title": f"Odśwież stan CT{vmid}",
+            "text": f"Pobrać aktualny stan CT{vmid}?",
+        },
+        "scan": {
+            "title": f"Skan CT{vmid}",
+            "text": f"Sprawdzić dostępne aktualizacje dla CT{vmid}?",
+        },
+        "approve": {
+            "title": f"Aktualizacja CT{vmid}",
+            "text": f"Zatwierdzić aktualny plan aktualizacji CT{vmid}?",
+            "confirm_text": "Aktualizuj",
+            "dismiss_text": "Anuluj",
+        },
+        "reject": {
+            "title": f"Odrzucenie planu CT{vmid}",
+            "text": f"Odrzucić aktualny plan CT{vmid}?",
+            "confirm_text": "Odrzuć plan",
+            "dismiss_text": "Anuluj",
+        },
+        "retry_healthcheck": {
+            "title": f"Ponów healthcheck CT{vmid}",
+            "text": f"Ponowić healthcheck CT{vmid}?",
+        },
+        "rollback": {
+            "title": f"Rollback CT{vmid}",
+            "text": f"Przywrócić zapisany snapshot CT{vmid}?",
+            "confirm_text": "Przywróć",
+            "dismiss_text": "Anuluj",
+        },
+    }
     name = names[action]
     return {
         "type": "custom:mushroom-template-card",
         "primary": name,
+        "secondary": secondary[action],
         "icon": {
             "start": "mdi:play",
             "shutdown": "mdi:power",
@@ -308,37 +381,82 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
             "reject": "mdi:close-octagon-outline",
             "retry_healthcheck": "mdi:heart-pulse",
         }.get(action, "mdi:backup-restore"),
+        "color": colors[action],
         "tap_action": {
             "action": "perform-action",
             "perform_action": service_names.get(
                 action, f"script.hubinet_ops_{action}_container"
             ),
             "data": {"vmid": vmid},
-            "confirmation": {"text": f"Potwierdź akcję „{name}” dla CT{vmid}."},
+            "confirmation": confirmations[action],
         },
     }
+
+
+def _state_condition(
+    entity: str,
+    *,
+    state: str | None = None,
+    state_not: str | None = None,
+) -> dict[str, str]:
+    if (state is None) == (state_not is None):
+        raise ValueError("A state condition requires exactly one of state or state_not")
+    condition = {"condition": "state", "entity": entity}
+    condition["state" if state is not None else "state_not"] = (
+        state if state is not None else state_not
+    )
+    return condition
 
 
 def _control_conditions(
     vmid: int, cfg: dict[str, Any], action: str
 ) -> list[dict[str, Any]]:
-    runtime = _entity(vmid, cfg, "runtime_status")
+    runtime = _entity(vmid, cfg, "lxc_status")
     operation = _entity(vmid, cfg, "operation_status")
-    conditions = [{"entity": operation, "state_not": "running"}]
-    if action == "start":
-        conditions.extend(
-            [
-                {"entity": runtime, "state": "stopped"},
-                {"entity": operation, "state_not": "waiting_approval"},
-            ]
-        )
-    elif action in {"shutdown", "reboot", "scan"}:
-        conditions.append({"entity": runtime, "state": "running"})
-        if action in {"shutdown", "reboot"}:
-            conditions.append({"entity": operation, "state_not": "waiting_approval"})
-    elif action in {"approve", "reject"}:
-        conditions = [{"entity": operation, "state": "waiting_approval"}]
-    return conditions
+    active_job = _entity(vmid, cfg, "active_job_id")
+    lifecycle = _entity(vmid, cfg, "lifecycle_status")
+    capability = _entity(vmid, cfg, f"capability_{action}")
+
+    if action == "refresh":
+        return [_state_condition(capability, state="allowed")]
+    if action in {"approve", "reject"}:
+        return [
+            _state_condition(operation, state="waiting_approval"),
+            _state_condition(capability, state="allowed"),
+        ]
+    if action == "retry_healthcheck":
+        return [
+            _state_condition(_entity(vmid, cfg, "health_status"), state="critical"),
+            _state_condition(capability, state="allowed"),
+            _state_condition(active_job, state="none"),
+            _state_condition(lifecycle, state_not="running"),
+        ]
+    if action == "rollback":
+        return [
+            _state_condition(operation, state="manual_intervention"),
+            _state_condition(_entity(vmid, cfg, "rollback_allowed"), state="allowed"),
+            _state_condition(capability, state="allowed"),
+            _state_condition(active_job, state="none"),
+            _state_condition(lifecycle, state_not="running"),
+        ]
+    if action == "scan":
+        return [
+            _state_condition(runtime, state="running"),
+            _state_condition(capability, state="allowed"),
+            _state_condition(active_job, state="none"),
+            _state_condition(lifecycle, state_not="running"),
+            _state_condition(operation, state_not="running"),
+        ]
+    if action in {"start", "shutdown", "reboot"}:
+        return [
+            _state_condition(runtime, state="stopped" if action == "start" else "running"),
+            _state_condition(capability, state="allowed"),
+            _state_condition(active_job, state="none"),
+            _state_condition(lifecycle, state_not="running"),
+            _state_condition(operation, state_not="waiting_approval"),
+            _state_condition(operation, state_not="running"),
+        ]
+    raise ValueError(f"Unsupported operator action: {action}")
 
 
 def _controls_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:

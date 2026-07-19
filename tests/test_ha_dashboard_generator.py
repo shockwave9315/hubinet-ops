@@ -4,7 +4,14 @@ from typing import Any
 
 import yaml
 
-from scripts.generate_ha_dashboard import DEFAULT_CONFIG, DEFAULT_OUTPUT, render
+from scripts.generate_ha_dashboard import (
+    DEFAULT_CONFIG,
+    DEFAULT_OUTPUT,
+    _control_card,
+    _control_conditions,
+    load_resources,
+    render,
+)
 
 
 def _dashboard() -> dict:
@@ -70,6 +77,26 @@ def test_overview_and_details_use_multiple_mushroom_sections() -> None:
             if isinstance(item, dict) and item.get("type") == "entities"
         ]
         assert mega_entities == []
+
+
+def test_every_conditional_card_has_complete_lovelace_state_conditions() -> None:
+    conditional_cards = [
+        item
+        for item in _walk(_dashboard())
+        if isinstance(item, dict) and item.get("type") == "conditional"
+    ]
+
+    assert conditional_cards
+    for card in conditional_cards:
+        conditions = card.get("conditions")
+        assert isinstance(conditions, list) and conditions
+        for condition in conditions:
+            assert condition.get("condition") == "state"
+            assert condition.get("entity")
+            assert ("state" in condition) != ("state_not" in condition)
+            expected_keys = {"condition", "entity"}
+            expected_keys.add("state" if "state" in condition else "state_not")
+            assert set(condition) == expected_keys
 
 
 def test_mushroom_chips_use_semantic_colors_without_generic_red_fallback() -> None:
@@ -152,7 +179,8 @@ def test_ct110_has_only_supported_self_metrics() -> None:
 
 def test_ct106_is_only_view_with_capability_control_cards() -> None:
     data = _dashboard()
-    ct106 = _text(_view(data, "ct-106"))
+    ct106_view = _view(data, "ct-106")
+    ct106 = _text(ct106_view)
 
     for name in (
         "Uruchom", "Wyłącz łagodnie", "Uruchom ponownie", "Odśwież stan",
@@ -165,6 +193,104 @@ def test_ct106_is_only_view_with_capability_control_cards() -> None:
     assert "confirmation:" in ct106
     assert ct106.count("perform-action") == 8
 
+    controls = {}
+    for item in _walk(ct106_view):
+        if not isinstance(item, dict) or item.get("type") != "conditional":
+            continue
+        card = item.get("card") or {}
+        service = (card.get("tap_action") or {}).get("perform_action")
+        if service:
+            controls[service] = item
+    expected_services = {
+        "script.hubinet_ops_start_container",
+        "script.hubinet_ops_shutdown_container",
+        "script.hubinet_ops_reboot_container",
+        "script.hubinet_ops_refresh_container",
+        "script.hubinet_ops_scan_container",
+        "script.hubinet_ops_approve_container",
+        "script.hubinet_ops_reject_container",
+        "script.hubinet_ops_retry_healthcheck",
+    }
+    assert set(controls) == expected_services
+    assert "script.hubinet_ops_rollback" not in controls
+
+    def signatures(service: str) -> set[tuple[str, str, str]]:
+        return {
+            (
+                condition["entity"],
+                "state" if "state" in condition else "state_not",
+                condition.get("state", condition.get("state_not")),
+            )
+            for condition in controls[service]["conditions"]
+        }
+
+    common_idle = {
+        ("sensor.hubinet_ops_ct106_active_job_id", "state", "none"),
+        ("sensor.hubinet_ops_ct106_lifecycle_status", "state_not", "running"),
+    }
+    for action in ("start", "shutdown", "reboot"):
+        service = f"script.hubinet_ops_{action}_container"
+        expected = common_idle | {
+            (f"sensor.hubinet_ops_ct106_capability_{action}", "state", "allowed"),
+            (
+                "sensor.hubinet_ops_ct106_lxc_status",
+                "state",
+                "stopped" if action == "start" else "running",
+            ),
+            ("sensor.hubinet_ops_ct106_operation_status", "state_not", "waiting_approval"),
+            ("sensor.hubinet_ops_ct106_operation_status", "state_not", "running"),
+        }
+        assert signatures(service) == expected
+
+    assert signatures("script.hubinet_ops_scan_container") == common_idle | {
+        ("sensor.hubinet_ops_ct106_lxc_status", "state", "running"),
+        ("sensor.hubinet_ops_ct106_capability_scan", "state", "allowed"),
+        ("sensor.hubinet_ops_ct106_operation_status", "state_not", "running"),
+    }
+    assert signatures("script.hubinet_ops_refresh_container") == {
+        ("sensor.hubinet_ops_ct106_capability_refresh", "state", "allowed")
+    }
+    for action in ("approve", "reject"):
+        assert signatures(f"script.hubinet_ops_{action}_container") == {
+            ("sensor.hubinet_ops_ct106_operation_status", "state", "waiting_approval"),
+            (f"sensor.hubinet_ops_ct106_capability_{action}", "state", "allowed"),
+        }
+    assert signatures("script.hubinet_ops_retry_healthcheck") == common_idle | {
+        ("sensor.hubinet_ops_ct106_health_status", "state", "critical"),
+        (
+            "sensor.hubinet_ops_ct106_capability_retry_healthcheck",
+            "state",
+            "allowed",
+        ),
+    }
+
+    colors = {
+        "start": "green",
+        "shutdown": "red",
+        "reboot": "amber",
+        "refresh": "cyan",
+        "scan": "blue",
+        "approve": "green",
+        "reject": "red",
+        "retry_healthcheck": "amber",
+    }
+    service_by_action = {
+        action: f"script.hubinet_ops_{action}_container" for action in colors
+    }
+    service_by_action["retry_healthcheck"] = "script.hubinet_ops_retry_healthcheck"
+    for action, color in colors.items():
+        card = controls[service_by_action[action]]["card"]
+        assert card["secondary"]
+        assert card["color"] == color
+        assert card["tap_action"]["confirmation"]["title"]
+        assert card["tap_action"]["confirmation"]["text"]
+    for action in ("start", "shutdown", "reboot", "approve", "reject"):
+        confirmation = controls[f"script.hubinet_ops_{action}_container"]["card"][
+            "tap_action"
+        ]["confirmation"]
+        assert confirmation["confirm_text"]
+        assert confirmation["dismiss_text"] == "Anuluj"
+
     for path in (
         "vm-100", "ct-101", "ct-102", "ct-103", "ct-104", "ct-105",
         "ct-107", "ct-108", "ct-109", "ct-110",
@@ -172,6 +298,33 @@ def test_ct106_is_only_view_with_capability_control_cards() -> None:
         view_text = _text(_view(data, path))
         assert "perform-action" not in view_text
         assert "Tryb obserwacji — sterowanie zablokowane przez politykę backendu" in view_text
+
+
+def test_future_rollback_control_remains_fully_guarded() -> None:
+    cfg = load_resources(DEFAULT_CONFIG)[106]
+    conditions = _control_conditions(106, cfg, "rollback")
+    signatures = {
+        (
+            condition["entity"],
+            "state" if "state" in condition else "state_not",
+            condition.get("state", condition.get("state_not")),
+        )
+        for condition in conditions
+    }
+    assert signatures == {
+        ("sensor.hubinet_ops_ct106_operation_status", "state", "manual_intervention"),
+        ("sensor.hubinet_ops_ct106_rollback_allowed", "state", "allowed"),
+        ("sensor.hubinet_ops_ct106_capability_rollback", "state", "allowed"),
+        ("sensor.hubinet_ops_ct106_active_job_id", "state", "none"),
+        ("sensor.hubinet_ops_ct106_lifecycle_status", "state_not", "running"),
+    }
+    card = _control_card(106, "rollback")
+    assert card["color"] == "red"
+    assert card["secondary"]
+    assert card["tap_action"]["perform_action"] == "script.hubinet_ops_rollback"
+    assert card["tap_action"]["data"] == {"vmid": 106}
+    assert card["tap_action"]["confirmation"]["confirm_text"] == "Przywróć"
+    assert card["tap_action"]["confirmation"]["dismiss_text"] == "Anuluj"
 
 
 def test_apt_views_have_resources_updates_verification_packages_and_optional_docker() -> None:
