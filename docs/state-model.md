@@ -1,9 +1,13 @@
 # Resource state and SQLite compatibility
 
-Normalized state contains `resource_type`, `adapter`, `runtime_status`, health, hostname/OS/uptime/IPs, CPU/RAM/disk/network, services, Docker, Guest Agent status, monitoring, and operator capabilities. LXC also keeps `lxc_status`; QEMU has `qemu_status`.
+Normalized resource state contains identity/runtime/health, telemetry, configured capabilities, and adapter-specific values. APT LXC adds plan/update/verification, executor compatibility, lifecycle, job, and snapshot summary fields. QEMU and agent-self represent unsupported values as null/unknown rather than false zero.
 
-HAOS and agent-self states represent unsupported APT values as `null`/unknown, never as a false zero. Explicit `null` after a failed final APT scan is preserved consistently in `packages_remaining_count`, `pending_updates`, and `updates.pending_count`.
+Executor state includes `executor_version`, `executor_protocol_version`, `executor_compatible`, `executor_sha256`, `executor_profile_sha256`, `executor_missing_actions`, `profile_validation_status`, and `executor_last_checked_at`. Snapshot state includes only count, latest name/time/kind, and operation status; full lists remain REST-only.
 
-SQLite keeps `/var/lib/hubinet-ops/ops.db`, VMID keys, tables, plans, jobs, events, snapshots, and state payload history. The schema migration is additive/idempotent (`user_version=300`); old state payloads default to LXC/APT. The historical `container_states` name remains on disk to avoid a destructive rebuild, with canonical resource methods layered over it.
+Every durable job stores `operation_type`, `request_id`, plan/resource identity, status, stage, progress, result, error, timestamps, optional snapshot, and ordered events. Operation types are update, lifecycle start/shutdown/reboot/force-stop, snapshot create/rollback/delete, retry-healthcheck, and self-update. `active_job_id` is present only while work is active; `last_job_id` retains terminal identity for the shortened dashboard display.
 
-Retained MQTT is a bounded projection, not an authority. Home Assistant never writes state back to SQLite.
+After rollback, `verification_status` returns to unknown and `last_verification`, APT/dpkg booleans, `packages_remaining_count`, pending count, and package projection are cleared. Failed verification events remain durable. Any recovery plan is a new row with a new ID/fingerprint.
+
+SQLite remains `/var/lib/hubinet-ops/ops.db`. Migration to `user_version=400` is additive and idempotent; existing plans/jobs/events/state survive. Historical `container_states` remains on disk with canonical resource methods layered over it. Hostd uses a separate PVE SQLite database so CT110 host job results survive the guest being offline.
+
+Retained MQTT state/attributes are bounded projections, not authority. Home Assistant never writes resource state back to SQLite.

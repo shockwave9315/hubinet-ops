@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .pytest_tmp/
 .pytest-tmp-*/
+.pytest-run-*/
+.test-tmp/
 .mypy_cache/
 .ruff_cache/
 .coverage

@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-CONFIG_PATH = Path("/etc/hubinet-maint.json")
+CONFIG_PATH = Path(os.environ.get("HUBINET_MAINT_CONFIG_PATH", "/etc/hubinet-maint.json"))
 VERSION = "0.4.0"
 PROTOCOL_VERSION = 1
 SUPPORTED_ACTIONS = (
@@ -787,7 +787,7 @@ def repair(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
-    if os.geteuid() != 0:
+    if os.environ.get("HUBINET_OPS_TEST_MODE") != "1" and os.geteuid() != 0:
         output(False, error="hubinet-maint must run as root", rc=1)
     if len(sys.argv) != 2:
         output(False, error="Exactly one action is required", rc=1)

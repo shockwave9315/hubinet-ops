@@ -6,10 +6,12 @@
 2. Read `GET /api/v1/jobs/<job_id>/events?limit=200` with the bearer token.
 3. Check whether the latest events show initial grace, Docker unavailable, container counts, repair, rollback wait, or rollback timeout.
 4. Use the dashboard `Refresh` action. It performs inspect only and cannot approve or update.
-5. Use `Retry healthcheck` only after services have had time to recover. The retry receives a new follow-up job/event history.
-6. Use dashboard rollback only when the backend publishes `rollback_allowed=allowed`; the backend still rechecks policy, failed state, and snapshot presence.
+5. Use `Retry healthcheck` only after services have had time to recover. It creates an idempotent durable `retry_healthcheck` job with its own events.
+6. Use snapshot rollback only for a listed Hubinet-owned snapshot. The backend rechecks ownership, compatibility, policy, active work, runtime, and snapshot presence even when the UI card is visible.
 
-An agent restart marks queued/running jobs interrupted. It does not silently resume APT or rollback. Inspect the managed CT and snapshot state before creating a new plan.
+An agent restart reconciles queued/running jobs with actual LXC/snapshot state. It can confirm an already reached terminal condition, otherwise it marks the job interrupted; it never silently replays APT, lifecycle, snapshot deletion, or rollback. Host jobs for CT110 remain in hostd's independent SQLite store while CT110 is offline.
+
+After rollback, current verification and remaining-package fields are cleared to unknown/null rather than presenting pre-rollback success. The failed verification remains in job events. A recovery scan may create a new plan with a new ID and fingerprint; the rolled-back plan is never reused.
 
 ## Disable MQTT
 
@@ -21,6 +23,6 @@ The upgrade writes its backup path to `/root/hubinet-ops-last-upgrade-backup` in
 
 The upgrade does not replace `agent.env` or SSH keys and does not enable MQTT, operator scan, approval, or update. Version 0.3.0 intentionally enables the separate read-only `monitoring_scheduler` for APT resources whose `monitoring.update_scan` is true; observation-only results cannot create an approvable plan.
 
-## Observe CT106 without updating it
+## Read-only diagnosis without changing a resource
 
-Use a non-production copy of runtime config and keep `scheduler.enabled: false`. Verify CT106 is allowlisted, then call only the authenticated CT106 `refresh` endpoint. Refresh maps to fixed `inspect` and does not run APT. A deliberate `scan` runs package metadata refresh/simulation and may create a waiting plan, but it cannot update packages. Reject the plan from the dashboard; do not approve it. Never test with the update or rollback endpoint unless an explicit maintenance window and rollback policy have been reviewed.
+Use a non-production copy of runtime config and keep `scheduler.enabled: false`. Call only authenticated `refresh`, wrapper `inspect`, executor `capabilities`, or snapshot list. These are read-only. A deliberate scan may refresh APT metadata and create a waiting plan, so it is not part of installer validation. Never test update, lifecycle, snapshot mutation, or rollback against production as a smoke check.

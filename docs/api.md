@@ -1,17 +1,39 @@
-# REST API 0.3.2
+# REST API 0.4.0
 
-Every `/api/v1` route requires `Authorization: Bearer …`. A policy, adapter, state, or concurrency conflict returns HTTP 409; unknown resources return 404.
+Every `/api/v1` route requires `Authorization: Bearer …`. Unknown resources return 404. Policy, compatibility, state, ownership, idempotency, or concurrency conflicts return an explicit 409; no endpoint accepts command text.
 
-Canonical inventory routes:
+Canonical state and inventory:
 
 - `GET /api/v1/resources`
 - `GET /api/v1/resources/{vmid}`
+- `GET /api/v1/state`
 - `GET /api/v1/resources/{vmid}/state`
 - `GET /api/v1/resources/{vmid}/events`
-- `POST /api/v1/resources/{vmid}/refresh`
-- `POST /api/v1/resources/{vmid}/scan`
-- `POST /api/v1/resources/{vmid}/start|shutdown|reboot`
+- `POST /api/v1/resources/{vmid}/refresh|scan|retry-healthcheck`
 
-Each inventory item includes VMID, resource type, adapter, names, monitoring policy, operator capabilities, and current state. `/api/v1/containers` returns LXC only, preserves the 0.2.4 shape for CT101/CT106, and never includes VM100. Existing LXC `/containers/{vmid}/...` routes remain compatibility aliases.
+`/api/v1/states` does not exist. Historical `/containers/{vmid}/...` LXC aliases remain where documented for 0.3.x clients.
 
-There is no generic command endpoint. VMID or plan selection never accepts shell text. Plans, jobs, retry-healthcheck, and rollback retain their 0.2.4 fixed endpoints and policies.
+Active plans use VMID as the primary operator contract:
+
+- `POST /api/v1/resources/{vmid}/plans/approve-active`
+- `POST /api/v1/resources/{vmid}/plans/reject-active`
+
+The backend requires exactly one unexpired waiting plan, an unchanged fingerprint, an allowed capability, no active destructive job, and a compatible executor. The older endpoints that accept `plan_id` remain compatibility aliases. Missing or ambiguous active plans return 409 rather than silently doing nothing.
+
+Lifecycle and self-update:
+
+- `POST /api/v1/resources/{vmid}/start|shutdown|reboot|force-stop`
+- `POST /api/v1/resources/110/self-update`
+
+Each accepts optional JSON `{"request_id":"..."}`. Repeating the same VMID/request ID and operation returns the same persisted job; reusing it for another operation returns 409.
+
+Snapshots:
+
+- `GET /api/v1/resources/{vmid}/snapshots`
+- `POST /api/v1/resources/{vmid}/snapshots`
+- `POST /api/v1/resources/{vmid}/snapshots/{name}/rollback`
+- `DELETE /api/v1/resources/{vmid}/snapshots/{name}`
+
+List entries contain `name`, `description`, `created_at`, `kind`, `owned_by_hubinet_ops`, `rollback_eligible`, `delete_eligible`, and `source_job_id`. Rollback/delete reject names not owned by Hubinet Ops. `latest` is selected by parsed creation time, not lexical accident.
+
+Jobs expose operation type, request ID, status, stage, progress, result, error, and durable events. Terminal jobs are never replayed; startup reconciliation marks uncertain destructive work interrupted unless the real host state proves the requested terminal condition.

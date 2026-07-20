@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+[[ ${EUID} -eq 0 || ${HUBINET_OPS_TEST_MODE:-0} == 1 ]] || {
+  echo "Hubinet Ops self-update requires root" >&2
+  exit 1
+}
+[[ $# -eq 0 ]] || { echo "Self-update accepts no arguments" >&2; exit 2; }
+
+RELEASE_ROOT="${HUBINET_OPS_RELEASE_ROOT:-/var/lib/hubinet-ops-hostd/approved-release}"
+UPGRADE="$RELEASE_ROOT/deploy/upgrade-0.4.0-from-pve.sh"
+[[ -f "$UPGRADE" && ! -L "$UPGRADE" ]] || {
+  echo "No approved Hubinet Ops release is staged" >&2
+  exit 1
+}
+if [[ ${HUBINET_OPS_TEST_MODE:-0} != 1 ]]; then
+  owner="$(stat -c %U "$RELEASE_ROOT" "$UPGRADE")"
+  [[ "$owner" == $'root\nroot' ]] || {
+    echo "Approved release must be root-owned" >&2
+    exit 1
+  }
+  mode="$(stat -c %a "$UPGRADE")"
+  (( (8#$mode & 8#022) == 0 )) || {
+    echo "Approved upgrade must not be group/world writable" >&2
+    exit 1
+  }
+fi
+bash -n "$UPGRADE"
+exec bash "$UPGRADE"
