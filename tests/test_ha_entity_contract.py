@@ -16,7 +16,7 @@ from app.ha_entities import (
     resource_prefix,
 )
 from app.mqtt import MqttTelemetry
-from app.mqtt_budget import bounded_state
+from app.mqtt_budget import HA_ATTRIBUTE_BUDGET_BYTES, bounded_attributes, bounded_state
 from app.state import normalize_state
 from scripts.generate_ha_dashboard import DEFAULT_CONFIG, build_dashboard, render
 
@@ -206,6 +206,65 @@ def test_agent_last_refresh_discovery_is_a_diagnostic_timestamp() -> None:
 
     assert payload["device_class"] == "timestamp"
     assert payload["entity_category"] == "diagnostic"
+
+
+def test_health_discovery_uses_dedicated_attributes_topic_without_force_update() -> None:
+    configs, _ = _discovery()
+
+    for prefix, vmid in (("vm", 100), ("ct", 106), ("ct", 110)):
+        payload = configs[
+            f"homeassistant/sensor/hubinet_ops_{prefix}{vmid}_health_status/config"
+        ]
+        assert payload["json_attributes_topic"] == (
+            f"hubinet/ops/resource/{vmid}/attributes"
+        )
+        assert payload["json_attributes_topic"] != payload["state_topic"]
+        assert "force_update" not in payload
+
+
+def test_dashboard_attributes_have_an_independent_ten_kib_budget() -> None:
+    payload = bounded_attributes(
+        {
+            "last_refresh": "2026-07-20T18:00:00+00:00",
+            "uptime_seconds": 100,
+            "cpu": {"usage_percent": 3.0},
+            "memory": {"used_bytes": 1},
+            "disk": {"used_bytes": 2},
+            "network": {"in_bytes": 3},
+            "updates": {
+                "packages": [
+                    {"name": f"package-{index}-" + "x" * 200}
+                    for index in range(200)
+                ]
+            },
+            "recent_job_events": [
+                {"message": f"event-{index}-" + "y" * 1000}
+                for index in range(50)
+            ],
+            "recent_warnings": ["z" * 500 for _ in range(20)],
+        }
+    )
+
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(encoded) <= HA_ATTRIBUTE_BUDGET_BYTES
+    assert set(payload) <= {
+        "updates",
+        "recent_job_events",
+        "recent_warnings",
+        "attribute_payload",
+        "failed_units",
+    }
+    for forbidden in (
+        "last_refresh",
+        "uptime_seconds",
+        "cpu",
+        "memory",
+        "disk",
+        "network",
+        "health_score",
+        "runtime_status",
+    ):
+        assert forbidden not in payload
 
 
 def test_vm100_primary_ip_replaces_479_character_state_without_losing_attributes() -> None:

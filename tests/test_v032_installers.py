@@ -26,10 +26,15 @@ def test_032_upgrade_updates_agent_and_wrapper_transactionally_only() -> None:
     assert "SSH_ORIGINAL_COMMAND='inspect 106' /usr/local/sbin/hubinet-ops-host" in text
     assert 'validate_wrapper_inspect qemu "$qemu_smoke"' in text
     assert 'validate_wrapper_inspect lxc "$lxc_smoke"' in text
+    assert 'data["qemu_status"] == "running" and usage is None' in text
     assert 'tar -C "$SOURCE_DIR" -czf "$ARCHIVE" app' in text
+    assert 'VALIDATION_NOT_BEFORE="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"' in text
     assert '"version":"0.3.2"' in text
     assert "/api/v1/states" in text
     assert 'set(resources) != expected_vmids' in text
+    assert 'utc_timestamp(resources[vmid].get("last_refresh")) < validation_not_before' in text
+    assert "math.isfinite(usage)" in text
+    assert "0 <= usage <= 100" in text
     assert 'vm100.get("health_status") != "healthy"' in text
     assert 'ct106.get("health_status") != "healthy"' in text
     assert 'ct110.get("health_status") != "healthy"' in text

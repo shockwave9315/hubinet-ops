@@ -8,7 +8,9 @@
 - expose QEMU and agent-self byte metrics as numeric GiB sensors and render uptime and agent refresh time readably;
 - publish one deduplicated agent summary per full telemetry cycle with a second-precision UTC completion timestamp;
 - exclude only Hubinet Ops `last_refresh` sensors from future Recorder history without changing the user's Recorder retention or database settings;
+- move health attributes to a separately bounded, retained, deduplicated MQTT topic so metric-only refreshes do not create Recorder attribute churn;
 - add read-only VM100/CT106 wrapper and first-cycle telemetry smoke checks to the transactional 0.3.2 installer;
+- require fresh per-resource timestamps and bounded VM100 CPU values before the 0.3.2 installer accepts its first telemetry cycle;
 - add transactional 0.3.2 CT110/PVE-wrapper and Home Assistant installers with rollback and no automatic HA restart.
 
 ## 0.3.1

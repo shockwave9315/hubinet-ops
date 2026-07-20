@@ -12,7 +12,11 @@ export LOG_DIR
 
 cat > "$MOCK_BIN/date" <<'SH'
 #!/usr/bin/env bash
-printf '%s\n' 20260720-180000
+if [[ "$*" == '-u +%Y-%m-%dT%H:%M:%S+00:00' ]]; then
+  printf '%s\n' '2026-07-20T18:00:00+00:00'
+else
+  printf '%s\n' 20260720-180000
+fi
 SH
 
 cat > "$MOCK_BIN/python3" <<'SH'
@@ -83,7 +87,24 @@ case "$action" in
       fi
       if [[ "$payload" == *'/api/v1/states'* ]]; then
         printf '%s\n' '/api/v1/states' >> "$LOG_DIR/pct.log"
-        printf '%s\n' '{"version":"0.3.2","resources":{"100":{"health_status":"healthy","cpu":{"usage_percent":3.05257}},"101":{},"102":{},"103":{},"104":{},"105":{},"106":{"health_status":"healthy"},"107":{},"108":{},"109":{},"110":{"health_status":"healthy","health_score":100}}}'
+        if [[ ${STALE_STATES:-0} == 1 ]]; then
+          refresh='2026-07-20T17:59:59+00:00'
+          cpu=0
+        else
+          refresh='2026-07-20T18:00:01+00:00'
+          cpu=3.05257
+        fi
+        printf '%s' '{"version":"0.3.2","resources":{'
+        for id in {100..110}; do
+          [[ "$id" == 100 ]] || printf ','
+          case "$id" in
+            100) printf '"100":{"last_refresh":"%s","health_status":"healthy","cpu":{"usage_percent":%s}}' "$refresh" "$cpu" ;;
+            106) printf '"106":{"last_refresh":"%s","health_status":"healthy"}' "$refresh" ;;
+            110) printf '"110":{"last_refresh":"%s","health_status":"healthy","health_score":100}' "$refresh" ;;
+            *) printf '"%s":{"last_refresh":"%s"}' "$id" "$refresh" ;;
+          esac
+        done
+        printf '%s\n' '}}'
         exit 0
       fi
     fi
@@ -98,6 +119,10 @@ case "$SSH_ORIGINAL_COMMAND" in
   'inspect 100')
     if [[ ${BAD_WRAPPER_JSON:-0} == 1 ]]; then
       printf '%s\n' 'not-json'
+    elif [[ ${WRAPPER_VM_STOPPED:-0} == 1 ]]; then
+      printf '%s\n' '{"ok":true,"data":{"resource_type":"qemu","adapter":"haos","qemu_status":"stopped","cpu":{"usage":null}}}'
+    elif [[ ${WRAPPER_CPU_NULL:-0} == 1 || ${CLUSTER_RESOURCES_MISSING:-0} == 1 ]]; then
+      printf '%s\n' '{"ok":true,"data":{"resource_type":"qemu","adapter":"haos","qemu_status":"running","cpu":{"usage":null}}}'
     else
       printf '%s\n' '{"ok":true,"data":{"resource_type":"qemu","adapter":"haos","qemu_status":"running","cpu":{"usage":0.0305257}}}'
     fi
@@ -162,6 +187,54 @@ if grep -Fxq install "$LOG_DIR/agent-layers.log"; then
   echo "Agent was replaced after the wrapper smoke had already failed" >&2
   exit 1
 fi
+grep -Fxq 'echo old-wrapper' "$HOST_WRAPPER"
+
+printf '%s\n' '#!/usr/bin/env bash' 'echo old-wrapper' > "$HOST_WRAPPER"
+: > "$LOG_DIR/agent-layers.log"
+export WRAPPER_CPU_NULL=1
+if bash "$ROOT/deploy/upgrade-0.3.2-from-pve.sh" >/dev/null 2>&1; then
+  echo "0.3.2 upgrade unexpectedly accepted null CPU for running VM100" >&2
+  exit 1
+fi
+unset WRAPPER_CPU_NULL
+grep -Fxq backup "$LOG_DIR/agent-layers.log"
+grep -Fxq start-unchanged "$LOG_DIR/agent-layers.log"
+if grep -Fxq install "$LOG_DIR/agent-layers.log"; then
+  echo "Agent was replaced after running VM100 returned null CPU" >&2
+  exit 1
+fi
+grep -Fxq 'echo old-wrapper' "$HOST_WRAPPER"
+
+printf '%s\n' '#!/usr/bin/env bash' 'echo old-wrapper' > "$HOST_WRAPPER"
+: > "$LOG_DIR/agent-layers.log"
+export WRAPPER_VM_STOPPED=1
+bash "$ROOT/deploy/upgrade-0.3.2-from-pve.sh" >/dev/null
+unset WRAPPER_VM_STOPPED
+grep -Fxq backup "$LOG_DIR/agent-layers.log"
+grep -Fxq install "$LOG_DIR/agent-layers.log"
+grep -Fq 'cluster/resources' "$HOST_WRAPPER"
+
+printf '%s\n' '#!/usr/bin/env bash' 'echo old-wrapper' > "$HOST_WRAPPER"
+: > "$LOG_DIR/agent-layers.log"
+export CLUSTER_RESOURCES_MISSING=1
+if bash "$ROOT/deploy/upgrade-0.3.2-from-pve.sh" >/dev/null 2>&1; then
+  echo "0.3.2 upgrade unexpectedly accepted missing VM100 cluster CPU" >&2
+  exit 1
+fi
+unset CLUSTER_RESOURCES_MISSING
+grep -Fxq start-unchanged "$LOG_DIR/agent-layers.log"
+grep -Fxq 'echo old-wrapper' "$HOST_WRAPPER"
+
+printf '%s\n' '#!/usr/bin/env bash' 'echo old-wrapper' > "$HOST_WRAPPER"
+: > "$LOG_DIR/agent-layers.log"
+export STALE_STATES=1
+if bash "$ROOT/deploy/upgrade-0.3.2-from-pve.sh" >/dev/null 2>&1; then
+  echo "0.3.2 upgrade unexpectedly accepted stale persisted resource states" >&2
+  exit 1
+fi
+unset STALE_STATES
+grep -Fxq install "$LOG_DIR/agent-layers.log"
+grep -Fxq restore "$LOG_DIR/agent-layers.log"
 grep -Fxq 'echo old-wrapper' "$HOST_WRAPPER"
 
 printf '%s\n' '#!/usr/bin/env bash' 'echo old-wrapper' > "$HOST_WRAPPER"

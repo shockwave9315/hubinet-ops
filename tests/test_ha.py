@@ -166,6 +166,14 @@ def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() ->
     assert text.count("kolejnych widocznych pakietów") == 9
 
 
+def test_dashboard_reads_rich_content_from_health_status_attributes() -> None:
+    text = DASHBOARD.read_text(encoding="utf-8")
+
+    assert "state_attr(''sensor.hubinet_ops_ct101_health_status'', ''updates'')" in text
+    assert "state_attr(''sensor.hubinet_ops_ct101_health_status'', ''recent_job_events'')" in text
+    assert "state_attr(''sensor.hubinet_ops_ct110_health_status'', ''recent_warnings'')" in text
+
+
 def test_dashboard_sensor_ids_match_home_assistant_discovery_names() -> None:
     dashboard = DASHBOARD.read_text(encoding="utf-8")
     keys = {key for key, _, _, _ in _ct_entities()}

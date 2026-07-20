@@ -48,6 +48,8 @@ cpu = data.get("cpu")
 if not isinstance(cpu, dict) or "usage" not in cpu:
     raise SystemExit("VM100 cpu must be an object containing usage")
 usage = cpu["usage"]
+if data["qemu_status"] == "running" and usage is None:
+    raise SystemExit("running VM100 requires cluster/resources cpu.usage")
 if usage is not None and (
     isinstance(usage, bool)
     or not isinstance(usage, (int, float))
@@ -168,6 +170,7 @@ fi
 
 pct push "$AGENT_VMID" "$ARCHIVE" /root/hubinet-ops-0.3.2.tgz --perms 0600
 agent_changes_started=true
+VALIDATION_NOT_BEFORE="$(date -u +%Y-%m-%dT%H:%M:%S+00:00)"
 
 pct exec "$AGENT_VMID" -- bash -s <<'REMOTE_INSTALL_AGENT'
 set -Eeuo pipefail
@@ -198,22 +201,49 @@ curl -fsS --max-time 5 -H "Authorization: Bearer $HUBINET_OPS_API_TOKEN" \
   http://127.0.0.1:8787/api/v1/states
 REMOTE_CHECK_STATES
 )" || states_rc=$?
-    if [[ "$states_rc" -eq 0 ]] && python3 - "$states" <<'PY'
-import json, sys
+    if [[ "$states_rc" -eq 0 ]] && python3 - "$states" "$VALIDATION_NOT_BEFORE" <<'PY'
+from datetime import UTC, datetime
+import json, math, sys
 
 try:
     payload = json.loads(sys.argv[1])
     resources = payload["resources"]
 except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     raise SystemExit(1)
+
+def utc_timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError
+    return parsed.astimezone(UTC)
+
+try:
+    validation_not_before = utc_timestamp(sys.argv[2])
+except (TypeError, ValueError):
+    raise SystemExit(1)
 expected_vmids = {str(vmid) for vmid in range(100, 111)}
 if payload.get("version") != "0.3.2" or not isinstance(resources, dict) or set(resources) != expected_vmids:
+    raise SystemExit(1)
+try:
+    if any(
+        utc_timestamp(resources[vmid].get("last_refresh")) < validation_not_before
+        for vmid in expected_vmids
+    ):
+        raise SystemExit(1)
+except (AttributeError, TypeError, ValueError):
     raise SystemExit(1)
 vm100 = resources.get("100", {})
 ct106 = resources.get("106", {})
 ct110 = resources.get("110", {})
 usage = vm100.get("cpu", {}).get("usage_percent")
-valid_number = isinstance(usage, (int, float)) and not isinstance(usage, bool)
+valid_number = (
+    isinstance(usage, (int, float))
+    and not isinstance(usage, bool)
+    and math.isfinite(usage)
+    and 0 <= usage <= 100
+)
 if not valid_number or vm100.get("health_status") != "healthy":
     raise SystemExit(1)
 if ct106.get("health_status") != "healthy":
