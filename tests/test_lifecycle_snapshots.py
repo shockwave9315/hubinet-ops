@@ -187,6 +187,38 @@ def test_lifecycle_guards_runtime_active_job_plan_and_request_id(tmp_path: Path)
         service.queue_lifecycle(106, "reboot")
 
 
+def test_retry_healthcheck_is_a_durable_idempotent_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)  # type: ignore[arg-type]
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="update",
+        request_id="failed-update-0001",
+    )
+    db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    monkeypatch.setattr(
+        service.stabilizer,
+        "wait",
+        lambda **_kwargs: {"health_status": "healthy", "health_score": 100},
+    )
+
+    queued = service.queue_retry_healthcheck(106, "retry-health-0001")
+    same = service.queue_retry_healthcheck(106, "retry-health-0001")
+    assert same["id"] == queued["id"]
+    assert queued["operation_type"] == "retry_healthcheck"
+
+    terminal = run_queued(service, db)
+    assert terminal["status"] == "success"
+    assert service.get_state(106)["health_status"] == "healthy"
+    assert host.calls == []
+
+
 def test_snapshot_create_list_latest_rollback_delete_and_foreign_rejection(tmp_path: Path) -> None:
     cfg = settings(tmp_path)
     db = Database(cfg.db_path)

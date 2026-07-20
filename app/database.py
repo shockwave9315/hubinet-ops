@@ -418,6 +418,18 @@ class Database:
             raise KeyError(job_id)
         return _decode_job(row)
 
+    def get_job_by_request_id(
+        self,
+        vmid: int,
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
+                (int(vmid), str(request_id)),
+            ).fetchone()
+        return _decode_job(row) if row else None
+
     def get_active_job(self, vmid: int) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute(

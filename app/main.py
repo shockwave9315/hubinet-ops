@@ -285,10 +285,16 @@ def create_app(
         except (ValueError, ExecutorError, HostControlError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @api.post("/api/v1/resources/{vmid}/retry-healthcheck", dependencies=auth)
     @api.post("/api/v1/containers/{vmid}/retry-healthcheck", dependencies=auth)
-    def retry_healthcheck(vmid: int) -> dict[str, Any]:
+    def retry_healthcheck(
+        vmid: int,
+        request: OperationRequest | None = None,
+    ) -> dict[str, Any]:
         try:
-            return service.retry_healthcheck(vmid)
+            return service.queue_retry_healthcheck(
+                vmid, request.request_id if request else None
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Container not found") from exc
         except ValueError as exc:

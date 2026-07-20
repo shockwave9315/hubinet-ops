@@ -547,6 +547,7 @@ class OpsService:
                 "active_plan_id": plan["id"],
                 "active_plan_status": "approved",
                 "active_job_id": job["id"],
+                "operation_type": job.get("operation_type", "update"),
                 "operation_status": "running",
                 "job_stage": "preflight",
                 "job_progress": 1,
@@ -639,6 +640,36 @@ class OpsService:
             return self.get_state(vmid)
         finally:
             lock.release()
+
+    def queue_retry_healthcheck(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, "retry_healthcheck")
+        self._require_compatible_executor(vmid)
+        resolved_request_id = request_id or uuid.uuid4().hex
+        existing = self.db.get_job_by_request_id(vmid, resolved_request_id)
+        if existing is not None:
+            if existing.get("operation_type") != "retry_healthcheck":
+                raise ValueError("request_id was already used for another operation")
+            return existing
+        latest = self.db.get_latest_job(vmid)
+        if latest is None:
+            raise ValueError("No job is available for retry")
+        if latest.get("status") not in {"failed", "blocked", "interrupted"}:
+            raise ValueError("Healthcheck retry is only allowed after a failed operation")
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"ct-{vmid}")),
+            operation_type="retry_healthcheck",
+            request_id=resolved_request_id,
+            plan_id=latest.get("plan_id"),
+            snapshot_name=latest.get("snapshot_name"),
+        )
+        self._mark_job_queued(vmid, job)
+        return job
 
     def manual_rollback(self, vmid: int) -> dict[str, Any]:
         cfg = self._resource(vmid)
@@ -833,6 +864,7 @@ class OpsService:
         state.update(
             {
                 "active_job_id": job["id"],
+                "operation_type": job["operation_type"],
                 "operation_status": "running",
                 "job_stage": "queued",
                 "job_progress": 0,
@@ -1569,7 +1601,10 @@ class OpsService:
             message=f"Operation {operation_type} started",
         )
         try:
-            result = self._execute_host_operation(job)
+            if operation_type == "retry_healthcheck":
+                result = self._execute_retry_healthcheck(job, emit)
+            else:
+                result = self._execute_host_operation(job)
             if operation_type == "snapshot_create":
                 self._enforce_snapshot_retention(vmid, job)
             self.db.update_job(job["id"], result=result)
@@ -1603,11 +1638,24 @@ class OpsService:
                     )
                 self._save_state(vmid, state)
                 self.list_snapshots(vmid)
+            elif operation_type == "retry_healthcheck":
+                state.update(result)
+                state["health_status"] = result.get(
+                    "health_status", result.get("health", "healthy")
+                )
+                state["last_refresh"] = self._utc_second_timestamp()
+                self._save_state(vmid, state)
             else:
                 self._save_state(vmid, state)
             self._terminal(job, "success", "success", None)
         except (ExecutorError, HostControlError, ValueError) as exc:
             state = self.get_state(vmid)
+            if operation_type == "retry_healthcheck" and isinstance(exc, ExecutorError):
+                if exc.data:
+                    state.update(exc.data)
+                    state["health_status"] = exc.data.get(
+                        "health_status", exc.data.get("health", "critical")
+                    )
             if operation_type.startswith("lifecycle_"):
                 state.update(
                     {
@@ -1620,6 +1668,22 @@ class OpsService:
                 state["snapshot_operation_status"] = "failed"
             self._save_state(vmid, state)
             self._terminal(job, "failed", "failed", str(exc))
+
+    def _execute_retry_healthcheck(
+        self,
+        job: dict[str, Any],
+        emit: Callable[..., None],
+    ) -> dict[str, Any]:
+        cfg = self._resource(int(job["vmid"]))
+        policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
+        return self.stabilizer.wait(
+            vmid=int(job["vmid"]),
+            phase="update",
+            timeout_seconds=policy.repair_timeout_seconds,
+            policy=policy,
+            emit=emit,
+            initial_grace=False,
+        )
 
     def _execute_host_operation(self, job: dict[str, Any]) -> dict[str, Any]:
         operation_type = str(job["operation_type"])
@@ -1934,7 +1998,9 @@ class OpsService:
         suppress_recovery = result in {"success", "rolled_back"}
         state.update(
             {
-                "active_job_id": job["id"],
+                "active_job_id": None,
+                "last_job_id": job["id"],
+                "operation_type": job.get("operation_type", "update"),
                 "operation_status": operation,
                 "job_stage": event["stage"],
                 "job_progress": 100,
@@ -2125,6 +2191,7 @@ class OpsService:
             state.update(
                 {
                     "active_job_id": active_job["id"],
+                    "operation_type": active_job.get("operation_type", "update"),
                     "operation_status": "running",
                     "job_stage": active_job["stage"],
                     "job_progress": active_job.get("progress", 0),
@@ -2208,7 +2275,8 @@ class OpsService:
                 if latest and latest.get("status") == "interrupted":
                     state.update(
                         {
-                            "active_job_id": latest["id"],
+                            "active_job_id": None,
+                            "last_job_id": latest["id"],
                             "operation_status": "failed",
                             "job_stage": "failed",
                             "job_progress": 100,

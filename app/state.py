@@ -137,6 +137,8 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("active_plan_id", None)
     state.setdefault("active_plan_status", None)
     state.setdefault("active_job_id", None)
+    state.setdefault("last_job_id", None)
+    state.setdefault("operation_type", None)
     state.setdefault("last_scan", None)
     state.setdefault("last_refresh", None)
     state.setdefault("last_update", None)
