@@ -77,6 +77,24 @@ def _entity_grid(cards: Iterable[dict[str, Any]], columns: int = 2) -> dict[str,
     }
 
 
+def _uptime_card(entity: str) -> dict[str, Any]:
+    return {
+        "type": "custom:mushroom-template-card",
+        "entity": entity,
+        "primary": "Uptime",
+        "secondary": (
+            "{% set seconds = states(entity) | int(0) %}"
+            "{% set days = seconds // 86400 %}"
+            "{% set hours = (seconds % 86400) // 3600 %}"
+            "{% set minutes = (seconds % 3600) // 60 %}"
+            "{{ days }} d {{ hours }} h {{ minutes }} min"
+        ),
+        "icon": "mdi:timer-outline",
+        "color": "green",
+        "tap_action": {"action": "more-info"},
+    }
+
+
 def _chip(
     entity: str,
     icon: str,
@@ -483,7 +501,7 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             _entity_card(_entity(vmid, cfg, "disk_free_mb"), "Wolne miejsce", "mdi:database-arrow-down-outline", "cyan"),
             _entity_card(_entity(vmid, cfg, "memory_used_percent"), "Pamięć RAM", "mdi:memory", "purple"),
             _entity_card(_entity(vmid, cfg, "lxc_status"), "Status LXC", "mdi:server", "green"),
-            _entity_card(_entity(vmid, cfg, "uptime_seconds"), "Uptime", "mdi:timer-outline", "green"),
+            _uptime_card(_entity(vmid, cfg, "uptime_seconds")),
         ]
     )
     operation = {
@@ -499,7 +517,7 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         "color": "{{ 'blue' if is_state(entity, 'running') else 'amber' if is_state(entity, 'waiting_approval') else 'green' }}",
         "tap_action": {"action": "more-info"},
     }
-    verification = _entity_grid(
+    verification_details = _entity_grid(
         [
             _entity_card(_entity(vmid, cfg, "verification_status"), "Weryfikacja", "mdi:check-decagram"),
             _entity_card(_entity(vmid, cfg, "apt_check_ok"), "APT check", "mdi:package-check", "green"),
@@ -509,6 +527,28 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             _entity_card(_entity(vmid, cfg, "last_operation_result"), "Ostatni wynik", "mdi:history"),
         ]
     )
+    verification_status = _entity(vmid, cfg, "verification_status")
+    verification = _section(
+        {
+            "type": "conditional",
+            "conditions": [_state_condition(verification_status, state="unknown")],
+            "card": {
+                "type": "custom:mushroom-template-card",
+                "entity": verification_status,
+                "primary": "Brak wykonanej weryfikacji aktualizacji",
+                "secondary": "Szczegółowe wyniki pojawią się po uruchomieniu aktualizacji.",
+                "multiline_secondary": True,
+                "icon": "mdi:clipboard-alert-outline",
+                "color": "blue-grey",
+                "tap_action": {"action": "more-info"},
+            },
+        },
+        {
+            "type": "conditional",
+            "conditions": [_state_condition(verification_status, state_not="unknown")],
+            "card": verification_details,
+        },
+    )
     diagnostics = _entity_grid(
         [
             _entity_card(_entity(vmid, cfg, "last_refresh"), "Ostatnie odświeżenie", "mdi:refresh"),
@@ -517,6 +557,7 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             _entity_card(_entity(vmid, cfg, "active_plan_id"), "Aktywny plan", "mdi:clipboard-text-clock-outline", "amber"),
             _entity_card(_entity(vmid, cfg, "active_job_id"), "Aktywny job", "mdi:identifier"),
             _entity_card(_entity(vmid, cfg, "rollback_allowed"), "Rollback", "mdi:backup-restore", "amber"),
+            _entity_card(_entity(vmid, cfg, "last_operation_result"), "Ostatni wynik", "mdi:history"),
             _entity_card(_entity(vmid, cfg, "last_error"), "Ostatni błąd", "mdi:alert-circle-outline", "red"),
         ]
     )
@@ -540,34 +581,54 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         "title": "Logi live",
         "content": (
             f"{{% set events = state_attr('{health}', 'recent_job_events') or [] %}}\n"
-            "{% for event in events[-25:] | reverse %}"
+            "{% for event in events[-10:] | reverse %}"
             "- `{{ event.get('created_at', '') }}` **{{ event.get('stage', '') }}** "
             "{{ event.get('message', '') | replace('|', '¦') }}\n"
             "{% endfor %}"
         ),
     }
-    sections = [
-        _section(
-            _title(_label(vmid, cfg), f"Adapter APT · {cfg['criticality']}"),
-            _resource_status(vmid, cfg),
-            _resource_chips(vmid, cfg),
+    status_section = _section(
+        _title("Status", f"{_label(vmid, cfg)} · Adapter APT · {cfg['criticality']}"),
+        _resource_status(vmid, cfg),
+        _resource_chips(vmid, cfg),
+    )
+    control_section = (
+        _controls_section(vmid, cfg)
+        if any(cfg["operator_capabilities"].values())
+        else _observation_section(vmid, cfg)
+    )
+    resource_section = _section(_title("Zasoby", "Ostatni pomiar z kontenera"), resources)
+    update_section = _section(
+        _title("Aktualizacje", "Stan operacji i planu"),
+        _entity_grid(
+            [
+                _entity_card(_entity(vmid, cfg, "update_status"), "Status aktualizacji", "mdi:package-up"),
+                _entity_card(_entity(vmid, cfg, "pending_updates"), "Pakiety oczekujące", "mdi:format-list-numbered", "amber"),
+            ]
         ),
-        _section(_title("Zasoby", "Ostatni pomiar z kontenera"), resources),
-        _section(_title("Aktualizacje", "Stan operacji i planu"), operation),
-        _section(_title("Weryfikacja końcowa", "APT, dpkg i wynik operacji"), verification),
-        _section(
-            _title("Recovery scan", "Stan bezpiecznego skanu odzyskiwania"),
-            _entity_grid(
-                [
-                    _entity_card(_entity(vmid, cfg, "recovery_scan_status"), "Status", "mdi:shield-sync-outline"),
-                    _entity_card(_entity(vmid, cfg, "last_recovery_scan"), "Ostatni skan", "mdi:history"),
-                    _entity_card(_entity(vmid, cfg, "last_recovery_scan_result"), "Ostatni wynik", "mdi:shield-check-outline"),
-                ]
-            ),
+        operation,
+    )
+    history_section = _section(
+        _title("Historia i diagnostyka", "Ostatnie operacje oraz błędy"), diagnostics
+    )
+    recovery_section = _section(
+        _title("Recovery scan", "Stan bezpiecznego skanu odzyskiwania"),
+        _entity_grid(
+            [
+                _entity_card(_entity(vmid, cfg, "recovery_scan_status"), "Status", "mdi:shield-sync-outline"),
+                _entity_card(_entity(vmid, cfg, "last_recovery_scan"), "Ostatni skan", "mdi:history"),
+                _entity_card(_entity(vmid, cfg, "last_recovery_scan_result"), "Ostatni wynik", "mdi:shield-check-outline"),
+            ]
         ),
-        _section(_title("Historia i diagnostyka", "Ostatnie operacje oraz błędy"), diagnostics),
-        _section(_title("Pakiety i diagnostyka", "Ograniczony podgląd MQTT"), package_card, logs_card),
-    ]
+    )
+    packages_section = _section(
+        _title("Pakiety i logi", "Ograniczony podgląd MQTT"), package_card, logs_card
+    )
+    sections = [status_section, control_section, resource_section, update_section]
+    if cfg["operator_capabilities"].get("approve", False):
+        sections.append(
+            _section(_title("Weryfikacja końcowa", "Wynik po aktualizacji"), verification)
+        )
     docker = cfg.get("docker") or {}
     if docker.get("enabled"):
         sections.append(
@@ -581,11 +642,7 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
             )
         )
-    sections.append(
-        _controls_section(vmid, cfg)
-        if any(cfg["operator_capabilities"].values())
-        else _observation_section(vmid, cfg)
-    )
+    sections.extend([history_section, recovery_section, packages_section])
     return sections
 
 
@@ -596,6 +653,7 @@ def _qemu_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             _resource_status(vmid, cfg),
             _resource_chips(vmid, cfg),
         ),
+        _observation_section(vmid, cfg),
         _section(
             _title("CPU i pamięć", "Metryki dostarczane przez Proxmox"),
             _entity_grid(
@@ -625,11 +683,10 @@ def _qemu_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
                     _entity_card(_entity(vmid, cfg, "qemu_status"), "Status QEMU", "mdi:monitor"),
                     _entity_card(_entity(vmid, cfg, "guest_agent_status"), "Guest Agent", "mdi:lan-connect", "green"),
                     _entity_card(_entity(vmid, cfg, "ip_addresses"), "Primary IP", "mdi:ip-network", "cyan"),
-                    _entity_card(_entity(vmid, cfg, "uptime_seconds"), "Uptime", "mdi:timer-outline", "green"),
+                    _uptime_card(_entity(vmid, cfg, "uptime_seconds")),
                 ]
             ),
         ),
-        _observation_section(vmid, cfg),
     ]
 
 
@@ -641,6 +698,7 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
             _resource_status(vmid, cfg),
             _resource_chips(vmid, cfg),
         ),
+        _observation_section(vmid, cfg),
         _section(
             _title("Usługa i API", "Lokalna kontrola CT110"),
             _entity_grid(
@@ -648,7 +706,7 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
                     _entity_card(_entity(vmid, cfg, "service_status"), "Usługa", "mdi:application-cog", "green"),
                     _entity_card(_entity(vmid, cfg, "api_health"), "API health", "mdi:api", "green"),
                     _entity_card(_entity(vmid, cfg, "agent_version"), "Wersja", "mdi:tag-outline"),
-                    _entity_card(_entity(vmid, cfg, "uptime_seconds"), "Uptime", "mdi:timer-outline"),
+                    _uptime_card(_entity(vmid, cfg, "uptime_seconds")),
                 ]
             ),
         ),
@@ -687,7 +745,6 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
                 ),
             },
         ),
-        _observation_section(vmid, cfg),
     ]
 
 
@@ -741,6 +798,10 @@ def build_dashboard(resources: dict[int, dict[str, Any]]) -> dict[str, Any]:
             _chip(
                 agent_entity_id("last_refresh"),
                 "mdi:clock-outline",
+                content=(
+                    "{{ relative_time(states(entity) | as_datetime) "
+                    "if states(entity) not in ['unknown', 'unavailable'] else 'brak' }}"
+                ),
                 icon_color="blue-grey",
             ),
         ]

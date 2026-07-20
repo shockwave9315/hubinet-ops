@@ -1,6 +1,6 @@
-# Hubinet Ops 0.3.1
+# Hubinet Ops 0.3.2
 
-Hubinet Ops is a policy-controlled Proxmox inventory, telemetry, and manually approved APT maintenance service. Version 0.3.1 restores the Home Assistant Mushroom dashboard and makes MQTT discovery, entity IDs, and adapter telemetry use one canonical contract.
+Hubinet Ops is a policy-controlled Proxmox inventory, telemetry, and manually approved APT maintenance service. Version 0.3.2 restores production entity IDs and dashboard layout, reads QEMU CPU from the cluster resource view, and batches agent refresh telemetry.
 
 The production inventory contains VM/CT 100–110. VM100 (HAOS), CT101–105, CT107–110 are observation-only. CT106 WeatherHub is the only lifecycle-enabled and live-test target. Observation-only policy does not disable internal telemetry or scheduled APT scans.
 
@@ -27,6 +27,8 @@ The production inventory contains VM/CT 100–110. VM100 (HAOS), CT101–105, CT
 - `deploy/install-ha-0.3.0-from-pve.sh`: historical full-release HA installer.
 - `deploy/upgrade-0.3.1-from-pve.sh`: transactional CT110-only 0.3.0 → 0.3.1 patch.
 - `deploy/install-ha-0.3.1-from-pve.sh`: transactional package/dashboard patch; checks but never restarts HA.
+- `deploy/upgrade-0.3.2-from-pve.sh`: transactional CT110 application and PVE host-wrapper patch.
+- `deploy/install-ha-0.3.2-from-pve.sh`: transactional HA package/dashboard patch with no automatic restart.
 
 ## Local validation
 
@@ -36,12 +38,12 @@ pytest -q
 python -m py_compile deploy/managed/hubinet-maint
 python scripts/validate_yaml.py
 python scripts/generate_ha_dashboard.py --check
-bash -n deploy/upgrade-0.3.1-from-pve.sh
-bash -n deploy/install-ha-0.3.1-from-pve.sh
+bash -n deploy/upgrade-0.3.2-from-pve.sh
+bash -n deploy/install-ha-0.3.2-from-pve.sh
 bash -n deploy/pve/hubinet-ops-host
 python scripts/check_tracked_files.py
 ```
 
 Repository tests use fake executors, fake clocks, temporary SQLite databases, and stub commands. They do not contact Proxmox, guests, Home Assistant, or MQTT.
 
-See [architecture](docs/architecture.md), [API](docs/api.md), [security](docs/security.md), [resource adapters](docs/resource-adapters.md), [production inventory](docs/production-inventory.md), [MQTT](docs/mqtt.md), [Home Assistant](docs/home-assistant.md), and the [0.3.1 patch guide](docs/upgrade-0.3.1.md).
+See [architecture](docs/architecture.md), [API](docs/api.md), [security](docs/security.md), [resource adapters](docs/resource-adapters.md), [production inventory](docs/production-inventory.md), [MQTT](docs/mqtt.md), [Home Assistant](docs/home-assistant.md), and the [0.3.2 patch guide](docs/upgrade-0.3.2.md).

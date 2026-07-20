@@ -6,6 +6,13 @@ from typing import Any
 from .security import sanitize_data, sanitize_text
 
 HA_ATTRIBUTE_BUDGET_BYTES = 10_000
+HA_ATTRIBUTE_FIELDS = (
+    "updates",
+    "recent_job_events",
+    "recent_warnings",
+    "attribute_payload",
+    "failed_units",
+)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -317,3 +324,30 @@ def bounded_state(value: dict[str, Any]) -> dict[str, Any]:
         or meta["events_visible"] < meta["events_total"]
     )
     return state
+
+
+def bounded_attributes(value: dict[str, Any]) -> dict[str, Any]:
+    """Build the independently bounded payload attached to health_status only."""
+
+    source = {
+        key: value.get(key)
+        for key in HA_ATTRIBUTE_FIELDS
+        if key != "attribute_payload" and key in value
+    }
+    source["recent_warnings"] = [
+        sanitize_text(item, limit=160)
+        for item in _sequence(source.get("recent_warnings"))[-20:]
+    ]
+    source["failed_units"] = [
+        sanitize_text(item, limit=160)
+        for item in _sequence(source.get("failed_units"))[:20]
+    ]
+    bounded = bounded_state(source)
+    attributes = {
+        key: bounded[key]
+        for key in HA_ATTRIBUTE_FIELDS
+        if key in bounded
+    }
+    if _json_bytes(attributes) > HA_ATTRIBUTE_BUDGET_BYTES:
+        raise ValueError("Home Assistant attribute payload exceeds its byte budget")
+    return attributes

@@ -17,10 +17,10 @@ from .ha_entities import (
     resource_prefix,
 )
 from .security import sanitize_data, sanitize_text
-from .mqtt_budget import bounded_state
+from .mqtt_budget import bounded_attributes, bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 
 @dataclass(frozen=True)
@@ -148,9 +148,16 @@ class MqttTelemetry:
         force: bool = False,
     ) -> None:
         payload = bounded_state(state)
+        attributes = bounded_attributes(state)
         self._publish_json(
             f"{self.base_topic}/resource/{int(vmid)}/state",
             payload,
+            retain=self.retain_state,
+            force=force,
+        )
+        self._publish_json(
+            f"{self.base_topic}/resource/{int(vmid)}/attributes",
+            attributes,
             retain=self.retain_state,
             force=force,
         )
@@ -158,6 +165,12 @@ class MqttTelemetry:
             self._publish_json(
                 f"{self.base_topic}/ct/{int(vmid)}/state",
                 payload,
+                retain=self.retain_state,
+                force=force,
+            )
+            self._publish_json(
+                f"{self.base_topic}/ct/{int(vmid)}/attributes",
+                attributes,
                 retain=self.retain_state,
                 force=force,
             )
@@ -224,6 +237,7 @@ class MqttTelemetry:
             prefix = "vm" if identity.resource_type == "qemu" else "ct"
             identifier = f"hubinet_ops_{prefix}_{vmid}"
             state_topic = f"{self.base_topic}/resource/{vmid}/state"
+            attributes_topic = f"{self.base_topic}/resource/{vmid}/attributes"
             model = (
                 "Observed Proxmox QEMU"
                 if identity.resource_type == "qemu"
@@ -250,7 +264,9 @@ class MqttTelemetry:
                     device=device,
                     # The dashboard reads rich attributes from this one entity only.
                     # Attaching the same large JSON payload to every sensor bloats HA state storage.
-                    attributes_topic=state_topic if spec.key == "health_status" else None,
+                    attributes_topic=(
+                        attributes_topic if spec.key == "health_status" else None
+                    ),
                     extra=dict(spec.extra),
                     force=force,
                 )

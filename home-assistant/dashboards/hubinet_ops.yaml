@@ -46,7 +46,8 @@ views:
       - type: template
         entity: sensor.hubinet_ops_agent_last_refresh
         icon: mdi:clock-outline
-        content: '{{ states(entity) }}'
+        content: '{{ relative_time(states(entity) | as_datetime) if states(entity) not in [''unknown'', ''unavailable''] else
+          ''brak'' }}'
         icon_color: blue-grey
         tap_action:
           action: more-info
@@ -293,6 +294,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_vm100_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: CPU i pamięć
       subtitle: Metryki dostarczane przez Proxmox
     - type: grid
@@ -372,25 +387,15 @@ views:
         name: Primary IP
         icon: mdi:ip-network
         icon_color: cyan
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_vm100_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_vm100_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
+        color: green
+        tap_action:
+          action: more-info
 - title: CT101
   path: ct-101
   icon: mdi:cloud-lock-outline
@@ -400,8 +405,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT101 · Cloudflared
-      subtitle: Adapter APT · high
+      title: Status
+      subtitle: CT101 · Cloudflared · Adapter APT · high
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct101_health_status
       primary: CT101 · Cloudflared
@@ -478,6 +483,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct101_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Zasoby
       subtitle: Ostatni pomiar z kontenera
     - type: grid
@@ -504,16 +523,34 @@ views:
         name: Status LXC
         icon: mdi:server
         icon_color: green
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct101_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
       title: Aktualizacje
       subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct101_operation_status
       primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
@@ -525,69 +562,6 @@ views:
         }}'
       tap_action:
         action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct101_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
-        icon_color: blue
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -628,6 +602,11 @@ views:
         icon: mdi:backup-restore
         icon_color: amber
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct101_last_error
         name: Ostatni błąd
         icon: mdi:alert-circle-outline
@@ -635,7 +614,31 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
       subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
@@ -667,24 +670,10 @@ views:
       title: Logi live
       content: '{% set events = state_attr(''sensor.hubinet_ops_ct101_health_status'', ''recent_job_events'') or [] %}
 
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct101_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
 - title: CT102
   path: ct-102
   icon: mdi:database
@@ -694,8 +683,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT102 · MariaDB
-      subtitle: Adapter APT · critical
+      title: Status
+      subtitle: CT102 · MariaDB · Adapter APT · critical
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct102_health_status
       primary: CT102 · MariaDB
@@ -772,6 +761,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct102_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Zasoby
       subtitle: Ostatni pomiar z kontenera
     - type: grid
@@ -798,16 +801,34 @@ views:
         name: Status LXC
         icon: mdi:server
         icon_color: green
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct102_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
       title: Aktualizacje
       subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct102_operation_status
       primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
@@ -819,69 +840,6 @@ views:
         }}'
       tap_action:
         action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct102_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
-        icon_color: blue
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -922,6 +880,11 @@ views:
         icon: mdi:backup-restore
         icon_color: amber
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct102_last_error
         name: Ostatni błąd
         icon: mdi:alert-circle-outline
@@ -929,7 +892,31 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
       subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
@@ -961,24 +948,10 @@ views:
       title: Logi live
       content: '{% set events = state_attr(''sensor.hubinet_ops_ct102_health_status'', ''recent_job_events'') or [] %}
 
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct102_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
 - title: CT103
   path: ct-103
   icon: mdi:access-point-network
@@ -988,8 +961,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT103 · MQTT
-      subtitle: Adapter APT · critical
+      title: Status
+      subtitle: CT103 · MQTT · Adapter APT · critical
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct103_health_status
       primary: CT103 · MQTT
@@ -1066,6 +1039,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct103_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Zasoby
       subtitle: Ostatni pomiar z kontenera
     - type: grid
@@ -1092,16 +1079,34 @@ views:
         name: Status LXC
         icon: mdi:server
         icon_color: green
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct103_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
       title: Aktualizacje
       subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct103_operation_status
       primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
@@ -1113,69 +1118,6 @@ views:
         }}'
       tap_action:
         action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct103_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
-        icon_color: blue
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -1216,6 +1158,11 @@ views:
         icon: mdi:backup-restore
         icon_color: amber
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct103_last_error
         name: Ostatni błąd
         icon: mdi:alert-circle-outline
@@ -1223,7 +1170,31 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
       subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
@@ -1255,24 +1226,10 @@ views:
       title: Logi live
       content: '{% set events = state_attr(''sensor.hubinet_ops_ct103_health_status'', ''recent_job_events'') or [] %}
 
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct103_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
 - title: CT104
   path: ct-104
   icon: mdi:cloud
@@ -1282,8 +1239,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT104 · Nextcloud
-      subtitle: Adapter APT · critical
+      title: Status
+      subtitle: CT104 · Nextcloud · Adapter APT · critical
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct104_health_status
       primary: CT104 · Nextcloud
@@ -1360,6 +1317,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct104_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Zasoby
       subtitle: Ostatni pomiar z kontenera
     - type: grid
@@ -1386,16 +1357,34 @@ views:
         name: Status LXC
         icon: mdi:server
         icon_color: green
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct104_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
       title: Aktualizacje
       subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct104_operation_status
       primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
@@ -1407,69 +1396,6 @@ views:
         }}'
       tap_action:
         action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct104_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
-        icon_color: blue
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -1510,6 +1436,11 @@ views:
         icon: mdi:backup-restore
         icon_color: amber
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct104_last_error
         name: Ostatni błąd
         icon: mdi:alert-circle-outline
@@ -1517,7 +1448,31 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
       subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
@@ -1549,24 +1504,10 @@ views:
       title: Logi live
       content: '{% set events = state_attr(''sensor.hubinet_ops_ct104_health_status'', ''recent_job_events'') or [] %}
 
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct104_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
 - title: CT105
   path: ct-105
   icon: mdi:shield-check-outline
@@ -1576,8 +1517,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT105 · AdGuard Home
-      subtitle: Adapter APT · critical
+      title: Status
+      subtitle: CT105 · AdGuard Home · Adapter APT · critical
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct105_health_status
       primary: CT105 · AdGuard Home
@@ -1654,6 +1595,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct105_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Zasoby
       subtitle: Ostatni pomiar z kontenera
     - type: grid
@@ -1680,16 +1635,34 @@ views:
         name: Status LXC
         icon: mdi:server
         icon_color: green
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct105_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
       title: Aktualizacje
       subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct105_operation_status
       primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
@@ -1701,69 +1674,6 @@ views:
         }}'
       tap_action:
         action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct105_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
-        icon_color: blue
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -1804,6 +1714,11 @@ views:
         icon: mdi:backup-restore
         icon_color: amber
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct105_last_error
         name: Ostatni błąd
         icon: mdi:alert-circle-outline
@@ -1811,7 +1726,31 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
       subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
@@ -1843,24 +1782,10 @@ views:
       title: Logi live
       content: '{% set events = state_attr(''sensor.hubinet_ops_ct105_health_status'', ''recent_job_events'') or [] %}
 
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct105_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
 - title: CT106
   path: ct-106
   icon: mdi:weather-partly-cloudy
@@ -1870,8 +1795,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT106 · WeatherHub
-      subtitle: Adapter APT · low
+      title: Status
+      subtitle: CT106 · WeatherHub · Adapter APT · low
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct106_health_status
       primary: CT106 · WeatherHub
@@ -1945,221 +1870,6 @@ views:
           ''grey'' }}'
         tap_action:
           action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Zasoby
-      subtitle: Ostatni pomiar z kontenera
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_disk_used
-        name: Dysk zajęty
-        icon: mdi:harddisk
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_disk_free
-        name: Wolne miejsce
-        icon: mdi:database-arrow-down-outline
-        icon_color: cyan
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_memory_used
-        name: Pamięć RAM
-        icon: mdi:memory
-        icon_color: purple
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_lxc_status
-        name: Status LXC
-        icon: mdi:server
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_uptime
-        name: Uptime
-        icon: mdi:timer-outline
-        icon_color: green
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Aktualizacje
-      subtitle: Stan operacji i planu
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct106_operation_status
-      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
-      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct106_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct106_job_progress'')
-        }}%'
-      multiline_secondary: true
-      icon: mdi:progress-wrench
-      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
-        }}'
-      tap_action:
-        action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Historia i diagnostyka
-      subtitle: Ostatnie operacje oraz błędy
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_last_refresh
-        name: Ostatnie odświeżenie
-        icon: mdi:refresh
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_last_scan
-        name: Ostatni skan
-        icon: mdi:magnify-scan
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_last_update
-        name: Ostatnia aktualizacja
-        icon: mdi:update
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_active_plan_id
-        name: Aktywny plan
-        icon: mdi:clipboard-text-clock-outline
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_active_job_id
-        name: Aktywny job
-        icon: mdi:identifier
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_rollback_allowed
-        name: Rollback
-        icon: mdi:backup-restore
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_last_error
-        name: Ostatni błąd
-        icon: mdi:alert-circle-outline
-        icon_color: red
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
-      subtitle: Ograniczony podgląd MQTT
-    - type: markdown
-      title: Pakiety APT
-      content: '{% set updates = state_attr(''sensor.hubinet_ops_ct106_health_status'', ''updates'') or {} %}
-
-        {% set packages = updates.get(''packages'', []) %}
-
-        {% set meta = state_attr(''sensor.hubinet_ops_ct106_health_status'', ''attribute_payload'') or {} %}
-
-        {% set total = meta.get(''packages_total'', packages | count) %}
-
-        {% set visible = packages | count %}
-
-        **Łącznie: {{ total }} · widoczne: {{ visible }}**
-
-
-        {% for package in packages[:30] %}- `{{ package.get(''name'', ''?'') }}`
-
-        {% endfor %}{% if visible > 30 %}
-
-        _… {{ visible - 30 }} kolejnych widocznych pakietów._
-
-        {% endif %}{% if meta.get(''truncated'') %}
-
-        _Podgląd ogranicza limit atrybutów 10 KB._
-
-        {% endif %}'
-    - type: markdown
-      title: Logi live
-      content: '{% set events = state_attr(''sensor.hubinet_ops_ct106_health_status'', ''recent_job_events'') or [] %}
-
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
-        }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
-
-        {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Docker
-      subtitle: Tylko skonfigurowane kontenery
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_docker_required_healthy
-        name: Wymagane healthy
-        icon: mdi:docker
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct106_docker_required_total
-        name: Wymagane łącznie
-        icon: mdi:format-list-checks
-        icon_color: blue
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -2403,6 +2113,267 @@ views:
               text: Łagodnie zrestartować kontener CT106? Usługi będą chwilowo niedostępne.
               confirm_text: Restartuj CT106
               dismiss_text: Anuluj
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Zasoby
+      subtitle: Ostatni pomiar z kontenera
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_disk_used
+        name: Dysk zajęty
+        icon: mdi:harddisk
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_disk_free
+        name: Wolne miejsce
+        icon: mdi:database-arrow-down-outline
+        icon_color: cyan
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_memory_used
+        name: Pamięć RAM
+        icon: mdi:memory
+        icon_color: purple
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_lxc_status
+        name: Status LXC
+        icon: mdi:server
+        icon_color: green
+      - type: custom:mushroom-template-card
+        entity: sensor.hubinet_ops_ct106_uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
+        icon: mdi:timer-outline
+        color: green
+        tap_action:
+          action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Aktualizacje
+      subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct106_operation_status
+      primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
+      secondary: 'Etap: {{ states(''sensor.hubinet_ops_ct106_job_stage'') }} · postęp: {{ states(''sensor.hubinet_ops_ct106_job_progress'')
+        }}%'
+      multiline_secondary: true
+      icon: mdi:progress-wrench
+      color: '{{ ''blue'' if is_state(entity, ''running'') else ''amber'' if is_state(entity, ''waiting_approval'') else ''green''
+        }}'
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Weryfikacja końcowa
+      subtitle: Wynik po aktualizacji
+    - type: grid
+      cards:
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_verification_status
+          state: unknown
+        card:
+          type: custom:mushroom-template-card
+          entity: sensor.hubinet_ops_ct106_verification_status
+          primary: Brak wykonanej weryfikacji aktualizacji
+          secondary: Szczegółowe wyniki pojawią się po uruchomieniu aktualizacji.
+          multiline_secondary: true
+          icon: mdi:clipboard-alert-outline
+          color: blue-grey
+          tap_action:
+            action: more-info
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct106_verification_status
+          state_not: unknown
+        card:
+          type: grid
+          columns: 2
+          square: false
+          cards:
+          - type: custom:mushroom-entity-card
+            entity: sensor.hubinet_ops_ct106_verification_status
+            name: Weryfikacja
+            icon: mdi:check-decagram
+            icon_color: blue
+          - type: custom:mushroom-entity-card
+            entity: sensor.hubinet_ops_ct106_apt_check
+            name: APT check
+            icon: mdi:package-check
+            icon_color: green
+          - type: custom:mushroom-entity-card
+            entity: sensor.hubinet_ops_ct106_dpkg_audit
+            name: dpkg audit
+            icon: mdi:shield-check-outline
+            icon_color: green
+          - type: custom:mushroom-entity-card
+            entity: sensor.hubinet_ops_ct106_reboot_required
+            name: Restart wymagany
+            icon: mdi:restart-alert
+            icon_color: amber
+          - type: custom:mushroom-entity-card
+            entity: sensor.hubinet_ops_ct106_packages_remaining
+            name: Pakiety pozostałe
+            icon: mdi:package-variant
+            icon_color: blue
+          - type: custom:mushroom-entity-card
+            entity: sensor.hubinet_ops_ct106_last_operation_result
+            name: Ostatni wynik
+            icon: mdi:history
+            icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Docker
+      subtitle: Tylko skonfigurowane kontenery
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_docker_required_healthy
+        name: Wymagane healthy
+        icon: mdi:docker
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_docker_required_total
+        name: Wymagane łącznie
+        icon: mdi:format-list-checks
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Historia i diagnostyka
+      subtitle: Ostatnie operacje oraz błędy
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_refresh
+        name: Ostatnie odświeżenie
+        icon: mdi:refresh
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_scan
+        name: Ostatni skan
+        icon: mdi:magnify-scan
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_update
+        name: Ostatnia aktualizacja
+        icon: mdi:update
+        icon_color: green
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_active_plan_id
+        name: Aktywny plan
+        icon: mdi:clipboard-text-clock-outline
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_active_job_id
+        name: Aktywny job
+        icon: mdi:identifier
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_rollback_allowed
+        name: Rollback
+        icon: mdi:backup-restore
+        icon_color: amber
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_error
+        name: Ostatni błąd
+        icon: mdi:alert-circle-outline
+        icon_color: red
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
+      subtitle: Ograniczony podgląd MQTT
+    - type: markdown
+      title: Pakiety APT
+      content: '{% set updates = state_attr(''sensor.hubinet_ops_ct106_health_status'', ''updates'') or {} %}
+
+        {% set packages = updates.get(''packages'', []) %}
+
+        {% set meta = state_attr(''sensor.hubinet_ops_ct106_health_status'', ''attribute_payload'') or {} %}
+
+        {% set total = meta.get(''packages_total'', packages | count) %}
+
+        {% set visible = packages | count %}
+
+        **Łącznie: {{ total }} · widoczne: {{ visible }}**
+
+
+        {% for package in packages[:30] %}- `{{ package.get(''name'', ''?'') }}`
+
+        {% endfor %}{% if visible > 30 %}
+
+        _… {{ visible - 30 }} kolejnych widocznych pakietów._
+
+        {% endif %}{% if meta.get(''truncated'') %}
+
+        _Podgląd ogranicza limit atrybutów 10 KB._
+
+        {% endif %}'
+    - type: markdown
+      title: Logi live
+      content: '{% set events = state_attr(''sensor.hubinet_ops_ct106_health_status'', ''recent_job_events'') or [] %}
+
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
+
+        {% endfor %}'
 - title: CT107
   path: ct-107
   icon: mdi:image-multiple-outline
@@ -2412,8 +2383,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT107 · Immich
-      subtitle: Adapter APT · high
+      title: Status
+      subtitle: CT107 · Immich · Adapter APT · high
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct107_health_status
       primary: CT107 · Immich
@@ -2490,6 +2461,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct107_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Zasoby
       subtitle: Ostatni pomiar z kontenera
     - type: grid
@@ -2516,16 +2501,34 @@ views:
         name: Status LXC
         icon: mdi:server
         icon_color: green
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct107_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
       title: Aktualizacje
       subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct107_operation_status
       primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
@@ -2537,69 +2540,6 @@ views:
         }}'
       tap_action:
         action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct107_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
-        icon_color: blue
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -2640,6 +2580,11 @@ views:
         icon: mdi:backup-restore
         icon_color: amber
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct107_last_error
         name: Ostatni błąd
         icon: mdi:alert-circle-outline
@@ -2647,7 +2592,31 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
       subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
@@ -2679,24 +2648,10 @@ views:
       title: Logi live
       content: '{% set events = state_attr(''sensor.hubinet_ops_ct107_health_status'', ''recent_job_events'') or [] %}
 
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct107_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
 - title: CT108
   path: ct-108
   icon: mdi:dns-outline
@@ -2706,8 +2661,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT108 · DDNS
-      subtitle: Adapter APT · medium
+      title: Status
+      subtitle: CT108 · DDNS · Adapter APT · medium
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct108_health_status
       primary: CT108 · DDNS
@@ -2784,6 +2739,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct108_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Zasoby
       subtitle: Ostatni pomiar z kontenera
     - type: grid
@@ -2810,16 +2779,34 @@ views:
         name: Status LXC
         icon: mdi:server
         icon_color: green
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct108_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
       title: Aktualizacje
       subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct108_operation_status
       primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
@@ -2831,69 +2818,6 @@ views:
         }}'
       tap_action:
         action: more-info
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct108_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
-        icon_color: blue
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -2934,6 +2858,11 @@ views:
         icon: mdi:backup-restore
         icon_color: amber
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct108_last_error
         name: Ostatni błąd
         icon: mdi:alert-circle-outline
@@ -2941,7 +2870,31 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
       subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
@@ -2973,24 +2926,10 @@ views:
       title: Logi live
       content: '{% set events = state_attr(''sensor.hubinet_ops_ct108_health_status'', ''recent_job_events'') or [] %}
 
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct108_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
 - title: CT109
   path: ct-109
   icon: mdi:water-pump
@@ -3000,8 +2939,8 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: CT109 · Pompa
-      subtitle: Adapter APT · critical
+      title: Status
+      subtitle: CT109 · Pompa · Adapter APT · critical
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct109_health_status
       primary: CT109 · Pompa
@@ -3078,6 +3017,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct109_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Zasoby
       subtitle: Ostatni pomiar z kontenera
     - type: grid
@@ -3104,16 +3057,34 @@ views:
         name: Status LXC
         icon: mdi:server
         icon_color: green
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct109_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: green
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
       title: Aktualizacje
       subtitle: Stan operacji i planu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_update_status
+        name: Status aktualizacji
+        icon: mdi:package-up
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_pending_update_count
+        name: Pakiety oczekujące
+        icon: mdi:format-list-numbered
+        icon_color: amber
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct109_operation_status
       primary: '{{ states(entity) | replace(''_'', '' '') | title }}'
@@ -3128,65 +3099,21 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Weryfikacja końcowa
-      subtitle: APT, dpkg i wynik operacji
+      title: Docker
+      subtitle: Tylko skonfigurowane kontenery
     - type: grid
       columns: 2
       square: false
       cards:
       - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_verification_status
-        name: Weryfikacja
-        icon: mdi:check-decagram
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_apt_check_ok
-        name: APT check
-        icon: mdi:package-check
+        entity: sensor.hubinet_ops_ct109_docker_required_healthy
+        name: Wymagane healthy
+        icon: mdi:docker
         icon_color: green
       - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_dpkg_audit_ok
-        name: dpkg audit
-        icon: mdi:shield-check-outline
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_reboot_required
-        name: Restart wymagany
-        icon: mdi:restart-alert
-        icon_color: amber
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_packages_remaining_count
-        name: Pakiety pozostałe
-        icon: mdi:package-variant
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_last_operation_result
-        name: Ostatni wynik
-        icon: mdi:history
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Recovery scan
-      subtitle: Stan bezpiecznego skanu odzyskiwania
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_recovery_scan_status
-        name: Status
-        icon: mdi:shield-sync-outline
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_last_recovery_scan
-        name: Ostatni skan
-        icon: mdi:history
-        icon_color: blue
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_last_recovery_scan_result
-        name: Ostatni wynik
-        icon: mdi:shield-check-outline
+        entity: sensor.hubinet_ops_ct109_docker_required_total
+        name: Wymagane łącznie
+        icon: mdi:format-list-checks
         icon_color: blue
   - type: grid
     cards:
@@ -3228,6 +3155,11 @@ views:
         icon: mdi:backup-restore
         icon_color: amber
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_operation_result
+        name: Ostatni wynik
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct109_last_error
         name: Ostatni błąd
         icon: mdi:alert-circle-outline
@@ -3235,7 +3167,31 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
-      title: Pakiety i diagnostyka
+      title: Recovery scan
+      subtitle: Stan bezpiecznego skanu odzyskiwania
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_recovery_scan_status
+        name: Status
+        icon: mdi:shield-sync-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_recovery_scan
+        name: Ostatni skan
+        icon: mdi:history
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_last_recovery_scan_result
+        name: Ostatni wynik
+        icon: mdi:shield-check-outline
+        icon_color: blue
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Pakiety i logi
       subtitle: Ograniczony podgląd MQTT
     - type: markdown
       title: Pakiety APT
@@ -3267,43 +3223,10 @@ views:
       title: Logi live
       content: '{% set events = state_attr(''sensor.hubinet_ops_ct109_health_status'', ''recent_job_events'') or [] %}
 
-        {% for event in events[-25:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
+        {% for event in events[-10:] | reverse %}- `{{ event.get(''created_at'', '''') }}` **{{ event.get(''stage'', '''')
         }}** {{ event.get(''message'', '''') | replace(''|'', ''¦'') }}
 
         {% endfor %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Docker
-      subtitle: Tylko skonfigurowane kontenery
-    - type: grid
-      columns: 2
-      square: false
-      cards:
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_docker_required_healthy
-        name: Wymagane healthy
-        icon: mdi:docker
-        icon_color: green
-      - type: custom:mushroom-entity-card
-        entity: sensor.hubinet_ops_ct109_docker_required_total
-        name: Wymagane łącznie
-        icon: mdi:format-list-checks
-        icon_color: blue
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct109_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info
 - title: CT110
   path: ct-110
   icon: mdi:shield-crown-outline
@@ -3380,6 +3303,20 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Sterowanie
+      subtitle: Polityka backendu jest źródłem prawdy
+    - type: custom:mushroom-template-card
+      entity: sensor.hubinet_ops_ct110_health_status
+      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
+      secondary: Telemetria i diagnostyka pozostają dostępne.
+      multiline_secondary: true
+      icon: mdi:eye-lock-outline
+      color: blue-grey
+      tap_action:
+        action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Usługa i API
       subtitle: Lokalna kontrola CT110
     - type: grid
@@ -3401,11 +3338,15 @@ views:
         name: Wersja
         icon: mdi:tag-outline
         icon_color: blue
-      - type: custom:mushroom-entity-card
+      - type: custom:mushroom-template-card
         entity: sensor.hubinet_ops_ct110_uptime
-        name: Uptime
+        primary: Uptime
+        secondary: '{% set seconds = states(entity) | int(0) %}{% set days = seconds // 86400 %}{% set hours = (seconds %
+          86400) // 3600 %}{% set minutes = (seconds % 3600) // 60 %}{{ days }} d {{ hours }} h {{ minutes }} min'
         icon: mdi:timer-outline
-        icon_color: blue
+        color: green
+        tap_action:
+          action: more-info
   - type: grid
     cards:
     - type: custom:mushroom-title-card
@@ -3481,17 +3422,3 @@ views:
         {% for warning in warnings[-20:] | reverse %}- {{ warning | replace(''|'', ''¦'') }}
 
         {% endfor %}{% if not warnings %}Brak ostatnich ostrzeżeń.{% endif %}'
-  - type: grid
-    cards:
-    - type: custom:mushroom-title-card
-      title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
-    - type: custom:mushroom-template-card
-      entity: sensor.hubinet_ops_ct110_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
-      multiline_secondary: true
-      icon: mdi:eye-lock-outline
-      color: blue-grey
-      tap_action:
-        action: more-info

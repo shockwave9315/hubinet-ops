@@ -123,11 +123,31 @@ case "$action" in
     if [[ "$resource_type" == "lxc" ]]; then
       state="$(status_lxc)"
       if [[ "$state" != "running" ]]; then
-        printf '{"ok":true,"data":{"runtime_status":"%s","lxc_status":"%s","health_status":"offline","health_score":0}}\n' "$state" "$state"
+        printf '{"ok":true,"data":{"resource_type":"lxc","adapter":"apt","runtime_status":"%s","lxc_status":"%s","health_status":"offline","health_score":0}}\n' "$state" "$state"
         exit 0
       fi
-      timeout --signal=TERM --kill-after=10s 180s \
-        pct exec "$vmid" -- /usr/local/sbin/hubinet-maint inspect
+      if ! inspected="$(timeout --signal=TERM --kill-after=10s 180s \
+        pct exec "$vmid" -- /usr/local/sbin/hubinet-maint inspect)"; then
+        fail "Managed LXC inspect failed or timed out"
+      fi
+      if ! normalized="$(python3 - "$inspected" <<'PY'
+import json, sys
+
+try:
+    payload = json.loads(sys.argv[1])
+    data = payload["data"]
+    if payload.get("ok") is not True or not isinstance(data, dict):
+        raise ValueError
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit("invalid managed LXC inspect response")
+data["resource_type"] = "lxc"
+data["adapter"] = "apt"
+print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+PY
+)"; then
+        fail "Managed LXC inspect returned invalid JSON"
+      fi
+      printf '%s\n' "$normalized"
       exit 0
     fi
 
@@ -138,6 +158,11 @@ case "$action" in
     if ! current="$(timeout --signal=TERM --kill-after=5s 30s \
       pvesh get "/nodes/$pve_node/qemu/$vmid/status/current" --output-format json 2>&1)"; then
       fail "QEMU current status failed or timed out: $current"
+    fi
+    cluster_resources='[]'
+    if ! cluster_resources="$(timeout --signal=TERM --kill-after=5s 30s \
+      pvesh get /cluster/resources --type vm --output-format json 2>/dev/null)"; then
+      cluster_resources='[]'
     fi
     guest_status="unknown"
     guest='[]'
@@ -150,18 +175,33 @@ case "$action" in
         guest='[]'
       fi
     fi
-    python3 - "$state" "$guest_status" "$current" "$guest" <<'PY'
+    python3 - "$state" "$guest_status" "$current" "$cluster_resources" "$guest" "$vmid" <<'PY'
 import json, sys
 
-state, guest_status, current_raw, guest_raw = sys.argv[1:]
+state, guest_status, current_raw, resources_raw, guest_raw, vmid_raw = sys.argv[1:]
 try:
     current = json.loads(current_raw)
 except (TypeError, ValueError):
     current = {}
 try:
+    resources = json.loads(resources_raw)
+except (TypeError, ValueError):
+    resources = []
+try:
     guest = json.loads(guest_raw)
 except (TypeError, ValueError):
     guest = []
+cpu_usage = None
+for resource in resources if isinstance(resources, list) else []:
+    if not isinstance(resource, dict):
+        continue
+    try:
+        matches = int(resource.get("vmid")) == int(vmid_raw)
+    except (TypeError, ValueError):
+        matches = False
+    if matches:
+        cpu_usage = resource.get("cpu")
+        break
 if isinstance(guest, dict):
     guest = guest.get("result", guest.get("data", []))
 addresses = []
@@ -171,13 +211,15 @@ for interface in guest if isinstance(guest, list) else []:
         if value and value not in {"127.0.0.1", "::1"}:
             addresses.append(str(value)[:128])
 data = {
+    "resource_type": "qemu",
+    "adapter": "haos",
     "runtime_status": state,
     "qemu_status": state,
     "health_status": "healthy" if state == "running" else "offline",
     "health_score": 100 if state == "running" else 0,
     "name": str(current.get("name", ""))[:255],
     "uptime_seconds": max(0, int(current.get("uptime", 0) or 0)),
-    "cpu": {"usage": current.get("cpu"), "cores": current.get("cpus")},
+    "cpu": {"usage": cpu_usage, "cores": current.get("cpus")},
     "memory": {"used_bytes": current.get("mem"), "total_bytes": current.get("maxmem")},
     "disk": {"used_bytes": current.get("disk"), "total_bytes": current.get("maxdisk")},
     "network": {"in_bytes": current.get("netin"), "out_bytes": current.get("netout")},

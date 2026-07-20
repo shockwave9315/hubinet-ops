@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from app.mqtt import MqttTelemetry
 
 
@@ -115,6 +117,8 @@ def test_topics_retention_discovery_lwt_and_stable_ids() -> None:
     assert by_topic["hubinet/ops/agent/state"][1] is True
     assert by_topic["hubinet/ops/ct/106/state"][1] is True
     assert by_topic["hubinet/ops/resource/106/state"][1] is True
+    assert by_topic["hubinet/ops/ct/106/attributes"][1] is True
+    assert by_topic["hubinet/ops/resource/106/attributes"][1] is True
     assert by_topic["hubinet/ops/ct/106/job"][1] is True
     assert by_topic["hubinet/ops/ct/106/event"][1] is False
     discovery = by_topic[
@@ -122,7 +126,9 @@ def test_topics_retention_discovery_lwt_and_stable_ids() -> None:
     ][0]
     assert discovery["unique_id"] == "hubinet_ops_ct_106_health_status"
     assert discovery["device"]["identifiers"] == ["hubinet_ops_ct_106"]
-    assert discovery["json_attributes_topic"] == "hubinet/ops/resource/106/state"
+    assert discovery["json_attributes_topic"] == "hubinet/ops/resource/106/attributes"
+    assert discovery["json_attributes_topic"] != discovery["state_topic"]
+    assert "force_update" not in discovery
     progress_discovery = by_topic[
         "homeassistant/sensor/hubinet_ops_ct106_job_progress/config"
     ][0]
@@ -201,6 +207,108 @@ def test_unchanged_retained_state_is_not_republished() -> None:
     telemetry.stop()
 
 
+def test_metric_only_refresh_republishes_state_but_not_attributes() -> None:
+    client = FakeClient("agent")
+    telemetry = MqttTelemetry(
+        config(),
+        {100: {"resource_type": "qemu", "adapter": "haos"}},
+        client_factory=lambda **kwargs: client,
+    )
+    telemetry.set_state_provider(lambda: ({"version": "0.3.2"}, []))
+    telemetry.start()
+    state_topic = "hubinet/ops/resource/100/state"
+    attributes_topic = "hubinet/ops/resource/100/attributes"
+    first = {
+        "vmid": 100,
+        "health_status": "healthy",
+        "last_refresh": "2026-07-20T18:00:00+00:00",
+        "uptime_seconds": 100,
+        "cpu": {"usage": 0.02, "usage_percent": 2.0},
+        "memory": {"used_bytes": 1},
+        "disk": {"used_bytes": 2},
+        "network": {"in_bytes": 3, "out_bytes": 4},
+        "updates": {"packages": [{"name": "curl"}]},
+        "recent_job_events": [{"message": "done"}],
+        "recent_warnings": ["warning"],
+    }
+    second = {
+        **first,
+        "last_refresh": "2026-07-20T18:00:30+00:00",
+        "uptime_seconds": 130,
+        "cpu": {"usage": 0.03, "usage_percent": 3.0},
+        "memory": {"used_bytes": 10},
+        "disk": {"used_bytes": 20},
+        "network": {"in_bytes": 30, "out_bytes": 40},
+    }
+
+    telemetry.publish_resource_state(100, first)
+    telemetry.publish_resource_state(100, second)
+    wait_for(lambda: sum(item[0] == state_topic for item in client.published) == 2)
+    time.sleep(0.05)
+
+    assert sum(item[0] == state_topic for item in client.published) == 2
+    assert sum(item[0] == attributes_topic for item in client.published) == 1
+    attributes = json.loads(
+        next(item[1] for item in client.published if item[0] == attributes_topic)
+    )
+    for forbidden in (
+        "last_refresh",
+        "uptime_seconds",
+        "cpu",
+        "memory",
+        "disk",
+        "network",
+    ):
+        assert forbidden not in attributes
+    assert attributes["updates"]["packages"] == [{"name": "curl"}]
+    assert attributes["recent_job_events"] == [{"message": "done"}]
+    assert attributes["recent_warnings"] == ["warning"]
+    telemetry.stop()
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("updates", {"packages": [{"name": "openssl"}]}),
+        ("recent_job_events", [{"message": "new event"}]),
+        ("recent_warnings", ["new warning"]),
+    ],
+)
+def test_dashboard_attribute_changes_publish_new_payload(
+    field: str,
+    changed: Any,
+) -> None:
+    client = FakeClient("agent")
+    telemetry = MqttTelemetry(
+        config(),
+        {100: {"resource_type": "qemu", "adapter": "haos"}},
+        client_factory=lambda **kwargs: client,
+    )
+    telemetry.set_state_provider(lambda: ({"version": "0.3.2"}, []))
+    telemetry.start()
+    attributes_topic = "hubinet/ops/resource/100/attributes"
+    initial = {
+        "vmid": 100,
+        "updates": {"packages": []},
+        "recent_job_events": [],
+        "recent_warnings": [],
+    }
+
+    telemetry.publish_resource_state(100, initial)
+    telemetry.publish_resource_state(100, {**initial, field: changed})
+    wait_for(
+        lambda: sum(item[0] == attributes_topic for item in client.published) == 2
+    )
+
+    payloads = [
+        payload
+        for topic, payload, _, _ in client.published
+        if topic == attributes_topic
+    ]
+    assert payloads[0] != payloads[1]
+    telemetry.stop()
+
+
 def test_disabled_mqtt_is_noop() -> None:
     called = False
 
@@ -252,6 +360,10 @@ def test_reconnect_republishes_discovery_and_full_state() -> None:
     telemetry._on_connect(client, None, None, 0, None)
     wait_for(
         lambda: sum(1 for item in client.published if item[0] == discovery_topic) >= 2
+    )
+    attributes_topic = "hubinet/ops/resource/106/attributes"
+    wait_for(
+        lambda: sum(1 for item in client.published if item[0] == attributes_topic) >= 2
     )
     obsolete_topics = {
         "homeassistant/sensor/hubinet_ops_vm100_cpu_load_1m/config",

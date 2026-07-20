@@ -36,6 +36,15 @@ def _walk(value: Any):
             yield from _walk(child)
 
 
+def _section_title(section: dict) -> str:
+    title = next(
+        card
+        for card in section["cards"]
+        if card.get("type") == "custom:mushroom-title-card"
+    )
+    return str(title["title"])
+
+
 def test_dashboard_generator_is_deterministic_and_checked_in() -> None:
     first = render(DEFAULT_CONFIG)
     second = render(DEFAULT_CONFIG)
@@ -113,6 +122,9 @@ def test_mushroom_chips_use_semantic_colors_without_generic_red_fallback() -> No
         "sensor.hubinet_ops_agent_configured_resource_count"
     ]["icon_color"] == "blue"
     assert overview_by_entity["sensor.hubinet_ops_agent_last_refresh"]["icon_color"] == "blue-grey"
+    assert "relative_time" in overview_by_entity[
+        "sensor.hubinet_ops_agent_last_refresh"
+    ]["content"]
     active_jobs = overview_by_entity["sensor.hubinet_ops_agent_active_job_count"][
         "icon_color"
     ]
@@ -300,6 +312,64 @@ def test_ct106_is_only_view_with_capability_control_cards() -> None:
         assert "Tryb obserwacji — sterowanie zablokowane przez politykę backendu" in view_text
 
 
+def test_ct106_section_order_and_observation_cards_are_high() -> None:
+    data = _dashboard()
+    ct106 = _view(data, "ct-106")
+    assert [_section_title(section) for section in ct106["sections"]] == [
+        "Status",
+        "Sterowanie",
+        "Zasoby",
+        "Aktualizacje",
+        "Weryfikacja końcowa",
+        "Docker",
+        "Historia i diagnostyka",
+        "Recovery scan",
+        "Pakiety i logi",
+    ]
+
+    for path in (
+        "ct-101", "ct-102", "ct-103", "ct-104", "ct-105",
+        "ct-107", "ct-108", "ct-109",
+    ):
+        titles = [_section_title(section) for section in _view(data, path)["sections"]]
+        assert titles[1] == "Sterowanie"
+        assert "Weryfikacja końcowa" not in titles
+        assert titles[-1] == "Pakiety i logi"
+
+
+def test_verification_is_ct106_only_and_unknown_has_clear_message() -> None:
+    data = _dashboard()
+    apt_paths = [f"ct-{vmid}" for vmid in range(101, 110)]
+    for path in apt_paths:
+        text = _text(_view(data, path))
+        if path == "ct-106":
+            assert "Weryfikacja końcowa" in text
+            assert "Brak wykonanej weryfikacji aktualizacji" in text
+            assert "sensor.hubinet_ops_ct106_apt_check" in text
+            assert "sensor.hubinet_ops_ct106_dpkg_audit" in text
+            assert "sensor.hubinet_ops_ct106_packages_remaining" in text
+        else:
+            assert "Weryfikacja końcowa" not in text
+
+
+def test_live_logs_are_limited_to_ten_and_uptime_is_human_readable() -> None:
+    data = _dashboard()
+    ct106 = _text(_view(data, "ct-106"))
+    assert "events[-10:]" in ct106
+    assert "events[-25:]" not in ct106
+
+    for path in ("vm-100", "ct-101", "ct-110"):
+        uptime = next(
+            item
+            for item in _walk(_view(data, path))
+            if isinstance(item, dict)
+            and item.get("type") == "custom:mushroom-template-card"
+            and item.get("primary") == "Uptime"
+        )
+        assert "seconds // 86400" in uptime["secondary"]
+        assert "{{ days }} d {{ hours }} h {{ minutes }} min" in uptime["secondary"]
+
+
 def test_future_rollback_control_remains_fully_guarded() -> None:
     cfg = load_resources(DEFAULT_CONFIG)[106]
     conditions = _control_conditions(106, cfg, "rollback")
@@ -331,10 +401,11 @@ def test_apt_views_have_resources_updates_verification_packages_and_optional_doc
     data = _dashboard()
     apt = _text(_view(data, "ct-101"))
     for title in (
-        "Zasoby", "Aktualizacje", "Weryfikacja końcowa",
-        "Historia i diagnostyka", "Pakiety i diagnostyka", "Logi live",
+        "Zasoby", "Aktualizacje", "Historia i diagnostyka", "Pakiety i logi", "Logi live",
     ):
         assert title in apt
+    assert "Weryfikacja końcowa" not in apt
+    assert "Weryfikacja końcowa" in _text(_view(data, "ct-106"))
     assert "Docker" not in apt
     assert "Docker" in _text(_view(data, "ct-106"))
     assert "Docker" in _text(_view(data, "ct-109"))
