@@ -434,10 +434,27 @@ class Database:
             ).fetchone()
         return _decode_job(row) if row else None
 
+    def rollback_source_snapshots(self, vmid: int) -> set[str]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT snapshot_name FROM jobs WHERE vmid=? AND snapshot_name IS NOT NULL "
+                "AND status IN ('failed','blocked','interrupted')",
+                (vmid,),
+            ).fetchall()
+        return {str(row["snapshot_name"]) for row in rows if row["snapshot_name"]}
+
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [_decode_job(row) for row in rows]
+
+    def active_jobs(self) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE status IN ('queued','running') "
+                "ORDER BY created_at, id"
             ).fetchall()
         return [_decode_job(row) for row in rows]
 

@@ -20,6 +20,7 @@ from .contracts import (
 )
 from .database import Database, utc_now
 from .executor import Executor, ExecutorError
+from .host_control import HostControlClient, HostControlError
 from .mqtt import MqttTelemetry, VERSION
 from .security import sanitize_data, sanitize_text
 from .stabilization import StabilizationPolicy, Stabilizer
@@ -64,6 +65,7 @@ class OpsService:
         stabilizer: Stabilizer | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] | None = None,
+        host_control: HostControlClient | None = None,
     ):
         self.settings = settings
         self.db = db
@@ -79,6 +81,7 @@ class OpsService:
         self._agent_publish_context = threading.local()
         self._agent_publish_lock = threading.RLock()
         self.stabilizer = stabilizer or Stabilizer(executor, self._stop)
+        self.host_control = host_control
         self._scan_all_lock = threading.Lock()
         self._scan_locks = {vmid: threading.Lock() for vmid in settings.resources}
         self._recovery_lock = threading.RLock()
@@ -104,6 +107,7 @@ class OpsService:
         self.mqtt.set_state_provider(self._mqtt_snapshot)
 
     def start(self) -> None:
+        self._reconcile_startup_jobs()
         self._ensure_initial_states()
         self.mqtt.start()
         self._worker.start()
@@ -643,6 +647,7 @@ class OpsService:
         if not lock.acquire(blocking=False):
             raise ValueError("Another scan or manual operation is active for this resource")
         try:
+            self._require_compatible_executor(vmid)
             if not bool(cfg.get("manual_rollback_allowed", False)):
                 raise ValueError("Manual rollback is not allowed by resource policy")
             if self.db.get_active_job(vmid) is not None:
@@ -658,6 +663,192 @@ class OpsService:
             return self.db.get_job(job["id"])
         finally:
             lock.release()
+
+    def queue_lifecycle(
+        self,
+        vmid: int,
+        action: str,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        operation_type = {
+            "start": "lifecycle_start",
+            "shutdown": "lifecycle_shutdown",
+            "reboot": "lifecycle_reboot",
+            "force-stop": "lifecycle_force_stop",
+        }.get(action)
+        if operation_type is None:
+            raise ValueError("Unsupported lifecycle action")
+        capability = "force_stop" if action == "force-stop" else action
+        cfg = self._resource(vmid)
+        if cfg.get("resource_type") != "lxc":
+            raise ValueError("Lifecycle is supported only for LXC resources")
+        self._require_capability(vmid, capability)
+        if cfg.get("adapter") == "apt":
+            self._require_compatible_executor(vmid)
+        elif vmid != 110 or self.host_control is None:
+            raise ValueError("CT110 lifecycle requires independent PVE host control")
+        if self.db.find_active_plan(vmid) is not None and action != "start":
+            raise ValueError("Resolve the active update plan before lifecycle control")
+        status = self._host_status(vmid)
+        runtime = str(status.get("lxc_status") or status.get("runtime_status") or "unknown")
+        if action == "start" and runtime != "stopped":
+            raise ValueError(f"Start requires stopped runtime, got {runtime}")
+        if action != "start" and runtime != "running":
+            raise ValueError(f"{action} requires running runtime, got {runtime}")
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"ct-{vmid}")),
+            operation_type=operation_type,
+            request_id=request_id or uuid.uuid4().hex,
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
+    def list_snapshots(self, vmid: int) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        if cfg.get("resource_type") != "lxc":
+            raise ValueError("Snapshots are supported only for LXC resources")
+        self._require_capability(vmid, "snapshot_list")
+        if self.host_control is not None:
+            snapshots = self.host_control.list_snapshots(vmid)
+        elif cfg.get("adapter") == "apt":
+            snapshots = list(
+                _executor_data(self.executor.run("list-snapshots", vmid, timeout=60)).get(
+                    "snapshots", []
+                )
+            )
+        else:
+            raise ValueError("CT110 snapshots require independent PVE host control")
+        snapshots = [
+            dict(item) for item in snapshots
+            if isinstance(item, dict)
+        ]
+        snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        owned = [item for item in snapshots if item.get("owned_by_hubinet_ops") is True]
+        latest = owned[0] if owned else {}
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "snapshot_count": len(owned),
+                "latest_snapshot_name": latest.get("name"),
+                "latest_snapshot_at": latest.get("created_at"),
+                "latest_snapshot_kind": latest.get("kind"),
+            }
+        )
+        self._save_state(vmid, state)
+        return {"snapshots": snapshots, "latest": latest or None}
+
+    def queue_snapshot_create(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, "snapshot_create")
+        if cfg.get("adapter") == "apt":
+            self._require_compatible_executor(vmid)
+        elif vmid != 110 or self.host_control is None:
+            raise ValueError("CT110 snapshots require independent PVE host control")
+        stamp = self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        name = f"hubinet-ops-{vmid}-manual-{stamp}"
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"ct-{vmid}")),
+            operation_type="snapshot_create",
+            request_id=request_id or uuid.uuid4().hex,
+            snapshot_name=name,
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
+    def queue_snapshot_action(
+        self,
+        vmid: int,
+        action: str,
+        name: str | None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        from .contracts import parse_owned_snapshot_name
+
+        operation_type = {
+            "rollback": "snapshot_rollback",
+            "delete": "snapshot_delete",
+        }.get(action)
+        if operation_type is None:
+            raise ValueError("Unsupported snapshot action")
+        capability = "snapshot_rollback" if action == "rollback" else "snapshot_delete"
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, capability)
+        listing = self.list_snapshots(vmid)
+        snapshots = [item for item in listing["snapshots"] if item.get("owned_by_hubinet_ops")]
+        if name in {None, "latest"}:
+            eligible_key = "rollback_eligible" if action == "rollback" else "delete_eligible"
+            selected = next((item for item in snapshots if item.get(eligible_key)), None)
+        else:
+            selected = next((item for item in snapshots if item.get("name") == name), None)
+        if selected is None or parse_owned_snapshot_name(str(selected.get("name")), vmid=vmid) is None:
+            raise ValueError("Hubinet Ops snapshot does not exist")
+        if action == "rollback" and self.db.find_active_plan(vmid) is not None:
+            raise ValueError("Resolve the active update plan before snapshot rollback")
+        if not bool(selected.get(f"{action}_eligible")):
+            raise ValueError(f"Snapshot is not {action} eligible")
+        if cfg.get("adapter") == "apt":
+            self._require_compatible_executor(vmid)
+        elif vmid != 110 or self.host_control is None:
+            raise ValueError("CT110 snapshots require independent PVE host control")
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"ct-{vmid}")),
+            operation_type=operation_type,
+            request_id=request_id or uuid.uuid4().hex,
+            snapshot_name=str(selected["name"]),
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
+    def queue_self_update(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, "self_update")
+        if vmid != 110 or cfg.get("adapter") != "agent_self":
+            raise ValueError("Self-update is supported only for CT110")
+        if self.host_control is None:
+            raise ValueError("CT110 self-update requires independent PVE host control")
+        if self.db.find_active_plan(vmid) is not None:
+            raise ValueError("Resolve the active plan before CT110 self-update")
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", "hubinet-ops")),
+            operation_type="self_update",
+            request_id=request_id or uuid.uuid4().hex,
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
+    def _mark_job_queued(self, vmid: int, job: dict[str, Any]) -> None:
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "active_job_id": job["id"],
+                "operation_status": "running",
+                "job_stage": "queued",
+                "job_progress": 0,
+                "last_operation_result": None,
+                "last_error": None,
+            }
+        )
+        self._save_state(vmid, state)
+
+    def _host_status(self, vmid: int) -> dict[str, Any]:
+        try:
+            if self.host_control is not None:
+                return self.host_control.status(vmid)
+            return _executor_data(self.executor.run("status", vmid, timeout=30))
+        except (ExecutorError, HostControlError) as exc:
+            raise ValueError(f"Cannot read current LXC state: {exc}") from exc
 
     def lifecycle_container(self, vmid: int, action: str) -> dict[str, Any]:
         if action not in {"start", "shutdown", "reboot"}:
@@ -1047,12 +1238,53 @@ class OpsService:
         except Exception:
             LOGGER.exception("Failed to persist terminal state for job %s", job.get("id"))
 
+    def _reconcile_startup_jobs(self) -> None:
+        for job in self.db.active_jobs():
+            operation_type = str(job.get("operation_type") or "update")
+            succeeded = False
+            result: dict[str, Any] | None = None
+            try:
+                if operation_type in {
+                    "lifecycle_start", "lifecycle_shutdown", "lifecycle_force_stop"
+                }:
+                    status = self._host_status(int(job["vmid"]))
+                    actual = str(status.get("lxc_status") or status.get("runtime_status"))
+                    expected = "running" if operation_type == "lifecycle_start" else "stopped"
+                    succeeded = actual == expected
+                    result = {"runtime_status": actual, "reconciled": True}
+                elif operation_type in {"snapshot_create", "snapshot_delete"}:
+                    listing = self.list_snapshots(int(job["vmid"]))
+                    exists = any(
+                        item.get("name") == job.get("snapshot_name")
+                        for item in listing["snapshots"]
+                    )
+                    succeeded = exists if operation_type == "snapshot_create" else not exists
+                    result = {"snapshot_exists": exists, "reconciled": True}
+            except Exception as exc:
+                LOGGER.warning("Startup reconciliation failed for job %s: %s", job["id"], exc)
+            if succeeded:
+                self.db.update_job(job["id"], result=result or {})
+                self._terminal(job, "success", "success", None)
+            else:
+                self._terminal(
+                    job,
+                    "interrupted",
+                    "failed",
+                    "Agent restarted during the operation; it was not replayed",
+                )
+
     def _run_job(self, job: dict[str, Any]) -> None:
+        if str(job.get("operation_type") or "update") != "update":
+            self._run_operation_job(job)
+            return
         vmid = int(job["vmid"])
         cfg = self._resource(vmid)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         auto_rollback = bool(cfg.get("automatic_rollback", False))
-        snapshot = f"ops-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{job['id'][:6]}"
+        snapshot = (
+            f"hubinet-ops-{vmid}-pre-update-"
+            f"{self._now().astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        )
         emit = self._emitter(job)
         emit(
             stage="preflight",
@@ -1061,7 +1293,20 @@ class OpsService:
             message="Update job started",
         )
         try:
-            self._require_compatible_executor(vmid)
+            executor_contract = self._require_compatible_executor(vmid)
+            if (
+                auto_rollback
+                and executor_contract.get("profile_validation_status")
+                == "insufficient_health_contract"
+            ):
+                auto_rollback = False
+                emit(
+                    stage="preflight",
+                    progress=6,
+                    level="warning",
+                    event_type="automatic_rollback_disabled",
+                    message="Automatic rollback disabled: profile health contract is insufficient",
+                )
             preflight = self._execute("preflight", vmid, 700, emit)
             self._validate_approved_plan(job, preflight)
             preflight_updates = dict(_executor_data(preflight).get("updates") or {})
@@ -1089,6 +1334,7 @@ class OpsService:
                     message="Creating rollback snapshot",
                 )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
+                self._enforce_snapshot_retention(vmid, job)
                 emit(
                     stage="snapshot",
                     progress=25,
@@ -1301,6 +1547,147 @@ class OpsService:
                     )
                 )
 
+    def _run_operation_job(self, job: dict[str, Any]) -> None:
+        vmid = int(job["vmid"])
+        operation_type = str(job["operation_type"])
+        emit = self._emitter(job)
+        stage = {
+            "lifecycle_start": "starting",
+            "lifecycle_shutdown": "shutting_down",
+            "lifecycle_reboot": "rebooting",
+            "lifecycle_force_stop": "force_stopping",
+            "snapshot_create": "snapshot_creating",
+            "snapshot_rollback": "snapshot_rollback",
+            "snapshot_delete": "snapshot_deleting",
+            "retry_healthcheck": "healthcheck",
+            "self_update": "self_updating",
+        }.get(operation_type, "executing")
+        emit(
+            stage=stage,
+            progress=5,
+            event_type="operation_started",
+            message=f"Operation {operation_type} started",
+        )
+        try:
+            result = self._execute_host_operation(job)
+            if operation_type == "snapshot_create":
+                self._enforce_snapshot_retention(vmid, job)
+            self.db.update_job(job["id"], result=result)
+            state = self.get_state(vmid)
+            if operation_type.startswith("lifecycle_"):
+                runtime = str(result.get("lxc_status") or result.get("runtime_status") or "unknown")
+                state.update(
+                    {
+                        "lxc_status": runtime,
+                        "runtime_status": runtime,
+                        "lifecycle_action": operation_type.removeprefix("lifecycle_"),
+                        "lifecycle_status": "success",
+                        "lifecycle_finished_at": self._utc_second_timestamp(),
+                        "lifecycle_error": None,
+                    }
+                )
+            if operation_type.startswith("snapshot_"):
+                state["snapshot_operation_status"] = "success"
+                if operation_type == "snapshot_rollback":
+                    state.update(
+                        {
+                            "verification_status": "unknown",
+                            "last_verification": None,
+                            "apt_check_ok": None,
+                            "dpkg_audit_ok": None,
+                            "packages_remaining_count": None,
+                            "pending_updates": None,
+                            "update_status": "unknown",
+                            "updates": {"pending_count": None, "packages": []},
+                        }
+                    )
+                self._save_state(vmid, state)
+                self.list_snapshots(vmid)
+            else:
+                self._save_state(vmid, state)
+            self._terminal(job, "success", "success", None)
+        except (ExecutorError, HostControlError, ValueError) as exc:
+            state = self.get_state(vmid)
+            if operation_type.startswith("lifecycle_"):
+                state.update(
+                    {
+                        "lifecycle_status": "failed",
+                        "lifecycle_finished_at": self._utc_second_timestamp(),
+                        "lifecycle_error": sanitize_text(exc, limit=2000),
+                    }
+                )
+            if operation_type.startswith("snapshot_"):
+                state["snapshot_operation_status"] = "failed"
+            self._save_state(vmid, state)
+            self._terminal(job, "failed", "failed", str(exc))
+
+    def _execute_host_operation(self, job: dict[str, Any]) -> dict[str, Any]:
+        operation_type = str(job["operation_type"])
+        vmid = int(job["vmid"])
+        snapshot_name = job.get("snapshot_name")
+        if self.host_control is not None:
+            return self.host_control.execute(
+                operation_type,
+                vmid,
+                str(job["request_id"]),
+                snapshot_name=str(snapshot_name) if snapshot_name else None,
+            )
+        cfg = self._resource(vmid)
+        if cfg.get("adapter") != "apt":
+            raise ValueError("Independent PVE host control is required")
+        action = {
+            "lifecycle_start": "start",
+            "lifecycle_shutdown": "shutdown",
+            "lifecycle_reboot": "reboot",
+            "lifecycle_force_stop": "force-stop",
+            "snapshot_create": "snapshot-create",
+            "snapshot_rollback": "snapshot-rollback",
+            "snapshot_delete": "snapshot-delete",
+        }.get(operation_type)
+        if action is None:
+            raise ValueError("Operation requires independent PVE host control")
+        return _executor_data(
+            self.executor.run(
+                action,
+                vmid,
+                str(snapshot_name) if snapshot_name else None,
+                timeout=1800,
+            )
+        )
+
+    def _raw_snapshot_list(self, vmid: int) -> list[dict[str, Any]]:
+        if self.host_control is not None:
+            return self.host_control.list_snapshots(vmid)
+        return list(
+            _executor_data(self.executor.run("list-snapshots", vmid, timeout=60)).get(
+                "snapshots", []
+            )
+        )
+
+    def _enforce_snapshot_retention(self, vmid: int, job: dict[str, Any]) -> None:
+        retention = max(1, int(self._resource(vmid).get("snapshot_retention", 5)))
+        snapshots = [
+            dict(item)
+            for item in self._raw_snapshot_list(vmid)
+            if isinstance(item, dict) and item.get("owned_by_hubinet_ops") is True
+        ]
+        snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        protected = self.db.rollback_source_snapshots(vmid)
+        protected.add(str(job.get("snapshot_name") or ""))
+        for index, snapshot in enumerate(snapshots[retention:], start=retention):
+            name = str(snapshot.get("name") or "")
+            if not name or name in protected or not snapshot.get("delete_eligible"):
+                continue
+            if self.host_control is not None:
+                self.host_control.execute(
+                    "snapshot_delete",
+                    vmid,
+                    f"retention-{str(job['id'])[:32]}-{index}",
+                    snapshot_name=name,
+                )
+            else:
+                self.executor.run("snapshot-delete", vmid, name, timeout=300)
+
     def _validate_approved_plan(
         self,
         job: dict[str, Any],
@@ -1466,6 +1853,14 @@ class OpsService:
                     "snapshot_name": snapshot,
                     "last_error": cause,
                     "active_job_id": job["id"],
+                    "verification_status": "unknown",
+                    "last_verification": None,
+                    "apt_check_ok": None,
+                    "dpkg_audit_ok": None,
+                    "packages_remaining_count": None,
+                    "pending_updates": None,
+                    "update_status": "unknown",
+                    "updates": {"pending_count": None, "packages": []},
                 }
             )
             self._save_state(vmid, state)
@@ -1522,13 +1917,16 @@ class OpsService:
             progress=100,
             error=error,
         )
-        plan = self.db.get_plan(job["plan_id"])
-        plan_status = str(plan["status"])
+        plan_status: str | None = None
+        if job.get("plan_id"):
+            plan = self.db.get_plan(job["plan_id"])
+            plan_status = str(plan["status"])
         if plan_status == "approved":
             plan_status = {
                 "success": "completed",
                 "rolled_back": "rolled_back",
                 "blocked": "blocked",
+                "interrupted": "interrupted",
             }.get(job_status, "failed")
             self.db.update_plan_status(job["plan_id"], plan_status)
         state = self.get_state(int(job["vmid"]))
@@ -1536,8 +1934,6 @@ class OpsService:
         suppress_recovery = result in {"success", "rolled_back"}
         state.update(
             {
-                "active_plan_id": None,
-                "active_plan_status": plan_status,
                 "active_job_id": job["id"],
                 "operation_status": operation,
                 "job_stage": event["stage"],
@@ -1558,6 +1954,9 @@ class OpsService:
                 ),
             }
         )
+        if job.get("plan_id"):
+            state["active_plan_id"] = None
+            state["active_plan_status"] = plan_status
         self._save_state(int(job["vmid"]), state)
         self.mqtt.publish_event(int(job["vmid"]), event)
         self.mqtt.publish_job(

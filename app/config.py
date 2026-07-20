@@ -7,6 +7,7 @@ from ipaddress import ip_address
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -88,6 +89,10 @@ class Settings:
     @property
     def mqtt(self) -> dict[str, Any]:
         return self.raw.get("mqtt", {})
+
+    @property
+    def host_control(self) -> dict[str, Any]:
+        return self.raw.get("host_control", {})
 
     @property
     def resources(self) -> dict[int, dict[str, Any]]:
@@ -431,6 +436,36 @@ def validate_config(raw: dict[str, Any]) -> None:
         raise RuntimeError("MQTT reconnect delays must be positive")
     if reconnect_min > reconnect_max:
         raise RuntimeError("mqtt.reconnect_min_seconds cannot exceed reconnect_max_seconds")
+
+    host_control = raw.get("host_control") or {}
+    if not isinstance(host_control, dict):
+        raise RuntimeError("host_control must be an object")
+    unknown_host_control = set(host_control) - {
+        "enabled", "base_url", "token_env", "timeout_seconds",
+        "operation_timeout_seconds", "poll_interval_seconds",
+    }
+    if unknown_host_control:
+        raise RuntimeError("host_control contains unknown settings")
+    if "token" in host_control:
+        raise RuntimeError("host_control bearer token must be provided through the environment")
+    if host_control.get("enabled"):
+        parsed = urlsplit(str(host_control.get("base_url") or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise RuntimeError("host_control.base_url must be an HTTP(S) URL")
+        token_env = str(host_control.get("token_env") or "HUBINET_OPS_HOSTD_TOKEN")
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", token_env):
+            raise RuntimeError("host_control.token_env is invalid")
+    for key, default in (
+        ("timeout_seconds", 30),
+        ("operation_timeout_seconds", 1800),
+    ):
+        if _strict_int(host_control.get(key, default), f"host_control.{key}") <= 0:
+            raise RuntimeError(f"host_control.{key} must be positive")
+    if _finite_float(
+        host_control.get("poll_interval_seconds", 1),
+        "host_control.poll_interval_seconds",
+    ) <= 0:
+        raise RuntimeError("host_control.poll_interval_seconds must be positive")
 
     monitoring_scheduler = raw.get("monitoring_scheduler", {})
     if not isinstance(monitoring_scheduler, dict):

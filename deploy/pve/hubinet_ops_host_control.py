@@ -153,8 +153,25 @@ class HostController:
             return self._snapshot_create(vmid, str(argument), source_job_id)
         if action == "snapshot-rollback":
             self._require_owned_existing_snapshot(vmid, str(argument))
-            self._run(["pct", "rollback", str(vmid), str(argument)], timeout=900)
-            return {"snapshot": argument, "action": "rollback"}
+            was_running = self._status(vmid, "lxc")["lxc_status"] == "running"
+            if was_running:
+                self._lifecycle(vmid, "shutdown")
+            try:
+                self._run(["pct", "rollback", str(vmid), str(argument)], timeout=900)
+            except Exception:
+                if was_running:
+                    try:
+                        self._lifecycle(vmid, "start")
+                    except Exception:
+                        pass
+                raise
+            if was_running:
+                self._lifecycle(vmid, "start")
+            return {
+                "snapshot": argument,
+                "action": "rollback",
+                "lxc_status": "running" if was_running else "stopped",
+            }
         if action == "snapshot-delete":
             snapshot = self._require_owned_existing_snapshot(vmid, str(argument))
             if not snapshot["delete_eligible"]:

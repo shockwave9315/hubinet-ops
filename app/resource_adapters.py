@@ -29,6 +29,11 @@ APT_ACTIONS = {
     "start",
     "shutdown",
     "reboot",
+    "force-stop",
+    "list-snapshots",
+    "snapshot-create",
+    "snapshot-rollback",
+    "snapshot-delete",
 }
 READ_ONLY_ACTIONS = {"status", "inspect"}
 

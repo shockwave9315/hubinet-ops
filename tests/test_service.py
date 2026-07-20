@@ -8,10 +8,15 @@ from typing import Any
 import pytest
 
 from app.config import Settings
+from app.contracts import REQUIRED_APT_ACTIONS
 from app.database import Database
 from app.executor import ExecutorError
 from app.service import OpsService
 from app.stabilization import StabilizationPolicy, Stabilizer
+
+
+EXECUTOR_HASH = "a" * 64
+PROFILE_HASH = "b" * 64
 
 
 class FakeClock:
@@ -70,6 +75,18 @@ class WorkflowExecutor:
         on_event=None,
     ) -> dict[str, Any]:
         self.actions.append(action)
+        if action == "capabilities":
+            return {
+                "ok": True,
+                "data": {
+                    "version": "0.4.0",
+                    "protocol_version": 1,
+                    "supported_actions": sorted(REQUIRED_APT_ACTIONS),
+                    "executor_sha256": EXECUTOR_HASH,
+                    "profile_sha256": PROFILE_HASH,
+                    "profile_validation_status": "valid",
+                },
+            }
         if action == "inspect":
             data = self.inspect_states.pop(0) if self.inspect_states else self.last
             return {"ok": True, "data": data}
@@ -139,6 +156,10 @@ def settings(
                     "criticality": "low",
                     "automatic_rollback": True,
                     "manual_rollback_allowed": True,
+                    "executor_contract": {
+                        "executor_sha256": EXECUTOR_HASH,
+                        "profile_sha256": PROFILE_HASH,
+                    },
                     "operator_capabilities": {
                         "refresh": True,
                         "scan": True,
@@ -292,8 +313,7 @@ def test_production_periodic_scan_targets_only_apt_lxc_resources(
     assert 100 not in executor.vmids
     assert 110 not in executor.vmids
     for vmid in (101, 102, 103, 104, 105, 107, 108, 109):
-        with pytest.raises(ValueError, match="scan.*blocked"):
-            service.scan_container(vmid, operator=True)
+        assert service.scan_container(vmid, operator=True)["status"] == "up_to_date"
 
 
 def test_agent_self_state_adds_inventory_jobs_and_mqtt_without_secrets(
@@ -760,6 +780,7 @@ def test_interrupted_job_is_reconciled_into_container_state(tmp_path: Path) -> N
         WorkflowExecutor(),
         database=restarted_db,
     )
+    service._reconcile_startup_jobs()
     state = service.get_state(106)
     assert restarted_db.get_job(job["id"])["status"] == "interrupted"
     assert state["operation_status"] == "failed"
@@ -833,6 +854,16 @@ def test_post_update_verification_failure_triggers_rollback(tmp_path: Path) -> N
                     "apt-get check failed",
                     data={"apt_check_ok": False, "dpkg_audit_ok": True},
                 )
+            if action == "scan":
+                self.actions.append(action)
+                return {
+                    "ok": True,
+                    "data": {
+                        "pending_count": 1,
+                        "packages": [{"name": "curl"}],
+                        "fingerprint": "recovery-after-rollback",
+                    },
+                }
             return super().run(action, vmid, argument, timeout, on_event)
 
     executor = VerificationFailureExecutor()
@@ -842,8 +873,15 @@ def test_post_update_verification_failure_triggers_rollback(tmp_path: Path) -> N
     assert db.get_job(job["id"])["status"] == "rolled_back"
     assert "rollback" in executor.actions
     state = service.get_state(106)
-    assert state["verification_status"] == "failed"
-    assert state["apt_check_ok"] is False
+    assert state["verification_status"] == "unknown"
+    assert state["apt_check_ok"] is None
+    assert state["packages_remaining_count"] is None
+    assert any(
+        "apt-get check failed" in event["message"]
+        for event in db.list_job_events(job["id"])
+    )
+    recovery = service.scan_container(106, source="recovery")
+    assert recovery["plan"]["id"] != job["plan_id"]
 
 
 def test_verification_reboot_warning_and_success_webhook_summary(tmp_path: Path) -> None:
@@ -1093,4 +1131,10 @@ def test_integrity_or_docker_verification_failure_follows_rollback_policy(
     service._run_job(job)
     assert db.get_job(job["id"])["status"] == "rolled_back"
     assert "rollback" in executor.actions
-    assert service.get_state(106)["verification_status"] == "failed"
+    state = service.get_state(106)
+    assert state["verification_status"] == "unknown"
+    assert state["packages_remaining_count"] is None
+    assert any(
+        message in event["message"]
+        for event in db.list_job_events(job["id"])
+    )

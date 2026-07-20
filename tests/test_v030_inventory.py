@@ -27,20 +27,18 @@ def test_production_inventory_is_exact_and_fail_closed() -> None:
     assert resources[100]["adapter"] == "haos"
     assert resources[100]["guest_agent"] is True
     assert resources[110]["adapter"] == "agent_self"
-    assert resources[106]["manual_rollback_allowed"] is False
-    assert resources[106]["operator_capabilities"] == {
-        "refresh": True,
-        "scan": True,
-        "approve": True,
-        "reject": True,
-        "retry_healthcheck": True,
-        "rollback": False,
-        "start": True,
-        "shutdown": True,
-        "reboot": True,
-    }
-    for vmid in (100, 101, 102, 103, 104, 105, 107, 108, 109, 110):
-        assert not any(resources[vmid]["operator_capabilities"].values())
+    assert resources[106]["manual_rollback_allowed"] is True
+    assert not any(resources[100]["operator_capabilities"].values())
+    for vmid in range(101, 110):
+        capabilities = resources[vmid]["operator_capabilities"]
+        assert all(value for name, value in capabilities.items() if name != "self_update")
+        assert capabilities["self_update"] is False
+        assert resources[vmid]["manual_rollback_allowed"] is True
+    ct110 = resources[110]["operator_capabilities"]
+    assert ct110["start"] is True
+    assert ct110["snapshot_create"] is True
+    assert ct110["self_update"] is True
+    assert ct110["approve"] is False
 
 
 def test_inventory_services_and_docker_do_not_guess_unknown_names() -> None:

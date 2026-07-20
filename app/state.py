@@ -19,6 +19,7 @@ OPERATION_STATUSES = {
 }
 JOB_STAGES = {
     "idle",
+    "queued",
     "scanning",
     "preflight",
     "snapshot",
@@ -29,6 +30,12 @@ JOB_STAGES = {
     "starting",
     "shutting_down",
     "rebooting",
+    "force_stopping",
+    "snapshot_creating",
+    "snapshot_rollback",
+    "snapshot_deleting",
+    "self_updating",
+    "executing",
     "repair",
     "rollback",
     "rollback_wait",
@@ -240,6 +247,16 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
         else []
     )
     state.setdefault("executor_last_checked_at", None)
+    state["snapshot_count"] = max(0, _safe_int(state.get("snapshot_count"), 0))
+    state.setdefault("latest_snapshot_name", None)
+    state.setdefault("latest_snapshot_at", None)
+    state.setdefault("latest_snapshot_kind", None)
+    snapshot_operation = str(state.get("snapshot_operation_status") or "idle")
+    state["snapshot_operation_status"] = (
+        snapshot_operation
+        if snapshot_operation in {"idle", "running", "success", "failed"}
+        else "idle"
+    )
     state.setdefault("profile_validation_status", "unknown")
     recent = state.get("recent_job_events")
     state["recent_job_events"] = list(recent)[-50:] if isinstance(recent, list) else []

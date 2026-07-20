@@ -37,6 +37,9 @@ ACTION_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/"
     r"(?P<action>start|shutdown|reboot|force-stop|self-update)$"
 )
+STATUS_PATH_RE = re.compile(
+    r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/status$"
+)
 TERMINAL_STATUSES = {"succeeded", "failed", "interrupted"}
 
 LOG = logging.getLogger("hubinet-ops-hostd")
@@ -354,6 +357,17 @@ class HostdHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.NOT_FOUND, {"error": "host job not found"})
                 return
             self._send(HTTPStatus.OK, job)
+            return
+        status_match = STATUS_PATH_RE.fullmatch(path)
+        if status_match:
+            try:
+                result = self.app.runner.controller.execute(
+                    "status", int(status_match.group("vmid"))
+                )
+            except (HostControlError, ValueError) as exc:
+                self._send(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send(HTTPStatus.OK, result)
             return
         match = SNAPSHOT_PATH_RE.fullmatch(path)
         if match and match.group("name") is None:

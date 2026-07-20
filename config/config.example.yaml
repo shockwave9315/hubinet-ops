@@ -10,6 +10,14 @@ executor:
   connect_timeout_seconds: 10
   command_timeout_seconds: 4800
 
+host_control:
+  enabled: true
+  base_url: http://192.0.2.10:8741
+  token_env: HUBINET_OPS_HOSTD_TOKEN
+  timeout_seconds: 30
+  operation_timeout_seconds: 1800
+  poll_interval_seconds: 1
+
 scheduler:
   enabled: false
   approval_ttl_minutes: 1440
@@ -63,6 +71,12 @@ resources:
       start: false
       shutdown: false
       reboot: false
+      force_stop: false
+      snapshot_create: false
+      snapshot_list: false
+      snapshot_rollback: false
+      snapshot_delete: false
+      self_update: false
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: []
@@ -82,13 +96,32 @@ resources:
     ip_address: 192.168.4.153
     os: Debian 12
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities: *deny_all
+    operator_capabilities: &full_lxc_control
+      refresh: true
+      scan: true
+      approve: true
+      reject: true
+      retry_healthcheck: true
+      rollback: true
+      start: true
+      shutdown: true
+      reboot: true
+      force_stop: true
+      snapshot_create: true
+      snapshot_list: true
+      snapshot_rollback: true
+      snapshot_delete: true
+      self_update: false
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: e101a103edf2622208fa8207a37ef58c35568f8b0b3a821fe9dda9d8c05ea205
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: [cloudflared.service]
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-101
     stabilization: {}
 
@@ -102,13 +135,17 @@ resources:
     ip_address: 192.168.4.233
     os: Debian 12
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities: *deny_all
+    operator_capabilities: *full_lxc_control
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: 43eb03016572e1282624e9a1560223c517705009f2bd938be4a50ef0ddd711f4
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: [apache2.service, mariadb.service]
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-102
     stabilization: {}
 
@@ -122,13 +159,17 @@ resources:
     ip_address: 192.168.4.112
     os: Debian 12
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities: *deny_all
+    operator_capabilities: *full_lxc_control
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: 8f8c58d96d72996c08c42262341e9b84f9fcc6932576dcc0453dc70340bea8f1
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: [mosquitto.service]
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-103
     stabilization: {}
 
@@ -142,7 +183,11 @@ resources:
     ip_address: 192.168.4.113
     os: Debian 13
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities: *deny_all
+    operator_capabilities: *full_lxc_control
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: 29a19ed2935970a7e88516acec792062b1bdc4849596b16e7f448179ce350e62
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services:
@@ -152,7 +197,7 @@ resources:
       - redis-server.service
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-104
     stabilization: {}
 
@@ -166,13 +211,17 @@ resources:
     ip_address: 192.168.4.80
     os: Debian 13
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities: *deny_all
+    operator_capabilities: *full_lxc_control
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: 53c881c47e88f6c589df0341097f09ebb9b703ae662c15987175bb6c3d82de3a
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: []
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-105
     stabilization: {}
 
@@ -186,16 +235,11 @@ resources:
     ip_address: 192.168.40.106
     os: Debian 13
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities:
-      refresh: true
-      scan: true
-      approve: true
-      reject: true
-      retry_healthcheck: true
-      rollback: false
-      start: true
-      shutdown: true
-      reboot: true
+    operator_capabilities: *full_lxc_control
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: 110df87fefe1d99ab8d39b1b96ab2d32f7ebf0ffd38c6fe783d51def2620d82c
+    snapshot_retention: 5
     recovery_scan: {enabled: true, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: [restart_services, restart_required_containers]
     required_services: [containerd.service, docker.service]
@@ -208,7 +252,7 @@ resources:
         - weatherhub-redis-1
     approval_mode: always
     automatic_rollback: true
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-106
     stabilization: &managed_stabilization
       post_update_timeout_seconds: 300
@@ -228,13 +272,17 @@ resources:
     ip_address: 192.168.4.128
     os: Debian 13
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities: *deny_all
+    operator_capabilities: *full_lxc_control
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: 87ea05776807a81eb9760118b645b40ce7940b9dabefed5683518e17c8fc27d6
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: [postgresql@16-main.service, redis-server.service]
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-107
     stabilization: {}
 
@@ -248,13 +296,17 @@ resources:
     ip_address: 192.168.4.184
     os: Debian 13
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities: *deny_all
+    operator_capabilities: *full_lxc_control
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: 53c881c47e88f6c589df0341097f09ebb9b703ae662c15987175bb6c3d82de3a
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: []
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-108
     stabilization: {}
 
@@ -268,13 +320,17 @@ resources:
     ip_address: 192.168.4.60
     os: Debian 13
     monitoring: {inspect: true, update_scan: true}
-    operator_capabilities: *deny_all
+    operator_capabilities: *full_lxc_control
+    executor_contract:
+      executor_sha256: 4a59c6bb526349bc256ad8ae9c4f668400bff7f81a9a5dff8211059cf3837059
+      profile_sha256: 7be7c63d5b3e49b762788b2786592cd138ad37ba5948220e4c1753ae34ee6c32
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: []
     docker: {enabled: true, require_health: false, required: []}
     automatic_rollback: false
-    manual_rollback_allowed: false
+    manual_rollback_allowed: true
     dashboard_path: /hubinet-ops/ct-109
     stabilization: {}
 
@@ -288,7 +344,23 @@ resources:
     ip_address: 192.168.4.200
     os: Debian 13
     monitoring: {inspect: true, update_scan: false}
-    operator_capabilities: *deny_all
+    operator_capabilities:
+      refresh: true
+      scan: false
+      approve: false
+      reject: false
+      retry_healthcheck: false
+      rollback: false
+      start: true
+      shutdown: true
+      reboot: true
+      force_stop: true
+      snapshot_create: true
+      snapshot_list: true
+      snapshot_rollback: true
+      snapshot_delete: true
+      self_update: true
+    snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: [hubinet-ops.service]

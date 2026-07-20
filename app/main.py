@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from .config import Settings, load_settings
 from .database import Database
 from .executor import Executor, ExecutorError
+from .host_control import HostControlClient, HostControlError
 from .mqtt import MqttTelemetry, VERSION
 from .resource_adapters import ResourceExecutor
 from .service import OpsService
@@ -37,6 +38,7 @@ def create_app(
     database: Database | None = None,
     executor: Executor | None = None,
     mqtt: MqttTelemetry | None = None,
+    host_control: HostControlClient | None = None,
 ) -> FastAPI:
     db = database or Database(app_settings.db_path)
     if executor is None:
@@ -47,7 +49,9 @@ def create_app(
             app_settings.resources,
         )
     mqtt = mqtt or MqttTelemetry(app_settings.mqtt, app_settings.resources)
-    service = OpsService(app_settings, db, executor, mqtt)
+    if host_control is None and app_settings.host_control.get("enabled"):
+        host_control = HostControlClient(app_settings.host_control)
+    service = OpsService(app_settings, db, executor, mqtt, host_control=host_control)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -165,42 +169,121 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    def lifecycle(vmid: int, action: str) -> dict[str, Any]:
+    def lifecycle(
+        vmid: int,
+        action: str,
+        request: OperationRequest | None = None,
+    ) -> dict[str, Any]:
         try:
-            return service.lifecycle_container(vmid, action)
+            return service.queue_lifecycle(
+                vmid,
+                action,
+                request.request_id if request else None,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Container not found") from exc
-        except ValueError as exc:
+        except (ValueError, ExecutorError, HostControlError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    def lifecycle_container_alias(vmid: int, action: str) -> dict[str, Any]:
+    def lifecycle_container_alias(
+        vmid: int,
+        action: str,
+        request: OperationRequest | None = None,
+    ) -> dict[str, Any]:
         if vmid not in app_settings.containers:
             raise HTTPException(status_code=404, detail="Container not found")
-        return lifecycle(vmid, action)
+        return lifecycle(vmid, action, request)
 
     @api.post("/api/v1/containers/{vmid}/start", dependencies=auth)
-    def start_container(vmid: int) -> dict[str, Any]:
-        return lifecycle_container_alias(vmid, "start")
+    def start_container(vmid: int, request: OperationRequest | None = None) -> dict[str, Any]:
+        return lifecycle_container_alias(vmid, "start", request)
 
     @api.post("/api/v1/containers/{vmid}/shutdown", dependencies=auth)
-    def shutdown_container(vmid: int) -> dict[str, Any]:
-        return lifecycle_container_alias(vmid, "shutdown")
+    def shutdown_container(vmid: int, request: OperationRequest | None = None) -> dict[str, Any]:
+        return lifecycle_container_alias(vmid, "shutdown", request)
 
     @api.post("/api/v1/containers/{vmid}/reboot", dependencies=auth)
-    def reboot_container(vmid: int) -> dict[str, Any]:
-        return lifecycle_container_alias(vmid, "reboot")
+    def reboot_container(vmid: int, request: OperationRequest | None = None) -> dict[str, Any]:
+        return lifecycle_container_alias(vmid, "reboot", request)
 
     @api.post("/api/v1/resources/{vmid}/start", dependencies=auth)
-    def start_resource(vmid: int) -> dict[str, Any]:
-        return lifecycle(vmid, "start")
+    def start_resource(vmid: int, request: OperationRequest | None = None) -> dict[str, Any]:
+        return lifecycle(vmid, "start", request)
 
     @api.post("/api/v1/resources/{vmid}/shutdown", dependencies=auth)
-    def shutdown_resource(vmid: int) -> dict[str, Any]:
-        return lifecycle(vmid, "shutdown")
+    def shutdown_resource(vmid: int, request: OperationRequest | None = None) -> dict[str, Any]:
+        return lifecycle(vmid, "shutdown", request)
 
     @api.post("/api/v1/resources/{vmid}/reboot", dependencies=auth)
-    def reboot_resource(vmid: int) -> dict[str, Any]:
-        return lifecycle(vmid, "reboot")
+    def reboot_resource(vmid: int, request: OperationRequest | None = None) -> dict[str, Any]:
+        return lifecycle(vmid, "reboot", request)
+
+    @api.post("/api/v1/resources/{vmid}/force-stop", dependencies=auth)
+    def force_stop_resource(vmid: int, request: OperationRequest | None = None) -> dict[str, Any]:
+        return lifecycle(vmid, "force-stop", request)
+
+    @api.get("/api/v1/resources/{vmid}/snapshots", dependencies=auth)
+    def snapshots(vmid: int) -> dict[str, Any]:
+        try:
+            return service.list_snapshots(vmid)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/snapshots", dependencies=auth)
+    def create_snapshot(
+        vmid: int,
+        request: OperationRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return service.queue_snapshot_create(vmid, request.request_id if request else None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/snapshots/{name}/rollback", dependencies=auth)
+    def rollback_snapshot(
+        vmid: int,
+        name: str,
+        request: OperationRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return service.queue_snapshot_action(
+                vmid, "rollback", name, request.request_id if request else None
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.delete("/api/v1/resources/{vmid}/snapshots/{name}", dependencies=auth)
+    def delete_snapshot(
+        vmid: int,
+        name: str,
+        request: OperationRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return service.queue_snapshot_action(
+                vmid, "delete", name, request.request_id if request else None
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/self-update", dependencies=auth)
+    def self_update_resource(
+        vmid: int,
+        request: OperationRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return service.queue_self_update(vmid, request.request_id if request else None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @api.post("/api/v1/containers/{vmid}/retry-healthcheck", dependencies=auth)
     def retry_healthcheck(vmid: int) -> dict[str, Any]:

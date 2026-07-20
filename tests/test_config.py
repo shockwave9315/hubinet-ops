@@ -166,17 +166,22 @@ def test_recovery_delay_above_default_cooldown_uses_safe_dynamic_default() -> No
     validate_config(config)
 
 
-def test_example_policy_keeps_ct101_denied_and_ct106_managed() -> None:
+def test_example_policy_enables_full_lxc_control_and_keeps_vm100_denied() -> None:
     import yaml
     from pathlib import Path
 
     raw = yaml.safe_load(Path("config/config.example.yaml").read_text(encoding="utf-8"))
     validate_config(raw)
+    vm100 = raw["resources"][100]["operator_capabilities"]
     ct101 = raw["resources"][101]["operator_capabilities"]
-    ct106 = raw["resources"][106]["operator_capabilities"]
-    assert ct101 and not any(ct101.values())
-    assert ct106 and all(value for key, value in ct106.items() if key != "rollback")
-    assert ct106["rollback"] is False
+    ct110 = raw["resources"][110]["operator_capabilities"]
+    assert vm100 and not any(vm100.values())
+    assert all(value for name, value in ct101.items() if name != "self_update")
+    assert ct101["self_update"] is False
+    assert ct110["start"] is True
+    assert ct110["snapshot_rollback"] is True
+    assert ct110["self_update"] is True
+    assert ct110["approve"] is False
     assert raw["resources"][101]["recovery_scan"]["enabled"] is False
     assert raw["resources"][106]["recovery_scan"] == {
         "enabled": True,
@@ -261,7 +266,7 @@ def test_production_monitoring_scheduler_is_enabled_for_observation_scans() -> N
     }
     for vmid in (101, 102, 103, 104, 105, 107, 108, 109):
         assert raw["resources"][vmid]["monitoring"]["update_scan"] is True
-        assert raw["resources"][vmid]["operator_capabilities"]["scan"] is False
+        assert raw["resources"][vmid]["operator_capabilities"]["scan"] is True
     assert raw["resources"][100]["monitoring"]["update_scan"] is False
     assert raw["resources"][110]["monitoring"]["update_scan"] is False
 
