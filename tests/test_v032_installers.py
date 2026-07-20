@@ -22,9 +22,18 @@ def test_032_upgrade_updates_agent_and_wrapper_transactionally_only() -> None:
     assert 'python3 -m py_compile "$SOURCE_DIR"/app/*.py' in text
     assert 'bash -n "$SOURCE_WRAPPER"' in text
     assert 'bash -n "$HOST_WRAPPER"' in text
+    assert "SSH_ORIGINAL_COMMAND='inspect 100' /usr/local/sbin/hubinet-ops-host" in text
+    assert "SSH_ORIGINAL_COMMAND='inspect 106' /usr/local/sbin/hubinet-ops-host" in text
+    assert 'validate_wrapper_inspect qemu "$qemu_smoke"' in text
+    assert 'validate_wrapper_inspect lxc "$lxc_smoke"' in text
     assert 'tar -C "$SOURCE_DIR" -czf "$ARCHIVE" app' in text
     assert '"version":"0.3.2"' in text
-    assert "expected 11" in text
+    assert "/api/v1/states" in text
+    assert 'set(resources) != expected_vmids' in text
+    assert 'vm100.get("health_status") != "healthy"' in text
+    assert 'ct106.get("health_status") != "healthy"' in text
+    assert 'ct110.get("health_status") != "healthy"' in text
+    assert 'ct110.get("health_score") != 100' in text
     for forbidden in (
         "install-managed.sh",
         "deploy/pve/managed-vmids",

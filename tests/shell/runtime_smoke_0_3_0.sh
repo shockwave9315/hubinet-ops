@@ -97,6 +97,8 @@ for vmid in $(seq 100 110); do
 done
 
 qemu="$(SSH_ORIGINAL_COMMAND='inspect 100' "$TMP_ROOT/hubinet-ops-host")"
+[[ "$qemu" == *'"resource_type":"qemu"'* ]]
+[[ "$qemu" == *'"adapter":"haos"'* ]]
 [[ "$qemu" == *'"qemu_status":"running"'* ]]
 [[ "$qemu" == *'"guest_agent_status":"available"'* ]]
 [[ "$qemu" == *'"cpu":{"usage":0.0305257,"cores":2}'* ]]
@@ -106,6 +108,11 @@ export CLUSTER_MISSING=1
 qemu_missing="$(SSH_ORIGINAL_COMMAND='inspect 100' "$TMP_ROOT/hubinet-ops-host")"
 unset CLUSTER_MISSING
 [[ "$qemu_missing" == *'"cpu":{"usage":null,"cores":2}'* ]]
+
+lxc="$(SSH_ORIGINAL_COMMAND='inspect 106' "$TMP_ROOT/hubinet-ops-host")"
+[[ "$lxc" == *'"resource_type":"lxc"'* ]]
+[[ "$lxc" == *'"adapter":"apt"'* ]]
+[[ "$lxc" == *'"health_status":"healthy"'* ]]
 if grep -Fq '/nodes/proxmox.local/' "$SMOKE_LOG"; then
   echo 'QEMU inspect used the system hostname instead of the local PVE node' >&2
   exit 1

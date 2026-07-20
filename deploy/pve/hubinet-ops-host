@@ -123,11 +123,31 @@ case "$action" in
     if [[ "$resource_type" == "lxc" ]]; then
       state="$(status_lxc)"
       if [[ "$state" != "running" ]]; then
-        printf '{"ok":true,"data":{"runtime_status":"%s","lxc_status":"%s","health_status":"offline","health_score":0}}\n' "$state" "$state"
+        printf '{"ok":true,"data":{"resource_type":"lxc","adapter":"apt","runtime_status":"%s","lxc_status":"%s","health_status":"offline","health_score":0}}\n' "$state" "$state"
         exit 0
       fi
-      timeout --signal=TERM --kill-after=10s 180s \
-        pct exec "$vmid" -- /usr/local/sbin/hubinet-maint inspect
+      if ! inspected="$(timeout --signal=TERM --kill-after=10s 180s \
+        pct exec "$vmid" -- /usr/local/sbin/hubinet-maint inspect)"; then
+        fail "Managed LXC inspect failed or timed out"
+      fi
+      if ! normalized="$(python3 - "$inspected" <<'PY'
+import json, sys
+
+try:
+    payload = json.loads(sys.argv[1])
+    data = payload["data"]
+    if payload.get("ok") is not True or not isinstance(data, dict):
+        raise ValueError
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit("invalid managed LXC inspect response")
+data["resource_type"] = "lxc"
+data["adapter"] = "apt"
+print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+PY
+)"; then
+        fail "Managed LXC inspect returned invalid JSON"
+      fi
+      printf '%s\n' "$normalized"
       exit 0
     fi
 
@@ -191,6 +211,8 @@ for interface in guest if isinstance(guest, list) else []:
         if value and value not in {"127.0.0.1", "::1"}:
             addresses.append(str(value)[:128])
 data = {
+    "resource_type": "qemu",
+    "adapter": "haos",
     "runtime_status": state,
     "qemu_status": state,
     "health_status": "healthy" if state == "running" else "offline",

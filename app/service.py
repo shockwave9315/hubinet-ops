@@ -1810,8 +1810,10 @@ class OpsService:
             LOGGER.warning("Home Assistant webhook delivery failed")
 
     def _utc_second_timestamp(self) -> str:
-        current = parse_utc_timestamp(self._now()) or datetime.now(UTC)
-        return current.replace(microsecond=0).isoformat()
+        current = self._now()
+        if current.tzinfo is None or current.utcoffset() is None:
+            current = current.replace(tzinfo=UTC)
+        return current.astimezone(UTC).replace(microsecond=0).isoformat()
 
     def _suppress_agent_publication(self) -> None:
         depth = int(getattr(self._agent_publish_context, "depth", 0))

@@ -13,6 +13,11 @@ ROOT = Path(__file__).parents[1]
 PACKAGE = ROOT / "home-assistant" / "packages" / "hubinet_ops.yaml"
 DASHBOARD = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
 INSTALLER = ROOT / "deploy" / "install-ha-from-pve.sh"
+LAST_REFRESH_RECORDER_EXCLUSIONS = {
+    "sensor.hubinet_ops_agent_last_refresh",
+    "sensor.hubinet_ops_vm100_last_refresh",
+    *(f"sensor.hubinet_ops_ct{vmid}_last_refresh" for vmid in range(101, 111)),
+}
 
 
 def _load(path: Path) -> Any:
@@ -42,6 +47,14 @@ def test_all_repository_yaml_parses() -> None:
     ).splitlines()
     for name in tracked:
         _load(ROOT / name)
+
+
+def test_recorder_excludes_exactly_the_last_refresh_entities() -> None:
+    recorder = _load(PACKAGE)["recorder"]
+
+    assert set(recorder) == {"exclude"}
+    assert set(recorder["exclude"]) == {"entities"}
+    assert set(recorder["exclude"]["entities"]) == LAST_REFRESH_RECORDER_EXCLUSIONS
 
 
 def test_current_automations_replace_the_legacy_webhook_automation() -> None:

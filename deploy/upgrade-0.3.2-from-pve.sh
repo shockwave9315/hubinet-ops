@@ -23,6 +23,41 @@ agent_changes_started=false
 wrapper_backup_complete=false
 wrapper_changes_started=false
 
+validate_wrapper_inspect() {
+  local expected="$1" payload="$2"
+  python3 - "$expected" "$payload" <<'PY'
+import json, math, sys
+
+expected, raw = sys.argv[1:]
+try:
+    payload = json.loads(raw)
+    data = payload["data"]
+except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"invalid wrapper JSON: {exc}")
+if payload.get("ok") is not True or not isinstance(data, dict):
+    raise SystemExit("wrapper response must contain ok=true and an object data")
+if data.get("resource_type") != expected:
+    raise SystemExit(f"unexpected resource_type: {data.get('resource_type')!r}")
+if expected == "lxc":
+    raise SystemExit(0)
+if data.get("adapter") != "haos":
+    raise SystemExit("VM100 adapter must be haos")
+if data.get("qemu_status") not in {"running", "stopped"}:
+    raise SystemExit("VM100 qemu_status must be running or stopped")
+cpu = data.get("cpu")
+if not isinstance(cpu, dict) or "usage" not in cpu:
+    raise SystemExit("VM100 cpu must be an object containing usage")
+usage = cpu["usage"]
+if usage is not None and (
+    isinstance(usage, bool)
+    or not isinstance(usage, (int, float))
+    or not math.isfinite(usage)
+    or not 0 <= usage <= 1
+):
+    raise SystemExit("VM100 cpu.usage must be null or a number from 0 to 1")
+PY
+}
+
 required_source=(
   app
   deploy/pve/hubinet-ops-host
@@ -103,6 +138,34 @@ wrapper_changes_started=true
 install -o root -g root -m 0755 "$SOURCE_WRAPPER" "$HOST_WRAPPER"
 bash -n "$HOST_WRAPPER"
 
+if [[ ${HUBINET_OPS_TEST_MODE:-0} == 1 && -n ${HUBINET_OPS_TEST_WRAPPER_RUNNER:-} ]]; then
+  if ! qemu_smoke="$(SSH_ORIGINAL_COMMAND='inspect 100' "$HUBINET_OPS_TEST_WRAPPER_RUNNER")"; then
+    echo "PVE wrapper VM100 read-only smoke failed" >&2
+    rollback_patch 1
+  fi
+  if ! lxc_smoke="$(SSH_ORIGINAL_COMMAND='inspect 106' "$HUBINET_OPS_TEST_WRAPPER_RUNNER")"; then
+    echo "PVE wrapper CT106 read-only smoke failed" >&2
+    rollback_patch 1
+  fi
+else
+  if ! qemu_smoke="$(SSH_ORIGINAL_COMMAND='inspect 100' /usr/local/sbin/hubinet-ops-host)"; then
+    echo "PVE wrapper VM100 read-only smoke failed" >&2
+    rollback_patch 1
+  fi
+  if ! lxc_smoke="$(SSH_ORIGINAL_COMMAND='inspect 106' /usr/local/sbin/hubinet-ops-host)"; then
+    echo "PVE wrapper CT106 read-only smoke failed" >&2
+    rollback_patch 1
+  fi
+fi
+if ! validate_wrapper_inspect qemu "$qemu_smoke"; then
+  echo "PVE wrapper VM100 returned an invalid read-only inspect response" >&2
+  rollback_patch 1
+fi
+if ! validate_wrapper_inspect lxc "$lxc_smoke"; then
+  echo "PVE wrapper CT106 returned an invalid read-only inspect response" >&2
+  rollback_patch 1
+fi
+
 pct push "$AGENT_VMID" "$ARCHIVE" /root/hubinet-ops-0.3.2.tgz --perms 0600
 agent_changes_started=true
 
@@ -121,33 +184,54 @@ rm -rf "$staging" /root/hubinet-ops-0.3.2.tgz
 systemctl start hubinet-ops
 REMOTE_INSTALL_AGENT
 
-for attempt in $(seq 1 30); do
+for attempt in $(seq 1 45); do
   health_rc=0
   health="$(pct exec "$AGENT_VMID" -- curl -fsS --max-time 3 http://127.0.0.1:8787/health 2>/dev/null)" || health_rc=$?
   if [[ "$health_rc" -eq 0 && "$health" == *'"version":"0.3.2"'* ]]; then
-    resources="$(pct exec "$AGENT_VMID" -- bash -s <<'REMOTE_CHECK_RESOURCES'
+    states_rc=0
+    states="$(pct exec "$AGENT_VMID" -- bash -s <<'REMOTE_CHECK_STATES'
 set -Eeuo pipefail
 set -a
 source /etc/hubinet-ops/agent.env
 set +a
 curl -fsS --max-time 5 -H "Authorization: Bearer $HUBINET_OPS_API_TOKEN" \
-  http://127.0.0.1:8787/api/v1/resources
-REMOTE_CHECK_RESOURCES
-)"
-    count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' <<<"$resources")"
-    [[ "$count" == 11 ]] || {
-      echo "Resource inventory count is $count, expected 11" >&2
-      rollback_patch 1
-    }
-    trap - ERR INT TERM EXIT
-    rm -f "$ARCHIVE"
-    echo "Hubinet Ops 0.3.2 installed transactionally in CT110 and the PVE host wrapper."
-    echo "No managed resource action or lifecycle action was executed."
-    echo "Backups: CT110:$AGENT_BACKUP PVE:$WRAPPER_BACKUP_DIR"
-    exit 0
+  http://127.0.0.1:8787/api/v1/states
+REMOTE_CHECK_STATES
+)" || states_rc=$?
+    if [[ "$states_rc" -eq 0 ]] && python3 - "$states" <<'PY'
+import json, sys
+
+try:
+    payload = json.loads(sys.argv[1])
+    resources = payload["resources"]
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+expected_vmids = {str(vmid) for vmid in range(100, 111)}
+if payload.get("version") != "0.3.2" or not isinstance(resources, dict) or set(resources) != expected_vmids:
+    raise SystemExit(1)
+vm100 = resources.get("100", {})
+ct106 = resources.get("106", {})
+ct110 = resources.get("110", {})
+usage = vm100.get("cpu", {}).get("usage_percent")
+valid_number = isinstance(usage, (int, float)) and not isinstance(usage, bool)
+if not valid_number or vm100.get("health_status") != "healthy":
+    raise SystemExit(1)
+if ct106.get("health_status") != "healthy":
+    raise SystemExit(1)
+if ct110.get("health_status") != "healthy" or ct110.get("health_score") != 100:
+    raise SystemExit(1)
+PY
+    then
+      trap - ERR INT TERM EXIT
+      rm -f "$ARCHIVE"
+      echo "Hubinet Ops 0.3.2 installed transactionally in CT110 and the PVE host wrapper."
+      echo "No managed resource action or lifecycle action was executed."
+      echo "Backups: CT110:$AGENT_BACKUP PVE:$WRAPPER_BACKUP_DIR"
+      exit 0
+    fi
   fi
-  [[ "$attempt" -eq 30 ]] || sleep 2
+  [[ "$attempt" -eq 45 ]] || sleep 2
 done
 
-echo "Agent 0.3.2 health validation failed" >&2
+echo "Agent 0.3.2 first telemetry validation failed" >&2
 rollback_patch 1

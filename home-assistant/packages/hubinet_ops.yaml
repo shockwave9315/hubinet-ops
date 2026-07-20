@@ -1,5 +1,21 @@
 # Hubinet Ops 0.3.2: resource REST aliases and navigation-only notifications.
 
+recorder:
+  exclude:
+    entities:
+      - sensor.hubinet_ops_agent_last_refresh
+      - sensor.hubinet_ops_vm100_last_refresh
+      - sensor.hubinet_ops_ct101_last_refresh
+      - sensor.hubinet_ops_ct102_last_refresh
+      - sensor.hubinet_ops_ct103_last_refresh
+      - sensor.hubinet_ops_ct104_last_refresh
+      - sensor.hubinet_ops_ct105_last_refresh
+      - sensor.hubinet_ops_ct106_last_refresh
+      - sensor.hubinet_ops_ct107_last_refresh
+      - sensor.hubinet_ops_ct108_last_refresh
+      - sensor.hubinet_ops_ct109_last_refresh
+      - sensor.hubinet_ops_ct110_last_refresh
+
 rest_command:
   hubinet_ops_scan_container:
     url: !secret hubinet_ops_scan_url

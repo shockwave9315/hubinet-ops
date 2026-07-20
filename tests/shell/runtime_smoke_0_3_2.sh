@@ -17,9 +17,8 @@ SH
 
 cat > "$MOCK_BIN/python3" <<'SH'
 #!/usr/bin/env bash
-if [[ "${1:-}" == -c ]]; then
-  cat >/dev/null
-  printf '%s\n' 11
+if [[ "${1:-}" == - ]]; then
+  exec python "$@"
 fi
 exit 0
 SH
@@ -59,6 +58,10 @@ case "$action" in
     vmid="${1:-}"
     shift || true
     [[ "${1:-}" == -- ]] && shift
+    if [[ "${1:-}" == systemctl && "${2:-}" == start ]]; then
+      printf '%s\n' start-unchanged >> "$LOG_DIR/agent-layers.log"
+      exit 0
+    fi
     if [[ "${1:-}" == curl ]]; then
       printf '%s\n' '{"status":"ok","version":"0.3.2"}'
       exit 0
@@ -78,12 +81,31 @@ case "$action" in
         printf '%s\n' backup >> "$LOG_DIR/agent-layers.log"
         exit 0
       fi
-      if [[ "$payload" == *'/api/v1/resources'* ]]; then
-        printf '[%s]\n' '0,1,2,3,4,5,6,7,8,9,10'
+      if [[ "$payload" == *'/api/v1/states'* ]]; then
+        printf '%s\n' '/api/v1/states' >> "$LOG_DIR/pct.log"
+        printf '%s\n' '{"version":"0.3.2","resources":{"100":{"health_status":"healthy","cpu":{"usage_percent":3.05257}},"101":{},"102":{},"103":{},"104":{},"105":{},"106":{"health_status":"healthy"},"107":{},"108":{},"109":{},"110":{"health_status":"healthy","health_score":100}}}'
         exit 0
       fi
     fi
     ;;
+esac
+SH
+
+cat > "$MOCK_BIN/wrapper-smoke" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$SSH_ORIGINAL_COMMAND" >> "$LOG_DIR/wrapper-smoke.log"
+case "$SSH_ORIGINAL_COMMAND" in
+  'inspect 100')
+    if [[ ${BAD_WRAPPER_JSON:-0} == 1 ]]; then
+      printf '%s\n' 'not-json'
+    else
+      printf '%s\n' '{"ok":true,"data":{"resource_type":"qemu","adapter":"haos","qemu_status":"running","cpu":{"usage":0.0305257}}}'
+    fi
+    ;;
+  'inspect 106')
+    printf '%s\n' '{"ok":true,"data":{"resource_type":"lxc","adapter":"apt","lxc_status":"running"}}'
+    ;;
+  *) exit 1 ;;
 esac
 SH
 
@@ -113,6 +135,7 @@ export HUBINET_OPS_TEST_MODE=1
 export HUBINET_OPS_TEST_ARCHIVE="$TMP_ROOT/hubinet-ops-0.3.2.tgz"
 export HUBINET_OPS_HOST_WRAPPER="$HOST_WRAPPER"
 export HUBINET_OPS_BACKUP_ROOT="$TMP_ROOT/backups"
+export HUBINET_OPS_TEST_WRAPPER_RUNNER="$MOCK_BIN/wrapper-smoke"
 
 printf '%s\n' '#!/usr/bin/env bash' 'echo old-wrapper' > "$HOST_WRAPPER"
 chmod 0755 "$HOST_WRAPPER"
@@ -120,7 +143,26 @@ bash "$ROOT/deploy/upgrade-0.3.2-from-pve.sh"
 grep -Fxq backup "$LOG_DIR/agent-layers.log"
 grep -Fxq install "$LOG_DIR/agent-layers.log"
 grep -Fq 'cluster/resources' "$HOST_WRAPPER"
+grep -Fxq 'inspect 100' "$LOG_DIR/wrapper-smoke.log"
+grep -Fxq 'inspect 106' "$LOG_DIR/wrapper-smoke.log"
+grep -Fq '/api/v1/states' "$LOG_DIR/pct.log"
 [[ ! -e "$TMP_ROOT/hubinet-ops-0.3.2.tgz" ]]
+
+printf '%s\n' '#!/usr/bin/env bash' 'echo old-wrapper' > "$HOST_WRAPPER"
+: > "$LOG_DIR/agent-layers.log"
+export BAD_WRAPPER_JSON=1
+if bash "$ROOT/deploy/upgrade-0.3.2-from-pve.sh" >/dev/null 2>&1; then
+  echo "0.3.2 upgrade unexpectedly succeeded with invalid wrapper JSON" >&2
+  exit 1
+fi
+unset BAD_WRAPPER_JSON
+grep -Fxq backup "$LOG_DIR/agent-layers.log"
+grep -Fxq start-unchanged "$LOG_DIR/agent-layers.log"
+if grep -Fxq install "$LOG_DIR/agent-layers.log"; then
+  echo "Agent was replaced after the wrapper smoke had already failed" >&2
+  exit 1
+fi
+grep -Fxq 'echo old-wrapper' "$HOST_WRAPPER"
 
 printf '%s\n' '#!/usr/bin/env bash' 'echo old-wrapper' > "$HOST_WRAPPER"
 : > "$LOG_DIR/agent-layers.log"

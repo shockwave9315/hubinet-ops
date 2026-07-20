@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +55,10 @@ class InventoryExecutor:
         }
 
 
-def _service(tmp_path: Path) -> tuple[OpsService, RecordingMqtt]:
+def _service(
+    tmp_path: Path,
+    moment: datetime | None = None,
+) -> tuple[OpsService, RecordingMqtt]:
     raw = yaml.safe_load(Path("config/config.example.yaml").read_text(encoding="utf-8"))
     cfg = Settings(
         raw=raw,
@@ -64,7 +67,7 @@ def _service(tmp_path: Path) -> tuple[OpsService, RecordingMqtt]:
         api_token="t" * 64,
     )
     mqtt = RecordingMqtt()
-    moment = datetime(2026, 7, 19, 20, 29, 43, 175219, tzinfo=UTC)
+    moment = moment or datetime(2026, 7, 19, 20, 29, 43, 175219, tzinfo=UTC)
     service = OpsService(
         cfg,
         Database(cfg.db_path),
@@ -167,4 +170,43 @@ def test_agent_last_refresh_is_utc_iso_without_microseconds(tmp_path: Path) -> N
     assert parsed is not None
     assert parsed.tzinfo == UTC
     assert parsed.microsecond == 0
+    assert "." not in value
+
+
+def test_utc_second_timestamp_preserves_aware_utc(tmp_path: Path) -> None:
+    service, _ = _service(
+        tmp_path,
+        datetime(2026, 7, 19, 20, 29, 43, 175219, tzinfo=UTC),
+    )
+
+    assert service._utc_second_timestamp() == "2026-07-19T20:29:43+00:00"
+
+
+def test_utc_second_timestamp_converts_aware_offset_to_utc(tmp_path: Path) -> None:
+    service, _ = _service(
+        tmp_path,
+        datetime(
+            2026,
+            7,
+            19,
+            22,
+            29,
+            43,
+            175219,
+            tzinfo=timezone(timedelta(hours=2)),
+        ),
+    )
+
+    assert service._utc_second_timestamp() == "2026-07-19T20:29:43+00:00"
+
+
+def test_utc_second_timestamp_treats_naive_datetime_as_utc(tmp_path: Path) -> None:
+    service, _ = _service(
+        tmp_path,
+        datetime(2026, 7, 19, 20, 29, 43, 175219),
+    )
+
+    value = service._utc_second_timestamp()
+
+    assert value == "2026-07-19T20:29:43+00:00"
     assert "." not in value

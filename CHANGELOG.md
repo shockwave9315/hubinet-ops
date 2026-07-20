@@ -7,6 +7,8 @@
 - source VM100 CPU from `/cluster/resources --type vm` while retaining `status/current` for the remaining QEMU fields;
 - expose QEMU and agent-self byte metrics as numeric GiB sensors and render uptime and agent refresh time readably;
 - publish one deduplicated agent summary per full telemetry cycle with a second-precision UTC completion timestamp;
+- exclude only Hubinet Ops `last_refresh` sensors from future Recorder history without changing the user's Recorder retention or database settings;
+- add read-only VM100/CT106 wrapper and first-cycle telemetry smoke checks to the transactional 0.3.2 installer;
 - add transactional 0.3.2 CT110/PVE-wrapper and Home Assistant installers with rollback and no automatic HA restart.
 
 ## 0.3.1

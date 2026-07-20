@@ -13,3 +13,5 @@ bash deploy/install-ha-0.3.2-from-pve.sh HA_HOST 22
 ```
 
 The installer requires the existing private secrets and URL aliases, backs up package/dashboard/secrets, runs `ha core check`, rolls files back on error, and never restarts Home Assistant automatically.
+
+The package excludes only the agent and resource `last_refresh` sensors from Recorder, because the dashboard needs their current state rather than a state change every telemetry cycle. Historical rows recorded before this package is installed are not deleted immediately; they disappear according to the existing Recorder purge configuration.
