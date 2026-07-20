@@ -18,7 +18,18 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_PATH = Path("/etc/hubinet-maint.json")
-VERSION = "0.3.0"
+VERSION = "0.4.0"
+PROTOCOL_VERSION = 1
+SUPPORTED_ACTIONS = (
+    "capabilities",
+    "inspect",
+    "check-updates",
+    "preflight",
+    "update",
+    "healthcheck",
+    "repair",
+    "verify",
+)
 DOCKER_PACKAGES = {
     "docker-ce",
     "docker-ce-cli",
@@ -111,7 +122,71 @@ def load_config() -> dict[str, Any]:
     raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise RuntimeError("/etc/hubinet-maint.json must contain an object")
+    status, errors = validate_profile(raw)
+    if status == "invalid":
+        raise RuntimeError("invalid hubinet-maint profile: " + "; ".join(errors))
     return raw
+
+
+def validate_profile(config: dict[str, Any]) -> tuple[str, list[str]]:
+    errors: list[str] = []
+    for key in ("services", "health_urls", "ignore_failed_units", "repair_actions"):
+        if not isinstance(config.get(key, []), list):
+            errors.append(f"{key} must be a list")
+    for key in ("services", "ignore_failed_units", "repair_actions"):
+        values = config.get(key, [])
+        if isinstance(values, list) and not all(
+            isinstance(value, str) and value.strip() for value in values
+        ):
+            errors.append(f"{key} must contain non-empty strings")
+    try:
+        if isinstance(config.get("min_free_mb"), bool) or int(
+            config.get("min_free_mb", 1024)
+        ) <= 0:
+            errors.append("min_free_mb must be a positive integer")
+    except (TypeError, ValueError):
+        errors.append("min_free_mb must be a positive integer")
+    docker = config.get("docker", {})
+    if not isinstance(docker, dict):
+        errors.append("docker must be an object")
+        docker = {}
+    required = docker.get("required_containers", [])
+    if not isinstance(required, list) or not all(
+        isinstance(value, str) and value.strip() for value in required
+    ):
+        errors.append("docker.required_containers must contain non-empty strings")
+        required = []
+    urls = config.get("health_urls", [])
+    if isinstance(urls, list) and not all(
+        isinstance(value, (str, dict)) for value in urls
+    ):
+        errors.append("health_urls entries must be strings or objects")
+    if errors:
+        return "invalid", errors
+    meaningful = bool(config.get("services") or config.get("health_urls"))
+    meaningful = meaningful or bool(docker.get("enabled") and required)
+    return ("valid" if meaningful else "insufficient_health_contract"), []
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def capabilities() -> dict[str, Any]:
+    config = load_config()
+    profile_status, _ = validate_profile(config)
+    return {
+        "version": VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "supported_actions": list(SUPPORTED_ACTIONS),
+        "executor_sha256": _sha256(Path(__file__).resolve()),
+        "profile_sha256": _sha256(CONFIG_PATH),
+        "profile_validation_status": profile_status,
+    }
 
 
 def apt_scan() -> dict[str, Any]:
@@ -718,6 +793,8 @@ def main() -> None:
         output(False, error="Exactly one action is required", rc=1)
     action = sys.argv[1]
     try:
+        if action == "capabilities":
+            output(True, capabilities())
         config = load_config()
         if action == "check-updates":
             output(True, apt_scan())

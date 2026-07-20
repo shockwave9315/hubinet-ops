@@ -14,6 +14,7 @@ from .security import sanitize_text
 LOGGER = logging.getLogger("hubinet_ops.adapters")
 
 APT_ACTIONS = {
+    "capabilities",
     "status",
     "inspect",
     "scan",

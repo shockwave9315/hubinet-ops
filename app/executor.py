@@ -36,6 +36,7 @@ class Executor:
         on_event: EventCallback | None = None,
     ) -> dict[str, Any]:
         allowed_actions = {
+            "capabilities",
             "status",
             "inspect",
             "scan",
@@ -68,7 +69,7 @@ class Executor:
         if command_timeout <= 0:
             raise ExecutorError("Executor timeout must be positive")
 
-        if action in {"start", "shutdown", "reboot", "verify"} and argument is not None:
+        if action in {"capabilities", "start", "shutdown", "reboot", "verify"} and argument is not None:
             raise ExecutorError(f"Action {action} does not accept an argument")
         remote_command = f"{action} {vmid}"
         if argument is not None:

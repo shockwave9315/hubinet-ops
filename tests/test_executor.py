@@ -136,7 +136,9 @@ def test_action_vmid_and_argument_injection_are_rejected(
         executor().run(action, vmid, argument)
 
 
-@pytest.mark.parametrize("action", ["start", "shutdown", "reboot", "verify"])
+@pytest.mark.parametrize(
+    "action", ["capabilities", "start", "shutdown", "reboot", "verify"]
+)
 def test_fixed_lifecycle_and_verify_actions_have_no_extra_argument(
     action: str,
     monkeypatch: pytest.MonkeyPatch,

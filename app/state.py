@@ -228,6 +228,19 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("last_terminal_event", None)
     state.setdefault("last_terminal_at", None)
     state.setdefault("recovery_notification_suppressed_until", None)
+    state.setdefault("executor_version", None)
+    state.setdefault("executor_protocol_version", None)
+    state["executor_compatible"] = state.get("executor_compatible") is True
+    state.setdefault("executor_sha256", None)
+    state.setdefault("executor_profile_sha256", None)
+    missing_actions = state.get("executor_missing_actions")
+    state["executor_missing_actions"] = (
+        [str(action)[:64] for action in missing_actions[:32]]
+        if isinstance(missing_actions, list)
+        else []
+    )
+    state.setdefault("executor_last_checked_at", None)
+    state.setdefault("profile_validation_status", "unknown")
     recent = state.get("recent_job_events")
     state["recent_job_events"] = list(recent)[-50:] if isinstance(recent, list) else []
     if not isinstance(state.get("last_job_event"), (dict, type(None))):
