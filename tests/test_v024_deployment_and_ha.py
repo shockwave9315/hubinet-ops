@@ -154,30 +154,29 @@ def test_dashboard_policy_controls_verification_recovery_and_navigation_only_pus
     ct101 = views["ct-101"]
     ct106 = views["ct-106"]
 
-    assert "Tryb obserwacji — sterowanie zablokowane przez politykę backendu" in ct101
-    assert "perform_action:" not in ct101
+    for service in (
+        "script.hubinet_ops_start_container",
+        "script.hubinet_ops_force_stop_container",
+        "script.hubinet_ops_snapshot_create",
+    ):
+        assert service in ct101
     for label in ("Uruchom", "Wyłącz łagodnie", "Uruchom ponownie"):
         assert f"primary: {label}" in ct106
-    for forbidden in ("force-stop", "destroy", "terminal", "console"):
+    for forbidden in ("destroy", "terminal", "console"):
         assert forbidden not in dashboard.lower()
     assert "title: Weryfikacja końcowa" in ct106
     assert "title: Recovery scan" in ct106
     assert "confirmation:" in ct106
     assert "recovery_notification_suppressed_until" in package
     assert "state_attr(trigger.entity_id, 'recovery_notification_suppressed_until')" in package
-    progress = package.split("id: hubinet_ops_live_progress_v022", 1)[1].split(
+    progress = package.split("id: hubinet_ops_live_progress_v040", 1)[1].split(
         "id: hubinet_ops_health_watchdog_v022", 1
     )[0]
     assert "active_job_id" in progress
-    assert "attribute: active_job_id" in progress
-    assert "sensor.hubinet_ops_ct106_operation_status" not in progress
-    assert "state_attr(state_entity, 'operation_status')" in progress
-    assert "state_attr(state_entity, 'job_stage')" in progress
-    assert "state_attr(state_entity, 'job_progress')" in progress
-    assert "['preflight', 'snapshot', 'updating'" in progress
-    assert "starting" not in progress
-    assert "shutting_down" not in progress
-    assert "rebooting" not in progress
+    assert "sensor.hubinet_ops_ct101_active_job_id" in progress
+    assert "states(entity_prefix ~ 'operation_status')" in progress
+    assert "states(entity_prefix ~ 'job_stage')" in progress
+    assert "states(entity_prefix ~ 'job_progress')" in progress
     watchdog = package.split("id: hubinet_ops_health_watchdog_v022", 1)[1]
     assert "intentional_shutdown" in watchdog
     assert "lifecycle_status') != 'running'" in watchdog

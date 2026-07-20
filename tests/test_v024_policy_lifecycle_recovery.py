@@ -52,6 +52,10 @@ def settings(tmp_path: Path) -> Settings:
                     "adapter": "apt",
                     "manual_rollback_allowed": True,
                     "operator_capabilities": dict(CAPABILITIES),
+                    "executor_contract": {
+                        "executor_sha256": "e" * 64,
+                        "profile_sha256": "b" * 64,
+                    },
                     "recovery_scan": {
                         "enabled": True,
                         "delay_seconds": 90,
@@ -88,12 +92,37 @@ class FakeExecutor:
     ) -> dict[str, Any]:
         self.actions.append((action, vmid, argument))
         if action == "status":
-            return {"ok": True, "data": {"status": self.statuses.pop(0)}}
+            status = self.statuses.pop(0)
+            return {
+                "ok": True,
+                "data": {"status": status, "lxc_status": status},
+            }
         if action == "inspect":
             values = self.inspect_states.setdefault(vmid, [])
             return {"ok": True, "data": values.pop(0)}
         if action == "scan":
             return {"ok": True, "data": dict(self.scan_data)}
+        if action == "capabilities":
+            return {
+                "ok": True,
+                "data": {
+                    "version": "0.4.0",
+                    "protocol_version": 1,
+                    "supported_actions": [
+                        "capabilities",
+                        "inspect",
+                        "check-updates",
+                        "preflight",
+                        "update",
+                        "healthcheck",
+                        "repair",
+                        "verify",
+                    ],
+                    "executor_sha256": "e" * 64,
+                    "profile_sha256": "b" * 64,
+                    "profile_validation_status": "valid",
+                },
+            }
         return {"ok": True, "data": {}}
 
 
@@ -328,9 +357,13 @@ def test_api_requires_auth_denies_ct101_and_never_executes_invalid_vmid(
         assert client.post("/api/v1/containers/106/start", headers=headers).status_code == 409
     finally:
         lock.release()
-    assert client.post("/api/v1/containers/106/start", headers=headers).status_code == 200
+    response = client.post("/api/v1/containers/106/start", headers=headers)
+    assert response.status_code == 200, response.text
+    queued = response.json()
+    assert client.post("/api/v1/containers/106/reboot", headers=headers).status_code == 409
+    db.update_job(queued["id"], status="success", stage="completed", progress=100)
 
-    active = db.create_plan(
+    db.create_plan(
         vmid=106,
         container_name="weather",
         fingerprint="active",
@@ -338,7 +371,6 @@ def test_api_requires_auth_denies_ct101_and_never_executes_invalid_vmid(
         payload={},
         ttl_minutes=60,
     )
-    db.approve_plan(active["id"])
     assert client.post("/api/v1/containers/106/reboot", headers=headers).status_code == 409
 
 

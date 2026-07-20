@@ -523,9 +523,17 @@ class OpsService:
     def reject_active(self, vmid: int) -> dict[str, Any]:
         self._resource(vmid)
         self._require_capability(vmid, "reject")
-        plan = self._single_waiting_plan(vmid)
-        self._require_compatible_executor(vmid)
-        return self.reject(plan["id"])
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan is active for this resource")
+        try:
+            if self.db.get_active_job(vmid) is not None:
+                raise ValueError("Another job is already active for this resource")
+            plan = self._single_waiting_plan(vmid)
+            self._require_compatible_executor(vmid)
+            return self.reject(plan["id"])
+        finally:
+            lock.release()
 
     def _single_waiting_plan(self, vmid: int) -> dict[str, Any]:
         plans = self.db.waiting_plans(vmid)
@@ -646,6 +654,19 @@ class OpsService:
         vmid: int,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_retry_healthcheck_locked(vmid, request_id)
+        finally:
+            lock.release()
+
+    def _queue_retry_healthcheck_locked(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         cfg = self._resource(vmid)
         self._require_capability(vmid, "retry_healthcheck")
         self._require_compatible_executor(vmid)
@@ -696,6 +717,20 @@ class OpsService:
             lock.release()
 
     def queue_lifecycle(
+        self,
+        vmid: int,
+        action: str,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_lifecycle_locked(vmid, action, request_id)
+        finally:
+            lock.release()
+
+    def _queue_lifecycle_locked(
         self,
         vmid: int,
         action: str,
@@ -774,6 +809,19 @@ class OpsService:
         vmid: int,
         request_id: str | None = None,
     ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_snapshot_create_locked(vmid, request_id)
+        finally:
+            lock.release()
+
+    def _queue_snapshot_create_locked(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         cfg = self._resource(vmid)
         self._require_capability(vmid, "snapshot_create")
         if cfg.get("adapter") == "apt":
@@ -793,6 +841,21 @@ class OpsService:
         return job
 
     def queue_snapshot_action(
+        self,
+        vmid: int,
+        action: str,
+        name: str | None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_snapshot_action_locked(vmid, action, name, request_id)
+        finally:
+            lock.release()
+
+    def _queue_snapshot_action_locked(
         self,
         vmid: int,
         action: str,
@@ -838,6 +901,19 @@ class OpsService:
         return job
 
     def queue_self_update(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_self_update_locked(vmid, request_id)
+        finally:
+            lock.release()
+
+    def _queue_self_update_locked(
         self,
         vmid: int,
         request_id: str | None = None,
