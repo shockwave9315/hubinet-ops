@@ -1,0 +1,8 @@
+{
+  "bind": "192.0.2.10",
+  "port": 8741,
+  "database": "/var/lib/hubinet-ops-hostd/jobs.db",
+  "client_allowlist": [
+    "192.0.2.20"
+  ]
+}

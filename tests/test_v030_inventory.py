@@ -69,25 +69,23 @@ def test_pve_allowlists_and_type_map_are_exact() -> None:
 
     assert observation == [str(vmid) for vmid in range(100, 111)]
     assert managed == [str(vmid) for vmid in range(101, 110)]
-    assert maintenance == ["106"]
-    assert lifecycle == ["106"]
+    assert maintenance == [str(vmid) for vmid in range(101, 110)]
+    assert lifecycle == [str(vmid) for vmid in range(101, 111)]
     assert mappings == ["100 qemu"] + [f"{vmid} lxc" for vmid in range(101, 111)]
     assert len({line.split()[0] for line in mappings}) == len(mappings)
 
 
 def test_wrapper_routes_fixed_qemu_reads_and_blocks_managed_qemu_actions() -> None:
-    text = WRAPPER.read_text(encoding="utf-8")
-    assert 'qm status "$vmid"' in text
-    assert 'qm guest cmd "$vmid" network-get-interfaces' in text
-    assert 'readlink -f -- "$PVE_LOCAL_PATH"' in text
-    assert 'pvesh get "/nodes/$pve_node/qemu/$vmid/status/current"' in text
-    assert "$(hostname)" not in text
-    assert "hostname -s" not in text
-    assert "hostname -f" not in text
-    assert '[[ "$resource_type" == "lxc" ]] || fail "Managed action is supported only for LXC"' in text
-    assert 'listed "$vmid" "$MAINTENANCE_ALLOWLIST"' in text
-    assert "VMID must have exactly one resource type" in text
-    assert "eval " not in text
+    wrapper = WRAPPER.read_text(encoding="utf-8")
+    text = (ROOT / "deploy/pve/hubinet_ops_host_control.py").read_text(encoding="utf-8")
+    assert '"qm", "status", str(vmid)' in text
+    assert '"/cluster/resources", "--type", "vm"' in text
+    assert 'f"/nodes/{node}/qemu/{vmid}/status/current"' in text
+    assert "$(hostname)" not in wrapper + text
+    assert "HostPolicy" in text
+    assert "VMID not managed-executor allowed" in text
+    assert "shell=False" in text
+    assert "eval " not in wrapper + text
     assert "pct enter" not in text
     assert "pct console" not in text
 

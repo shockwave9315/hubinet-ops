@@ -22,26 +22,26 @@ DASHBOARD = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
 
 def test_wrapper_has_only_fixed_graceful_lifecycle_verbs() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
-    assert "verify|start|shutdown|reboot" in text
-    assert 'pct start "$vmid"' in text
-    assert 'pct shutdown "$vmid"' in text
-    assert 'pct reboot "$vmid"' in text
-    assert "Action does not accept an argument" in text
-    assert "timeout --signal=TERM" in text
-    assert 'listed "$vmid" "$OBSERVATION_ALLOWLIST"' in text
-    assert 'LIFECYCLE_ALLOWLIST="/etc/hubinet-ops/lifecycle-vmids"' in text
-    assert 'listed "$vmid" "$LIFECYCLE_ALLOWLIST"' in text
-    assert 'MANAGED_ALLOWLIST="/etc/hubinet-ops/managed-vmids"' in text
-    assert 'MAINTENANCE_ALLOWLIST="/etc/hubinet-ops/maintenance-vmids"' in text
-    assert 'RESOURCE_TYPES="/etc/hubinet-ops/resource-types"' in text
-    assert '[[ -z "${extra:-}" ]]' in text
+    implementation = (ROOT / "deploy/pve/hubinet_ops_host_control.py").read_text(
+        encoding="utf-8"
+    )
+    assert "--forced-command" in text
+    assert 'SSH_ORIGINAL_COMMAND:-$*' in text
+    assert '["pct", "start", str(vmid)]' in implementation
+    assert '["pct", "shutdown", str(vmid), "--timeout", "90"]' in implementation
+    assert '["pct", "reboot", str(vmid), "--timeout", "90"]' in implementation
+    assert "Action does not accept an argument" in implementation
+    assert "HostPolicy" in implementation
+    assert "shell=False" in implementation
     for forbidden in ("pct destroy", "pct console", "pct enter", " eval ", "generic-command"):
-        assert forbidden not in text
+        assert forbidden not in text + implementation
 
 
-def test_production_lifecycle_allowlist_contains_only_ct106() -> None:
+def test_production_lifecycle_allowlist_contains_all_lxc() -> None:
     lifecycle_allowlist = ROOT / "deploy" / "pve" / "lifecycle-vmids"
-    assert lifecycle_allowlist.read_text(encoding="utf-8").splitlines() == ["106"]
+    assert lifecycle_allowlist.read_text(encoding="utf-8").splitlines() == [
+        str(vmid) for vmid in range(101, 111)
+    ]
     installer = (ROOT / "deploy" / "pve" / "install-pve-access.sh").read_text(
         encoding="utf-8"
     )
@@ -49,12 +49,13 @@ def test_production_lifecycle_allowlist_contains_only_ct106() -> None:
         'install -m 0640 "$SOURCE_DIR/lifecycle-vmids" '
         "/etc/hubinet-ops/lifecycle-vmids"
     ) in installer
-    assert '== "106"' in installer
+    assert "host-control-vmids" in installer
+    assert "hubinet_ops_host_control.py" in installer
 
 
 def test_managed_verify_is_fixed_and_checks_integrity_services_and_docker() -> None:
     text = (ROOT / "deploy" / "managed" / "hubinet-maint").read_text(encoding="utf-8")
-    assert 'VERSION = "0.3.0"' in text
+    assert 'VERSION = "0.4.0"' in text
     assert 'run(["apt-get", "check"]' in text
     assert 'run(["dpkg", "--audit"]' in text
     assert 'Path("/var/run/reboot-required").exists()' in text
