@@ -6,12 +6,18 @@ import logging
 import math
 import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 import httpx
 
 from .config import Settings
+from .contracts import (
+    EXECUTOR_PROTOCOL_VERSION,
+    EXECUTOR_VERSION,
+    evaluate_executor_contract,
+)
 from .database import Database, utc_now
 from .executor import Executor, ExecutorError
 from .mqtt import MqttTelemetry, VERSION
@@ -460,22 +466,34 @@ class OpsService:
             )
         try:
             plan, job = self.db.approve_plan(plan_id)
-            state = self.get_state(vmid)
-            state.update(
-                {
-                    "active_plan_id": plan_id,
-                    "active_plan_status": "approved",
-                    "active_job_id": job["id"],
-                    "operation_status": "running",
-                    "job_stage": "preflight",
-                    "job_progress": 1,
-                    "last_operation_result": None,
-                    "last_error": None,
-                }
+            return self._publish_approved_plan(plan, job)
+        finally:
+            lock.release()
+
+    def approve_active(self, vmid: int, request_id: str | None = None) -> dict[str, Any]:
+        self._resource(vmid)
+        self._require_capability(vmid, "approve")
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan is active for this resource")
+        try:
+            plan = self._single_waiting_plan(vmid)
+            self._require_compatible_executor(vmid)
+            scan = _executor_data(self.executor.run("scan", vmid, timeout=700))
+            pending = max(0, int(scan.get("pending_count", 0) or 0))
+            fingerprint = str(scan.get("fingerprint") or _fingerprint(scan))
+            if pending <= 0 or fingerprint != str(plan["fingerprint"]):
+                self.db.update_plan_status(plan["id"], "superseded")
+                raise ValueError(
+                    "Active plan fingerprint changed; run a new update scan before approval"
+                )
+            plan, job = self.db.approve_plan(
+                plan["id"],
+                request_id=request_id or uuid.uuid4().hex,
             )
-            self._save_state(vmid, state)
-            self._notify_ha(self._notification("job_queued", vmid))
-            return {"plan": plan, "job": job}
+            return self._publish_approved_plan(plan, job)
+        except ExecutorError as exc:
+            raise ValueError(str(exc)) from exc
         finally:
             lock.release()
 
@@ -497,6 +515,77 @@ class OpsService:
         )
         self._save_state(vmid, state)
         return {"plan": plan}
+
+    def reject_active(self, vmid: int) -> dict[str, Any]:
+        self._resource(vmid)
+        self._require_capability(vmid, "reject")
+        plan = self._single_waiting_plan(vmid)
+        self._require_compatible_executor(vmid)
+        return self.reject(plan["id"])
+
+    def _single_waiting_plan(self, vmid: int) -> dict[str, Any]:
+        plans = self.db.waiting_plans(vmid)
+        if not plans:
+            raise ValueError(f"Resource {vmid} has no active waiting plan")
+        if len(plans) != 1:
+            raise ValueError(f"Resource {vmid} has multiple active waiting plans")
+        return plans[0]
+
+    def _publish_approved_plan(
+        self,
+        plan: dict[str, Any],
+        job: dict[str, Any],
+    ) -> dict[str, Any]:
+        vmid = int(plan["vmid"])
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "active_plan_id": plan["id"],
+                "active_plan_status": "approved",
+                "active_job_id": job["id"],
+                "operation_status": "running",
+                "job_stage": "preflight",
+                "job_progress": 1,
+                "last_operation_result": None,
+                "last_error": None,
+            }
+        )
+        self._save_state(vmid, state)
+        self._notify_ha(self._notification("job_queued", vmid))
+        return {"plan": plan, "job": job}
+
+    def _require_compatible_executor(self, vmid: int) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        if cfg.get("adapter", "apt") != "apt":
+            raise ExecutorError(f"Resource {vmid} does not use a managed APT executor")
+        contract_cfg = cfg.get("executor_contract") or {}
+        try:
+            payload = _executor_data(self.executor.run("capabilities", vmid, timeout=60))
+        except ExecutorError as exc:
+            payload = {}
+            executor_error = str(exc)
+        else:
+            executor_error = None
+        compatibility = evaluate_executor_contract(
+            payload,
+            expected_executor_sha256=str(contract_cfg.get("executor_sha256") or ""),
+            expected_profile_sha256=str(contract_cfg.get("profile_sha256") or ""),
+        )
+        state = self.get_state(vmid)
+        state.update(compatibility.state_fields())
+        state["executor_last_checked_at"] = self._utc_second_timestamp()
+        self._save_state(vmid, state)
+        if not compatibility.compatible:
+            installed = compatibility.version or "unknown"
+            reasons = "; ".join(compatibility.reasons)
+            if executor_error:
+                reasons = f"{executor_error}; {reasons}".strip("; ")
+            raise ExecutorError(
+                f"Executor CT{vmid} is incompatible: required {EXECUTOR_VERSION}/"
+                f"protocol {EXECUTOR_PROTOCOL_VERSION}/verify with configured hashes; "
+                f"installed {installed}. {reasons}"
+            )
+        return payload
 
     def retry_healthcheck(self, vmid: int) -> dict[str, Any]:
         cfg = self._resource(vmid)
@@ -972,6 +1061,7 @@ class OpsService:
             message="Update job started",
         )
         try:
+            self._require_compatible_executor(vmid)
             preflight = self._execute("preflight", vmid, 700, emit)
             self._validate_approved_plan(job, preflight)
             preflight_updates = dict(_executor_data(preflight).get("updates") or {})
@@ -1891,6 +1981,12 @@ class OpsService:
             "start",
             "shutdown",
             "reboot",
+            "force_stop",
+            "snapshot_create",
+            "snapshot_list",
+            "snapshot_rollback",
+            "snapshot_delete",
+            "self_update",
         )
         return {
             name: bool(configured.get(name, False))

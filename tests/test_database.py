@@ -4,6 +4,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from app.database import Database
 
 
@@ -88,9 +90,9 @@ def test_020_database_migrates_without_data_loss(tmp_path: Path) -> None:
     assert db.get_plan("plan1")["status"] == "completed"
     assert db.get_job("job1")["snapshot_name"] == "snap1"
     with sqlite3.connect(path) as migrated:
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 300
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 400
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(jobs)")}
-        assert "progress" in columns
+        assert {"progress", "request_id", "operation_type"} <= columns
 
     assert state["resource_type"] == "lxc"
     assert state["adapter"] == "apt"
@@ -99,6 +101,8 @@ def test_020_database_migrates_without_data_loss(tmp_path: Path) -> None:
     reopened = Database(path)
     assert reopened.get_plan("plan1")["status"] == "completed"
     assert reopened.get_job("job1")["snapshot_name"] == "snap1"
+    assert reopened.get_job("job1")["operation_type"] == "update"
+    assert reopened.get_job("job1")["request_id"] == "job1"
     assert reopened.get_resource_state(106)["resource_type"] == "lxc"
 
 
@@ -152,3 +156,41 @@ def test_nonterminal_event_cannot_reach_100(tmp_path: Path) -> None:
         event_type="bad_progress", message="still running",
     )
     assert event["progress"] == 99
+
+
+def test_operation_jobs_are_idempotent_and_plan_is_optional(tmp_path: Path) -> None:
+    db = Database(tmp_path / "ops.db")
+    job, created = db.create_operation_job(
+        vmid=106,
+        container_name="weather",
+        operation_type="lifecycle_reboot",
+        request_id="request-12345678",
+    )
+    same, created_again = db.create_operation_job(
+        vmid=106,
+        container_name="weather",
+        operation_type="lifecycle_reboot",
+        request_id="request-12345678",
+    )
+    assert created is True
+    assert created_again is False
+    assert same["id"] == job["id"]
+    assert job["plan_id"] is None
+    assert job["operation_type"] == "lifecycle_reboot"
+
+
+def test_only_one_destructive_job_is_active_globally(tmp_path: Path) -> None:
+    db = Database(tmp_path / "ops.db")
+    db.create_operation_job(
+        vmid=101,
+        container_name="one",
+        operation_type="snapshot_create",
+        request_id="request-11111111",
+    )
+    with pytest.raises(ValueError, match="destructive maintenance job"):
+        db.create_operation_job(
+            vmid=106,
+            container_name="two",
+            operation_type="lifecycle_reboot",
+            request_id="request-22222222",
+        )

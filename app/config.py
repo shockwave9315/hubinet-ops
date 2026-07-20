@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from ipaddress import ip_address
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,12 @@ OPERATOR_CAPABILITIES = {
     "start",
     "shutdown",
     "reboot",
+    "force_stop",
+    "snapshot_create",
+    "snapshot_list",
+    "snapshot_rollback",
+    "snapshot_delete",
+    "self_update",
 }
 RECOVERY_SCAN_KEYS = {"enabled", "delay_seconds", "cooldown_seconds"}
 MONITORING_KEYS = {"inspect", "update_scan"}
@@ -46,6 +53,8 @@ RESOURCE_KEYS = {
     "required_services",
     "docker",
     "os",
+    "executor_contract",
+    "snapshot_retention",
 }
 
 
@@ -224,7 +233,7 @@ def validate_config(raw: dict[str, Any]) -> None:
             if key in monitoring and not isinstance(monitoring[key], bool):
                 raise RuntimeError(f"Resource {vmid} monitoring.{key} must be a boolean")
 
-        if adapter in {"haos", "agent_self"}:
+        if adapter == "haos":
             forbidden = {
                 name
                 for name in (
@@ -248,8 +257,17 @@ def validate_config(raw: dict[str, Any]) -> None:
                 raise RuntimeError(
                     f"Resource {vmid} adapter {adapter} does not support APT update scans"
                 )
-        if adapter == "agent_self" and any(bool(value) for value in capabilities.values()):
-            raise RuntimeError("Resource 110 agent_self must deny every operator capability")
+        if adapter == "agent_self":
+            forbidden = {
+                name
+                for name in ("scan", "approve", "reject", "retry_healthcheck", "rollback")
+                if bool(capabilities.get(name, False))
+            }
+            if forbidden:
+                raise RuntimeError(
+                    "Resource 110 agent_self supports only host lifecycle, snapshot, refresh, "
+                    "and self-update capabilities"
+                )
 
         actions_raw = value.get("repair_actions") or []
         if not isinstance(actions_raw, list):
@@ -259,6 +277,26 @@ def validate_config(raw: dict[str, Any]) -> None:
             raise RuntimeError(f"Resource {vmid} contains an unsupported repair action")
         if adapter != "apt" and actions:
             raise RuntimeError(f"Resource {vmid} adapter {adapter} cannot configure repair_actions")
+
+        executor_contract = value.get("executor_contract", {})
+        if not isinstance(executor_contract, dict):
+            raise RuntimeError(f"Resource {vmid} executor_contract must be an object")
+        unknown_contract = set(executor_contract) - {
+            "executor_sha256", "profile_sha256"
+        }
+        if unknown_contract:
+            raise RuntimeError(f"Resource {vmid} executor_contract contains unknown settings")
+        for key in ("executor_sha256", "profile_sha256"):
+            if key in executor_contract and not _sha256(executor_contract[key]):
+                raise RuntimeError(f"Resource {vmid} executor_contract.{key} must be SHA-256")
+        if executor_contract and adapter != "apt":
+            raise RuntimeError(f"Resource {vmid} executor_contract is supported only for apt")
+        retention = _strict_int(
+            value.get("snapshot_retention", 5),
+            f"Resource {vmid} snapshot_retention",
+        )
+        if retention < 1 or retention > 100:
+            raise RuntimeError(f"Resource {vmid} snapshot_retention must be between 1 and 100")
 
         required_services = value.get("required_services", [])
         if not isinstance(required_services, list) or not all(
@@ -479,3 +517,7 @@ def _strict_int(value: Any, name: str) -> int:
         if not text or not text.lstrip("+-").isdigit():
             raise RuntimeError(f"{name} must be an integer")
     return result
+
+
+def _sha256(value: Any) -> bool:
+    return bool(re.fullmatch(r"[a-f0-9]{64}", str(value or "")))

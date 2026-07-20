@@ -128,3 +128,54 @@ def test_canonical_resources_include_qemu_and_container_alias_filters_it(
     assert client.post("/api/v1/resources/101/scan", headers=headers).status_code == 409
     assert client.post("/api/v1/resources/110/scan", headers=headers).status_code == 409
     assert client.post("/api/v1/resources/110/reboot", headers=headers).status_code == 409
+
+
+def test_state_endpoint_is_singular_and_active_plan_routes_return_explicit_conflict(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "active-plan-import.yaml"
+    config_path.write_text(
+        "scheduler:\n  enabled: false\ncontainers:\n  106:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "active-plan-import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+    cfg = Settings(
+        raw={
+            "scheduler": {"enabled": False},
+            "mqtt": {"enabled": False},
+            "home_assistant": {},
+            "resources": {
+                106: {
+                    "resource_type": "lxc",
+                    "adapter": "apt",
+                    "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": True},
+                    "operator_capabilities": {"approve": True, "reject": True},
+                }
+            },
+        },
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "ops.db",
+        api_token="t" * 64,
+    )
+    client = TestClient(main.create_app(cfg, executor=FakeExecutor()))
+    headers = {"Authorization": f"Bearer {cfg.api_token}"}
+
+    assert client.get("/api/v1/state", headers=headers).status_code == 200
+    assert client.get("/api/v1/states", headers=headers).status_code == 404
+    approve = client.post(
+        "/api/v1/resources/106/plans/approve-active",
+        headers=headers,
+    )
+    reject = client.post(
+        "/api/v1/resources/106/plans/reject-active",
+        headers=headers,
+    )
+    assert approve.status_code == 409
+    assert reject.status_code == 409
+    assert "no active waiting plan" in approve.json()["detail"]
+    assert "no active waiting plan" in reject.json()["detail"]

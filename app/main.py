@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from .config import Settings, load_settings
 from .database import Database
-from .executor import Executor
+from .executor import Executor, ExecutorError
 from .mqtt import MqttTelemetry, VERSION
 from .resource_adapters import ResourceExecutor
 from .service import OpsService
@@ -20,6 +20,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 class PlanRequest(BaseModel):
     plan_id: str = Field(min_length=16, max_length=64, pattern=r"^[a-f0-9]+$")
+
+
+class OperationRequest(BaseModel):
+    request_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$",
+    )
 
 
 def create_app(
@@ -234,6 +243,27 @@ def create_app(
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Plan not found") from exc
         except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/plans/approve-active", dependencies=auth)
+    def approve_active(
+        vmid: int,
+        request: OperationRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return service.approve_active(vmid, request.request_id if request else None)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/plans/reject-active", dependencies=auth)
+    def reject_active(vmid: int) -> dict[str, Any]:
+        try:
+            return service.reject_active(vmid)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @api.get("/api/v1/jobs", dependencies=auth)

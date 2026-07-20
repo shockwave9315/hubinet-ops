@@ -39,6 +39,7 @@ SNAPSHOT_NAME_RE = re.compile(
     r"(?P<kind>pre-update|manual)-(?P<timestamp>[0-9]{8}T[0-9]{6}Z)$"
 )
 SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 
 
 @dataclass(frozen=True)

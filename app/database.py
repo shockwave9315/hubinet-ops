@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .contracts import JOB_OPERATION_TYPES, REQUEST_ID_RE
 from .security import bounded_json, sanitize_data, sanitize_text
 from .state import JOB_STAGES, normalize_state
 from .time_utils import parse_utc_timestamp
@@ -48,7 +49,9 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY,
-                    plan_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    operation_type TEXT NOT NULL,
+                    plan_id TEXT,
                     vmid INTEGER NOT NULL,
                     container_name TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -59,7 +62,8 @@ class Database:
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    FOREIGN KEY(plan_id) REFERENCES plans(id)
+                    FOREIGN KEY(plan_id) REFERENCES plans(id),
+                    UNIQUE(vmid, request_id)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -91,22 +95,93 @@ class Database:
                     ON job_events(vmid, created_at DESC, id DESC);
                 """
             )
-            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
-            if "progress" not in job_columns:
-                conn.execute("ALTER TABLE jobs ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
+            self._migrate_jobs(conn)
             self._migrate_container_states(conn)
-            conn.execute("PRAGMA user_version=300")
-            # Po restarcie nie udajemy, że przerwane zadanie dalej działa.
-            now = utc_now()
+            conn.execute("PRAGMA user_version=400")
+
+    def _migrate_jobs(self, conn: sqlite3.Connection) -> None:
+        columns = list(conn.execute("PRAGMA table_info(jobs)"))
+        names = {row["name"] for row in columns}
+        plan_column = next((row for row in columns if row["name"] == "plan_id"), None)
+        if (
+            {"request_id", "operation_type", "progress"} <= names
+            and plan_column is not None
+            and plan_column["notnull"] == 0
+        ):
+            return
+        jobs = [dict(row) for row in conn.execute("SELECT * FROM jobs")]
+        events = [dict(row) for row in conn.execute("SELECT * FROM job_events")]
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.executescript(
+            """
+            DROP TABLE job_events;
+            DROP TABLE jobs;
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                operation_type TEXT NOT NULL,
+                plan_id TEXT,
+                vmid INTEGER NOT NULL,
+                container_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0,
+                snapshot_name TEXT,
+                result TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(plan_id) REFERENCES plans(id),
+                UNIQUE(vmid, request_id)
+            );
+            CREATE INDEX idx_jobs_status ON jobs(status);
+            CREATE INDEX idx_jobs_vmid ON jobs(vmid);
+            CREATE TABLE job_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                vmid INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                level TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                progress INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                details_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(job_id) REFERENCES jobs(id)
+            );
+            CREATE INDEX idx_job_events_job_created
+                ON job_events(job_id, created_at DESC, id DESC);
+            CREATE INDEX idx_job_events_vmid_created
+                ON job_events(vmid, created_at DESC, id DESC);
+            """
+        )
+        for job in jobs:
             conn.execute(
-                "UPDATE jobs SET status='interrupted', stage='failed', progress=100, updated_at=? "
-                "WHERE status IN ('queued','running')",
-                (now,),
+                "INSERT INTO jobs "
+                "(id,request_id,operation_type,plan_id,vmid,container_name,status,stage,progress,"
+                "snapshot_name,result,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    job["id"], job.get("request_id") or job["id"],
+                    job.get("operation_type") or "update", job.get("plan_id"),
+                    job["vmid"], job["container_name"], job["status"], job["stage"],
+                    int(job.get("progress") or 0), job.get("snapshot_name"),
+                    job.get("result"), job.get("error"), job["created_at"], job["updated_at"],
+                ),
             )
+        for event in events:
             conn.execute(
-                "UPDATE plans SET status='interrupted' WHERE status='approved' "
-                "AND id IN (SELECT plan_id FROM jobs WHERE status='interrupted')"
+                "INSERT INTO job_events "
+                "(id,job_id,vmid,created_at,level,stage,progress,event_type,message,details_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                tuple(
+                    event[key]
+                    for key in (
+                        "id", "job_id", "vmid", "created_at", "level", "stage",
+                        "progress", "event_type", "message", "details_json"
+                    )
+                ),
             )
+        conn.execute("PRAGMA foreign_keys=ON")
 
     def _migrate_container_states(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute("SELECT vmid, payload FROM container_states").fetchall()
@@ -177,6 +252,20 @@ class Database:
             row = conn.execute(query, args).fetchone()
         return _decode_plan(row) if row else None
 
+    def waiting_plans(self, vmid: int) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE plans SET status='expired' WHERE vmid=? "
+                "AND status='waiting_approval' AND expires_at<=?",
+                (vmid, utc_now()),
+            )
+            rows = conn.execute(
+                "SELECT * FROM plans WHERE vmid=? AND status='waiting_approval' "
+                "ORDER BY created_at DESC, id DESC",
+                (vmid,),
+            ).fetchall()
+        return [_decode_plan(row) for row in rows]
+
     def get_plan(self, plan_id: str) -> dict[str, Any]:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT * FROM plans WHERE id=?", (plan_id,)).fetchone()
@@ -196,7 +285,12 @@ class Database:
             rows = conn.execute(query, args).fetchall()
         return [_decode_plan(row) for row in rows]
 
-    def approve_plan(self, plan_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    def approve_plan(
+        self,
+        plan_id: str,
+        *,
+        request_id: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         now = datetime.now(UTC)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -205,6 +299,21 @@ class Database:
                 conn.execute("ROLLBACK")
                 raise KeyError(plan_id)
             plan = _decode_plan(row)
+            request_id = request_id or uuid.uuid4().hex
+            if not REQUEST_ID_RE.fullmatch(request_id):
+                conn.execute("ROLLBACK")
+                raise ValueError("Invalid request_id")
+            existing = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
+                (plan["vmid"], request_id),
+            ).fetchone()
+            if existing is not None:
+                job = _decode_job(existing)
+                if job["operation_type"] != "update" or job["plan_id"] != plan_id:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("request_id was already used for another operation")
+                conn.execute("COMMIT")
+                return plan, job
             if plan["status"] != "waiting_approval":
                 conn.execute("ROLLBACK")
                 raise ValueError(f"Plan status is {plan['status']}, not waiting_approval")
@@ -215,12 +324,11 @@ class Database:
                 raise ValueError("Plan expired")
 
             active_job = conn.execute(
-                "SELECT id FROM jobs WHERE vmid=? AND status IN ('queued','running') LIMIT 1",
-                (plan["vmid"],),
+                "SELECT id FROM jobs WHERE status IN ('queued','running') LIMIT 1"
             ).fetchone()
             if active_job:
                 conn.execute("ROLLBACK")
-                raise ValueError("Another job is already queued or running for this VMID")
+                raise ValueError("Another destructive maintenance job is active")
 
             job_id = uuid.uuid4().hex
             now_iso = now.isoformat()
@@ -229,10 +337,12 @@ class Database:
                 (now_iso, plan_id),
             )
             conn.execute(
-                "INSERT INTO jobs(id, plan_id, vmid, container_name, status, stage, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs(id,request_id,operation_type,plan_id,vmid,container_name,status,stage,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
+                    request_id,
+                    "update",
                     plan_id,
                     plan["vmid"],
                     plan["container_name"],
@@ -292,9 +402,11 @@ class Database:
                 conn.execute("COMMIT")
                 return None
             now = utc_now()
+            stage = "preflight" if row["operation_type"] == "update" else "queued"
+            progress = 5 if row["operation_type"] == "update" else 1
             conn.execute(
-                "UPDATE jobs SET status='running', stage='preflight', progress=5, updated_at=? WHERE id=?",
-                (now, row["id"]),
+                "UPDATE jobs SET status='running', stage=?, progress=?, updated_at=? WHERE id=?",
+                (stage, progress, now, row["id"]),
             )
             conn.execute("COMMIT")
         return self.get_job(row["id"])
@@ -336,6 +448,56 @@ class Database:
             ).fetchone()
         return int(row["count"])
 
+    def create_operation_job(
+        self,
+        *,
+        vmid: int,
+        container_name: str,
+        operation_type: str,
+        request_id: str,
+        plan_id: str | None = None,
+        snapshot_name: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        if operation_type not in JOB_OPERATION_TYPES:
+            raise ValueError("Invalid operation_type")
+        if not REQUEST_ID_RE.fullmatch(str(request_id)):
+            raise ValueError("Invalid request_id")
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
+                (vmid, request_id),
+            ).fetchone()
+            if existing is not None:
+                job = _decode_job(existing)
+                if (
+                    job["operation_type"] != operation_type
+                    or job.get("plan_id") != plan_id
+                    or job.get("snapshot_name") != snapshot_name
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("request_id was already used for another operation")
+                conn.execute("COMMIT")
+                return job, False
+            if conn.execute(
+                "SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1"
+            ).fetchone():
+                conn.execute("ROLLBACK")
+                raise ValueError("Another destructive maintenance job is active")
+            job_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO jobs "
+                "(id,request_id,operation_type,plan_id,vmid,container_name,status,stage,progress,"
+                "snapshot_name,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued','queued',0,?,?,?)",
+                (
+                    job_id, request_id, operation_type, plan_id, vmid, container_name,
+                    snapshot_name, now, now,
+                ),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(job_id), True
+
     def create_manual_rollback_job(self, source_job_id: str) -> dict[str, Any]:
         return self.create_followup_job(source_job_id, stage="rollback", progress=1)
 
@@ -348,18 +510,20 @@ class Database:
     ) -> dict[str, Any]:
         source = self.get_job(source_job_id)
         job_id = uuid.uuid4().hex
+        request_id = uuid.uuid4().hex
         now = utc_now()
         with self._lock, self._connect() as conn:
             if conn.execute(
-                "SELECT 1 FROM jobs WHERE vmid=? AND status IN ('queued','running')",
-                (source["vmid"],),
+                "SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1"
             ).fetchone():
-                raise ValueError("Another job is already active for this VMID")
+                raise ValueError("Another destructive maintenance job is active")
             conn.execute(
-                "INSERT INTO jobs(id,plan_id,vmid,container_name,status,stage,progress,snapshot_name,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs(id,request_id,operation_type,plan_id,vmid,container_name,status,stage,progress,snapshot_name,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
+                    request_id,
+                    "snapshot_rollback" if stage == "rollback" else "retry_healthcheck",
                     source["plan_id"],
                     source["vmid"],
                     source["container_name"],
