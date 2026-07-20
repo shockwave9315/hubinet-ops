@@ -66,6 +66,12 @@ class OpsService:
         self._stop = threading.Event()
         self._monotonic = monotonic
         self._now = now or (lambda: datetime.now(UTC))
+        self._last_full_refresh: str | None = None
+        self._last_resource_refresh: str | None = None
+        self._resource_refresh_sequence = 0
+        self._last_published_agent_state: dict[str, Any] | None = None
+        self._agent_publish_context = threading.local()
+        self._agent_publish_lock = threading.RLock()
         self.stabilizer = stabilizer or Stabilizer(executor, self._stop)
         self._scan_all_lock = threading.Lock()
         self._scan_locks = {vmid: threading.Lock() for vmid in settings.resources}
@@ -176,6 +182,17 @@ class OpsService:
         return state
 
     def refresh_container(self, vmid: int, *, operator: bool = False) -> dict[str, Any]:
+        self._suppress_agent_publication()
+        try:
+            return self._refresh_container(vmid, operator=operator)
+        finally:
+            self._resume_agent_publication()
+            with self._agent_publish_lock:
+                self._resource_refresh_sequence += 1
+                self._last_resource_refresh = self._utc_second_timestamp()
+            self._publish_agent_state_if_changed()
+
+    def _refresh_container(self, vmid: int, *, operator: bool = False) -> dict[str, Any]:
         cfg = self._resource(vmid)
         if operator:
             self._require_capability(vmid, "refresh")
@@ -221,16 +238,27 @@ class OpsService:
         return saved
 
     def refresh_all(self, *, operator: bool = False) -> list[dict[str, Any]]:
-        return [
-            self.refresh_container(vmid, operator=operator)
-            for vmid, cfg in sorted(self.settings.resources.items())
-            if bool(cfg.get("enabled", False))
-            and (
-                self._capabilities(vmid)["refresh"]
-                if operator
-                else self._monitoring(vmid)["inspect"]
-            )
-        ]
+        completed = False
+        self._suppress_agent_publication()
+        try:
+            refreshed = [
+                self.refresh_container(vmid, operator=operator)
+                for vmid, cfg in sorted(self.settings.resources.items())
+                if bool(cfg.get("enabled", False))
+                and (
+                    self._capabilities(vmid)["refresh"]
+                    if operator
+                    else self._monitoring(vmid)["inspect"]
+                )
+            ]
+            completed = True
+            return refreshed
+        finally:
+            self._resume_agent_publication()
+            if completed:
+                with self._agent_publish_lock:
+                    self._last_full_refresh = self._utc_second_timestamp()
+                self._publish_agent_state_if_changed()
 
     def scan_all(self, *, operator: bool = True) -> list[dict[str, Any]]:
         if not self._scan_all_lock.acquire(blocking=False):
@@ -1574,7 +1602,7 @@ class OpsService:
         state["docker"] = docker
         saved = self.db.upsert_resource_state(vmid, state)
         self.mqtt.publish_resource_state(vmid, saved)
-        self.mqtt.publish_agent_state(self._agent_state())
+        self._publish_agent_state_if_changed()
         return saved
 
     def _decorate_state(self, vmid: int, state: dict[str, Any]) -> dict[str, Any]:
@@ -1614,7 +1642,9 @@ class OpsService:
                 }
             )
         if cfg.get("adapter") == "agent_self":
-            state.update(self._agent_state())
+            agent_summary = self._agent_state()
+            agent_summary.pop("last_refresh", None)
+            state.update(agent_summary)
             state["mqtt_availability"] = self.mqtt.availability
         return state
 
@@ -1653,50 +1683,55 @@ class OpsService:
         )
 
     def _ensure_initial_states(self) -> None:
-        for vmid in self.settings.resources:
-            state = self.db.get_resource_state(vmid) or self._base_state(vmid)
-            if state.get("lifecycle_status") == "running":
-                state.update(
-                    {
-                        "lifecycle_status": "failed",
-                        "lifecycle_finished_at": self._now().isoformat(),
-                        "lifecycle_error": "Agent restarted during lifecycle operation",
-                        "operation_status": "failed",
-                        "job_stage": "failed",
-                        "job_progress": 100,
-                        "last_operation_result": "failed",
-                        "last_error": "Agent restarted during lifecycle operation",
-                        "expected_lxc_status": None,
-                        "intentional_shutdown": False,
-                        "lifecycle_health_pending": False,
-                    }
-                )
-            if state.get("recovery_scan_status") in {"scheduled", "running"}:
-                state.update(
-                    {
-                        "recovery_scan_status": "cancelled",
-                        "recovery_scan_due_at": None,
-                        "last_recovery_scan_result": "agent_restarted",
-                    }
-                )
-            if state.get("update_status") == "scanning":
-                state["update_status"] = "unknown"
-                if state.get("job_stage") == "scanning":
-                    state["job_stage"] = "idle"
-            latest = self.db.get_latest_job(vmid)
-            if latest and latest.get("status") == "interrupted":
-                state.update(
-                    {
-                        "active_job_id": latest["id"],
-                        "operation_status": "failed",
-                        "job_stage": "failed",
-                        "job_progress": 100,
-                        "last_operation_result": "failed",
-                        "last_error": latest.get("error")
-                        or "Agent restarted while this job was active",
-                    }
-                )
-            self._save_state(vmid, state)
+        self._suppress_agent_publication()
+        try:
+            for vmid in self.settings.resources:
+                state = self.db.get_resource_state(vmid) or self._base_state(vmid)
+                if state.get("lifecycle_status") == "running":
+                    state.update(
+                        {
+                            "lifecycle_status": "failed",
+                            "lifecycle_finished_at": self._now().isoformat(),
+                            "lifecycle_error": "Agent restarted during lifecycle operation",
+                            "operation_status": "failed",
+                            "job_stage": "failed",
+                            "job_progress": 100,
+                            "last_operation_result": "failed",
+                            "last_error": "Agent restarted during lifecycle operation",
+                            "expected_lxc_status": None,
+                            "intentional_shutdown": False,
+                            "lifecycle_health_pending": False,
+                        }
+                    )
+                if state.get("recovery_scan_status") in {"scheduled", "running"}:
+                    state.update(
+                        {
+                            "recovery_scan_status": "cancelled",
+                            "recovery_scan_due_at": None,
+                            "last_recovery_scan_result": "agent_restarted",
+                        }
+                    )
+                if state.get("update_status") == "scanning":
+                    state["update_status"] = "unknown"
+                    if state.get("job_stage") == "scanning":
+                        state["job_stage"] = "idle"
+                latest = self.db.get_latest_job(vmid)
+                if latest and latest.get("status") == "interrupted":
+                    state.update(
+                        {
+                            "active_job_id": latest["id"],
+                            "operation_status": "failed",
+                            "job_stage": "failed",
+                            "job_progress": 100,
+                            "last_operation_result": "failed",
+                            "last_error": latest.get("error")
+                            or "Agent restarted while this job was active",
+                        }
+                    )
+                self._save_state(vmid, state)
+        finally:
+            self._resume_agent_publication()
+            self._publish_agent_state_if_changed()
 
     def _scheduler_loop(self) -> None:
         scheduler = self.settings.monitoring_scheduler
@@ -1774,27 +1809,49 @@ class OpsService:
         except Exception:
             LOGGER.warning("Home Assistant webhook delivery failed")
 
+    def _utc_second_timestamp(self) -> str:
+        current = parse_utc_timestamp(self._now()) or datetime.now(UTC)
+        return current.replace(microsecond=0).isoformat()
+
+    def _suppress_agent_publication(self) -> None:
+        depth = int(getattr(self._agent_publish_context, "depth", 0))
+        self._agent_publish_context.depth = depth + 1
+
+    def _resume_agent_publication(self) -> None:
+        depth = int(getattr(self._agent_publish_context, "depth", 0))
+        if depth <= 0:
+            raise RuntimeError("Agent publication suppression is not active")
+        self._agent_publish_context.depth = depth - 1
+
+    def _publish_agent_state_if_changed(self) -> bool:
+        if int(getattr(self._agent_publish_context, "depth", 0)):
+            return False
+        with self._agent_publish_lock:
+            state = self._agent_state()
+            if state == self._last_published_agent_state:
+                return False
+            self.mqtt.publish_agent_state(state)
+            self._last_published_agent_state = dict(state)
+            return True
+
     def _agent_state(self) -> dict[str, Any]:
-        states = self.db.list_resource_states()
-        refreshed = [
-            str(item.get("last_refresh"))
-            for item in states
-            if item.get("last_refresh")
-        ]
-        return {
-            "version": VERSION,
-            "configured_resource_count": len(self.settings.resources),
-            "configured_lxc_count": len(self.settings.containers),
-            "configured_qemu_count": sum(
-                1
-                for cfg in self.settings.resources.values()
-                if cfg.get("resource_type") == "qemu"
-            ),
-            "configured_container_count": len(self.settings.containers),
-            "active_job_count": self.db.active_job_count(),
-            "mqtt_availability": self.mqtt.availability,
-            "last_refresh": max(refreshed) if refreshed else None,
-        }
+        with self._agent_publish_lock:
+            return {
+                "version": VERSION,
+                "configured_resource_count": len(self.settings.resources),
+                "configured_lxc_count": len(self.settings.containers),
+                "configured_qemu_count": sum(
+                    1
+                    for cfg in self.settings.resources.values()
+                    if cfg.get("resource_type") == "qemu"
+                ),
+                "configured_container_count": len(self.settings.containers),
+                "active_job_count": self.db.active_job_count(),
+                "mqtt_availability": self.mqtt.availability,
+                "last_refresh": self._last_full_refresh,
+                "last_resource_refresh": self._last_resource_refresh,
+                "resource_refresh_sequence": self._resource_refresh_sequence,
+            }
 
     def _mqtt_snapshot(
         self,

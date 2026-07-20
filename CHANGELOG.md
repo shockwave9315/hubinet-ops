@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2
+
+- restore the production `apt_check`, `dpkg_audit`, and `packages_remaining` entity IDs without changing unique IDs;
+- move CT106 controls directly below status, hide final verification on observation-only CTs, clarify unknown verification, and cap live logs at ten entries;
+- source VM100 CPU from `/cluster/resources --type vm` while retaining `status/current` for the remaining QEMU fields;
+- expose QEMU and agent-self byte metrics as numeric GiB sensors and render uptime and agent refresh time readably;
+- publish one deduplicated agent summary per full telemetry cycle with a second-precision UTC completion timestamp;
+- add transactional 0.3.2 CT110/PVE-wrapper and Home Assistant installers with rollback and no automatic HA restart.
+
 ## 0.3.1
 
 - unify MQTT discovery and dashboard entity IDs in one adapter-aware contract while preserving existing unique IDs;

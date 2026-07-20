@@ -134,7 +134,7 @@ def test_core_mqtt_uses_the_0_3_1_byte_budget() -> None:
 
     source = inspect.getsource(mqtt.MqttTelemetry.publish_container_state)
 
-    assert mqtt.VERSION == "0.3.1"
+    assert mqtt.VERSION == "0.3.2"
     assert mqtt.bounded_state is bounded_state
     assert "publish_resource_state" in source
     assert "_bounded_state" not in source

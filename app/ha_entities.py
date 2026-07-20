@@ -39,6 +39,31 @@ def _numeric(
     )
 
 
+def _gib_numeric(
+    key: str,
+    suffix: str,
+    name: str,
+    path: str,
+    *,
+    state_class: str = "measurement",
+) -> EntitySpec:
+    return EntitySpec(
+        key,
+        suffix,
+        name,
+        (
+            "{{ none if "
+            f"{path} is not defined or {path} is none "
+            f"else (({path} | float) / 1073741824) | round(2) }}}}"
+        ),
+        {
+            "device_class": "data_size",
+            "unit_of_measurement": "GiB",
+            "state_class": state_class,
+        },
+    )
+
+
 AGENT_ENTITY_SPECS = (
     EntitySpec("availability", "availability", "Availability", "{{ value }}"),
     EntitySpec("version", "version", "Version", "{{ value_json.version }}"),
@@ -77,6 +102,7 @@ AGENT_ENTITY_SPECS = (
         "last_refresh",
         "Last refresh",
         "{{ value_json.last_refresh | default('unknown', true) }}",
+        {"device_class": "timestamp", "entity_category": "diagnostic"},
     ),
 )
 
@@ -111,10 +137,10 @@ APT_ENTITY_SPECS = (
     EntitySpec("lifecycle_action", "lifecycle_action", "Lifecycle action", "{{ value_json.lifecycle_action | default('none', true) }}"),
     EntitySpec("verification_status", "verification_status", "Verification status", "{{ value_json.verification_status | default('unknown') }}"),
     EntitySpec("last_verification", "last_verification", "Last verification", "{{ value_json.last_verification | default('unknown', true) }}"),
-    EntitySpec("apt_check_ok", "apt_check_ok", "APT check", "{{ 'unknown' if value_json.apt_check_ok is none else 'ok' if value_json.apt_check_ok else 'failed' }}"),
-    EntitySpec("dpkg_audit_ok", "dpkg_audit_ok", "dpkg audit", "{{ 'unknown' if value_json.dpkg_audit_ok is none else 'ok' if value_json.dpkg_audit_ok else 'failed' }}"),
+    EntitySpec("apt_check_ok", "apt_check", "APT check", "{{ 'unknown' if value_json.apt_check_ok is none else 'ok' if value_json.apt_check_ok else 'failed' }}"),
+    EntitySpec("dpkg_audit_ok", "dpkg_audit", "dpkg audit", "{{ 'unknown' if value_json.dpkg_audit_ok is none else 'ok' if value_json.dpkg_audit_ok else 'failed' }}"),
     EntitySpec("reboot_required", "reboot_required", "Reboot required", "{{ 'unknown' if value_json.reboot_required is none else 'yes' if value_json.reboot_required else 'no' }}"),
-    EntitySpec("packages_remaining_count", "packages_remaining_count", "Packages remaining", "{{ value_json.packages_remaining_count | default(none) }}"),
+    EntitySpec("packages_remaining_count", "packages_remaining", "Packages remaining", "{{ value_json.packages_remaining_count | default(none) }}"),
     EntitySpec("recovery_scan_status", "recovery_scan_status", "Recovery scan status", "{{ value_json.recovery_scan_status | default('disabled') }}"),
     EntitySpec("last_recovery_scan", "last_recovery_scan", "Last recovery scan", "{{ value_json.last_recovery_scan | default('unknown', true) }}"),
     EntitySpec("last_recovery_scan_result", "last_recovery_scan_result", "Last recovery scan result", "{{ value_json.last_recovery_scan_result | default('none', true) }}"),
@@ -138,12 +164,12 @@ QEMU_ENTITY_SPECS = (
     _numeric("uptime_seconds", "uptime", "Uptime", "value_json.uptime_seconds", "s"),
     _numeric("cpu_usage", "cpu_usage", "CPU usage", "value_json.cpu.usage_percent", "%"),
     EntitySpec("cpu_cores", "cpu_cores", "CPU cores", "{{ value_json.cpu.cores | default(none) }}"),
-    _numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes", "B"),
-    _numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes", "B"),
-    _numeric("disk_used_bytes", "disk_used", "Disk used", "value_json.disk.used_bytes", "B"),
-    _numeric("disk_total_bytes", "disk_total", "Disk total", "value_json.disk.total_bytes", "B"),
-    _numeric("network_in_bytes", "network_received", "Network received", "value_json.network.in_bytes", "B"),
-    _numeric("network_out_bytes", "network_sent", "Network sent", "value_json.network.out_bytes", "B"),
+    _gib_numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes"),
+    _gib_numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes"),
+    _gib_numeric("disk_used_bytes", "disk_used", "Disk used", "value_json.disk.used_bytes"),
+    _gib_numeric("disk_total_bytes", "disk_total", "Disk total", "value_json.disk.total_bytes"),
+    _gib_numeric("network_in_bytes", "network_received", "Network received", "value_json.network.in_bytes", state_class="total_increasing"),
+    _gib_numeric("network_out_bytes", "network_sent", "Network sent", "value_json.network.out_bytes", state_class="total_increasing"),
     EntitySpec("guest_agent_status", "guest_agent", "Guest Agent", "{{ value_json.guest_agent_status | default('unknown') }}"),
     EntitySpec("ip_addresses", "ip_addresses", "Primary IP", "{{ value_json.primary_ip_address | default('unknown', true) }}"),
     EntitySpec("last_refresh", "last_refresh", "Last refresh", "{{ value_json.last_refresh | default('unknown', true) }}"),
@@ -159,12 +185,12 @@ AGENT_SELF_ENTITY_SPECS = (
     _numeric("uptime_seconds", "uptime", "Uptime", "value_json.uptime_seconds", "s"),
     EntitySpec("cpu_cores", "cpu_cores", "CPU cores", "{{ value_json.cpu.cores | default(none) }}"),
     EntitySpec("cpu_load_1m", "cpu_load_1m", "CPU load 1m", "{{ value_json.cpu.load_1m | default(none) }}"),
-    _numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes", "B"),
-    _numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes", "B"),
-    _numeric("memory_available_bytes", "memory_available", "Memory available", "value_json.memory.available_bytes", "B"),
-    _numeric("disk_used_bytes", "disk_used", "Disk used", "value_json.disk.used_bytes", "B"),
-    _numeric("disk_total_bytes", "disk_total", "Disk total", "value_json.disk.total_bytes", "B"),
-    _numeric("disk_free_bytes", "disk_free", "Disk free", "value_json.disk.free_bytes", "B"),
+    _gib_numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes"),
+    _gib_numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes"),
+    _gib_numeric("memory_available_bytes", "memory_available", "Memory available", "value_json.memory.available_bytes"),
+    _gib_numeric("disk_used_bytes", "disk_used", "Disk used", "value_json.disk.used_bytes"),
+    _gib_numeric("disk_total_bytes", "disk_total", "Disk total", "value_json.disk.total_bytes"),
+    _gib_numeric("disk_free_bytes", "disk_free", "Disk free", "value_json.disk.free_bytes"),
     EntitySpec("service_status", "service_status", "Service status", "{{ value_json.service_status | default('unknown') }}"),
     EntitySpec("api_health", "api_health", "API health", "{{ value_json.api_health | default('unknown') }}"),
     EntitySpec("agent_version", "agent_version", "Agent version", "{{ value_json.agent_version | default('unknown') }}"),
@@ -182,7 +208,7 @@ SUPPORTED_RESOURCE_IDENTITIES = frozenset(
     }
 )
 
-# These exact 0.3.0 discovery keys are retained but have no 0.3.1 data source.
+# These exact 0.3.0 discovery keys are retained but have no current data source.
 OBSOLETE_DISCOVERY_KEYS = {
     ("qemu", "haos"): ("cpu_load_1m",),
     ("lxc", "agent_self"): ("cpu_usage", "network_in_bytes", "network_out_bytes"),

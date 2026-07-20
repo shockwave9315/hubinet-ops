@@ -61,7 +61,15 @@ SH
 cat > "$TMP_ROOT/bin/pvesh" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$SMOKE_LOG"
-printf '{"name":"haos16.0","uptime":10,"cpu":0.1,"cpus":2,"mem":1024,"maxmem":2048,"disk":1,"maxdisk":2,"netin":3,"netout":4}\n'
+if [[ "$*" == *'/cluster/resources --type vm'* ]]; then
+  if [[ ${CLUSTER_MISSING:-0} == 1 ]]; then
+    printf '[]\n'
+  else
+    printf '[{"vmid":100,"type":"qemu","cpu":0.0305257}]\n'
+  fi
+else
+  printf '{"name":"haos16.0","uptime":10,"cpu":0,"cpus":2,"mem":1024,"maxmem":2048,"disk":1,"maxdisk":2,"netin":3,"netout":4}\n'
+fi
 SH
 cat > "$TMP_ROOT/bin/hostname" <<'SH'
 #!/usr/bin/env bash
@@ -91,7 +99,13 @@ done
 qemu="$(SSH_ORIGINAL_COMMAND='inspect 100' "$TMP_ROOT/hubinet-ops-host")"
 [[ "$qemu" == *'"qemu_status":"running"'* ]]
 [[ "$qemu" == *'"guest_agent_status":"available"'* ]]
+[[ "$qemu" == *'"cpu":{"usage":0.0305257,"cores":2}'* ]]
 grep -Fxq 'get /nodes/proxmox/qemu/100/status/current --output-format json' "$SMOKE_LOG"
+grep -Fxq 'get /cluster/resources --type vm --output-format json' "$SMOKE_LOG"
+export CLUSTER_MISSING=1
+qemu_missing="$(SSH_ORIGINAL_COMMAND='inspect 100' "$TMP_ROOT/hubinet-ops-host")"
+unset CLUSTER_MISSING
+[[ "$qemu_missing" == *'"cpu":{"usage":null,"cores":2}'* ]]
 if grep -Fq '/nodes/proxmox.local/' "$SMOKE_LOG"; then
   echo 'QEMU inspect used the system hostname instead of the local PVE node' >&2
   exit 1

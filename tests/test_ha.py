@@ -147,7 +147,7 @@ def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() ->
 
     assert text.count("title: Logi live") == 9
     assert text.count("recent_job_events") >= 9
-    assert text.count("events[-25:] | reverse") == 9
+    assert text.count("events[-10:] | reverse") == 9
     assert text.count("replace(''|'', ''¦'')") == 10
     assert text.count("packages[:30]") == 9
     assert text.count("kolejnych widocznych pakietów") == 9

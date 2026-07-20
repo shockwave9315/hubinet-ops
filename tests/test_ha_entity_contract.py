@@ -21,6 +21,11 @@ from app.state import normalize_state
 from scripts.generate_ha_dashboard import DEFAULT_CONFIG, build_dashboard, render
 
 
+PRODUCTION_REGISTRY_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "production_entity_registry_0_3_1.yaml"
+)
+
+
 def _resources() -> dict[int, dict]:
     raw = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
     return {int(vmid): dict(cfg) for vmid, cfg in raw["resources"].items()}
@@ -50,6 +55,19 @@ def _dashboard_sensor_ids(text: str) -> set[str]:
     return set(re.findall(r"sensor\.hubinet_ops_[a-z0-9_]+", text))
 
 
+def _production_registry() -> dict[str, str]:
+    fixture = yaml.safe_load(PRODUCTION_REGISTRY_FIXTURE.read_text(encoding="utf-8"))
+    registry: dict[str, str] = {}
+    for group in fixture["groups"].values():
+        for vmid in group["vmids"]:
+            for key, suffix in group["suffixes"].items():
+                values = {"vmid": vmid, "key": key, "suffix": suffix}
+                registry[group["unique_pattern"].format(**values)] = group[
+                    "entity_pattern"
+                ].format(**values)
+    return registry
+
+
 def _assert_references_published(dashboard: str, published: set[str]) -> None:
     missing = _dashboard_sensor_ids(dashboard) - published
     assert not missing, f"Dashboard references unpublished entities: {sorted(missing)}"
@@ -74,6 +92,24 @@ def test_full_inventory_dashboard_references_only_discovery_entities() -> None:
             _assert_references_published(dashboard + "\n" + stale, published)
 
 
+def test_dashboard_references_exist_in_production_031_entity_registry_fixture() -> None:
+    dashboard = render(DEFAULT_CONFIG)
+    registry = _production_registry()
+
+    assert "Nie znaleziono encji" not in dashboard
+    missing = _dashboard_sensor_ids(dashboard) - set(registry.values())
+    assert not missing, f"Dashboard references entities absent in production: {sorted(missing)}"
+    assert registry["hubinet_ops_ct_101_apt_check_ok"] == (
+        "sensor.hubinet_ops_ct101_apt_check"
+    )
+    assert registry["hubinet_ops_ct_101_dpkg_audit_ok"] == (
+        "sensor.hubinet_ops_ct101_dpkg_audit"
+    )
+    assert registry["hubinet_ops_ct_101_packages_remaining_count"] == (
+        "sensor.hubinet_ops_ct101_packages_remaining"
+    )
+
+
 def test_discovery_uses_production_suffixes_and_preserves_unique_ids() -> None:
     configs, _ = _discovery()
     by_unique_id = {payload["unique_id"]: payload for payload in configs.values()}
@@ -90,6 +126,9 @@ def test_discovery_uses_production_suffixes_and_preserves_unique_ids() -> None:
         "hubinet_ops_ct_101_disk_used_percent": "sensor.hubinet_ops_ct101_disk_used",
         "hubinet_ops_ct_101_disk_free_mb": "sensor.hubinet_ops_ct101_disk_free",
         "hubinet_ops_ct_101_memory_used_percent": "sensor.hubinet_ops_ct101_memory_used",
+        "hubinet_ops_ct_101_apt_check_ok": "sensor.hubinet_ops_ct101_apt_check",
+        "hubinet_ops_ct_101_dpkg_audit_ok": "sensor.hubinet_ops_ct101_dpkg_audit",
+        "hubinet_ops_ct_101_packages_remaining_count": "sensor.hubinet_ops_ct101_packages_remaining",
     }
     for unique_id, entity_id in expected.items():
         assert by_unique_id[unique_id]["default_entity_id"] == entity_id
@@ -121,7 +160,7 @@ def test_numeric_discovery_never_falls_back_to_unknown_string() -> None:
     for payload in numeric:
         template = payload["value_template"]
         assert "'unknown'" not in template
-        assert "default(none)" in template
+        assert "default(none)" in template or " is none " in template
 
     state = bounded_state(
         {
@@ -133,6 +172,40 @@ def test_numeric_discovery_never_falls_back_to_unknown_string() -> None:
     assert state["memory"]["total_bytes"] == 456
     assert state["disk"]["used_bytes"] == 789
     assert "available_bytes" not in state["memory"]
+
+
+def test_data_size_discovery_uses_gib_without_changing_raw_backend_bytes() -> None:
+    state = bounded_state(
+        {
+            "memory": {"used_bytes": 5_838_413_824, "total_bytes": 34_359_738_368},
+            "disk": {"used_bytes": 5_838_413_824, "total_bytes": 34_359_738_368},
+            "network": {"in_bytes": 5_838_413_824, "out_bytes": 34_359_738_368},
+        }
+    )
+    assert state["memory"]["used_bytes"] == 5_838_413_824
+    assert state["memory"]["total_bytes"] == 34_359_738_368
+    assert round(5_838_413_824 / 1_073_741_824, 2) == 5.44
+    assert round(34_359_738_368 / 1_073_741_824, 2) == 32.00
+
+    configs, _ = _discovery()
+    for topic in (
+        "homeassistant/sensor/hubinet_ops_vm100_memory_used_bytes/config",
+        "homeassistant/sensor/hubinet_ops_vm100_network_in_bytes/config",
+        "homeassistant/sensor/hubinet_ops_ct110_disk_free_bytes/config",
+    ):
+        payload = configs[topic]
+        assert payload["device_class"] == "data_size"
+        assert payload["unit_of_measurement"] == "GiB"
+        assert payload["state_class"] in {"measurement", "total_increasing"}
+        assert "1073741824" in payload["value_template"]
+
+
+def test_agent_last_refresh_discovery_is_a_diagnostic_timestamp() -> None:
+    configs, _ = _discovery()
+    payload = configs["homeassistant/sensor/hubinet_ops_agent_last_refresh/config"]
+
+    assert payload["device_class"] == "timestamp"
+    assert payload["entity_category"] == "diagnostic"
 
 
 def test_vm100_primary_ip_replaces_479_character_state_without_losing_attributes() -> None:
@@ -172,12 +245,12 @@ def test_qemu_cpu_share_is_exposed_as_an_explicit_ha_percentage() -> None:
                 "resource_type": "qemu",
                 "adapter": "haos",
                 "qemu_status": "running",
-                "cpu": {"usage": 0.125, "cores": 4},
+                "cpu": {"usage": 0.0305257, "cores": 4},
             }
         )
     )
-    assert state["cpu"]["usage"] == 0.125
-    assert state["cpu"]["usage_percent"] == 12.5
+    assert state["cpu"]["usage"] == 0.0305257
+    assert state["cpu"]["usage_percent"] == 3.053
 
     configs, _ = _discovery()
     cpu_sensor = configs[

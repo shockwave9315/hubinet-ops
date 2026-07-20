@@ -1,4 +1,4 @@
-# Hubinet Ops 0.3.1: resource REST aliases and navigation-only notifications.
+# Hubinet Ops 0.3.2: resource REST aliases and navigation-only notifications.
 
 rest_command:
   hubinet_ops_scan_container:

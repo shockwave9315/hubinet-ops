@@ -12,4 +12,6 @@ During 0.3.x every LXC is dual-published to `hubinet/ops/ct/{vmid}/...`; this pr
 
 The deprecated `sensor.hubinet_ops_agent_configured_container_count` remains. New counters are `configured_resource_count`, `configured_lxc_count`, and `configured_qemu_count`.
 
+Agent state is published once after a complete inventory refresh instead of once per resource. `agent_last_refresh` is an ISO 8601 UTC timestamp, rounded to seconds, for the completion of the most recent full telemetry cycle. Discovery marks it as a diagnostic timestamp.
+
 Only the health sensor receives rich JSON attributes. `bounded_state` sanitizes and budgets that UTF-8 payload to at most 10,000 bytes while preserving resource type/runtime, policies, lifecycle/verification/recovery fields, QEMU Guest Agent fields, self-health scalars, and unknown (`null`) APT values. Package/event/Docker/journal previews are bounded.
