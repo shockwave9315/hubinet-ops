@@ -50,7 +50,9 @@ class MqttTelemetry:
         self.retain_state = bool(self.config.get("retain_state", True))
         self._client_factory = client_factory
         self._client: Any = None
-        self._queue: queue.Queue[PublishItem | None] = queue.Queue(maxsize=1000)
+        # Two complete discovery passes must fit during reconnect without
+        # evicting retained cleanup messages as the 0.4.0 entity contract grows.
+        self._queue: queue.Queue[PublishItem | None] = queue.Queue(maxsize=2000)
         self._cache: dict[str, str] = {}
         self._connected = threading.Event()
         self._stop = threading.Event()

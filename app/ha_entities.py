@@ -64,6 +64,40 @@ def _gib_numeric(
     )
 
 
+def _timestamp(key: str, suffix: str, name: str, path: str) -> EntitySpec:
+    return EntitySpec(
+        key,
+        suffix,
+        name,
+        f"{{{{ {path} | default('unknown', true) }}}}",
+        {"device_class": "timestamp", "entity_category": "diagnostic"},
+    )
+
+
+SNAPSHOT_ENTITY_SPECS = (
+    EntitySpec("snapshot_count", "snapshot_count", "Snapshot count", "{{ value_json.snapshot_count | default(0) }}"),
+    EntitySpec("latest_snapshot_name", "latest_snapshot_name", "Latest snapshot name", "{{ value_json.latest_snapshot_name | default('none', true) }}"),
+    _timestamp("latest_snapshot_at", "latest_snapshot_at", "Latest snapshot at", "value_json.latest_snapshot_at"),
+    EntitySpec("latest_snapshot_kind", "latest_snapshot_kind", "Latest snapshot kind", "{{ value_json.latest_snapshot_kind | default('none', true) }}"),
+    EntitySpec("snapshot_operation_status", "snapshot_operation_status", "Snapshot operation status", "{{ value_json.snapshot_operation_status | default('idle') }}"),
+)
+
+
+LIFECYCLE_CAPABILITY_SPECS = tuple(
+    EntitySpec(
+        f"capability_{key}",
+        f"capability_{key}",
+        f"Capability {key.replace('_', ' ')}",
+        f"{{{{ 'allowed' if value_json.operator_capabilities.{key} else 'blocked' }}}}",
+    )
+    for key in (
+        "start", "shutdown", "reboot", "force_stop", "refresh",
+        "snapshot_create", "snapshot_list", "snapshot_rollback", "snapshot_delete",
+        "self_update",
+    )
+)
+
+
 AGENT_ENTITY_SPECS = (
     EntitySpec("availability", "availability", "Availability", "{{ value }}"),
     EntitySpec("version", "version", "Version", "{{ value_json.version }}"),
@@ -125,35 +159,44 @@ APT_ENTITY_SPECS = (
     EntitySpec("docker_required_healthy", "docker_required_healthy", "Docker required healthy", "{{ value_json.docker.required_healthy | default(none) }}"),
     EntitySpec("docker_required_total", "docker_required_total", "Docker required total", "{{ value_json.docker.required_total | default(none) }}"),
     EntitySpec("active_plan_id", "active_plan_id", "Active plan ID", "{{ value_json.active_plan_id | default('none', true) }}"),
+    EntitySpec("active_plan_status", "active_plan_status", "Active plan status", "{{ value_json.active_plan_status | default('none', true) }}"),
     EntitySpec("active_job_id", "active_job_id", "Active job ID", "{{ value_json.active_job_id | default('none', true) }}"),
-    EntitySpec("last_scan", "last_scan", "Last scan", "{{ value_json.last_scan | default('unknown', true) }}"),
-    EntitySpec("last_refresh", "last_refresh", "Last refresh", "{{ value_json.last_refresh | default('unknown', true) }}"),
-    EntitySpec("last_update", "last_update", "Last update", "{{ value_json.last_update | default('unknown', true) }}"),
+    EntitySpec("last_job_id", "last_job_id", "Last job ID", "{{ value_json.last_job_id | default('none', true) }}"),
+    EntitySpec("operation_type", "operation_type", "Operation type", "{{ value_json.operation_type | default('none', true) }}"),
+    _timestamp("last_scan", "last_scan", "Last scan", "value_json.last_scan"),
+    _timestamp("last_refresh", "last_refresh", "Last refresh", "value_json.last_refresh"),
+    _timestamp("last_update", "last_update", "Last update", "value_json.last_update"),
     EntitySpec("last_error", "last_error", "Last error", "{{ value_json.last_error | default('none', true) }}"),
     EntitySpec("last_operation_result", "last_operation_result", "Last operation result", "{{ value_json.last_operation_result | default('none', true) }}"),
     EntitySpec("rollback_allowed", "rollback_allowed", "Rollback allowed", "{{ 'allowed' if value_json.rollback_allowed else 'blocked' }}"),
     EntitySpec("last_job_event", "last_job_event", "Last job event", "{{ value_json.last_job_event.message | default('none') }}"),
     EntitySpec("lifecycle_status", "lifecycle_status", "Lifecycle status", "{{ value_json.lifecycle_status | default('idle') }}"),
     EntitySpec("lifecycle_action", "lifecycle_action", "Lifecycle action", "{{ value_json.lifecycle_action | default('none', true) }}"),
+    _timestamp("lifecycle_started_at", "lifecycle_started_at", "Lifecycle started at", "value_json.lifecycle_started_at"),
+    _timestamp("lifecycle_finished_at", "lifecycle_finished_at", "Lifecycle finished at", "value_json.lifecycle_finished_at"),
     EntitySpec("verification_status", "verification_status", "Verification status", "{{ value_json.verification_status | default('unknown') }}"),
-    EntitySpec("last_verification", "last_verification", "Last verification", "{{ value_json.last_verification | default('unknown', true) }}"),
+    _timestamp("last_verification", "last_verification", "Last verification", "value_json.last_verification"),
     EntitySpec("apt_check_ok", "apt_check", "APT check", "{{ 'unknown' if value_json.apt_check_ok is none else 'ok' if value_json.apt_check_ok else 'failed' }}"),
     EntitySpec("dpkg_audit_ok", "dpkg_audit", "dpkg audit", "{{ 'unknown' if value_json.dpkg_audit_ok is none else 'ok' if value_json.dpkg_audit_ok else 'failed' }}"),
     EntitySpec("reboot_required", "reboot_required", "Reboot required", "{{ 'unknown' if value_json.reboot_required is none else 'yes' if value_json.reboot_required else 'no' }}"),
     EntitySpec("packages_remaining_count", "packages_remaining", "Packages remaining", "{{ value_json.packages_remaining_count | default(none) }}"),
     EntitySpec("recovery_scan_status", "recovery_scan_status", "Recovery scan status", "{{ value_json.recovery_scan_status | default('disabled') }}"),
-    EntitySpec("last_recovery_scan", "last_recovery_scan", "Last recovery scan", "{{ value_json.last_recovery_scan | default('unknown', true) }}"),
+    _timestamp("last_recovery_scan", "last_recovery_scan", "Last recovery scan", "value_json.last_recovery_scan"),
     EntitySpec("last_recovery_scan_result", "last_recovery_scan_result", "Last recovery scan result", "{{ value_json.last_recovery_scan_result | default('none', true) }}"),
-    EntitySpec("capability_start", "capability_start", "Capability start", "{{ 'allowed' if value_json.operator_capabilities.start else 'blocked' }}"),
-    EntitySpec("capability_shutdown", "capability_shutdown", "Capability shutdown", "{{ 'allowed' if value_json.operator_capabilities.shutdown else 'blocked' }}"),
-    EntitySpec("capability_reboot", "capability_reboot", "Capability reboot", "{{ 'allowed' if value_json.operator_capabilities.reboot else 'blocked' }}"),
-    EntitySpec("capability_refresh", "capability_refresh", "Capability refresh", "{{ 'allowed' if value_json.operator_capabilities.refresh else 'blocked' }}"),
     EntitySpec("capability_scan", "capability_scan", "Capability scan", "{{ 'allowed' if value_json.operator_capabilities.scan else 'blocked' }}"),
     EntitySpec("capability_approve", "capability_approve", "Capability approve", "{{ 'allowed' if value_json.operator_capabilities.approve else 'blocked' }}"),
     EntitySpec("capability_reject", "capability_reject", "Capability reject", "{{ 'allowed' if value_json.operator_capabilities.reject else 'blocked' }}"),
     EntitySpec("capability_retry_healthcheck", "capability_retry_healthcheck", "Capability retry healthcheck", "{{ 'allowed' if value_json.operator_capabilities.retry_healthcheck else 'blocked' }}"),
     EntitySpec("capability_rollback", "capability_rollback", "Capability rollback", "{{ 'allowed' if value_json.operator_capabilities.rollback else 'blocked' }}"),
-)
+    EntitySpec("executor_version", "executor_version", "Executor version", "{{ value_json.executor_version | default('unknown', true) }}", {"entity_category": "diagnostic"}),
+    EntitySpec("executor_protocol_version", "executor_protocol_version", "Executor protocol", "{{ value_json.executor_protocol_version | default(none) }}", {"entity_category": "diagnostic"}),
+    EntitySpec("executor_compatible", "executor_compatible", "Executor compatible", "{{ 'compatible' if value_json.executor_compatible else 'incompatible' }}", {"entity_category": "diagnostic"}),
+    EntitySpec("executor_sha256", "executor_sha256", "Executor SHA-256", "{{ value_json.executor_sha256 | default('unknown', true) }}", {"entity_category": "diagnostic"}),
+    EntitySpec("executor_profile_sha256", "executor_profile_sha256", "Executor profile SHA-256", "{{ value_json.executor_profile_sha256 | default('unknown', true) }}", {"entity_category": "diagnostic"}),
+    EntitySpec("executor_missing_actions", "executor_missing_actions", "Executor missing actions", "{{ value_json.executor_missing_actions | default([]) | join(', ') or 'none' }}", {"entity_category": "diagnostic"}),
+    EntitySpec("profile_validation_status", "profile_validation_status", "Profile validation", "{{ value_json.profile_validation_status | default('unknown', true) }}", {"entity_category": "diagnostic"}),
+    _timestamp("executor_last_checked_at", "executor_last_checked_at", "Executor last checked", "value_json.executor_last_checked_at"),
+) + LIFECYCLE_CAPABILITY_SPECS + SNAPSHOT_ENTITY_SPECS
 
 
 QEMU_ENTITY_SPECS = (
@@ -172,7 +215,7 @@ QEMU_ENTITY_SPECS = (
     _gib_numeric("network_out_bytes", "network_sent", "Network sent", "value_json.network.out_bytes", state_class="total_increasing"),
     EntitySpec("guest_agent_status", "guest_agent", "Guest Agent", "{{ value_json.guest_agent_status | default('unknown') }}"),
     EntitySpec("ip_addresses", "ip_addresses", "Primary IP", "{{ value_json.primary_ip_address | default('unknown', true) }}"),
-    EntitySpec("last_refresh", "last_refresh", "Last refresh", "{{ value_json.last_refresh | default('unknown', true) }}"),
+    _timestamp("last_refresh", "last_refresh", "Last refresh", "value_json.last_refresh"),
     EntitySpec("last_error", "last_error", "Last error", "{{ value_json.last_error | default('none', true) }}"),
 )
 
@@ -195,9 +238,18 @@ AGENT_SELF_ENTITY_SPECS = (
     EntitySpec("api_health", "api_health", "API health", "{{ value_json.api_health | default('unknown') }}"),
     EntitySpec("agent_version", "agent_version", "Agent version", "{{ value_json.agent_version | default('unknown') }}"),
     EntitySpec("recent_warnings", "recent_warnings", "Recent warnings", "{{ value_json.recent_warnings | default([]) | count }}"),
-    EntitySpec("last_refresh", "last_refresh", "Last refresh", "{{ value_json.last_refresh | default('unknown', true) }}"),
+    _timestamp("last_refresh", "last_refresh", "Last refresh", "value_json.last_refresh"),
     EntitySpec("last_error", "last_error", "Last error", "{{ value_json.last_error | default('none', true) }}"),
-)
+    EntitySpec("operation_status", "operation_status", "Operation status", "{{ value_json.operation_status | default('idle') }}"),
+    EntitySpec("operation_type", "operation_type", "Operation type", "{{ value_json.operation_type | default('none', true) }}"),
+    EntitySpec("job_stage", "job_stage", "Job stage", "{{ value_json.job_stage | default('idle') }}"),
+    _numeric("job_progress", "job_progress", "Job progress", "value_json.job_progress", "%"),
+    EntitySpec("active_job_id", "active_job_id", "Active job ID", "{{ value_json.active_job_id | default('none', true) }}"),
+    EntitySpec("last_job_id", "last_job_id", "Last job ID", "{{ value_json.last_job_id | default('none', true) }}"),
+    EntitySpec("lifecycle_status", "lifecycle_status", "Lifecycle status", "{{ value_json.lifecycle_status | default('idle') }}"),
+    _timestamp("lifecycle_started_at", "lifecycle_started_at", "Lifecycle started at", "value_json.lifecycle_started_at"),
+    _timestamp("lifecycle_finished_at", "lifecycle_finished_at", "Lifecycle finished at", "value_json.lifecycle_finished_at"),
+) + LIFECYCLE_CAPABILITY_SPECS + SNAPSHOT_ENTITY_SPECS
 
 
 SUPPORTED_RESOURCE_IDENTITIES = frozenset(

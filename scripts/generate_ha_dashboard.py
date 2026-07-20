@@ -35,6 +35,22 @@ ICONS = {
     110: "mdi:shield-crown-outline",
 }
 
+CONTROL_ORDER = (
+    "start",
+    "shutdown",
+    "reboot",
+    "force_stop",
+    "refresh",
+    "scan",
+    "approve",
+    "reject",
+    "retry_healthcheck",
+    "snapshot_create",
+    "snapshot_rollback",
+    "snapshot_delete",
+    "self_update",
+)
+
 
 def _label(vmid: int, cfg: dict[str, Any]) -> str:
     kind = "VM" if normalize_resource_identity(cfg).resource_type == "qemu" else "CT"
@@ -91,6 +107,68 @@ def _uptime_card(entity: str) -> dict[str, Any]:
         ),
         "icon": "mdi:timer-outline",
         "color": "green",
+        "tap_action": {"action": "more-info"},
+    }
+
+
+def _timestamp_card(entity: str, name: str, icon: str) -> dict[str, Any]:
+    return {
+        "type": "custom:mushroom-template-card",
+        "entity": entity,
+        "primary": name,
+        "secondary": (
+            "{% set value = states(entity) %}"
+            "{% if value in ['unknown', 'unavailable', 'none', 'None', ''] %}"
+            "Brak danych"
+            "{% else %}"
+            "{% set stamp = as_timestamp(value, none) %}"
+            "{{ stamp | timestamp_custom('%d.%m.%Y %H:%M', true) if stamp is not none else 'Nieprawidłowa data' }}"
+            "{% endif %}"
+        ),
+        "icon": icon,
+        "color": "blue-grey",
+        "tap_action": {"action": "more-info"},
+    }
+
+
+def _plan_card(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    plan = _entity(vmid, cfg, "active_plan_id")
+    status = _entity(vmid, cfg, "active_plan_status")
+    packages = _entity(vmid, cfg, "pending_updates")
+    risk = _entity(vmid, cfg, "risk")
+    return {
+        "type": "custom:mushroom-template-card",
+        "entity": plan,
+        "primary": (
+            f"{{{{ 'Oczekuje · ' ~ states('{packages}') ~ ' pakietów · ryzyko ' ~ states('{risk}') "
+            f"if states('{status}') == 'waiting' else states('{status}') | replace('_', ' ') | title }}}}"
+        ),
+        "secondary": "{{ ('ID ' ~ states(entity)[:8]) if states(entity) not in ['none', 'unknown', 'unavailable'] else 'Brak aktywnego planu' }}",
+        "icon": "mdi:clipboard-text-clock-outline",
+        "color": "amber",
+        "tap_action": {"action": "more-info"},
+    }
+
+
+def _job_card(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    active = _entity(vmid, cfg, "active_job_id")
+    last = _entity(vmid, cfg, "last_job_id")
+    operation = _entity(vmid, cfg, "operation_type")
+    stage = _entity(vmid, cfg, "job_stage")
+    progress = _entity(vmid, cfg, "job_progress")
+    return {
+        "type": "custom:mushroom-template-card",
+        "entity": active,
+        "primary": (
+            f"{{{{ states('{operation}') | replace('_', ' ') | title }}}} · "
+            f"{{{{ states('{stage}') | replace('_', ' ') }}}} · {{{{ states('{progress}') }}}}%"
+        ),
+        "secondary": (
+            f"{{% set identifier = states('{active}') if states('{active}') not in ['none', 'unknown', 'unavailable'] else states('{last}') %}}"
+            "{{ ('ID ' ~ identifier[:8]) if identifier not in ['none', 'unknown', 'unavailable'] else 'Brak joba' }}"
+        ),
+        "icon": "mdi:progress-wrench",
+        "color": "blue",
         "tap_action": {"action": "more-info"},
     }
 
@@ -299,40 +377,56 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
         "start": "Uruchom",
         "shutdown": "Wyłącz łagodnie",
         "reboot": "Uruchom ponownie",
+        "force_stop": "Zatrzymaj natychmiast",
         "refresh": "Odśwież stan",
         "scan": "Sprawdź aktualizacje",
         "approve": "Zatwierdź plan",
         "reject": "Odrzuć plan",
         "retry_healthcheck": "Ponów healthcheck",
-        "rollback": "Rollback",
+        "snapshot_create": "Utwórz snapshot",
+        "snapshot_rollback": "Przywróć ostatni snapshot",
+        "snapshot_delete": "Usuń ostatni snapshot",
+        "self_update": "Aktualizuj control plane",
     }
     service_names = {
         "approve": "script.hubinet_ops_approve_container",
         "reject": "script.hubinet_ops_reject_container",
         "retry_healthcheck": "script.hubinet_ops_retry_healthcheck",
-        "rollback": "script.hubinet_ops_rollback",
+        "force_stop": "script.hubinet_ops_force_stop_container",
+        "snapshot_create": "script.hubinet_ops_snapshot_create",
+        "snapshot_rollback": "script.hubinet_ops_snapshot_rollback_latest",
+        "snapshot_delete": "script.hubinet_ops_snapshot_delete_latest",
+        "self_update": "script.hubinet_ops_self_update",
     }
     secondary = {
         "start": f"Start CT{vmid}",
         "shutdown": f"Graceful shutdown CT{vmid}",
         "reboot": f"Graceful reboot CT{vmid}",
+        "force_stop": f"Natychmiast odetnij CT{vmid}",
         "refresh": "Health, zasoby i usługi",
         "scan": "Pobierz aktualną listę pakietów",
         "approve": "Snapshot, update i stabilizacja usług",
         "reject": "Nie wykonuj aktualizacji",
         "retry_healthcheck": "Sprawdź stabilizację usług jeszcze raz",
-        "rollback": "Ręczny rollback ostatniej nieudanej operacji",
+        "snapshot_create": "Ręczny punkt przywracania Hubinet Ops",
+        "snapshot_rollback": "Cofnij wszystkie zmiany do ostatniego snapshotu",
+        "snapshot_delete": "Trwale usuń ostatni snapshot Hubinet Ops",
+        "self_update": "Aktualizacja CT110 nadzorowana z PVE",
     }
     colors = {
         "start": "green",
         "shutdown": "red",
         "reboot": "amber",
+        "force_stop": "red",
         "refresh": "cyan",
         "scan": "blue",
         "approve": "green",
         "reject": "red",
         "retry_healthcheck": "amber",
-        "rollback": "red",
+        "snapshot_create": "purple",
+        "snapshot_rollback": "red",
+        "snapshot_delete": "red",
+        "self_update": "amber",
     }
     confirmations = {
         "start": {
@@ -351,6 +445,12 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
             "title": f"Uruchom ponownie CT{vmid}",
             "text": f"Łagodnie zrestartować kontener CT{vmid}? Usługi będą chwilowo niedostępne.",
             "confirm_text": f"Restartuj CT{vmid}",
+            "dismiss_text": "Anuluj",
+        },
+        "force_stop": {
+            "title": f"Natychmiast zatrzymaj CT{vmid}",
+            "text": "Kontener zostanie odcięty bez łagodnego zamknięcia. Grozi to utratą niezapisanych danych.",
+            "confirm_text": "Zatrzymaj natychmiast",
             "dismiss_text": "Anuluj",
         },
         "refresh": {
@@ -377,10 +477,26 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
             "title": f"Ponów healthcheck CT{vmid}",
             "text": f"Ponowić healthcheck CT{vmid}?",
         },
-        "rollback": {
-            "title": f"Rollback CT{vmid}",
-            "text": f"Przywrócić zapisany snapshot CT{vmid}?",
-            "confirm_text": "Przywróć",
+        "snapshot_create": {
+            "title": f"Utwórz snapshot CT{vmid}",
+            "text": "Utworzyć ręczny snapshot oznaczony jako własność Hubinet Ops?",
+        },
+        "snapshot_rollback": {
+            "title": f"Przywróć snapshot CT{vmid}",
+            "text": "Bieżący stan kontenera zostanie zastąpiony stanem z ostatniego snapshotu Hubinet Ops.",
+            "confirm_text": "Przywróć snapshot",
+            "dismiss_text": "Anuluj",
+        },
+        "snapshot_delete": {
+            "title": f"Usuń snapshot CT{vmid}",
+            "text": "Ostatni snapshot Hubinet Ops zostanie trwale usunięty i nie będzie można go przywrócić.",
+            "confirm_text": "Usuń snapshot",
+            "dismiss_text": "Anuluj",
+        },
+        "self_update": {
+            "title": "Aktualizuj Hubinet Ops",
+            "text": "Aktualizacja CT110 będzie nadzorowana przez niezależny control plane na PVE.",
+            "confirm_text": "Aktualizuj",
             "dismiss_text": "Anuluj",
         },
     }
@@ -393,12 +509,17 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
             "start": "mdi:play",
             "shutdown": "mdi:power",
             "reboot": "mdi:restart",
+            "force_stop": "mdi:stop-circle",
             "refresh": "mdi:refresh",
             "scan": "mdi:magnify-scan",
             "approve": "mdi:check-decagram",
             "reject": "mdi:close-octagon-outline",
             "retry_healthcheck": "mdi:heart-pulse",
-        }.get(action, "mdi:backup-restore"),
+            "snapshot_create": "mdi:camera-plus-outline",
+            "snapshot_rollback": "mdi:backup-restore",
+            "snapshot_delete": "mdi:delete-alert-outline",
+            "self_update": "mdi:update",
+        }[action],
         "color": colors[action],
         "tap_action": {
             "action": "perform-action",
@@ -429,18 +550,24 @@ def _state_condition(
 def _control_conditions(
     vmid: int, cfg: dict[str, Any], action: str
 ) -> list[dict[str, Any]]:
-    runtime = _entity(vmid, cfg, "lxc_status")
+    runtime = _entity(vmid, cfg, "runtime_status")
     operation = _entity(vmid, cfg, "operation_status")
     active_job = _entity(vmid, cfg, "active_job_id")
     lifecycle = _entity(vmid, cfg, "lifecycle_status")
     capability = _entity(vmid, cfg, f"capability_{action}")
 
+    idle = [
+        _state_condition(active_job, state="none"),
+        _state_condition(lifecycle, state_not="running"),
+        _state_condition(operation, state_not="running"),
+    ]
     if action == "refresh":
         return [_state_condition(capability, state="allowed")]
     if action in {"approve", "reject"}:
         return [
             _state_condition(operation, state="waiting_approval"),
             _state_condition(capability, state="allowed"),
+            _state_condition(active_job, state="none"),
         ]
     if action == "retry_healthcheck":
         return [
@@ -449,36 +576,47 @@ def _control_conditions(
             _state_condition(active_job, state="none"),
             _state_condition(lifecycle, state_not="running"),
         ]
-    if action == "rollback":
-        return [
-            _state_condition(operation, state="manual_intervention"),
-            _state_condition(_entity(vmid, cfg, "rollback_allowed"), state="allowed"),
-            _state_condition(capability, state="allowed"),
-            _state_condition(active_job, state="none"),
-            _state_condition(lifecycle, state_not="running"),
-        ]
     if action == "scan":
         return [
             _state_condition(runtime, state="running"),
             _state_condition(capability, state="allowed"),
-            _state_condition(active_job, state="none"),
-            _state_condition(lifecycle, state_not="running"),
-            _state_condition(operation, state_not="running"),
+            *idle,
         ]
-    if action in {"start", "shutdown", "reboot"}:
+    if action in {"start", "shutdown", "reboot", "force_stop"}:
         return [
             _state_condition(runtime, state="stopped" if action == "start" else "running"),
             _state_condition(capability, state="allowed"),
-            _state_condition(active_job, state="none"),
-            _state_condition(lifecycle, state_not="running"),
             _state_condition(operation, state_not="waiting_approval"),
-            _state_condition(operation, state_not="running"),
+            *idle,
+        ]
+    if action == "snapshot_create":
+        return [
+            _state_condition(capability, state="allowed"),
+            _state_condition(operation, state_not="waiting_approval"),
+            *idle,
+        ]
+    if action in {"snapshot_rollback", "snapshot_delete"}:
+        return [
+            _state_condition(capability, state="allowed"),
+            _state_condition(
+                _entity(vmid, cfg, "latest_snapshot_name"), state_not="none"
+            ),
+            _state_condition(operation, state_not="waiting_approval"),
+            *idle,
+        ]
+    if action == "self_update":
+        return [
+            _state_condition(runtime, state="running"),
+            _state_condition(capability, state="allowed"),
+            _state_condition(operation, state_not="waiting_approval"),
+            *idle,
         ]
     raise ValueError(f"Unsupported operator action: {action}")
 
 
 def _controls_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
-    actions = [name for name, enabled in cfg["operator_capabilities"].items() if enabled]
+    capabilities = cfg["operator_capabilities"]
+    actions = [name for name in CONTROL_ORDER if capabilities.get(name, False)]
     controls = [
         {
             "type": "conditional",
@@ -490,6 +628,77 @@ def _controls_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
     return _section(
         _title("Sterowanie", "Każda akcja wymaga potwierdzenia"),
         _entity_grid(controls, columns=2),
+    )
+
+
+def _snapshot_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    return _section(
+        _title("Snapshoty", "Wyłącznie punkty przywracania należące do Hubinet Ops"),
+        _entity_grid(
+            [
+                _entity_card(
+                    _entity(vmid, cfg, "snapshot_count"),
+                    "Liczba snapshotów",
+                    "mdi:camera-burst",
+                ),
+                _entity_card(
+                    _entity(vmid, cfg, "latest_snapshot_name"),
+                    "Ostatni snapshot",
+                    "mdi:camera-outline",
+                ),
+                _entity_card(
+                    _entity(vmid, cfg, "latest_snapshot_kind"),
+                    "Typ",
+                    "mdi:shape-outline",
+                ),
+                _timestamp_card(
+                    _entity(vmid, cfg, "latest_snapshot_at"),
+                    "Utworzony",
+                    "mdi:calendar-clock",
+                ),
+                _entity_card(
+                    _entity(vmid, cfg, "snapshot_operation_status"),
+                    "Ostatnia operacja",
+                    "mdi:progress-check",
+                ),
+            ]
+        ),
+    )
+
+
+def _executor_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    return _section(
+        _title("Executor", "Kontrakt wymagany przed operacjami destrukcyjnymi"),
+        _entity_grid(
+            [
+                _entity_card(
+                    _entity(vmid, cfg, "executor_compatible"),
+                    "Zgodność",
+                    "mdi:shield-check-outline",
+                ),
+                _entity_card(
+                    _entity(vmid, cfg, "executor_version"),
+                    "Wersja",
+                    "mdi:tag-outline",
+                ),
+                _entity_card(
+                    _entity(vmid, cfg, "executor_protocol_version"),
+                    "Protokół",
+                    "mdi:connection",
+                ),
+                _entity_card(
+                    _entity(vmid, cfg, "executor_missing_actions"),
+                    "Brakujące akcje",
+                    "mdi:alert-outline",
+                    "amber",
+                ),
+                _timestamp_card(
+                    _entity(vmid, cfg, "executor_last_checked_at"),
+                    "Ostatnie sprawdzenie",
+                    "mdi:clock-check-outline",
+                ),
+            ]
+        ),
     )
 
 
@@ -551,11 +760,14 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     )
     diagnostics = _entity_grid(
         [
-            _entity_card(_entity(vmid, cfg, "last_refresh"), "Ostatnie odświeżenie", "mdi:refresh"),
-            _entity_card(_entity(vmid, cfg, "last_scan"), "Ostatni skan", "mdi:magnify-scan"),
-            _entity_card(_entity(vmid, cfg, "last_update"), "Ostatnia aktualizacja", "mdi:update", "green"),
-            _entity_card(_entity(vmid, cfg, "active_plan_id"), "Aktywny plan", "mdi:clipboard-text-clock-outline", "amber"),
-            _entity_card(_entity(vmid, cfg, "active_job_id"), "Aktywny job", "mdi:identifier"),
+            _timestamp_card(_entity(vmid, cfg, "last_refresh"), "Ostatnie odświeżenie", "mdi:refresh"),
+            _timestamp_card(_entity(vmid, cfg, "last_scan"), "Ostatni skan", "mdi:magnify-scan"),
+            _timestamp_card(_entity(vmid, cfg, "last_update"), "Ostatnia aktualizacja", "mdi:update"),
+            _timestamp_card(_entity(vmid, cfg, "last_verification"), "Ostatnia weryfikacja", "mdi:check-decagram"),
+            _timestamp_card(_entity(vmid, cfg, "lifecycle_started_at"), "Lifecycle rozpoczęty", "mdi:clock-start"),
+            _timestamp_card(_entity(vmid, cfg, "lifecycle_finished_at"), "Lifecycle zakończony", "mdi:clock-check"),
+            _plan_card(vmid, cfg),
+            _job_card(vmid, cfg),
             _entity_card(_entity(vmid, cfg, "rollback_allowed"), "Rollback", "mdi:backup-restore", "amber"),
             _entity_card(_entity(vmid, cfg, "last_operation_result"), "Ostatni wynik", "mdi:history"),
             _entity_card(_entity(vmid, cfg, "last_error"), "Ostatni błąd", "mdi:alert-circle-outline", "red"),
@@ -582,7 +794,8 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         "content": (
             f"{{% set events = state_attr('{health}', 'recent_job_events') or [] %}}\n"
             "{% for event in events[-10:] | reverse %}"
-            "- `{{ event.get('created_at', '') }}` **{{ event.get('stage', '') }}** "
+            "{% set stamp = as_timestamp(event.get('created_at'), none) %}"
+            "- `{{ stamp | timestamp_custom('%H:%M', true) if stamp is not none else '--:--' }}` **{{ event.get('stage', '') }}** "
             "{{ event.get('message', '') | replace('|', '¦') }}\n"
             "{% endfor %}"
         ),
@@ -616,7 +829,7 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         _entity_grid(
             [
                 _entity_card(_entity(vmid, cfg, "recovery_scan_status"), "Status", "mdi:shield-sync-outline"),
-                _entity_card(_entity(vmid, cfg, "last_recovery_scan"), "Ostatni skan", "mdi:history"),
+                _timestamp_card(_entity(vmid, cfg, "last_recovery_scan"), "Ostatni skan", "mdi:history"),
                 _entity_card(_entity(vmid, cfg, "last_recovery_scan_result"), "Ostatni wynik", "mdi:shield-check-outline"),
             ]
         ),
@@ -629,6 +842,7 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
         sections.append(
             _section(_title("Weryfikacja końcowa", "Wynik po aktualizacji"), verification)
         )
+    sections.extend([_snapshot_section(vmid, cfg), _executor_section(vmid, cfg)])
     docker = cfg.get("docker") or {}
     if docker.get("enabled"):
         sections.append(
@@ -684,6 +898,11 @@ def _qemu_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
                     _entity_card(_entity(vmid, cfg, "guest_agent_status"), "Guest Agent", "mdi:lan-connect", "green"),
                     _entity_card(_entity(vmid, cfg, "ip_addresses"), "Primary IP", "mdi:ip-network", "cyan"),
                     _uptime_card(_entity(vmid, cfg, "uptime_seconds")),
+                    _timestamp_card(
+                        _entity(vmid, cfg, "last_refresh"),
+                        "Ostatnie odświeżenie",
+                        "mdi:refresh",
+                    ),
                 ]
             ),
         ),
@@ -698,7 +917,7 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
             _resource_status(vmid, cfg),
             _resource_chips(vmid, cfg),
         ),
-        _observation_section(vmid, cfg),
+        _controls_section(vmid, cfg),
         _section(
             _title("Usługa i API", "Lokalna kontrola CT110"),
             _entity_grid(
@@ -729,6 +948,36 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
                     _entity_card(_entity(vmid, cfg, "disk_used_bytes"), "Dysk użyty", "mdi:harddisk"),
                     _entity_card(_entity(vmid, cfg, "disk_total_bytes"), "Dysk łącznie", "mdi:harddisk"),
                     _entity_card(_entity(vmid, cfg, "disk_free_bytes"), "Dysk wolny", "mdi:database-arrow-down-outline", "cyan"),
+                ]
+            ),
+        ),
+        _snapshot_section(vmid, cfg),
+        _section(
+            _title("Historia i diagnostyka", "Bieżący job i lokalnie sformatowane czasy"),
+            _entity_grid(
+                [
+                    _job_card(vmid, cfg),
+                    _timestamp_card(
+                        _entity(vmid, cfg, "last_refresh"),
+                        "Ostatnie odświeżenie",
+                        "mdi:refresh",
+                    ),
+                    _timestamp_card(
+                        _entity(vmid, cfg, "lifecycle_started_at"),
+                        "Lifecycle rozpoczęty",
+                        "mdi:clock-start",
+                    ),
+                    _timestamp_card(
+                        _entity(vmid, cfg, "lifecycle_finished_at"),
+                        "Lifecycle zakończony",
+                        "mdi:clock-check",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "last_error"),
+                        "Ostatni błąd",
+                        "mdi:alert-circle-outline",
+                        "red",
+                    ),
                 ]
             ),
         ),

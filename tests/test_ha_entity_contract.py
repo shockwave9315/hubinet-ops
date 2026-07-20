@@ -92,13 +92,16 @@ def test_full_inventory_dashboard_references_only_discovery_entities() -> None:
             _assert_references_published(dashboard + "\n" + stale, published)
 
 
-def test_dashboard_references_exist_in_production_031_entity_registry_fixture() -> None:
+def test_dashboard_preserves_production_031_ids_and_discovers_new_040_entities() -> None:
     dashboard = render(DEFAULT_CONFIG)
     registry = _production_registry()
+    configs, _ = _discovery()
+    published = {payload["default_entity_id"] for payload in configs.values()}
 
     assert "Nie znaleziono encji" not in dashboard
-    missing = _dashboard_sensor_ids(dashboard) - set(registry.values())
-    assert not missing, f"Dashboard references entities absent in production: {sorted(missing)}"
+    references = _dashboard_sensor_ids(dashboard)
+    assert references <= set(registry.values()) | published
+    assert references - set(registry.values()) <= published
     assert registry["hubinet_ops_ct_101_apt_check_ok"] == (
         "sensor.hubinet_ops_ct101_apt_check"
     )
