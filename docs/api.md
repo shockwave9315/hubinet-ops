@@ -38,4 +38,4 @@ List entries contain `name`, `description`, `created_at`, `kind`, `owned_by_hubi
 
 Manual update rollback remains `POST /api/v1/containers/{vmid}/rollback`. It requires `manual_rollback_allowed`, a failed/blocked/interrupted update job, and the snapshot recorded by that job.
 
-Jobs expose operation type, request ID, status, stage, progress, result, error, and durable events. Terminal jobs are never replayed; startup reconciliation marks uncertain destructive work interrupted unless the real host state proves the requested terminal condition.
+Jobs expose operation type, request ID, status, stage, progress, result, error, and durable events. Polling a live lifecycle or snapshot job is a read-only database operation and never performs reconciliation or changes job state. Terminal jobs are never replayed; one-time startup reconciliation marks uncertain destructive work interrupted unless the real host state proves the requested terminal condition. Self-update polling separately refreshes the durable supervisor marker so a late terminal rollout result can be observed without another hostd restart.

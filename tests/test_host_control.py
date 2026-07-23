@@ -340,6 +340,34 @@ class DummyController:
         return {"action": action, "vmid": vmid}
 
 
+class BlockingController(DummyController):
+    def __init__(self) -> None:
+        super().__init__()
+        self.operation_started = threading.Event()
+        self.allow_completion = threading.Event()
+
+    def execute(
+        self,
+        action: str,
+        vmid: int,
+        argument: str | None = None,
+        *,
+        source_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        if action == "status":
+            return super().execute(
+                action,
+                vmid,
+                argument,
+                source_job_id=source_job_id,
+            )
+        self.calls.append((action, vmid, argument, source_job_id))
+        self.operation_started.set()
+        if not self.allow_completion.wait(timeout=5):
+            raise RuntimeError("test did not release the blocked host operation")
+        return {"action": action, "vmid": vmid}
+
+
 class DelayedSelfUpdateController(DummyController):
     def __init__(self, results: Path) -> None:
         super().__init__()
@@ -475,6 +503,134 @@ def test_host_job_runner_persists_terminal_result(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("operation_type", "argument"),
+    [
+        ("snapshot_create", "hubinet-ops-110-manual-20260723T220000Z"),
+        ("snapshot_rollback", "hubinet-ops-110-manual-20260723T220000Z"),
+        ("snapshot_delete", "hubinet-ops-110-manual-20260723T220000Z"),
+        ("lifecycle_shutdown", None),
+        ("lifecycle_start", None),
+        ("lifecycle_force_stop", None),
+        ("lifecycle_reboot", None),
+    ],
+)
+def test_live_job_polling_is_read_only_until_worker_finishes(
+    tmp_path: Path,
+    operation_type: str,
+    argument: str | None,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = BlockingController()
+    runner = HostJobRunner(store, controller)  # type: ignore[arg-type]
+    application = HostdApplication(
+        HostdConfig(
+            bind="127.0.0.1",
+            port=8741,
+            database=tmp_path / "jobs.db",
+            client_allowlist=frozenset(),
+        ),
+        store,
+        runner,
+        "g" * 64,
+        "u" * 64,
+    )
+    job, _ = store.create(
+        vmid=110,
+        operation_type=operation_type,
+        request_id=f"request-live-{operation_type}",
+        argument=argument,
+    )
+    worker = threading.Thread(target=runner.run, args=(job["id"],))
+    worker.start()
+    assert controller.operation_started.wait(timeout=5)
+
+    for _ in range(3):
+        polled = application.get_job(job["id"])
+        assert polled["status"] == "running"
+        assert polled["stage"] == "executing"
+    assert all(call[0] != "status" for call in controller.calls)
+
+    controller.allow_completion.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    terminal = application.get_job(job["id"])
+    assert terminal["status"] == "succeeded"
+    assert terminal["result"]["action"] == {
+        "snapshot_create": "snapshot-create",
+        "snapshot_rollback": "snapshot-rollback",
+        "snapshot_delete": "snapshot-delete",
+        "lifecycle_shutdown": "shutdown",
+        "lifecycle_start": "start",
+        "lifecycle_force_stop": "force-stop",
+        "lifecycle_reboot": "reboot",
+    }[operation_type]
+    assert all(call[0] != "status" for call in controller.calls)
+
+
+def test_get_job_leaves_queued_job_unchanged_before_worker_starts(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = DummyController()
+    application = HostdApplication(
+        HostdConfig(
+            bind="127.0.0.1",
+            port=8741,
+            database=tmp_path / "jobs.db",
+            client_allowlist=frozenset(),
+        ),
+        store,
+        HostJobRunner(store, controller),  # type: ignore[arg-type]
+        "g" * 64,
+        "u" * 64,
+    )
+    job, _ = store.create(
+        vmid=110,
+        operation_type="snapshot_create",
+        request_id="request-queued-before-worker",
+        argument="hubinet-ops-110-manual-20260723T220100Z",
+    )
+
+    assert application.get_job(job["id"])["status"] == "queued"
+    assert store.get(job["id"])["status"] == "queued"
+    assert controller.calls == []
+
+
+def test_worker_does_not_overwrite_existing_terminal_result(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = BlockingController()
+    runner = HostJobRunner(store, controller)  # type: ignore[arg-type]
+    job, _ = store.create(
+        vmid=110,
+        operation_type="snapshot_delete",
+        request_id="request-terminal-cas-preserved",
+        argument="hubinet-ops-110-manual-20260723T220200Z",
+    )
+    worker = threading.Thread(target=runner.run, args=(job["id"],))
+    worker.start()
+    assert controller.operation_started.wait(timeout=5)
+    store.transition_from_active(
+        job["id"],
+        status="interrupted",
+        stage="interrupted",
+        progress=100,
+        error="startup ownership was lost; outcome is unknown",
+    )
+
+    controller.allow_completion.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    terminal = store.get(job["id"])
+    assert terminal["status"] == "interrupted"
+    assert terminal["error"] == "startup ownership was lost; outcome is unknown"
+    assert terminal["result"] is None
+    assert "transition skipped because job is no longer active" in caplog.text
+
+
+@pytest.mark.parametrize(
     ("operation_type", "runtime_status"),
     [
         ("lifecycle_start", "running"),
@@ -482,7 +638,7 @@ def test_host_job_runner_persists_terminal_result(tmp_path: Path) -> None:
         ("lifecycle_force_stop", "stopped"),
     ],
 )
-def test_startup_reconciliation_uses_production_runtime_payload_without_replay(
+def test_startup_reconciliation_after_store_recreation_uses_runtime_without_replay(
     tmp_path: Path,
     operation_type: str,
     runtime_status: str,
@@ -496,7 +652,20 @@ def test_startup_reconciliation_uses_production_runtime_payload_without_replay(
         request_id=f"request-{operation_type}-0004",
     )
 
-    reconciled = store.reconcile(controller)  # type: ignore[arg-type]
+    restarted = HostJobStore(tmp_path / "jobs.db")
+    reconciled = restarted.reconcile_startup(controller)  # type: ignore[arg-type]
+    application = HostdApplication(
+        HostdConfig(
+            bind="127.0.0.1",
+            port=8741,
+            database=tmp_path / "jobs.db",
+            client_allowlist=frozenset(),
+        ),
+        restarted,
+        HostJobRunner(restarted, controller),  # type: ignore[arg-type]
+        "g" * 64,
+        "u" * 64,
+    )
 
     assert reconciled[0]["status"] == "succeeded"
     assert reconciled[0]["result"] == {
@@ -504,7 +673,34 @@ def test_startup_reconciliation_uses_production_runtime_payload_without_replay(
         "runtime_status": runtime_status,
     }
     assert controller.calls == [("status", 110, None, None)]
-    assert store.get(job["id"])["status"] == "succeeded"
+    assert application.get_job(job["id"])["status"] == "succeeded"
+    assert controller.calls == [("status", 110, None, None)]
+
+
+@pytest.mark.parametrize(
+    "operation_type",
+    ["snapshot_create", "snapshot_rollback", "snapshot_delete"],
+)
+def test_snapshot_job_at_real_startup_is_interrupted_without_replay(
+    tmp_path: Path,
+    operation_type: str,
+) -> None:
+    initial = HostJobStore(tmp_path / "jobs.db")
+    job, _ = initial.create(
+        vmid=110,
+        operation_type=operation_type,
+        request_id=f"request-startup-{operation_type}",
+        argument="hubinet-ops-110-manual-20260723T220300Z",
+    )
+    initial.begin_execution(job["id"])
+    controller = DummyController()
+    restarted = HostJobStore(tmp_path / "jobs.db")
+
+    reconciled = restarted.reconcile_startup(controller)  # type: ignore[arg-type]
+
+    assert reconciled[0]["status"] == "interrupted"
+    assert "outcome is unknown" in reconciled[0]["error"]
+    assert controller.calls == []
 
 
 def test_reboot_reconciliation_is_unknown_even_when_lxc_is_running(
@@ -519,7 +715,7 @@ def test_reboot_reconciliation_is_unknown_even_when_lxc_is_running(
         request_id="request-reboot-0004",
     )
 
-    reconciled = store.reconcile(controller)  # type: ignore[arg-type]
+    reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
     assert reconciled[0]["status"] == "interrupted"
     assert "cannot prove" in reconciled[0]["error"]
@@ -543,7 +739,7 @@ def test_status_reconciliation_falls_back_to_runtime_status(
         request_id="request-runtime-fallback-0004",
     )
 
-    reconciled = store.reconcile(controller)  # type: ignore[arg-type]
+    reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
     assert reconciled[0]["status"] == "succeeded"
     assert reconciled[0]["result"]["runtime_status"] == "running"
@@ -572,7 +768,7 @@ def test_status_reconciliation_reports_controlled_unknown_for_invalid_payload_or
         request_id="request-invalid-status-0004",
     )
 
-    reconciled = store.reconcile(controller)  # type: ignore[arg-type]
+    reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
     assert reconciled[0]["status"] == "interrupted"
     assert reconciled[0]["error"].startswith("status reconciliation failed:")
@@ -615,7 +811,7 @@ def test_self_update_result_survives_hostd_store_recreation(
     )
 
     restarted = HostJobStore(database, results)
-    still_running = restarted.reconcile(DummyController())  # type: ignore[arg-type]
+    still_running = restarted.reconcile_startup(DummyController())  # type: ignore[arg-type]
 
     assert still_running[0]["status"] == "running"
     write_marker(
@@ -632,7 +828,7 @@ def test_self_update_result_survives_hostd_store_recreation(
         },
     )
 
-    reconciled = restarted.reconcile(DummyController())  # type: ignore[arg-type]
+    reconciled = restarted.reconcile_startup(DummyController())  # type: ignore[arg-type]
 
     terminal = restarted.get(job["id"])
     assert reconciled[0]["status"] == expected_status
@@ -663,7 +859,7 @@ def test_self_update_without_supervisor_marker_is_interrupted_unknown(
     terminal = HostJobStore(
         tmp_path / "jobs.db",
         tmp_path / "results",
-    ).reconcile(DummyController())[0]  # type: ignore[arg-type]
+    ).reconcile_startup(DummyController())[0]  # type: ignore[arg-type]
 
     assert terminal["status"] == "interrupted"
     assert "outcome is unknown" in terminal["error"]
@@ -725,6 +921,7 @@ def test_get_during_slow_self_update_prepare_waits_for_marker_and_then_succeeds(
 
     assert terminal["status"] == "succeeded"
     assert terminal["result"]["exit_code"] == 0
+    assert terminal["result"]["supervisor_result_refreshed"] is True
 
 
 def test_missing_launch_marker_before_deadline_survives_hostd_restart_without_replay(
@@ -744,7 +941,7 @@ def test_missing_launch_marker_before_deadline_survives_hostd_restart_without_re
 
     controller = DummyController()
     restarted = HostJobStore(database, results)
-    reconciled = restarted.reconcile(controller)  # type: ignore[arg-type]
+    reconciled = restarted.reconcile_startup(controller)  # type: ignore[arg-type]
 
     assert reconciled[0]["status"] == "running"
     assert reconciled[0]["stage"] == "launching"
@@ -765,7 +962,7 @@ def test_terminal_self_update_job_cannot_invoke_systemd_run(
         argument="a" * 64,
     )
     store.begin_self_update_launch(job["id"])
-    store.transition(
+    store.transition_from_active(
         job["id"],
         status="interrupted",
         stage="interrupted",
@@ -820,7 +1017,7 @@ def test_prepare_does_not_publish_running_marker_after_job_terminalization(
 
     def terminalize_during_scan(root: Path) -> dict[str, Any]:
         assert root == release_root
-        store.transition(
+        store.transition_from_active(
             job["id"],
             status="interrupted",
             stage="interrupted",
@@ -880,7 +1077,7 @@ def test_supervisor_rechecks_terminal_job_after_release_scan_before_rollout(
 
     def terminalize_during_scan(root: Path) -> dict[str, Any]:
         assert root == release_root
-        store.transition(
+        store.transition_from_active(
             job["id"],
             status="interrupted",
             stage="interrupted",

@@ -207,7 +207,25 @@ class HostJobStore:
             ).fetchall()
         return [self._row(row) for row in rows]
 
-    def transition(
+    def begin_execution(self, job_id: str) -> dict[str, Any]:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE host_jobs SET status='running', stage='executing', progress=10, "
+                "updated_at=? WHERE id=? AND status='queued'",
+                (utc_now(), job_id),
+            )
+        if cursor.rowcount != 1:
+            current = self.get(job_id)
+            LOG.warning(
+                "host job execution start skipped because job is no longer queued "
+                "id=%s existing_status=%s",
+                job_id,
+                current["status"],
+            )
+            return current
+        return self.get(job_id)
+
+    def transition_from_active(
         self,
         job_id: str,
         *,
@@ -217,20 +235,34 @@ class HostJobStore:
         result: dict[str, Any] | None = None,
         error: str | None = None,
     ) -> dict[str, Any]:
+        if status not in TERMINAL_STATUSES:
+            raise ValueError("transition_from_active requires a terminal status")
         with self._lock, self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE host_jobs SET status=?, stage=?, progress=?, result_json=?, error=?, "
-                "updated_at=? WHERE id=?",
+                "updated_at=? WHERE id=? AND status IN ('queued','running')",
                 (
                     status,
                     stage,
                     progress,
-                    json.dumps(result, sort_keys=True, separators=(",", ":")) if result else None,
+                    json.dumps(result, sort_keys=True, separators=(",", ":"))
+                    if result
+                    else None,
                     error,
                     utc_now(),
                     job_id,
                 ),
             )
+        if cursor.rowcount != 1:
+            current = self.get(job_id)
+            LOG.warning(
+                "host job transition skipped because job is no longer active "
+                "id=%s requested_status=%s existing_status=%s",
+                job_id,
+                status,
+                current["status"],
+            )
+            return current
         return self.get(job_id)
 
     def begin_self_update_launch(
@@ -271,7 +303,7 @@ class HostJobStore:
                 },
             )
         except (OSError, ReleaseError) as exc:
-            self.transition(
+            self.transition_from_active(
                 job_id,
                 status="failed",
                 stage="failed",
@@ -283,17 +315,19 @@ class HostJobStore:
             ) from exc
         return self.get(job_id)
 
-    def reconcile(self, controller: HostController) -> list[dict[str, Any]]:
+    def reconcile_startup(self, controller: HostController) -> list[dict[str, Any]]:
         reconciled: list[dict[str, Any]] = []
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM host_jobs WHERE status IN ('queued','running') ORDER BY created_at"
             ).fetchall()
         for row in rows:
-            reconciled.append(self.reconcile_job(controller, self._row(row)["id"]))
+            reconciled.append(
+                self.reconcile_startup_job(controller, self._row(row)["id"])
+            )
         return reconciled
 
-    def reconcile_job(
+    def reconcile_startup_job(
         self,
         controller: HostController,
         job_id: str,
@@ -302,7 +336,7 @@ class HostJobStore:
         if job["status"] in TERMINAL_STATUSES:
             return job
         if job["operation_type"] == "self_update":
-            return self._reconcile_self_update(job)
+            return self.refresh_self_update_result(job_id)
 
         result: dict[str, Any] | None = None
         terminal = "interrupted"
@@ -336,7 +370,7 @@ class HostJobStore:
                     )
             except Exception as exc:  # reconciliation must never repeat the operation
                 message = f"status reconciliation failed: {exc}"
-        return self.transition(
+        return self.transition_from_active(
             job["id"],
             status=terminal,
             stage="complete" if terminal == "succeeded" else "interrupted",
@@ -345,7 +379,14 @@ class HostJobStore:
             error=message,
         )
 
-    def _reconcile_self_update(self, job: dict[str, Any]) -> dict[str, Any]:
+    def refresh_self_update_result(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job["operation_type"] != "self_update":
+            raise HostControlError(
+                "supervisor marker refresh is supported only for self-update jobs"
+            )
+        if job["status"] in TERMINAL_STATUSES:
+            return job
         terminal = "interrupted"
         stage = "interrupted"
         result: dict[str, Any] | None = None
@@ -389,7 +430,7 @@ class HostJobStore:
                 terminal = "succeeded"
                 stage = "complete"
                 message = None
-                result = {**marker, "reconciled": True}
+                result = {**marker, "supervisor_result_refreshed": True}
                 remove = True
             elif marker.get("status") == "failed":
                 terminal = "failed"
@@ -399,13 +440,13 @@ class HostJobStore:
                     f"self-update supervisor failed with exit code {exit_code}: "
                     f"{str(marker.get('error') or 'rollout failed')[:4096]}"
                 )
-                result = {**marker, "reconciled": True}
+                result = {**marker, "supervisor_result_refreshed": True}
                 remove = True
         except ReleaseError as exc:
             message = f"{exc}; rollout outcome is unknown"
             remove = True
 
-        persisted = self.transition(
+        persisted = self.transition_from_active(
             job["id"],
             status=terminal,
             stage=stage,
@@ -450,7 +491,9 @@ class HostJobRunner:
             elif job["status"] != "queued":
                 return job
             else:
-                self.store.transition(job_id, status="running", stage="executing", progress=10)
+                started = self.store.begin_execution(job_id)
+                if started["status"] != "running" or started["stage"] != "executing":
+                    return started
             action = {
                 "lifecycle_start": "start",
                 "lifecycle_shutdown": "shutdown",
@@ -489,10 +532,10 @@ class HostJobRunner:
                     except ReleaseError:
                         marker = {"status": "invalid"}
                     if marker is not None:
-                        reconciled = self.store.reconcile_job(self.controller, job_id)
-                        if reconciled["status"] in TERMINAL_STATUSES:
-                            return reconciled
-                failed = self.store.transition(
+                        refreshed = self.store.refresh_self_update_result(job_id)
+                        if refreshed["status"] in TERMINAL_STATUSES:
+                            return refreshed
+                failed = self.store.transition_from_active(
                     job_id,
                     status="failed",
                     stage="failed",
@@ -510,9 +553,9 @@ class HostJobRunner:
                         )
                 return failed
             if job["operation_type"] == "self_update":
-                return self.store.reconcile_job(self.controller, job_id)
+                return self.store.refresh_self_update_result(job_id)
             LOG.info("host job succeeded id=%s vmid=%s operation=%s", job_id, job["vmid"], job["operation_type"])
-            return self.store.transition(
+            return self.store.transition_from_active(
                 job_id,
                 status="succeeded",
                 stage="complete",
@@ -592,7 +635,13 @@ class HostdApplication:
         return job, created
 
     def get_job(self, job_id: str) -> dict[str, Any]:
-        return self.store.reconcile_job(self.runner.controller, job_id)
+        job = self.store.get(job_id)
+        if (
+            job["operation_type"] == "self_update"
+            and job["status"] not in TERMINAL_STATUSES
+        ):
+            return self.store.refresh_self_update_result(job_id)
+        return job
 
 
 class HostdHandler(BaseHTTPRequestHandler):
@@ -785,7 +834,7 @@ def main() -> int:
     controller = HostController()
     store = HostJobStore(config.database)
     os.environ["HUBINET_OPS_SELF_UPDATE_RESULTS"] = str(store.self_update_results)
-    store.reconcile(controller)
+    store.reconcile_startup(controller)
     application = HostdApplication(
         config,
         store,
