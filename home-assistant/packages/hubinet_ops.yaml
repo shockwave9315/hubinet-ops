@@ -143,7 +143,7 @@ rest_command:
       Authorization: !secret hubinet_ops_host_authorization
       Content-Type: application/json
     payload: >-
-      {"request_id":"ha-{{ now().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-{{ action }}"}
     timeout: 30
 
   hubinet_ops_host_snapshot_create:
@@ -153,7 +153,7 @@ rest_command:
       Authorization: !secret hubinet_ops_host_authorization
       Content-Type: application/json
     payload: >-
-      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110","name":"hubinet-ops-110-manual-{{ utcnow().strftime('%Y%m%dT%H%M%SZ') }}"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-snap-create","name":"hubinet-ops-110-manual-{{ utcnow().strftime('%Y%m%dT%H%M%SZ') }}"}
     timeout: 30
 
   hubinet_ops_host_snapshot_restore:
@@ -163,7 +163,7 @@ rest_command:
       Authorization: !secret hubinet_ops_host_authorization
       Content-Type: application/json
     payload: >-
-      {"request_id":"ha-{{ now().strftime('%Y%m%dT%H%M%S') }}-110"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-snap-restore-{{ snapshot_name }}"}
     timeout: 30
 
   hubinet_ops_host_snapshot_delete:
@@ -173,7 +173,7 @@ rest_command:
       Authorization: !secret hubinet_ops_host_authorization
       Content-Type: application/json
     payload: >-
-      {"request_id":"ha-{{ now().strftime('%Y%m%dT%H%M%S') }}-110"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-snap-delete-{{ snapshot_name }}"}
     timeout: 30
 
 script:

@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+ROOT = Path(__file__).parents[1]
+PVE = ROOT / "deploy" / "pve"
+sys.path.insert(0, str(PVE))
+
 from app.mqtt import _ct_entities
+from hubinet_ops_hostd import REQUEST_ID_RE
 from scripts.validate_yaml import HomeAssistantLoader
 
-ROOT = Path(__file__).parents[1]
 PACKAGE = ROOT / "home-assistant" / "packages" / "hubinet_ops.yaml"
 DASHBOARD = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
 SECRETS_EXAMPLE = ROOT / "home-assistant" / "secrets.example.yaml"
@@ -190,6 +196,97 @@ def test_dashboard_actions_exist_and_active_plan_decisions_use_only_vmid() -> No
     assert "/containers/{{ vmid }}/rollback" in secrets_text
     assert "state_attr" not in package_text.split("hubinet_ops_approve_container:", 1)[1].split("automation:", 1)[0]
     assert "active_plan_id" not in package_text.split("script:", 1)[1].split("automation:", 1)[0]
+
+
+def test_ct110_host_request_ids_include_operation_and_snapshot_identity() -> None:
+    package = _load(PACKAGE)
+    commands = package["rest_command"]
+    timestamp = "20260723T221530"
+    snapshot = "hubinet-ops-110-manual-20260723T220000Z"
+
+    def render_request_id(
+        command: str,
+        *,
+        action: str | None = None,
+        snapshot_name: str | None = None,
+    ) -> str:
+        payload = commands[command]["payload"]
+        payload = payload.replace(
+            "{{ utcnow().strftime('%Y%m%dT%H%M%S') }}",
+            timestamp,
+        ).replace(
+            "{{ utcnow().strftime('%Y%m%dT%H%M%SZ') }}",
+            f"{timestamp}Z",
+        )
+        payload = payload.replace("{{ vmid | int }}", "110")
+        if action is not None:
+            payload = payload.replace("{{ action }}", action)
+        if snapshot_name is not None:
+            payload = payload.replace("{{ snapshot_name }}", snapshot_name)
+        parsed = json.loads(payload)
+        return str(parsed["request_id"])
+
+    request_ids = {
+        "start": render_request_id("hubinet_ops_host_action", action="start"),
+        "shutdown": render_request_id("hubinet_ops_host_action", action="shutdown"),
+        "reboot": render_request_id("hubinet_ops_host_action", action="reboot"),
+        "force-stop": render_request_id(
+            "hubinet_ops_host_action",
+            action="force-stop",
+        ),
+        "snapshot-create": render_request_id("hubinet_ops_host_snapshot_create"),
+        "snapshot-restore": render_request_id(
+            "hubinet_ops_host_snapshot_restore",
+            snapshot_name=snapshot,
+        ),
+        "snapshot-delete": render_request_id(
+            "hubinet_ops_host_snapshot_delete",
+            snapshot_name=snapshot,
+        ),
+    }
+
+    assert request_ids == {
+        "start": "ha-20260723T221530-110-start",
+        "shutdown": "ha-20260723T221530-110-shutdown",
+        "reboot": "ha-20260723T221530-110-reboot",
+        "force-stop": "ha-20260723T221530-110-force-stop",
+        "snapshot-create": "ha-20260723T221530-110-snap-create",
+        "snapshot-restore": (
+            "ha-20260723T221530-110-snap-restore-"
+            "hubinet-ops-110-manual-20260723T220000Z"
+        ),
+        "snapshot-delete": (
+            "ha-20260723T221530-110-snap-delete-"
+            "hubinet-ops-110-manual-20260723T220000Z"
+        ),
+    }
+    assert len(set(request_ids.values())) == len(request_ids)
+    assert all(REQUEST_ID_RE.fullmatch(value) for value in request_ids.values())
+    assert all(len(value) <= 128 for value in request_ids.values())
+    assert snapshot in request_ids["snapshot-restore"]
+    assert snapshot in request_ids["snapshot-delete"]
+    assert all(
+        "{{ now().strftime" not in commands[name]["payload"]
+        for name in (
+            "hubinet_ops_host_action",
+            "hubinet_ops_host_snapshot_create",
+            "hubinet_ops_host_snapshot_restore",
+            "hubinet_ops_host_snapshot_delete",
+        )
+    )
+    lifecycle_actions = {
+        item["data"]["action"]
+        for script_name in (
+            "hubinet_ops_start_container",
+            "hubinet_ops_shutdown_container",
+            "hubinet_ops_reboot_container",
+            "hubinet_ops_force_stop_container",
+        )
+        for item in _walk(package["script"][script_name])
+        if isinstance(item, dict)
+        and item.get("action") == "rest_command.hubinet_ops_host_action"
+    }
+    assert lifecycle_actions == {"start", "shutdown", "reboot", "force-stop"}
 
 
 def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() -> None:

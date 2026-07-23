@@ -442,6 +442,25 @@ def test_host_jobs_are_durable_idempotent_and_single_writer(tmp_path: Path) -> N
     assert created is True
     assert created_again is False
     assert same["id"] == job["id"]
+    with pytest.raises(
+        ValueError,
+        match="request_id was already used for another operation",
+    ):
+        store.create(
+            vmid=110,
+            operation_type="lifecycle_shutdown",
+            request_id="request-0001",
+        )
+    with pytest.raises(
+        ValueError,
+        match="request_id was already used for another operation",
+    ):
+        store.create(
+            vmid=110,
+            operation_type="lifecycle_start",
+            request_id="request-0001",
+            argument="different-argument",
+        )
     with pytest.raises(HostControlError, match="active"):
         store.create(
             vmid=106,
