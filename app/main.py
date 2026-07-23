@@ -279,7 +279,7 @@ def create_app(
         request: OperationRequest | None = None,
     ) -> dict[str, Any]:
         try:
-            return service.queue_self_update(vmid, request.request_id if request else None)
+            return service.create_self_update_plan(vmid)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Resource not found") from exc
         except (ValueError, ExecutorError, HostControlError) as exc:

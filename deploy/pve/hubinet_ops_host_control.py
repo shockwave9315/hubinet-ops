@@ -12,13 +12,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from hubinet_ops_release import FINGERPRINT_RE, inspect_staged_release, public_release
+
 SNAPSHOT_RE = re.compile(
     r"^hubinet-ops-(?P<vmid>[1-9][0-9]{1,5})-"
     r"(?P<kind>pre-update|manual)-(?P<stamp>[0-9]{8}T[0-9]{6}Z)$"
 )
 SOURCE_JOB_RE = re.compile(r"^[a-f0-9]{8,64}$")
 RESOURCE_TYPES = {"lxc", "qemu"}
-READ_ONLY_ACTIONS = {"status", "inspect", "capabilities", "list-snapshots"}
+READ_ONLY_ACTIONS = {
+    "status",
+    "inspect",
+    "capabilities",
+    "list-snapshots",
+    "self-update-release",
+}
 LIFECYCLE_ACTIONS = {"start", "shutdown", "reboot", "force-stop"}
 MANAGED_ACTIONS = {
     "scan": "check-updates",
@@ -59,6 +67,7 @@ class HostPaths:
     pve_local: Path = Path("/etc/pve/local")
     pve_nodes: Path = Path("/etc/pve/nodes")
     self_update: Path = Path("/usr/local/sbin/hubinet-ops-self-update")
+    self_update_release: Path = Path("/var/lib/hubinet-ops-hostd/approved-release")
 
 
 class HostPolicy:
@@ -97,11 +106,14 @@ class HostPolicy:
         if normalized in SNAPSHOT_ACTIONS:
             if resource_type != "lxc" or vmid not in self.host_control:
                 raise HostControlError("VMID not host-control allowed")
-        if normalized == "self-update" and vmid != 110:
+        if normalized in {"self-update", "self-update-release"} and vmid != 110:
             raise HostControlError("Self-update is allowed only for CT110")
         if normalized in SNAPSHOT_ACTIONS:
             if not argument or not owned_snapshot(argument, vmid):
                 raise HostControlError("Snapshot is not owned by Hubinet Ops")
+        elif normalized == "self-update":
+            if not argument or not FINGERPRINT_RE.fullmatch(argument):
+                raise HostControlError("Self-update requires an approved release fingerprint")
         elif argument is not None:
             raise HostControlError("Action does not accept an argument")
         return normalized, vmid, argument, resource_type
@@ -137,6 +149,13 @@ class HostController:
             return self._status(vmid, resource_type)
         if action == "inspect":
             return self._inspect(vmid, resource_type)
+        if action == "self-update-release":
+            try:
+                return public_release(
+                    inspect_staged_release(self.policy.paths.self_update_release)
+                )
+            except RuntimeError as exc:
+                raise HostControlError(str(exc)) from exc
         if action == "capabilities":
             self._require_running(vmid)
             return self._managed(vmid, "capabilities", timeout=60)
@@ -182,8 +201,24 @@ class HostController:
             script = self.policy.paths.self_update
             if not script.is_file():
                 raise HostControlError("CT110 self-update supervisor is not installed")
-            self._run([str(script)], timeout=3600)
-            return {"action": "self-update", "vmid": 110}
+            if source_job_id is None:
+                raise HostControlError("Self-update requires a durable source job ID")
+            self._run(
+                [
+                    str(script),
+                    "--job-id",
+                    source_job_id,
+                    "--fingerprint",
+                    str(argument),
+                ],
+                timeout=60,
+            )
+            return {
+                "action": "self-update",
+                "vmid": 110,
+                "fingerprint": argument,
+                "supervisor_started": True,
+            }
         raise HostControlError("Action not implemented")
 
     def managed_passthrough(self, action: str, vmid: int) -> int:

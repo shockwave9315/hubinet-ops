@@ -265,13 +265,13 @@ def validate_config(raw: dict[str, Any]) -> None:
         if adapter == "agent_self":
             forbidden = {
                 name
-                for name in ("scan", "approve", "reject", "retry_healthcheck", "rollback")
+                for name in ("scan", "retry_healthcheck", "rollback")
                 if bool(capabilities.get(name, False))
             }
             if forbidden:
                 raise RuntimeError(
-                    "Resource 110 agent_self supports only host lifecycle, snapshot, refresh, "
-                    "and self-update capabilities"
+                    "Resource 110 agent_self supports only plan approval, host lifecycle, "
+                    "snapshot, refresh, and self-update capabilities"
                 )
 
         actions_raw = value.get("repair_actions") or []
@@ -441,7 +441,7 @@ def validate_config(raw: dict[str, Any]) -> None:
     if not isinstance(host_control, dict):
         raise RuntimeError("host_control must be an object")
     unknown_host_control = set(host_control) - {
-        "enabled", "base_url", "token_env", "timeout_seconds",
+        "enabled", "base_url", "token_env", "update_token_env", "timeout_seconds",
         "operation_timeout_seconds", "poll_interval_seconds",
     }
     if unknown_host_control:
@@ -455,6 +455,12 @@ def validate_config(raw: dict[str, Any]) -> None:
         token_env = str(host_control.get("token_env") or "HUBINET_OPS_HOSTD_TOKEN")
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", token_env):
             raise RuntimeError("host_control.token_env is invalid")
+        update_token_env = str(
+            host_control.get("update_token_env")
+            or "HUBINET_OPS_HOSTD_UPDATE_TOKEN"
+        )
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", update_token_env):
+            raise RuntimeError("host_control.update_token_env is invalid")
     for key, default in (
         ("timeout_seconds", 30),
         ("operation_timeout_seconds", 1800),

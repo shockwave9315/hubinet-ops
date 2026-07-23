@@ -40,14 +40,25 @@ class CompatibleExecutor:
 class FakeHostControl:
     def __init__(self, status: str = "stopped") -> None:
         self.runtime = status
-        self.calls: list[tuple[str, int, str, str | None]] = []
+        self.calls: list[tuple[str, int, str, str | None, str | None]] = []
         self.snapshots: list[dict[str, Any]] = []
+        self.release = {
+            "version": "0.4.0",
+            "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
+            "fingerprint": "a" * 64,
+            "file_count": 136,
+            "total_bytes": 1000,
+        }
 
     def status(self, vmid: int) -> dict[str, Any]:
         return {"resource_type": "lxc", "runtime_status": self.runtime, "lxc_status": self.runtime}
 
     def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
         return [dict(item) for item in self.snapshots]
+
+    def inspect_self_update_release(self, vmid: int) -> dict[str, Any]:
+        assert vmid == 110
+        return dict(self.release)
 
     def execute(
         self,
@@ -56,8 +67,17 @@ class FakeHostControl:
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        release_fingerprint: str | None = None,
     ) -> dict[str, Any]:
-        self.calls.append((operation_type, vmid, request_id, snapshot_name))
+        self.calls.append(
+            (
+                operation_type,
+                vmid,
+                request_id,
+                snapshot_name,
+                release_fingerprint,
+            )
+        )
         if operation_type == "lifecycle_start":
             self.runtime = "running"
         elif operation_type in {"lifecycle_shutdown", "lifecycle_force_stop"}:
@@ -81,6 +101,14 @@ class FakeHostControl:
             )
         elif operation_type == "snapshot_delete":
             self.snapshots = [item for item in self.snapshots if item["name"] != snapshot_name]
+        elif operation_type == "self_update":
+            assert release_fingerprint == self.release["fingerprint"]
+            return {
+                "version": self.release["version"],
+                "release_id": self.release["release_id"],
+                "fingerprint": release_fingerprint,
+                "exit_code": 0,
+            }
         return {"runtime_status": self.runtime, "lxc_status": self.runtime}
 
 
@@ -94,7 +122,7 @@ def settings(tmp_path: Path, *, vmid: int = 106, adapter: str = "apt") -> Settin
         )
     }
     if adapter == "agent_self":
-        for name in ("scan", "approve", "reject", "retry_healthcheck"):
+        for name in ("scan", "retry_healthcheck"):
             capabilities[name] = False
         capabilities["self_update"] = True
     resource: dict[str, Any] = {
@@ -319,6 +347,121 @@ def test_ct110_start_uses_host_control_when_agent_executor_is_unavailable(tmp_pa
     assert terminal["status"] == "success"
     assert host.runtime == "running"
     assert executor.calls == []
+
+
+def test_ct110_self_update_requires_plan_approval_and_rechecks_before_rollout(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)  # type: ignore[arg-type]
+
+    planned = service.create_self_update_plan(110)
+
+    assert planned["status"] == "plan_created"
+    assert planned["plan"]["status"] == "waiting_approval"
+    assert planned["plan"]["payload"]["release_id"] == host.release["release_id"]
+    assert db.list_jobs() == []
+    state = service.get_state(110)
+    assert state["operation_status"] == "waiting_approval"
+    assert state["self_update_release_fingerprint"] == "a" * 64
+
+    approved = service.approve_active(110, "approve-self-update-0001")
+    same = service.approve_active(110, "approve-self-update-0001")
+    assert same["job"]["id"] == approved["job"]["id"]
+    assert same["job"]["operation_type"] == "self_update"
+    assert approved["job"]["request_id"] == "approve-self-update-0001"
+
+    terminal = run_queued(service, db)
+    assert terminal["status"] == "success"
+    assert terminal["result"]["exit_code"] == 0
+    assert host.calls == [
+        (
+            "self_update",
+            110,
+            "approve-self-update-0001",
+            None,
+            "a" * 64,
+        )
+    ]
+
+
+def test_ct110_self_update_fingerprint_change_blocks_before_host_mutation(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)  # type: ignore[arg-type]
+    planned = service.create_self_update_plan(110)
+    approved = service.approve_active(110, "approve-self-update-0002")
+    host.release["fingerprint"] = "b" * 64
+    host.release["release_id"] = "hubinet-ops-0.4.0-bbbbbbbbbbbbbbbb"
+
+    terminal = run_queued(service, db)
+
+    assert approved["job"]["id"] == terminal["id"]
+    assert terminal["status"] == "failed"
+    assert "changed before rollout" in terminal["error"]
+    assert db.get_plan(planned["plan"]["id"])["status"] == "superseded"
+    assert host.calls == []
+
+
+def test_ct110_self_update_changed_release_cannot_be_approved(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)  # type: ignore[arg-type]
+    planned = service.create_self_update_plan(110)
+    host.release["fingerprint"] = "c" * 64
+    host.release["release_id"] = "hubinet-ops-0.4.0-cccccccccccccccc"
+
+    with pytest.raises(ValueError, match="fingerprint changed"):
+        service.approve_active(110, "approve-self-update-0003")
+
+    assert db.get_plan(planned["plan"]["id"])["status"] == "superseded"
+    assert db.list_jobs() == []
+    assert host.calls == []
+
+
+def test_ct110_self_update_plan_can_be_rejected_without_rollout(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)  # type: ignore[arg-type]
+    planned = service.create_self_update_plan(110)
+
+    rejected = service.reject_active(110)
+
+    assert rejected["plan"]["id"] == planned["plan"]["id"]
+    assert rejected["plan"]["status"] == "rejected"
+    assert db.list_jobs() == []
+    assert host.calls == []
+
+
+@pytest.mark.parametrize("terminal_plan_status", ["expired", "rejected", "completed"])
+def test_terminal_self_update_plan_cannot_start_rollout(
+    tmp_path: Path,
+    terminal_plan_status: str,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)  # type: ignore[arg-type]
+    planned = service.create_self_update_plan(110)
+    service.approve_active(110, f"approve-self-update-{terminal_plan_status}")
+    db.update_plan_status(planned["plan"]["id"], terminal_plan_status)
+
+    terminal = run_queued(service, db)
+
+    assert terminal["status"] == "failed"
+    assert f"status is {terminal_plan_status}, not approved" in terminal["error"]
+    assert host.calls == []
 
 
 def test_startup_reconciliation_marks_terminal_without_replaying(tmp_path: Path) -> None:

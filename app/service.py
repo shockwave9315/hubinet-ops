@@ -17,6 +17,7 @@ from .contracts import (
     EXECUTOR_PROTOCOL_VERSION,
     EXECUTOR_VERSION,
     evaluate_executor_contract,
+    parse_owned_snapshot_name,
 )
 from .database import Database, utc_now
 from .executor import Executor, ExecutorError
@@ -469,6 +470,8 @@ class OpsService:
                 "A scan is running for this container; retry approval after it finishes"
             )
         try:
+            if self._plan_type(candidate) == "self_update":
+                return self._approve_self_update_plan(candidate)
             plan, job = self.db.approve_plan(plan_id)
             return self._publish_approved_plan(plan, job)
         finally:
@@ -481,7 +484,23 @@ class OpsService:
         if not lock.acquire(blocking=False):
             raise ValueError("A scan is active for this resource")
         try:
+            if request_id:
+                existing = self.db.get_job_by_request_id(vmid, request_id)
+                if existing is not None:
+                    if (
+                        existing.get("plan_id")
+                        and existing.get("operation_type") in {"update", "self_update"}
+                    ):
+                        return {
+                            "plan": self.db.get_plan(str(existing["plan_id"])),
+                            "job": existing,
+                        }
+                    raise ValueError(
+                        "request_id was already used for another operation"
+                    )
             plan = self._single_waiting_plan(vmid)
+            if self._plan_type(plan) == "self_update":
+                return self._approve_self_update_plan(plan, request_id)
             self._require_compatible_executor(vmid)
             scan = _executor_data(self.executor.run("scan", vmid, timeout=700))
             pending = max(0, int(scan.get("pending_count", 0) or 0))
@@ -530,7 +549,8 @@ class OpsService:
             if self.db.get_active_job(vmid) is not None:
                 raise ValueError("Another job is already active for this resource")
             plan = self._single_waiting_plan(vmid)
-            self._require_compatible_executor(vmid)
+            if self._plan_type(plan) != "self_update":
+                self._require_compatible_executor(vmid)
             return self.reject(plan["id"])
         finally:
             lock.release()
@@ -542,6 +562,37 @@ class OpsService:
         if len(plans) != 1:
             raise ValueError(f"Resource {vmid} has multiple active waiting plans")
         return plans[0]
+
+    @staticmethod
+    def _plan_type(plan: dict[str, Any]) -> str:
+        payload = plan.get("payload")
+        if not isinstance(payload, dict):
+            return "update"
+        return str(payload.get("plan_type") or "update")
+
+    def _approve_self_update_plan(
+        self,
+        plan: dict[str, Any],
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        if int(plan["vmid"]) != 110 or self._plan_type(plan) != "self_update":
+            raise ValueError("Plan is not a CT110 self-update plan")
+        release = self._read_self_update_release(110)
+        payload = dict(plan.get("payload") or {})
+        if any(
+            str(release.get(key) or "") != str(payload.get(key) or "")
+            for key in ("fingerprint", "release_id", "version")
+        ):
+            self.db.update_plan_status(plan["id"], "superseded")
+            raise ValueError(
+                "Active self-update plan fingerprint changed; create and approve a new plan"
+            )
+        plan, job = self.db.approve_plan(
+            plan["id"],
+            request_id=request_id or uuid.uuid4().hex,
+            operation_type="self_update",
+        )
+        return self._publish_approved_plan(plan, job)
 
     def _publish_approved_plan(
         self,
@@ -557,7 +608,11 @@ class OpsService:
                 "active_job_id": job["id"],
                 "operation_type": job.get("operation_type", "update"),
                 "operation_status": "running",
-                "job_stage": "preflight",
+                "job_stage": (
+                    "preflight"
+                    if job.get("operation_type", "update") == "update"
+                    else "queued"
+                ),
                 "job_progress": 1,
                 "last_operation_result": None,
                 "last_error": None,
@@ -862,8 +917,6 @@ class OpsService:
         name: str | None,
         request_id: str | None = None,
     ) -> dict[str, Any]:
-        from .contracts import parse_owned_snapshot_name
-
         operation_type = {
             "rollback": "snapshot_rollback",
             "delete": "snapshot_delete",
@@ -900,40 +953,123 @@ class OpsService:
         self._mark_job_queued(vmid, job)
         return job
 
-    def queue_self_update(
-        self,
-        vmid: int,
-        request_id: str | None = None,
-    ) -> dict[str, Any]:
+    def create_self_update_plan(self, vmid: int) -> dict[str, Any]:
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
             raise ValueError("A scan or manual operation is active for this resource")
         try:
-            return self._queue_self_update_locked(vmid, request_id)
+            return self._create_self_update_plan_locked(vmid)
         finally:
             lock.release()
 
-    def _queue_self_update_locked(
-        self,
-        vmid: int,
-        request_id: str | None = None,
-    ) -> dict[str, Any]:
+    def _create_self_update_plan_locked(self, vmid: int) -> dict[str, Any]:
         cfg = self._resource(vmid)
         self._require_capability(vmid, "self_update")
         if vmid != 110 or cfg.get("adapter") != "agent_self":
             raise ValueError("Self-update is supported only for CT110")
         if self.host_control is None:
             raise ValueError("CT110 self-update requires independent PVE host control")
-        if self.db.find_active_plan(vmid) is not None:
-            raise ValueError("Resolve the active plan before CT110 self-update")
-        job, _ = self.db.create_operation_job(
-            vmid=vmid,
-            container_name=str(cfg.get("name", "hubinet-ops")),
-            operation_type="self_update",
-            request_id=request_id or uuid.uuid4().hex,
+        if self.db.get_active_job(vmid) is not None:
+            raise ValueError("Another job is already active for this resource")
+        release = self._read_self_update_release(vmid)
+        fingerprint = str(release["fingerprint"])
+        active = self.db.find_active_plan(vmid, fingerprint)
+        if active is not None:
+            if self._plan_type(active) != "self_update":
+                raise ValueError("Resolve the active plan before CT110 self-update")
+            if active.get("status") != "waiting_approval":
+                raise ValueError("Approved self-update plan is already pending execution")
+            status = "existing_plan"
+        else:
+            other = self.db.find_active_plan(vmid)
+            if other is not None:
+                raise ValueError("Resolve the active plan before CT110 self-update")
+            payload = {
+                "plan_type": "self_update",
+                "version": str(release["version"]),
+                "release_id": str(release["release_id"]),
+                "fingerprint": fingerprint,
+                "file_count": release.get("file_count"),
+                "total_bytes": release.get("total_bytes"),
+            }
+            active = self.db.create_plan(
+                vmid=vmid,
+                container_name=str(cfg.get("name", "hubinet-ops")),
+                fingerprint=fingerprint,
+                risk="high",
+                payload=payload,
+                ttl_minutes=int(
+                    self.settings.scheduler.get("approval_ttl_minutes", 1440)
+                ),
+            )
+            status = "plan_created"
+            self._notify_ha(
+                self._notification(
+                    "approval_required",
+                    vmid,
+                    release_id=payload["release_id"],
+                    release_version=payload["version"],
+                    risk="high",
+                )
+            )
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "risk": "high",
+                "active_plan_id": active["id"],
+                "active_plan_status": active["status"],
+                "operation_status": "waiting_approval",
+                "job_stage": "idle",
+                "job_progress": 0,
+                "self_update_release_id": release["release_id"],
+                "self_update_release_version": release["version"],
+                "self_update_release_fingerprint": fingerprint,
+            }
         )
-        self._mark_job_queued(vmid, job)
-        return job
+        self._save_state(vmid, state)
+        return {
+            "vmid": vmid,
+            "status": status,
+            "plan": active,
+            "release": release,
+        }
+
+    def _read_self_update_release(self, vmid: int) -> dict[str, Any]:
+        if self.host_control is None:
+            raise ValueError("CT110 self-update requires independent PVE host control")
+        try:
+            release = self.host_control.inspect_self_update_release(vmid)
+        except HostControlError as exc:
+            raise ValueError(f"Cannot inspect staged self-update release: {exc}") from exc
+        required = ("version", "release_id", "fingerprint")
+        if not all(isinstance(release.get(key), str) and release[key] for key in required):
+            raise ValueError("Staged self-update release identity is invalid")
+        fingerprint = str(release["fingerprint"])
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint
+        ):
+            raise ValueError("Staged self-update release fingerprint is invalid")
+        return dict(release)
+
+    def _validate_self_update_plan(self, job: dict[str, Any]) -> dict[str, Any]:
+        if not job.get("plan_id"):
+            raise ValueError("Self-update job has no approved plan")
+        plan = self.db.get_plan(str(job["plan_id"]))
+        if plan.get("status") != "approved" or self._plan_type(plan) != "self_update":
+            raise ValueError(
+                f"Self-update plan status is {plan.get('status')}, not approved"
+            )
+        release = self._read_self_update_release(int(job["vmid"]))
+        payload = dict(plan.get("payload") or {})
+        if any(
+            str(release.get(key) or "") != str(payload.get(key) or "")
+            for key in ("fingerprint", "release_id", "version")
+        ):
+            self.db.update_plan_status(plan["id"], "superseded")
+            raise ValueError(
+                "Approved self-update release changed before rollout; no changes were made"
+            )
+        return release
 
     def _mark_job_queued(self, vmid: int, job: dict[str, Any]) -> None:
         state = self.get_state(vmid)
@@ -1351,6 +1487,7 @@ class OpsService:
             operation_type = str(job.get("operation_type") or "update")
             succeeded = False
             result: dict[str, Any] | None = None
+            error: Exception | None = None
             try:
                 if operation_type in {
                     "lifecycle_start", "lifecycle_shutdown", "lifecycle_force_stop"
@@ -1368,11 +1505,35 @@ class OpsService:
                     )
                     succeeded = exists if operation_type == "snapshot_create" else not exists
                     result = {"snapshot_exists": exists, "reconciled": True}
+                elif operation_type == "self_update":
+                    if self.host_control is None:
+                        raise ValueError(
+                            "CT110 self-update reconciliation requires PVE host control"
+                        )
+                    release = self._approved_self_update_release(job)
+                    result = self.host_control.execute(
+                        "self_update",
+                        int(job["vmid"]),
+                        str(job["request_id"]),
+                        release_fingerprint=str(release["fingerprint"]),
+                    )
+                    succeeded = True
             except Exception as exc:
+                error = exc
                 LOGGER.warning("Startup reconciliation failed for job %s: %s", job["id"], exc)
             if succeeded:
                 self.db.update_job(job["id"], result=result or {})
                 self._terminal(job, "success", "success", None)
+            elif operation_type == "self_update" and isinstance(error, HostControlError):
+                host_error = error
+                if host_error.result:
+                    self.db.update_job(job["id"], result=host_error.result)
+                self._terminal(
+                    job,
+                    "interrupted" if host_error.status == "interrupted" else "failed",
+                    "failed",
+                    str(host_error),
+                )
             else:
                 self._terminal(
                     job,
@@ -1725,6 +1886,8 @@ class OpsService:
                 self._save_state(vmid, state)
             self._terminal(job, "success", "success", None)
         except (ExecutorError, HostControlError, ValueError) as exc:
+            if isinstance(exc, HostControlError) and exc.result:
+                self.db.update_job(job["id"], result=exc.result)
             state = self.get_state(vmid)
             if operation_type == "retry_healthcheck" and isinstance(exc, ExecutorError):
                 if exc.data:
@@ -1766,6 +1929,14 @@ class OpsService:
         vmid = int(job["vmid"])
         snapshot_name = job.get("snapshot_name")
         if self.host_control is not None:
+            if operation_type == "self_update":
+                release = self._validate_self_update_plan(job)
+                return self.host_control.execute(
+                    operation_type,
+                    vmid,
+                    str(job["request_id"]),
+                    release_fingerprint=str(release["fingerprint"]),
+                )
             return self.host_control.execute(
                 operation_type,
                 vmid,
@@ -1794,6 +1965,20 @@ class OpsService:
                 timeout=1800,
             )
         )
+
+    def _approved_self_update_release(self, job: dict[str, Any]) -> dict[str, Any]:
+        if not job.get("plan_id"):
+            raise ValueError("Self-update job has no approved plan")
+        plan = self.db.get_plan(str(job["plan_id"]))
+        if plan.get("status") != "approved" or self._plan_type(plan) != "self_update":
+            raise ValueError(
+                f"Self-update plan status is {plan.get('status')}, not approved"
+            )
+        payload = dict(plan.get("payload") or {})
+        fingerprint = str(payload.get("fingerprint") or "")
+        if len(fingerprint) != 64:
+            raise ValueError("Approved self-update plan has an invalid fingerprint")
+        return payload
 
     def _raw_snapshot_list(self, vmid: int) -> list[dict[str, Any]]:
         if self.host_control is not None:

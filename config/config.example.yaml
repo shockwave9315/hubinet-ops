@@ -14,6 +14,7 @@ host_control:
   enabled: true
   base_url: http://192.0.2.10:8741
   token_env: HUBINET_OPS_HOSTD_TOKEN
+  update_token_env: HUBINET_OPS_HOSTD_UPDATE_TOKEN
   timeout_seconds: 30
   operation_timeout_seconds: 1800
   poll_interval_seconds: 1
@@ -347,8 +348,8 @@ resources:
     operator_capabilities:
       refresh: true
       scan: false
-      approve: false
-      reject: false
+      approve: true
+      reject: true
       retry_healthcheck: false
       rollback: false
       start: true

@@ -38,7 +38,8 @@ def test_production_inventory_is_exact_and_fail_closed() -> None:
     assert ct110["start"] is True
     assert ct110["snapshot_create"] is True
     assert ct110["self_update"] is True
-    assert ct110["approve"] is False
+    assert ct110["approve"] is True
+    assert ct110["reject"] is True
 
 
 def test_inventory_services_and_docker_do_not_guess_unknown_names() -> None:

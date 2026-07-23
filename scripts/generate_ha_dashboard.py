@@ -386,7 +386,7 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
         "snapshot_create": "Utwórz snapshot",
         "snapshot_rollback": "Przywróć ostatni snapshot",
         "snapshot_delete": "Usuń ostatni snapshot",
-        "self_update": "Aktualizuj control plane",
+        "self_update": "Przygotuj plan aktualizacji",
     }
     service_names = {
         "approve": "script.hubinet_ops_approve_container",
@@ -411,7 +411,7 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
         "snapshot_create": "Ręczny punkt przywracania Hubinet Ops",
         "snapshot_rollback": "Cofnij wszystkie zmiany do ostatniego snapshotu",
         "snapshot_delete": "Trwale usuń ostatni snapshot Hubinet Ops",
-        "self_update": "Aktualizacja CT110 nadzorowana z PVE",
+        "self_update": "Najpierw utwórz plan, następnie zatwierdź go ręcznie",
     }
     colors = {
         "start": "green",
@@ -494,9 +494,9 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
             "dismiss_text": "Anuluj",
         },
         "self_update": {
-            "title": "Aktualizuj Hubinet Ops",
-            "text": "Aktualizacja CT110 będzie nadzorowana przez niezależny control plane na PVE.",
-            "confirm_text": "Aktualizuj",
+            "title": "Przygotuj plan aktualizacji Hubinet Ops",
+            "text": "Staged release zostanie odczytany bez zmian. Rollout wymaga osobnego ręcznego zatwierdzenia aktywnego planu.",
+            "confirm_text": "Utwórz plan",
             "dismiss_text": "Anuluj",
         },
     }
@@ -918,6 +918,41 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
             _resource_chips(vmid, cfg),
         ),
         _controls_section(vmid, cfg),
+        _section(
+            _title(
+                "Plan self-update",
+                "Wersja i fingerprint staged release zatwierdzane ręcznie",
+            ),
+            _entity_grid(
+                [
+                    _entity_card(
+                        _entity(vmid, cfg, "active_plan_status"),
+                        "Status planu",
+                        "mdi:clipboard-check-outline",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "active_plan_id"),
+                        "ID planu",
+                        "mdi:identifier",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "self_update_release_version"),
+                        "Wersja release",
+                        "mdi:tag-outline",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "self_update_release_id"),
+                        "Release ID",
+                        "mdi:package-variant-closed",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "self_update_release_fingerprint"),
+                        "Fingerprint release",
+                        "mdi:fingerprint",
+                    ),
+                ]
+            ),
+        ),
         _section(
             _title("Usługa i API", "Lokalna kontrola CT110"),
             _entity_grid(

@@ -181,7 +181,8 @@ def test_example_policy_enables_full_lxc_control_and_keeps_vm100_denied() -> Non
     assert ct110["start"] is True
     assert ct110["snapshot_rollback"] is True
     assert ct110["self_update"] is True
-    assert ct110["approve"] is False
+    assert ct110["approve"] is True
+    assert ct110["reject"] is True
     assert raw["resources"][101]["recovery_scan"]["enabled"] is False
     assert raw["resources"][106]["recovery_scan"] == {
         "enabled": True,

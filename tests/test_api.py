@@ -15,6 +15,18 @@ class FakeExecutor:
         return {"ok": True, "data": {}}
 
 
+class FakeSelfUpdateHost:
+    def inspect_self_update_release(self, vmid: int) -> dict[str, Any]:
+        assert vmid == 110
+        return {
+            "version": "0.4.0",
+            "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
+            "fingerprint": "a" * 64,
+            "file_count": 136,
+            "total_bytes": 1000,
+        }
+
+
 def make_settings(tmp_path: Path) -> Settings:
     return Settings(
         raw={"scheduler": {"enabled": False}, "mqtt": {"enabled": False}, "home_assistant": {}, "containers": {106: {"enabled": True}}},
@@ -179,3 +191,65 @@ def test_state_endpoint_is_singular_and_active_plan_routes_return_explicit_confl
     assert reject.status_code == 409
     assert "no active waiting plan" in approve.json()["detail"]
     assert "no active waiting plan" in reject.json()["detail"]
+
+
+def test_self_update_endpoint_creates_plan_before_active_approval(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "self-update-import.yaml"
+    config_path.write_text(
+        "scheduler:\n  enabled: false\ncontainers:\n  106:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "self-update-import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+    cfg = Settings(
+        raw={
+            "scheduler": {"enabled": False, "approval_ttl_minutes": 60},
+            "mqtt": {"enabled": False},
+            "home_assistant": {},
+            "resources": {
+                110: {
+                    "name": "hubinet-ops",
+                    "resource_type": "lxc",
+                    "adapter": "agent_self",
+                    "enabled": True,
+                    "monitoring": {"inspect": True, "update_scan": False},
+                    "operator_capabilities": {
+                        "self_update": True,
+                        "approve": True,
+                        "reject": True,
+                    },
+                }
+            },
+        },
+        config_path=tmp_path / "config.yaml",
+        db_path=tmp_path / "self-update.db",
+        api_token="t" * 64,
+    )
+    db = Database(cfg.db_path)
+    client = TestClient(
+        main.create_app(
+            cfg,
+            database=db,
+            executor=FakeExecutor(),
+            host_control=FakeSelfUpdateHost(),  # type: ignore[arg-type]
+        )
+    )
+    headers = {"Authorization": f"Bearer {cfg.api_token}"}
+
+    planned = client.post("/api/v1/resources/110/self-update", headers=headers)
+
+    assert planned.status_code == 200
+    assert planned.json()["plan"]["status"] == "waiting_approval"
+    assert db.list_jobs() == []
+    approved = client.post(
+        "/api/v1/resources/110/plans/approve-active",
+        headers=headers,
+        json={"request_id": "ha-self-update-approval-0001"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["job"]["operation_type"] == "self_update"

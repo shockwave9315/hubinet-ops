@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from hubinet_ops_host_control import HostControlError, HostController
+from hubinet_ops_release import ReleaseError, read_marker, remove_marker
 
 VERSION = "0.4.0"
 MAX_REQUEST_BYTES = 16 * 1024
@@ -40,6 +41,9 @@ ACTION_PATH_RE = re.compile(
 STATUS_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/status$"
 )
+SELF_UPDATE_RELEASE_PATH_RE = re.compile(
+    r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/self-update/release$"
+)
 TERMINAL_STATUSES = {"succeeded", "failed", "interrupted"}
 
 LOG = logging.getLogger("hubinet-ops-hostd")
@@ -47,6 +51,28 @@ LOG = logging.getLogger("hubinet-ops-hostd")
 
 def utc_now() -> str:
     return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
+def _runtime_status(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        raise HostControlError("status response must be an object")
+    value = payload.get("lxc_status")
+    if value in {None, ""}:
+        value = payload.get("runtime_status")
+    status = str(value or "").strip().lower()
+    if status not in {"running", "stopped"}:
+        raise HostControlError("status response has no valid LXC runtime state")
+    return status
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
 
 
 @dataclass(frozen=True)
@@ -79,8 +105,15 @@ class HostdConfig:
 
 
 class HostJobStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        self_update_results: Path | None = None,
+    ) -> None:
         self.path = path
+        self.self_update_results = (
+            self_update_results or path.parent / "self-update-results"
+        )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._init_schema()
@@ -197,35 +230,124 @@ class HostJobStore:
                 "SELECT * FROM host_jobs WHERE status IN ('queued','running') ORDER BY created_at"
             ).fetchall()
         for row in rows:
-            job = self._row(row)
-            result: dict[str, Any] | None = None
-            terminal = "interrupted"
-            message = "hostd restarted while the operation was in progress"
-            if job["operation_type"].startswith("lifecycle_"):
-                try:
-                    actual = controller.execute("status", job["vmid"])["status"]
-                    expected = {
-                        "lifecycle_start": "running",
-                        "lifecycle_shutdown": "stopped",
-                        "lifecycle_force_stop": "stopped",
-                    }.get(job["operation_type"])
-                    if expected is not None and actual == expected:
-                        terminal = "succeeded"
-                        message = None
-                        result = {"status": actual, "reconciled": True}
-                except Exception as exc:  # reconciliation must never repeat the operation
-                    message = f"status reconciliation failed: {exc}"
-            reconciled.append(
-                self.transition(
-                    job["id"],
-                    status=terminal,
-                    stage="complete" if terminal == "succeeded" else "interrupted",
-                    progress=100,
-                    result=result,
-                    error=message,
-                )
-            )
+            reconciled.append(self.reconcile_job(controller, self._row(row)["id"]))
         return reconciled
+
+    def reconcile_job(
+        self,
+        controller: HostController,
+        job_id: str,
+    ) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job["status"] in TERMINAL_STATUSES:
+            return job
+        if job["operation_type"] == "self_update":
+            return self._reconcile_self_update(job)
+
+        result: dict[str, Any] | None = None
+        terminal = "interrupted"
+        message = "hostd restarted while the operation was in progress; outcome is unknown"
+        if job["operation_type"] == "lifecycle_reboot":
+            message = (
+                "hostd restarted during lifecycle_reboot; running state cannot prove "
+                "that the reboot completed"
+            )
+        elif job["operation_type"] in {
+            "lifecycle_start",
+            "lifecycle_shutdown",
+            "lifecycle_force_stop",
+        }:
+            try:
+                payload = controller.execute("status", job["vmid"])
+                actual = _runtime_status(payload)
+                expected = (
+                    "running"
+                    if job["operation_type"] == "lifecycle_start"
+                    else "stopped"
+                )
+                if actual == expected:
+                    terminal = "succeeded"
+                    message = None
+                    result = {"runtime_status": actual, "reconciled": True}
+                else:
+                    message = (
+                        f"lifecycle reconciliation observed {actual}, expected {expected}; "
+                        "outcome is unknown"
+                    )
+            except Exception as exc:  # reconciliation must never repeat the operation
+                message = f"status reconciliation failed: {exc}"
+        return self.transition(
+            job["id"],
+            status=terminal,
+            stage="complete" if terminal == "succeeded" else "interrupted",
+            progress=100,
+            result=result,
+            error=message,
+        )
+
+    def _reconcile_self_update(self, job: dict[str, Any]) -> dict[str, Any]:
+        terminal = "interrupted"
+        stage = "interrupted"
+        result: dict[str, Any] | None = None
+        message = "self-update supervisor result is missing; rollout outcome is unknown"
+        remove = False
+        try:
+            marker = read_marker(self.self_update_results, str(job["id"]))
+            if marker is None:
+                marker = {}
+            elif marker.get("fingerprint") != job.get("argument"):
+                message = (
+                    "self-update supervisor fingerprint does not match the approved release; "
+                    "rollout outcome is unknown"
+                )
+                remove = True
+            elif marker.get("status") == "running":
+                deadline = _parse_timestamp(marker.get("deadline_at"))
+                if deadline is not None and deadline > datetime.now(UTC):
+                    return job
+                message = (
+                    "self-update supervisor did not publish a terminal result before "
+                    "its deadline; rollout outcome is unknown"
+                )
+                remove = True
+            elif marker.get("status") == "succeeded":
+                terminal = "succeeded"
+                stage = "complete"
+                message = None
+                result = {**marker, "reconciled": True}
+                remove = True
+            elif marker.get("status") == "failed":
+                terminal = "failed"
+                stage = "failed"
+                exit_code = int(marker["exit_code"])
+                message = (
+                    f"self-update supervisor failed with exit code {exit_code}: "
+                    f"{str(marker.get('error') or 'rollout failed')[:4096]}"
+                )
+                result = {**marker, "reconciled": True}
+                remove = True
+        except ReleaseError as exc:
+            message = f"{exc}; rollout outcome is unknown"
+            remove = True
+
+        persisted = self.transition(
+            job["id"],
+            status=terminal,
+            stage=stage,
+            progress=100,
+            result=result,
+            error=message,
+        )
+        if remove:
+            try:
+                remove_marker(self.self_update_results, str(job["id"]))
+            except OSError as exc:
+                LOG.warning(
+                    "terminal self-update marker cleanup failed job=%s: %s",
+                    job["id"],
+                    exc,
+                )
+        return persisted
 
     @staticmethod
     def _row(row: sqlite3.Row) -> dict[str, Any]:
@@ -276,13 +398,37 @@ class HostJobRunner:
                 )
             except Exception as exc:
                 LOG.error("host job failed id=%s vmid=%s operation=%s", job_id, job["vmid"], job["operation_type"])
-                return self.store.transition(
+                if job["operation_type"] == "self_update":
+                    try:
+                        marker = read_marker(
+                            self.store.self_update_results,
+                            str(job_id),
+                        )
+                    except ReleaseError:
+                        marker = {"status": "invalid"}
+                    if marker is not None:
+                        reconciled = self.store.reconcile_job(self.controller, job_id)
+                        if reconciled["status"] in TERMINAL_STATUSES:
+                            return reconciled
+                failed = self.store.transition(
                     job_id,
                     status="failed",
                     stage="failed",
                     progress=100,
                     error=str(exc)[:1024],
                 )
+                if job["operation_type"] == "self_update":
+                    try:
+                        remove_marker(self.store.self_update_results, str(job_id))
+                    except OSError as cleanup_error:
+                        LOG.warning(
+                            "failed self-update marker cleanup failed job=%s: %s",
+                            job_id,
+                            cleanup_error,
+                        )
+                return failed
+            if job["operation_type"] == "self_update":
+                return self.store.reconcile_job(self.controller, job_id)
             LOG.info("host job succeeded id=%s vmid=%s operation=%s", job_id, job["vmid"], job["operation_type"])
             return self.store.transition(
                 job_id,
@@ -294,19 +440,40 @@ class HostJobRunner:
 
 
 class HostdApplication:
-    def __init__(self, config: HostdConfig, store: HostJobStore, runner: HostJobRunner, token: str) -> None:
+    def __init__(
+        self,
+        config: HostdConfig,
+        store: HostJobStore,
+        runner: HostJobRunner,
+        token: str,
+        update_token: str,
+    ) -> None:
         if len(token) < 32:
             raise ValueError("HUBINET_OPS_HOSTD_TOKEN must contain at least 32 characters")
+        if len(update_token) < 32:
+            raise ValueError(
+                "HUBINET_OPS_HOSTD_UPDATE_TOKEN must contain at least 32 characters"
+            )
+        if hmac.compare_digest(token, update_token):
+            raise ValueError("Hostd general and self-update bearer tokens must differ")
         self.config = config
         self.store = store
         self.runner = runner
         self.token = token
+        self.update_token = update_token
 
-    def authorize(self, headers: Any, client_ip: str) -> bool:
+    def authorize(
+        self,
+        headers: Any,
+        client_ip: str,
+        *,
+        self_update: bool = False,
+    ) -> bool:
         if self.config.client_allowlist and client_ip not in self.config.client_allowlist:
             return False
         provided = headers.get("Authorization", "")
-        return hmac.compare_digest(provided, f"Bearer {self.token}")
+        expected = self.update_token if self_update else self.token
+        return hmac.compare_digest(provided, f"Bearer {expected}")
 
     def submit(
         self,
@@ -338,6 +505,9 @@ class HostdApplication:
             self.runner.start(job["id"])
         return job, created
 
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        return self.store.reconcile_job(self.runner.controller, job_id)
+
 
 class HostdHandler(BaseHTTPRequestHandler):
     server_version = f"hubinet-ops-hostd/{VERSION}"
@@ -352,7 +522,7 @@ class HostdHandler(BaseHTTPRequestHandler):
             return
         if path.startswith("/api/v1/jobs/"):
             try:
-                job = self.app.store.get(path.removeprefix("/api/v1/jobs/"))
+                job = self.app.get_job(path.removeprefix("/api/v1/jobs/"))
             except KeyError:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "host job not found"})
                 return
@@ -363,6 +533,17 @@ class HostdHandler(BaseHTTPRequestHandler):
             try:
                 result = self.app.runner.controller.execute(
                     "status", int(status_match.group("vmid"))
+                )
+            except (HostControlError, ValueError) as exc:
+                self._send(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send(HTTPStatus.OK, result)
+            return
+        release_match = SELF_UPDATE_RELEASE_PATH_RE.fullmatch(path)
+        if release_match:
+            try:
+                result = self.app.runner.controller.execute(
+                    "self-update-release", int(release_match.group("vmid"))
                 )
             except (HostControlError, ValueError) as exc:
                 self._send(HTTPStatus.CONFLICT, {"error": str(exc)})
@@ -381,11 +562,15 @@ class HostdHandler(BaseHTTPRequestHandler):
         self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if not self._authorized():
-            return
         path = urlsplit(self.path).path
         action_match = ACTION_PATH_RE.fullmatch(path)
         snapshot_match = SNAPSHOT_PATH_RE.fullmatch(path)
+        if not self._authorized(
+            self_update=bool(
+                action_match and action_match.group("action") == "self-update"
+            )
+        ):
+            return
         try:
             payload = self._body()
             request_id = str(payload.get("request_id") or uuid.uuid4().hex)
@@ -398,7 +583,11 @@ class HostdHandler(BaseHTTPRequestHandler):
                     "force-stop": "lifecycle_force_stop",
                     "self-update": "self_update",
                 }[action_match.group("action")]
-                argument = None
+                argument = (
+                    str(payload.get("fingerprint") or "")
+                    if operation_type == "self_update"
+                    else None
+                )
             elif snapshot_match and snapshot_match.group("operation") == "rollback":
                 vmid = int(snapshot_match.group("vmid"))
                 operation_type = "snapshot_rollback"
@@ -447,8 +636,12 @@ class HostdHandler(BaseHTTPRequestHandler):
             return
         self._send(HTTPStatus.ACCEPTED if created else HTTPStatus.OK, job)
 
-    def _authorized(self) -> bool:
-        if self.app.authorize(self.headers, self.client_address[0]):
+    def _authorized(self, *, self_update: bool = False) -> bool:
+        if self.app.authorize(
+            self.headers,
+            self.client_address[0],
+            self_update=self_update,
+        ):
             return True
         self._send(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
         return False
@@ -497,11 +690,18 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     token = os.environ.get("HUBINET_OPS_HOSTD_TOKEN", "")
+    update_token = os.environ.get("HUBINET_OPS_HOSTD_UPDATE_TOKEN", "")
     config = HostdConfig.load(args.config)
     controller = HostController()
     store = HostJobStore(config.database)
     store.reconcile(controller)
-    application = HostdApplication(config, store, HostJobRunner(store, controller), token)
+    application = HostdApplication(
+        config,
+        store,
+        HostJobRunner(store, controller),
+        token,
+        update_token,
+    )
     serve(config, application)
     return 0
 

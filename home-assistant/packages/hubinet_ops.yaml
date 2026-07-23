@@ -62,7 +62,8 @@ rest_command:
     url: !secret hubinet_ops_approve_url
     method: POST
     headers: *hubinet_auth_headers
-    payload: "{}"
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-approve"}
     timeout: 20
 
   hubinet_ops_reject:
@@ -71,6 +72,13 @@ rest_command:
     headers: *hubinet_auth_headers
     payload: "{}"
     timeout: 20
+
+  hubinet_ops_self_update_plan:
+    url: !secret hubinet_ops_self_update_plan_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: "{}"
+    timeout: 30
 
   hubinet_ops_start_container:
     url: !secret hubinet_ops_start_url
@@ -352,7 +360,7 @@ script:
         data: {vmid: "{{ vmid | int }}", action_name: "usunięcie snapshotu", response: "{{ response | default({}) }}"}
 
   hubinet_ops_self_update:
-    alias: "Hubinet Ops — aktualizuj control plane"
+    alias: "Hubinet Ops — przygotuj plan aktualizacji control plane"
     mode: single
     fields: *lifecycle_vmid_field
     sequence:
@@ -360,14 +368,14 @@ script:
           - conditions: "{{ vmid | int == 110 }}"
             sequence:
               - continue_on_error: true
-                action: rest_command.hubinet_ops_host_action
-                data: {vmid: 110, action: "self-update"}
+                action: rest_command.hubinet_ops_self_update_plan
+                data: {vmid: 110}
                 response_variable: response
         default:
           - variables:
               response: {status: 403, content: {detail: "Self-update jest dozwolony wyłącznie dla CT110"}}
       - action: script.hubinet_ops_report_action
-        data: {vmid: 110, action_name: "aktualizacja control plane", response: "{{ response | default({}) }}"}
+        data: {vmid: 110, action_name: "plan aktualizacji control plane", response: "{{ response | default({}) }}"}
 
   hubinet_ops_scan_container:
     alias: "Hubinet Ops — skanuj kontener"

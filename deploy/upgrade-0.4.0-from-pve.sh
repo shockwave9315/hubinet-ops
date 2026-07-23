@@ -22,6 +22,7 @@ HOSTD_SERVICE="${HUBINET_OPS_HOSTD_SERVICE:-hubinet-ops-hostd}"
 VALIDATION_NOT_BEFORE=""
 HOST_CONTROL_URL="${HUBINET_OPS_HOST_CONTROL_URL:-}"
 TOKEN_STAGE=""
+HOSTD_ENV_STAGE=""
 changes_started=false
 agent_backup_complete=false
 agent_changes_started=false
@@ -35,6 +36,7 @@ HOST_DESTINATIONS=(
   /usr/local/sbin/hubinet-ops-self-update
   /usr/local/lib/hubinet-ops/hubinet_ops_host_control.py
   /usr/local/lib/hubinet-ops/hubinet_ops_hostd.py
+  /usr/local/lib/hubinet-ops/hubinet_ops_release.py
   /etc/systemd/system/hubinet-ops-hostd.service
   /etc/hubinet-ops/observation-vmids
   /etc/hubinet-ops/managed-vmids
@@ -42,6 +44,7 @@ HOST_DESTINATIONS=(
   /etc/hubinet-ops/lifecycle-vmids
   /etc/hubinet-ops/host-control-vmids
   /etc/hubinet-ops/resource-types
+  "$HOSTD_ENV"
 )
 
 required_source=(
@@ -55,6 +58,7 @@ required_source=(
   deploy/pve/hubinet-ops-self-update
   deploy/pve/hubinet_ops_host_control.py
   deploy/pve/hubinet_ops_hostd.py
+  deploy/pve/hubinet_ops_release.py
   deploy/pve/hubinet-ops-hostd.service
   scripts/validate_managed_profiles.py
   scripts/migrate_config_0_4_0.py
@@ -73,7 +77,8 @@ python3 -m compileall -q "$SOURCE_DIR/app"
 python3 -m py_compile \
   "$SOURCE_DIR/deploy/managed/hubinet-maint" \
   "$SOURCE_DIR/deploy/pve/hubinet_ops_host_control.py" \
-  "$SOURCE_DIR/deploy/pve/hubinet_ops_hostd.py"
+  "$SOURCE_DIR/deploy/pve/hubinet_ops_hostd.py" \
+  "$SOURCE_DIR/deploy/pve/hubinet_ops_release.py"
 bash -n "$SOURCE_DIR/deploy/pve/hubinet-ops-host" \
   "$SOURCE_DIR/deploy/pve/hubinet-ops-self-update"
 python3 -m json.tool "$(pve_path "$HOSTD_CONFIG")" >/dev/null
@@ -282,7 +287,7 @@ rollback_all() {
 trap 'rollback_all $?' ERR
 trap 'rollback_all 130' INT
 trap 'rollback_all 143' TERM
-trap 'rm -f "$ARCHIVE"; [[ -z "$TOKEN_STAGE" ]] || rm -f "$TOKEN_STAGE"' EXIT
+trap 'rm -f "$ARCHIVE"; [[ -z "$TOKEN_STAGE" ]] || rm -f "$TOKEN_STAGE"; [[ -z "$HOSTD_ENV_STAGE" ]] || rm -f "$HOSTD_ENV_STAGE"' EXIT
 
 install -d -m 0700 "$BACKUP/pve" "$BACKUP/managed"
 systemctl is-active --quiet "$HOSTD_SERVICE" && hostd_was_active=true || true
@@ -307,9 +312,21 @@ set -a
 source "$(pve_path "$HOSTD_ENV")"
 set +a
 [[ ${#HUBINET_OPS_HOSTD_TOKEN} -ge 32 ]] || { echo "Invalid hostd token" >&2; exit 1; }
+if [[ -z ${HUBINET_OPS_HOSTD_UPDATE_TOKEN:-} ]]; then
+  HUBINET_OPS_HOSTD_UPDATE_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+elif [[ ${#HUBINET_OPS_HOSTD_UPDATE_TOKEN} -lt 32 || "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" == "$HUBINET_OPS_HOSTD_TOKEN" ]]; then
+  echo "Invalid hostd self-update token" >&2
+  exit 1
+fi
+HOSTD_ENV_STAGE="$(mktemp)"
+grep -v -E '^HUBINET_OPS_HOSTD_(UPDATE_)?TOKEN=' "$(pve_path "$HOSTD_ENV")" > "$HOSTD_ENV_STAGE" || true
+printf 'HUBINET_OPS_HOSTD_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_TOKEN" >> "$HOSTD_ENV_STAGE"
+printf 'HUBINET_OPS_HOSTD_UPDATE_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" >> "$HOSTD_ENV_STAGE"
+chmod 0600 "$HOSTD_ENV_STAGE"
 TOKEN_STAGE="$(mktemp)"
-grep -v '^HUBINET_OPS_HOSTD_TOKEN=' "$BACKUP/agent.env" > "$TOKEN_STAGE"
+grep -v -E '^HUBINET_OPS_HOSTD_(UPDATE_)?TOKEN=' "$BACKUP/agent.env" > "$TOKEN_STAGE" || true
 printf 'HUBINET_OPS_HOSTD_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_TOKEN" >> "$TOKEN_STAGE"
+printf 'HUBINET_OPS_HOSTD_UPDATE_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" >> "$TOKEN_STAGE"
 chmod 0600 "$TOKEN_STAGE"
 pct push "$AGENT_VMID" "$BACKUP/agent-config-0.4.0.yaml" /etc/hubinet-ops/config.yaml.new --perms 0640
 pct push "$AGENT_VMID" "$TOKEN_STAGE" /etc/hubinet-ops/agent.env.new --perms 0600
@@ -317,16 +334,23 @@ rm -f "$TOKEN_STAGE"
 TOKEN_STAGE=""
 changes_started=true
 
+install -m 0600 "$HOSTD_ENV_STAGE" "$(pve_path "$HOSTD_ENV")"
+rm -f "$HOSTD_ENV_STAGE"
+HOSTD_ENV_STAGE=""
 install -d -m 0755 "$(pve_path /usr/local/lib/hubinet-ops)" "$(pve_path /usr/local/sbin)" "$(pve_path /etc/hubinet-ops)" "$(pve_path /etc/systemd/system)"
 install -m 0644 "$SOURCE_DIR/deploy/pve/hubinet_ops_host_control.py" "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_host_control.py)"
 install -m 0644 "$SOURCE_DIR/deploy/pve/hubinet_ops_hostd.py" "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_hostd.py)"
+install -m 0644 "$SOURCE_DIR/deploy/pve/hubinet_ops_release.py" "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_release.py)"
 install -m 0755 "$SOURCE_DIR/deploy/pve/hubinet-ops-host" "$(pve_path /usr/local/sbin/hubinet-ops-host)"
 install -m 0755 "$SOURCE_DIR/deploy/pve/hubinet-ops-self-update" "$(pve_path /usr/local/sbin/hubinet-ops-self-update)"
 install -m 0644 "$SOURCE_DIR/deploy/pve/hubinet-ops-hostd.service" "$(pve_path /etc/systemd/system/hubinet-ops-hostd.service)"
 for name in observation-vmids managed-vmids maintenance-vmids lifecycle-vmids host-control-vmids resource-types; do
   install -m 0644 "$SOURCE_DIR/deploy/pve/$name" "$(pve_path /etc/hubinet-ops/$name)"
 done
-python3 -m py_compile "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_host_control.py)" "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_hostd.py)"
+python3 -m py_compile \
+  "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_host_control.py)" \
+  "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_hostd.py)" \
+  "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_release.py)"
 bash -n "$(pve_path /usr/local/sbin/hubinet-ops-host)" "$(pve_path /usr/local/sbin/hubinet-ops-self-update)"
 systemctl daemon-reload
 systemctl enable "$HOSTD_SERVICE" >/dev/null

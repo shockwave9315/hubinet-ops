@@ -175,6 +175,11 @@ def test_dashboard_actions_exist_and_active_plan_decisions_use_only_vmid() -> No
     secrets_text = SECRETS_EXAMPLE.read_text(encoding="utf-8")
     assert "/plans/approve-active" in secrets_text
     assert "/plans/reject-active" in secrets_text
+    assert "/resources/{{ vmid }}/self-update" in secrets_text
+    self_update = package["script"]["hubinet_ops_self_update"]
+    self_update_text = str(self_update)
+    assert "rest_command.hubinet_ops_self_update_plan" in self_update_text
+    assert "rest_command.hubinet_ops_host_action" not in self_update_text
     assert "state_attr" not in package_text.split("hubinet_ops_approve_container:", 1)[1].split("automation:", 1)[0]
     assert "active_plan_id" not in package_text.split("script:", 1)[1].split("automation:", 1)[0]
 

@@ -19,8 +19,10 @@ def test_upgrade_is_transactional_across_host_managed_lxc_and_agent() -> None:
     assert "restore-0.3.0.sh" in text
     assert "hubinet_ops_hostd.py" in text
     assert "hubinet_ops_host_control.py" in text
+    assert "hubinet_ops_release.py" in text
     assert "hubinet-ops-hostd.service" in text
     assert "hubinet-ops-self-update" in text
+    assert "HUBINET_OPS_HOSTD_UPDATE_TOKEN" in text
     assert "for vmid in $(seq 101 109)" in text
     assert "pct mount" in text and "pct unmount" in text
     assert "hubinet-maint capabilities" in text
@@ -90,8 +92,13 @@ def test_config_migration_preserves_inventory_and_sets_040_policy(tmp_path: Path
         assert caps["self_update"] is False
         assert len(migrated["resources"][vmid]["executor_contract"]["executor_sha256"]) == 64
     assert migrated["resources"][110]["operator_capabilities"]["self_update"] is True
-    assert migrated["resources"][110]["operator_capabilities"]["approve"] is False
+    assert migrated["resources"][110]["operator_capabilities"]["approve"] is True
+    assert migrated["resources"][110]["operator_capabilities"]["reject"] is True
     assert migrated["host_control"]["token_env"] == "HUBINET_OPS_HOSTD_TOKEN"
+    assert (
+        migrated["host_control"]["update_token_env"]
+        == "HUBINET_OPS_HOSTD_UPDATE_TOKEN"
+    )
 
 
 def test_all_managed_profiles_pass_the_executor_schema() -> None:

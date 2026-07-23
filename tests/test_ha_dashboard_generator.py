@@ -181,13 +181,17 @@ def test_ct110_has_only_supported_self_metrics() -> None:
         "service_status", "api_health", "agent_version", "cpu_load_1m",
         "cpu_cores", "memory_used", "memory_total", "memory_available",
         "disk_used", "disk_total", "disk_free", "recent_warnings",
+        "active_plan_id", "active_plan_status", "self_update_release_id",
+        "self_update_release_version", "self_update_release_fingerprint",
     ):
         assert f"sensor.hubinet_ops_ct110_{suffix}" in text
     for unsupported in ("cpu_usage", "network_received", "network_sent"):
         assert f"sensor.hubinet_ops_ct110_{unsupported}" not in text
     assert "pending_update_count" not in text
-    assert text.count("perform-action") == 9
+    assert text.count("perform-action") == 11
     assert "script.hubinet_ops_self_update" in text
+    assert "script.hubinet_ops_approve_container" in text
+    assert "script.hubinet_ops_reject_container" in text
     assert "script.hubinet_ops_scan_container" not in text
 
 

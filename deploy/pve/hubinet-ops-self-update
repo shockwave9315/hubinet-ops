@@ -6,25 +6,56 @@ umask 077
   echo "Hubinet Ops self-update requires root" >&2
   exit 1
 }
-[[ $# -eq 0 ]] || { echo "Self-update accepts no arguments" >&2; exit 2; }
+[[ $# -eq 4 && $1 == --job-id && $3 == --fingerprint ]] || {
+  echo "Self-update requires a typed job ID and approved fingerprint" >&2
+  exit 2
+}
+
+JOB_ID="$2"
+FINGERPRINT="$4"
+[[ "$JOB_ID" =~ ^[a-f0-9]{8,64}$ ]] || { echo "Invalid self-update job ID" >&2; exit 2; }
+[[ "$FINGERPRINT" =~ ^[a-f0-9]{64}$ ]] || {
+  echo "Invalid approved release fingerprint" >&2
+  exit 2
+}
 
 RELEASE_ROOT="${HUBINET_OPS_RELEASE_ROOT:-/var/lib/hubinet-ops-hostd/approved-release}"
-UPGRADE="$RELEASE_ROOT/deploy/upgrade-0.4.0-from-pve.sh"
-[[ -f "$UPGRADE" && ! -L "$UPGRADE" ]] || {
-  echo "No approved Hubinet Ops release is staged" >&2
+RESULT_DIR="${HUBINET_OPS_SELF_UPDATE_RESULTS:-/var/lib/hubinet-ops-hostd/self-update-results}"
+HELPER="${HUBINET_OPS_RELEASE_HELPER:-/usr/local/lib/hubinet-ops/hubinet_ops_release.py}"
+SYSTEMD_RUN="${HUBINET_OPS_SYSTEMD_RUN:-/usr/bin/systemd-run}"
+PYTHON="${HUBINET_OPS_PYTHON:-/usr/bin/python3}"
+
+[[ -f "$HELPER" && ! -L "$HELPER" ]] || {
+  echo "Self-update release helper is not installed" >&2
   exit 1
 }
-if [[ ${HUBINET_OPS_TEST_MODE:-0} != 1 ]]; then
-  owner="$(stat -c %U "$RELEASE_ROOT" "$UPGRADE")"
-  [[ "$owner" == $'root\nroot' ]] || {
-    echo "Approved release must be root-owned" >&2
-    exit 1
-  }
-  mode="$(stat -c %a "$UPGRADE")"
-  (( (8#$mode & 8#022) == 0 )) || {
-    echo "Approved upgrade must not be group/world writable" >&2
-    exit 1
-  }
+
+"$PYTHON" "$HELPER" prepare \
+  --release-root "$RELEASE_ROOT" \
+  --result-dir "$RESULT_DIR" \
+  --job-id "$JOB_ID" \
+  --fingerprint "$FINGERPRINT"
+
+set +e
+"$SYSTEMD_RUN" \
+  --unit "hubinet-ops-self-update-$JOB_ID" \
+  --collect \
+  --no-block \
+  --property Type=exec \
+  "$PYTHON" "$HELPER" run \
+    --release-root "$RELEASE_ROOT" \
+    --result-dir "$RESULT_DIR" \
+    --job-id "$JOB_ID" \
+    --fingerprint "$FINGERPRINT"
+rc=$?
+set -e
+if [[ "$rc" -ne 0 ]]; then
+  "$PYTHON" "$HELPER" launch-failed \
+    --result-dir "$RESULT_DIR" \
+    --job-id "$JOB_ID" \
+    --fingerprint "$FINGERPRINT" \
+    --exit-code "$rc"
+  exit "$rc"
 fi
-bash -n "$UPGRADE"
-exec bash "$UPGRADE"
+
+echo "Hubinet Ops self-update supervisor started for job $JOB_ID"

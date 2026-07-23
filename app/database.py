@@ -290,7 +290,10 @@ class Database:
         plan_id: str,
         *,
         request_id: str | None = None,
+        operation_type: str = "update",
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if operation_type not in {"update", "self_update"}:
+            raise ValueError("Invalid approved plan operation")
         now = datetime.now(UTC)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -309,7 +312,10 @@ class Database:
             ).fetchone()
             if existing is not None:
                 job = _decode_job(existing)
-                if job["operation_type"] != "update" or job["plan_id"] != plan_id:
+                if (
+                    job["operation_type"] != operation_type
+                    or job["plan_id"] != plan_id
+                ):
                     conn.execute("ROLLBACK")
                     raise ValueError("request_id was already used for another operation")
                 conn.execute("COMMIT")
@@ -342,7 +348,7 @@ class Database:
                 (
                     job_id,
                     request_id,
-                    "update",
+                    operation_type,
                     plan_id,
                     plan["vmid"],
                     plan["container_name"],

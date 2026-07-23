@@ -80,3 +80,56 @@ def test_host_control_health_is_the_only_unauthenticated_request(
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     assert client.health()["version"] == "0.4.0"
+
+
+def test_self_update_poll_survives_transient_hostd_restart_without_resubmission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
+    monkeypatch.setenv("TEST_HOSTD_UPDATE_TOKEN", "u" * 64)
+    fingerprint = "a" * 64
+    requests: list[httpx.Request] = []
+    poll_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal poll_count
+        requests.append(request)
+        if request.method == "POST":
+            assert request.headers["Authorization"] == f"Bearer {'u' * 64}"
+            assert json.loads(request.content) == {
+                "request_id": "self-update-request-0001",
+                "fingerprint": fingerprint,
+            }
+            return httpx.Response(202, json={"id": "job-self", "status": "running"})
+        poll_count += 1
+        if poll_count == 1:
+            raise httpx.ConnectError("hostd restarting", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "job-self",
+                "status": "succeeded",
+                "result": {"fingerprint": fingerprint, "exit_code": 0},
+            },
+        )
+
+    client = HostControlClient(
+        {
+            "base_url": "http://hostd.invalid:8741",
+            "token_env": "TEST_HOSTD_TOKEN",
+            "update_token_env": "TEST_HOSTD_UPDATE_TOKEN",
+            "poll_interval_seconds": 0.001,
+        },
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _seconds: None,
+    )
+
+    result = client.execute(
+        "self_update",
+        110,
+        "self-update-request-0001",
+        release_fingerprint=fingerprint,
+    )
+
+    assert result == {"fingerprint": fingerprint, "exit_code": 0}
+    assert len([request for request in requests if request.method == "POST"]) == 1

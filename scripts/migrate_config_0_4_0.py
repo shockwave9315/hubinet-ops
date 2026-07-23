@@ -58,7 +58,7 @@ def main() -> int:
             cfg.setdefault("snapshot_retention", 5)
         else:
             cfg["operator_capabilities"] = capabilities(
-                {"refresh", "start", "shutdown", "reboot", "force_stop",
+                {"refresh", "approve", "reject", "start", "shutdown", "reboot", "force_stop",
                  "snapshot_create", "snapshot_list", "snapshot_rollback",
                  "snapshot_delete", "self_update"}
             )
@@ -69,6 +69,7 @@ def main() -> int:
         "enabled": True,
         "base_url": args.host_control_url.rstrip("/"),
         "token_env": "HUBINET_OPS_HOSTD_TOKEN",
+        "update_token_env": "HUBINET_OPS_HOSTD_UPDATE_TOKEN",
         "timeout_seconds": 30,
         "operation_timeout_seconds": 1800,
         "poll_interval_seconds": 1,

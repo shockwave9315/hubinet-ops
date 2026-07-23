@@ -23,7 +23,13 @@ from hubinet_ops_host_control import (  # noqa: E402
     owned_snapshot,
     run_forced_command,
 )
-from hubinet_ops_hostd import HostJobRunner, HostJobStore  # noqa: E402
+from hubinet_ops_hostd import (  # noqa: E402
+    HostdApplication,
+    HostdConfig,
+    HostJobRunner,
+    HostJobStore,
+)
+from hubinet_ops_release import write_marker  # noqa: E402
 
 
 def _write(path: Path, value: str) -> Path:
@@ -39,6 +45,13 @@ def policy(tmp_path: Path) -> HostPolicy:
         local.symlink_to(node, target_is_directory=True)
     except OSError:
         local = node
+    release = tmp_path / "approved-release"
+    (release / "deploy").mkdir(parents=True)
+    _write(
+        release / "deploy" / "upgrade-0.4.0-from-pve.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    _write(tmp_path / "self-update", "#!/usr/bin/env bash\nexit 0\n")
     return HostPolicy(
         HostPaths(
             observation=_write(tmp_path / "observation", "100\n101\n106\n110\n"),
@@ -53,6 +66,7 @@ def policy(tmp_path: Path) -> HostPolicy:
             pve_local=local,
             pve_nodes=node.parent,
             self_update=tmp_path / "self-update",
+            self_update_release=release,
         )
     )
 
@@ -117,6 +131,41 @@ def test_controller_uses_fixed_argv_without_shell_and_enforces_runtime(tmp_path:
         controller.execute("start", 101)
 
 
+def test_controller_inspects_and_launches_only_the_approved_release_fingerprint(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    controller = HostController(policy(tmp_path), runner=runner)
+    release = controller.execute("self-update-release", 110)
+
+    result = controller.execute(
+        "self-update",
+        110,
+        release["fingerprint"],
+        source_job_id="abcd1234",
+    )
+
+    assert release["version"] == "0.4.0"
+    assert release["release_id"].startswith("hubinet-ops-0.4.0-")
+    assert result["supervisor_started"] is True
+    assert runner.calls[-1][0] == [
+        str(tmp_path / "self-update"),
+        "--job-id",
+        "abcd1234",
+        "--fingerprint",
+        release["fingerprint"],
+    ]
+    _write(
+        tmp_path / "approved-release" / "CHANGELOG.md",
+        "changed staged content\n",
+    )
+    changed = controller.execute("self-update-release", 110)
+    assert changed["fingerprint"] != release["fingerprint"]
+    assert changed["release_id"] != release["release_id"]
+    with pytest.raises(HostControlError, match="fingerprint"):
+        controller.execute("self-update", 110, "bad", source_job_id="abcd1234")
+
+
 def test_snapshot_list_marks_only_project_snapshots_as_eligible(tmp_path: Path) -> None:
     runner = FakeRunner()
     controller = HostController(policy(tmp_path), runner=runner)
@@ -166,6 +215,8 @@ class DummyController:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int, str | None, str | None]] = []
         self.status = "stopped"
+        self.status_payload: dict[str, Any] | None = None
+        self.status_error: Exception | None = None
 
     def execute(
         self,
@@ -177,7 +228,15 @@ class DummyController:
     ) -> dict[str, Any]:
         self.calls.append((action, vmid, argument, source_job_id))
         if action == "status":
-            return {"status": self.status}
+            if self.status_error is not None:
+                raise self.status_error
+            if self.status_payload is not None:
+                return dict(self.status_payload)
+            return {
+                "resource_type": "lxc",
+                "runtime_status": self.status,
+                "lxc_status": self.status,
+            }
         return {"action": action, "vmid": vmid}
 
 
@@ -206,6 +265,38 @@ def test_host_jobs_are_durable_idempotent_and_single_writer(tmp_path: Path) -> N
     assert HostJobStore(tmp_path / "jobs.db").get(job["id"])["status"] == "queued"
 
 
+def test_general_hostd_bearer_cannot_authorize_self_update(tmp_path: Path) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    runner = HostJobRunner(store, DummyController())  # type: ignore[arg-type]
+    application = HostdApplication(
+        HostdConfig(
+            bind="127.0.0.1",
+            port=8741,
+            database=tmp_path / "jobs.db",
+            client_allowlist=frozenset(),
+        ),
+        store,
+        runner,
+        "g" * 64,
+        "u" * 64,
+    )
+
+    assert application.authorize(
+        {"Authorization": f"Bearer {'g' * 64}"},
+        "127.0.0.1",
+    )
+    assert not application.authorize(
+        {"Authorization": f"Bearer {'g' * 64}"},
+        "127.0.0.1",
+        self_update=True,
+    )
+    assert application.authorize(
+        {"Authorization": f"Bearer {'u' * 64}"},
+        "127.0.0.1",
+        self_update=True,
+    )
+
+
 def test_host_job_runner_persists_terminal_result(tmp_path: Path) -> None:
     store = HostJobStore(tmp_path / "jobs.db")
     controller = DummyController()
@@ -224,22 +315,205 @@ def test_host_job_runner_persists_terminal_result(tmp_path: Path) -> None:
     assert controller.calls == [("start", 110, None, job["id"])]
 
 
-def test_startup_reconciliation_never_replays_destructive_operation(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("operation_type", "runtime_status"),
+    [
+        ("lifecycle_start", "running"),
+        ("lifecycle_shutdown", "stopped"),
+        ("lifecycle_force_stop", "stopped"),
+    ],
+)
+def test_startup_reconciliation_uses_production_runtime_payload_without_replay(
+    tmp_path: Path,
+    operation_type: str,
+    runtime_status: str,
+) -> None:
     store = HostJobStore(tmp_path / "jobs.db")
     controller = DummyController()
-    controller.status = "running"
+    controller.status = runtime_status
     job, _ = store.create(
         vmid=110,
-        operation_type="lifecycle_start",
-        request_id="request-0004",
+        operation_type=operation_type,
+        request_id=f"request-{operation_type}-0004",
     )
 
     reconciled = store.reconcile(controller)  # type: ignore[arg-type]
 
     assert reconciled[0]["status"] == "succeeded"
-    assert reconciled[0]["result"] == {"reconciled": True, "status": "running"}
+    assert reconciled[0]["result"] == {
+        "reconciled": True,
+        "runtime_status": runtime_status,
+    }
     assert controller.calls == [("status", 110, None, None)]
     assert store.get(job["id"])["status"] == "succeeded"
+
+
+def test_reboot_reconciliation_is_unknown_even_when_lxc_is_running(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = DummyController()
+    controller.status = "running"
+    job, _ = store.create(
+        vmid=110,
+        operation_type="lifecycle_reboot",
+        request_id="request-reboot-0004",
+    )
+
+    reconciled = store.reconcile(controller)  # type: ignore[arg-type]
+
+    assert reconciled[0]["status"] == "interrupted"
+    assert "cannot prove" in reconciled[0]["error"]
+    assert controller.calls == []
+    assert store.get(job["id"])["status"] == "interrupted"
+
+
+def test_status_reconciliation_falls_back_to_runtime_status(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = DummyController()
+    controller.status_payload = {
+        "resource_type": "lxc",
+        "runtime_status": "running",
+        "lxc_status": "",
+    }
+    store.create(
+        vmid=110,
+        operation_type="lifecycle_start",
+        request_id="request-runtime-fallback-0004",
+    )
+
+    reconciled = store.reconcile(controller)  # type: ignore[arg-type]
+
+    assert reconciled[0]["status"] == "succeeded"
+    assert reconciled[0]["result"]["runtime_status"] == "running"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"resource_type": "lxc", "runtime_status": "paused", "lxc_status": "paused"},
+        RuntimeError("pct status unavailable"),
+    ],
+)
+def test_status_reconciliation_reports_controlled_unknown_for_invalid_payload_or_error(
+    tmp_path: Path,
+    failure: dict[str, Any] | Exception,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = DummyController()
+    if isinstance(failure, Exception):
+        controller.status_error = failure
+    else:
+        controller.status_payload = failure
+    store.create(
+        vmid=110,
+        operation_type="lifecycle_start",
+        request_id="request-invalid-status-0004",
+    )
+
+    reconciled = store.reconcile(controller)  # type: ignore[arg-type]
+
+    assert reconciled[0]["status"] == "interrupted"
+    assert reconciled[0]["error"].startswith("status reconciliation failed:")
+
+
+@pytest.mark.parametrize(
+    ("marker_status", "exit_code", "expected_status"),
+    [("succeeded", 0, "succeeded"), ("failed", 37, "failed")],
+)
+def test_self_update_result_survives_hostd_store_recreation(
+    tmp_path: Path,
+    marker_status: str,
+    exit_code: int,
+    expected_status: str,
+) -> None:
+    database = tmp_path / "jobs.db"
+    results = tmp_path / "self-update-results"
+    fingerprint = "a" * 64
+    initial = HostJobStore(database, results)
+    job, _ = initial.create(
+        vmid=110,
+        operation_type="self_update",
+        request_id=f"request-self-update-{marker_status}",
+        argument=fingerprint,
+    )
+    initial.transition(
+        job["id"],
+        status="running",
+        stage="executing",
+        progress=10,
+    )
+    write_marker(
+        results,
+        job["id"],
+        {
+            "job_id": job["id"],
+            "status": "running",
+            "version": "0.4.0",
+            "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
+            "fingerprint": fingerprint,
+            "exit_code": None,
+            "error": None,
+            "deadline_at": "2999-01-01T00:00:00+00:00",
+        },
+    )
+
+    restarted = HostJobStore(database, results)
+    still_running = restarted.reconcile(DummyController())  # type: ignore[arg-type]
+
+    assert still_running[0]["status"] == "running"
+    write_marker(
+        results,
+        job["id"],
+        {
+            "job_id": job["id"],
+            "status": marker_status,
+            "version": "0.4.0",
+            "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
+            "fingerprint": fingerprint,
+            "exit_code": exit_code,
+            "error": None if exit_code == 0 else "installer validation failed",
+        },
+    )
+
+    reconciled = restarted.reconcile(DummyController())  # type: ignore[arg-type]
+
+    terminal = restarted.get(job["id"])
+    assert reconciled[0]["status"] == expected_status
+    assert terminal["status"] == expected_status
+    assert terminal["result"]["exit_code"] == exit_code
+    if expected_status == "failed":
+        assert "exit code 37" in terminal["error"]
+        assert "installer validation failed" in terminal["error"]
+    assert not (results / f"{job['id']}.json").exists()
+
+
+def test_self_update_without_supervisor_marker_is_interrupted_unknown(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db", tmp_path / "results")
+    job, _ = store.create(
+        vmid=110,
+        operation_type="self_update",
+        request_id="request-self-update-missing",
+        argument="a" * 64,
+    )
+    store.transition(
+        job["id"],
+        status="running",
+        stage="executing",
+        progress=10,
+    )
+
+    terminal = HostJobStore(
+        tmp_path / "jobs.db",
+        tmp_path / "results",
+    ).reconcile(DummyController())[0]  # type: ignore[arg-type]
+
+    assert terminal["status"] == "interrupted"
+    assert "outcome is unknown" in terminal["error"]
 
 
 def test_hostd_service_is_root_owned_and_hardened() -> None:
