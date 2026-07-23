@@ -7,7 +7,8 @@
 3. Check whether the latest events show initial grace, Docker unavailable, container counts, repair, rollback wait, or rollback timeout.
 4. Use the dashboard `Refresh` action. It performs inspect only and cannot approve or update.
 5. Use `Retry healthcheck` only after services have had time to recover. It creates an idempotent durable `retry_healthcheck` job with its own events.
-6. Use snapshot rollback only for a listed Hubinet-owned snapshot. The backend rechecks ownership, compatibility, policy, active work, runtime, and snapshot presence even when the UI card is visible.
+6. Manual update rollback is allowed only after a failed/blocked/interrupted update job with its recorded snapshot and `manual_rollback_allowed`.
+7. Explicit operator snapshot restore is separate: use only a listed rollback-eligible Hubinet-owned snapshot. The backend rechecks `manual_snapshot_restore_allowed`, capability, ownership, active work, and presence; PVE independently enforces `snapshot-restore-vmids`, including for offline CT110 restore.
 
 An agent restart reconciles queued/running jobs with actual LXC/snapshot state. It can confirm an already reached terminal condition, otherwise it marks the job interrupted; it never silently replays APT, lifecycle, snapshot deletion, or rollback. Host jobs for CT110 remain in hostd's independent SQLite store while CT110 is offline.
 

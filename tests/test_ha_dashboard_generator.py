@@ -208,7 +208,7 @@ def test_all_lxc_views_have_policy_scoped_controls_and_vm100_has_none() -> None:
         "script.hubinet_ops_reject_container",
         "script.hubinet_ops_retry_healthcheck",
         "script.hubinet_ops_snapshot_create",
-        "script.hubinet_ops_snapshot_rollback_latest",
+        "script.hubinet_ops_snapshot_restore_latest",
         "script.hubinet_ops_snapshot_delete_latest",
     }
     for vmid in range(101, 110):
@@ -242,6 +242,10 @@ def test_lxc_control_guards_and_dangerous_confirmations_are_explicit() -> None:
         assert confirmation["confirm_text"]
         assert confirmation["dismiss_text"] == "Anuluj"
         assert card["secondary"]
+    restore_conditions = {
+        item["entity"] for item in _control_conditions(106, cfg, "snapshot_rollback")
+    }
+    assert "sensor.hubinet_ops_ct106_snapshot_restore_allowed" in restore_conditions
 
 
 def test_lxc_section_order_keeps_controls_high_and_exposes_snapshots() -> None:

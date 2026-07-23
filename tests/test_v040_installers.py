@@ -28,6 +28,13 @@ def test_upgrade_is_transactional_across_host_managed_lxc_and_agent() -> None:
     assert "hubinet-maint capabilities" in text
     assert "validate_capabilities" in text
     assert "profile_validation_status" in text
+    for policy in (
+        "snapshot-create-vmids",
+        "snapshot-restore-vmids",
+        "snapshot-delete-vmids",
+    ):
+        assert text.count(policy) >= 3
+    assert "validate_pve_snapshot_policy.py" in text
 
 
 def test_upgrade_validation_is_read_only_and_uses_singular_state_endpoint() -> None:
@@ -59,6 +66,9 @@ def test_ha_installer_backs_up_all_user_files_checks_and_never_restarts() -> Non
     assert "ha core restart" not in text
     assert "entity_registry" not in text
     assert "/config/.storage/lovelace_resources" in text
+    assert "hubinet_ops_snapshot_restore_url" in text
+    assert "hubinet_ops_host_snapshot_restore_url" in text
+    assert "snapshot_rollback_url" not in text
 
 
 def test_config_migration_preserves_inventory_and_sets_040_policy(tmp_path: Path) -> None:
@@ -91,14 +101,35 @@ def test_config_migration_preserves_inventory_and_sets_040_policy(tmp_path: Path
         assert all(value for key, value in caps.items() if key != "self_update")
         assert caps["self_update"] is False
         assert len(migrated["resources"][vmid]["executor_contract"]["executor_sha256"]) == 64
+        assert migrated["resources"][vmid]["manual_snapshot_restore_allowed"] is True
     assert migrated["resources"][110]["operator_capabilities"]["self_update"] is True
     assert migrated["resources"][110]["operator_capabilities"]["approve"] is True
     assert migrated["resources"][110]["operator_capabilities"]["reject"] is True
+    assert migrated["resources"][110]["manual_rollback_allowed"] is False
+    assert migrated["resources"][110]["manual_snapshot_restore_allowed"] is True
     assert migrated["host_control"]["token_env"] == "HUBINET_OPS_HOSTD_TOKEN"
     assert (
         migrated["host_control"]["update_token_env"]
         == "HUBINET_OPS_HOSTD_UPDATE_TOKEN"
     )
+
+
+def test_pve_snapshot_policy_matches_backend_restore_contract() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "validate_pve_snapshot_policy.py"),
+            str(ROOT / "config" / "config.example.yaml"),
+            "--policy-dir",
+            str(ROOT / "deploy" / "pve"),
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "CT101-CT110 consistent" in completed.stdout
 
 
 def test_all_managed_profiles_pass_the_executor_schema() -> None:

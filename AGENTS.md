@@ -11,7 +11,8 @@ These rules apply to every future coding agent working in this repository.
 - Keep bearer authentication on every `/api/v1` endpoint. MQTT is telemetry and discovery only.
 - Updates always require manual plan approval. Push notifications only navigate to the matching dashboard.
 - Automatic rollback requires an existing snapshot and the per-container `automatic_rollback` policy.
-- Manual rollback requires the `manual_rollback_allowed` policy and a failed operation with a recorded snapshot.
+- Manual update rollback requires the `manual_rollback_allowed` policy and a failed/blocked/interrupted update operation with its recorded snapshot.
+- Explicit operator snapshot restore is a separate action. It requires `manual_snapshot_restore_allowed`, the `snapshot_rollback` capability, an existing rollback-eligible Hubinet-owned snapshot, no active destructive job, explicit Home Assistant confirmation, and the independent PVE snapshot-restore policy.
 - The backend and SQLite database are the source of truth; Home Assistant is presentation and controlled input.
 - Never commit API tokens, MQTT passwords, webhook IDs, SSH keys, production addresses, runtime databases, or logs.
 - Never log authorization headers, bearer tokens, MQTT passwords, private keys, or webhook identifiers.

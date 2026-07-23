@@ -243,8 +243,9 @@ def create_app(
         except (ValueError, ExecutorError, HostControlError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @api.post("/api/v1/resources/{vmid}/snapshots/{name}/restore", dependencies=auth)
     @api.post("/api/v1/resources/{vmid}/snapshots/{name}/rollback", dependencies=auth)
-    def rollback_snapshot(
+    def restore_snapshot(
         vmid: int,
         name: str,
         request: OperationRequest | None = None,

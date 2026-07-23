@@ -43,6 +43,9 @@ HOST_DESTINATIONS=(
   /etc/hubinet-ops/maintenance-vmids
   /etc/hubinet-ops/lifecycle-vmids
   /etc/hubinet-ops/host-control-vmids
+  /etc/hubinet-ops/snapshot-create-vmids
+  /etc/hubinet-ops/snapshot-restore-vmids
+  /etc/hubinet-ops/snapshot-delete-vmids
   /etc/hubinet-ops/resource-types
   "$HOSTD_ENV"
 )
@@ -60,7 +63,14 @@ required_source=(
   deploy/pve/hubinet_ops_hostd.py
   deploy/pve/hubinet_ops_release.py
   deploy/pve/hubinet-ops-hostd.service
+  deploy/pve/observation-vmids
+  deploy/pve/host-control-vmids
+  deploy/pve/snapshot-create-vmids
+  deploy/pve/snapshot-restore-vmids
+  deploy/pve/snapshot-delete-vmids
+  deploy/pve/resource-types
   scripts/validate_managed_profiles.py
+  scripts/validate_pve_snapshot_policy.py
   scripts/migrate_config_0_4_0.py
 )
 for item in "${required_source[@]}"; do
@@ -73,6 +83,9 @@ done
 grep -Fq 'VERSION = "0.4.0"' "$SOURCE_DIR/app/mqtt.py"
 grep -Fq 'VERSION = "0.4.0"' "$SOURCE_DIR/deploy/managed/hubinet-maint"
 python3 "$SOURCE_DIR/scripts/validate_managed_profiles.py"
+python3 "$SOURCE_DIR/scripts/validate_pve_snapshot_policy.py" \
+  "$SOURCE_DIR/config/config.example.yaml" \
+  --policy-dir "$SOURCE_DIR/deploy/pve"
 python3 -m compileall -q "$SOURCE_DIR/app"
 python3 -m py_compile \
   "$SOURCE_DIR/deploy/managed/hubinet-maint" \
@@ -307,6 +320,9 @@ pct pull "$AGENT_VMID" /etc/hubinet-ops/agent.env "$BACKUP/agent.env" >/dev/null
 python3 "$SOURCE_DIR/scripts/migrate_config_0_4_0.py" \
   "$BACKUP/agent-config.yaml" "$BACKUP/agent-config-0.4.0.yaml" \
   --host-control-url "$HOST_CONTROL_URL"
+python3 "$SOURCE_DIR/scripts/validate_pve_snapshot_policy.py" \
+  "$BACKUP/agent-config-0.4.0.yaml" \
+  --policy-dir "$SOURCE_DIR/deploy/pve"
 set -a
 # The token remains outside the repository and is never printed.
 source "$(pve_path "$HOSTD_ENV")"
@@ -344,7 +360,9 @@ install -m 0644 "$SOURCE_DIR/deploy/pve/hubinet_ops_release.py" "$(pve_path /usr
 install -m 0755 "$SOURCE_DIR/deploy/pve/hubinet-ops-host" "$(pve_path /usr/local/sbin/hubinet-ops-host)"
 install -m 0755 "$SOURCE_DIR/deploy/pve/hubinet-ops-self-update" "$(pve_path /usr/local/sbin/hubinet-ops-self-update)"
 install -m 0644 "$SOURCE_DIR/deploy/pve/hubinet-ops-hostd.service" "$(pve_path /etc/systemd/system/hubinet-ops-hostd.service)"
-for name in observation-vmids managed-vmids maintenance-vmids lifecycle-vmids host-control-vmids resource-types; do
+for name in observation-vmids managed-vmids maintenance-vmids lifecycle-vmids \
+  host-control-vmids snapshot-create-vmids snapshot-restore-vmids \
+  snapshot-delete-vmids resource-types; do
   install -m 0644 "$SOURCE_DIR/deploy/pve/$name" "$(pve_path /etc/hubinet-ops/$name)"
 done
 python3 -m py_compile \

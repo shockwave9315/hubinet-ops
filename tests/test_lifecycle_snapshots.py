@@ -133,6 +133,8 @@ def settings(tmp_path: Path, *, vmid: int = 106, adapter: str = "apt") -> Settin
         "monitoring": {"inspect": True, "update_scan": adapter == "apt"},
         "operator_capabilities": capabilities,
         "snapshot_retention": 5,
+        "manual_snapshot_restore_allowed": True,
+        "manual_rollback_allowed": adapter == "apt",
     }
     if adapter == "apt":
         resource["executor_contract"] = {
@@ -346,6 +348,66 @@ def test_ct110_start_uses_host_control_when_agent_executor_is_unavailable(tmp_pa
 
     assert terminal["status"] == "success"
     assert host.runtime == "running"
+    assert executor.calls == []
+
+
+def test_ct110_legacy_update_rollback_remains_disabled(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    service = OpsService(
+        cfg,
+        db,
+        CompatibleExecutor(),
+        host_control=FakeHostControl("stopped"),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Operator action rollback is blocked by policy for resource 110",
+    ):
+        service.manual_rollback(110)
+
+    assert cfg.resources[110]["manual_rollback_allowed"] is False
+
+
+def test_ct110_explicit_snapshot_restore_uses_independent_policy_offline(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("stopped")
+    snapshot = "hubinet-ops-110-manual-20260723T190000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-23T19:00:00+00:00",
+            "kind": "manual",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    executor = CompatibleExecutor()
+    service = OpsService(cfg, db, executor, host_control=host)  # type: ignore[arg-type]
+
+    queued = service.queue_snapshot_action(
+        110,
+        "rollback",
+        snapshot,
+        "ct110-explicit-snapshot-restore",
+    )
+    terminal = run_queued(service, db)
+
+    assert queued["operation_type"] == "snapshot_rollback"
+    assert terminal["status"] == "success"
+    assert host.calls[0][:4] == (
+        "snapshot_rollback",
+        110,
+        "ct110-explicit-snapshot-restore",
+        snapshot,
+    )
     assert executor.calls == []
 
 

@@ -111,7 +111,7 @@ class HostControlClient:
             method = "POST"
             path = (
                 f"/api/v1/resources/{int(vmid)}/snapshots/"
-                f"{quote(str(snapshot_name), safe='')}/rollback"
+                f"{quote(str(snapshot_name), safe='')}/restore"
             )
         elif operation_type == "snapshot_delete":
             method = "DELETE"

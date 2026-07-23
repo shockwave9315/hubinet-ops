@@ -7,6 +7,7 @@
 1. The telemetry loop calls `inspect` only when `monitoring.inspect` is enabled.
 2. The independent `monitoring_scheduler` and recovery worker call APT scan only when `monitoring.update_scan` is enabled. Operator scan capability is not consulted for these read-only checks.
 3. REST operator requests independently require the matching `operator_capabilities` flag.
+4. Manual update rollback and explicit snapshot restore are distinct policies: the former is tied to a failed update job and `manual_rollback_allowed`; the latter is tied to `manual_snapshot_restore_allowed`, an eligible owned snapshot, explicit confirmation, and an action-specific root-owned PVE allowlist.
 4. `ResourceExecutor` selects a validated adapter: LXC/APT, QEMU/HAOS read-only, or CT110 self-inspection.
 5. The shared PVE host-control implementation revalidates action, VMID, resource type, observation, managed, maintenance, lifecycle, host-control access, and optional Hubinet-owned snapshot names. Both the forced-command wrapper and `hubinet-ops-hostd` call this implementation.
 6. SQLite stores plans, jobs, events, and normalized resource state. MQTT and Home Assistant are projections.

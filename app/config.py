@@ -47,6 +47,7 @@ RESOURCE_KEYS = {
     "approval_mode",
     "automatic_rollback",
     "manual_rollback_allowed",
+    "manual_snapshot_restore_allowed",
     "recovery_scan",
     "repair_actions",
     "dashboard_path",
@@ -360,7 +361,11 @@ def validate_config(raw: dict[str, Any]) -> None:
                 f"Resource {vmid} recovery_scan.cooldown_seconds must be between delay_seconds and 604800"
             )
 
-        for key in ("automatic_rollback", "manual_rollback_allowed"):
+        for key in (
+            "automatic_rollback",
+            "manual_rollback_allowed",
+            "manual_snapshot_restore_allowed",
+        ):
             if key in value and not isinstance(value[key], bool):
                 raise RuntimeError(f"Resource {vmid} {key} must be a boolean")
         if bool(capabilities.get("rollback", False)) and not bool(
@@ -368,6 +373,13 @@ def validate_config(raw: dict[str, Any]) -> None:
         ):
             raise RuntimeError(
                 f"Resource {vmid} rollback capability requires manual_rollback_allowed"
+            )
+        if bool(value.get("manual_snapshot_restore_allowed", False)) and not bool(
+            capabilities.get("snapshot_rollback", False)
+        ):
+            raise RuntimeError(
+                f"Resource {vmid} manual_snapshot_restore_allowed requires "
+                "snapshot_rollback capability"
             )
         if adapter != "apt" and (
             bool(value.get("automatic_rollback", False))

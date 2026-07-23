@@ -183,6 +183,10 @@ def test_example_policy_enables_full_lxc_control_and_keeps_vm100_denied() -> Non
     assert ct110["self_update"] is True
     assert ct110["approve"] is True
     assert ct110["reject"] is True
+    assert raw["resources"][110]["manual_rollback_allowed"] is False
+    assert raw["resources"][110]["manual_snapshot_restore_allowed"] is True
+    for vmid in range(101, 110):
+        assert raw["resources"][vmid]["manual_snapshot_restore_allowed"] is True
     assert raw["resources"][101]["recovery_scan"]["enabled"] is False
     assert raw["resources"][106]["recovery_scan"] == {
         "enabled": True,
@@ -201,6 +205,16 @@ def resource_config(**overrides: Any) -> dict[str, Any]:
     }
     resource.update(overrides)
     return {"resources": {101: resource}, "mqtt": {"enabled": False}}
+
+
+def test_snapshot_restore_policy_requires_snapshot_rollback_capability() -> None:
+    raw = resource_config(manual_snapshot_restore_allowed=True)
+
+    with pytest.raises(
+        RuntimeError,
+        match="manual_snapshot_restore_allowed requires snapshot_rollback",
+    ):
+        validate_config(raw)
 
 
 def test_legacy_containers_are_exposed_as_lxc_resources_without_file_rewrite(

@@ -68,9 +68,9 @@ ssh "${SSH_ARGS[@]}" '
     hubinet_ops_rollback_url hubinet_ops_approve_url hubinet_ops_reject_url \
     hubinet_ops_start_url hubinet_ops_shutdown_url hubinet_ops_reboot_url \
     hubinet_ops_force_stop_url hubinet_ops_snapshot_create_url \
-    hubinet_ops_snapshot_rollback_url hubinet_ops_snapshot_delete_url \
+    hubinet_ops_snapshot_restore_url hubinet_ops_snapshot_delete_url \
     hubinet_ops_host_authorization hubinet_ops_host_action_url \
-    hubinet_ops_host_snapshot_create_url hubinet_ops_host_snapshot_action_url \
+    hubinet_ops_host_snapshot_create_url hubinet_ops_host_snapshot_restore_url \
     hubinet_ops_host_snapshot_delete_url; do
     grep -q "^$key:" /config/secrets.yaml || { echo "Missing required secret: $key" >&2; exit 1; }
   done

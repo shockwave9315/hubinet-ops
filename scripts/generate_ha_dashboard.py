@@ -394,7 +394,7 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
         "retry_healthcheck": "script.hubinet_ops_retry_healthcheck",
         "force_stop": "script.hubinet_ops_force_stop_container",
         "snapshot_create": "script.hubinet_ops_snapshot_create",
-        "snapshot_rollback": "script.hubinet_ops_snapshot_rollback_latest",
+        "snapshot_rollback": "script.hubinet_ops_snapshot_restore_latest",
         "snapshot_delete": "script.hubinet_ops_snapshot_delete_latest",
         "self_update": "script.hubinet_ops_self_update",
     }
@@ -409,7 +409,7 @@ def _control_card(vmid: int, action: str) -> dict[str, Any]:
         "reject": "Nie wykonuj aktualizacji",
         "retry_healthcheck": "Sprawdź stabilizację usług jeszcze raz",
         "snapshot_create": "Ręczny punkt przywracania Hubinet Ops",
-        "snapshot_rollback": "Cofnij wszystkie zmiany do ostatniego snapshotu",
+        "snapshot_rollback": "Jawnie przywróć stan z ostatniego snapshotu",
         "snapshot_delete": "Trwale usuń ostatni snapshot Hubinet Ops",
         "self_update": "Najpierw utwórz plan, następnie zatwierdź go ręcznie",
     }
@@ -596,7 +596,7 @@ def _control_conditions(
             *idle,
         ]
     if action in {"snapshot_rollback", "snapshot_delete"}:
-        return [
+        conditions = [
             _state_condition(capability, state="allowed"),
             _state_condition(
                 _entity(vmid, cfg, "latest_snapshot_name"), state_not="none"
@@ -604,6 +604,15 @@ def _control_conditions(
             _state_condition(operation, state_not="waiting_approval"),
             *idle,
         ]
+        if action == "snapshot_rollback":
+            conditions.insert(
+                1,
+                _state_condition(
+                    _entity(vmid, cfg, "snapshot_restore_allowed"),
+                    state="allowed",
+                ),
+            )
+        return conditions
     if action == "self_update":
         return [
             _state_condition(runtime, state="running"),

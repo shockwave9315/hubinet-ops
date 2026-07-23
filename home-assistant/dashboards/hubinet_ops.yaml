@@ -812,6 +812,9 @@ views:
           entity: sensor.hubinet_ops_ct101_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct101_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct101_latest_snapshot_name
           state_not: none
         - condition: state
@@ -829,12 +832,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 101
             confirmation:
@@ -1667,6 +1670,9 @@ views:
           entity: sensor.hubinet_ops_ct102_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct102_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct102_latest_snapshot_name
           state_not: none
         - condition: state
@@ -1684,12 +1690,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 102
             confirmation:
@@ -2522,6 +2528,9 @@ views:
           entity: sensor.hubinet_ops_ct103_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct103_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct103_latest_snapshot_name
           state_not: none
         - condition: state
@@ -2539,12 +2548,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 103
             confirmation:
@@ -3377,6 +3386,9 @@ views:
           entity: sensor.hubinet_ops_ct104_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct104_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct104_latest_snapshot_name
           state_not: none
         - condition: state
@@ -3394,12 +3406,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 104
             confirmation:
@@ -4232,6 +4244,9 @@ views:
           entity: sensor.hubinet_ops_ct105_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct105_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct105_latest_snapshot_name
           state_not: none
         - condition: state
@@ -4249,12 +4264,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 105
             confirmation:
@@ -5087,6 +5102,9 @@ views:
           entity: sensor.hubinet_ops_ct106_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct106_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct106_latest_snapshot_name
           state_not: none
         - condition: state
@@ -5104,12 +5122,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 106
             confirmation:
@@ -5961,6 +5979,9 @@ views:
           entity: sensor.hubinet_ops_ct107_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct107_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct107_latest_snapshot_name
           state_not: none
         - condition: state
@@ -5978,12 +5999,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 107
             confirmation:
@@ -6816,6 +6837,9 @@ views:
           entity: sensor.hubinet_ops_ct108_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct108_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct108_latest_snapshot_name
           state_not: none
         - condition: state
@@ -6833,12 +6857,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 108
             confirmation:
@@ -7671,6 +7695,9 @@ views:
           entity: sensor.hubinet_ops_ct109_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct109_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct109_latest_snapshot_name
           state_not: none
         - condition: state
@@ -7688,12 +7715,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 109
             confirmation:
@@ -8475,6 +8502,9 @@ views:
           entity: sensor.hubinet_ops_ct110_capability_snapshot_rollback
           state: allowed
         - condition: state
+          entity: sensor.hubinet_ops_ct110_snapshot_restore_allowed
+          state: allowed
+        - condition: state
           entity: sensor.hubinet_ops_ct110_latest_snapshot_name
           state_not: none
         - condition: state
@@ -8492,12 +8522,12 @@ views:
         card:
           type: custom:mushroom-template-card
           primary: Przywróć ostatni snapshot
-          secondary: Cofnij wszystkie zmiany do ostatniego snapshotu
+          secondary: Jawnie przywróć stan z ostatniego snapshotu
           icon: mdi:backup-restore
           color: red
           tap_action:
             action: perform-action
-            perform_action: script.hubinet_ops_snapshot_rollback_latest
+            perform_action: script.hubinet_ops_snapshot_restore_latest
             data:
               vmid: 110
             confirmation:

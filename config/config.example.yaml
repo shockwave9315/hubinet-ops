@@ -84,6 +84,7 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: false
+    manual_snapshot_restore_allowed: false
     dashboard_path: /hubinet-ops/vm-100
     stabilization: {}
 
@@ -123,6 +124,7 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-101
     stabilization: {}
 
@@ -147,6 +149,7 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-102
     stabilization: {}
 
@@ -171,6 +174,7 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-103
     stabilization: {}
 
@@ -199,6 +203,7 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-104
     stabilization: {}
 
@@ -223,6 +228,7 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-105
     stabilization: {}
 
@@ -254,6 +260,7 @@ resources:
     approval_mode: always
     automatic_rollback: true
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-106
     stabilization: &managed_stabilization
       post_update_timeout_seconds: 300
@@ -284,6 +291,7 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-107
     stabilization: {}
 
@@ -308,6 +316,7 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-108
     stabilization: {}
 
@@ -332,6 +341,7 @@ resources:
     docker: {enabled: true, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: true
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-109
     stabilization: {}
 
@@ -368,5 +378,6 @@ resources:
     docker: {enabled: false, require_health: false, required: []}
     automatic_rollback: false
     manual_rollback_allowed: false
+    manual_snapshot_restore_allowed: true
     dashboard_path: /hubinet-ops/ct-110
     stabilization: {}

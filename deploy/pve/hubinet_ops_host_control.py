@@ -63,6 +63,9 @@ class HostPaths:
     maintenance: Path = Path("/etc/hubinet-ops/maintenance-vmids")
     lifecycle: Path = Path("/etc/hubinet-ops/lifecycle-vmids")
     host_control: Path = Path("/etc/hubinet-ops/host-control-vmids")
+    snapshot_create: Path = Path("/etc/hubinet-ops/snapshot-create-vmids")
+    snapshot_restore: Path = Path("/etc/hubinet-ops/snapshot-restore-vmids")
+    snapshot_delete: Path = Path("/etc/hubinet-ops/snapshot-delete-vmids")
     resource_types: Path = Path("/etc/hubinet-ops/resource-types")
     pve_local: Path = Path("/etc/pve/local")
     pve_nodes: Path = Path("/etc/pve/nodes")
@@ -78,6 +81,9 @@ class HostPolicy:
         self.maintenance = _read_vmids(paths.maintenance)
         self.lifecycle = _read_vmids(paths.lifecycle)
         self.host_control = _read_vmids(paths.host_control)
+        self.snapshot_create = _read_vmids(paths.snapshot_create)
+        self.snapshot_restore = _read_vmids(paths.snapshot_restore)
+        self.snapshot_delete = _read_vmids(paths.snapshot_delete)
         self.resource_types = _read_resource_types(paths.resource_types)
 
     def validate(
@@ -106,6 +112,15 @@ class HostPolicy:
         if normalized in SNAPSHOT_ACTIONS:
             if resource_type != "lxc" or vmid not in self.host_control:
                 raise HostControlError("VMID not host-control allowed")
+            action_policy = {
+                "snapshot-create": (self.snapshot_create, "snapshot create"),
+                "snapshot-rollback": (self.snapshot_restore, "snapshot restore"),
+                "snapshot-delete": (self.snapshot_delete, "snapshot delete"),
+            }[normalized]
+            if vmid not in action_policy[0]:
+                raise HostControlError(
+                    f"VMID not {action_policy[1]} allowed by PVE policy"
+                )
         if normalized in {"self-update", "self-update-release"} and vmid != 110:
             raise HostControlError("Self-update is allowed only for CT110")
         if normalized in SNAPSHOT_ACTIONS:
@@ -171,7 +186,9 @@ class HostController:
         if action == "snapshot-create":
             return self._snapshot_create(vmid, str(argument), source_job_id)
         if action == "snapshot-rollback":
-            self._require_owned_existing_snapshot(vmid, str(argument))
+            snapshot = self._require_owned_existing_snapshot(vmid, str(argument))
+            if not snapshot["rollback_eligible"]:
+                raise HostControlError("Snapshot is not restore eligible")
             was_running = self._status(vmid, "lxc")["lxc_status"] == "running"
             if was_running:
                 self._lifecycle(vmid, "shutdown")

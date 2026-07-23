@@ -163,6 +163,9 @@ class OpsService:
             "approval_mode": cfg.get("approval_mode", "always"),
             "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
             "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
+            "manual_snapshot_restore_allowed": bool(
+                cfg.get("manual_snapshot_restore_allowed", False)
+            ),
             "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
             "operator_capabilities": self._capabilities(vmid),
             "monitoring": self._monitoring(vmid),
@@ -926,6 +929,10 @@ class OpsService:
         capability = "snapshot_rollback" if action == "rollback" else "snapshot_delete"
         cfg = self._resource(vmid)
         self._require_capability(vmid, capability)
+        if action == "rollback" and not bool(
+            cfg.get("manual_snapshot_restore_allowed", False)
+        ):
+            raise ValueError("Explicit snapshot restore is not allowed by resource policy")
         listing = self.list_snapshots(vmid)
         snapshots = [item for item in listing["snapshots"] if item.get("owned_by_hubinet_ops")]
         if name in {None, "latest"}:
@@ -936,7 +943,7 @@ class OpsService:
         if selected is None or parse_owned_snapshot_name(str(selected.get("name")), vmid=vmid) is None:
             raise ValueError("Hubinet Ops snapshot does not exist")
         if action == "rollback" and self.db.find_active_plan(vmid) is not None:
-            raise ValueError("Resolve the active update plan before snapshot rollback")
+            raise ValueError("Resolve the active update plan before snapshot restore")
         if not bool(selected.get(f"{action}_eligible")):
             raise ValueError(f"Snapshot is not {action} eligible")
         if cfg.get("adapter") == "apt":
@@ -2440,6 +2447,9 @@ class OpsService:
                 "rollback_allowed": bool(
                     cfg.get("manual_rollback_allowed", False)
                 ) and self._capabilities(vmid)["rollback"],
+                "snapshot_restore_allowed": bool(
+                    cfg.get("manual_snapshot_restore_allowed", False)
+                ) and self._capabilities(vmid)["snapshot_rollback"],
                 "operator_capabilities": self._capabilities(vmid),
                 "monitoring": self._monitoring(vmid),
                 "recovery_scan_enabled": bool(
@@ -2483,6 +2493,9 @@ class OpsService:
                 "pending_updates": 0 if apt else None,
                 "updates": {"pending_count": 0 if apt else None, "packages": []},
                 "operator_capabilities": self._capabilities(vmid),
+                "snapshot_restore_allowed": bool(
+                    cfg.get("manual_snapshot_restore_allowed", False)
+                ) and self._capabilities(vmid)["snapshot_rollback"],
                 "monitoring": self._monitoring(vmid),
                 "lifecycle_status": "idle",
                 "verification_status": "unknown",

@@ -32,7 +32,7 @@ MAX_REQUEST_BYTES = 16 * 1024
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 SNAPSHOT_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/snapshots"
-    r"(?:/(?P<name>[^/]+)(?:/(?P<operation>rollback))?)?$"
+    r"(?:/(?P<name>[^/]+)(?:/(?P<operation>restore|rollback))?)?$"
 )
 ACTION_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/"
@@ -674,7 +674,10 @@ class HostdHandler(BaseHTTPRequestHandler):
                     if operation_type == "self_update"
                     else None
                 )
-            elif snapshot_match and snapshot_match.group("operation") == "rollback":
+            elif snapshot_match and snapshot_match.group("operation") in {
+                "restore",
+                "rollback",
+            }:
                 vmid = int(snapshot_match.group("vmid"))
                 operation_type = "snapshot_rollback"
                 argument = unquote(snapshot_match.group("name"))

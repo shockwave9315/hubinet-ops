@@ -63,6 +63,8 @@ def main() -> int:
                  "snapshot_delete", "self_update"}
             )
             cfg.setdefault("snapshot_retention", 5)
+            cfg["manual_rollback_allowed"] = False
+        cfg["manual_snapshot_restore_allowed"] = vmid != 100
     raw.pop("containers", None)
     raw["resources"] = normalized
     raw["host_control"] = {

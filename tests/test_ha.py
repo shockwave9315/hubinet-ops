@@ -180,6 +180,14 @@ def test_dashboard_actions_exist_and_active_plan_decisions_use_only_vmid() -> No
     self_update_text = str(self_update)
     assert "rest_command.hubinet_ops_self_update_plan" in self_update_text
     assert "rest_command.hubinet_ops_host_action" not in self_update_text
+    restore = package["script"]["hubinet_ops_snapshot_restore_latest"]
+    restore_text = str(restore)
+    assert "rest_command.hubinet_ops_host_snapshot_restore" in restore_text
+    assert "rest_command.hubinet_ops_snapshot_restore" in restore_text
+    assert "hubinet_ops_snapshot_rollback" not in restore_text
+    assert "/snapshots/{{ snapshot_name }}/restore" in secrets_text
+    assert "/snapshots/{{ snapshot_name }}/rollback" not in secrets_text
+    assert "/containers/{{ vmid }}/rollback" in secrets_text
     assert "state_attr" not in package_text.split("hubinet_ops_approve_container:", 1)[1].split("automation:", 1)[0]
     assert "active_plan_id" not in package_text.split("script:", 1)[1].split("automation:", 1)[0]
 

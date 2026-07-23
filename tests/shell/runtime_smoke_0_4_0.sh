@@ -187,6 +187,9 @@ grep -Fq 'VERSION = "0.4.0"' "$TMP/success/ct/ct101/usr/local/sbin/hubinet-maint
 grep -Fq 'VERSION = "0.4.0"' "$TMP/success/ct/ct109/usr/local/sbin/hubinet-maint"
 grep -Fq 'AGENT_INSTALLED' "$TMP/success/actions.log"
 grep -Fq 'VERSION = "0.4.0"' "$TMP/success/pve/usr/local/lib/hubinet-ops/hubinet_ops_hostd.py"
+for policy in snapshot-create-vmids snapshot-restore-vmids snapshot-delete-vmids; do
+  cmp "$ROOT/deploy/pve/$policy" "$TMP/success/pve/etc/hubinet-ops/$policy"
+done
 if grep -Eq 'pct (start|stop|shutdown|reboot|snapshot|rollback|delsnapshot)' "$TMP/success/actions.log"; then
   echo "upgrade executed a forbidden resource lifecycle or snapshot mutation" >&2
   exit 1
@@ -203,6 +206,9 @@ for vmid in $(seq 101 109); do
   grep -Fq "old_profile" "$TMP/rollback/ct/ct$vmid/etc/hubinet-maint.json"
 done
 grep -Fq 'old-wrapper' "$TMP/rollback/pve/usr/local/sbin/hubinet-ops-host"
+for policy in snapshot-create-vmids snapshot-restore-vmids snapshot-delete-vmids; do
+  [[ ! -e "$TMP/rollback/pve/etc/hubinet-ops/$policy" ]]
+done
 grep -Fq 'AGENT_STARTED' "$TMP/rollback/actions.log"
 if grep -Eq 'pct (start|stop|shutdown|reboot|snapshot|rollback|delsnapshot)' "$TMP/rollback/actions.log"; then
   echo "rollback executed a forbidden resource lifecycle or snapshot mutation" >&2

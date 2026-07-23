@@ -256,6 +256,9 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("latest_snapshot_name", None)
     state.setdefault("latest_snapshot_at", None)
     state.setdefault("latest_snapshot_kind", None)
+    state["snapshot_restore_allowed"] = bool(
+        state.get("snapshot_restore_allowed", False)
+    )
     snapshot_operation = str(state.get("snapshot_operation_status") or "idle")
     state["snapshot_operation_status"] = (
         snapshot_operation

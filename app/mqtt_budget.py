@@ -185,6 +185,7 @@ def _minimal_state(state: dict[str, Any]) -> dict[str, Any]:
         "last_error",
         "last_operation_result",
         "rollback_allowed",
+        "snapshot_restore_allowed",
         "dashboard_path",
         "lifecycle_action",
         "lifecycle_status",

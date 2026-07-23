@@ -80,6 +80,7 @@ SNAPSHOT_ENTITY_SPECS = (
     _timestamp("latest_snapshot_at", "latest_snapshot_at", "Latest snapshot at", "value_json.latest_snapshot_at"),
     EntitySpec("latest_snapshot_kind", "latest_snapshot_kind", "Latest snapshot kind", "{{ value_json.latest_snapshot_kind | default('none', true) }}"),
     EntitySpec("snapshot_operation_status", "snapshot_operation_status", "Snapshot operation status", "{{ value_json.snapshot_operation_status | default('idle') }}"),
+    EntitySpec("snapshot_restore_allowed", "snapshot_restore_allowed", "Snapshot restore allowed", "{{ 'allowed' if value_json.snapshot_restore_allowed else 'blocked' }}"),
 )
 
 

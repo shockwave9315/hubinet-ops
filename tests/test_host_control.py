@@ -48,7 +48,11 @@ def _write(path: Path, value: str) -> Path:
     return path
 
 
-def policy(tmp_path: Path) -> HostPolicy:
+def policy(
+    tmp_path: Path,
+    *,
+    snapshot_restore_vmids: str = "101\n102\n103\n104\n105\n106\n107\n108\n109\n110\n",
+) -> HostPolicy:
     node = tmp_path / "nodes" / "pve-a"
     node.mkdir(parents=True)
     local = tmp_path / "local"
@@ -70,6 +74,18 @@ def policy(tmp_path: Path) -> HostPolicy:
             maintenance=_write(tmp_path / "maintenance", "101\n106\n"),
             lifecycle=_write(tmp_path / "lifecycle", "101\n106\n110\n"),
             host_control=_write(tmp_path / "host-control", "101\n106\n110\n"),
+            snapshot_create=_write(
+                tmp_path / "snapshot-create",
+                "101\n106\n110\n",
+            ),
+            snapshot_restore=_write(
+                tmp_path / "snapshot-restore",
+                snapshot_restore_vmids,
+            ),
+            snapshot_delete=_write(
+                tmp_path / "snapshot-delete",
+                "101\n106\n110\n",
+            ),
             resource_types=_write(
                 tmp_path / "types",
                 "100 qemu\n101 lxc\n106 lxc\n110 lxc\n",
@@ -192,6 +208,79 @@ def test_snapshot_list_marks_only_project_snapshots_as_eligible(tmp_path: Path) 
     assert owned_snapshot(owned["name"], 106)
     with pytest.raises(HostControlError, match="owned"):
         controller.execute("snapshot-delete", 106, "foreign-backup")
+
+
+def test_pve_snapshot_restore_policy_rejects_owned_snapshot_for_disallowed_vmid(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    controller = HostController(
+        policy(tmp_path, snapshot_restore_vmids="110\n"),
+        runner=runner,
+    )
+    name = "hubinet-ops-106-manual-20260720T170000Z"
+
+    with pytest.raises(HostControlError, match="snapshot restore allowed by PVE policy"):
+        controller.execute("snapshot-rollback", 106, name)
+
+    assert not any(call[0][:2] == ["pct", "rollback"] for call in runner.calls)
+
+
+def test_pve_snapshot_restore_always_rejects_foreign_snapshot(tmp_path: Path) -> None:
+    controller = HostController(policy(tmp_path), runner=FakeRunner())
+
+    with pytest.raises(HostControlError, match="not owned"):
+        controller.execute("snapshot-rollback", 110, "foreign-backup")
+
+
+def test_ct110_snapshot_restore_works_without_backend_through_explicit_pve_policy(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    name = "hubinet-ops-110-manual-20260723T190000Z"
+    runner.snapshots = [
+        {
+            "name": name,
+            "description": "hubinet-ops;kind=manual;source_job_id=abc12345",
+            "snaptime": 1_721_492_400,
+        }
+    ]
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    result = controller.execute("snapshot-rollback", 110, name)
+
+    assert result["action"] == "rollback"
+    assert ["pct", "rollback", "110", name] in [call[0] for call in runner.calls]
+
+
+def test_active_host_job_blocks_explicit_snapshot_restore(tmp_path: Path) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = HostController(policy(tmp_path), runner=FakeRunner())
+    application = HostdApplication(
+        HostdConfig(
+            bind="127.0.0.1",
+            port=8741,
+            database=tmp_path / "jobs.db",
+            client_allowlist=frozenset(),
+        ),
+        store,
+        HostJobRunner(store, controller),
+        "g" * 64,
+        "u" * 64,
+    )
+    store.create(
+        vmid=101,
+        operation_type="lifecycle_start",
+        request_id="request-active-host-operation",
+    )
+
+    with pytest.raises(HostControlError, match="active"):
+        application.submit(
+            vmid=110,
+            operation_type="snapshot_rollback",
+            request_id="request-ct110-explicit-restore",
+            argument="hubinet-ops-110-manual-20260723T190000Z",
+        )
 
 
 def test_snapshot_create_uses_validated_name_and_auditable_description(tmp_path: Path) -> None:
