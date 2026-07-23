@@ -4,6 +4,8 @@ import importlib.util
 import json
 import subprocess
 import sys
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -29,7 +31,16 @@ from hubinet_ops_hostd import (  # noqa: E402
     HostJobRunner,
     HostJobStore,
 )
-from hubinet_ops_release import write_marker  # noqa: E402
+from hubinet_ops_release import (  # noqa: E402
+    ReleaseError,
+    inspect_staged_release,
+    prepare_supervisor,
+    read_marker,
+    remove_marker,
+    run_supervisor,
+    verify_supervisor_launch,
+    write_marker,
+)
 
 
 def _write(path: Path, value: str) -> Path:
@@ -240,6 +251,65 @@ class DummyController:
         return {"action": action, "vmid": vmid}
 
 
+class DelayedSelfUpdateController(DummyController):
+    def __init__(self, results: Path) -> None:
+        super().__init__()
+        self.results = results
+        self.prepare_started = threading.Event()
+        self.allow_running_marker = threading.Event()
+        self.running_marker_written = threading.Event()
+        self.allow_terminal_marker = threading.Event()
+        self.terminal_marker_written = threading.Event()
+
+    def execute(
+        self,
+        action: str,
+        vmid: int,
+        argument: str | None = None,
+        *,
+        source_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        if action != "self-update":
+            return super().execute(
+                action,
+                vmid,
+                argument,
+                source_job_id=source_job_id,
+            )
+        assert source_job_id is not None
+        assert argument is not None
+        self.calls.append((action, vmid, argument, source_job_id))
+        self.prepare_started.set()
+        assert self.allow_running_marker.wait(timeout=5)
+        write_marker(
+            self.results,
+            source_job_id,
+            {
+                "job_id": source_job_id,
+                "status": "running",
+                "fingerprint": argument,
+                "deadline_at": "2999-01-01T00:00:00+00:00",
+            },
+        )
+        self.running_marker_written.set()
+        assert self.allow_terminal_marker.wait(timeout=5)
+        write_marker(
+            self.results,
+            source_job_id,
+            {
+                "job_id": source_job_id,
+                "status": "succeeded",
+                "fingerprint": argument,
+                "version": "0.4.0",
+                "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
+                "exit_code": 0,
+                "error": None,
+            },
+        )
+        self.terminal_marker_written.set()
+        return {"supervisor_started": True}
+
+
 def test_host_jobs_are_durable_idempotent_and_single_writer(tmp_path: Path) -> None:
     store = HostJobStore(tmp_path / "jobs.db")
     job, created = store.create(
@@ -439,12 +509,7 @@ def test_self_update_result_survives_hostd_store_recreation(
         request_id=f"request-self-update-{marker_status}",
         argument=fingerprint,
     )
-    initial.transition(
-        job["id"],
-        status="running",
-        stage="executing",
-        progress=10,
-    )
+    initial.begin_self_update_launch(job["id"])
     write_marker(
         results,
         job["id"],
@@ -500,12 +565,11 @@ def test_self_update_without_supervisor_marker_is_interrupted_unknown(
         request_id="request-self-update-missing",
         argument="a" * 64,
     )
-    store.transition(
+    store.begin_self_update_launch(
         job["id"],
-        status="running",
-        stage="executing",
-        progress=10,
+        now=datetime(2000, 1, 1, tzinfo=UTC),
     )
+    remove_marker(tmp_path / "results", job["id"])
 
     terminal = HostJobStore(
         tmp_path / "jobs.db",
@@ -514,6 +578,247 @@ def test_self_update_without_supervisor_marker_is_interrupted_unknown(
 
     assert terminal["status"] == "interrupted"
     assert "outcome is unknown" in terminal["error"]
+
+
+def test_get_during_slow_self_update_prepare_waits_for_marker_and_then_succeeds(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.db"
+    results = tmp_path / "results"
+    store = HostJobStore(database, results)
+    controller = DelayedSelfUpdateController(results)
+    runner = HostJobRunner(store, controller)  # type: ignore[arg-type]
+    application = HostdApplication(
+        HostdConfig(
+            bind="127.0.0.1",
+            port=8741,
+            database=database,
+            client_allowlist=frozenset(),
+        ),
+        store,
+        runner,
+        "g" * 64,
+        "u" * 64,
+    )
+
+    job, created = application.submit(
+        vmid=110,
+        operation_type="self_update",
+        request_id="request-slow-self-update-prepare",
+        argument="a" * 64,
+    )
+    assert created is True
+    assert controller.prepare_started.wait(timeout=5)
+
+    during_prepare = application.get_job(job["id"])
+
+    assert during_prepare["status"] == "running"
+    assert during_prepare["stage"] == "launching"
+    assert during_prepare["launching_started_at"]
+    assert during_prepare["launch_deadline_at"]
+    same, created_again = application.submit(
+        vmid=110,
+        operation_type="self_update",
+        request_id="request-slow-self-update-prepare",
+        argument="a" * 64,
+    )
+    assert created_again is False
+    assert same["id"] == job["id"]
+    assert controller.calls == [("self-update", 110, "a" * 64, job["id"])]
+
+    controller.allow_running_marker.set()
+    assert controller.running_marker_written.wait(timeout=5)
+    assert application.get_job(job["id"])["status"] == "running"
+
+    controller.allow_terminal_marker.set()
+    assert controller.terminal_marker_written.wait(timeout=5)
+    terminal = application.get_job(job["id"])
+
+    assert terminal["status"] == "succeeded"
+    assert terminal["result"]["exit_code"] == 0
+
+
+def test_missing_launch_marker_before_deadline_survives_hostd_restart_without_replay(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.db"
+    results = tmp_path / "results"
+    initial = HostJobStore(database, results)
+    job, _ = initial.create(
+        vmid=110,
+        operation_type="self_update",
+        request_id="request-self-update-launch-restart",
+        argument="a" * 64,
+    )
+    initial.begin_self_update_launch(job["id"])
+    remove_marker(results, job["id"])
+
+    controller = DummyController()
+    restarted = HostJobStore(database, results)
+    reconciled = restarted.reconcile(controller)  # type: ignore[arg-type]
+
+    assert reconciled[0]["status"] == "running"
+    assert reconciled[0]["stage"] == "launching"
+    assert controller.calls == []
+    assert read_marker(results, job["id"]) is None
+
+
+def test_terminal_self_update_job_cannot_invoke_systemd_run(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.db"
+    results = tmp_path / "results"
+    store = HostJobStore(database, results)
+    job, _ = store.create(
+        vmid=110,
+        operation_type="self_update",
+        request_id="request-terminal-before-systemd-run",
+        argument="a" * 64,
+    )
+    store.begin_self_update_launch(job["id"])
+    store.transition(
+        job["id"],
+        status="interrupted",
+        stage="interrupted",
+        progress=100,
+        error="launch deadline expired; outcome is unknown",
+    )
+    write_marker(
+        results,
+        job["id"],
+        {
+            "job_id": job["id"],
+            "status": "running",
+            "fingerprint": "a" * 64,
+            "deadline_at": "2999-01-01T00:00:00+00:00",
+        },
+    )
+
+    with pytest.raises(ReleaseError, match="no longer active"):
+        verify_supervisor_launch(
+            result_dir=results,
+            database=database,
+            job_id=job["id"],
+            expected_fingerprint="a" * 64,
+        )
+
+    wrapper = (PVE / "hubinet-ops-self-update").read_text(encoding="utf-8")
+    assert wrapper.index("verify-active") < wrapper.index('set +e')
+    assert wrapper.index("verify-active") < wrapper.index('"$SYSTEMD_RUN"')
+
+
+def test_prepare_does_not_publish_running_marker_after_job_terminalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "jobs.db"
+    results = tmp_path / "results"
+    release_root = tmp_path / "release"
+    (release_root / "deploy").mkdir(parents=True)
+    _write(
+        release_root / "deploy" / "upgrade-0.4.0-from-pve.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    release = inspect_staged_release(release_root)
+    store = HostJobStore(database, results)
+    job, _ = store.create(
+        vmid=110,
+        operation_type="self_update",
+        request_id="request-terminal-during-prepare",
+        argument=release["fingerprint"],
+    )
+    store.begin_self_update_launch(job["id"])
+
+    def terminalize_during_scan(root: Path) -> dict[str, Any]:
+        assert root == release_root
+        store.transition(
+            job["id"],
+            status="interrupted",
+            stage="interrupted",
+            progress=100,
+            error="launch deadline expired; outcome is unknown",
+        )
+        return release
+
+    monkeypatch.setattr(
+        "hubinet_ops_release.inspect_staged_release",
+        terminalize_during_scan,
+    )
+
+    with pytest.raises(ReleaseError, match="no longer active"):
+        prepare_supervisor(
+            release_root=release_root,
+            result_dir=results,
+            database=database,
+            job_id=job["id"],
+            expected_fingerprint=release["fingerprint"],
+        )
+
+    assert read_marker(results, job["id"])["status"] == "launching"
+
+
+def test_supervisor_rechecks_terminal_job_after_release_scan_before_rollout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "jobs.db"
+    results = tmp_path / "results"
+    release_root = tmp_path / "release"
+    (release_root / "deploy").mkdir(parents=True)
+    _write(
+        release_root / "deploy" / "upgrade-0.4.0-from-pve.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    release = inspect_staged_release(release_root)
+    store = HostJobStore(database, results)
+    job, _ = store.create(
+        vmid=110,
+        operation_type="self_update",
+        request_id="request-terminal-before-rollout",
+        argument=release["fingerprint"],
+    )
+    store.begin_self_update_launch(job["id"])
+    write_marker(
+        results,
+        job["id"],
+        {
+            "job_id": job["id"],
+            "status": "running",
+            "fingerprint": release["fingerprint"],
+            "deadline_at": "2999-01-01T00:00:00+00:00",
+        },
+    )
+
+    def terminalize_during_scan(root: Path) -> dict[str, Any]:
+        assert root == release_root
+        store.transition(
+            job["id"],
+            status="interrupted",
+            stage="interrupted",
+            progress=100,
+            error="rollout outcome is unknown",
+        )
+        return release
+
+    def forbidden_rollout(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("rollout subprocess must not be invoked for a terminal job")
+
+    monkeypatch.setattr(
+        "hubinet_ops_release.inspect_staged_release",
+        terminalize_during_scan,
+    )
+    monkeypatch.setattr("hubinet_ops_release.subprocess.run", forbidden_rollout)
+
+    exit_code = run_supervisor(
+        release_root=release_root,
+        result_dir=results,
+        database=database,
+        job_id=job["id"],
+        expected_fingerprint=release["fingerprint"],
+    )
+
+    assert exit_code == 125
+    assert store.get(job["id"])["status"] == "interrupted"
 
 
 def test_hostd_service_is_root_owned_and_hardened() -> None:

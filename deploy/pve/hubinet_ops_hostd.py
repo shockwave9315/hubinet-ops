@@ -17,7 +17,7 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,7 +25,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from hubinet_ops_host_control import HostControlError, HostController
-from hubinet_ops_release import ReleaseError, read_marker, remove_marker
+from hubinet_ops_release import ReleaseError, read_marker, remove_marker, write_marker
 
 VERSION = "0.4.0"
 MAX_REQUEST_BYTES = 16 * 1024
@@ -45,6 +45,7 @@ SELF_UPDATE_RELEASE_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/self-update/release$"
 )
 TERMINAL_STATUSES = {"succeeded", "failed", "interrupted"}
+SELF_UPDATE_LAUNCH_TIMEOUT_SECONDS = 600
 
 LOG = logging.getLogger("hubinet-ops-hostd")
 
@@ -139,6 +140,8 @@ class HostJobStore:
                     progress INTEGER NOT NULL,
                     result_json TEXT,
                     error TEXT,
+                    launching_started_at TEXT,
+                    launch_deadline_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(vmid, request_id)
@@ -147,6 +150,13 @@ class HostJobStore:
                     ON host_jobs(status, created_at);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(host_jobs)").fetchall()
+            }
+            for name in ("launching_started_at", "launch_deadline_at"):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE host_jobs ADD COLUMN {name} TEXT")
 
     def create(
         self,
@@ -223,6 +233,56 @@ class HostJobStore:
             )
         return self.get(job_id)
 
+    def begin_self_update_launch(
+        self,
+        job_id: str,
+        *,
+        timeout_seconds: int = SELF_UPDATE_LAUNCH_TIMEOUT_SECONDS,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        current = self.get(job_id)
+        if current["operation_type"] != "self_update" or current["status"] != "queued":
+            raise HostControlError("self-update job is not queued for launch")
+        started = (now or datetime.now(UTC)).replace(microsecond=0)
+        deadline = started + timedelta(seconds=timeout_seconds)
+        started_at = started.isoformat()
+        deadline_at = deadline.isoformat()
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE host_jobs SET status='running', stage='launching', progress=5, "
+                "launching_started_at=?, launch_deadline_at=?, updated_at=? "
+                "WHERE id=? AND status='queued' AND operation_type='self_update'",
+                (started_at, deadline_at, utc_now(), job_id),
+            )
+            if cursor.rowcount != 1:
+                raise HostControlError("self-update job could not enter launching state")
+        try:
+            write_marker(
+                self.self_update_results,
+                job_id,
+                {
+                    "job_id": job_id,
+                    "status": "launching",
+                    "fingerprint": str(current["argument"]),
+                    "started_at": started_at,
+                    "deadline_at": deadline_at,
+                    "exit_code": None,
+                    "error": None,
+                },
+            )
+        except (OSError, ReleaseError) as exc:
+            self.transition(
+                job_id,
+                status="failed",
+                stage="failed",
+                progress=100,
+                error=f"failed to persist self-update launch marker: {exc}",
+            )
+            raise HostControlError(
+                "failed to persist self-update launch marker"
+            ) from exc
+        return self.get(job_id)
+
     def reconcile(self, controller: HostController) -> list[dict[str, Any]]:
         reconciled: list[dict[str, Any]] = []
         with self._connect() as connection:
@@ -294,11 +354,26 @@ class HostJobStore:
         try:
             marker = read_marker(self.self_update_results, str(job["id"]))
             if marker is None:
-                marker = {}
+                launch_deadline = _parse_timestamp(job.get("launch_deadline_at"))
+                if launch_deadline is not None and launch_deadline > datetime.now(UTC):
+                    return job
+                message = (
+                    "self-update supervisor launch marker did not appear before "
+                    "the launch deadline; rollout outcome is unknown"
+                )
             elif marker.get("fingerprint") != job.get("argument"):
                 message = (
                     "self-update supervisor fingerprint does not match the approved release; "
                     "rollout outcome is unknown"
+                )
+                remove = True
+            elif marker.get("status") == "launching":
+                deadline = _parse_timestamp(marker.get("deadline_at"))
+                if deadline is not None and deadline > datetime.now(UTC):
+                    return job
+                message = (
+                    "self-update supervisor did not finish launching before "
+                    "its deadline; rollout outcome is unknown"
                 )
                 remove = True
             elif marker.get("status") == "running":
@@ -369,9 +444,13 @@ class HostJobRunner:
     def run(self, job_id: str) -> dict[str, Any]:
         with self._lock:
             job = self.store.get(job_id)
-            if job["status"] != "queued":
+            if job["operation_type"] == "self_update":
+                if job["status"] != "running" or job["stage"] != "launching":
+                    return job
+            elif job["status"] != "queued":
                 return job
-            self.store.transition(job_id, status="running", stage="executing", progress=10)
+            else:
+                self.store.transition(job_id, status="running", stage="executing", progress=10)
             action = {
                 "lifecycle_start": "start",
                 "lifecycle_shutdown": "shutdown",
@@ -399,6 +478,9 @@ class HostJobRunner:
             except Exception as exc:
                 LOG.error("host job failed id=%s vmid=%s operation=%s", job_id, job["vmid"], job["operation_type"])
                 if job["operation_type"] == "self_update":
+                    current = self.store.get(job_id)
+                    if current["status"] in TERMINAL_STATUSES:
+                        return current
                     try:
                         marker = read_marker(
                             self.store.self_update_results,
@@ -461,6 +543,7 @@ class HostdApplication:
         self.runner = runner
         self.token = token
         self.update_token = update_token
+        self._submit_lock = threading.Lock()
 
     def authorize(
         self,
@@ -495,14 +578,17 @@ class HostdApplication:
             "self_update": "self-update",
         }[operation_type]
         self.runner.controller.policy.validate(action, vmid, argument)
-        job, created = self.store.create(
-            vmid=vmid,
-            operation_type=operation_type,
-            request_id=request_id,
-            argument=argument,
-        )
-        if created:
-            self.runner.start(job["id"])
+        with self._submit_lock:
+            job, created = self.store.create(
+                vmid=vmid,
+                operation_type=operation_type,
+                request_id=request_id,
+                argument=argument,
+            )
+            if created:
+                if operation_type == "self_update":
+                    job = self.store.begin_self_update_launch(job["id"])
+                self.runner.start(job["id"])
         return job, created
 
     def get_job(self, job_id: str) -> dict[str, Any]:
@@ -692,8 +778,10 @@ def main() -> int:
     token = os.environ.get("HUBINET_OPS_HOSTD_TOKEN", "")
     update_token = os.environ.get("HUBINET_OPS_HOSTD_UPDATE_TOKEN", "")
     config = HostdConfig.load(args.config)
+    os.environ["HUBINET_OPS_HOSTD_DATABASE"] = str(config.database)
     controller = HostController()
     store = HostJobStore(config.database)
+    os.environ["HUBINET_OPS_SELF_UPDATE_RESULTS"] = str(store.self_update_results)
     store.reconcile(controller)
     application = HostdApplication(
         config,

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -124,7 +125,7 @@ def read_marker(result_dir: Path, job_id: str) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         raise ReleaseError("Self-update supervisor marker is invalid")
     status = str(payload.get("status") or "")
-    if status not in {"running", *TERMINAL_MARKER_STATUSES}:
+    if status not in {"launching", "running", *TERMINAL_MARKER_STATUSES}:
         raise ReleaseError("Self-update supervisor marker has invalid status")
     fingerprint = str(payload.get("fingerprint") or "")
     if not FINGERPRINT_RE.fullmatch(fingerprint):
@@ -162,24 +163,116 @@ def remove_marker(result_dir: Path, job_id: str) -> None:
     marker_path(result_dir, job_id).unlink(missing_ok=True)
 
 
+def assert_active_self_update_job(
+    *,
+    database: Path,
+    job_id: str,
+    expected_fingerprint: str,
+    require_launch_window: bool,
+) -> dict[str, Any]:
+    if not JOB_ID_RE.fullmatch(job_id):
+        raise ReleaseError("Invalid self-update job ID")
+    if not FINGERPRINT_RE.fullmatch(expected_fingerprint):
+        raise ReleaseError("Invalid approved release fingerprint")
+    try:
+        uri = f"{database.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=5) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT id, operation_type, argument, status, stage, "
+                "launching_started_at, launch_deadline_at "
+                "FROM host_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise ReleaseError("Self-update host job state is unavailable") from exc
+    if row is None:
+        raise ReleaseError("Self-update host job does not exist")
+    job = dict(row)
+    if (
+        job["operation_type"] != "self_update"
+        or job["argument"] != expected_fingerprint
+        or job["status"] != "running"
+        or job["stage"] not in {"launching", "executing"}
+    ):
+        raise ReleaseError("Self-update host job is no longer active")
+    if require_launch_window:
+        try:
+            deadline = datetime.fromisoformat(str(job["launch_deadline_at"]))
+        except (TypeError, ValueError) as exc:
+            raise ReleaseError("Self-update launch deadline is invalid") from exc
+        if deadline.tzinfo is None or deadline.astimezone(UTC) <= datetime.now(UTC):
+            raise ReleaseError("Self-update launch deadline expired")
+    return job
+
+
+def _require_marker(
+    *,
+    result_dir: Path,
+    job_id: str,
+    expected_fingerprint: str,
+    expected_status: str,
+) -> dict[str, Any]:
+    marker = read_marker(result_dir, job_id)
+    if marker is None or marker.get("status") != expected_status:
+        raise ReleaseError(
+            f"Self-update {expected_status} marker is missing"
+        )
+    if marker.get("fingerprint") != expected_fingerprint:
+        raise ReleaseError(
+            "Self-update marker fingerprint does not match the approved release"
+        )
+    if expected_status == "launching":
+        try:
+            deadline = datetime.fromisoformat(str(marker.get("deadline_at")))
+        except (TypeError, ValueError) as exc:
+            raise ReleaseError("Self-update launch marker deadline is invalid") from exc
+        if deadline.tzinfo is None or deadline.astimezone(UTC) <= datetime.now(UTC):
+            raise ReleaseError("Self-update launch marker expired")
+    return marker
+
+
 def prepare_supervisor(
     *,
     release_root: Path,
     result_dir: Path,
+    database: Path,
     job_id: str,
     expected_fingerprint: str,
 ) -> dict[str, Any]:
-    if not FINGERPRINT_RE.fullmatch(expected_fingerprint):
-        raise ReleaseError("Invalid approved release fingerprint")
+    assert_active_self_update_job(
+        database=database,
+        job_id=job_id,
+        expected_fingerprint=expected_fingerprint,
+        require_launch_window=True,
+    )
+    launching = _require_marker(
+        result_dir=result_dir,
+        job_id=job_id,
+        expected_fingerprint=expected_fingerprint,
+        expected_status="launching",
+    )
     release = inspect_staged_release(release_root)
     if release["fingerprint"] != expected_fingerprint:
         raise ReleaseError("Staged release fingerprint changed before rollout")
+    assert_active_self_update_job(
+        database=database,
+        job_id=job_id,
+        expected_fingerprint=expected_fingerprint,
+        require_launch_window=True,
+    )
+    _require_marker(
+        result_dir=result_dir,
+        job_id=job_id,
+        expected_fingerprint=expected_fingerprint,
+        expected_status="launching",
+    )
     now = datetime.now(UTC).replace(microsecond=0)
     marker = {
         **public_release(release),
         "job_id": job_id,
         "status": "running",
-        "started_at": now.isoformat(),
+        "started_at": launching.get("started_at") or now.isoformat(),
         "deadline_at": (now + timedelta(seconds=SUPERVISOR_TIMEOUT_SECONDS)).isoformat(),
         "exit_code": None,
         "error": None,
@@ -188,17 +281,51 @@ def prepare_supervisor(
     return marker
 
 
+def verify_supervisor_launch(
+    *,
+    result_dir: Path,
+    database: Path,
+    job_id: str,
+    expected_fingerprint: str,
+) -> None:
+    assert_active_self_update_job(
+        database=database,
+        job_id=job_id,
+        expected_fingerprint=expected_fingerprint,
+        require_launch_window=False,
+    )
+    _require_marker(
+        result_dir=result_dir,
+        job_id=job_id,
+        expected_fingerprint=expected_fingerprint,
+        expected_status="running",
+    )
+
+
 def run_supervisor(
     *,
     release_root: Path,
     result_dir: Path,
+    database: Path,
     job_id: str,
     expected_fingerprint: str,
 ) -> int:
     try:
-        running = read_marker(result_dir, job_id)
-        if running is None or running.get("status") != "running":
-            raise ReleaseError("Self-update running marker is missing")
+        assert_active_self_update_job(
+            database=database,
+            job_id=job_id,
+            expected_fingerprint=expected_fingerprint,
+            require_launch_window=False,
+        )
+    except ReleaseError:
+        return 125
+    try:
+        running = _require_marker(
+            result_dir=result_dir,
+            job_id=job_id,
+            expected_fingerprint=expected_fingerprint,
+            expected_status="running",
+        )
         release = inspect_staged_release(release_root)
         if release["fingerprint"] != expected_fingerprint:
             raise ReleaseError("Staged release fingerprint changed before rollout")
@@ -210,6 +337,16 @@ def run_supervisor(
             exit_code=125,
             error=str(exc),
         )
+        return 125
+
+    try:
+        verify_supervisor_launch(
+            result_dir=result_dir,
+            database=database,
+            job_id=job_id,
+            expected_fingerprint=expected_fingerprint,
+        )
+    except ReleaseError:
         return 125
 
     timed_out = False
@@ -316,8 +453,14 @@ def main() -> int:
         child = subparsers.add_parser(command)
         child.add_argument("--release-root", type=Path, required=True)
         child.add_argument("--result-dir", type=Path, required=True)
+        child.add_argument("--job-database", type=Path, required=True)
         child.add_argument("--job-id", required=True)
         child.add_argument("--fingerprint", required=True)
+    verify = subparsers.add_parser("verify-active")
+    verify.add_argument("--result-dir", type=Path, required=True)
+    verify.add_argument("--job-database", type=Path, required=True)
+    verify.add_argument("--job-id", required=True)
+    verify.add_argument("--fingerprint", required=True)
     failed = subparsers.add_parser("launch-failed")
     failed.add_argument("--result-dir", type=Path, required=True)
     failed.add_argument("--job-id", required=True)
@@ -328,6 +471,7 @@ def main() -> int:
         prepare_supervisor(
             release_root=args.release_root,
             result_dir=args.result_dir,
+            database=args.job_database,
             job_id=args.job_id,
             expected_fingerprint=args.fingerprint,
         )
@@ -336,9 +480,18 @@ def main() -> int:
         return run_supervisor(
             release_root=args.release_root,
             result_dir=args.result_dir,
+            database=args.job_database,
             job_id=args.job_id,
             expected_fingerprint=args.fingerprint,
         )
+    if args.command == "verify-active":
+        verify_supervisor_launch(
+            result_dir=args.result_dir,
+            database=args.job_database,
+            job_id=args.job_id,
+            expected_fingerprint=args.fingerprint,
+        )
+        return 0
     record_launch_failure(
         result_dir=args.result_dir,
         job_id=args.job_id,

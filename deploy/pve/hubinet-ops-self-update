@@ -21,6 +21,7 @@ FINGERPRINT="$4"
 
 RELEASE_ROOT="${HUBINET_OPS_RELEASE_ROOT:-/var/lib/hubinet-ops-hostd/approved-release}"
 RESULT_DIR="${HUBINET_OPS_SELF_UPDATE_RESULTS:-/var/lib/hubinet-ops-hostd/self-update-results}"
+JOB_DATABASE="${HUBINET_OPS_HOSTD_DATABASE:-/var/lib/hubinet-ops-hostd/jobs.db}"
 HELPER="${HUBINET_OPS_RELEASE_HELPER:-/usr/local/lib/hubinet-ops/hubinet_ops_release.py}"
 SYSTEMD_RUN="${HUBINET_OPS_SYSTEMD_RUN:-/usr/bin/systemd-run}"
 PYTHON="${HUBINET_OPS_PYTHON:-/usr/bin/python3}"
@@ -33,6 +34,13 @@ PYTHON="${HUBINET_OPS_PYTHON:-/usr/bin/python3}"
 "$PYTHON" "$HELPER" prepare \
   --release-root "$RELEASE_ROOT" \
   --result-dir "$RESULT_DIR" \
+  --job-database "$JOB_DATABASE" \
+  --job-id "$JOB_ID" \
+  --fingerprint "$FINGERPRINT"
+
+"$PYTHON" "$HELPER" verify-active \
+  --result-dir "$RESULT_DIR" \
+  --job-database "$JOB_DATABASE" \
   --job-id "$JOB_ID" \
   --fingerprint "$FINGERPRINT"
 
@@ -45,6 +53,7 @@ set +e
   "$PYTHON" "$HELPER" run \
     --release-root "$RELEASE_ROOT" \
     --result-dir "$RESULT_DIR" \
+    --job-database "$JOB_DATABASE" \
     --job-id "$JOB_ID" \
     --fingerprint "$FINGERPRINT"
 rc=$?
