@@ -12,6 +12,6 @@
 | 107 | Immich | LXC / APT | high | full APT/lifecycle/snapshot control; non-Docker deployment |
 | 108 | DDNS | LXC / APT | medium | full control; insufficient health contract is explicit |
 | 109 | Pompa | LXC / APT + Docker | critical | full control; Docker names are not guessed |
-| 110 | Hubinet Ops | LXC / agent_self | high | hostd lifecycle/snapshot and dedicated self-update |
+| 110 | Hubinet Ops | LXC / agent_self | high | backend-gated hostd lifecycle/snapshot, dedicated self-update, scoped offline recovery |
 
 Exact IP addresses, services, Docker requirements, monitoring flags, and dashboard paths are versioned in `config/config.example.yaml`. The repository never treats any production resource as a live test target; rollout validation is read-only.

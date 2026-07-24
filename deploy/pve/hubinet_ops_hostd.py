@@ -38,6 +38,16 @@ ACTION_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/"
     r"(?P<action>start|shutdown|reboot|force-stop|self-update)$"
 )
+OFFLINE_RESTORE_PATH_RE = re.compile(
+    r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/snapshots/"
+    r"(?P<name>[^/]+)/offline-restore$"
+)
+OFFLINE_FORCE_STOP_PATH_RE = re.compile(
+    r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/offline-force-stop$"
+)
+RECOVERY_EVENT_PATH_RE = re.compile(
+    r"^/api/v1/recovery-events/(?P<recovery_id>[a-f0-9]{32})/ack$"
+)
 STATUS_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/status$"
 )
@@ -151,6 +161,23 @@ class HostJobStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_host_jobs_status
                     ON host_jobs(status, created_at);
+                CREATE TABLE IF NOT EXISTS recovery_events (
+                    recovery_id TEXT PRIMARY KEY,
+                    host_job_id TEXT NOT NULL UNIQUE,
+                    request_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    snapshot_name TEXT,
+                    operation_type TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT,
+                    completed_at TEXT,
+                    acknowledged_at TEXT,
+                    FOREIGN KEY(host_job_id) REFERENCES host_jobs(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_recovery_events_unacknowledged
+                    ON recovery_events(acknowledged_at, started_at);
                 """
             )
             columns = {
@@ -217,6 +244,136 @@ class HostJobStore:
             raise KeyError((int(vmid), str(request_id)))
         return self._row(row)
 
+    def create_recovery(
+        self,
+        *,
+        vmid: int,
+        operation_type: str,
+        request_id: str,
+        argument: str | None,
+    ) -> tuple[dict[str, Any], bool]:
+        if operation_type not in {
+            "offline_snapshot_restore",
+            "offline_force_stop",
+        }:
+            raise ValueError("invalid recovery operation")
+        if not REQUEST_ID_RE.fullmatch(request_id):
+            raise ValueError("invalid request_id")
+        now = utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM host_jobs WHERE vmid=? AND request_id=?",
+                (vmid, request_id),
+            ).fetchone()
+            if existing is not None:
+                job = self._row(existing)
+                if job["operation_type"] != operation_type or job["argument"] != argument:
+                    connection.execute("ROLLBACK")
+                    raise ValueError("request_id was already used for another operation")
+                recovery = connection.execute(
+                    "SELECT recovery_id FROM recovery_events WHERE host_job_id=?",
+                    (job["id"],),
+                ).fetchone()
+                if recovery is None:
+                    connection.execute("ROLLBACK")
+                    raise HostControlError("recovery marker is missing for existing job")
+                connection.execute("COMMIT")
+                return job, False
+            if connection.execute(
+                "SELECT id FROM host_jobs WHERE status IN ('queued','running') LIMIT 1"
+            ).fetchone():
+                connection.execute("ROLLBACK")
+                raise HostControlError("another destructive host job is active")
+            job_id = uuid.uuid4().hex
+            recovery_id = uuid.uuid4().hex
+            connection.execute(
+                "INSERT INTO host_jobs "
+                "(id, request_id, vmid, operation_type, argument, status, stage, progress, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'queued', 'queued', 0, ?, ?)",
+                (job_id, request_id, vmid, operation_type, argument, now, now),
+            )
+            connection.execute(
+                "INSERT INTO recovery_events "
+                "(recovery_id,host_job_id,request_id,vmid,snapshot_name,operation_type,"
+                "started_at,status) VALUES(?,?,?,?,?,?,?,'queued')",
+                (
+                    recovery_id,
+                    job_id,
+                    request_id,
+                    vmid,
+                    argument if operation_type == "offline_snapshot_restore" else None,
+                    operation_type,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM host_jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+        if row is None:
+            raise HostControlError("failed to persist recovery host job")
+        return self._row(row), True
+
+    def list_unacknowledged_recovery_events(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM recovery_events WHERE acknowledged_at IS NULL "
+                "ORDER BY started_at, recovery_id"
+            ).fetchall()
+        return [self._recovery_row(row) for row in rows]
+
+    def has_recovery_event(self, host_job_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM recovery_events WHERE host_job_id=?",
+                (host_job_id,),
+            ).fetchone()
+        return row is not None
+
+    def acknowledge_recovery_event(self, recovery_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[a-f0-9]{32}", recovery_id):
+            raise ValueError("invalid recovery_id")
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM recovery_events WHERE recovery_id=?",
+                (recovery_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(recovery_id)
+            if row["status"] not in TERMINAL_STATUSES:
+                raise HostControlError("active recovery event cannot be acknowledged")
+            if row["acknowledged_at"] is None:
+                connection.execute(
+                    "UPDATE recovery_events SET acknowledged_at=? WHERE recovery_id=?",
+                    (utc_now(), recovery_id),
+                )
+            persisted = connection.execute(
+                "SELECT * FROM recovery_events WHERE recovery_id=?",
+                (recovery_id,),
+            ).fetchone()
+        if persisted is None:
+            raise KeyError(recovery_id)
+        return self._recovery_row(persisted)
+
+    def _sync_recovery_event(self, job: dict[str, Any]) -> None:
+        completed_at = utc_now() if job["status"] in TERMINAL_STATUSES else None
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE recovery_events SET status=?, result_json=?, error=?, "
+                "completed_at=COALESCE(completed_at, ?) WHERE host_job_id=?",
+                (
+                    job["status"],
+                    json.dumps(job["result"], sort_keys=True, separators=(",", ":"))
+                    if job.get("result") is not None
+                    else None,
+                    job.get("error"),
+                    completed_at,
+                    job["id"],
+                ),
+            )
+
     def queued(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -240,7 +397,9 @@ class HostJobStore:
                 current["status"],
             )
             return current
-        return self.get(job_id)
+        persisted = self.get(job_id)
+        self._sync_recovery_event(persisted)
+        return persisted
 
     def transition_from_active(
         self,
@@ -280,7 +439,9 @@ class HostJobStore:
                 current["status"],
             )
             return current
-        return self.get(job_id)
+        persisted = self.get(job_id)
+        self._sync_recovery_event(persisted)
+        return persisted
 
     def begin_self_update_launch(
         self,
@@ -488,6 +649,14 @@ class HostJobStore:
         result["result"] = json.loads(result.pop("result_json")) if result["result_json"] else None
         return result
 
+    @staticmethod
+    def _recovery_row(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["result"] = (
+            json.loads(result.pop("result_json")) if result["result_json"] else None
+        )
+        return result
+
 
 class HostJobRunner:
     def __init__(self, store: HostJobStore, controller: HostController) -> None:
@@ -520,6 +689,8 @@ class HostJobRunner:
                 "snapshot_rollback": "snapshot-rollback",
                 "snapshot_delete": "snapshot-delete",
                 "self_update": "self-update",
+                "offline_snapshot_restore": "snapshot-rollback",
+                "offline_force_stop": "force-stop",
             }[job["operation_type"]]
             LOG.info(
                 "host job executing id=%s request_id=%s vmid=%s operation=%s",
@@ -588,35 +759,40 @@ class HostdApplication:
         store: HostJobStore,
         runner: HostJobRunner,
         token: str,
+        backend_token: str,
         update_token: str,
+        recovery_token: str,
     ) -> None:
-        if len(token) < 32:
-            raise ValueError("HUBINET_OPS_HOSTD_TOKEN must contain at least 32 characters")
-        if len(update_token) < 32:
-            raise ValueError(
-                "HUBINET_OPS_HOSTD_UPDATE_TOKEN must contain at least 32 characters"
-            )
-        if hmac.compare_digest(token, update_token):
-            raise ValueError("Hostd general and self-update bearer tokens must differ")
+        tokens = {
+            "general": ("HUBINET_OPS_HOSTD_TOKEN", token),
+            "backend": ("HUBINET_OPS_HOSTD_BACKEND_TOKEN", backend_token),
+            "self_update": ("HUBINET_OPS_HOSTD_UPDATE_TOKEN", update_token),
+            "recovery": ("HUBINET_OPS_HOSTD_RECOVERY_TOKEN", recovery_token),
+        }
+        for environment_name, value in tokens.values():
+            if len(value) < 32:
+                raise ValueError(f"{environment_name} must contain at least 32 characters")
+        values = [value for _, value in tokens.values()]
+        if any(
+            hmac.compare_digest(left, right)
+            for index, left in enumerate(values)
+            for right in values[index + 1 :]
+        ):
+            raise ValueError("Hostd bearer tokens for separate scopes must differ")
         self.config = config
         self.store = store
         self.runner = runner
-        self.token = token
-        self.update_token = update_token
+        self.tokens = {scope: value for scope, (_, value) in tokens.items()}
         self._submit_lock = threading.Lock()
 
-    def authorize(
-        self,
-        headers: Any,
-        client_ip: str,
-        *,
-        self_update: bool = False,
-    ) -> bool:
+    def authentication_scope(self, headers: Any, client_ip: str) -> str | None:
         if self.config.client_allowlist and client_ip not in self.config.client_allowlist:
-            return False
+            return None
         provided = headers.get("Authorization", "")
-        expected = self.update_token if self_update else self.token
-        return hmac.compare_digest(provided, f"Bearer {expected}")
+        for scope, token in self.tokens.items():
+            if hmac.compare_digest(provided, f"Bearer {token}"):
+                return scope
+        return None
 
     def submit(
         self,
@@ -651,6 +827,71 @@ class HostdApplication:
                 self.runner.start(job["id"])
         return job, created
 
+    def submit_recovery(
+        self,
+        *,
+        vmid: int,
+        operation_type: str,
+        request_id: str,
+        argument: str | None,
+    ) -> tuple[dict[str, Any], bool]:
+        if vmid != 110:
+            raise HostControlError("offline recovery is restricted to CT110")
+        action = {
+            "offline_snapshot_restore": "snapshot-rollback",
+            "offline_force_stop": "force-stop",
+        }[operation_type]
+        self.runner.controller.policy.validate(action, vmid, argument)
+        with self._submit_lock:
+            try:
+                existing = self.store.get_by_request_id(vmid, request_id)
+            except KeyError:
+                existing = None
+            if existing is not None:
+                if (
+                    existing["operation_type"] != operation_type
+                    or existing["argument"] != argument
+                ):
+                    raise ValueError(
+                        "request_id was already used for another operation"
+                    )
+                if not self.store.has_recovery_event(str(existing["id"])):
+                    raise HostControlError("recovery marker is missing")
+                return existing, False
+            if operation_type == "offline_snapshot_restore":
+                status = self.runner.controller.execute("status", vmid)
+                if _runtime_status(status) != "stopped":
+                    raise HostControlError(
+                        "offline snapshot restore requires CT110 runtime to be stopped"
+                    )
+                snapshots = self.runner.controller.execute("list-snapshots", vmid)
+                values = snapshots.get("snapshots") if isinstance(snapshots, dict) else None
+                snapshot = next(
+                    (
+                        item
+                        for item in values or []
+                        if isinstance(item, dict) and item.get("name") == argument
+                    ),
+                    None,
+                )
+                if (
+                    snapshot is None
+                    or snapshot.get("owned_by_hubinet_ops") is not True
+                    or snapshot.get("rollback_eligible") is not True
+                ):
+                    raise HostControlError(
+                        "offline restore requires an owned rollback-eligible snapshot"
+                    )
+            job, created = self.store.create_recovery(
+                vmid=vmid,
+                operation_type=operation_type,
+                request_id=request_id,
+                argument=argument,
+            )
+            if created:
+                self.runner.start(job["id"])
+        return job, created
+
     def get_job(self, job_id: str) -> dict[str, Any]:
         job = self.store.get(job_id)
         if (
@@ -673,6 +914,12 @@ class HostdApplication:
             return self.store.refresh_self_update_result(str(job["id"]))
         return job
 
+    def list_recovery_events(self) -> dict[str, Any]:
+        return {"events": self.store.list_unacknowledged_recovery_events()}
+
+    def acknowledge_recovery_event(self, recovery_id: str) -> dict[str, Any]:
+        return self.store.acknowledge_recovery_event(recovery_id)
+
 
 class HostdHandler(BaseHTTPRequestHandler):
     server_version = f"hubinet-ops-hostd/{VERSION}"
@@ -683,10 +930,15 @@ class HostdHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send(HTTPStatus.OK, {"status": "ok", "version": VERSION})
             return
-        if not self._authorized():
+        if path == "/api/v1/recovery-events":
+            if not self._authorized({"backend"}):
+                return
+            self._send(HTTPStatus.OK, self.app.list_recovery_events())
             return
         lookup_match = JOB_BY_REQUEST_PATH_RE.fullmatch(path)
         if lookup_match:
+            if not self._authorized({"general", "backend"}):
+                return
             raw_vmid = lookup_match.group("vmid")
             request_id = lookup_match.group("request_id")
             if (
@@ -709,6 +961,8 @@ class HostdHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, job)
             return
         if path.startswith("/api/v1/jobs/"):
+            if not self._authorized({"general", "backend"}):
+                return
             try:
                 job = self.app.get_job(path.removeprefix("/api/v1/jobs/"))
             except KeyError:
@@ -718,6 +972,8 @@ class HostdHandler(BaseHTTPRequestHandler):
             return
         status_match = STATUS_PATH_RE.fullmatch(path)
         if status_match:
+            if not self._authorized({"general", "backend"}):
+                return
             try:
                 result = self.app.runner.controller.execute(
                     "status", int(status_match.group("vmid"))
@@ -729,6 +985,8 @@ class HostdHandler(BaseHTTPRequestHandler):
             return
         release_match = SELF_UPDATE_RELEASE_PATH_RE.fullmatch(path)
         if release_match:
+            if not self._authorized({"backend", "self_update"}):
+                return
             try:
                 result = self.app.runner.controller.execute(
                     "self-update-release", int(release_match.group("vmid"))
@@ -740,6 +998,8 @@ class HostdHandler(BaseHTTPRequestHandler):
             return
         match = SNAPSHOT_PATH_RE.fullmatch(path)
         if match and match.group("name") is None:
+            if not self._authorized({"general", "backend"}):
+                return
             try:
                 snapshots = self.app.runner.controller.execute("list-snapshots", int(match.group("vmid")))
             except (HostControlError, ValueError) as exc:
@@ -747,22 +1007,68 @@ class HostdHandler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, snapshots)
             return
-        self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        if self._authorized({"general", "backend", "self_update", "recovery"}):
+            self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         action_match = ACTION_PATH_RE.fullmatch(path)
         snapshot_match = SNAPSHOT_PATH_RE.fullmatch(path)
-        if not self._authorized(
-            self_update=bool(
-                action_match and action_match.group("action") == "self-update"
-            )
-        ):
+        offline_restore_match = OFFLINE_RESTORE_PATH_RE.fullmatch(path)
+        offline_force_stop_match = OFFLINE_FORCE_STOP_PATH_RE.fullmatch(path)
+        recovery_event_match = RECOVERY_EVENT_PATH_RE.fullmatch(path)
+        if recovery_event_match:
+            if not self._authorized({"backend"}):
+                return
+            try:
+                event = self.app.acknowledge_recovery_event(
+                    recovery_event_match.group("recovery_id")
+                )
+            except KeyError:
+                self._send(HTTPStatus.NOT_FOUND, {"error": "recovery event not found"})
+                return
+            except (ValueError, HostControlError) as exc:
+                self._send(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send(HTTPStatus.OK, event)
+            return
+        required_scopes = {"recovery"} if (
+            offline_restore_match or offline_force_stop_match
+        ) else (
+            {"self_update"}
+            if action_match and action_match.group("action") == "self-update"
+            else {"general", "backend"}
+            if action_match and action_match.group("action") == "start"
+            else {"backend"}
+        )
+        if not self._authorized(required_scopes):
             return
         try:
             payload = self._body()
             request_id = str(payload.get("request_id") or uuid.uuid4().hex)
-            if action_match:
+            if offline_restore_match:
+                if payload.get("confirm") != "RESTORE_CT110_OFFLINE":
+                    raise ValueError(
+                        "offline restore requires confirm=RESTORE_CT110_OFFLINE"
+                    )
+                job, created = self.app.submit_recovery(
+                    vmid=int(offline_restore_match.group("vmid")),
+                    operation_type="offline_snapshot_restore",
+                    request_id=request_id,
+                    argument=unquote(offline_restore_match.group("name")),
+                )
+            elif offline_force_stop_match:
+                if payload.get("confirm") != "FORCE_STOP_CT110_RECOVERY":
+                    raise ValueError(
+                        "offline force-stop requires confirm=FORCE_STOP_CT110_RECOVERY"
+                    )
+                job, created = self.app.submit_recovery(
+                    vmid=int(offline_force_stop_match.group("vmid")),
+                    operation_type="offline_force_stop",
+                    request_id=request_id,
+                    argument=None,
+                )
+            elif action_match:
                 vmid = int(action_match.group("vmid"))
                 operation_type = {
                     "start": "lifecycle_start",
@@ -776,6 +1082,12 @@ class HostdHandler(BaseHTTPRequestHandler):
                     if operation_type == "self_update"
                     else None
                 )
+                job, created = self.app.submit(
+                    vmid=vmid,
+                    operation_type=operation_type,
+                    request_id=request_id,
+                    argument=argument,
+                )
             elif snapshot_match and snapshot_match.group("operation") in {
                 "restore",
                 "rollback",
@@ -783,19 +1095,25 @@ class HostdHandler(BaseHTTPRequestHandler):
                 vmid = int(snapshot_match.group("vmid"))
                 operation_type = "snapshot_rollback"
                 argument = unquote(snapshot_match.group("name"))
+                job, created = self.app.submit(
+                    vmid=vmid,
+                    operation_type=operation_type,
+                    request_id=request_id,
+                    argument=argument,
+                )
             elif snapshot_match and snapshot_match.group("name") is None:
                 vmid = int(snapshot_match.group("vmid"))
                 operation_type = "snapshot_create"
                 argument = str(payload.get("name", ""))
+                job, created = self.app.submit(
+                    vmid=vmid,
+                    operation_type=operation_type,
+                    request_id=request_id,
+                    argument=argument,
+                )
             else:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
-            job, created = self.app.submit(
-                vmid=vmid,
-                operation_type=operation_type,
-                request_id=request_id,
-                argument=argument,
-            )
         except ValueError as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -805,7 +1123,7 @@ class HostdHandler(BaseHTTPRequestHandler):
         self._send(HTTPStatus.ACCEPTED if created else HTTPStatus.OK, job)
 
     def do_DELETE(self) -> None:  # noqa: N802
-        if not self._authorized():
+        if not self._authorized({"backend"}):
             return
         match = SNAPSHOT_PATH_RE.fullmatch(urlsplit(self.path).path)
         if not match or match.group("name") is None or match.group("operation") is not None:
@@ -827,14 +1145,14 @@ class HostdHandler(BaseHTTPRequestHandler):
             return
         self._send(HTTPStatus.ACCEPTED if created else HTTPStatus.OK, job)
 
-    def _authorized(self, *, self_update: bool = False) -> bool:
-        if self.app.authorize(
-            self.headers,
-            self.client_address[0],
-            self_update=self_update,
-        ):
+    def _authorized(self, allowed_scopes: set[str]) -> bool:
+        scope = self.app.authentication_scope(self.headers, self.client_address[0])
+        if scope in allowed_scopes:
             return True
-        self._send(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+        self._send(
+            HTTPStatus.FORBIDDEN if scope is not None else HTTPStatus.UNAUTHORIZED,
+            {"error": "forbidden" if scope is not None else "unauthorized"},
+        )
         return False
 
     def _body(self) -> dict[str, Any]:
@@ -881,7 +1199,9 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     token = os.environ.get("HUBINET_OPS_HOSTD_TOKEN", "")
+    backend_token = os.environ.get("HUBINET_OPS_HOSTD_BACKEND_TOKEN", "")
     update_token = os.environ.get("HUBINET_OPS_HOSTD_UPDATE_TOKEN", "")
+    recovery_token = os.environ.get("HUBINET_OPS_HOSTD_RECOVERY_TOKEN", "")
     config = HostdConfig.load(args.config)
     os.environ["HUBINET_OPS_HOSTD_DATABASE"] = str(config.database)
     controller = HostController()
@@ -893,7 +1213,9 @@ def main() -> int:
         store,
         HostJobRunner(store, controller),
         token,
+        backend_token,
         update_token,
+        recovery_token,
     )
     serve(config, application)
     return 0

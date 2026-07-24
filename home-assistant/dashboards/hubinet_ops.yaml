@@ -8611,6 +8611,43 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Break-glass recovery CT110
+      subtitle: Osobny token recovery; brak automatycznego fallbacku z backendu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-template-card
+        primary: AWARYJNE przywrócenie CT110 offline
+        secondary: Tylko gdy CT110 jest zatrzymany. Następny start unieważni przywrócone aktywne plany i joby.
+        multiline_secondary: true
+        icon: mdi:backup-restore
+        color: red
+        tap_action:
+          action: perform-action
+          perform_action: script.hubinet_ops_offline_snapshot_restore_ct110
+          confirmation:
+            title: AWARYJNE przywrócenie CT110 offline
+            text: Przywrócić ostatni kwalifikujący się snapshot zatrzymanego CT110? To jest operacja recovery poza backendem.
+            confirm_text: Rozumiem — wykonaj recovery
+            dismiss_text: Anuluj
+      - type: custom:mushroom-template-card
+        primary: AWARYJNE wymuszenie zatrzymania CT110
+        secondary: Osobna operacja recovery, nie zwykły force-stop backendu.
+        multiline_secondary: true
+        icon: mdi:alert-octagon
+        color: red
+        tap_action:
+          action: perform-action
+          perform_action: script.hubinet_ops_offline_force_stop_ct110
+          confirmation:
+            title: AWARYJNE wymuszenie zatrzymania CT110
+            text: Wymusić zatrzymanie CT110 bez łagodnego zamknięcia?
+            confirm_text: Rozumiem — wykonaj recovery
+            dismiss_text: Anuluj
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: Plan self-update
       subtitle: Wersja i fingerprint staged release zatwierdzane ręcznie
     - type: grid

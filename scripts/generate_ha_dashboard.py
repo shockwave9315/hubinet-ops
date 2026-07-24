@@ -675,6 +675,62 @@ def _snapshot_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _ct110_break_glass_section() -> dict[str, Any]:
+    def card(
+        primary: str,
+        secondary: str,
+        service: str,
+        confirmation: str,
+        icon: str,
+    ) -> dict[str, Any]:
+        return {
+            "type": "custom:mushroom-template-card",
+            "primary": primary,
+            "secondary": secondary,
+            "multiline_secondary": True,
+            "icon": icon,
+            "color": "red",
+            "tap_action": {
+                "action": "perform-action",
+                "perform_action": service,
+                "confirmation": {
+                    "title": primary,
+                    "text": confirmation,
+                    "confirm_text": "Rozumiem — wykonaj recovery",
+                    "dismiss_text": "Anuluj",
+                },
+            },
+        }
+
+    return _section(
+        _title(
+            "Break-glass recovery CT110",
+            "Osobny token recovery; brak automatycznego fallbacku z backendu",
+        ),
+        _entity_grid(
+            [
+                card(
+                    "AWARYJNE przywrócenie CT110 offline",
+                    "Tylko gdy CT110 jest zatrzymany. Następny start unieważni "
+                    "przywrócone aktywne plany i joby.",
+                    "script.hubinet_ops_offline_snapshot_restore_ct110",
+                    "Przywrócić ostatni kwalifikujący się snapshot zatrzymanego "
+                    "CT110? To jest operacja recovery poza backendem.",
+                    "mdi:backup-restore",
+                ),
+                card(
+                    "AWARYJNE wymuszenie zatrzymania CT110",
+                    "Osobna operacja recovery, nie zwykły force-stop backendu.",
+                    "script.hubinet_ops_offline_force_stop_ct110",
+                    "Wymusić zatrzymanie CT110 bez łagodnego zamknięcia?",
+                    "mdi:alert-octagon",
+                ),
+            ],
+            columns=2,
+        ),
+    )
+
+
 def _executor_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
     return _section(
         _title("Executor", "Kontrakt wymagany przed operacjami destrukcyjnymi"),
@@ -927,6 +983,7 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
             _resource_chips(vmid, cfg),
         ),
         _controls_section(vmid, cfg),
+        _ct110_break_glass_section(),
         _section(
             _title(
                 "Plan self-update",

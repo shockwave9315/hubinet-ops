@@ -82,7 +82,7 @@ def _client(
     return HostControlClient(
         {
             "base_url": "http://hostd.invalid:8741",
-            "token_env": "TEST_REATTACH_HOSTD_TOKEN",
+            "backend_token_env": "TEST_REATTACH_HOSTD_TOKEN",
             "poll_interval_seconds": 0.001,
             "poll_error_retries": 3,
         },

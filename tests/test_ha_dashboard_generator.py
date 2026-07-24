@@ -188,7 +188,7 @@ def test_ct110_has_only_supported_self_metrics() -> None:
     for unsupported in ("cpu_usage", "network_received", "network_sent"):
         assert f"sensor.hubinet_ops_ct110_{unsupported}" not in text
     assert "pending_update_count" not in text
-    assert text.count("perform-action") == 11
+    assert text.count("perform-action") == 13
     assert "script.hubinet_ops_self_update" in text
     assert "script.hubinet_ops_approve_container" in text
     assert "script.hubinet_ops_reject_container" in text

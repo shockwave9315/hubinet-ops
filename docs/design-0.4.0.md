@@ -17,7 +17,8 @@ API, job engine, and PVE execution boundary.
 ```text
 Home Assistant
   |-- CT101–CT109 actions --> CT110 agent API --> fixed SSH command --> PVE
-  |-- CT110 host actions ---------------------> hubinet-ops-hostd on PVE
+  |-- CT110 normal mutations --> CT110 agent API --> hostd backend scope
+  |-- CT110 start/offline recovery ----------> hubinet-ops-hostd on PVE
   `-- telemetry <---------------- retained MQTT projections from CT110
 
 PVE
@@ -32,8 +33,8 @@ The CT110 agent owns inventory, plans, update jobs, resource state, MQTT, and
 notifications. It may request fixed PVE actions but never sends shell text.
 The PVE control plane owns LXC runtime and snapshot truth. The independent
 `hubinet-ops-hostd` service is the only path intended to start CT110 while the
-agent is offline and is also the safe supervisor for CT110 lifecycle,
-snapshots, and self-update.
+agent is offline and is the durable executor for CT110 lifecycle, snapshots,
+and self-update after the backend has persisted and gated normal work.
 
 The forced-command wrapper and hostd call one shared Python implementation for
 action validation, allowlists, snapshot ownership, and fixed subprocess argv.
@@ -172,10 +173,11 @@ attributes.
 
 ## CT110 offline and self-update behavior
 
-CT110 cannot reliably supervise its own stop or restart. Its start, shutdown,
-reboot, force stop, snapshot, rollback, delete, and self-update requests go to
-hostd. Home Assistant stores the hostd bearer token in secrets and can therefore
-start CT110 while the agent API and MQTT availability are offline.
+CT110 cannot reliably supervise its own stop or restart. Normal shutdown,
+reboot, force stop, snapshot, rollback, delete, and self-update requests enter
+through its backend and then use durable hostd jobs. Home Assistant can call
+hostd directly only to start stopped CT110 or to invoke separately confirmed
+break-glass recovery while the backend is unavailable.
 
 Hostd accepts an idempotent request, persists it, returns a job identifier, and
 executes fixed `pct` operations. CT110 shutdown/reboot responses do not depend
@@ -186,7 +188,8 @@ does not expose package-manager or arbitrary shell arguments.
 ## Hostd security
 
 - root-owned systemd service and configuration;
-- bearer token read from an environment file outside the repository;
+- four pairwise-distinct scoped bearer tokens read from an environment file
+  outside the repository;
 - bind address and port configured explicitly, with optional client CIDR/IP
   allowlist;
 - bounded request line/body and strict JSON schema;
@@ -202,7 +205,8 @@ does not expose package-manager or arbitrary shell arguments.
 
 Dashboard controls are generated from capabilities. VM100 has no controls.
 CT101–CT109 expose update, lifecycle, force stop, health retry, and snapshot
-actions. CT110 uses hostd-backed services for lifecycle/snapshots/self-update.
+actions. CT110 normal mutations use backend services; direct hostd cards are
+limited to start and clearly separated break-glass recovery.
 Every action requires confirmation and surfaces success or failure through a
 persistent notification; approve/reject never reads `active_plan_id` from
 health attributes.

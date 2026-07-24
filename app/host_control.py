@@ -38,7 +38,10 @@ class HostControlClient:
     ) -> None:
         self.config = dict(config)
         self.base_url = str(self.config.get("base_url") or "").rstrip("/")
-        token_env = str(self.config.get("token_env") or "HUBINET_OPS_HOSTD_TOKEN")
+        token_env = str(
+            self.config.get("backend_token_env")
+            or "HUBINET_OPS_HOSTD_BACKEND_TOKEN"
+        )
         self.token = os.environ.get(token_env, "")
         update_token_env = str(
             self.config.get("update_token_env")
@@ -86,6 +89,25 @@ class HostControlClient:
         if len(fingerprint) != 64 or any(char not in "0123456789abcdef" for char in fingerprint):
             raise HostControlError("Host control returned an invalid release fingerprint")
         return result
+
+    def list_recovery_events(self) -> list[dict[str, Any]]:
+        result = self._retry_read(
+            lambda: self._request("GET", "/api/v1/recovery-events"),
+            deadline=self.monotonic() + self.timeout,
+        )
+        if result is None:
+            raise HostControlError("Host control returned no recovery event list")
+        events = result.get("events")
+        if not isinstance(events, list):
+            raise HostControlError("Host control returned an invalid recovery event list")
+        return [dict(item) for item in events if isinstance(item, dict)]
+
+    def acknowledge_recovery_event(self, recovery_id: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/api/v1/recovery-events/{quote(str(recovery_id), safe='')}/ack",
+            json={},
+        )
 
     def execute(
         self,

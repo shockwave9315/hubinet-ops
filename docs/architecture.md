@@ -7,7 +7,7 @@
 1. The telemetry loop calls `inspect` only when `monitoring.inspect` is enabled.
 2. The independent `monitoring_scheduler` and recovery worker call APT scan only when `monitoring.update_scan` is enabled. Operator scan capability is not consulted for these read-only checks.
 3. REST operator requests independently require the matching `operator_capabilities` flag.
-4. Manual update rollback and explicit snapshot restore are distinct policies: the former is tied to a failed update job and `manual_rollback_allowed`; the latter is tied to `manual_snapshot_restore_allowed`, an eligible owned snapshot, explicit confirmation, and an action-specific root-owned PVE allowlist.
+4. Manual update rollback and explicit snapshot restore are distinct policies. Normal restore enters through the CT110 backend, which atomically checks waiting/approved plans and the global destructive-job lock while inserting the local job before any hostd POST. The PVE layer independently checks its restore allowlist.
 4. `ResourceExecutor` selects a validated adapter: LXC/APT, QEMU/HAOS read-only, or CT110 self-inspection.
 5. The shared PVE host-control implementation revalidates action, VMID, resource type, observation, managed, maintenance, lifecycle, host-control access, and optional Hubinet-owned snapshot names. Both the forced-command wrapper and `hubinet-ops-hostd` call this implementation.
 6. SQLite stores plans, jobs, events, and normalized resource state. MQTT and Home Assistant are projections.
@@ -24,7 +24,9 @@ Read-only refresh can proceed independently. Scans are serialized per resource, 
 
 ## CT110 offline boundary
 
-CT110 self-inspection never recursively invokes SSH or its own API. Its in-guest agent may request ordinary host work while online, but Home Assistant lifecycle, snapshot, and self-update actions for CT110 go directly to `hubinet-ops-hostd` on PVE. Hostd stores jobs in its own SQLite database, so shutdown/restart results survive CT110 being offline. It binds only to a configured management address, optionally filters client IPs, requires a bearer token outside the repository, limits request bodies, and audits typed operations to journald.
+CT110 self-inspection never recursively invokes SSH or its own API. Normal shutdown, reboot, force-stop, snapshot create/restore/delete, and self-update enter through the backend; only starting an already stopped CT110 may go directly from Home Assistant to hostd. Hostd separates general read/start, backend-operation, self-update, and offline-recovery bearer scopes.
+
+Offline CT110 restore and emergency force-stop are distinct break-glass endpoints with exact confirmations and the recovery scope. Offline restore additionally requires CT110 stopped, no active host job, and an owned rollback-eligible snapshot. Hostd writes a durable recovery event before rollback. On the next backend start, a succeeded unacknowledged event atomically invalidates restored active plans/jobs, clears stale state, writes a local audit record, and is acknowledged only after that commit. Reprocessing the same recovery ID is idempotent and never replays the restore.
 
 ## Compatibility
 

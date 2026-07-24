@@ -12,7 +12,9 @@ These rules apply to every future coding agent working in this repository.
 - Updates always require manual plan approval. Push notifications only navigate to the matching dashboard.
 - Automatic rollback requires an existing snapshot and the per-container `automatic_rollback` policy.
 - Manual update rollback requires the `manual_rollback_allowed` policy and a failed/blocked/interrupted update operation with its recorded snapshot.
-- Explicit operator snapshot restore is a separate action. It requires `manual_snapshot_restore_allowed`, the `snapshot_rollback` capability, an existing rollback-eligible Hubinet-owned snapshot, no active destructive job, explicit Home Assistant confirmation, and the independent PVE snapshot-restore policy.
+- Normal explicit snapshot restore is a backend operation. It requires `manual_snapshot_restore_allowed`, the `snapshot_rollback` capability, an existing rollback-eligible Hubinet-owned snapshot, no waiting/approved backend plan, no active global destructive job, explicit Home Assistant confirmation, and the independent PVE snapshot-restore policy.
+- Offline CT110 snapshot restore is a separate break-glass recovery operation for a stopped CT110, authenticated with a dedicated recovery token. It is not a normal exception to backend control and never runs as an automatic fallback.
+- A successful offline CT110 restore is recorded durably on PVE and, on the next backend start, deliberately supersedes waiting plans, marks approved plans recovered, and interrupts restored queued/running jobs before the event is acknowledged.
 - The backend and SQLite database are the source of truth; Home Assistant is presentation and controlled input.
 - Never commit API tokens, MQTT passwords, webhook IDs, SSH keys, production addresses, runtime databases, or logs.
 - Never log authorization headers, bearer tokens, MQTT passwords, private keys, or webhook identifiers.

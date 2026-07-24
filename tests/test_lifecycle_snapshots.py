@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+import threading
 from typing import Any
 
 import pytest
@@ -46,6 +47,8 @@ class FakeHostControl:
             tuple[str, int, str, str | None, str | None]
         ] = []
         self.existing_jobs: dict[str, dict[str, Any]] = {}
+        self.recovery_events: list[dict[str, Any]] = []
+        self.acknowledged_recovery_ids: list[str] = []
         self.snapshots: list[dict[str, Any]] = []
         self.release = {
             "version": "0.4.0",
@@ -64,6 +67,13 @@ class FakeHostControl:
     def inspect_self_update_release(self, vmid: int) -> dict[str, Any]:
         assert vmid == 110
         return dict(self.release)
+
+    def list_recovery_events(self) -> list[dict[str, Any]]:
+        return [dict(item) for item in self.recovery_events]
+
+    def acknowledge_recovery_event(self, recovery_id: str) -> dict[str, Any]:
+        self.acknowledged_recovery_ids.append(recovery_id)
+        return {"recovery_id": recovery_id, "acknowledged_at": "now"}
 
     def execute(
         self,
@@ -448,6 +458,213 @@ def test_ct110_explicit_snapshot_restore_uses_independent_policy_offline(
         snapshot,
     )
     assert executor.calls == []
+
+
+def test_ct110_restore_is_blocked_by_waiting_plan_and_queued_self_update(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-110-manual-20260724T120000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T12:00:00+00:00",
+            "kind": "manual",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    service = OpsService(
+        cfg, db, CompatibleExecutor(), host_control=host  # type: ignore[arg-type]
+    )
+    service.create_self_update_plan(110)
+    with pytest.raises(ValueError, match="active update plan"):
+        service.queue_snapshot_action(
+            110, "rollback", snapshot, "restore-waiting-plan-0001"
+        )
+    approved = service.approve_active(110, "queued-self-update-request-0001")
+    db.update_plan_status(approved["plan"]["id"], "completed")
+    with pytest.raises(ValueError, match="destructive maintenance job"):
+        service.queue_snapshot_action(
+            110, "rollback", snapshot, "restore-queued-update-0001"
+        )
+    assert db.get_job(approved["job"]["id"])["status"] == "queued"
+    assert host.calls == []
+
+
+def test_restore_plan_gate_and_local_job_insert_are_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-110-manual-20260724T121000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T12:10:00+00:00",
+            "kind": "manual",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    service = OpsService(
+        cfg, db, CompatibleExecutor(), host_control=host  # type: ignore[arg-type]
+    )
+    reached_atomic_insert = threading.Event()
+    release_insert = threading.Event()
+    original = db.create_operation_job
+
+    def gated_create(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        reached_atomic_insert.set()
+        assert release_insert.wait(timeout=5)
+        return original(**kwargs)
+
+    monkeypatch.setattr(db, "create_operation_job", gated_create)
+    outcome: list[Exception | dict[str, Any]] = []
+
+    def queue_restore() -> None:
+        try:
+            outcome.append(
+                service.queue_snapshot_action(
+                    110,
+                    "rollback",
+                    snapshot,
+                    "atomic-restore-gate-request-0001",
+                )
+            )
+        except Exception as exc:  # captured for assertion in the test thread
+            outcome.append(exc)
+
+    worker = threading.Thread(target=queue_restore)
+    worker.start()
+    assert reached_atomic_insert.wait(timeout=5)
+    db.create_plan(
+        vmid=110,
+        container_name="ct-110",
+        fingerprint="plan-arrived-before-insert",
+        risk="high",
+        payload={"plan_type": "self_update"},
+        ttl_minutes=60,
+    )
+    release_insert.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], ValueError)
+    assert "active update plan" in str(outcome[0])
+    assert db.list_jobs() == []
+    assert host.calls == []
+
+
+def test_startup_consumes_offline_recovery_idempotently_before_any_replay(
+    tmp_path: Path,
+) -> None:
+    class AckFailOnceHostControl(FakeHostControl):
+        def __init__(self) -> None:
+            super().__init__("running")
+            self.fail_ack = True
+
+        def acknowledge_recovery_event(self, recovery_id: str) -> dict[str, Any]:
+            if self.fail_ack:
+                self.fail_ack = False
+                raise HostControlError("simulated crash before ACK", status="unavailable")
+            return super().acknowledge_recovery_event(recovery_id)
+
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = AckFailOnceHostControl()
+    service = OpsService(
+        cfg, db, CompatibleExecutor(), host_control=host  # type: ignore[arg-type]
+    )
+    approved_plan = db.create_plan(
+        vmid=110,
+        container_name="ct-110",
+        fingerprint="approved-before-offline-recovery",
+        risk="high",
+        payload={"plan_type": "self_update"},
+        ttl_minutes=60,
+    )
+    approved_plan, active_job = db.approve_plan(
+        approved_plan["id"],
+        request_id="active-before-recovery-0001",
+        operation_type="self_update",
+    )
+    waiting_plan = db.create_plan(
+        vmid=106,
+        container_name="ct-106",
+        fingerprint="waiting-before-offline-recovery",
+        risk="low",
+        payload={"pending_count": 1},
+        ttl_minutes=60,
+    )
+    db.upsert_container_state(
+        110,
+        {
+            "resource_type": "lxc",
+            "adapter": "agent_self",
+            "active_plan_id": approved_plan["id"],
+            "active_plan_status": "approved",
+            "active_job_id": active_job["id"],
+            "verification_status": "passed",
+            "last_verification": "2026-07-24T10:00:00+00:00",
+            "apt_check_ok": True,
+            "dpkg_audit_ok": True,
+            "pending_updates": 7,
+            "updates": {"pending_count": 7, "packages": ["pkg"]},
+            "update_status": "update_available",
+        },
+    )
+    recovery_id = "a" * 32
+    snapshot = "hubinet-ops-110-manual-20260724T100000Z"
+    host.recovery_events = [
+        {
+            "recovery_id": recovery_id,
+            "host_job_id": "b" * 32,
+            "request_id": "offline-recovery-event-0001",
+            "vmid": 110,
+            "snapshot_name": snapshot,
+            "operation_type": "offline_snapshot_restore",
+            "started_at": "2026-07-24T11:00:00+00:00",
+            "status": "succeeded",
+            "result": {"snapshot": snapshot, "action": "rollback"},
+            "error": None,
+            "completed_at": "2026-07-24T11:05:00+00:00",
+        }
+    ]
+
+    service._consume_offline_recovery_events()
+
+    assert db.get_plan(approved_plan["id"])["status"] == "recovered"
+    assert db.get_plan(waiting_plan["id"])["status"] == "superseded"
+    recovered_job = db.get_job(active_job["id"])
+    assert recovered_job["status"] == "interrupted"
+    assert recovered_job["result"]["recovery_id"] == recovery_id
+    state = service.get_state(110)
+    assert state["active_plan_id"] is None
+    assert state["active_job_id"] is None
+    assert state["verification_status"] == "unknown"
+    assert state["last_verification"] is None
+    assert state["apt_check_ok"] is None
+    assert state["dpkg_audit_ok"] is None
+    assert state["pending_updates"] is None
+    assert state["update_status"] == "unknown"
+    assert state["last_offline_recovery_id"] == recovery_id
+    assert state["last_offline_recovery_snapshot"] == snapshot
+    assert host.acknowledged_recovery_ids == []
+    assert host.calls == []
+
+    service._consume_offline_recovery_events()
+
+    assert host.acknowledged_recovery_ids == [recovery_id]
+    assert db.get_processed_recovery_event(recovery_id)["status"] == "succeeded"
+    assert db.get_job(active_job["id"])["result"]["recovery_id"] == recovery_id
+    assert host.calls == []
 
 
 def test_ct110_self_update_requires_plan_approval_and_rechecks_before_rollout(

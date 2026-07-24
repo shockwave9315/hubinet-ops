@@ -70,7 +70,7 @@ def main() -> int:
     raw["host_control"] = {
         "enabled": True,
         "base_url": args.host_control_url.rstrip("/"),
-        "token_env": "HUBINET_OPS_HOSTD_TOKEN",
+        "backend_token_env": "HUBINET_OPS_HOSTD_BACKEND_TOKEN",
         "update_token_env": "HUBINET_OPS_HOSTD_UPDATE_TOKEN",
         "timeout_seconds": 30,
         "operation_timeout_seconds": 1800,

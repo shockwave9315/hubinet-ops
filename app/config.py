@@ -453,7 +453,8 @@ def validate_config(raw: dict[str, Any]) -> None:
     if not isinstance(host_control, dict):
         raise RuntimeError("host_control must be an object")
     unknown_host_control = set(host_control) - {
-        "enabled", "base_url", "token_env", "update_token_env", "timeout_seconds",
+        "enabled", "base_url", "backend_token_env",
+        "update_token_env", "timeout_seconds",
         "operation_timeout_seconds", "poll_interval_seconds",
     }
     if unknown_host_control:
@@ -464,9 +465,12 @@ def validate_config(raw: dict[str, Any]) -> None:
         parsed = urlsplit(str(host_control.get("base_url") or ""))
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise RuntimeError("host_control.base_url must be an HTTP(S) URL")
-        token_env = str(host_control.get("token_env") or "HUBINET_OPS_HOSTD_TOKEN")
+        token_env = str(
+            host_control.get("backend_token_env")
+            or "HUBINET_OPS_HOSTD_BACKEND_TOKEN"
+        )
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", token_env):
-            raise RuntimeError("host_control.token_env is invalid")
+            raise RuntimeError("host_control.backend_token_env is invalid")
         update_token_env = str(
             host_control.get("update_token_env")
             or "HUBINET_OPS_HOSTD_UPDATE_TOKEN"

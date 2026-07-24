@@ -35,7 +35,7 @@ def test_host_control_client_uses_typed_paths_bearer_and_idempotent_request(
     client = HostControlClient(
         {
             "base_url": "http://hostd.invalid:8741",
-            "token_env": "TEST_HOSTD_TOKEN",
+            "backend_token_env": "TEST_HOSTD_TOKEN",
             "poll_interval_seconds": 0.001,
         },
         client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -54,7 +54,7 @@ def test_host_control_client_bounds_response_contract_and_never_accepts_command_
 ) -> None:
     monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
     client = HostControlClient(
-        {"base_url": "http://hostd.invalid", "token_env": "TEST_HOSTD_TOKEN"},
+        {"base_url": "http://hostd.invalid", "backend_token_env": "TEST_HOSTD_TOKEN"},
         client=httpx.Client(
             transport=httpx.MockTransport(
                 lambda _request: httpx.Response(200, json={"snapshots": []})
@@ -76,10 +76,47 @@ def test_host_control_health_is_the_only_unauthenticated_request(
         return httpx.Response(200, json={"status": "ok", "version": "0.4.0"})
 
     client = HostControlClient(
-        {"base_url": "http://hostd.invalid", "token_env": "TEST_HOSTD_TOKEN"},
+        {"base_url": "http://hostd.invalid", "backend_token_env": "TEST_HOSTD_TOKEN"},
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     assert client.health()["version"] == "0.4.0"
+
+
+def test_backend_client_reads_and_acknowledges_recovery_events_with_backend_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_HOSTD_BACKEND_TOKEN", "b" * 64)
+    requests: list[httpx.Request] = []
+    event = {
+        "recovery_id": "a" * 32,
+        "request_id": "offline-recovery-request-0001",
+        "vmid": 110,
+        "snapshot_name": "hubinet-ops-110-manual-20260724T120000Z",
+        "operation_type": "offline_snapshot_restore",
+        "status": "succeeded",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert request.headers["Authorization"] == f"Bearer {'b' * 64}"
+        if request.method == "GET":
+            return httpx.Response(200, json={"events": [event]})
+        return httpx.Response(200, json={**event, "acknowledged_at": "now"})
+
+    client = HostControlClient(
+        {
+            "base_url": "http://hostd.invalid",
+            "backend_token_env": "TEST_HOSTD_BACKEND_TOKEN",
+        },
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    assert client.list_recovery_events() == [event]
+    assert client.acknowledge_recovery_event(event["recovery_id"])["acknowledged_at"] == "now"
+    assert [request.url.path for request in requests] == [
+        "/api/v1/recovery-events",
+        f"/api/v1/recovery-events/{event['recovery_id']}/ack",
+    ]
 
 
 def test_self_update_poll_survives_transient_hostd_restart_without_resubmission(
@@ -116,7 +153,7 @@ def test_self_update_poll_survives_transient_hostd_restart_without_resubmission(
     client = HostControlClient(
         {
             "base_url": "http://hostd.invalid:8741",
-            "token_env": "TEST_HOSTD_TOKEN",
+            "backend_token_env": "TEST_HOSTD_TOKEN",
             "update_token_env": "TEST_HOSTD_UPDATE_TOKEN",
             "poll_interval_seconds": 0.001,
         },
@@ -165,7 +202,7 @@ def test_normal_host_job_poll_retries_transient_get_without_resubmission(
     client = HostControlClient(
         {
             "base_url": "http://hostd.invalid:8741",
-            "token_env": "TEST_HOSTD_TOKEN",
+            "backend_token_env": "TEST_HOSTD_TOKEN",
             "poll_interval_seconds": 0.001,
         },
         client=httpx.Client(transport=httpx.MockTransport(handler)),
@@ -217,7 +254,7 @@ def test_wait_existing_job_rejects_contract_mismatch_without_post(
         )
 
     client = HostControlClient(
-        {"base_url": "http://hostd.invalid", "token_env": "TEST_HOSTD_TOKEN"},
+        {"base_url": "http://hostd.invalid", "backend_token_env": "TEST_HOSTD_TOKEN"},
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         sleep=lambda _seconds: None,
     )
@@ -263,7 +300,7 @@ def test_wait_existing_job_retries_transient_lookup_without_post(
     client = HostControlClient(
         {
             "base_url": "http://hostd.invalid",
-            "token_env": "TEST_HOSTD_TOKEN",
+            "backend_token_env": "TEST_HOSTD_TOKEN",
             "poll_interval_seconds": 0.001,
         },
         client=httpx.Client(transport=httpx.MockTransport(handler)),

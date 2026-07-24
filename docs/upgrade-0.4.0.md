@@ -6,7 +6,7 @@ This is an operator-run production procedure. Repository tests never execute it.
 
 1. Review the exact release commit and `docs/design-0.4.0.md`.
 2. On PVE, create root-owned `/etc/hubinet-ops/hostd.json` from the example with the real management bind/client allowlist.
-3. Put a new bearer value of at least 32 characters in root-only `/etc/hubinet-ops/hostd.env` as `HUBINET_OPS_HOSTD_TOKEN=...`. Do not add either production file to git.
+3. Put pairwise-distinct bearer values of at least 32 characters in root-only `/etc/hubinet-ops/hostd.env`: `HUBINET_OPS_HOSTD_TOKEN`, `HUBINET_OPS_HOSTD_BACKEND_TOKEN`, `HUBINET_OPS_HOSTD_UPDATE_TOKEN`, and `HUBINET_OPS_HOSTD_RECOVERY_TOKEN`. The upgrade can generate missing scoped values, but operators must provision the matching HA general/recovery secrets through their secret-management process. Do not add either production file to git.
 4. Confirm CT110 is already running. The installer will not start it.
 5. Confirm sufficient PVE/CT110 backup space and an explicit maintenance window.
 

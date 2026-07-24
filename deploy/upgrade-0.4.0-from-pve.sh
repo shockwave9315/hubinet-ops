@@ -328,20 +328,37 @@ set -a
 source "$(pve_path "$HOSTD_ENV")"
 set +a
 [[ ${#HUBINET_OPS_HOSTD_TOKEN} -ge 32 ]] || { echo "Invalid hostd token" >&2; exit 1; }
+if [[ -z ${HUBINET_OPS_HOSTD_BACKEND_TOKEN:-} ]]; then
+  HUBINET_OPS_HOSTD_BACKEND_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
 if [[ -z ${HUBINET_OPS_HOSTD_UPDATE_TOKEN:-} ]]; then
   HUBINET_OPS_HOSTD_UPDATE_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-elif [[ ${#HUBINET_OPS_HOSTD_UPDATE_TOKEN} -lt 32 || "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" == "$HUBINET_OPS_HOSTD_TOKEN" ]]; then
-  echo "Invalid hostd self-update token" >&2
-  exit 1
 fi
+if [[ -z ${HUBINET_OPS_HOSTD_RECOVERY_TOKEN:-} ]]; then
+  HUBINET_OPS_HOSTD_RECOVERY_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+[[ ${#HUBINET_OPS_HOSTD_BACKEND_TOKEN} -ge 32 ]] || { echo "Invalid hostd backend token" >&2; exit 1; }
+[[ ${#HUBINET_OPS_HOSTD_UPDATE_TOKEN} -ge 32 ]] || { echo "Invalid hostd self-update token" >&2; exit 1; }
+[[ ${#HUBINET_OPS_HOSTD_RECOVERY_TOKEN} -ge 32 ]] || { echo "Invalid hostd recovery token" >&2; exit 1; }
+[[ "$HUBINET_OPS_HOSTD_TOKEN" != "$HUBINET_OPS_HOSTD_BACKEND_TOKEN" &&
+   "$HUBINET_OPS_HOSTD_TOKEN" != "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" &&
+   "$HUBINET_OPS_HOSTD_TOKEN" != "$HUBINET_OPS_HOSTD_RECOVERY_TOKEN" &&
+   "$HUBINET_OPS_HOSTD_BACKEND_TOKEN" != "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" &&
+   "$HUBINET_OPS_HOSTD_BACKEND_TOKEN" != "$HUBINET_OPS_HOSTD_RECOVERY_TOKEN" &&
+   "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" != "$HUBINET_OPS_HOSTD_RECOVERY_TOKEN" ]] || {
+  echo "Hostd tokens for separate scopes must differ" >&2
+  exit 1
+}
 HOSTD_ENV_STAGE="$(mktemp)"
-grep -v -E '^HUBINET_OPS_HOSTD_(UPDATE_)?TOKEN=' "$(pve_path "$HOSTD_ENV")" > "$HOSTD_ENV_STAGE" || true
+grep -v -E '^HUBINET_OPS_HOSTD_(BACKEND_|UPDATE_|RECOVERY_)?TOKEN=' "$(pve_path "$HOSTD_ENV")" > "$HOSTD_ENV_STAGE" || true
 printf 'HUBINET_OPS_HOSTD_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_TOKEN" >> "$HOSTD_ENV_STAGE"
+printf 'HUBINET_OPS_HOSTD_BACKEND_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_BACKEND_TOKEN" >> "$HOSTD_ENV_STAGE"
 printf 'HUBINET_OPS_HOSTD_UPDATE_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" >> "$HOSTD_ENV_STAGE"
+printf 'HUBINET_OPS_HOSTD_RECOVERY_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_RECOVERY_TOKEN" >> "$HOSTD_ENV_STAGE"
 chmod 0600 "$HOSTD_ENV_STAGE"
 TOKEN_STAGE="$(mktemp)"
-grep -v -E '^HUBINET_OPS_HOSTD_(UPDATE_)?TOKEN=' "$BACKUP/agent.env" > "$TOKEN_STAGE" || true
-printf 'HUBINET_OPS_HOSTD_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_TOKEN" >> "$TOKEN_STAGE"
+grep -v -E '^HUBINET_OPS_HOSTD_(BACKEND_|UPDATE_|RECOVERY_)?TOKEN=' "$BACKUP/agent.env" > "$TOKEN_STAGE" || true
+printf 'HUBINET_OPS_HOSTD_BACKEND_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_BACKEND_TOKEN" >> "$TOKEN_STAGE"
 printf 'HUBINET_OPS_HOSTD_UPDATE_TOKEN=%s\n' "$HUBINET_OPS_HOSTD_UPDATE_TOKEN" >> "$TOKEN_STAGE"
 chmod 0600 "$TOKEN_STAGE"
 pct push "$AGENT_VMID" "$BACKUP/agent-config-0.4.0.yaml" /etc/hubinet-ops/config.yaml.new --perms 0640

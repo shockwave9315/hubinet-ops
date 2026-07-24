@@ -118,6 +118,7 @@ class OpsService:
         self.mqtt.set_state_provider(self._mqtt_snapshot)
 
     def start(self) -> None:
+        self._consume_offline_recovery_events()
         self._reconcile_startup_jobs()
         self._ensure_initial_states()
         self.mqtt.start()
@@ -966,6 +967,7 @@ class OpsService:
             operation_type=operation_type,
             request_id=request_id or uuid.uuid4().hex,
             snapshot_name=str(selected["name"]),
+            require_no_active_plan=action == "rollback",
         )
         self._mark_job_queued(vmid, job)
         return job
@@ -1539,6 +1541,50 @@ class OpsService:
                     "failed",
                     "Agent restarted during the operation; it was not replayed",
                 )
+
+    def _consume_offline_recovery_events(self) -> None:
+        if self.host_control is None:
+            return
+        try:
+            events = self.host_control.list_recovery_events()
+        except HostControlError as exc:
+            LOGGER.error(
+                "Read-only offline recovery event lookup blocks startup: %s",
+                exc,
+            )
+            raise
+        for event in events:
+            if str(event.get("status") or "") not in {
+                "succeeded",
+                "failed",
+                "interrupted",
+            }:
+                continue
+            recovery_id = str(event.get("recovery_id") or "")
+            try:
+                persisted, created = self.db.apply_recovery_event(event)
+                if created:
+                    LOGGER.warning(
+                        "Applied offline recovery event recovery_id=%s vmid=%s "
+                        "operation=%s status=%s",
+                        recovery_id,
+                        persisted["vmid"],
+                        persisted["operation_type"],
+                        persisted["status"],
+                    )
+                self.host_control.acknowledge_recovery_event(recovery_id)
+            except HostControlError as exc:
+                LOGGER.warning(
+                    "Offline recovery event remains unacknowledged recovery_id=%s: %s",
+                    recovery_id,
+                    exc,
+                )
+            except ValueError:
+                LOGGER.exception(
+                    "Invalid offline recovery event blocks startup recovery_id=%s",
+                    recovery_id,
+                )
+                raise
 
     def _reattach_host_control_job(self, job: dict[str, Any]) -> None:
         operation_type = str(job["operation_type"])

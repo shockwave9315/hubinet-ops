@@ -269,7 +269,9 @@ def test_active_host_job_blocks_explicit_snapshot_restore(tmp_path: Path) -> Non
         store,
         HostJobRunner(store, controller),
         "g" * 64,
+        "b" * 64,
         "u" * 64,
+        "r" * 64,
     )
     store.create(
         vmid=101,
@@ -380,6 +382,66 @@ class RecordingHostJobRunner:
         self.started.append(job_id)
 
 
+class NotifyingHostJobRunner(HostJobRunner):
+    def __init__(self, store: HostJobStore, controller: DummyController) -> None:
+        super().__init__(store, controller)  # type: ignore[arg-type]
+        self.completed = threading.Event()
+
+    def start(self, job_id: str) -> None:
+        def run_and_notify() -> None:
+            try:
+                self.run(job_id)
+            finally:
+                self.completed.set()
+
+        threading.Thread(target=run_and_notify, daemon=True).start()
+
+
+class RecoveryController(DummyController):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status = "stopped"
+        self.rollback_started = threading.Event()
+        self.allow_completion = threading.Event()
+        self.snapshot_name = "hubinet-ops-110-manual-20260724T120000Z"
+
+    def execute(
+        self,
+        action: str,
+        vmid: int,
+        argument: str | None = None,
+        *,
+        source_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        if action == "list-snapshots":
+            self.calls.append((action, vmid, argument, source_job_id))
+            return {
+                "snapshots": [
+                    {
+                        "name": self.snapshot_name,
+                        "owned_by_hubinet_ops": True,
+                        "rollback_eligible": True,
+                    }
+                ]
+            }
+        if action == "snapshot-rollback":
+            self.calls.append((action, vmid, argument, source_job_id))
+            self.rollback_started.set()
+            if not self.allow_completion.wait(timeout=5):
+                raise RuntimeError("test did not release offline restore")
+            return {
+                "action": "rollback",
+                "snapshot": argument,
+                "lxc_status": "stopped",
+            }
+        return super().execute(
+            action,
+            vmid,
+            argument,
+            source_job_id=source_job_id,
+        )
+
+
 @pytest.mark.parametrize("initial_status", ["queued", "running"])
 def test_http_lookup_by_request_is_read_only_and_preserves_active_job(
     tmp_path: Path,
@@ -406,7 +468,9 @@ def test_http_lookup_by_request_is_read_only_and_preserves_active_job(
         store,
         runner,  # type: ignore[arg-type]
         "g" * 64,
+        "b" * 64,
         "u" * 64,
+        "r" * 64,
     )
     handler = type(
         "LookupHostdHandler",
@@ -598,23 +662,373 @@ def test_general_hostd_bearer_cannot_authorize_self_update(tmp_path: Path) -> No
         store,
         runner,
         "g" * 64,
+        "b" * 64,
         "u" * 64,
+        "r" * 64,
     )
 
-    assert application.authorize(
+    assert application.authentication_scope(
         {"Authorization": f"Bearer {'g' * 64}"},
         "127.0.0.1",
-    )
-    assert not application.authorize(
+    ) == "general"
+    assert application.authentication_scope(
         {"Authorization": f"Bearer {'g' * 64}"},
         "127.0.0.1",
-        self_update=True,
-    )
-    assert application.authorize(
+    ) != "self_update"
+    assert application.authentication_scope(
         {"Authorization": f"Bearer {'u' * 64}"},
         "127.0.0.1",
-        self_update=True,
+    ) == "self_update"
+
+
+def test_general_ha_scope_cannot_submit_online_destructive_jobs(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = DummyController()
+    runner = RecordingHostJobRunner(controller)
+    application = HostdApplication(
+        HostdConfig("127.0.0.1", 0, tmp_path / "jobs.db", frozenset()),
+        store,
+        runner,  # type: ignore[arg-type]
+        "g" * 64,
+        "b" * 64,
+        "u" * 64,
+        "r" * 64,
     )
+    handler = type("ScopedHostdHandler", (HostdHandler,), {"app": application})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for index, (method, path) in enumerate(
+            [
+                ("POST", "/api/v1/resources/110/shutdown"),
+                ("POST", "/api/v1/resources/110/reboot"),
+                ("POST", "/api/v1/resources/110/force-stop"),
+                ("POST", "/api/v1/resources/110/self-update"),
+                ("POST", "/api/v1/resources/110/snapshots"),
+                (
+                    "POST",
+                    "/api/v1/resources/110/snapshots/"
+                    "hubinet-ops-110-manual-20260724T120000Z/restore",
+                ),
+                (
+                    "DELETE",
+                    "/api/v1/resources/110/snapshots/"
+                    "hubinet-ops-110-manual-20260724T120000Z",
+                ),
+            ]
+        ):
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_address[1], timeout=5
+            )
+            connection.request(
+                method,
+                path,
+                body=json.dumps(
+                    {
+                        "request_id": f"ha-scope-denied-request-{index:04d}",
+                        "name": "hubinet-ops-110-manual-20260724T120000Z",
+                    }
+                ),
+                headers={
+                    "Authorization": f"Bearer {'g' * 64}",
+                    "Content-Type": "application/json",
+                },
+            )
+            response = connection.getresponse()
+            assert response.status == 403
+            response.read()
+            connection.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert store.queued() == []
+    assert runner.started == []
+    assert controller.calls == []
+
+
+def test_backend_scope_submits_restore_and_general_scope_still_starts_ct110(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = DummyController()
+    runner = RecordingHostJobRunner(controller)
+    application = HostdApplication(
+        HostdConfig("127.0.0.1", 0, tmp_path / "jobs.db", frozenset()),
+        store,
+        runner,  # type: ignore[arg-type]
+        "g" * 64,
+        "b" * 64,
+        "u" * 64,
+        "r" * 64,
+    )
+    handler = type("BackendScopedHostdHandler", (HostdHandler,), {"app": application})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        restore = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        restore.request(
+            "POST",
+            "/api/v1/resources/110/snapshots/"
+            "hubinet-ops-110-manual-20260724T120000Z/restore",
+            body=json.dumps({"request_id": "backend-restore-request-0001"}),
+            headers={
+                "Authorization": f"Bearer {'b' * 64}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = restore.getresponse()
+        assert response.status == 202
+        restore_job = json.loads(response.read())
+        restore.close()
+        assert restore_job["operation_type"] == "snapshot_rollback"
+        store.transition_from_active(
+            restore_job["id"],
+            status="interrupted",
+            stage="interrupted",
+            progress=100,
+            error="test cleanup",
+        )
+
+        start = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        start.request(
+            "POST",
+            "/api/v1/resources/110/start",
+            body=json.dumps({"request_id": "general-start-request-0001"}),
+            headers={
+                "Authorization": f"Bearer {'g' * 64}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = start.getresponse()
+        assert response.status == 202
+        start_job = json.loads(response.read())
+        start.close()
+        assert start_job["operation_type"] == "lifecycle_start"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert len(runner.started) == 2
+
+
+def test_offline_restore_persists_recovery_marker_before_rollback_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.db"
+    store = HostJobStore(database)
+    controller = RecoveryController()
+    runner = NotifyingHostJobRunner(store, controller)
+    application = HostdApplication(
+        HostdConfig("127.0.0.1", 0, database, frozenset()),
+        store,
+        runner,
+        "g" * 64,
+        "b" * 64,
+        "u" * 64,
+        "r" * 64,
+    )
+
+    job, created = application.submit_recovery(
+        vmid=110,
+        operation_type="offline_snapshot_restore",
+        request_id="offline-restore-request-0001",
+        argument=controller.snapshot_name,
+    )
+    assert created is True
+    assert controller.rollback_started.wait(timeout=5)
+    running = store.list_unacknowledged_recovery_events()
+    assert len(running) == 1
+    assert running[0]["host_job_id"] == job["id"]
+    assert running[0]["status"] == "running"
+    assert running[0]["completed_at"] is None
+
+    restarted = HostJobStore(database)
+    assert restarted.list_unacknowledged_recovery_events()[0]["status"] == "running"
+    controller.allow_completion.set()
+    assert runner.completed.wait(timeout=5)
+    terminal = store.get(job["id"])
+    assert terminal["status"] == "succeeded"
+    event = HostJobStore(database).list_unacknowledged_recovery_events()[0]
+    assert event["status"] == "succeeded"
+    assert event["result"]["snapshot"] == controller.snapshot_name
+    assert event["completed_at"]
+
+
+def test_offline_restore_http_requires_recovery_scope_and_explicit_confirmation(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = RecoveryController()
+    runner = RecordingHostJobRunner(controller)
+    application = HostdApplication(
+        HostdConfig("127.0.0.1", 0, tmp_path / "jobs.db", frozenset()),
+        store,
+        runner,  # type: ignore[arg-type]
+        "g" * 64,
+        "b" * 64,
+        "u" * 64,
+        "r" * 64,
+    )
+    handler = type("RecoveryScopedHostdHandler", (HostdHandler,), {"app": application})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    path = (
+        "/api/v1/resources/110/snapshots/"
+        f"{controller.snapshot_name}/offline-restore"
+    )
+
+    def request(token: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request(
+            "POST",
+            path,
+            body=json.dumps(payload),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        value = json.loads(response.read())
+        connection.close()
+        return response.status, value
+
+    try:
+        status, _ = request(
+            "g" * 64,
+            {"request_id": "offline-wrong-scope-request-0001"},
+        )
+        assert status == 403
+        status, _ = request(
+            "r" * 64,
+            {"request_id": "offline-no-confirm-request-0001"},
+        )
+        assert status == 400
+        assert store.list_unacknowledged_recovery_events() == []
+
+        status, payload = request(
+            "r" * 64,
+            {
+                "request_id": "offline-confirmed-request-0001",
+                "confirm": "RESTORE_CT110_OFFLINE",
+            },
+        )
+        assert status == 202
+        assert payload["operation_type"] == "offline_snapshot_restore"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert len(store.list_unacknowledged_recovery_events()) == 1
+    assert runner.started == [payload["id"]]
+
+
+def test_offline_restore_rejects_running_ct110_foreign_snapshot_and_active_host_job(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = RecoveryController()
+    runner = RecordingHostJobRunner(controller)
+    application = HostdApplication(
+        HostdConfig("127.0.0.1", 0, tmp_path / "jobs.db", frozenset()),
+        store,
+        runner,  # type: ignore[arg-type]
+        "g" * 64,
+        "b" * 64,
+        "u" * 64,
+        "r" * 64,
+    )
+    controller.status = "running"
+    with pytest.raises(HostControlError, match="stopped"):
+        application.submit_recovery(
+            vmid=110,
+            operation_type="offline_snapshot_restore",
+            request_id="offline-running-request-0001",
+            argument=controller.snapshot_name,
+        )
+    controller.status = "stopped"
+    with pytest.raises(HostControlError, match="owned"):
+        application.submit_recovery(
+            vmid=110,
+            operation_type="offline_snapshot_restore",
+            request_id="offline-foreign-request-0001",
+            argument="foreign-snapshot",
+        )
+    store.create(
+        vmid=106,
+        operation_type="lifecycle_shutdown",
+        request_id="active-host-job-request-0001",
+    )
+    with pytest.raises(HostControlError, match="active"):
+        application.submit_recovery(
+            vmid=110,
+            operation_type="offline_snapshot_restore",
+            request_id="offline-blocked-request-0001",
+            argument=controller.snapshot_name,
+        )
+    assert store.list_unacknowledged_recovery_events() == []
+    assert runner.started == []
+
+
+def test_recovery_marker_tracks_failure_and_restart_interruption(tmp_path: Path) -> None:
+    class FailingRecoveryController(RecoveryController):
+        def execute(
+            self,
+            action: str,
+            vmid: int,
+            argument: str | None = None,
+            *,
+            source_job_id: str | None = None,
+        ) -> dict[str, Any]:
+            if action == "snapshot-rollback":
+                raise RuntimeError("exact pct rollback failure")
+            return super().execute(
+                action,
+                vmid,
+                argument,
+                source_job_id=source_job_id,
+            )
+
+    database = tmp_path / "jobs.db"
+    store = HostJobStore(database)
+    controller = FailingRecoveryController()
+    job, _ = store.create_recovery(
+        vmid=110,
+        operation_type="offline_snapshot_restore",
+        request_id="offline-failure-request-0001",
+        argument=controller.snapshot_name,
+    )
+    terminal = HostJobRunner(store, controller).run(job["id"])  # type: ignore[arg-type]
+    assert terminal["status"] == "failed"
+    failed = store.list_unacknowledged_recovery_events()[0]
+    assert failed["status"] == "failed"
+    assert failed["error"] == "exact pct rollback failure"
+
+    store.acknowledge_recovery_event(failed["recovery_id"])
+    active, _ = store.create_recovery(
+        vmid=110,
+        operation_type="offline_force_stop",
+        request_id="offline-interrupted-request-0001",
+        argument=None,
+    )
+    store.begin_execution(active["id"])
+    restarted = HostJobStore(database)
+    restarted.reconcile_startup(DummyController())  # type: ignore[arg-type]
+    interrupted = restarted.list_unacknowledged_recovery_events()[0]
+    assert interrupted["status"] == "interrupted"
+    assert "outcome is unknown" in interrupted["error"]
 
 
 def test_host_job_runner_persists_terminal_result(tmp_path: Path) -> None:
@@ -665,7 +1079,9 @@ def test_live_job_polling_is_read_only_until_worker_finishes(
         store,
         runner,
         "g" * 64,
+        "b" * 64,
         "u" * 64,
+        "r" * 64,
     )
     job, _ = store.create(
         vmid=110,
@@ -715,7 +1131,9 @@ def test_get_job_leaves_queued_job_unchanged_before_worker_starts(
         store,
         HostJobRunner(store, controller),  # type: ignore[arg-type]
         "g" * 64,
+        "b" * 64,
         "u" * 64,
+        "r" * 64,
     )
     job, _ = store.create(
         vmid=110,
@@ -797,7 +1215,9 @@ def test_startup_reconciliation_after_store_recreation_uses_runtime_without_repl
         restarted,
         HostJobRunner(restarted, controller),  # type: ignore[arg-type]
         "g" * 64,
+        "b" * 64,
         "u" * 64,
+        "r" * 64,
     )
 
     assert reconciled[0]["status"] == "succeeded"
@@ -1016,7 +1436,9 @@ def test_get_during_slow_self_update_prepare_waits_for_marker_and_then_succeeds(
         store,
         runner,
         "g" * 64,
+        "b" * 64,
         "u" * 64,
+        "r" * 64,
     )
 
     job, created = application.submit(

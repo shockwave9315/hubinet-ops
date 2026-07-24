@@ -69,9 +69,10 @@ ssh "${SSH_ARGS[@]}" '
     hubinet_ops_start_url hubinet_ops_shutdown_url hubinet_ops_reboot_url \
     hubinet_ops_force_stop_url hubinet_ops_snapshot_create_url \
     hubinet_ops_snapshot_restore_url hubinet_ops_snapshot_delete_url \
-    hubinet_ops_host_authorization hubinet_ops_host_action_url \
-    hubinet_ops_host_snapshot_create_url hubinet_ops_host_snapshot_restore_url \
-    hubinet_ops_host_snapshot_delete_url; do
+    hubinet_ops_host_authorization hubinet_ops_host_start_url \
+    hubinet_ops_host_recovery_authorization \
+    hubinet_ops_host_offline_snapshot_restore_url \
+    hubinet_ops_host_offline_force_stop_url; do
     grep -q "^$key:" /config/secrets.yaml || { echo "Missing required secret: $key" >&2; exit 1; }
   done
   grep -Rqs "lovelace-mushroom/mushroom.js" /config/.storage/lovelace_resources /config/configuration.yaml 2>/dev/null

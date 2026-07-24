@@ -12,6 +12,6 @@ Read-only in 0.4.0. The PVE wrapper uses `qm status`, `pvesh .../status/current`
 
 ## `agent_self` / CT110
 
-Combines read-only PVE LXC status with fixed local observations: `hubinet-ops.service`, in-process API health/version, inventory/job counts, MQTT availability, `/proc`/disk resource usage, and at most 20 sanitized journal warning/error lines. It never SSHes to itself and never runs `hubinet-maint` in CT110. Lifecycle, snapshot, and self-update are delegated to independent PVE hostd, which remains available while CT110 is stopped.
+Combines read-only PVE LXC status with fixed local observations: `hubinet-ops.service`, in-process API health/version, inventory/job counts, MQTT availability, `/proc`/disk resource usage, and at most 20 sanitized journal warning/error lines. It never SSHes to itself and never runs `hubinet-maint` in CT110. Normal lifecycle, snapshot, and self-update requests are gated and persisted by the backend before delegation to independent PVE hostd. Direct hostd access while CT110 is stopped is limited to start and separately scoped break-glass recovery.
 
 Invalid adapter/type combinations fail configuration validation. Adding another resource is configuration-driven; backend logic is not copied per VMID.

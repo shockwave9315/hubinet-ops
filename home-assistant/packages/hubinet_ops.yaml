@@ -136,44 +136,34 @@ rest_command:
       {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-delete"}
     timeout: 30
 
-  hubinet_ops_host_action:
-    url: !secret hubinet_ops_host_action_url
+  hubinet_ops_host_start:
+    url: !secret hubinet_ops_host_start_url
     method: POST
     headers:
       Authorization: !secret hubinet_ops_host_authorization
       Content-Type: application/json
     payload: >-
-      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-{{ action }}"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-start"}
     timeout: 30
 
-  hubinet_ops_host_snapshot_create:
-    url: !secret hubinet_ops_host_snapshot_create_url
+  hubinet_ops_host_offline_snapshot_restore:
+    url: !secret hubinet_ops_host_offline_snapshot_restore_url
     method: POST
     headers:
-      Authorization: !secret hubinet_ops_host_authorization
+      Authorization: !secret hubinet_ops_host_recovery_authorization
       Content-Type: application/json
     payload: >-
-      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-snap-create","name":"hubinet-ops-110-manual-{{ utcnow().strftime('%Y%m%dT%H%M%SZ') }}"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-offline-restore-{{ snapshot_name }}","confirm":"RESTORE_CT110_OFFLINE"}
     timeout: 30
 
-  hubinet_ops_host_snapshot_restore:
-    url: !secret hubinet_ops_host_snapshot_restore_url
+  hubinet_ops_host_offline_force_stop:
+    url: !secret hubinet_ops_host_offline_force_stop_url
     method: POST
     headers:
-      Authorization: !secret hubinet_ops_host_authorization
+      Authorization: !secret hubinet_ops_host_recovery_authorization
       Content-Type: application/json
     payload: >-
-      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-snap-restore-{{ snapshot_name }}"}
-    timeout: 30
-
-  hubinet_ops_host_snapshot_delete:
-    url: !secret hubinet_ops_host_snapshot_delete_url
-    method: DELETE
-    headers:
-      Authorization: !secret hubinet_ops_host_authorization
-      Content-Type: application/json
-    payload: >-
-      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-snap-delete-{{ snapshot_name }}"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-recovery-force-stop","confirm":"FORCE_STOP_CT110_RECOVERY"}
     timeout: 30
 
 script:
@@ -209,8 +199,8 @@ script:
           - conditions: "{{ vmid | int == 110 }}"
             sequence:
               - continue_on_error: true
-                action: rest_command.hubinet_ops_host_action
-                data: {vmid: 110, action: start}
+                action: rest_command.hubinet_ops_host_start
+                data: {}
                 response_variable: response
         default:
           - continue_on_error: true
@@ -226,19 +216,11 @@ script:
     mode: single
     fields: *lifecycle_vmid_field
     sequence:
-      - choose:
-          - conditions: "{{ vmid | int == 110 }}"
-            sequence:
-              - continue_on_error: true
-                action: rest_command.hubinet_ops_host_action
-                data: {vmid: 110, action: shutdown}
-                response_variable: response
-        default:
-          - continue_on_error: true
-            action: rest_command.hubinet_ops_shutdown_container
-            data:
-              vmid: "{{ vmid | int }}"
-            response_variable: response
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_shutdown_container
+        data:
+          vmid: "{{ vmid | int }}"
+        response_variable: response
       - action: script.hubinet_ops_report_action
         data: {vmid: "{{ vmid | int }}", action_name: "łagodne wyłączenie", response: "{{ response | default({}) }}"}
 
@@ -247,19 +229,11 @@ script:
     mode: single
     fields: *lifecycle_vmid_field
     sequence:
-      - choose:
-          - conditions: "{{ vmid | int == 110 }}"
-            sequence:
-              - continue_on_error: true
-                action: rest_command.hubinet_ops_host_action
-                data: {vmid: 110, action: reboot}
-                response_variable: response
-        default:
-          - continue_on_error: true
-            action: rest_command.hubinet_ops_reboot_container
-            data:
-              vmid: "{{ vmid | int }}"
-            response_variable: response
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_reboot_container
+        data:
+          vmid: "{{ vmid | int }}"
+        response_variable: response
       - action: script.hubinet_ops_report_action
         data: {vmid: "{{ vmid | int }}", action_name: "restart", response: "{{ response | default({}) }}"}
 
@@ -268,18 +242,10 @@ script:
     mode: single
     fields: *lifecycle_vmid_field
     sequence:
-      - choose:
-          - conditions: "{{ vmid | int == 110 }}"
-            sequence:
-              - continue_on_error: true
-                action: rest_command.hubinet_ops_host_action
-                data: {vmid: 110, action: force-stop}
-                response_variable: response
-        default:
-          - continue_on_error: true
-            action: rest_command.hubinet_ops_force_stop_container
-            data: {vmid: "{{ vmid | int }}"}
-            response_variable: response
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_force_stop_container
+        data: {vmid: "{{ vmid | int }}"}
+        response_variable: response
       - action: script.hubinet_ops_report_action
         data: {vmid: "{{ vmid | int }}", action_name: "natychmiastowe zatrzymanie", response: "{{ response | default({}) }}"}
 
@@ -288,18 +254,10 @@ script:
     mode: single
     fields: *lifecycle_vmid_field
     sequence:
-      - choose:
-          - conditions: "{{ vmid | int == 110 }}"
-            sequence:
-              - continue_on_error: true
-                action: rest_command.hubinet_ops_host_snapshot_create
-                data: {vmid: 110}
-                response_variable: response
-        default:
-          - continue_on_error: true
-            action: rest_command.hubinet_ops_snapshot_create
-            data: {vmid: "{{ vmid | int }}"}
-            response_variable: response
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_snapshot_create
+        data: {vmid: "{{ vmid | int }}"}
+        response_variable: response
       - action: script.hubinet_ops_report_action
         data: {vmid: "{{ vmid | int }}", action_name: "utworzenie snapshotu", response: "{{ response | default({}) }}"}
 
@@ -313,18 +271,10 @@ script:
       - choose:
           - conditions: "{{ snapshot_name not in ['none', 'unknown', 'unavailable', ''] }}"
             sequence:
-              - choose:
-                  - conditions: "{{ vmid | int == 110 }}"
-                    sequence:
-                      - continue_on_error: true
-                        action: rest_command.hubinet_ops_host_snapshot_restore
-                        data: {vmid: 110, snapshot_name: "{{ snapshot_name }}"}
-                        response_variable: response
-                default:
-                  - continue_on_error: true
-                    action: rest_command.hubinet_ops_snapshot_restore
-                    data: {vmid: "{{ vmid | int }}", snapshot_name: "{{ snapshot_name }}"}
-                    response_variable: response
+              - continue_on_error: true
+                action: rest_command.hubinet_ops_snapshot_restore
+                data: {vmid: "{{ vmid | int }}", snapshot_name: "{{ snapshot_name }}"}
+                response_variable: response
         default:
           - variables:
               response: {status: 409, content: {detail: "Brak snapshotu Hubinet Ops do przywrócenia"}}
@@ -341,23 +291,57 @@ script:
       - choose:
           - conditions: "{{ snapshot_name not in ['none', 'unknown', 'unavailable', ''] }}"
             sequence:
-              - choose:
-                  - conditions: "{{ vmid | int == 110 }}"
-                    sequence:
-                      - continue_on_error: true
-                        action: rest_command.hubinet_ops_host_snapshot_delete
-                        data: {vmid: 110, snapshot_name: "{{ snapshot_name }}"}
-                        response_variable: response
-                default:
-                  - continue_on_error: true
-                    action: rest_command.hubinet_ops_snapshot_delete
-                    data: {vmid: "{{ vmid | int }}", snapshot_name: "{{ snapshot_name }}"}
-                    response_variable: response
+              - continue_on_error: true
+                action: rest_command.hubinet_ops_snapshot_delete
+                data: {vmid: "{{ vmid | int }}", snapshot_name: "{{ snapshot_name }}"}
+                response_variable: response
         default:
           - variables:
               response: {status: 409, content: {detail: "Brak snapshotu Hubinet Ops do usunięcia"}}
       - action: script.hubinet_ops_report_action
         data: {vmid: "{{ vmid | int }}", action_name: "usunięcie snapshotu", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_offline_snapshot_restore_ct110:
+    alias: "Hubinet Ops — AWARYJNE przywrócenie CT110 offline"
+    description: >-
+      Operacja break-glass tylko dla zatrzymanego CT110. Omija działający backend
+      i po następnym starcie świadomie unieważnia jego aktywne plany i joby.
+    mode: single
+    variables:
+      snapshot_name: "{{ states('sensor.hubinet_ops_ct110_latest_snapshot_name') }}"
+    sequence:
+      - choose:
+          - conditions: "{{ snapshot_name not in ['none', 'unknown', 'unavailable', ''] }}"
+            sequence:
+              - continue_on_error: true
+                action: rest_command.hubinet_ops_host_offline_snapshot_restore
+                data: {snapshot_name: "{{ snapshot_name }}"}
+                response_variable: response
+        default:
+          - variables:
+              response: {status: 409, content: {detail: "Brak snapshotu CT110 do awaryjnego przywrócenia"}}
+      - action: script.hubinet_ops_report_action
+        data:
+          vmid: 110
+          action_name: "AWARYJNE przywrócenie CT110 offline"
+          response: "{{ response | default({}) }}"
+
+  hubinet_ops_offline_force_stop_ct110:
+    alias: "Hubinet Ops — AWARYJNE wymuszenie zatrzymania CT110"
+    description: >-
+      Osobna operacja break-glass z tokenem recovery. Nie jest automatycznym
+      fallbackiem po błędzie zwykłej operacji backendu.
+    mode: single
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_host_offline_force_stop
+        data: {}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data:
+          vmid: 110
+          action_name: "AWARYJNE wymuszenie zatrzymania CT110"
+          response: "{{ response | default({}) }}"
 
   hubinet_ops_self_update:
     alias: "Hubinet Ops — przygotuj plan aktualizacji control plane"

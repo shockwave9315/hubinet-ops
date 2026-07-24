@@ -185,11 +185,11 @@ def test_dashboard_actions_exist_and_active_plan_decisions_use_only_vmid() -> No
     self_update = package["script"]["hubinet_ops_self_update"]
     self_update_text = str(self_update)
     assert "rest_command.hubinet_ops_self_update_plan" in self_update_text
-    assert "rest_command.hubinet_ops_host_action" not in self_update_text
+    assert "rest_command.hubinet_ops_host_start" not in self_update_text
     restore = package["script"]["hubinet_ops_snapshot_restore_latest"]
     restore_text = str(restore)
-    assert "rest_command.hubinet_ops_host_snapshot_restore" in restore_text
     assert "rest_command.hubinet_ops_snapshot_restore" in restore_text
+    assert "rest_command.hubinet_ops_host_offline_snapshot_restore" not in restore_text
     assert "hubinet_ops_snapshot_rollback" not in restore_text
     assert "/snapshots/{{ snapshot_name }}/restore" in secrets_text
     assert "/snapshots/{{ snapshot_name }}/rollback" not in secrets_text
@@ -198,7 +198,7 @@ def test_dashboard_actions_exist_and_active_plan_decisions_use_only_vmid() -> No
     assert "active_plan_id" not in package_text.split("script:", 1)[1].split("automation:", 1)[0]
 
 
-def test_ct110_host_request_ids_include_operation_and_snapshot_identity() -> None:
+def test_ct110_direct_host_commands_are_limited_to_start_and_explicit_recovery() -> None:
     package = _load(PACKAGE)
     commands = package["rest_command"]
     timestamp = "20260723T221530"
@@ -207,7 +207,6 @@ def test_ct110_host_request_ids_include_operation_and_snapshot_identity() -> Non
     def render_request_id(
         command: str,
         *,
-        action: str | None = None,
         snapshot_name: str | None = None,
     ) -> str:
         payload = commands[command]["payload"]
@@ -219,74 +218,68 @@ def test_ct110_host_request_ids_include_operation_and_snapshot_identity() -> Non
             f"{timestamp}Z",
         )
         payload = payload.replace("{{ vmid | int }}", "110")
-        if action is not None:
-            payload = payload.replace("{{ action }}", action)
         if snapshot_name is not None:
             payload = payload.replace("{{ snapshot_name }}", snapshot_name)
         parsed = json.loads(payload)
         return str(parsed["request_id"])
 
     request_ids = {
-        "start": render_request_id("hubinet_ops_host_action", action="start"),
-        "shutdown": render_request_id("hubinet_ops_host_action", action="shutdown"),
-        "reboot": render_request_id("hubinet_ops_host_action", action="reboot"),
-        "force-stop": render_request_id(
-            "hubinet_ops_host_action",
-            action="force-stop",
-        ),
-        "snapshot-create": render_request_id("hubinet_ops_host_snapshot_create"),
-        "snapshot-restore": render_request_id(
-            "hubinet_ops_host_snapshot_restore",
+        "start": render_request_id("hubinet_ops_host_start"),
+        "offline-restore": render_request_id(
+            "hubinet_ops_host_offline_snapshot_restore",
             snapshot_name=snapshot,
         ),
-        "snapshot-delete": render_request_id(
-            "hubinet_ops_host_snapshot_delete",
-            snapshot_name=snapshot,
+        "offline-force-stop": render_request_id(
+            "hubinet_ops_host_offline_force_stop"
         ),
     }
 
     assert request_ids == {
         "start": "ha-20260723T221530-110-start",
-        "shutdown": "ha-20260723T221530-110-shutdown",
-        "reboot": "ha-20260723T221530-110-reboot",
-        "force-stop": "ha-20260723T221530-110-force-stop",
-        "snapshot-create": "ha-20260723T221530-110-snap-create",
-        "snapshot-restore": (
-            "ha-20260723T221530-110-snap-restore-"
+        "offline-restore": (
+            "ha-20260723T221530-110-offline-restore-"
             "hubinet-ops-110-manual-20260723T220000Z"
         ),
-        "snapshot-delete": (
-            "ha-20260723T221530-110-snap-delete-"
-            "hubinet-ops-110-manual-20260723T220000Z"
-        ),
+        "offline-force-stop": "ha-20260723T221530-110-recovery-force-stop",
     }
     assert len(set(request_ids.values())) == len(request_ids)
     assert all(REQUEST_ID_RE.fullmatch(value) for value in request_ids.values())
     assert all(len(value) <= 128 for value in request_ids.values())
-    assert snapshot in request_ids["snapshot-restore"]
-    assert snapshot in request_ids["snapshot-delete"]
+    assert snapshot in request_ids["offline-restore"]
     assert all(
         "{{ now().strftime" not in commands[name]["payload"]
         for name in (
-            "hubinet_ops_host_action",
-            "hubinet_ops_host_snapshot_create",
-            "hubinet_ops_host_snapshot_restore",
-            "hubinet_ops_host_snapshot_delete",
+            "hubinet_ops_host_start",
+            "hubinet_ops_host_offline_snapshot_restore",
+            "hubinet_ops_host_offline_force_stop",
         )
     )
-    lifecycle_actions = {
-        item["data"]["action"]
+    direct_host_actions = {
+        item["action"]
         for script_name in (
             "hubinet_ops_start_container",
             "hubinet_ops_shutdown_container",
             "hubinet_ops_reboot_container",
             "hubinet_ops_force_stop_container",
+            "hubinet_ops_snapshot_create",
+            "hubinet_ops_snapshot_restore_latest",
+            "hubinet_ops_snapshot_delete_latest",
         )
         for item in _walk(package["script"][script_name])
         if isinstance(item, dict)
-        and item.get("action") == "rest_command.hubinet_ops_host_action"
+        and str(item.get("action") or "").startswith("rest_command.hubinet_ops_host_")
     }
-    assert lifecycle_actions == {"start", "shutdown", "reboot", "force-stop"}
+    assert direct_host_actions == {"rest_command.hubinet_ops_host_start"}
+    assert (
+        package["rest_command"]["hubinet_ops_host_offline_snapshot_restore"]["payload"]
+        .find('"confirm":"RESTORE_CT110_OFFLINE"')
+        >= 0
+    )
+    assert (
+        package["rest_command"]["hubinet_ops_host_offline_force_stop"]["payload"]
+        .find('"confirm":"FORCE_STOP_CT110_RECOVERY"')
+        >= 0
+    )
 
 
 def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() -> None:
