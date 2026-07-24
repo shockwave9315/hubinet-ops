@@ -229,6 +229,20 @@ class OpsService:
             saved = self._save_state(vmid, state)
             self._observe_health(vmid, str(saved.get("health_status", "unknown")))
             return saved
+        executor_contract_error: str | None = None
+        if (
+            str(cfg.get("resource_type") or "lxc") == "lxc"
+            and str(cfg.get("adapter") or "apt") == "apt"
+        ):
+            try:
+                self._require_compatible_executor(vmid, publish_state=False)
+            except ExecutorError as exc:
+                executor_contract_error = sanitize_text(exc, limit=2000)
+                LOGGER.warning(
+                    "Executor compatibility probe failed during refresh CT%s: %s",
+                    vmid,
+                    executor_contract_error,
+                )
         try:
             inspected = _executor_data(self.executor.run("inspect", vmid, timeout=120))
             # Inspect may take long enough for a job to reach a terminal state.
@@ -246,7 +260,12 @@ class OpsService:
                 if state.get("lifecycle_status") != "running":
                     state["expected_lxc_status"] = None
             state["last_refresh"] = utc_now()
-            if state.get("last_operation_result") is None:
+            if (
+                executor_contract_error is not None
+                and state.get("last_operation_result") is None
+            ):
+                state["last_error"] = executor_contract_error
+            elif state.get("last_operation_result") is None:
                 state["last_error"] = None
         except ExecutorError as exc:
             state = self.get_state(vmid)
@@ -636,7 +655,12 @@ class OpsService:
         self._notify_ha(self._notification("job_queued", vmid))
         return {"plan": plan, "job": job}
 
-    def _require_compatible_executor(self, vmid: int) -> dict[str, Any]:
+    def _require_compatible_executor(
+        self,
+        vmid: int,
+        *,
+        publish_state: bool = True,
+    ) -> dict[str, Any]:
         cfg = self._resource(vmid)
         if cfg.get("adapter", "apt") != "apt":
             raise ExecutorError(f"Resource {vmid} does not use a managed APT executor")
@@ -656,17 +680,21 @@ class OpsService:
         state = self.get_state(vmid)
         state.update(compatibility.state_fields())
         state["executor_last_checked_at"] = self._utc_second_timestamp()
-        self._save_state(vmid, state)
         if not compatibility.compatible:
             installed = compatibility.version or "unknown"
             reasons = "; ".join(compatibility.reasons)
             if executor_error:
                 reasons = f"{executor_error}; {reasons}".strip("; ")
-            raise ExecutorError(
+            message = (
                 f"Executor CT{vmid} is incompatible: required {EXECUTOR_VERSION}/"
                 f"protocol {EXECUTOR_PROTOCOL_VERSION}/verify with configured hashes; "
                 f"installed {installed}. {reasons}"
             )
+            state["executor_contract_error"] = message
+            self._save_state(vmid, state, publish=publish_state)
+            raise ExecutorError(message)
+        state["executor_contract_error"] = None
+        self._save_state(vmid, state, publish=publish_state)
         return payload
 
     def retry_healthcheck(self, vmid: int) -> dict[str, Any]:
@@ -898,7 +926,7 @@ class OpsService:
         elif vmid != 110 or self.host_control is None:
             raise ValueError("CT110 snapshots require independent PVE host control")
         stamp = self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-        name = f"hubinet-ops-{vmid}-manual-{stamp}"
+        name = _snapshot_name(vmid, "manual", stamp)
         job, _ = self.db.create_operation_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"ct-{vmid}")),
@@ -1634,9 +1662,10 @@ class OpsService:
         cfg = self._resource(vmid)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         auto_rollback = bool(cfg.get("automatic_rollback", False))
-        snapshot = (
-            f"hubinet-ops-{vmid}-pre-update-"
-            f"{self._now().astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        snapshot = _snapshot_name(
+            vmid,
+            "pre-update",
+            self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ"),
         )
         emit = self._emitter(job)
         emit(
@@ -2533,7 +2562,13 @@ class OpsService:
             on_event=on_event,
         )
 
-    def _save_state(self, vmid: int, state: dict[str, Any]) -> dict[str, Any]:
+    def _save_state(
+        self,
+        vmid: int,
+        state: dict[str, Any],
+        *,
+        publish: bool = True,
+    ) -> dict[str, Any]:
         state = normalize_state(self._decorate_state(vmid, state))
         events = self.db.list_container_events(vmid, 50)
         state["recent_job_events"] = events
@@ -2558,7 +2593,8 @@ class OpsService:
         )
         state["docker"] = docker
         saved = self.db.upsert_resource_state(vmid, state)
-        self.mqtt.publish_resource_state(vmid, saved)
+        if publish:
+            self.mqtt.publish_resource_state(vmid, saved)
         self._publish_agent_state_if_changed()
         return saved
 
@@ -2894,6 +2930,16 @@ def _executor_data(result: Any) -> dict[str, Any]:
         return {}
     data = result.get("data")
     return dict(data) if isinstance(data, dict) else {}
+
+
+def _snapshot_name(vmid: int, kind: str, stamp: str) -> str:
+    physical_kind = "pre" if kind == "pre-update" else "manual"
+    name = f"hubinet-ops-{int(vmid)}-{physical_kind}-{stamp}"
+    if len(name) > 40 and physical_kind == "manual":
+        name = f"hubinet-ops-{int(vmid)}-man-{stamp}"
+    if len(name) > 40:
+        raise ValueError("Generated snapshot name exceeds the PVE 40 character limit")
+    return name
 
 
 def _fingerprint(data: dict[str, Any]) -> str:

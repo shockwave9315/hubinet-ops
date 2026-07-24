@@ -11,11 +11,18 @@ EnvironmentFile=/etc/hubinet-ops/hostd.env
 ExecStart=/usr/bin/python3 /usr/local/lib/hubinet-ops/hubinet_ops_hostd.py --config /etc/hubinet-ops/hostd.json
 Restart=on-failure
 RestartSec=5s
+StateDirectory=hubinet-ops-hostd
+StateDirectoryMode=0700
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/etc/pve /var/lib/hubinet-ops-hostd /run/lock
+# /etc/pve: PVE configuration and snapshot metadata.
+# /var/lib/hubinet-ops-hostd: durable host jobs and recovery events.
+# /run/lock and /run/lxc/lock: PVE/LXC operation locks.
+# /var/log/pve/tasks: PVE UPID task records.
+# /etc/lvm/archive and /etc/lvm/backup: LVM metadata safety copies.
+ReadWritePaths=/etc/pve /var/lib/hubinet-ops-hostd /run/lock /var/log/pve/tasks /run/lxc/lock /etc/lvm/archive /etc/lvm/backup
 
 [Install]
 WantedBy=multi-user.target

@@ -203,12 +203,13 @@ def test_data_size_discovery_uses_gib_without_changing_raw_backend_bytes() -> No
         assert "1073741824" in payload["value_template"]
 
 
-def test_agent_last_refresh_discovery_is_a_diagnostic_timestamp() -> None:
+def test_agent_last_refresh_discovery_is_nullable_diagnostic_text() -> None:
     configs, _ = _discovery()
     payload = configs["homeassistant/sensor/hubinet_ops_agent_last_refresh/config"]
 
-    assert payload["device_class"] == "timestamp"
+    assert "device_class" not in payload
     assert payload["entity_category"] == "diagnostic"
+    assert "default('unknown', true)" in payload["value_template"]
 
 
 def test_health_discovery_uses_dedicated_attributes_topic_without_force_update() -> None:

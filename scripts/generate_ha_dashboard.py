@@ -565,7 +565,10 @@ def _control_conditions(
         return [_state_condition(capability, state="allowed")]
     if action in {"approve", "reject"}:
         return [
-            _state_condition(operation, state="waiting_approval"),
+            _state_condition(
+                _entity(vmid, cfg, "active_plan_status"),
+                state="waiting_approval",
+            ),
             _state_condition(capability, state="allowed"),
             _state_condition(active_job, state="none"),
         ]
@@ -592,7 +595,6 @@ def _control_conditions(
     if action == "snapshot_create":
         return [
             _state_condition(capability, state="allowed"),
-            _state_condition(operation, state_not="waiting_approval"),
             *idle,
         ]
     if action in {"snapshot_rollback", "snapshot_delete"}:

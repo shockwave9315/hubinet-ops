@@ -14,6 +14,8 @@ An agent restart reattaches hostd-backed lifecycle, snapshot, and self-update wo
 
 After rollback, current verification and remaining-package fields are cleared to unknown/null rather than presenting pre-rollback success. The failed verification remains in job events. A recovery scan may create a new plan with a new ID and fingerprint; the rolled-back plan is never reused.
 
+PVE limits snapshot names to 40 characters. New automatic update snapshots use `hubinet-ops-<vmid>-pre-<UTC timestamp>` and are reported with logical kind `pre-update`. Existing `hubinet-ops-<vmid>-pre-update-<UTC timestamp>` snapshots remain owned and eligible. Normal manual names use `manual`; the generator uses the compact `man` physical alias only when required for a six-digit VMID, and the parser reports logical kind `manual`.
+
 If CT110 is stopped and its backend cannot answer, the separately labeled offline restore is the only snapshot break-glass path. It requires the dedicated recovery token, exact confirmation, stopped runtime, no active hostd job, and an owned rollback-eligible snapshot. It is never selected automatically after a backend error.
 
 Hostd persists the recovery ID, request ID, VMID, snapshot, type, timestamps, status, result, and error outside CT110. The event is created while the host job is queued. Immediately before invoking the PVE controller, hostd atomically stores `mutation_started_at`; a failure to persist that marker prevents the controller call. The marker survives hostd and PVE restarts and is exposed by the read-only recovery-events API.

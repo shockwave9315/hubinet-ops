@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+REAL_PYTHON="${HUBINET_OPS_TEST_PYTHON:-$(command -v python3 || command -v python)}"
+
+make_fakes() {
+  local root="$1" bin pve ct
+  bin="$root/bin"; pve="$root/pve"; ct="$root/ct"
+  mkdir -p "$bin" "$root/pycompat" "$pve/etc/hubinet-ops" "$pve/usr/local/sbin" "$ct/ct110"
+  printf 'LOCK_EX=2\nLOCK_NB=4\ndef flock(*args, **kwargs): return None\n' > "$root/pycompat/fcntl.py"
+  cp "$ROOT/config/config.example.yaml" "$ct/ct110/etc-config.yaml"
+  printf 'HUBINET_OPS_API_TOKEN=%064d\n' 0 > "$ct/ct110/agent.env"
+  printf '{"bind":"192.0.2.10","port":8741,"database":"/var/lib/hubinet-ops-hostd/jobs.db","client_allowlist":[]}\n' > "$pve/etc/hubinet-ops/hostd.json"
+  printf 'HUBINET_OPS_HOSTD_TOKEN=%064d\n' 1 > "$pve/etc/hubinet-ops/hostd.env"
+  printf 'old-wrapper\n' > "$pve/usr/local/sbin/hubinet-ops-host"
+  for vmid in $(seq 101 110); do
+    mkdir -p "$ct/ct$vmid/usr/local/sbin" "$ct/ct$vmid/etc"
+    printf 'old-executor-%s\n' "$vmid" > "$ct/ct$vmid/usr/local/sbin/hubinet-maint"
+    printf '{"old_profile":%s}\n' "$vmid" > "$ct/ct$vmid/etc/hubinet-maint.json"
+  done
+  cat > "$bin/pct" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'pct %s\n' "$*" >> "$TEST_LOG"
+if [[ -n "${PCT_FAIL_129_ONCE_MATCH:-}" &&
+      "$*" == *"$PCT_FAIL_129_ONCE_MATCH"* &&
+      ! -e "$TEST_CT_ROOT/pct-129-injected" ]]; then
+  : > "$TEST_CT_ROOT/pct-129-injected"
+  exit 129
+fi
+action="$1"; vmid="${2:-}"; shift 2 || true
+root="$TEST_CT_ROOT/ct$vmid"
+case "$action" in
+  status)
+    if (( vmid >= 106 && vmid <= 109 )); then echo "status stopped"; else echo "status running"; fi
+    ;;
+  mount)
+    mkdir -p "$root"
+    echo "CT $vmid mounted at '$root'"
+    ;;
+  unmount) ;;
+  pull)
+    src="$1"; dst="$2"
+    if [[ "$vmid" == 110 && "$src" == /etc/hubinet-ops/config.yaml ]]; then
+      cp "$TEST_CT_ROOT/ct110/etc-config.yaml" "$dst"
+    elif [[ "$vmid" == 110 && "$src" == /etc/hubinet-ops/agent.env ]]; then
+      cp "$TEST_CT_ROOT/ct110/agent.env" "$dst"
+    else
+      cp "$root$src" "$dst"
+    fi
+    ;;
+  push)
+    src="$1"; dst="$2"
+    mkdir -p "$(dirname "$root$dst")"
+    cp "$src" "$root$dst"
+    ;;
+  exec)
+    [[ "$1" == -- ]] && shift
+    if [[ "$1" == bash && "$2" == -s ]]; then
+      script="$(cat)"
+      if grep -q '/api/v1/state' <<<"$script"; then
+        "$REAL_PYTHON" - <<'PY'
+import json
+resources={}
+for vmid in range(100,111):
+    state={"vmid":vmid,"last_refresh":"2099-01-01T00:00:00+00:00","health_status":"healthy","health_score":100}
+    if vmid==100: state["cpu"]={"usage_percent":3.05257}
+    if 101 <= vmid <= 109: state.update(executor_compatible=True,executor_version="0.4.1",executor_protocol_version=1)
+    resources[str(vmid)]=state
+print(json.dumps({"version":"0.4.1","resources":resources}))
+PY
+      elif grep -q '/api/v1/resources/106/snapshots' <<<"$script"; then
+        echo '{"snapshots":[],"latest":null}'
+      elif grep -q 'hubinet-ops-0.4.1.tgz' <<<"$script"; then
+        mv "$root/etc/hubinet-ops/config.yaml.new" "$TEST_CT_ROOT/ct110/etc-config.yaml"
+        mv "$root/etc/hubinet-ops/agent.env.new" "$TEST_CT_ROOT/ct110/agent.env"
+        echo AGENT_INSTALLED >> "$TEST_LOG"
+      elif grep -q 'restore_started' <<<"$script"; then
+        echo AGENT_RESTORED >> "$TEST_LOG"
+      else
+        echo AGENT_BACKED_UP >> "$TEST_LOG"
+      fi
+    elif [[ "$1" == sh && "$2" == -c ]]; then
+      remote="${@: -1}"
+      [[ -e "$root$remote" ]] && echo present || echo absent
+    elif [[ "$1" == python3 && "$2" == -m && "$3" == py_compile ]]; then
+      "$REAL_PYTHON" -m py_compile "$root$4"
+    elif [[ "$1" == install ]]; then
+      src="${@: -2:1}"; dst="${@: -1}"
+      mkdir -p "$(dirname "$root$dst")"
+      cp "$root$src" "$root$dst"
+    elif [[ "$1" == mv ]]; then
+      src="${@: -2:1}"; dst="${@: -1}"
+      mkdir -p "$(dirname "$root$dst")"; mv "$root$src" "$root$dst"
+    elif [[ "$1" == rm ]]; then
+      for value in "$@"; do [[ "$value" == /* ]] && rm -f "$root$value" || true; done
+    elif [[ "$1" == /usr/local/sbin/hubinet-maint && "$2" == capabilities ]]; then
+      if [[ "${FAIL_CAPABILITIES_VMID:-}" == "$vmid" ]]; then echo '{"ok":false,"data":{}}'; else
+        HUBINET_MAINT_CONFIG_PATH="$root/etc/hubinet-maint.json" "$REAL_PYTHON" "$root/usr/local/sbin/hubinet-maint" capabilities
+      fi
+    elif [[ "$1" == systemctl && "$2" == start ]]; then
+      echo AGENT_STARTED >> "$TEST_LOG"
+    elif [[ "$1" == curl ]]; then
+      echo '{"status":"ok","version":"0.4.1"}'
+    elif [[ "$1" == /opt/hubinet-ops/.venv/bin/python ]]; then
+      cat >/dev/null
+    else
+      echo "unsupported fake pct exec: $*" >&2; exit 1
+    fi
+    ;;
+  *) echo "unsupported fake pct: $action" >&2; exit 1 ;;
+esac
+SH
+  cat > "$bin/python3" <<'SH'
+#!/usr/bin/env bash
+exec "$REAL_PYTHON" "$@"
+SH
+  cat > "$bin/install" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+directory=false
+values=()
+while (($#)); do
+  case "$1" in
+    -d) directory=true; shift ;;
+    -m|-o|-g) shift 2 ;;
+    -*) shift ;;
+    *) values+=("$1"); shift ;;
+  esac
+done
+if [[ "$directory" == true ]]; then
+  mkdir -p "${values[@]}"
+else
+  ((${#values[@]} >= 2))
+  src="${values[${#values[@]}-2]}"; dst="${values[${#values[@]}-1]}"
+  mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"
+fi
+SH
+  cat > "$bin/systemctl" <<'SH'
+#!/usr/bin/env bash
+printf 'systemctl %s\n' "$*" >> "$TEST_LOG"
+case "$1" in is-active) exit 3;; is-enabled) exit 1;; esac
+exit 0
+SH
+  cat > "$bin/curl" <<'SH'
+#!/usr/bin/env bash
+echo '{"status":"ok","version":"0.4.1"}'
+SH
+  cat > "$bin/wrapper-smoke" <<'SH'
+#!/usr/bin/env bash
+case "$SSH_ORIGINAL_COMMAND" in
+  'inspect 100') echo '{"ok":true,"data":{"resource_type":"qemu","adapter":"haos","qemu_status":"running","cpu":{"usage":0.0305257}}}' ;;
+  'inspect 106') echo '{"ok":true,"data":{"resource_type":"lxc"}}' ;;
+  'list-snapshots 106') echo '{"ok":true,"data":{"snapshots":[]}}' ;;
+  *) exit 1 ;;
+esac
+SH
+  chmod +x "$bin"/*
+}
+
+run_case() {
+  local name="$1" fail_vmid="${2:-}" retry_match="${3:-}" case_root
+  case_root="$TMP/$name"
+  mkdir -p "$case_root"
+  make_fakes "$case_root"
+  : > "$case_root/actions.log"
+  set +e
+  PATH="$case_root/bin:$PATH" \
+  TEST_LOG="$case_root/actions.log" \
+  TEST_CT_ROOT="$case_root/ct" \
+  REAL_PYTHON="$REAL_PYTHON" \
+  PYTHONPATH="$case_root/pycompat" \
+  FAIL_CAPABILITIES_VMID="$fail_vmid" \
+  PCT_FAIL_129_ONCE_MATCH="$retry_match" \
+  HUBINET_OPS_TEST_MODE=1 \
+  HUBINET_OPS_TEST_PVE_ROOT="$case_root/pve" \
+  HUBINET_OPS_BACKUP_ROOT="$case_root/backups" \
+  HUBINET_OPS_TEST_ARCHIVE="$case_root/release.tgz" \
+  HUBINET_OPS_TEST_WRAPPER_RUNNER="$case_root/bin/wrapper-smoke" \
+  HUBINET_OPS_HOSTD_HEALTH_URL="http://hostd.test/health" \
+  HUBINET_OPS_VALIDATION_ATTEMPTS=1 \
+  HUBINET_OPS_VALIDATION_DELAY=0 \
+    bash "$ROOT/deploy/upgrade-0.4.1-from-pve.sh" >"$case_root/stdout" 2>"$case_root/stderr"
+  rc=$?
+  set -e
+  printf '%s' "$rc"
+}
+
+success_rc="$(run_case success)"
+if [[ "$success_rc" != 0 ]]; then
+  cat "$TMP/success/stderr" >&2
+  exit 1
+fi
+
+retry_rc="$(run_case retry "" "push 101")"
+if [[ "$retry_rc" != 0 ]]; then
+  cat "$TMP/retry/stderr" >&2
+  exit 1
+fi
+[[ "$(grep -c '^pct push 101 ' "$TMP/retry/actions.log")" -ge 2 ]]
+grep -Fq 'pct received SIGHUP; retrying 2/3: pct push 101' "$TMP/retry/stderr"
+if grep -Fq '0.4.1 upgrade failed' "$TMP/retry/stderr"; then
+  echo "global ERR trap fired before the rc=129 retry succeeded" >&2
+  exit 1
+fi
+grep -Fq 'VERSION = "0.4.1"' "$TMP/success/ct/ct101/usr/local/sbin/hubinet-maint"
+grep -Fq 'VERSION = "0.4.1"' "$TMP/success/ct/ct109/usr/local/sbin/hubinet-maint"
+grep -Fq 'AGENT_INSTALLED' "$TMP/success/actions.log"
+grep -Fq 'VERSION = "0.4.1"' "$TMP/success/pve/usr/local/lib/hubinet-ops/hubinet_ops_hostd.py"
+for policy in snapshot-create-vmids snapshot-restore-vmids snapshot-delete-vmids; do
+  cmp "$ROOT/deploy/pve/$policy" "$TMP/success/pve/etc/hubinet-ops/$policy"
+done
+if grep -Eq 'pct (start|stop|shutdown|reboot|snapshot|rollback|delsnapshot)' "$TMP/success/actions.log"; then
+  echo "upgrade executed a forbidden resource lifecycle or snapshot mutation" >&2
+  exit 1
+fi
+
+failure_rc="$(run_case rollback 105)"
+if [[ "$failure_rc" == 0 ]]; then
+  cat "$TMP/rollback/stdout" >&2
+  echo "expected the injected executor failure" >&2
+  exit 1
+fi
+for vmid in $(seq 101 109); do
+  grep -Fq "old-executor-$vmid" "$TMP/rollback/ct/ct$vmid/usr/local/sbin/hubinet-maint"
+  grep -Fq "old_profile" "$TMP/rollback/ct/ct$vmid/etc/hubinet-maint.json"
+done
+grep -Fq 'old-wrapper' "$TMP/rollback/pve/usr/local/sbin/hubinet-ops-host"
+for policy in snapshot-create-vmids snapshot-restore-vmids snapshot-delete-vmids; do
+  [[ ! -e "$TMP/rollback/pve/etc/hubinet-ops/$policy" ]]
+done
+grep -Fq 'AGENT_STARTED' "$TMP/rollback/actions.log"
+if grep -Eq 'pct (start|stop|shutdown|reboot|snapshot|rollback|delsnapshot)' "$TMP/rollback/actions.log"; then
+  echo "rollback executed a forbidden resource lifecycle or snapshot mutation" >&2
+  exit 1
+fi
+
+echo "0.4.1 runtime smoke: success, retry and cross-layer rollback passed"

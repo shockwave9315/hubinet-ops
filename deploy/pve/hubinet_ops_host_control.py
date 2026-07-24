@@ -16,7 +16,7 @@ from hubinet_ops_release import FINGERPRINT_RE, inspect_staged_release, public_r
 
 SNAPSHOT_RE = re.compile(
     r"^hubinet-ops-(?P<vmid>[1-9][0-9]{1,5})-"
-    r"(?P<kind>pre-update|manual)-(?P<stamp>[0-9]{8}T[0-9]{6}Z)$"
+    r"(?P<kind>pre-update|pre|manual|man)-(?P<stamp>[0-9]{8}T[0-9]{6}Z)$"
 )
 SOURCE_JOB_RE = re.compile(r"^[a-f0-9]{8,64}$")
 RESOURCE_TYPES = {"lxc", "qemu"}
@@ -262,8 +262,15 @@ class HostController:
         return int(completed.returncode or 0)
 
     def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
+        node = self._resolve_node()
         raw = self._run(
-            ["pct", "listsnapshot", str(vmid), "--output-format", "json"],
+            [
+                "pvesh",
+                "get",
+                f"/nodes/{node}/lxc/{vmid}/snapshot",
+                "--output-format",
+                "json",
+            ],
             timeout=60,
         ).stdout
         try:
@@ -467,7 +474,12 @@ def parse_snapshot(name: str, vmid: int) -> dict[str, str] | None:
     match = SNAPSHOT_RE.fullmatch(str(name))
     if not match or int(match.group("vmid")) != int(vmid):
         return None
-    return match.groupdict()
+    parsed = match.groupdict()
+    parsed["kind"] = {
+        "pre": "pre-update",
+        "man": "manual",
+    }.get(parsed["kind"], parsed["kind"])
+    return parsed
 
 
 def run_forced_command(command: str, controller: HostController) -> int:

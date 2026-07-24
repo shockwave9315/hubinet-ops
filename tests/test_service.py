@@ -79,7 +79,7 @@ class WorkflowExecutor:
             return {
                 "ok": True,
                 "data": {
-                    "version": "0.4.0",
+                    "version": "0.4.1",
                     "protocol_version": 1,
                     "supported_actions": sorted(REQUIRED_APT_ACTIONS),
                     "executor_sha256": EXECUTOR_HASH,
@@ -238,7 +238,7 @@ def test_observation_only_monitoring_is_independent_from_operator_policy(
 
     assert refreshed["health_status"] == "healthy"
     assert scanned["status"] == "up_to_date"
-    assert executor.actions == ["inspect", "scan"]
+    assert executor.actions == ["capabilities", "inspect", "scan"]
     assert db.find_active_plan(101) is None
     with pytest.raises(ValueError, match="refresh.*blocked"):
         service.refresh_container(101, operator=True)
@@ -348,6 +348,16 @@ def test_agent_self_state_adds_inventory_jobs_and_mqtt_without_secrets(
         db_path=tmp_path / "self.db",
         api_token="t" * 64,
     )
+    vm100_executor = WorkflowExecutor(
+        [{"qemu_status": "running", "health_status": "healthy"}]
+    )
+    vm100_service = OpsService(
+        cfg,
+        Database(cfg.db_path),
+        vm100_executor,
+    )
+    assert vm100_service.refresh_container(100)["health_status"] == "healthy"
+    assert vm100_executor.actions == ["inspect"]
     executor = WorkflowExecutor(
         [
             {
@@ -363,6 +373,7 @@ def test_agent_self_state_adds_inventory_jobs_and_mqtt_without_secrets(
 
     state = service.refresh_container(110)
 
+    assert executor.actions == ["inspect"]
     assert state["configured_resource_count"] == 2
     assert state["configured_lxc_count"] == 1
     assert state["configured_qemu_count"] == 1
@@ -391,6 +402,55 @@ def service_with(
     service = OpsService(cfg, db, executor, stabilizer=stabilizer)  # type: ignore[arg-type]
     service._ensure_initial_states()
     return service, db
+
+
+def test_refresh_probes_and_persists_compatible_executor_contract(
+    tmp_path: Path,
+) -> None:
+    executor = WorkflowExecutor([docker_state(3)])
+    service, _ = service_with(tmp_path, executor)
+
+    state = service.refresh_container(106)
+
+    assert executor.actions[:2] == ["capabilities", "inspect"]
+    assert state["executor_compatible"] is True
+    assert state["executor_version"] == "0.4.1"
+    assert state["executor_protocol_version"] == 1
+    assert state["executor_sha256"] == EXECUTOR_HASH
+    assert state["executor_profile_sha256"] == PROFILE_HASH
+    assert state["profile_validation_status"] == "valid"
+    assert state["health_status"] == "healthy"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("version", "0.4.0", "version 0.4.0 != 0.4.1"),
+        ("executor_sha256", "c" * 64, "executor sha256 mismatch"),
+    ],
+)
+def test_refresh_keeps_inspect_when_executor_contract_is_incompatible(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    class IncompatibleExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, **kwargs: Any) -> dict[str, Any]:
+            result = super().run(action, vmid, **kwargs)
+            if action == "capabilities":
+                result["data"][field] = value
+            return result
+
+    executor = IncompatibleExecutor([docker_state(3)])
+    service, _ = service_with(tmp_path, executor)
+
+    state = service.refresh_container(106)
+
+    assert executor.actions[:2] == ["capabilities", "inspect"]
+    assert state["executor_compatible"] is False
+    assert state["health_status"] == "healthy"
+    assert message in state["last_error"]
 
 
 def approved_job(service: OpsService, db: Database) -> dict[str, Any]:
@@ -597,7 +657,15 @@ def test_update_0_2_3_3_succeeds_without_repair_or_rollback(tmp_path: Path) -> N
     assert result["status"] == "success"
     assert "repair" not in executor.actions
     assert "rollback" not in executor.actions
-    assert service.get_state(106)["update_status"] == "up_to_date"
+    state = service.get_state(106)
+    assert state["operation_status"] == "success"
+    assert state["job_stage"] == "completed"
+    assert state["last_operation_result"] == "success"
+    assert state["update_status"] == "up_to_date"
+    assert state["pending_updates"] == 0
+    assert state["verification_status"] == "passed"
+    assert state["snapshot_name"].startswith("hubinet-ops-106-pre-")
+    assert len(state["snapshot_name"]) <= 40
 
 
 def test_timeout_invokes_repair_and_repair_success_prevents_rollback(

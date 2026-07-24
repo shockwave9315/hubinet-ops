@@ -14,7 +14,7 @@ def test_current_release_installer_runtime_smoke() -> None:
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash is unavailable on this platform")
-    smoke = ROOT / "tests" / "shell" / "runtime_smoke_0_4_0.sh"
+    smoke = ROOT / "tests" / "shell" / "runtime_smoke_0_4_1.sh"
     result = subprocess.run(
         [bash, str(smoke)],
         cwd=ROOT,
@@ -25,6 +25,6 @@ def test_current_release_installer_runtime_smoke() -> None:
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert (
-        "0.4.0 runtime smoke: success and cross-layer rollback passed"
+        "0.4.1 runtime smoke: success, retry and cross-layer rollback passed"
         in result.stdout.splitlines()
     )

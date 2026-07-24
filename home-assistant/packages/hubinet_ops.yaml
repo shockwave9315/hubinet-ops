@@ -1,4 +1,4 @@
-# Hubinet Ops 0.4.0: typed resource actions; backend and hostd enforce policy.
+# Hubinet Ops 0.4.1: typed resource actions; backend and hostd enforce policy.
 
 recorder:
   exclude:
@@ -620,7 +620,7 @@ automation:
                     clickAction: "{{ dashboard_path }}"
 
   - id: hubinet_ops_live_progress_v040
-    alias: "Hubinet Ops 0.4.0 — progress operacji na telefonie"
+    alias: "Hubinet Ops 0.4.1 — progress operacji na telefonie"
     mode: parallel
     max: 9
     max_exceeded: silent

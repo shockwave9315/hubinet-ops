@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1
+
+- create the hostd state directory through systemd and the installer, and extend the strict sandbox only for PVE task logs, LXC locks, and LVM metadata backups required by real snapshot operations;
+- replace unsupported `pct listsnapshot --output-format json` with node-resolved `pvesh` snapshot listing while preserving ownership, `current`, ordering, retention, rollback, and delete semantics;
+- retry only `pct` rc=129 up to three times inside an ERR-trap-safe conditional and install running-CT executors/profiles idempotently;
+- make the 0.4.x config migration idempotently align CT101–CT109 rollback capability with `manual_rollback_allowed`, without changing database schema version 400;
+- validate large fresh-state payloads through stdin instead of argv and emit bounded, condition-specific rollout diagnostics;
+- probe and persist the 0.4.1 executor contract during APT refresh while retaining safe inspect telemetry when the contract is incompatible;
+- shorten new pre-update snapshot names to the `pre` physical alias, normalize it back to logical `pre-update`, retain legacy names, and enforce PVE's 40-character limit;
+- remove timestamp device classes from nullable MQTT diagnostics and make every capability template safe when the capability object or key is absent;
+- correct dashboard visibility for manual snapshots and waiting plans, retain numeric VMID script calls, and regenerate the deterministic dashboard;
+- require complete Home Assistant secrets, reject legacy plan URLs, document the active-plan endpoints, and add an optional checked `--restart-core` workflow while keeping no-restart as the default.
+
 ## 0.4.0
 
 - add the `hubinet-maint` 0.4.0/protocol 1 capabilities contract with required actions plus executor/profile hashes and profile validation status;

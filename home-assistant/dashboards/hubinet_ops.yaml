@@ -696,7 +696,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct101_operation_status
+          entity: sensor.hubinet_ops_ct101_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct101_capability_approve
@@ -723,7 +723,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct101_operation_status
+          entity: sensor.hubinet_ops_ct101_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct101_capability_reject
@@ -780,9 +780,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct101_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct101_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct101_active_job_id
           state: none
@@ -1554,7 +1551,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct102_operation_status
+          entity: sensor.hubinet_ops_ct102_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct102_capability_approve
@@ -1581,7 +1578,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct102_operation_status
+          entity: sensor.hubinet_ops_ct102_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct102_capability_reject
@@ -1638,9 +1635,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct102_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct102_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct102_active_job_id
           state: none
@@ -2412,7 +2406,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct103_operation_status
+          entity: sensor.hubinet_ops_ct103_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct103_capability_approve
@@ -2439,7 +2433,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct103_operation_status
+          entity: sensor.hubinet_ops_ct103_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct103_capability_reject
@@ -2496,9 +2490,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct103_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct103_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct103_active_job_id
           state: none
@@ -3270,7 +3261,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct104_operation_status
+          entity: sensor.hubinet_ops_ct104_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct104_capability_approve
@@ -3297,7 +3288,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct104_operation_status
+          entity: sensor.hubinet_ops_ct104_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct104_capability_reject
@@ -3354,9 +3345,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct104_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct104_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct104_active_job_id
           state: none
@@ -4128,7 +4116,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct105_operation_status
+          entity: sensor.hubinet_ops_ct105_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct105_capability_approve
@@ -4155,7 +4143,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct105_operation_status
+          entity: sensor.hubinet_ops_ct105_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct105_capability_reject
@@ -4212,9 +4200,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct105_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct105_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct105_active_job_id
           state: none
@@ -4986,7 +4971,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct106_operation_status
+          entity: sensor.hubinet_ops_ct106_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct106_capability_approve
@@ -5013,7 +4998,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct106_operation_status
+          entity: sensor.hubinet_ops_ct106_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct106_capability_reject
@@ -5070,9 +5055,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct106_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct106_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct106_active_job_id
           state: none
@@ -5863,7 +5845,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct107_operation_status
+          entity: sensor.hubinet_ops_ct107_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct107_capability_approve
@@ -5890,7 +5872,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct107_operation_status
+          entity: sensor.hubinet_ops_ct107_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct107_capability_reject
@@ -5947,9 +5929,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct107_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct107_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct107_active_job_id
           state: none
@@ -6721,7 +6700,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct108_operation_status
+          entity: sensor.hubinet_ops_ct108_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct108_capability_approve
@@ -6748,7 +6727,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct108_operation_status
+          entity: sensor.hubinet_ops_ct108_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct108_capability_reject
@@ -6805,9 +6784,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct108_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct108_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct108_active_job_id
           state: none
@@ -7579,7 +7555,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct109_operation_status
+          entity: sensor.hubinet_ops_ct109_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct109_capability_approve
@@ -7606,7 +7582,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct109_operation_status
+          entity: sensor.hubinet_ops_ct109_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct109_capability_reject
@@ -7663,9 +7639,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct109_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct109_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct109_active_job_id
           state: none
@@ -8414,7 +8387,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct110_operation_status
+          entity: sensor.hubinet_ops_ct110_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct110_capability_approve
@@ -8441,7 +8414,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct110_operation_status
+          entity: sensor.hubinet_ops_ct110_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct110_capability_reject
@@ -8470,9 +8443,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct110_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct110_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct110_active_job_id
           state: none

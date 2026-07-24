@@ -106,7 +106,7 @@ class FakeExecutor:
             return {
                 "ok": True,
                 "data": {
-                    "version": "0.4.0",
+                    "version": "0.4.1",
                     "protocol_version": 1,
                     "supported_actions": [
                         "capabilities",

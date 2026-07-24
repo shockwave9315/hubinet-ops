@@ -20,7 +20,7 @@ from .security import sanitize_data, sanitize_text
 from .mqtt_budget import bounded_attributes, bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,7 @@ class MqttTelemetry:
         self._client_factory = client_factory
         self._client: Any = None
         # Two complete discovery passes must fit during reconnect without
-        # evicting retained cleanup messages as the 0.4.0 entity contract grows.
+        # evicting retained cleanup messages as the 0.4.x entity contract grows.
         self._queue: queue.Queue[PublishItem | None] = queue.Queue(maxsize=2000)
         self._cache: dict[str, str] = {}
         self._connected = threading.Event()

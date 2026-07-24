@@ -70,7 +70,20 @@ def _timestamp(key: str, suffix: str, name: str, path: str) -> EntitySpec:
         suffix,
         name,
         f"{{{{ {path} | default('unknown', true) }}}}",
-        {"device_class": "timestamp", "entity_category": "diagnostic"},
+        {"entity_category": "diagnostic"},
+    )
+
+
+def _capability(key: str) -> EntitySpec:
+    return EntitySpec(
+        f"capability_{key}",
+        f"capability_{key}",
+        f"Capability {key.replace('_', ' ')}",
+        (
+            "{{ 'allowed' if "
+            f"(value_json.operator_capabilities | default({{}})).get('{key}', false) "
+            "else 'blocked' }}"
+        ),
     )
 
 
@@ -85,12 +98,7 @@ SNAPSHOT_ENTITY_SPECS = (
 
 
 LIFECYCLE_CAPABILITY_SPECS = tuple(
-    EntitySpec(
-        f"capability_{key}",
-        f"capability_{key}",
-        f"Capability {key.replace('_', ' ')}",
-        f"{{{{ 'allowed' if value_json.operator_capabilities.{key} else 'blocked' }}}}",
-    )
+    _capability(key)
     for key in (
         "start", "shutdown", "reboot", "force_stop", "refresh",
         "snapshot_create", "snapshot_list", "snapshot_rollback", "snapshot_delete",
@@ -137,7 +145,7 @@ AGENT_ENTITY_SPECS = (
         "last_refresh",
         "Last refresh",
         "{{ value_json.last_refresh | default('unknown', true) }}",
-        {"device_class": "timestamp", "entity_category": "diagnostic"},
+        {"entity_category": "diagnostic"},
     ),
 )
 
@@ -184,11 +192,11 @@ APT_ENTITY_SPECS = (
     EntitySpec("recovery_scan_status", "recovery_scan_status", "Recovery scan status", "{{ value_json.recovery_scan_status | default('disabled') }}"),
     _timestamp("last_recovery_scan", "last_recovery_scan", "Last recovery scan", "value_json.last_recovery_scan"),
     EntitySpec("last_recovery_scan_result", "last_recovery_scan_result", "Last recovery scan result", "{{ value_json.last_recovery_scan_result | default('none', true) }}"),
-    EntitySpec("capability_scan", "capability_scan", "Capability scan", "{{ 'allowed' if value_json.operator_capabilities.scan else 'blocked' }}"),
-    EntitySpec("capability_approve", "capability_approve", "Capability approve", "{{ 'allowed' if value_json.operator_capabilities.approve else 'blocked' }}"),
-    EntitySpec("capability_reject", "capability_reject", "Capability reject", "{{ 'allowed' if value_json.operator_capabilities.reject else 'blocked' }}"),
-    EntitySpec("capability_retry_healthcheck", "capability_retry_healthcheck", "Capability retry healthcheck", "{{ 'allowed' if value_json.operator_capabilities.retry_healthcheck else 'blocked' }}"),
-    EntitySpec("capability_rollback", "capability_rollback", "Capability rollback", "{{ 'allowed' if value_json.operator_capabilities.rollback else 'blocked' }}"),
+    _capability("scan"),
+    _capability("approve"),
+    _capability("reject"),
+    _capability("retry_healthcheck"),
+    _capability("rollback"),
     EntitySpec("executor_version", "executor_version", "Executor version", "{{ value_json.executor_version | default('unknown', true) }}", {"entity_category": "diagnostic"}),
     EntitySpec("executor_protocol_version", "executor_protocol_version", "Executor protocol", "{{ value_json.executor_protocol_version | default(none) }}", {"entity_category": "diagnostic"}),
     EntitySpec("executor_compatible", "executor_compatible", "Executor compatible", "{{ 'compatible' if value_json.executor_compatible else 'incompatible' }}", {"entity_category": "diagnostic"}),
@@ -196,6 +204,7 @@ APT_ENTITY_SPECS = (
     EntitySpec("executor_profile_sha256", "executor_profile_sha256", "Executor profile SHA-256", "{{ value_json.executor_profile_sha256 | default('unknown', true) }}", {"entity_category": "diagnostic"}),
     EntitySpec("executor_missing_actions", "executor_missing_actions", "Executor missing actions", "{{ value_json.executor_missing_actions | default([]) | join(', ') or 'none' }}", {"entity_category": "diagnostic"}),
     EntitySpec("profile_validation_status", "profile_validation_status", "Profile validation", "{{ value_json.profile_validation_status | default('unknown', true) }}", {"entity_category": "diagnostic"}),
+    EntitySpec("executor_contract_error", "executor_contract_error", "Executor contract error", "{{ value_json.executor_contract_error | default('none', true) }}", {"entity_category": "diagnostic"}),
     _timestamp("executor_last_checked_at", "executor_last_checked_at", "Executor last checked", "value_json.executor_last_checked_at"),
 ) + LIFECYCLE_CAPABILITY_SPECS + SNAPSHOT_ENTITY_SPECS
 
@@ -248,8 +257,8 @@ AGENT_SELF_ENTITY_SPECS = (
     EntitySpec("self_update_release_id", "self_update_release_id", "Self-update release ID", "{{ value_json.self_update_release_id | default('none', true) }}"),
     EntitySpec("self_update_release_version", "self_update_release_version", "Self-update release version", "{{ value_json.self_update_release_version | default('none', true) }}"),
     EntitySpec("self_update_release_fingerprint", "self_update_release_fingerprint", "Self-update release fingerprint", "{{ value_json.self_update_release_fingerprint | default('none', true) }}"),
-    EntitySpec("capability_approve", "capability_approve", "Capability approve", "{{ 'allowed' if value_json.operator_capabilities.approve else 'blocked' }}"),
-    EntitySpec("capability_reject", "capability_reject", "Capability reject", "{{ 'allowed' if value_json.operator_capabilities.reject else 'blocked' }}"),
+    _capability("approve"),
+    _capability("reject"),
     EntitySpec("job_stage", "job_stage", "Job stage", "{{ value_json.job_stage | default('idle') }}"),
     _numeric("job_progress", "job_progress", "Job progress", "value_json.job_progress", "%"),
     EntitySpec("active_job_id", "active_job_id", "Active job ID", "{{ value_json.active_job_id | default('none', true) }}"),

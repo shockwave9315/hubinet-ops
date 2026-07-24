@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-EXECUTOR_VERSION = "0.4.0"
+EXECUTOR_VERSION = "0.4.1"
 EXECUTOR_PROTOCOL_VERSION = 1
 REQUIRED_APT_ACTIONS = frozenset(
     {
@@ -36,7 +36,7 @@ JOB_OPERATION_TYPES = frozenset(
 SNAPSHOT_KINDS = frozenset({"pre-update", "manual"})
 SNAPSHOT_NAME_RE = re.compile(
     r"^hubinet-ops-(?P<vmid>[1-9][0-9]{1,5})-"
-    r"(?P<kind>pre-update|manual)-(?P<timestamp>[0-9]{8}T[0-9]{6}Z)$"
+    r"(?P<kind>pre-update|pre|manual|man)-(?P<timestamp>[0-9]{8}T[0-9]{6}Z)$"
 )
 SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
@@ -121,6 +121,10 @@ def parse_owned_snapshot_name(name: str, *, vmid: int | None = None) -> dict[str
     values = match.groupdict()
     if vmid is not None and int(values["vmid"]) != int(vmid):
         return None
+    values["kind"] = {
+        "pre": "pre-update",
+        "man": "manual",
+    }.get(values["kind"], values["kind"])
     return values
 
 

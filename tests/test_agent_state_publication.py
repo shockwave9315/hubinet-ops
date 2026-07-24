@@ -44,6 +44,8 @@ class InventoryExecutor:
         timeout: int | None = None,
         on_event: Any = None,
     ) -> dict[str, Any]:
+        if action == "capabilities":
+            return {"ok": True, "data": {}}
         assert action == "inspect"
         return {
             "ok": True,
