@@ -44,7 +44,6 @@ def test_production_inventory_is_exact_and_fail_closed() -> None:
 
 def test_inventory_services_and_docker_do_not_guess_unknown_names() -> None:
     resources = _resources()
-    assert resources[105].get("required_services", []) == []
     assert resources[108].get("required_services", []) == []
     assert resources[107]["required_services"] == [
         "postgresql@16-main.service",

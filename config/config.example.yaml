@@ -225,11 +225,11 @@ resources:
     operator_capabilities: *full_lxc_control
     executor_contract:
       executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
-      profile_sha256: 53c881c47e88f6c589df0341097f09ebb9b703ae662c15987175bb6c3d82de3a
+      profile_sha256: c1c0ee212c5318cac5be6d6a912baf33665a77d77efc0af0dfa66a443c59451a
     snapshot_retention: 5
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
-    required_services: []
+    required_services: [AdGuardHome.service]
     docker: {enabled: false, require_health: false, required: []}
     pre_update_snapshot: true
     automatic_rollback: false
