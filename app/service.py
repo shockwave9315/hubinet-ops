@@ -6,14 +6,22 @@ import logging
 import math
 import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
 
 import httpx
 
 from .config import Settings
+from .contracts import (
+    EXECUTOR_PROTOCOL_VERSION,
+    EXECUTOR_VERSION,
+    evaluate_executor_contract,
+    parse_owned_snapshot_name,
+)
 from .database import Database, utc_now
 from .executor import Executor, ExecutorError
+from .host_control import HostControlClient, HostControlError
 from .mqtt import MqttTelemetry, VERSION
 from .security import sanitize_data, sanitize_text
 from .stabilization import StabilizationPolicy, Stabilizer
@@ -46,6 +54,16 @@ TERMINAL_JOB_STATUSES = {
     "rolled_back",
     "success",
 }
+HOST_CONTROL_OPERATION_TYPES = {
+    "lifecycle_start",
+    "lifecycle_shutdown",
+    "lifecycle_reboot",
+    "lifecycle_force_stop",
+    "snapshot_create",
+    "snapshot_rollback",
+    "snapshot_delete",
+    "self_update",
+}
 
 
 class OpsService:
@@ -58,6 +76,7 @@ class OpsService:
         stabilizer: Stabilizer | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] | None = None,
+        host_control: HostControlClient | None = None,
     ):
         self.settings = settings
         self.db = db
@@ -73,6 +92,7 @@ class OpsService:
         self._agent_publish_context = threading.local()
         self._agent_publish_lock = threading.RLock()
         self.stabilizer = stabilizer or Stabilizer(executor, self._stop)
+        self.host_control = host_control
         self._scan_all_lock = threading.Lock()
         self._scan_locks = {vmid: threading.Lock() for vmid in settings.resources}
         self._recovery_lock = threading.RLock()
@@ -98,6 +118,8 @@ class OpsService:
         self.mqtt.set_state_provider(self._mqtt_snapshot)
 
     def start(self) -> None:
+        self._consume_offline_recovery_events()
+        self._reconcile_startup_jobs()
         self._ensure_initial_states()
         self.mqtt.start()
         self._worker.start()
@@ -152,6 +174,9 @@ class OpsService:
             "approval_mode": cfg.get("approval_mode", "always"),
             "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
             "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
+            "manual_snapshot_restore_allowed": bool(
+                cfg.get("manual_snapshot_restore_allowed", False)
+            ),
             "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
             "operator_capabilities": self._capabilities(vmid),
             "monitoring": self._monitoring(vmid),
@@ -459,23 +484,53 @@ class OpsService:
                 "A scan is running for this container; retry approval after it finishes"
             )
         try:
+            if self._plan_type(candidate) == "self_update":
+                return self._approve_self_update_plan(candidate)
             plan, job = self.db.approve_plan(plan_id)
-            state = self.get_state(vmid)
-            state.update(
-                {
-                    "active_plan_id": plan_id,
-                    "active_plan_status": "approved",
-                    "active_job_id": job["id"],
-                    "operation_status": "running",
-                    "job_stage": "preflight",
-                    "job_progress": 1,
-                    "last_operation_result": None,
-                    "last_error": None,
-                }
+            return self._publish_approved_plan(plan, job)
+        finally:
+            lock.release()
+
+    def approve_active(self, vmid: int, request_id: str | None = None) -> dict[str, Any]:
+        self._resource(vmid)
+        self._require_capability(vmid, "approve")
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan is active for this resource")
+        try:
+            if request_id:
+                existing = self.db.get_job_by_request_id(vmid, request_id)
+                if existing is not None:
+                    if (
+                        existing.get("plan_id")
+                        and existing.get("operation_type") in {"update", "self_update"}
+                    ):
+                        return {
+                            "plan": self.db.get_plan(str(existing["plan_id"])),
+                            "job": existing,
+                        }
+                    raise ValueError(
+                        "request_id was already used for another operation"
+                    )
+            plan = self._single_waiting_plan(vmid)
+            if self._plan_type(plan) == "self_update":
+                return self._approve_self_update_plan(plan, request_id)
+            self._require_compatible_executor(vmid)
+            scan = _executor_data(self.executor.run("scan", vmid, timeout=700))
+            pending = max(0, int(scan.get("pending_count", 0) or 0))
+            fingerprint = str(scan.get("fingerprint") or _fingerprint(scan))
+            if pending <= 0 or fingerprint != str(plan["fingerprint"]):
+                self.db.update_plan_status(plan["id"], "superseded")
+                raise ValueError(
+                    "Active plan fingerprint changed; run a new update scan before approval"
+                )
+            plan, job = self.db.approve_plan(
+                plan["id"],
+                request_id=request_id or uuid.uuid4().hex,
             )
-            self._save_state(vmid, state)
-            self._notify_ha(self._notification("job_queued", vmid))
-            return {"plan": plan, "job": job}
+            return self._publish_approved_plan(plan, job)
+        except ExecutorError as exc:
+            raise ValueError(str(exc)) from exc
         finally:
             lock.release()
 
@@ -497,6 +552,122 @@ class OpsService:
         )
         self._save_state(vmid, state)
         return {"plan": plan}
+
+    def reject_active(self, vmid: int) -> dict[str, Any]:
+        self._resource(vmid)
+        self._require_capability(vmid, "reject")
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan is active for this resource")
+        try:
+            if self.db.get_active_job(vmid) is not None:
+                raise ValueError("Another job is already active for this resource")
+            plan = self._single_waiting_plan(vmid)
+            if self._plan_type(plan) != "self_update":
+                self._require_compatible_executor(vmid)
+            return self.reject(plan["id"])
+        finally:
+            lock.release()
+
+    def _single_waiting_plan(self, vmid: int) -> dict[str, Any]:
+        plans = self.db.waiting_plans(vmid)
+        if not plans:
+            raise ValueError(f"Resource {vmid} has no active waiting plan")
+        if len(plans) != 1:
+            raise ValueError(f"Resource {vmid} has multiple active waiting plans")
+        return plans[0]
+
+    @staticmethod
+    def _plan_type(plan: dict[str, Any]) -> str:
+        payload = plan.get("payload")
+        if not isinstance(payload, dict):
+            return "update"
+        return str(payload.get("plan_type") or "update")
+
+    def _approve_self_update_plan(
+        self,
+        plan: dict[str, Any],
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        if int(plan["vmid"]) != 110 or self._plan_type(plan) != "self_update":
+            raise ValueError("Plan is not a CT110 self-update plan")
+        release = self._read_self_update_release(110)
+        payload = dict(plan.get("payload") or {})
+        if any(
+            str(release.get(key) or "") != str(payload.get(key) or "")
+            for key in ("fingerprint", "release_id", "version")
+        ):
+            self.db.update_plan_status(plan["id"], "superseded")
+            raise ValueError(
+                "Active self-update plan fingerprint changed; create and approve a new plan"
+            )
+        plan, job = self.db.approve_plan(
+            plan["id"],
+            request_id=request_id or uuid.uuid4().hex,
+            operation_type="self_update",
+        )
+        return self._publish_approved_plan(plan, job)
+
+    def _publish_approved_plan(
+        self,
+        plan: dict[str, Any],
+        job: dict[str, Any],
+    ) -> dict[str, Any]:
+        vmid = int(plan["vmid"])
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "active_plan_id": plan["id"],
+                "active_plan_status": "approved",
+                "active_job_id": job["id"],
+                "operation_type": job.get("operation_type", "update"),
+                "operation_status": "running",
+                "job_stage": (
+                    "preflight"
+                    if job.get("operation_type", "update") == "update"
+                    else "queued"
+                ),
+                "job_progress": 1,
+                "last_operation_result": None,
+                "last_error": None,
+            }
+        )
+        self._save_state(vmid, state)
+        self._notify_ha(self._notification("job_queued", vmid))
+        return {"plan": plan, "job": job}
+
+    def _require_compatible_executor(self, vmid: int) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        if cfg.get("adapter", "apt") != "apt":
+            raise ExecutorError(f"Resource {vmid} does not use a managed APT executor")
+        contract_cfg = cfg.get("executor_contract") or {}
+        try:
+            payload = _executor_data(self.executor.run("capabilities", vmid, timeout=60))
+        except ExecutorError as exc:
+            payload = {}
+            executor_error = str(exc)
+        else:
+            executor_error = None
+        compatibility = evaluate_executor_contract(
+            payload,
+            expected_executor_sha256=str(contract_cfg.get("executor_sha256") or ""),
+            expected_profile_sha256=str(contract_cfg.get("profile_sha256") or ""),
+        )
+        state = self.get_state(vmid)
+        state.update(compatibility.state_fields())
+        state["executor_last_checked_at"] = self._utc_second_timestamp()
+        self._save_state(vmid, state)
+        if not compatibility.compatible:
+            installed = compatibility.version or "unknown"
+            reasons = "; ".join(compatibility.reasons)
+            if executor_error:
+                reasons = f"{executor_error}; {reasons}".strip("; ")
+            raise ExecutorError(
+                f"Executor CT{vmid} is incompatible: required {EXECUTOR_VERSION}/"
+                f"protocol {EXECUTOR_PROTOCOL_VERSION}/verify with configured hashes; "
+                f"installed {installed}. {reasons}"
+            )
+        return payload
 
     def retry_healthcheck(self, vmid: int) -> dict[str, Any]:
         cfg = self._resource(vmid)
@@ -547,6 +718,49 @@ class OpsService:
         finally:
             lock.release()
 
+    def queue_retry_healthcheck(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_retry_healthcheck_locked(vmid, request_id)
+        finally:
+            lock.release()
+
+    def _queue_retry_healthcheck_locked(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, "retry_healthcheck")
+        self._require_compatible_executor(vmid)
+        resolved_request_id = request_id or uuid.uuid4().hex
+        existing = self.db.get_job_by_request_id(vmid, resolved_request_id)
+        if existing is not None:
+            if existing.get("operation_type") != "retry_healthcheck":
+                raise ValueError("request_id was already used for another operation")
+            return existing
+        latest = self.db.get_latest_job(vmid)
+        if latest is None:
+            raise ValueError("No job is available for retry")
+        if latest.get("status") not in {"failed", "blocked", "interrupted"}:
+            raise ValueError("Healthcheck retry is only allowed after a failed operation")
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"ct-{vmid}")),
+            operation_type="retry_healthcheck",
+            request_id=resolved_request_id,
+            plan_id=latest.get("plan_id"),
+            snapshot_name=latest.get("snapshot_name"),
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
     def manual_rollback(self, vmid: int) -> dict[str, Any]:
         cfg = self._resource(vmid)
         self._require_capability(vmid, "rollback")
@@ -554,6 +768,7 @@ class OpsService:
         if not lock.acquire(blocking=False):
             raise ValueError("Another scan or manual operation is active for this resource")
         try:
+            self._require_compatible_executor(vmid)
             if not bool(cfg.get("manual_rollback_allowed", False)):
                 raise ValueError("Manual rollback is not allowed by resource policy")
             if self.db.get_active_job(vmid) is not None:
@@ -569,6 +784,334 @@ class OpsService:
             return self.db.get_job(job["id"])
         finally:
             lock.release()
+
+    def queue_lifecycle(
+        self,
+        vmid: int,
+        action: str,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_lifecycle_locked(vmid, action, request_id)
+        finally:
+            lock.release()
+
+    def _queue_lifecycle_locked(
+        self,
+        vmid: int,
+        action: str,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        operation_type = {
+            "start": "lifecycle_start",
+            "shutdown": "lifecycle_shutdown",
+            "reboot": "lifecycle_reboot",
+            "force-stop": "lifecycle_force_stop",
+        }.get(action)
+        if operation_type is None:
+            raise ValueError("Unsupported lifecycle action")
+        capability = "force_stop" if action == "force-stop" else action
+        cfg = self._resource(vmid)
+        if cfg.get("resource_type") != "lxc":
+            raise ValueError("Lifecycle is supported only for LXC resources")
+        self._require_capability(vmid, capability)
+        if cfg.get("adapter") == "apt":
+            self._require_compatible_executor(vmid)
+        elif vmid != 110 or self.host_control is None:
+            raise ValueError("CT110 lifecycle requires independent PVE host control")
+        if self.db.find_active_plan(vmid) is not None and action != "start":
+            raise ValueError("Resolve the active update plan before lifecycle control")
+        status = self._host_status(vmid)
+        runtime = str(status.get("lxc_status") or status.get("runtime_status") or "unknown")
+        if action == "start" and runtime != "stopped":
+            raise ValueError(f"Start requires stopped runtime, got {runtime}")
+        if action != "start" and runtime != "running":
+            raise ValueError(f"{action} requires running runtime, got {runtime}")
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"ct-{vmid}")),
+            operation_type=operation_type,
+            request_id=request_id or uuid.uuid4().hex,
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
+    def list_snapshots(self, vmid: int) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        if cfg.get("resource_type") != "lxc":
+            raise ValueError("Snapshots are supported only for LXC resources")
+        self._require_capability(vmid, "snapshot_list")
+        if self.host_control is not None:
+            snapshots = self.host_control.list_snapshots(vmid)
+        elif cfg.get("adapter") == "apt":
+            snapshots = list(
+                _executor_data(self.executor.run("list-snapshots", vmid, timeout=60)).get(
+                    "snapshots", []
+                )
+            )
+        else:
+            raise ValueError("CT110 snapshots require independent PVE host control")
+        snapshots = [
+            dict(item) for item in snapshots
+            if isinstance(item, dict)
+        ]
+        snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        owned = [item for item in snapshots if item.get("owned_by_hubinet_ops") is True]
+        latest = owned[0] if owned else {}
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "snapshot_count": len(owned),
+                "latest_snapshot_name": latest.get("name"),
+                "latest_snapshot_at": latest.get("created_at"),
+                "latest_snapshot_kind": latest.get("kind"),
+            }
+        )
+        self._save_state(vmid, state)
+        return {"snapshots": snapshots, "latest": latest or None}
+
+    def queue_snapshot_create(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_snapshot_create_locked(vmid, request_id)
+        finally:
+            lock.release()
+
+    def _queue_snapshot_create_locked(
+        self,
+        vmid: int,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, "snapshot_create")
+        if cfg.get("adapter") == "apt":
+            self._require_compatible_executor(vmid)
+        elif vmid != 110 or self.host_control is None:
+            raise ValueError("CT110 snapshots require independent PVE host control")
+        stamp = self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+        name = f"hubinet-ops-{vmid}-manual-{stamp}"
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"ct-{vmid}")),
+            operation_type="snapshot_create",
+            request_id=request_id or uuid.uuid4().hex,
+            snapshot_name=name,
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
+    def queue_snapshot_action(
+        self,
+        vmid: int,
+        action: str,
+        name: str | None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._queue_snapshot_action_locked(vmid, action, name, request_id)
+        finally:
+            lock.release()
+
+    def _queue_snapshot_action_locked(
+        self,
+        vmid: int,
+        action: str,
+        name: str | None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        operation_type = {
+            "rollback": "snapshot_rollback",
+            "delete": "snapshot_delete",
+        }.get(action)
+        if operation_type is None:
+            raise ValueError("Unsupported snapshot action")
+        capability = "snapshot_rollback" if action == "rollback" else "snapshot_delete"
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, capability)
+        if action == "rollback" and not bool(
+            cfg.get("manual_snapshot_restore_allowed", False)
+        ):
+            raise ValueError("Explicit snapshot restore is not allowed by resource policy")
+        listing = self.list_snapshots(vmid)
+        snapshots = [item for item in listing["snapshots"] if item.get("owned_by_hubinet_ops")]
+        if name in {None, "latest"}:
+            eligible_key = "rollback_eligible" if action == "rollback" else "delete_eligible"
+            selected = next((item for item in snapshots if item.get(eligible_key)), None)
+        else:
+            selected = next((item for item in snapshots if item.get("name") == name), None)
+        if selected is None or parse_owned_snapshot_name(str(selected.get("name")), vmid=vmid) is None:
+            raise ValueError("Hubinet Ops snapshot does not exist")
+        if action == "rollback" and self.db.find_active_plan(vmid) is not None:
+            raise ValueError("Resolve the active update plan before snapshot restore")
+        if not bool(selected.get(f"{action}_eligible")):
+            raise ValueError(f"Snapshot is not {action} eligible")
+        if cfg.get("adapter") == "apt":
+            self._require_compatible_executor(vmid)
+        elif vmid != 110 or self.host_control is None:
+            raise ValueError("CT110 snapshots require independent PVE host control")
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"ct-{vmid}")),
+            operation_type=operation_type,
+            request_id=request_id or uuid.uuid4().hex,
+            snapshot_name=str(selected["name"]),
+            require_no_active_plan=action == "rollback",
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
+    def create_self_update_plan(self, vmid: int) -> dict[str, Any]:
+        lock = self._scan_locks[vmid]
+        if not lock.acquire(blocking=False):
+            raise ValueError("A scan or manual operation is active for this resource")
+        try:
+            return self._create_self_update_plan_locked(vmid)
+        finally:
+            lock.release()
+
+    def _create_self_update_plan_locked(self, vmid: int) -> dict[str, Any]:
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, "self_update")
+        if vmid != 110 or cfg.get("adapter") != "agent_self":
+            raise ValueError("Self-update is supported only for CT110")
+        if self.host_control is None:
+            raise ValueError("CT110 self-update requires independent PVE host control")
+        if self.db.get_active_job(vmid) is not None:
+            raise ValueError("Another job is already active for this resource")
+        release = self._read_self_update_release(vmid)
+        fingerprint = str(release["fingerprint"])
+        active = self.db.find_active_plan(vmid, fingerprint)
+        if active is not None:
+            if self._plan_type(active) != "self_update":
+                raise ValueError("Resolve the active plan before CT110 self-update")
+            if active.get("status") != "waiting_approval":
+                raise ValueError("Approved self-update plan is already pending execution")
+            status = "existing_plan"
+        else:
+            other = self.db.find_active_plan(vmid)
+            if other is not None:
+                raise ValueError("Resolve the active plan before CT110 self-update")
+            payload = {
+                "plan_type": "self_update",
+                "version": str(release["version"]),
+                "release_id": str(release["release_id"]),
+                "fingerprint": fingerprint,
+                "file_count": release.get("file_count"),
+                "total_bytes": release.get("total_bytes"),
+            }
+            active = self.db.create_plan(
+                vmid=vmid,
+                container_name=str(cfg.get("name", "hubinet-ops")),
+                fingerprint=fingerprint,
+                risk="high",
+                payload=payload,
+                ttl_minutes=int(
+                    self.settings.scheduler.get("approval_ttl_minutes", 1440)
+                ),
+            )
+            status = "plan_created"
+            self._notify_ha(
+                self._notification(
+                    "approval_required",
+                    vmid,
+                    release_id=payload["release_id"],
+                    release_version=payload["version"],
+                    risk="high",
+                )
+            )
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "risk": "high",
+                "active_plan_id": active["id"],
+                "active_plan_status": active["status"],
+                "operation_status": "waiting_approval",
+                "job_stage": "idle",
+                "job_progress": 0,
+                "self_update_release_id": release["release_id"],
+                "self_update_release_version": release["version"],
+                "self_update_release_fingerprint": fingerprint,
+            }
+        )
+        self._save_state(vmid, state)
+        return {
+            "vmid": vmid,
+            "status": status,
+            "plan": active,
+            "release": release,
+        }
+
+    def _read_self_update_release(self, vmid: int) -> dict[str, Any]:
+        if self.host_control is None:
+            raise ValueError("CT110 self-update requires independent PVE host control")
+        try:
+            release = self.host_control.inspect_self_update_release(vmid)
+        except HostControlError as exc:
+            raise ValueError(f"Cannot inspect staged self-update release: {exc}") from exc
+        required = ("version", "release_id", "fingerprint")
+        if not all(isinstance(release.get(key), str) and release[key] for key in required):
+            raise ValueError("Staged self-update release identity is invalid")
+        fingerprint = str(release["fingerprint"])
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint
+        ):
+            raise ValueError("Staged self-update release fingerprint is invalid")
+        return dict(release)
+
+    def _validate_self_update_plan(self, job: dict[str, Any]) -> dict[str, Any]:
+        if not job.get("plan_id"):
+            raise ValueError("Self-update job has no approved plan")
+        plan = self.db.get_plan(str(job["plan_id"]))
+        if plan.get("status") != "approved" or self._plan_type(plan) != "self_update":
+            raise ValueError(
+                f"Self-update plan status is {plan.get('status')}, not approved"
+            )
+        release = self._read_self_update_release(int(job["vmid"]))
+        payload = dict(plan.get("payload") or {})
+        if any(
+            str(release.get(key) or "") != str(payload.get(key) or "")
+            for key in ("fingerprint", "release_id", "version")
+        ):
+            self.db.update_plan_status(plan["id"], "superseded")
+            raise ValueError(
+                "Approved self-update release changed before rollout; no changes were made"
+            )
+        return release
+
+    def _mark_job_queued(self, vmid: int, job: dict[str, Any]) -> None:
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "active_job_id": job["id"],
+                "operation_type": job["operation_type"],
+                "operation_status": "running",
+                "job_stage": "queued",
+                "job_progress": 0,
+                "last_operation_result": None,
+                "last_error": None,
+            }
+        )
+        self._save_state(vmid, state)
+
+    def _host_status(self, vmid: int) -> dict[str, Any]:
+        try:
+            if self.host_control is not None:
+                return self.host_control.status(vmid)
+            return _executor_data(self.executor.run("status", vmid, timeout=30))
+        except (ExecutorError, HostControlError) as exc:
+            raise ValueError(f"Cannot read current LXC state: {exc}") from exc
 
     def lifecycle_container(self, vmid: int, action: str) -> dict[str, Any]:
         if action not in {"start", "shutdown", "reboot"}:
@@ -958,12 +1501,143 @@ class OpsService:
         except Exception:
             LOGGER.exception("Failed to persist terminal state for job %s", job.get("id"))
 
+    def _reconcile_startup_jobs(self) -> None:
+        for job in self.db.active_jobs():
+            operation_type = str(job.get("operation_type") or "update")
+            if (
+                self.host_control is not None
+                and operation_type in HOST_CONTROL_OPERATION_TYPES
+            ):
+                self._reattach_host_control_job(job)
+                continue
+            succeeded = False
+            result: dict[str, Any] | None = None
+            try:
+                if operation_type in {
+                    "lifecycle_start", "lifecycle_shutdown", "lifecycle_force_stop"
+                }:
+                    status = self._host_status(int(job["vmid"]))
+                    actual = str(status.get("lxc_status") or status.get("runtime_status"))
+                    expected = "running" if operation_type == "lifecycle_start" else "stopped"
+                    succeeded = actual == expected
+                    result = {"runtime_status": actual, "reconciled": True}
+                elif operation_type in {"snapshot_create", "snapshot_delete"}:
+                    listing = self.list_snapshots(int(job["vmid"]))
+                    exists = any(
+                        item.get("name") == job.get("snapshot_name")
+                        for item in listing["snapshots"]
+                    )
+                    succeeded = exists if operation_type == "snapshot_create" else not exists
+                    result = {"snapshot_exists": exists, "reconciled": True}
+            except Exception as exc:
+                LOGGER.warning("Startup reconciliation failed for job %s: %s", job["id"], exc)
+            if succeeded:
+                self.db.update_job(job["id"], result=result or {})
+                self._terminal(job, "success", "success", None)
+            else:
+                self._terminal(
+                    job,
+                    "interrupted",
+                    "failed",
+                    "Agent restarted during the operation; it was not replayed",
+                )
+
+    def _consume_offline_recovery_events(self) -> None:
+        if self.host_control is None:
+            return
+        try:
+            events = self.host_control.list_recovery_events()
+        except HostControlError as exc:
+            LOGGER.error(
+                "Read-only offline recovery event lookup blocks startup: %s",
+                exc,
+            )
+            raise
+        for event in events:
+            if str(event.get("status") or "") not in {
+                "succeeded",
+                "failed",
+                "interrupted",
+            }:
+                continue
+            recovery_id = str(event.get("recovery_id") or "")
+            try:
+                persisted, created = self.db.apply_recovery_event(event)
+                if created:
+                    LOGGER.warning(
+                        "Applied offline recovery event recovery_id=%s vmid=%s "
+                        "operation=%s status=%s",
+                        recovery_id,
+                        persisted["vmid"],
+                        persisted["operation_type"],
+                        persisted["status"],
+                    )
+                self.host_control.acknowledge_recovery_event(recovery_id)
+            except HostControlError as exc:
+                LOGGER.warning(
+                    "Offline recovery event remains unacknowledged recovery_id=%s: %s",
+                    recovery_id,
+                    exc,
+                )
+            except ValueError:
+                LOGGER.exception(
+                    "Invalid offline recovery event blocks startup recovery_id=%s",
+                    recovery_id,
+                )
+                raise
+
+    def _reattach_host_control_job(self, job: dict[str, Any]) -> None:
+        operation_type = str(job["operation_type"])
+        snapshot_name = (
+            str(job["snapshot_name"])
+            if operation_type.startswith("snapshot_") and job.get("snapshot_name")
+            else None
+        )
+        release_fingerprint: str | None = None
+        try:
+            if operation_type == "self_update":
+                release = self._approved_self_update_release(job)
+                release_fingerprint = str(release["fingerprint"])
+            result = self.host_control.wait_existing_job(
+                operation_type,
+                int(job["vmid"]),
+                str(job["request_id"]),
+                snapshot_name=snapshot_name,
+                release_fingerprint=release_fingerprint,
+            )
+            self._finalize_operation_success(
+                job,
+                result,
+                enforce_snapshot_retention=False,
+            )
+        except (HostControlError, ValueError) as exc:
+            LOGGER.warning(
+                "Read-only host job reattachment failed for local job %s: %s",
+                job["id"],
+                exc,
+            )
+            if isinstance(exc, HostControlError) and exc.status == "failed":
+                self._finalize_operation_failure(job, exc)
+                return
+            self._finalize_operation_failure(
+                job,
+                exc,
+                job_status="interrupted",
+                terminal_result="interrupted",
+            )
+
     def _run_job(self, job: dict[str, Any]) -> None:
+        if str(job.get("operation_type") or "update") != "update":
+            self._run_operation_job(job)
+            return
         vmid = int(job["vmid"])
         cfg = self._resource(vmid)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         auto_rollback = bool(cfg.get("automatic_rollback", False))
-        snapshot = f"ops-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{job['id'][:6]}"
+        snapshot = (
+            f"hubinet-ops-{vmid}-pre-update-"
+            f"{self._now().astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        )
         emit = self._emitter(job)
         emit(
             stage="preflight",
@@ -972,6 +1646,20 @@ class OpsService:
             message="Update job started",
         )
         try:
+            executor_contract = self._require_compatible_executor(vmid)
+            if (
+                auto_rollback
+                and executor_contract.get("profile_validation_status")
+                == "insufficient_health_contract"
+            ):
+                auto_rollback = False
+                emit(
+                    stage="preflight",
+                    progress=6,
+                    level="warning",
+                    event_type="automatic_rollback_disabled",
+                    message="Automatic rollback disabled: profile health contract is insufficient",
+                )
             preflight = self._execute("preflight", vmid, 700, emit)
             self._validate_approved_plan(job, preflight)
             preflight_updates = dict(_executor_data(preflight).get("updates") or {})
@@ -999,6 +1687,7 @@ class OpsService:
                     message="Creating rollback snapshot",
                 )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
+                self._enforce_snapshot_retention(vmid, job)
                 emit(
                     stage="snapshot",
                     progress=25,
@@ -1211,6 +1900,253 @@ class OpsService:
                     )
                 )
 
+    def _run_operation_job(self, job: dict[str, Any]) -> None:
+        vmid = int(job["vmid"])
+        operation_type = str(job["operation_type"])
+        emit = self._emitter(job)
+        stage = {
+            "lifecycle_start": "starting",
+            "lifecycle_shutdown": "shutting_down",
+            "lifecycle_reboot": "rebooting",
+            "lifecycle_force_stop": "force_stopping",
+            "snapshot_create": "snapshot_creating",
+            "snapshot_rollback": "snapshot_rollback",
+            "snapshot_delete": "snapshot_deleting",
+            "retry_healthcheck": "healthcheck",
+            "self_update": "self_updating",
+        }.get(operation_type, "executing")
+        emit(
+            stage=stage,
+            progress=5,
+            event_type="operation_started",
+            message=f"Operation {operation_type} started",
+        )
+        try:
+            if operation_type == "retry_healthcheck":
+                result = self._execute_retry_healthcheck(job, emit)
+            else:
+                result = self._execute_host_operation(job)
+            self._finalize_operation_success(job, result)
+        except (ExecutorError, HostControlError, ValueError) as exc:
+            if isinstance(exc, HostControlError) and exc.status in {
+                "interrupted",
+                "not_found",
+                "unavailable",
+            }:
+                self._finalize_operation_failure(
+                    job,
+                    exc,
+                    job_status="interrupted",
+                    terminal_result="interrupted",
+                )
+            else:
+                self._finalize_operation_failure(job, exc)
+
+    def _finalize_operation_success(
+        self,
+        job: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        enforce_snapshot_retention: bool = True,
+    ) -> None:
+        vmid = int(job["vmid"])
+        operation_type = str(job["operation_type"])
+        if operation_type == "snapshot_create" and enforce_snapshot_retention:
+            self._enforce_snapshot_retention(vmid, job)
+        self.db.update_job(job["id"], result=result)
+        state = self.get_state(vmid)
+        if operation_type.startswith("lifecycle_"):
+            runtime = str(
+                result.get("lxc_status")
+                or result.get("runtime_status")
+                or "unknown"
+            )
+            state.update(
+                {
+                    "lxc_status": runtime,
+                    "runtime_status": runtime,
+                    "lifecycle_action": operation_type.removeprefix("lifecycle_"),
+                    "lifecycle_status": "success",
+                    "lifecycle_finished_at": self._utc_second_timestamp(),
+                    "lifecycle_error": None,
+                }
+            )
+        if operation_type.startswith("snapshot_"):
+            state["snapshot_operation_status"] = "success"
+            if operation_type == "snapshot_rollback":
+                state.update(
+                    {
+                        "verification_status": "unknown",
+                        "last_verification": None,
+                        "apt_check_ok": None,
+                        "dpkg_audit_ok": None,
+                        "packages_remaining_count": None,
+                        "pending_updates": None,
+                        "update_status": "unknown",
+                        "updates": {"pending_count": None, "packages": []},
+                    }
+                )
+            self._save_state(vmid, state)
+            try:
+                self.list_snapshots(vmid)
+            except (ExecutorError, HostControlError, ValueError) as exc:
+                LOGGER.warning(
+                    "Read-only snapshot refresh failed after completed job %s: %s",
+                    job["id"],
+                    exc,
+                )
+        elif operation_type == "retry_healthcheck":
+            state.update(result)
+            state["health_status"] = result.get(
+                "health_status", result.get("health", "healthy")
+            )
+            state["last_refresh"] = self._utc_second_timestamp()
+            self._save_state(vmid, state)
+        else:
+            self._save_state(vmid, state)
+        self._terminal(job, "success", "success", None)
+
+    def _finalize_operation_failure(
+        self,
+        job: dict[str, Any],
+        error: ExecutorError | HostControlError | ValueError,
+        *,
+        job_status: str = "failed",
+        terminal_result: str = "failed",
+    ) -> None:
+        vmid = int(job["vmid"])
+        operation_type = str(job["operation_type"])
+        if isinstance(error, HostControlError) and error.result:
+            self.db.update_job(job["id"], result=error.result)
+        state = self.get_state(vmid)
+        if operation_type == "retry_healthcheck" and isinstance(error, ExecutorError):
+            if error.data:
+                state.update(error.data)
+                state["health_status"] = error.data.get(
+                    "health_status", error.data.get("health", "critical")
+                )
+        if operation_type.startswith("lifecycle_"):
+            state.update(
+                {
+                    "lifecycle_status": (
+                        "unknown" if job_status == "interrupted" else "failed"
+                    ),
+                    "lifecycle_finished_at": self._utc_second_timestamp(),
+                    "lifecycle_error": sanitize_text(error, limit=2000),
+                }
+            )
+        if operation_type.startswith("snapshot_"):
+            state["snapshot_operation_status"] = (
+                "unknown" if job_status == "interrupted" else "failed"
+            )
+        self._save_state(vmid, state)
+        self._terminal(job, job_status, terminal_result, str(error))
+
+    def _execute_retry_healthcheck(
+        self,
+        job: dict[str, Any],
+        emit: Callable[..., None],
+    ) -> dict[str, Any]:
+        cfg = self._resource(int(job["vmid"]))
+        policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
+        return self.stabilizer.wait(
+            vmid=int(job["vmid"]),
+            phase="update",
+            timeout_seconds=policy.repair_timeout_seconds,
+            policy=policy,
+            emit=emit,
+            initial_grace=False,
+        )
+
+    def _execute_host_operation(self, job: dict[str, Any]) -> dict[str, Any]:
+        operation_type = str(job["operation_type"])
+        vmid = int(job["vmid"])
+        snapshot_name = job.get("snapshot_name")
+        if self.host_control is not None:
+            if operation_type == "self_update":
+                release = self._validate_self_update_plan(job)
+                return self.host_control.execute(
+                    operation_type,
+                    vmid,
+                    str(job["request_id"]),
+                    release_fingerprint=str(release["fingerprint"]),
+                )
+            return self.host_control.execute(
+                operation_type,
+                vmid,
+                str(job["request_id"]),
+                snapshot_name=str(snapshot_name) if snapshot_name else None,
+            )
+        cfg = self._resource(vmid)
+        if cfg.get("adapter") != "apt":
+            raise ValueError("Independent PVE host control is required")
+        action = {
+            "lifecycle_start": "start",
+            "lifecycle_shutdown": "shutdown",
+            "lifecycle_reboot": "reboot",
+            "lifecycle_force_stop": "force-stop",
+            "snapshot_create": "snapshot-create",
+            "snapshot_rollback": "snapshot-rollback",
+            "snapshot_delete": "snapshot-delete",
+        }.get(operation_type)
+        if action is None:
+            raise ValueError("Operation requires independent PVE host control")
+        return _executor_data(
+            self.executor.run(
+                action,
+                vmid,
+                str(snapshot_name) if snapshot_name else None,
+                timeout=1800,
+            )
+        )
+
+    def _approved_self_update_release(self, job: dict[str, Any]) -> dict[str, Any]:
+        if not job.get("plan_id"):
+            raise ValueError("Self-update job has no approved plan")
+        plan = self.db.get_plan(str(job["plan_id"]))
+        if plan.get("status") != "approved" or self._plan_type(plan) != "self_update":
+            raise ValueError(
+                f"Self-update plan status is {plan.get('status')}, not approved"
+            )
+        payload = dict(plan.get("payload") or {})
+        fingerprint = str(payload.get("fingerprint") or "")
+        if len(fingerprint) != 64:
+            raise ValueError("Approved self-update plan has an invalid fingerprint")
+        return payload
+
+    def _raw_snapshot_list(self, vmid: int) -> list[dict[str, Any]]:
+        if self.host_control is not None:
+            return self.host_control.list_snapshots(vmid)
+        return list(
+            _executor_data(self.executor.run("list-snapshots", vmid, timeout=60)).get(
+                "snapshots", []
+            )
+        )
+
+    def _enforce_snapshot_retention(self, vmid: int, job: dict[str, Any]) -> None:
+        retention = max(1, int(self._resource(vmid).get("snapshot_retention", 5)))
+        snapshots = [
+            dict(item)
+            for item in self._raw_snapshot_list(vmid)
+            if isinstance(item, dict) and item.get("owned_by_hubinet_ops") is True
+        ]
+        snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        protected = self.db.rollback_source_snapshots(vmid)
+        protected.add(str(job.get("snapshot_name") or ""))
+        for index, snapshot in enumerate(snapshots[retention:], start=retention):
+            name = str(snapshot.get("name") or "")
+            if not name or name in protected or not snapshot.get("delete_eligible"):
+                continue
+            if self.host_control is not None:
+                self.host_control.execute(
+                    "snapshot_delete",
+                    vmid,
+                    f"retention-{str(job['id'])[:32]}-{index}",
+                    snapshot_name=name,
+                )
+            else:
+                self.executor.run("snapshot-delete", vmid, name, timeout=300)
+
     def _validate_approved_plan(
         self,
         job: dict[str, Any],
@@ -1376,6 +2312,14 @@ class OpsService:
                     "snapshot_name": snapshot,
                     "last_error": cause,
                     "active_job_id": job["id"],
+                    "verification_status": "unknown",
+                    "last_verification": None,
+                    "apt_check_ok": None,
+                    "dpkg_audit_ok": None,
+                    "packages_remaining_count": None,
+                    "pending_updates": None,
+                    "update_status": "unknown",
+                    "updates": {"pending_count": None, "packages": []},
                 }
             )
             self._save_state(vmid, state)
@@ -1414,11 +2358,18 @@ class OpsService:
             "rolled_back": "rolled_back",
             "manual_intervention": "manual_intervention",
             "failed": "failed",
+            "interrupted": "unknown",
         }[result]
         event = self.db.insert_job_event(
             job_id=job["id"],
             vmid=int(job["vmid"]),
-            level="error" if result in {"failed", "manual_intervention"} else "info",
+            level=(
+                "error"
+                if result in {"failed", "manual_intervention"}
+                else "warning"
+                if result == "interrupted"
+                else "info"
+            ),
             stage="completed" if result in {"success", "rolled_back"} else "failed",
             progress=100,
             event_type=f"job_{result}",
@@ -1432,13 +2383,16 @@ class OpsService:
             progress=100,
             error=error,
         )
-        plan = self.db.get_plan(job["plan_id"])
-        plan_status = str(plan["status"])
+        plan_status: str | None = None
+        if job.get("plan_id"):
+            plan = self.db.get_plan(job["plan_id"])
+            plan_status = str(plan["status"])
         if plan_status == "approved":
             plan_status = {
                 "success": "completed",
                 "rolled_back": "rolled_back",
                 "blocked": "blocked",
+                "interrupted": "interrupted",
             }.get(job_status, "failed")
             self.db.update_plan_status(job["plan_id"], plan_status)
         state = self.get_state(int(job["vmid"]))
@@ -1446,9 +2400,9 @@ class OpsService:
         suppress_recovery = result in {"success", "rolled_back"}
         state.update(
             {
-                "active_plan_id": None,
-                "active_plan_status": plan_status,
-                "active_job_id": job["id"],
+                "active_job_id": None,
+                "last_job_id": job["id"],
+                "operation_type": job.get("operation_type", "update"),
                 "operation_status": operation,
                 "job_stage": event["stage"],
                 "job_progress": 100,
@@ -1468,6 +2422,9 @@ class OpsService:
                 ),
             }
         )
+        if job.get("plan_id"):
+            state["active_plan_id"] = None
+            state["active_plan_status"] = plan_status
         self._save_state(int(job["vmid"]), state)
         self.mqtt.publish_event(int(job["vmid"]), event)
         self.mqtt.publish_job(
@@ -1624,6 +2581,9 @@ class OpsService:
                 "rollback_allowed": bool(
                     cfg.get("manual_rollback_allowed", False)
                 ) and self._capabilities(vmid)["rollback"],
+                "snapshot_restore_allowed": bool(
+                    cfg.get("manual_snapshot_restore_allowed", False)
+                ) and self._capabilities(vmid)["snapshot_rollback"],
                 "operator_capabilities": self._capabilities(vmid),
                 "monitoring": self._monitoring(vmid),
                 "recovery_scan_enabled": bool(
@@ -1636,6 +2596,7 @@ class OpsService:
             state.update(
                 {
                     "active_job_id": active_job["id"],
+                    "operation_type": active_job.get("operation_type", "update"),
                     "operation_status": "running",
                     "job_stage": active_job["stage"],
                     "job_progress": active_job.get("progress", 0),
@@ -1666,6 +2627,9 @@ class OpsService:
                 "pending_updates": 0 if apt else None,
                 "updates": {"pending_count": 0 if apt else None, "packages": []},
                 "operator_capabilities": self._capabilities(vmid),
+                "snapshot_restore_allowed": bool(
+                    cfg.get("manual_snapshot_restore_allowed", False)
+                ) and self._capabilities(vmid)["snapshot_rollback"],
                 "monitoring": self._monitoring(vmid),
                 "lifecycle_status": "idle",
                 "verification_status": "unknown",
@@ -1719,7 +2683,8 @@ class OpsService:
                 if latest and latest.get("status") == "interrupted":
                     state.update(
                         {
-                            "active_job_id": latest["id"],
+                            "active_job_id": None,
+                            "last_job_id": latest["id"],
                             "operation_status": "failed",
                             "job_stage": "failed",
                             "job_progress": 100,
@@ -1891,6 +2856,12 @@ class OpsService:
             "start",
             "shutdown",
             "reboot",
+            "force_stop",
+            "snapshot_create",
+            "snapshot_list",
+            "snapshot_rollback",
+            "snapshot_delete",
+            "self_update",
         )
         return {
             name: bool(configured.get(name, False))

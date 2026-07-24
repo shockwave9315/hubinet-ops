@@ -5,7 +5,7 @@ from typing import Any
 
 HEALTH_STATUSES = {"healthy", "degraded", "critical", "unknown", "offline"}
 UPDATE_STATUSES = {"unknown", "scanning", "up_to_date", "update_available"}
-LIFECYCLE_STATUSES = {"idle", "running", "success", "failed"}
+LIFECYCLE_STATUSES = {"idle", "running", "success", "failed", "unknown"}
 VERIFICATION_STATUSES = {"unknown", "running", "passed", "warning", "failed"}
 RECOVERY_SCAN_STATUSES = {"disabled", "idle", "scheduled", "running", "completed", "blocked", "cancelled", "failed"}
 OPERATION_STATUSES = {
@@ -16,9 +16,11 @@ OPERATION_STATUSES = {
     "failed",
     "rolled_back",
     "manual_intervention",
+    "unknown",
 }
 JOB_STAGES = {
     "idle",
+    "queued",
     "scanning",
     "preflight",
     "snapshot",
@@ -29,6 +31,12 @@ JOB_STAGES = {
     "starting",
     "shutting_down",
     "rebooting",
+    "force_stopping",
+    "snapshot_creating",
+    "snapshot_rollback",
+    "snapshot_deleting",
+    "self_updating",
+    "executing",
     "repair",
     "rollback",
     "rollback_wait",
@@ -36,7 +44,14 @@ JOB_STAGES = {
     "completed",
     "failed",
 }
-OPERATION_RESULTS = {None, "success", "failed", "rolled_back", "manual_intervention"}
+OPERATION_RESULTS = {
+    None,
+    "success",
+    "failed",
+    "interrupted",
+    "rolled_back",
+    "manual_intervention",
+}
 
 
 def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
@@ -129,11 +144,22 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("risk", "none")
     state.setdefault("active_plan_id", None)
     state.setdefault("active_plan_status", None)
+    state.setdefault("self_update_release_id", None)
+    state.setdefault("self_update_release_version", None)
+    state.setdefault("self_update_release_fingerprint", None)
     state.setdefault("active_job_id", None)
+    state.setdefault("last_job_id", None)
+    state.setdefault("operation_type", None)
     state.setdefault("last_scan", None)
     state.setdefault("last_refresh", None)
     state.setdefault("last_update", None)
     state.setdefault("last_error", None)
+    state.setdefault("last_offline_recovery_id", None)
+    state.setdefault("last_offline_recovery_snapshot", None)
+    state.setdefault("last_offline_recovery_at", None)
+    state.setdefault("last_offline_recovery_status", None)
+    state.setdefault("last_offline_recovery_error", None)
+    state.setdefault("last_offline_recovery_mutation_started_at", None)
     state["hostname"] = str(state.get("hostname") or "")[:255]
     state["os"] = str(state.get("os") or "")[:255]
     state["uptime_seconds"] = max(0, _safe_int(state.get("uptime_seconds"), 0))
@@ -228,6 +254,32 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("last_terminal_event", None)
     state.setdefault("last_terminal_at", None)
     state.setdefault("recovery_notification_suppressed_until", None)
+    state.setdefault("executor_version", None)
+    state.setdefault("executor_protocol_version", None)
+    state["executor_compatible"] = state.get("executor_compatible") is True
+    state.setdefault("executor_sha256", None)
+    state.setdefault("executor_profile_sha256", None)
+    missing_actions = state.get("executor_missing_actions")
+    state["executor_missing_actions"] = (
+        [str(action)[:64] for action in missing_actions[:32]]
+        if isinstance(missing_actions, list)
+        else []
+    )
+    state.setdefault("executor_last_checked_at", None)
+    state["snapshot_count"] = max(0, _safe_int(state.get("snapshot_count"), 0))
+    state.setdefault("latest_snapshot_name", None)
+    state.setdefault("latest_snapshot_at", None)
+    state.setdefault("latest_snapshot_kind", None)
+    state["snapshot_restore_allowed"] = bool(
+        state.get("snapshot_restore_allowed", False)
+    )
+    snapshot_operation = str(state.get("snapshot_operation_status") or "idle")
+    state["snapshot_operation_status"] = (
+        snapshot_operation
+        if snapshot_operation in {"idle", "running", "success", "failed", "unknown"}
+        else "idle"
+    )
+    state.setdefault("profile_validation_status", "unknown")
     recent = state.get("recent_job_events")
     state["recent_job_events"] = list(recent)[-50:] if isinstance(recent, list) else []
     if not isinstance(state.get("last_job_event"), (dict, type(None))):

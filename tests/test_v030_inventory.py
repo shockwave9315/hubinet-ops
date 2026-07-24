@@ -27,20 +27,19 @@ def test_production_inventory_is_exact_and_fail_closed() -> None:
     assert resources[100]["adapter"] == "haos"
     assert resources[100]["guest_agent"] is True
     assert resources[110]["adapter"] == "agent_self"
-    assert resources[106]["manual_rollback_allowed"] is False
-    assert resources[106]["operator_capabilities"] == {
-        "refresh": True,
-        "scan": True,
-        "approve": True,
-        "reject": True,
-        "retry_healthcheck": True,
-        "rollback": False,
-        "start": True,
-        "shutdown": True,
-        "reboot": True,
-    }
-    for vmid in (100, 101, 102, 103, 104, 105, 107, 108, 109, 110):
-        assert not any(resources[vmid]["operator_capabilities"].values())
+    assert resources[106]["manual_rollback_allowed"] is True
+    assert not any(resources[100]["operator_capabilities"].values())
+    for vmid in range(101, 110):
+        capabilities = resources[vmid]["operator_capabilities"]
+        assert all(value for name, value in capabilities.items() if name != "self_update")
+        assert capabilities["self_update"] is False
+        assert resources[vmid]["manual_rollback_allowed"] is True
+    ct110 = resources[110]["operator_capabilities"]
+    assert ct110["start"] is True
+    assert ct110["snapshot_create"] is True
+    assert ct110["self_update"] is True
+    assert ct110["approve"] is True
+    assert ct110["reject"] is True
 
 
 def test_inventory_services_and_docker_do_not_guess_unknown_names() -> None:
@@ -69,25 +68,23 @@ def test_pve_allowlists_and_type_map_are_exact() -> None:
 
     assert observation == [str(vmid) for vmid in range(100, 111)]
     assert managed == [str(vmid) for vmid in range(101, 110)]
-    assert maintenance == ["106"]
-    assert lifecycle == ["106"]
+    assert maintenance == [str(vmid) for vmid in range(101, 110)]
+    assert lifecycle == [str(vmid) for vmid in range(101, 111)]
     assert mappings == ["100 qemu"] + [f"{vmid} lxc" for vmid in range(101, 111)]
     assert len({line.split()[0] for line in mappings}) == len(mappings)
 
 
 def test_wrapper_routes_fixed_qemu_reads_and_blocks_managed_qemu_actions() -> None:
-    text = WRAPPER.read_text(encoding="utf-8")
-    assert 'qm status "$vmid"' in text
-    assert 'qm guest cmd "$vmid" network-get-interfaces' in text
-    assert 'readlink -f -- "$PVE_LOCAL_PATH"' in text
-    assert 'pvesh get "/nodes/$pve_node/qemu/$vmid/status/current"' in text
-    assert "$(hostname)" not in text
-    assert "hostname -s" not in text
-    assert "hostname -f" not in text
-    assert '[[ "$resource_type" == "lxc" ]] || fail "Managed action is supported only for LXC"' in text
-    assert 'listed "$vmid" "$MAINTENANCE_ALLOWLIST"' in text
-    assert "VMID must have exactly one resource type" in text
-    assert "eval " not in text
+    wrapper = WRAPPER.read_text(encoding="utf-8")
+    text = (ROOT / "deploy/pve/hubinet_ops_host_control.py").read_text(encoding="utf-8")
+    assert '"qm", "status", str(vmid)' in text
+    assert '"/cluster/resources", "--type", "vm"' in text
+    assert 'f"/nodes/{node}/qemu/{vmid}/status/current"' in text
+    assert "$(hostname)" not in wrapper + text
+    assert "HostPolicy" in text
+    assert "VMID not managed-executor allowed" in text
+    assert "shell=False" in text
+    assert "eval " not in wrapper + text
     assert "pct enter" not in text
     assert "pct console" not in text
 

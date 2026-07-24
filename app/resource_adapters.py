@@ -14,6 +14,7 @@ from .security import sanitize_text
 LOGGER = logging.getLogger("hubinet_ops.adapters")
 
 APT_ACTIONS = {
+    "capabilities",
     "status",
     "inspect",
     "scan",
@@ -28,6 +29,11 @@ APT_ACTIONS = {
     "start",
     "shutdown",
     "reboot",
+    "force-stop",
+    "list-snapshots",
+    "snapshot-create",
+    "snapshot-rollback",
+    "snapshot-delete",
 }
 READ_ONLY_ACTIONS = {"status", "inspect"}
 

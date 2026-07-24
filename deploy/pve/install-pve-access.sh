@@ -16,24 +16,29 @@ shift
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENT_IP="${HUBINET_OPS_AGENT_IP:-}"
 
-[[ -f "$SOURCE_DIR/lifecycle-vmids" ]] || {
-  echo "Brak lifecycle-vmids w pakiecie instalacyjnym" >&2
-  exit 1
-}
-for required in observation-vmids managed-vmids maintenance-vmids resource-types; do
+for required in observation-vmids managed-vmids maintenance-vmids lifecycle-vmids \
+  host-control-vmids snapshot-create-vmids snapshot-restore-vmids \
+  snapshot-delete-vmids resource-types hubinet_ops_host_control.py; do
   [[ -f "$SOURCE_DIR/$required" ]] || {
     echo "Missing $required in the installation package" >&2
     exit 1
   }
 done
-[[ "$(sed '/^[[:space:]]*$/d' "$SOURCE_DIR/lifecycle-vmids")" == "106" ]] || {
-  echo "Lista lifecycle wydania 0.2.4 musi zawierać wyłącznie CT106" >&2
+cmp -s "$SOURCE_DIR/managed-vmids" "$SOURCE_DIR/maintenance-vmids" || {
+  echo "Managed and maintenance allowlists must match for 0.4.0" >&2
   exit 1
 }
-[[ "$(sed '/^[[:space:]]*$/d' "$SOURCE_DIR/maintenance-vmids")" == "106" ]] || {
-  echo "Maintenance allowlist for 0.3.0 must contain only CT106" >&2
+cmp -s "$SOURCE_DIR/lifecycle-vmids" "$SOURCE_DIR/host-control-vmids" || {
+  echo "Lifecycle and host-control allowlists must match for 0.4.0" >&2
   exit 1
 }
+for policy in snapshot-create-vmids snapshot-restore-vmids snapshot-delete-vmids; do
+  cmp -s "$SOURCE_DIR/host-control-vmids" "$SOURCE_DIR/$policy" || {
+    echo "$policy must match host-control-vmids for 0.4.0" >&2
+    exit 1
+  }
+done
+python3 -m py_compile "$SOURCE_DIR/hubinet_ops_host_control.py"
 
 [[ "$PUBLIC_KEY" != *$'\n'* && "$PUBLIC_KEY" != *$'\r'* ]] || {
   echo "Klucz publiczny nie może zawierać nowych linii" >&2
@@ -69,6 +74,8 @@ fi
 
 install -d -m 0700 /root/.ssh
 install -d -m 0750 /etc/hubinet-ops
+install -d -m 0755 /usr/local/lib/hubinet-ops
+install -m 0755 "$SOURCE_DIR/hubinet_ops_host_control.py" /usr/local/lib/hubinet-ops/hubinet_ops_host_control.py
 install -m 0755 "$SOURCE_DIR/hubinet-ops-host" /usr/local/sbin/hubinet-ops-host
 # Deprecated rollback copy for 0.2.x; the wrapper uses observation-vmids.
 install -m 0640 "$TMP_ALLOWLIST" /etc/hubinet-ops/allowed-vmids
@@ -76,6 +83,10 @@ install -m 0640 "$SOURCE_DIR/observation-vmids" /etc/hubinet-ops/observation-vmi
 install -m 0640 "$SOURCE_DIR/managed-vmids" /etc/hubinet-ops/managed-vmids
 install -m 0640 "$SOURCE_DIR/maintenance-vmids" /etc/hubinet-ops/maintenance-vmids
 install -m 0640 "$SOURCE_DIR/lifecycle-vmids" /etc/hubinet-ops/lifecycle-vmids
+install -m 0640 "$SOURCE_DIR/host-control-vmids" /etc/hubinet-ops/host-control-vmids
+install -m 0640 "$SOURCE_DIR/snapshot-create-vmids" /etc/hubinet-ops/snapshot-create-vmids
+install -m 0640 "$SOURCE_DIR/snapshot-restore-vmids" /etc/hubinet-ops/snapshot-restore-vmids
+install -m 0640 "$SOURCE_DIR/snapshot-delete-vmids" /etc/hubinet-ops/snapshot-delete-vmids
 install -m 0640 "$SOURCE_DIR/resource-types" /etc/hubinet-ops/resource-types
 
 AUTHORIZED_KEYS=/root/.ssh/authorized_keys

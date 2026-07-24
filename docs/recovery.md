@@ -6,10 +6,21 @@
 2. Read `GET /api/v1/jobs/<job_id>/events?limit=200` with the bearer token.
 3. Check whether the latest events show initial grace, Docker unavailable, container counts, repair, rollback wait, or rollback timeout.
 4. Use the dashboard `Refresh` action. It performs inspect only and cannot approve or update.
-5. Use `Retry healthcheck` only after services have had time to recover. The retry receives a new follow-up job/event history.
-6. Use dashboard rollback only when the backend publishes `rollback_allowed=allowed`; the backend still rechecks policy, failed state, and snapshot presence.
+5. Use `Retry healthcheck` only after services have had time to recover. It creates an idempotent durable `retry_healthcheck` job with its own events.
+6. Manual update rollback is allowed only after a failed/blocked/interrupted update job with its recorded snapshot and `manual_rollback_allowed`.
+7. Normal explicit snapshot restore goes through the backend and uses only a listed rollback-eligible Hubinet-owned snapshot. The backend atomically rechecks policy, capability, ownership, waiting/approved plans, and global active work while inserting the local job; PVE independently enforces `snapshot-restore-vmids`.
 
-An agent restart marks queued/running jobs interrupted. It does not silently resume APT or rollback. Inspect the managed CT and snapshot state before creating a new plan.
+An agent restart reattaches hostd-backed lifecycle, snapshot, and self-update work through authenticated read-only lookup by VMID/request ID, validates the operation and argument, and polls the same durable host job. If the host job is missing or mismatched, the backend marks the local outcome interrupted/unknown and never submits a replacement. Locally executed work still uses read-only observation and is interrupted when completion cannot be proven. Host jobs remain in hostd's independent SQLite store while CT110 is offline.
+
+After rollback, current verification and remaining-package fields are cleared to unknown/null rather than presenting pre-rollback success. The failed verification remains in job events. A recovery scan may create a new plan with a new ID and fingerprint; the rolled-back plan is never reused.
+
+If CT110 is stopped and its backend cannot answer, the separately labeled offline restore is the only snapshot break-glass path. It requires the dedicated recovery token, exact confirmation, stopped runtime, no active hostd job, and an owned rollback-eligible snapshot. It is never selected automatically after a backend error.
+
+Hostd persists the recovery ID, request ID, VMID, snapshot, type, timestamps, status, result, and error outside CT110. The event is created while the host job is queued. Immediately before invoking the PVE controller, hostd atomically stores `mutation_started_at`; a failure to persist that marker prevents the controller call. The marker survives hostd and PVE restarts and is exposed by the read-only recovery-events API.
+
+An interrupted queued event without `mutation_started_at` proves that hostd never reached the destructive call boundary, so it is audited but does not invalidate backend state. For `offline_snapshot_restore`, a succeeded event always invalidates restored state. A failed or interrupted event with `mutation_started_at` keeps its true failed/interrupted status and exact error, but its PVE outcome is treated as unknown: the backend conservatively supersedes waiting plans, marks approved plans recovered, interrupts restored queued/running jobs, clears active IDs and verification/package projections, and records the recovery ID, snapshot, original status, error, and mutation timestamp. `offline_force_stop` never triggers snapshot-restore invalidation.
+
+Hostd retains every recovery event until backend ACK. On the next start, CT110 reads events without mutation and commits the event audit plus any required invalidation atomically. Only then does it ACK. A crash after the local commit but before ACK causes an idempotent reread, not another invalidation or restore.
 
 ## Disable MQTT
 
@@ -21,6 +32,6 @@ The upgrade writes its backup path to `/root/hubinet-ops-last-upgrade-backup` in
 
 The upgrade does not replace `agent.env` or SSH keys and does not enable MQTT, operator scan, approval, or update. Version 0.3.0 intentionally enables the separate read-only `monitoring_scheduler` for APT resources whose `monitoring.update_scan` is true; observation-only results cannot create an approvable plan.
 
-## Observe CT106 without updating it
+## Read-only diagnosis without changing a resource
 
-Use a non-production copy of runtime config and keep `scheduler.enabled: false`. Verify CT106 is allowlisted, then call only the authenticated CT106 `refresh` endpoint. Refresh maps to fixed `inspect` and does not run APT. A deliberate `scan` runs package metadata refresh/simulation and may create a waiting plan, but it cannot update packages. Reject the plan from the dashboard; do not approve it. Never test with the update or rollback endpoint unless an explicit maintenance window and rollback policy have been reviewed.
+Use a non-production copy of runtime config and keep `scheduler.enabled: false`. Call only authenticated `refresh`, wrapper `inspect`, executor `capabilities`, or snapshot list. These are read-only. A deliberate scan may refresh APT metadata and create a waiting plan, so it is not part of installer validation. Never test update, lifecycle, snapshot mutation, or rollback against production as a smoke check.

@@ -80,6 +80,17 @@ def test_lxc_never_routes_to_qemu_action(resources: dict[int, dict[str, Any]]) -
     assert remote.calls == [("scan", 101, None)]
 
 
+def test_managed_lxc_routes_read_only_capabilities_contract(
+    resources: dict[int, dict[str, Any]],
+) -> None:
+    remote = RecordingExecutor()
+    router = ResourceExecutor(remote, resources)
+
+    router.run("capabilities", 101)
+
+    assert remote.calls == [("capabilities", 101, None)]
+
+
 def test_self_adapter_never_runs_recursive_remote_inspect(
     resources: dict[int, dict[str, Any]],
 ) -> None:

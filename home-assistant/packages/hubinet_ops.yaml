@@ -1,4 +1,4 @@
-# Hubinet Ops 0.3.2: resource REST aliases and navigation-only notifications.
+# Hubinet Ops 0.4.0: typed resource actions; backend and hostd enforce policy.
 
 recorder:
   exclude:
@@ -15,6 +15,16 @@ recorder:
       - sensor.hubinet_ops_ct108_last_refresh
       - sensor.hubinet_ops_ct109_last_refresh
       - sensor.hubinet_ops_ct110_last_refresh
+      - sensor.hubinet_ops_ct101_job_progress
+      - sensor.hubinet_ops_ct102_job_progress
+      - sensor.hubinet_ops_ct103_job_progress
+      - sensor.hubinet_ops_ct104_job_progress
+      - sensor.hubinet_ops_ct105_job_progress
+      - sensor.hubinet_ops_ct106_job_progress
+      - sensor.hubinet_ops_ct107_job_progress
+      - sensor.hubinet_ops_ct108_job_progress
+      - sensor.hubinet_ops_ct109_job_progress
+      - sensor.hubinet_ops_ct110_job_progress
 
 rest_command:
   hubinet_ops_scan_container:
@@ -37,7 +47,8 @@ rest_command:
     url: !secret hubinet_ops_retry_healthcheck_url
     method: POST
     headers: *hubinet_auth_headers
-    payload: "{}"
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-health"}
     timeout: 600
 
   hubinet_ops_rollback:
@@ -52,39 +63,127 @@ rest_command:
     method: POST
     headers: *hubinet_auth_headers
     payload: >-
-      {"plan_id": "{{ plan_id }}"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-approve"}
     timeout: 20
 
   hubinet_ops_reject:
     url: !secret hubinet_ops_reject_url
     method: POST
     headers: *hubinet_auth_headers
-    payload: >-
-      {"plan_id": "{{ plan_id }}"}
+    payload: "{}"
     timeout: 20
+
+  hubinet_ops_self_update_plan:
+    url: !secret hubinet_ops_self_update_plan_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: "{}"
+    timeout: 30
 
   hubinet_ops_start_container:
     url: !secret hubinet_ops_start_url
     method: POST
     headers: *hubinet_auth_headers
-    payload: "{}"
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-start"}
     timeout: 210
 
   hubinet_ops_shutdown_container:
     url: !secret hubinet_ops_shutdown_url
     method: POST
     headers: *hubinet_auth_headers
-    payload: "{}"
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-shutdown"}
     timeout: 210
 
   hubinet_ops_reboot_container:
     url: !secret hubinet_ops_reboot_url
     method: POST
     headers: *hubinet_auth_headers
-    payload: "{}"
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-reboot"}
     timeout: 210
 
+  hubinet_ops_force_stop_container:
+    url: !secret hubinet_ops_force_stop_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-force"}
+    timeout: 210
+
+  hubinet_ops_snapshot_create:
+    url: !secret hubinet_ops_snapshot_create_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-create"}
+    timeout: 30
+
+  hubinet_ops_snapshot_restore:
+    url: !secret hubinet_ops_snapshot_restore_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-restore"}
+    timeout: 30
+
+  hubinet_ops_snapshot_delete:
+    url: !secret hubinet_ops_snapshot_delete_url
+    method: DELETE
+    headers: *hubinet_auth_headers
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-delete"}
+    timeout: 30
+
+  hubinet_ops_host_start:
+    url: !secret hubinet_ops_host_start_url
+    method: POST
+    headers:
+      Authorization: !secret hubinet_ops_host_authorization
+      Content-Type: application/json
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-start"}
+    timeout: 30
+
+  hubinet_ops_host_offline_snapshot_restore:
+    url: !secret hubinet_ops_host_offline_snapshot_restore_url
+    method: POST
+    headers:
+      Authorization: !secret hubinet_ops_host_recovery_authorization
+      Content-Type: application/json
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-offline-restore-{{ snapshot_name }}","confirm":"RESTORE_CT110_OFFLINE"}
+    timeout: 30
+
+  hubinet_ops_host_offline_force_stop:
+    url: !secret hubinet_ops_host_offline_force_stop_url
+    method: POST
+    headers:
+      Authorization: !secret hubinet_ops_host_recovery_authorization
+      Content-Type: application/json
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-110-recovery-force-stop","confirm":"FORCE_STOP_CT110_RECOVERY"}
+    timeout: 30
+
 script:
+  hubinet_ops_report_action:
+    alias: "Hubinet Ops — pokaż wynik akcji"
+    mode: parallel
+    fields:
+      vmid: {required: true}
+      action_name: {required: true}
+      response: {required: false}
+    sequence:
+      - action: persistent_notification.create
+        data:
+          notification_id: "hubinet_ops_action_ct{{ vmid | int }}"
+          title: "Hubinet Ops — {{ action_name }} CT{{ vmid | int }}"
+          message: >-
+            {% set result = response | default({}, true) %}
+            {{ 'Żądanie przyjęte.' if result.get('status', 0) in [200, 202]
+               else 'Błąd: ' ~ result.get('content', {}).get('detail', result.get('content', {}).get('error', 'usługa niedostępna')) }}
+
   hubinet_ops_start_container:
     alias: "Hubinet Ops — uruchom kontener"
     mode: single
@@ -96,27 +195,171 @@ script:
             min: 1
             max: 999999
     sequence:
-      - action: rest_command.hubinet_ops_start_container
-        data:
-          vmid: "{{ vmid | int }}"
+      - choose:
+          - conditions: "{{ vmid | int == 110 }}"
+            sequence:
+              - continue_on_error: true
+                action: rest_command.hubinet_ops_host_start
+                data: {}
+                response_variable: response
+        default:
+          - continue_on_error: true
+            action: rest_command.hubinet_ops_start_container
+            data:
+              vmid: "{{ vmid | int }}"
+            response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "uruchomienie", response: "{{ response | default({}) }}"}
 
   hubinet_ops_shutdown_container:
     alias: "Hubinet Ops — wyłącz kontener łagodnie"
     mode: single
     fields: *lifecycle_vmid_field
     sequence:
-      - action: rest_command.hubinet_ops_shutdown_container
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_shutdown_container
         data:
           vmid: "{{ vmid | int }}"
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "łagodne wyłączenie", response: "{{ response | default({}) }}"}
 
   hubinet_ops_reboot_container:
     alias: "Hubinet Ops — uruchom kontener ponownie"
     mode: single
     fields: *lifecycle_vmid_field
     sequence:
-      - action: rest_command.hubinet_ops_reboot_container
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_reboot_container
         data:
           vmid: "{{ vmid | int }}"
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "restart", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_force_stop_container:
+    alias: "Hubinet Ops — zatrzymaj kontener natychmiast"
+    mode: single
+    fields: *lifecycle_vmid_field
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_force_stop_container
+        data: {vmid: "{{ vmid | int }}"}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "natychmiastowe zatrzymanie", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_snapshot_create:
+    alias: "Hubinet Ops — utwórz snapshot"
+    mode: single
+    fields: *lifecycle_vmid_field
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_snapshot_create
+        data: {vmid: "{{ vmid | int }}"}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "utworzenie snapshotu", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_snapshot_restore_latest:
+    alias: "Hubinet Ops — przywróć ostatni snapshot"
+    mode: single
+    fields: *lifecycle_vmid_field
+    variables:
+      snapshot_name: "{{ states('sensor.hubinet_ops_ct' ~ (vmid | int) ~ '_latest_snapshot_name') }}"
+    sequence:
+      - choose:
+          - conditions: "{{ snapshot_name not in ['none', 'unknown', 'unavailable', ''] }}"
+            sequence:
+              - continue_on_error: true
+                action: rest_command.hubinet_ops_snapshot_restore
+                data: {vmid: "{{ vmid | int }}", snapshot_name: "{{ snapshot_name }}"}
+                response_variable: response
+        default:
+          - variables:
+              response: {status: 409, content: {detail: "Brak snapshotu Hubinet Ops do przywrócenia"}}
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "przywrócenie snapshotu", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_snapshot_delete_latest:
+    alias: "Hubinet Ops — usuń ostatni snapshot"
+    mode: single
+    fields: *lifecycle_vmid_field
+    variables:
+      snapshot_name: "{{ states('sensor.hubinet_ops_ct' ~ (vmid | int) ~ '_latest_snapshot_name') }}"
+    sequence:
+      - choose:
+          - conditions: "{{ snapshot_name not in ['none', 'unknown', 'unavailable', ''] }}"
+            sequence:
+              - continue_on_error: true
+                action: rest_command.hubinet_ops_snapshot_delete
+                data: {vmid: "{{ vmid | int }}", snapshot_name: "{{ snapshot_name }}"}
+                response_variable: response
+        default:
+          - variables:
+              response: {status: 409, content: {detail: "Brak snapshotu Hubinet Ops do usunięcia"}}
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "usunięcie snapshotu", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_offline_snapshot_restore_ct110:
+    alias: "Hubinet Ops — AWARYJNE przywrócenie CT110 offline"
+    description: >-
+      Operacja break-glass tylko dla zatrzymanego CT110. Omija działający backend
+      i po następnym starcie świadomie unieważnia jego aktywne plany i joby.
+    mode: single
+    variables:
+      snapshot_name: "{{ states('sensor.hubinet_ops_ct110_latest_snapshot_name') }}"
+    sequence:
+      - choose:
+          - conditions: "{{ snapshot_name not in ['none', 'unknown', 'unavailable', ''] }}"
+            sequence:
+              - continue_on_error: true
+                action: rest_command.hubinet_ops_host_offline_snapshot_restore
+                data: {snapshot_name: "{{ snapshot_name }}"}
+                response_variable: response
+        default:
+          - variables:
+              response: {status: 409, content: {detail: "Brak snapshotu CT110 do awaryjnego przywrócenia"}}
+      - action: script.hubinet_ops_report_action
+        data:
+          vmid: 110
+          action_name: "AWARYJNE przywrócenie CT110 offline"
+          response: "{{ response | default({}) }}"
+
+  hubinet_ops_offline_force_stop_ct110:
+    alias: "Hubinet Ops — AWARYJNE wymuszenie zatrzymania CT110"
+    description: >-
+      Osobna operacja break-glass z tokenem recovery. Nie jest automatycznym
+      fallbackiem po błędzie zwykłej operacji backendu.
+    mode: single
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_host_offline_force_stop
+        data: {}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data:
+          vmid: 110
+          action_name: "AWARYJNE wymuszenie zatrzymania CT110"
+          response: "{{ response | default({}) }}"
+
+  hubinet_ops_self_update:
+    alias: "Hubinet Ops — przygotuj plan aktualizacji control plane"
+    mode: single
+    fields: *lifecycle_vmid_field
+    sequence:
+      - choose:
+          - conditions: "{{ vmid | int == 110 }}"
+            sequence:
+              - continue_on_error: true
+                action: rest_command.hubinet_ops_self_update_plan
+                data: {vmid: 110}
+                response_variable: response
+        default:
+          - variables:
+              response: {status: 403, content: {detail: "Self-update jest dozwolony wyłącznie dla CT110"}}
+      - action: script.hubinet_ops_report_action
+        data: {vmid: 110, action_name: "plan aktualizacji control plane", response: "{{ response | default({}) }}"}
 
   hubinet_ops_scan_container:
     alias: "Hubinet Ops — skanuj kontener"
@@ -129,64 +372,88 @@ script:
             min: 1
             max: 999999
     sequence:
-      - action: rest_command.hubinet_ops_scan_container
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_scan_container
         data:
           vmid: "{{ vmid | int }}"
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "skan aktualizacji", response: "{{ response | default({}) }}"}
 
   hubinet_ops_refresh_container:
     alias: "Hubinet Ops — odśwież kontener"
     mode: parallel
     fields: *vmid_field
     sequence:
-      - action: rest_command.hubinet_ops_refresh_container
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_refresh_container
         data:
           vmid: "{{ vmid | int }}"
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "odświeżenie", response: "{{ response | default({}) }}"}
 
   hubinet_ops_retry_healthcheck:
     alias: "Hubinet Ops — ponów healthcheck"
     mode: parallel
     fields: *vmid_field
     sequence:
-      - action: rest_command.hubinet_ops_retry_healthcheck
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_retry_healthcheck
         data:
           vmid: "{{ vmid | int }}"
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "healthcheck", response: "{{ response | default({}) }}"}
 
   hubinet_ops_rollback:
     alias: "Hubinet Ops — rollback"
     mode: single
     fields: *vmid_field
     sequence:
-      - action: rest_command.hubinet_ops_rollback
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_rollback
         data:
           vmid: "{{ vmid | int }}"
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "rollback operacji", response: "{{ response | default({}) }}"}
 
   hubinet_ops_approve_container:
     alias: "Hubinet Ops — zatwierdź plan"
     mode: parallel
     fields: *vmid_field
-    variables:
-      state_entity: "sensor.hubinet_ops_ct{{ vmid | int }}_health_status"
-      plan_id: "{{ state_attr(state_entity, 'active_plan_id') }}"
     sequence:
-      - condition: template
-        value_template: "{{ plan_id not in [none, '', 'None'] }}"
-      - action: rest_command.hubinet_ops_approve
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_approve
         data:
-          plan_id: "{{ plan_id }}"
+          vmid: "{{ vmid | int }}"
+        response_variable: response
+      - action: persistent_notification.create
+        data:
+          notification_id: "hubinet_ops_action_ct{{ vmid | int }}"
+          title: "Hubinet Ops — zatwierdzenie planu CT{{ vmid | int }}"
+          message: >-
+            {{ 'Żądanie przyjęte.' if (response | default({})).get('status', 0) in [200, 202]
+               else 'Błąd: ' ~ ((response | default({})).get('content', {}).get('detail', 'backend niedostępny lub brak aktywnego planu')) }}
 
   hubinet_ops_reject_container:
     alias: "Hubinet Ops — odrzuć plan"
     mode: parallel
     fields: *vmid_field
-    variables:
-      state_entity: "sensor.hubinet_ops_ct{{ vmid | int }}_health_status"
-      plan_id: "{{ state_attr(state_entity, 'active_plan_id') }}"
     sequence:
-      - condition: template
-        value_template: "{{ plan_id not in [none, '', 'None'] }}"
-      - action: rest_command.hubinet_ops_reject
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_reject
         data:
-          plan_id: "{{ plan_id }}"
+          vmid: "{{ vmid | int }}"
+        response_variable: response
+      - action: persistent_notification.create
+        data:
+          notification_id: "hubinet_ops_action_ct{{ vmid | int }}"
+          title: "Hubinet Ops — odrzucenie planu CT{{ vmid | int }}"
+          message: >-
+            {{ 'Plan odrzucony.' if (response | default({})).get('status', 0) in [200, 202]
+               else 'Błąd: ' ~ ((response | default({})).get('content', {}).get('detail', 'backend niedostępny lub brak aktywnego planu')) }}
 
 automation:
   - id: hubinet_ops_webhook_notifications_v022
@@ -352,50 +619,66 @@ automation:
                     url: "{{ dashboard_path }}"
                     clickAction: "{{ dashboard_path }}"
 
-  - id: hubinet_ops_live_progress_v022
-    alias: "Hubinet Ops 0.2.2 — progress aktualizacji na telefonie"
+  - id: hubinet_ops_live_progress_v040
+    alias: "Hubinet Ops 0.4.0 — progress operacji na telefonie"
     mode: parallel
-    max: 2
+    max: 9
     max_exceeded: silent
     triggers:
       - trigger: state
-        entity_id: sensor.hubinet_ops_ct101_health_status
-        attribute: active_job_id
+        entity_id: sensor.hubinet_ops_ct101_active_job_id
         id: ct101
       - trigger: state
-        entity_id: sensor.hubinet_ops_ct106_health_status
-        attribute: active_job_id
+        entity_id: sensor.hubinet_ops_ct102_active_job_id
+        id: ct102
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct103_active_job_id
+        id: ct103
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct104_active_job_id
+        id: ct104
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct105_active_job_id
+        id: ct105
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct106_active_job_id
         id: ct106
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct107_active_job_id
+        id: ct107
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct108_active_job_id
+        id: ct108
+      - trigger: state
+        entity_id: sensor.hubinet_ops_ct109_active_job_id
+        id: ct109
     variables:
-      vmid: "{{ 101 if trigger.id == 'ct101' else 106 }}"
-      container: "{{ 'cloudflared' if trigger.id == 'ct101' else 'weather' }}"
-      state_entity: >-
-        {{ 'sensor.hubinet_ops_ct101_health_status' if trigger.id == 'ct101' else 'sensor.hubinet_ops_ct106_health_status' }}
-      dashboard_path: "{{ '/hubinet-ops/ct-101' if trigger.id == 'ct101' else '/hubinet-ops/ct-106' }}"
+      vmid: "{{ trigger.id[2:] | int }}"
+      container: "CT{{ vmid }}"
+      entity_prefix: "sensor.hubinet_ops_ct{{ vmid }}_"
+      dashboard_path: "/hubinet-ops/ct-{{ vmid }}"
     conditions:
       - condition: template
         value_template: >-
-          {{ state_attr(state_entity, 'active_job_id') not in [none, '', 'unknown', 'unavailable']
-             and state_attr(state_entity, 'operation_status') == 'running'
-             and state_attr(state_entity, 'job_stage') in ['preflight', 'snapshot', 'updating', 'waiting_services', 'healthcheck', 'verifying', 'repair', 'rollback', 'rollback_wait', 'rollback_healthcheck'] }}
+          {{ states(entity_prefix ~ 'active_job_id') not in [none, '', 'none', 'unknown', 'unavailable']
+             and states(entity_prefix ~ 'operation_status') == 'running' }}
     actions:
       - repeat:
           while:
             - condition: template
               value_template: >-
-                {{ state_attr(state_entity, 'operation_status') == 'running'
-                   and state_attr(state_entity, 'active_job_id') not in [none, '', 'unknown', 'unavailable']
-                   and state_attr(state_entity, 'job_stage') in ['preflight', 'snapshot', 'updating', 'waiting_services', 'healthcheck', 'verifying', 'repair', 'rollback', 'rollback_wait', 'rollback_healthcheck'] }}
+                {{ states(entity_prefix ~ 'operation_status') == 'running'
+                   and states(entity_prefix ~ 'active_job_id') not in [none, '', 'none', 'unknown', 'unavailable'] }}
           sequence:
             - variables:
-                current_progress: "{{ state_attr(state_entity, 'job_progress') | int(0) }}"
-                current_stage: "{{ state_attr(state_entity, 'job_stage') | default('idle', true) | replace('_', ' ') }}"
-                current_event: "{{ state_attr(state_entity, 'last_job_event') or {} }}"
+                current_progress: "{{ states(entity_prefix ~ 'job_progress') | int(0) }}"
+                current_stage: "{{ states(entity_prefix ~ 'job_stage') | default('idle', true) | replace('_', ' ') }}"
+                current_event: "{{ states(entity_prefix ~ 'last_job_event') }}"
             - action: !secret hubinet_ops_notify_service
               data:
                 title: "⚙️ CT{{ vmid }} {{ container }} — {{ current_progress }}%"
                 message: >-
-                  {{ current_stage | title }}{% if current_event.get('message') %} · {{ current_event.get('message') }}{% endif %}
+                  {{ current_stage | title }}{% if current_event not in ['none', 'unknown', 'unavailable'] %} · {{ current_event }}{% endif %}
                 data:
                   tag: "hubinet_ops_ct{{ vmid }}_job"
                   group: hubinet_ops

@@ -1,0 +1,21 @@
+[Unit]
+Description=Hubinet Ops PVE host control plane
+After=network-online.target pve-cluster.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+EnvironmentFile=/etc/hubinet-ops/hostd.env
+ExecStart=/usr/bin/python3 /usr/local/lib/hubinet-ops/hubinet_ops_hostd.py --config /etc/hubinet-ops/hostd.json
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/pve /var/lib/hubinet-ops-hostd /run/lock
+
+[Install]
+WantedBy=multi-user.target

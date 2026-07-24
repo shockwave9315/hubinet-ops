@@ -1,22 +1,32 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+ROOT = Path(__file__).parents[1]
+PVE = ROOT / "deploy" / "pve"
+sys.path.insert(0, str(PVE))
+
 from app.mqtt import _ct_entities
+from hubinet_ops_hostd import REQUEST_ID_RE
 from scripts.validate_yaml import HomeAssistantLoader
 
-ROOT = Path(__file__).parents[1]
 PACKAGE = ROOT / "home-assistant" / "packages" / "hubinet_ops.yaml"
 DASHBOARD = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
+SECRETS_EXAMPLE = ROOT / "home-assistant" / "secrets.example.yaml"
 INSTALLER = ROOT / "deploy" / "install-ha-from-pve.sh"
 LAST_REFRESH_RECORDER_EXCLUSIONS = {
     "sensor.hubinet_ops_agent_last_refresh",
     "sensor.hubinet_ops_vm100_last_refresh",
     *(f"sensor.hubinet_ops_ct{vmid}_last_refresh" for vmid in range(101, 111)),
+}
+PROGRESS_RECORDER_EXCLUSIONS = {
+    *(f"sensor.hubinet_ops_ct{vmid}_job_progress" for vmid in range(101, 111)),
 }
 
 
@@ -49,12 +59,14 @@ def test_all_repository_yaml_parses() -> None:
         _load(ROOT / name)
 
 
-def test_recorder_excludes_exactly_the_last_refresh_entities() -> None:
+def test_recorder_keeps_exact_timestamp_excludes_and_omits_ephemeral_progress() -> None:
     recorder = _load(PACKAGE)["recorder"]
 
     assert set(recorder) == {"exclude"}
     assert set(recorder["exclude"]) == {"entities"}
-    assert set(recorder["exclude"]["entities"]) == LAST_REFRESH_RECORDER_EXCLUSIONS
+    exclusions = set(recorder["exclude"]["entities"])
+    assert exclusions & LAST_REFRESH_RECORDER_EXCLUSIONS == LAST_REFRESH_RECORDER_EXCLUSIONS
+    assert exclusions == LAST_REFRESH_RECORDER_EXCLUSIONS | PROGRESS_RECORDER_EXCLUSIONS
 
 
 def test_current_automations_replace_the_legacy_webhook_automation() -> None:
@@ -63,7 +75,7 @@ def test_current_automations_replace_the_legacy_webhook_automation() -> None:
 
     assert automation_ids == {
         "hubinet_ops_webhook_notifications_v022",
-        "hubinet_ops_live_progress_v022",
+        "hubinet_ops_live_progress_v040",
         "hubinet_ops_health_watchdog_v022",
     }
     assert "hubinet_ops_webhook_v021" not in PACKAGE.read_text(encoding="utf-8")
@@ -94,26 +106,25 @@ def test_notifications_are_navigation_only_and_use_private_target() -> None:
 
 
 def test_live_progress_runs_only_for_active_jobs_and_reuses_one_tag() -> None:
-    progress = _automation("hubinet_ops_live_progress_v022")
+    progress = _automation("hubinet_ops_live_progress_v040")
     text = PACKAGE.read_text(encoding="utf-8")
 
     assert progress["mode"] == "parallel"
-    assert progress["max"] == 2
+    assert progress["max"] == 9
     assert {trigger["entity_id"] for trigger in progress["triggers"]} == {
-        "sensor.hubinet_ops_ct101_health_status",
-        "sensor.hubinet_ops_ct106_health_status",
+        *(f"sensor.hubinet_ops_ct{vmid}_active_job_id" for vmid in range(101, 110)),
     }
-    assert all(trigger["attribute"] == "active_job_id" for trigger in progress["triggers"])
+    assert all("attribute" not in trigger for trigger in progress["triggers"])
     assert all("to" not in trigger for trigger in progress["triggers"])
     assert "active_job_id" in progress["conditions"][0]["value_template"]
-    assert "job_stage" in progress["conditions"][0]["value_template"]
+    assert "operation_status" in progress["conditions"][0]["value_template"]
 
     repeat = progress["actions"][0]["repeat"]
     assert repeat["while"][0]["condition"] == "template"
-    assert "state_attr(state_entity, 'operation_status') == 'running'" in repeat["while"][0][
+    assert "states(entity_prefix ~ 'operation_status') == 'running'" in repeat["while"][0][
         "value_template"
     ]
-    assert "state_attr(state_entity, 'active_job_id')" in repeat["while"][0][
+    assert "states(entity_prefix ~ 'active_job_id')" in repeat["while"][0][
         "value_template"
     ]
     assert all(
@@ -153,6 +164,122 @@ def test_dashboard_is_mushroom_sections_with_dashboard_only_approval() -> None:
     automation_text = PACKAGE.read_text(encoding="utf-8").split("automation:", 1)[1]
     assert "hubinet_ops_approve" not in automation_text
     assert "hubinet_ops_reject" not in automation_text
+
+
+def test_dashboard_actions_exist_and_active_plan_decisions_use_only_vmid() -> None:
+    package = _load(PACKAGE)
+    dashboard = _load(DASHBOARD)
+    invoked = {
+        item["tap_action"]["perform_action"].removeprefix("script.")
+        for item in _walk(dashboard)
+        if isinstance(item, dict)
+        and item.get("tap_action", {}).get("action") == "perform-action"
+    }
+    assert invoked <= set(package["script"])
+
+    package_text = PACKAGE.read_text(encoding="utf-8")
+    secrets_text = SECRETS_EXAMPLE.read_text(encoding="utf-8")
+    assert "/plans/approve-active" in secrets_text
+    assert "/plans/reject-active" in secrets_text
+    assert "/resources/{{ vmid }}/self-update" in secrets_text
+    self_update = package["script"]["hubinet_ops_self_update"]
+    self_update_text = str(self_update)
+    assert "rest_command.hubinet_ops_self_update_plan" in self_update_text
+    assert "rest_command.hubinet_ops_host_start" not in self_update_text
+    restore = package["script"]["hubinet_ops_snapshot_restore_latest"]
+    restore_text = str(restore)
+    assert "rest_command.hubinet_ops_snapshot_restore" in restore_text
+    assert "rest_command.hubinet_ops_host_offline_snapshot_restore" not in restore_text
+    assert "hubinet_ops_snapshot_rollback" not in restore_text
+    assert "/snapshots/{{ snapshot_name }}/restore" in secrets_text
+    assert "/snapshots/{{ snapshot_name }}/rollback" not in secrets_text
+    assert "/containers/{{ vmid }}/rollback" in secrets_text
+    assert "state_attr" not in package_text.split("hubinet_ops_approve_container:", 1)[1].split("automation:", 1)[0]
+    assert "active_plan_id" not in package_text.split("script:", 1)[1].split("automation:", 1)[0]
+
+
+def test_ct110_direct_host_commands_are_limited_to_start_and_explicit_recovery() -> None:
+    package = _load(PACKAGE)
+    commands = package["rest_command"]
+    timestamp = "20260723T221530"
+    snapshot = "hubinet-ops-110-manual-20260723T220000Z"
+
+    def render_request_id(
+        command: str,
+        *,
+        snapshot_name: str | None = None,
+    ) -> str:
+        payload = commands[command]["payload"]
+        payload = payload.replace(
+            "{{ utcnow().strftime('%Y%m%dT%H%M%S') }}",
+            timestamp,
+        ).replace(
+            "{{ utcnow().strftime('%Y%m%dT%H%M%SZ') }}",
+            f"{timestamp}Z",
+        )
+        payload = payload.replace("{{ vmid | int }}", "110")
+        if snapshot_name is not None:
+            payload = payload.replace("{{ snapshot_name }}", snapshot_name)
+        parsed = json.loads(payload)
+        return str(parsed["request_id"])
+
+    request_ids = {
+        "start": render_request_id("hubinet_ops_host_start"),
+        "offline-restore": render_request_id(
+            "hubinet_ops_host_offline_snapshot_restore",
+            snapshot_name=snapshot,
+        ),
+        "offline-force-stop": render_request_id(
+            "hubinet_ops_host_offline_force_stop"
+        ),
+    }
+
+    assert request_ids == {
+        "start": "ha-20260723T221530-110-start",
+        "offline-restore": (
+            "ha-20260723T221530-110-offline-restore-"
+            "hubinet-ops-110-manual-20260723T220000Z"
+        ),
+        "offline-force-stop": "ha-20260723T221530-110-recovery-force-stop",
+    }
+    assert len(set(request_ids.values())) == len(request_ids)
+    assert all(REQUEST_ID_RE.fullmatch(value) for value in request_ids.values())
+    assert all(len(value) <= 128 for value in request_ids.values())
+    assert snapshot in request_ids["offline-restore"]
+    assert all(
+        "{{ now().strftime" not in commands[name]["payload"]
+        for name in (
+            "hubinet_ops_host_start",
+            "hubinet_ops_host_offline_snapshot_restore",
+            "hubinet_ops_host_offline_force_stop",
+        )
+    )
+    direct_host_actions = {
+        item["action"]
+        for script_name in (
+            "hubinet_ops_start_container",
+            "hubinet_ops_shutdown_container",
+            "hubinet_ops_reboot_container",
+            "hubinet_ops_force_stop_container",
+            "hubinet_ops_snapshot_create",
+            "hubinet_ops_snapshot_restore_latest",
+            "hubinet_ops_snapshot_delete_latest",
+        )
+        for item in _walk(package["script"][script_name])
+        if isinstance(item, dict)
+        and str(item.get("action") or "").startswith("rest_command.hubinet_ops_host_")
+    }
+    assert direct_host_actions == {"rest_command.hubinet_ops_host_start"}
+    assert (
+        package["rest_command"]["hubinet_ops_host_offline_snapshot_restore"]["payload"]
+        .find('"confirm":"RESTORE_CT110_OFFLINE"')
+        >= 0
+    )
+    assert (
+        package["rest_command"]["hubinet_ops_host_offline_force_stop"]["payload"]
+        .find('"confirm":"FORCE_STOP_CT110_RECOVERY"')
+        >= 0
+    )
 
 
 def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() -> None:

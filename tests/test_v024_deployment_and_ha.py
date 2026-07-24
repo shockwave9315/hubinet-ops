@@ -22,26 +22,26 @@ DASHBOARD = ROOT / "home-assistant" / "dashboards" / "hubinet_ops.yaml"
 
 def test_wrapper_has_only_fixed_graceful_lifecycle_verbs() -> None:
     text = WRAPPER.read_text(encoding="utf-8")
-    assert "verify|start|shutdown|reboot" in text
-    assert 'pct start "$vmid"' in text
-    assert 'pct shutdown "$vmid"' in text
-    assert 'pct reboot "$vmid"' in text
-    assert "Action does not accept an argument" in text
-    assert "timeout --signal=TERM" in text
-    assert 'listed "$vmid" "$OBSERVATION_ALLOWLIST"' in text
-    assert 'LIFECYCLE_ALLOWLIST="/etc/hubinet-ops/lifecycle-vmids"' in text
-    assert 'listed "$vmid" "$LIFECYCLE_ALLOWLIST"' in text
-    assert 'MANAGED_ALLOWLIST="/etc/hubinet-ops/managed-vmids"' in text
-    assert 'MAINTENANCE_ALLOWLIST="/etc/hubinet-ops/maintenance-vmids"' in text
-    assert 'RESOURCE_TYPES="/etc/hubinet-ops/resource-types"' in text
-    assert '[[ -z "${extra:-}" ]]' in text
+    implementation = (ROOT / "deploy/pve/hubinet_ops_host_control.py").read_text(
+        encoding="utf-8"
+    )
+    assert "--forced-command" in text
+    assert 'SSH_ORIGINAL_COMMAND:-$*' in text
+    assert '["pct", "start", str(vmid)]' in implementation
+    assert '["pct", "shutdown", str(vmid), "--timeout", "90"]' in implementation
+    assert '["pct", "reboot", str(vmid), "--timeout", "90"]' in implementation
+    assert "Action does not accept an argument" in implementation
+    assert "HostPolicy" in implementation
+    assert "shell=False" in implementation
     for forbidden in ("pct destroy", "pct console", "pct enter", " eval ", "generic-command"):
-        assert forbidden not in text
+        assert forbidden not in text + implementation
 
 
-def test_production_lifecycle_allowlist_contains_only_ct106() -> None:
+def test_production_lifecycle_allowlist_contains_all_lxc() -> None:
     lifecycle_allowlist = ROOT / "deploy" / "pve" / "lifecycle-vmids"
-    assert lifecycle_allowlist.read_text(encoding="utf-8").splitlines() == ["106"]
+    assert lifecycle_allowlist.read_text(encoding="utf-8").splitlines() == [
+        str(vmid) for vmid in range(101, 111)
+    ]
     installer = (ROOT / "deploy" / "pve" / "install-pve-access.sh").read_text(
         encoding="utf-8"
     )
@@ -49,12 +49,13 @@ def test_production_lifecycle_allowlist_contains_only_ct106() -> None:
         'install -m 0640 "$SOURCE_DIR/lifecycle-vmids" '
         "/etc/hubinet-ops/lifecycle-vmids"
     ) in installer
-    assert '== "106"' in installer
+    assert "host-control-vmids" in installer
+    assert "hubinet_ops_host_control.py" in installer
 
 
 def test_managed_verify_is_fixed_and_checks_integrity_services_and_docker() -> None:
     text = (ROOT / "deploy" / "managed" / "hubinet-maint").read_text(encoding="utf-8")
-    assert 'VERSION = "0.3.0"' in text
+    assert 'VERSION = "0.4.0"' in text
     assert 'run(["apt-get", "check"]' in text
     assert 'run(["dpkg", "--audit"]' in text
     assert 'Path("/var/run/reboot-required").exists()' in text
@@ -153,30 +154,29 @@ def test_dashboard_policy_controls_verification_recovery_and_navigation_only_pus
     ct101 = views["ct-101"]
     ct106 = views["ct-106"]
 
-    assert "Tryb obserwacji — sterowanie zablokowane przez politykę backendu" in ct101
-    assert "perform_action:" not in ct101
+    for service in (
+        "script.hubinet_ops_start_container",
+        "script.hubinet_ops_force_stop_container",
+        "script.hubinet_ops_snapshot_create",
+    ):
+        assert service in ct101
     for label in ("Uruchom", "Wyłącz łagodnie", "Uruchom ponownie"):
         assert f"primary: {label}" in ct106
-    for forbidden in ("force-stop", "destroy", "terminal", "console"):
+    for forbidden in ("destroy", "terminal", "console"):
         assert forbidden not in dashboard.lower()
     assert "title: Weryfikacja końcowa" in ct106
     assert "title: Recovery scan" in ct106
     assert "confirmation:" in ct106
     assert "recovery_notification_suppressed_until" in package
     assert "state_attr(trigger.entity_id, 'recovery_notification_suppressed_until')" in package
-    progress = package.split("id: hubinet_ops_live_progress_v022", 1)[1].split(
+    progress = package.split("id: hubinet_ops_live_progress_v040", 1)[1].split(
         "id: hubinet_ops_health_watchdog_v022", 1
     )[0]
     assert "active_job_id" in progress
-    assert "attribute: active_job_id" in progress
-    assert "sensor.hubinet_ops_ct106_operation_status" not in progress
-    assert "state_attr(state_entity, 'operation_status')" in progress
-    assert "state_attr(state_entity, 'job_stage')" in progress
-    assert "state_attr(state_entity, 'job_progress')" in progress
-    assert "['preflight', 'snapshot', 'updating'" in progress
-    assert "starting" not in progress
-    assert "shutting_down" not in progress
-    assert "rebooting" not in progress
+    assert "sensor.hubinet_ops_ct101_active_job_id" in progress
+    assert "states(entity_prefix ~ 'operation_status')" in progress
+    assert "states(entity_prefix ~ 'job_stage')" in progress
+    assert "states(entity_prefix ~ 'job_progress')" in progress
     watchdog = package.split("id: hubinet_ops_health_watchdog_v022", 1)[1]
     assert "intentional_shutdown" in watchdog
     assert "lifecycle_status') != 'running'" in watchdog

@@ -36,6 +36,7 @@ class Executor:
         on_event: EventCallback | None = None,
     ) -> dict[str, Any]:
         allowed_actions = {
+            "capabilities",
             "status",
             "inspect",
             "scan",
@@ -50,6 +51,11 @@ class Executor:
             "start",
             "shutdown",
             "reboot",
+            "force-stop",
+            "list-snapshots",
+            "snapshot-create",
+            "snapshot-rollback",
+            "snapshot-delete",
         }
         if action not in allowed_actions:
             raise ExecutorError(f"Action not allowed by agent: {action}")
@@ -68,7 +74,10 @@ class Executor:
         if command_timeout <= 0:
             raise ExecutorError("Executor timeout must be positive")
 
-        if action in {"start", "shutdown", "reboot", "verify"} and argument is not None:
+        if action in {
+            "capabilities", "start", "shutdown", "reboot", "force-stop",
+            "list-snapshots", "verify",
+        } and argument is not None:
             raise ExecutorError(f"Action {action} does not accept an argument")
         remote_command = f"{action} {vmid}"
         if argument is not None:

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+- add the `hubinet-maint` 0.4.0/protocol 1 capabilities contract with required actions plus executor/profile hashes and profile validation status;
+- expand policy-controlled APT maintenance and lifecycle/snapshot controls to CT101–CT109 while keeping VM100 observation-only;
+- add shared typed PVE host control and a root-owned, bearer-authenticated, request-bounded, durable `hubinet-ops-hostd` path for CT110 offline control;
+- unify update, lifecycle, force-stop, snapshot, retry-healthcheck, and self-update work as persistent idempotent jobs with startup reconciliation;
+- add owned snapshot create/list/latest/rollback/delete, configurable retention, foreign-snapshot rejection, and post-rollback state invalidation;
+- add VMID-only active-plan approval/rejection endpoints with explicit conflicts and remove Home Assistant's dependency on `active_plan_id` health attributes;
+- expose executor and snapshot summary entities without restoring changing full-state health attributes;
+- add complete guarded Mushroom controls for CT101–CT110, local timestamp formatting, short plan/job IDs, and independent CT110 host actions;
+- add transactional PVE/CT110/managed-LXC and Home Assistant installers with full cross-layer rollback and read-only final validation.
+
 ## 0.3.2
 
 - restore the production `apt_check`, `dpkg_audit`, and `packages_remaining` entity IDs without changing unique IDs;

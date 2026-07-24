@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from ipaddress import ip_address
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -20,6 +22,12 @@ OPERATOR_CAPABILITIES = {
     "start",
     "shutdown",
     "reboot",
+    "force_stop",
+    "snapshot_create",
+    "snapshot_list",
+    "snapshot_rollback",
+    "snapshot_delete",
+    "self_update",
 }
 RECOVERY_SCAN_KEYS = {"enabled", "delay_seconds", "cooldown_seconds"}
 MONITORING_KEYS = {"inspect", "update_scan"}
@@ -39,6 +47,7 @@ RESOURCE_KEYS = {
     "approval_mode",
     "automatic_rollback",
     "manual_rollback_allowed",
+    "manual_snapshot_restore_allowed",
     "recovery_scan",
     "repair_actions",
     "dashboard_path",
@@ -46,6 +55,8 @@ RESOURCE_KEYS = {
     "required_services",
     "docker",
     "os",
+    "executor_contract",
+    "snapshot_retention",
 }
 
 
@@ -79,6 +90,10 @@ class Settings:
     @property
     def mqtt(self) -> dict[str, Any]:
         return self.raw.get("mqtt", {})
+
+    @property
+    def host_control(self) -> dict[str, Any]:
+        return self.raw.get("host_control", {})
 
     @property
     def resources(self) -> dict[int, dict[str, Any]]:
@@ -224,7 +239,7 @@ def validate_config(raw: dict[str, Any]) -> None:
             if key in monitoring and not isinstance(monitoring[key], bool):
                 raise RuntimeError(f"Resource {vmid} monitoring.{key} must be a boolean")
 
-        if adapter in {"haos", "agent_self"}:
+        if adapter == "haos":
             forbidden = {
                 name
                 for name in (
@@ -248,8 +263,17 @@ def validate_config(raw: dict[str, Any]) -> None:
                 raise RuntimeError(
                     f"Resource {vmid} adapter {adapter} does not support APT update scans"
                 )
-        if adapter == "agent_self" and any(bool(value) for value in capabilities.values()):
-            raise RuntimeError("Resource 110 agent_self must deny every operator capability")
+        if adapter == "agent_self":
+            forbidden = {
+                name
+                for name in ("scan", "retry_healthcheck", "rollback")
+                if bool(capabilities.get(name, False))
+            }
+            if forbidden:
+                raise RuntimeError(
+                    "Resource 110 agent_self supports only plan approval, host lifecycle, "
+                    "snapshot, refresh, and self-update capabilities"
+                )
 
         actions_raw = value.get("repair_actions") or []
         if not isinstance(actions_raw, list):
@@ -259,6 +283,26 @@ def validate_config(raw: dict[str, Any]) -> None:
             raise RuntimeError(f"Resource {vmid} contains an unsupported repair action")
         if adapter != "apt" and actions:
             raise RuntimeError(f"Resource {vmid} adapter {adapter} cannot configure repair_actions")
+
+        executor_contract = value.get("executor_contract", {})
+        if not isinstance(executor_contract, dict):
+            raise RuntimeError(f"Resource {vmid} executor_contract must be an object")
+        unknown_contract = set(executor_contract) - {
+            "executor_sha256", "profile_sha256"
+        }
+        if unknown_contract:
+            raise RuntimeError(f"Resource {vmid} executor_contract contains unknown settings")
+        for key in ("executor_sha256", "profile_sha256"):
+            if key in executor_contract and not _sha256(executor_contract[key]):
+                raise RuntimeError(f"Resource {vmid} executor_contract.{key} must be SHA-256")
+        if executor_contract and adapter != "apt":
+            raise RuntimeError(f"Resource {vmid} executor_contract is supported only for apt")
+        retention = _strict_int(
+            value.get("snapshot_retention", 5),
+            f"Resource {vmid} snapshot_retention",
+        )
+        if retention < 1 or retention > 100:
+            raise RuntimeError(f"Resource {vmid} snapshot_retention must be between 1 and 100")
 
         required_services = value.get("required_services", [])
         if not isinstance(required_services, list) or not all(
@@ -317,7 +361,11 @@ def validate_config(raw: dict[str, Any]) -> None:
                 f"Resource {vmid} recovery_scan.cooldown_seconds must be between delay_seconds and 604800"
             )
 
-        for key in ("automatic_rollback", "manual_rollback_allowed"):
+        for key in (
+            "automatic_rollback",
+            "manual_rollback_allowed",
+            "manual_snapshot_restore_allowed",
+        ):
             if key in value and not isinstance(value[key], bool):
                 raise RuntimeError(f"Resource {vmid} {key} must be a boolean")
         if bool(capabilities.get("rollback", False)) and not bool(
@@ -325,6 +373,13 @@ def validate_config(raw: dict[str, Any]) -> None:
         ):
             raise RuntimeError(
                 f"Resource {vmid} rollback capability requires manual_rollback_allowed"
+            )
+        if bool(value.get("manual_snapshot_restore_allowed", False)) and not bool(
+            capabilities.get("snapshot_rollback", False)
+        ):
+            raise RuntimeError(
+                f"Resource {vmid} manual_snapshot_restore_allowed requires "
+                "snapshot_rollback capability"
             )
         if adapter != "apt" and (
             bool(value.get("automatic_rollback", False))
@@ -393,6 +448,46 @@ def validate_config(raw: dict[str, Any]) -> None:
         raise RuntimeError("MQTT reconnect delays must be positive")
     if reconnect_min > reconnect_max:
         raise RuntimeError("mqtt.reconnect_min_seconds cannot exceed reconnect_max_seconds")
+
+    host_control = raw.get("host_control") or {}
+    if not isinstance(host_control, dict):
+        raise RuntimeError("host_control must be an object")
+    unknown_host_control = set(host_control) - {
+        "enabled", "base_url", "backend_token_env",
+        "update_token_env", "timeout_seconds",
+        "operation_timeout_seconds", "poll_interval_seconds",
+    }
+    if unknown_host_control:
+        raise RuntimeError("host_control contains unknown settings")
+    if "token" in host_control:
+        raise RuntimeError("host_control bearer token must be provided through the environment")
+    if host_control.get("enabled"):
+        parsed = urlsplit(str(host_control.get("base_url") or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise RuntimeError("host_control.base_url must be an HTTP(S) URL")
+        token_env = str(
+            host_control.get("backend_token_env")
+            or "HUBINET_OPS_HOSTD_BACKEND_TOKEN"
+        )
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", token_env):
+            raise RuntimeError("host_control.backend_token_env is invalid")
+        update_token_env = str(
+            host_control.get("update_token_env")
+            or "HUBINET_OPS_HOSTD_UPDATE_TOKEN"
+        )
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", update_token_env):
+            raise RuntimeError("host_control.update_token_env is invalid")
+    for key, default in (
+        ("timeout_seconds", 30),
+        ("operation_timeout_seconds", 1800),
+    ):
+        if _strict_int(host_control.get(key, default), f"host_control.{key}") <= 0:
+            raise RuntimeError(f"host_control.{key} must be positive")
+    if _finite_float(
+        host_control.get("poll_interval_seconds", 1),
+        "host_control.poll_interval_seconds",
+    ) <= 0:
+        raise RuntimeError("host_control.poll_interval_seconds must be positive")
 
     monitoring_scheduler = raw.get("monitoring_scheduler", {})
     if not isinstance(monitoring_scheduler, dict):
@@ -479,3 +574,7 @@ def _strict_int(value: Any, name: str) -> int:
         if not text or not text.lstrip("+-").isdigit():
             raise RuntimeError(f"{name} must be an integer")
     return result
+
+
+def _sha256(value: Any) -> bool:
+    return bool(re.fullmatch(r"[a-f0-9]{64}", str(value or "")))
