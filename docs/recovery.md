@@ -10,7 +10,7 @@
 6. Manual update rollback is allowed only after a failed/blocked/interrupted update job with its recorded snapshot and `manual_rollback_allowed`.
 7. Explicit operator snapshot restore is separate: use only a listed rollback-eligible Hubinet-owned snapshot. The backend rechecks `manual_snapshot_restore_allowed`, capability, ownership, active work, and presence; PVE independently enforces `snapshot-restore-vmids`, including for offline CT110 restore.
 
-An agent restart reconciles queued/running jobs with actual LXC/snapshot state. It can confirm an already reached terminal condition, otherwise it marks the job interrupted; it never silently replays APT, lifecycle, snapshot deletion, or rollback. Host jobs for CT110 remain in hostd's independent SQLite store while CT110 is offline.
+An agent restart reattaches hostd-backed lifecycle, snapshot, and self-update work through authenticated read-only lookup by VMID/request ID, validates the operation and argument, and polls the same durable host job. If the host job is missing or mismatched, the backend marks the local outcome interrupted/unknown and never submits a replacement. Locally executed work still uses read-only observation and is interrupted when completion cannot be proven. Host jobs remain in hostd's independent SQLite store while CT110 is offline.
 
 After rollback, current verification and remaining-package fields are cleared to unknown/null rather than presenting pre-rollback success. The failed verification remains in job events. A recovery scan may create a new plan with a new ID and fingerprint; the rolled-back plan is never reused.
 

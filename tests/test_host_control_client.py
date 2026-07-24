@@ -133,3 +133,146 @@ def test_self_update_poll_survives_transient_hostd_restart_without_resubmission(
 
     assert result == {"fingerprint": fingerprint, "exit_code": 0}
     assert len([request for request in requests if request.method == "POST"]) == 1
+
+
+def test_normal_host_job_poll_retries_transient_get_without_resubmission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
+    requests: list[httpx.Request] = []
+    get_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(
+                202,
+                json={"id": "job-start", "status": "running"},
+            )
+        get_count += 1
+        if get_count == 1:
+            return httpx.Response(503, json={"error": "hostd temporarily unavailable"})
+        return httpx.Response(
+            200,
+            json={
+                "id": "job-start",
+                "status": "succeeded",
+                "result": {"lxc_status": "running"},
+            },
+        )
+
+    client = HostControlClient(
+        {
+            "base_url": "http://hostd.invalid:8741",
+            "token_env": "TEST_HOSTD_TOKEN",
+            "poll_interval_seconds": 0.001,
+        },
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _seconds: None,
+    )
+
+    assert client.execute(
+        "lifecycle_start",
+        110,
+        "normal-transient-get-0001",
+    ) == {"lxc_status": "running"}
+    assert len([request for request in requests if request.method == "POST"]) == 1
+    assert len([request for request in requests if request.method == "GET"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("remote_operation", "remote_argument", "expected_error"),
+    [
+        ("snapshot_delete", "hubinet-ops-110-manual-20260723T220000Z", "operation_type"),
+        ("snapshot_rollback", "hubinet-ops-110-manual-20260723T220001Z", "snapshot_name"),
+    ],
+)
+def test_wait_existing_job_rejects_contract_mismatch_without_post(
+    monkeypatch: pytest.MonkeyPatch,
+    remote_operation: str,
+    remote_argument: str,
+    expected_error: str,
+) -> None:
+    monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
+    requests: list[httpx.Request] = []
+    request_id = "reattach-contract-0001"
+    expected_snapshot = "hubinet-ops-110-manual-20260723T220000Z"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "existing-job",
+                "vmid": 110,
+                "request_id": request_id,
+                "operation_type": remote_operation,
+                "argument": remote_argument,
+                "status": "running",
+                "stage": "executing",
+                "result": None,
+                "error": None,
+            },
+        )
+
+    client = HostControlClient(
+        {"base_url": "http://hostd.invalid", "token_env": "TEST_HOSTD_TOKEN"},
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(HostControlError, match=expected_error) as captured:
+        client.wait_existing_job(
+            "snapshot_rollback",
+            110,
+            request_id,
+            snapshot_name=expected_snapshot,
+        )
+
+    assert captured.value.status == "contract_mismatch"
+    assert [request.method for request in requests] == ["GET"]
+
+
+def test_wait_existing_job_retries_transient_lookup_without_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
+    requests: list[httpx.Request] = []
+    request_id = "reattach-transient-lookup-0001"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            raise httpx.ConnectError("hostd restarting", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "existing-start",
+                "vmid": 110,
+                "request_id": request_id,
+                "operation_type": "lifecycle_start",
+                "argument": None,
+                "status": "succeeded",
+                "stage": "complete",
+                "result": {"lxc_status": "running"},
+                "error": None,
+            },
+        )
+
+    client = HostControlClient(
+        {
+            "base_url": "http://hostd.invalid",
+            "token_env": "TEST_HOSTD_TOKEN",
+            "poll_interval_seconds": 0.001,
+        },
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _seconds: None,
+    )
+
+    assert client.wait_existing_job(
+        "lifecycle_start",
+        110,
+        request_id,
+    ) == {"lxc_status": "running"}
+    assert [request.method for request in requests] == ["GET", "GET"]

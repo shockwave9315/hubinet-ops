@@ -17,10 +17,12 @@ class HostControlError(RuntimeError):
         *,
         status: str | None = None,
         result: dict[str, Any] | None = None,
+        http_status: int | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.result = dict(result or {})
+        self.http_status = http_status
 
 
 class HostControlClient:
@@ -32,6 +34,7 @@ class HostControlClient:
         *,
         client: httpx.Client | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.config = dict(config)
         self.base_url = str(self.config.get("base_url") or "").rstrip("/")
@@ -50,8 +53,13 @@ class HostControlClient:
         self.timeout = max(1, int(self.config.get("timeout_seconds", 30)))
         self.operation_timeout = max(1, int(self.config.get("operation_timeout_seconds", 1800)))
         self.poll_interval = max(0.1, float(self.config.get("poll_interval_seconds", 1)))
+        self.poll_error_retries = max(
+            1,
+            int(self.config.get("poll_error_retries", 3)),
+        )
         self.client = client or httpx.Client(timeout=self.timeout)
         self.sleep = sleep
+        self.monotonic = monotonic
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health", authenticated=False)
@@ -129,23 +137,111 @@ class HostControlClient:
         job_id = str(submitted.get("id") or "")
         if not job_id:
             raise HostControlError("Host control did not return a job ID")
-        deadline = time.monotonic() + self.operation_timeout
-        current = submitted
-        last_poll_error: HostControlError | None = None
+        return self._wait_for_terminal(job_id, submitted)
+
+    def find_job_by_request_id(
+        self,
+        vmid: int,
+        request_id: str,
+    ) -> dict[str, Any] | None:
+        try:
+            return self._request(
+                "GET",
+                f"/api/v1/jobs/by-request/{int(vmid)}/"
+                f"{quote(str(request_id), safe='._:-')}",
+            )
+        except HostControlError as exc:
+            if exc.http_status == 404:
+                return None
+            raise
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        try:
+            return self._request(
+                "GET",
+                f"/api/v1/jobs/{quote(str(job_id), safe='')}",
+            )
+        except HostControlError as exc:
+            if exc.http_status == 404:
+                raise HostControlError(
+                    "Existing host control job disappeared; outcome is unknown",
+                    status="not_found",
+                    http_status=404,
+                ) from exc
+            raise
+
+    def wait_existing_job(
+        self,
+        operation_type: str,
+        vmid: int,
+        request_id: str,
+        *,
+        snapshot_name: str | None = None,
+        release_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        deadline = self.monotonic() + self.operation_timeout
+        current = self._retry_read(
+            lambda: self.find_job_by_request_id(vmid, request_id),
+            deadline=deadline,
+        )
+        if current is None:
+            raise HostControlError(
+                "Host control job was not found; operation outcome is unknown",
+                status="not_found",
+            )
+
+        def validate(remote: dict[str, Any]) -> None:
+            self._validate_existing_contract(
+                remote,
+                operation_type=operation_type,
+                vmid=vmid,
+                request_id=request_id,
+                snapshot_name=snapshot_name,
+                release_fingerprint=release_fingerprint,
+            )
+
+        validate(current)
+        job_id = str(current.get("id") or "")
+        if not job_id:
+            raise HostControlError(
+                "Host control lookup returned no job ID",
+                status="contract_mismatch",
+            )
+        return self._wait_for_terminal(
+            job_id,
+            current,
+            deadline=deadline,
+            validate=validate,
+        )
+
+    def _wait_for_terminal(
+        self,
+        job_id: str,
+        current: dict[str, Any],
+        *,
+        deadline: float | None = None,
+        validate: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        deadline = (
+            deadline
+            if deadline is not None
+            else self.monotonic() + self.operation_timeout
+        )
+        if validate is not None:
+            validate(current)
         while str(current.get("status")) not in {"succeeded", "failed", "interrupted"}:
-            if time.monotonic() >= deadline:
-                detail = f": {last_poll_error}" if last_poll_error else ""
-                raise HostControlError(f"Timed out waiting for host control job{detail}")
+            if self.monotonic() >= deadline:
+                raise HostControlError(
+                    "Timed out waiting for existing host control job; outcome is unknown",
+                    status="unavailable",
+                )
             self.sleep(self.poll_interval)
-            try:
-                current = self._request("GET", f"/api/v1/jobs/{job_id}")
-                last_poll_error = None
-            except HostControlError as exc:
-                # hostd is expected to restart during CT110 self-update. The durable
-                # host job remains authoritative and is polled again without replay.
-                if operation_type != "self_update":
-                    raise
-                last_poll_error = exc
+            current = self._retry_read(
+                lambda: self.get_job(job_id),
+                deadline=deadline,
+            )
+            if validate is not None and current is not None:
+                validate(current)
         if current.get("status") != "succeeded":
             result = current.get("result")
             raise HostControlError(
@@ -155,6 +251,84 @@ class HostControlClient:
             )
         result = current.get("result")
         return dict(result) if isinstance(result, dict) else {}
+
+    def _retry_read(
+        self,
+        operation: Callable[[], dict[str, Any] | None],
+        *,
+        deadline: float,
+    ) -> dict[str, Any] | None:
+        last_error: HostControlError | None = None
+        for attempt in range(self.poll_error_retries):
+            try:
+                return operation()
+            except HostControlError as exc:
+                if not self._transient_read_error(exc):
+                    raise
+                last_error = exc
+                if attempt + 1 >= self.poll_error_retries or self.monotonic() >= deadline:
+                    break
+                self.sleep(self.poll_interval)
+        raise HostControlError(
+            f"Host control is temporarily unavailable during read-only polling: {last_error}",
+            status="unavailable",
+            http_status=last_error.http_status if last_error else None,
+        ) from last_error
+
+    @staticmethod
+    def _transient_read_error(error: HostControlError) -> bool:
+        return (
+            error.http_status is None
+            or error.http_status in {408, 429}
+            or error.http_status >= 500
+        )
+
+    @staticmethod
+    def _validate_existing_contract(
+        current: dict[str, Any],
+        *,
+        operation_type: str,
+        vmid: int,
+        request_id: str,
+        snapshot_name: str | None,
+        release_fingerprint: str | None,
+    ) -> None:
+        try:
+            remote_vmid = int(current.get("vmid"))
+        except (TypeError, ValueError) as exc:
+            raise HostControlError(
+                "Host control job VMID is invalid",
+                status="contract_mismatch",
+            ) from exc
+        expected_argument: str | None = None
+        if operation_type == "self_update":
+            expected_argument = release_fingerprint
+        elif operation_type.startswith("snapshot_"):
+            expected_argument = snapshot_name
+        remote_argument = current.get("argument")
+        if remote_argument is None and operation_type == "self_update":
+            remote_argument = current.get("fingerprint")
+        if remote_argument is None and operation_type.startswith("snapshot_"):
+            remote_argument = current.get("snapshot_name")
+        mismatches: list[str] = []
+        if remote_vmid != int(vmid):
+            mismatches.append("vmid")
+        if str(current.get("request_id") or "") != str(request_id):
+            mismatches.append("request_id")
+        if str(current.get("operation_type") or "") != operation_type:
+            mismatches.append("operation_type")
+        if remote_argument != expected_argument:
+            if operation_type == "self_update":
+                mismatches.append("fingerprint")
+            elif operation_type.startswith("snapshot_"):
+                mismatches.append("snapshot_name")
+            else:
+                mismatches.append("argument")
+        if mismatches:
+            raise HostControlError(
+                "Host control job contract mismatch: " + ", ".join(mismatches),
+                status="contract_mismatch",
+            )
 
     def _request(
         self,
@@ -176,7 +350,10 @@ class HostControlClient:
                 timeout=self.timeout,
             )
         except httpx.HTTPError as exc:
-            raise HostControlError(f"Host control request failed: {exc}") from exc
+            raise HostControlError(
+                f"Host control request failed: {exc}",
+                status="unavailable",
+            ) from exc
         try:
             payload = response.json()
         except ValueError as exc:
@@ -185,6 +362,7 @@ class HostControlClient:
             raise HostControlError("Host control returned a non-object response")
         if response.status_code >= 400:
             raise HostControlError(
-                sanitize_text(payload.get("error") or f"HTTP {response.status_code}", limit=1000)
+                sanitize_text(payload.get("error") or f"HTTP {response.status_code}", limit=1000),
+                http_status=response.status_code,
             )
         return payload

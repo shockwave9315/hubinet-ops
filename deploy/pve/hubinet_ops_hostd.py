@@ -41,6 +41,9 @@ ACTION_PATH_RE = re.compile(
 STATUS_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/status$"
 )
+JOB_BY_REQUEST_PATH_RE = re.compile(
+    r"^/api/v1/jobs/by-request/(?P<vmid>[^/]+)/(?P<request_id>[^/]+)$"
+)
 SELF_UPDATE_RELEASE_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/self-update/release$"
 )
@@ -198,6 +201,20 @@ class HostJobStore:
             row = connection.execute("SELECT * FROM host_jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             raise KeyError(job_id)
+        return self._row(row)
+
+    def get_by_request_id(self, vmid: int, request_id: str) -> dict[str, Any]:
+        if isinstance(vmid, bool) or not 1 <= int(vmid) <= 999999:
+            raise ValueError("invalid vmid")
+        if not REQUEST_ID_RE.fullmatch(str(request_id)):
+            raise ValueError("invalid request_id")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM host_jobs WHERE vmid=? AND request_id=?",
+                (int(vmid), str(request_id)),
+            ).fetchone()
+        if row is None:
+            raise KeyError((int(vmid), str(request_id)))
         return self._row(row)
 
     def queued(self) -> list[dict[str, Any]]:
@@ -643,6 +660,19 @@ class HostdApplication:
             return self.store.refresh_self_update_result(job_id)
         return job
 
+    def find_job_by_request_id(
+        self,
+        vmid: int,
+        request_id: str,
+    ) -> dict[str, Any]:
+        job = self.store.get_by_request_id(vmid, request_id)
+        if (
+            job["operation_type"] == "self_update"
+            and job["status"] not in TERMINAL_STATUSES
+        ):
+            return self.store.refresh_self_update_result(str(job["id"]))
+        return job
+
 
 class HostdHandler(BaseHTTPRequestHandler):
     server_version = f"hubinet-ops-hostd/{VERSION}"
@@ -654,6 +684,29 @@ class HostdHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, {"status": "ok", "version": VERSION})
             return
         if not self._authorized():
+            return
+        lookup_match = JOB_BY_REQUEST_PATH_RE.fullmatch(path)
+        if lookup_match:
+            raw_vmid = lookup_match.group("vmid")
+            request_id = lookup_match.group("request_id")
+            if (
+                not re.fullmatch(r"[1-9][0-9]{0,5}", raw_vmid)
+                or not REQUEST_ID_RE.fullmatch(request_id)
+            ):
+                self._send(HTTPStatus.BAD_REQUEST, {"error": "invalid job lookup"})
+                return
+            try:
+                job = self.app.find_job_by_request_id(
+                    int(raw_vmid),
+                    request_id,
+                )
+            except KeyError:
+                self._send(HTTPStatus.NOT_FOUND, {"error": "host job not found"})
+                return
+            except ValueError as exc:
+                self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            self._send(HTTPStatus.OK, job)
             return
         if path.startswith("/api/v1/jobs/"):
             try:

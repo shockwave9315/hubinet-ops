@@ -54,6 +54,16 @@ TERMINAL_JOB_STATUSES = {
     "rolled_back",
     "success",
 }
+HOST_CONTROL_OPERATION_TYPES = {
+    "lifecycle_start",
+    "lifecycle_shutdown",
+    "lifecycle_reboot",
+    "lifecycle_force_stop",
+    "snapshot_create",
+    "snapshot_rollback",
+    "snapshot_delete",
+    "self_update",
+}
 
 
 class OpsService:
@@ -1492,9 +1502,14 @@ class OpsService:
     def _reconcile_startup_jobs(self) -> None:
         for job in self.db.active_jobs():
             operation_type = str(job.get("operation_type") or "update")
+            if (
+                self.host_control is not None
+                and operation_type in HOST_CONTROL_OPERATION_TYPES
+            ):
+                self._reattach_host_control_job(job)
+                continue
             succeeded = False
             result: dict[str, Any] | None = None
-            error: Exception | None = None
             try:
                 if operation_type in {
                     "lifecycle_start", "lifecycle_shutdown", "lifecycle_force_stop"
@@ -1512,35 +1527,11 @@ class OpsService:
                     )
                     succeeded = exists if operation_type == "snapshot_create" else not exists
                     result = {"snapshot_exists": exists, "reconciled": True}
-                elif operation_type == "self_update":
-                    if self.host_control is None:
-                        raise ValueError(
-                            "CT110 self-update reconciliation requires PVE host control"
-                        )
-                    release = self._approved_self_update_release(job)
-                    result = self.host_control.execute(
-                        "self_update",
-                        int(job["vmid"]),
-                        str(job["request_id"]),
-                        release_fingerprint=str(release["fingerprint"]),
-                    )
-                    succeeded = True
             except Exception as exc:
-                error = exc
                 LOGGER.warning("Startup reconciliation failed for job %s: %s", job["id"], exc)
             if succeeded:
                 self.db.update_job(job["id"], result=result or {})
                 self._terminal(job, "success", "success", None)
-            elif operation_type == "self_update" and isinstance(error, HostControlError):
-                host_error = error
-                if host_error.result:
-                    self.db.update_job(job["id"], result=host_error.result)
-                self._terminal(
-                    job,
-                    "interrupted" if host_error.status == "interrupted" else "failed",
-                    "failed",
-                    str(host_error),
-                )
             else:
                 self._terminal(
                     job,
@@ -1548,6 +1539,46 @@ class OpsService:
                     "failed",
                     "Agent restarted during the operation; it was not replayed",
                 )
+
+    def _reattach_host_control_job(self, job: dict[str, Any]) -> None:
+        operation_type = str(job["operation_type"])
+        snapshot_name = (
+            str(job["snapshot_name"])
+            if operation_type.startswith("snapshot_") and job.get("snapshot_name")
+            else None
+        )
+        release_fingerprint: str | None = None
+        try:
+            if operation_type == "self_update":
+                release = self._approved_self_update_release(job)
+                release_fingerprint = str(release["fingerprint"])
+            result = self.host_control.wait_existing_job(
+                operation_type,
+                int(job["vmid"]),
+                str(job["request_id"]),
+                snapshot_name=snapshot_name,
+                release_fingerprint=release_fingerprint,
+            )
+            self._finalize_operation_success(
+                job,
+                result,
+                enforce_snapshot_retention=False,
+            )
+        except (HostControlError, ValueError) as exc:
+            LOGGER.warning(
+                "Read-only host job reattachment failed for local job %s: %s",
+                job["id"],
+                exc,
+            )
+            if isinstance(exc, HostControlError) and exc.status == "failed":
+                self._finalize_operation_failure(job, exc)
+                return
+            self._finalize_operation_failure(
+                job,
+                exc,
+                job_status="interrupted",
+                terminal_result="interrupted",
+            )
 
     def _run_job(self, job: dict[str, Any]) -> None:
         if str(job.get("operation_type") or "update") != "update":
@@ -1849,71 +1880,121 @@ class OpsService:
                 result = self._execute_retry_healthcheck(job, emit)
             else:
                 result = self._execute_host_operation(job)
-            if operation_type == "snapshot_create":
-                self._enforce_snapshot_retention(vmid, job)
-            self.db.update_job(job["id"], result=result)
-            state = self.get_state(vmid)
-            if operation_type.startswith("lifecycle_"):
-                runtime = str(result.get("lxc_status") or result.get("runtime_status") or "unknown")
-                state.update(
-                    {
-                        "lxc_status": runtime,
-                        "runtime_status": runtime,
-                        "lifecycle_action": operation_type.removeprefix("lifecycle_"),
-                        "lifecycle_status": "success",
-                        "lifecycle_finished_at": self._utc_second_timestamp(),
-                        "lifecycle_error": None,
-                    }
-                )
-            if operation_type.startswith("snapshot_"):
-                state["snapshot_operation_status"] = "success"
-                if operation_type == "snapshot_rollback":
-                    state.update(
-                        {
-                            "verification_status": "unknown",
-                            "last_verification": None,
-                            "apt_check_ok": None,
-                            "dpkg_audit_ok": None,
-                            "packages_remaining_count": None,
-                            "pending_updates": None,
-                            "update_status": "unknown",
-                            "updates": {"pending_count": None, "packages": []},
-                        }
-                    )
-                self._save_state(vmid, state)
-                self.list_snapshots(vmid)
-            elif operation_type == "retry_healthcheck":
-                state.update(result)
-                state["health_status"] = result.get(
-                    "health_status", result.get("health", "healthy")
-                )
-                state["last_refresh"] = self._utc_second_timestamp()
-                self._save_state(vmid, state)
-            else:
-                self._save_state(vmid, state)
-            self._terminal(job, "success", "success", None)
+            self._finalize_operation_success(job, result)
         except (ExecutorError, HostControlError, ValueError) as exc:
-            if isinstance(exc, HostControlError) and exc.result:
-                self.db.update_job(job["id"], result=exc.result)
-            state = self.get_state(vmid)
-            if operation_type == "retry_healthcheck" and isinstance(exc, ExecutorError):
-                if exc.data:
-                    state.update(exc.data)
-                    state["health_status"] = exc.data.get(
-                        "health_status", exc.data.get("health", "critical")
-                    )
-            if operation_type.startswith("lifecycle_"):
+            if isinstance(exc, HostControlError) and exc.status in {
+                "interrupted",
+                "not_found",
+                "unavailable",
+            }:
+                self._finalize_operation_failure(
+                    job,
+                    exc,
+                    job_status="interrupted",
+                    terminal_result="interrupted",
+                )
+            else:
+                self._finalize_operation_failure(job, exc)
+
+    def _finalize_operation_success(
+        self,
+        job: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        enforce_snapshot_retention: bool = True,
+    ) -> None:
+        vmid = int(job["vmid"])
+        operation_type = str(job["operation_type"])
+        if operation_type == "snapshot_create" and enforce_snapshot_retention:
+            self._enforce_snapshot_retention(vmid, job)
+        self.db.update_job(job["id"], result=result)
+        state = self.get_state(vmid)
+        if operation_type.startswith("lifecycle_"):
+            runtime = str(
+                result.get("lxc_status")
+                or result.get("runtime_status")
+                or "unknown"
+            )
+            state.update(
+                {
+                    "lxc_status": runtime,
+                    "runtime_status": runtime,
+                    "lifecycle_action": operation_type.removeprefix("lifecycle_"),
+                    "lifecycle_status": "success",
+                    "lifecycle_finished_at": self._utc_second_timestamp(),
+                    "lifecycle_error": None,
+                }
+            )
+        if operation_type.startswith("snapshot_"):
+            state["snapshot_operation_status"] = "success"
+            if operation_type == "snapshot_rollback":
                 state.update(
                     {
-                        "lifecycle_status": "failed",
-                        "lifecycle_finished_at": self._utc_second_timestamp(),
-                        "lifecycle_error": sanitize_text(exc, limit=2000),
+                        "verification_status": "unknown",
+                        "last_verification": None,
+                        "apt_check_ok": None,
+                        "dpkg_audit_ok": None,
+                        "packages_remaining_count": None,
+                        "pending_updates": None,
+                        "update_status": "unknown",
+                        "updates": {"pending_count": None, "packages": []},
                     }
                 )
-            if operation_type.startswith("snapshot_"):
-                state["snapshot_operation_status"] = "failed"
             self._save_state(vmid, state)
-            self._terminal(job, "failed", "failed", str(exc))
+            try:
+                self.list_snapshots(vmid)
+            except (ExecutorError, HostControlError, ValueError) as exc:
+                LOGGER.warning(
+                    "Read-only snapshot refresh failed after completed job %s: %s",
+                    job["id"],
+                    exc,
+                )
+        elif operation_type == "retry_healthcheck":
+            state.update(result)
+            state["health_status"] = result.get(
+                "health_status", result.get("health", "healthy")
+            )
+            state["last_refresh"] = self._utc_second_timestamp()
+            self._save_state(vmid, state)
+        else:
+            self._save_state(vmid, state)
+        self._terminal(job, "success", "success", None)
+
+    def _finalize_operation_failure(
+        self,
+        job: dict[str, Any],
+        error: ExecutorError | HostControlError | ValueError,
+        *,
+        job_status: str = "failed",
+        terminal_result: str = "failed",
+    ) -> None:
+        vmid = int(job["vmid"])
+        operation_type = str(job["operation_type"])
+        if isinstance(error, HostControlError) and error.result:
+            self.db.update_job(job["id"], result=error.result)
+        state = self.get_state(vmid)
+        if operation_type == "retry_healthcheck" and isinstance(error, ExecutorError):
+            if error.data:
+                state.update(error.data)
+                state["health_status"] = error.data.get(
+                    "health_status", error.data.get("health", "critical")
+                )
+        if operation_type.startswith("lifecycle_"):
+            state.update(
+                {
+                    "lifecycle_status": (
+                        "unknown" if job_status == "interrupted" else "failed"
+                    ),
+                    "lifecycle_finished_at": self._utc_second_timestamp(),
+                    "lifecycle_error": sanitize_text(error, limit=2000),
+                }
+            )
+        if operation_type.startswith("snapshot_"):
+            state["snapshot_operation_status"] = (
+                "unknown" if job_status == "interrupted" else "failed"
+            )
+        self._save_state(vmid, state)
+        self._terminal(job, job_status, terminal_result, str(error))
 
     def _execute_retry_healthcheck(
         self,
@@ -2231,11 +2312,18 @@ class OpsService:
             "rolled_back": "rolled_back",
             "manual_intervention": "manual_intervention",
             "failed": "failed",
+            "interrupted": "unknown",
         }[result]
         event = self.db.insert_job_event(
             job_id=job["id"],
             vmid=int(job["vmid"]),
-            level="error" if result in {"failed", "manual_intervention"} else "info",
+            level=(
+                "error"
+                if result in {"failed", "manual_intervention"}
+                else "warning"
+                if result == "interrupted"
+                else "info"
+            ),
             stage="completed" if result in {"success", "rolled_back"} else "failed",
             progress=100,
             event_type=f"job_{result}",

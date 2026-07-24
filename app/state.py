@@ -5,7 +5,7 @@ from typing import Any
 
 HEALTH_STATUSES = {"healthy", "degraded", "critical", "unknown", "offline"}
 UPDATE_STATUSES = {"unknown", "scanning", "up_to_date", "update_available"}
-LIFECYCLE_STATUSES = {"idle", "running", "success", "failed"}
+LIFECYCLE_STATUSES = {"idle", "running", "success", "failed", "unknown"}
 VERIFICATION_STATUSES = {"unknown", "running", "passed", "warning", "failed"}
 RECOVERY_SCAN_STATUSES = {"disabled", "idle", "scheduled", "running", "completed", "blocked", "cancelled", "failed"}
 OPERATION_STATUSES = {
@@ -16,6 +16,7 @@ OPERATION_STATUSES = {
     "failed",
     "rolled_back",
     "manual_intervention",
+    "unknown",
 }
 JOB_STAGES = {
     "idle",
@@ -43,7 +44,14 @@ JOB_STAGES = {
     "completed",
     "failed",
 }
-OPERATION_RESULTS = {None, "success", "failed", "rolled_back", "manual_intervention"}
+OPERATION_RESULTS = {
+    None,
+    "success",
+    "failed",
+    "interrupted",
+    "rolled_back",
+    "manual_intervention",
+}
 
 
 def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
@@ -262,7 +270,7 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     snapshot_operation = str(state.get("snapshot_operation_status") or "idle")
     state["snapshot_operation_status"] = (
         snapshot_operation
-        if snapshot_operation in {"idle", "running", "success", "failed"}
+        if snapshot_operation in {"idle", "running", "success", "failed", "unknown"}
         else "idle"
     )
     state.setdefault("profile_validation_status", "unknown")

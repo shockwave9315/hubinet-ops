@@ -9,6 +9,7 @@ import pytest
 from app.config import Settings
 from app.contracts import REQUIRED_APT_ACTIONS
 from app.database import Database
+from app.host_control import HostControlError
 from app.service import OpsService
 
 
@@ -41,6 +42,10 @@ class FakeHostControl:
     def __init__(self, status: str = "stopped") -> None:
         self.runtime = status
         self.calls: list[tuple[str, int, str, str | None, str | None]] = []
+        self.reattach_calls: list[
+            tuple[str, int, str, str | None, str | None]
+        ] = []
+        self.existing_jobs: dict[str, dict[str, Any]] = {}
         self.snapshots: list[dict[str, Any]] = []
         self.release = {
             "version": "0.4.0",
@@ -110,6 +115,40 @@ class FakeHostControl:
                 "exit_code": 0,
             }
         return {"runtime_status": self.runtime, "lxc_status": self.runtime}
+
+    def wait_existing_job(
+        self,
+        operation_type: str,
+        vmid: int,
+        request_id: str,
+        *,
+        snapshot_name: str | None = None,
+        release_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        self.reattach_calls.append(
+            (
+                operation_type,
+                vmid,
+                request_id,
+                snapshot_name,
+                release_fingerprint,
+            )
+        )
+        existing = self.existing_jobs.get(request_id)
+        if existing is None:
+            raise HostControlError(
+                "Host control job was not found; operation outcome is unknown",
+                status="not_found",
+            )
+        status = str(existing.get("status") or "succeeded")
+        result = dict(existing.get("result") or {})
+        if status != "succeeded":
+            raise HostControlError(
+                str(existing.get("error") or "Host control job failed"),
+                status=status,
+                result=result,
+            )
+        return result
 
 
 def settings(tmp_path: Path, *, vmid: int = 106, adapter: str = "apt") -> Settings:
@@ -535,8 +574,21 @@ def test_startup_reconciliation_marks_terminal_without_replaying(tmp_path: Path)
         vmid=106, container_name="ct-106", operation_type="lifecycle_start",
         request_id="startup-reconcile-0001",
     )
+    host.existing_jobs[job["request_id"]] = {
+        "status": "succeeded",
+        "result": {"runtime_status": "running", "lxc_status": "running"},
+    }
 
     service._reconcile_startup_jobs()
 
     assert db.get_job(job["id"])["status"] == "success"
     assert host.calls == []
+    assert host.reattach_calls == [
+        (
+            "lifecycle_start",
+            106,
+            "startup-reconcile-0001",
+            None,
+            None,
+        )
+    ]

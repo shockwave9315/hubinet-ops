@@ -20,7 +20,7 @@ The recovery worker uses observed in-process unhealthy→healthy transitions, a 
 
 ## Concurrency
 
-Read-only refresh can proceed independently. Scans are serialized per resource, and by default only one destructive maintenance job can be queued/running globally. Every destructive job has an idempotent request ID, durable events, and a terminal state. Startup reconciliation observes real LXC/snapshot state but never automatically replays an uncertain destructive operation.
+Read-only refresh can proceed independently. Scans are serialized per resource, and by default only one destructive maintenance job can be queued/running globally. Every destructive job has an idempotent request ID, durable events, and a terminal state. Startup reconciliation never replays uncertain destructive work. For hostd-backed operations it performs authenticated read-only lookup by VMID/request ID, verifies the operation and argument, and polls only the matching persisted host job; locally executed work uses read-only state observation.
 
 ## CT110 offline boundary
 

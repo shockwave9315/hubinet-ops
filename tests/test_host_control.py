@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import http.client
 import json
 import subprocess
 import sys
 import threading
 from datetime import UTC, datetime
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -28,6 +30,7 @@ from hubinet_ops_host_control import (  # noqa: E402
 from hubinet_ops_hostd import (  # noqa: E402
     HostdApplication,
     HostdConfig,
+    HostdHandler,
     HostJobRunner,
     HostJobStore,
 )
@@ -366,6 +369,117 @@ class BlockingController(DummyController):
         if not self.allow_completion.wait(timeout=5):
             raise RuntimeError("test did not release the blocked host operation")
         return {"action": action, "vmid": vmid}
+
+
+class RecordingHostJobRunner:
+    def __init__(self, controller: DummyController) -> None:
+        self.controller = controller
+        self.started: list[str] = []
+
+    def start(self, job_id: str) -> None:
+        self.started.append(job_id)
+
+
+@pytest.mark.parametrize("initial_status", ["queued", "running"])
+def test_http_lookup_by_request_is_read_only_and_preserves_active_job(
+    tmp_path: Path,
+    initial_status: str,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    job, _ = store.create(
+        vmid=110,
+        operation_type="snapshot_rollback",
+        request_id=f"lookup-{initial_status}-request-0001",
+        argument="hubinet-ops-110-manual-20260723T220000Z",
+    )
+    if initial_status == "running":
+        store.begin_execution(job["id"])
+    controller = DummyController()
+    runner = RecordingHostJobRunner(controller)
+    application = HostdApplication(
+        HostdConfig(
+            bind="127.0.0.1",
+            port=0,
+            database=tmp_path / "jobs.db",
+            client_allowlist=frozenset(),
+        ),
+        store,
+        runner,  # type: ignore[arg-type]
+        "g" * 64,
+        "u" * 64,
+    )
+    handler = type(
+        "LookupHostdHandler",
+        (HostdHandler,),
+        {"app": application},
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        server.server_address[1],
+        timeout=5,
+    )
+    headers = {"Authorization": f"Bearer {'g' * 64}"}
+    try:
+        path = f"/api/v1/jobs/by-request/110/{job['request_id']}"
+        connection.request("GET", path, headers=headers)
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status == 200
+        assert {
+            key: payload[key]
+            for key in (
+                "id",
+                "vmid",
+                "request_id",
+                "operation_type",
+                "argument",
+                "status",
+                "stage",
+                "result",
+                "error",
+            )
+        } == {
+            "id": job["id"],
+            "vmid": 110,
+            "request_id": job["request_id"],
+            "operation_type": "snapshot_rollback",
+            "argument": "hubinet-ops-110-manual-20260723T220000Z",
+            "status": initial_status,
+            "stage": "queued" if initial_status == "queued" else "executing",
+            "result": None,
+            "error": None,
+        }
+
+        connection.request(
+            "GET",
+            "/api/v1/jobs/by-request/110/missing-request-0001",
+            headers=headers,
+        )
+        missing = connection.getresponse()
+        assert missing.status == 404
+        assert json.loads(missing.read())["error"] == "host job not found"
+
+        connection.request(
+            "GET",
+            "/api/v1/jobs/by-request/110/bad",
+            headers=headers,
+        )
+        invalid = connection.getresponse()
+        assert invalid.status == 400
+        invalid.read()
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert runner.started == []
+    assert controller.calls == []
+    assert store.get(job["id"])["status"] == initial_status
+    assert len(store.queued()) == (1 if initial_status == "queued" else 0)
 
 
 class DelayedSelfUpdateController(DummyController):
