@@ -399,6 +399,7 @@ install -d -o root -g root -m 0700 "$(pve_path /var/lib/hubinet-ops-hostd)"
 install -d -o root -g root -m 0755 \
   "$(pve_path /var/log/pve/tasks)" \
   "$(pve_path /run/lxc/lock)" \
+  "$(pve_path /var/lib/lxc)" \
   "$(pve_path /etc/lvm/archive)" \
   "$(pve_path /etc/lvm/backup)"
 install -m 0644 "$SOURCE_DIR/deploy/pve/hubinet_ops_host_control.py" "$(pve_path /usr/local/lib/hubinet-ops/hubinet_ops_host_control.py)"

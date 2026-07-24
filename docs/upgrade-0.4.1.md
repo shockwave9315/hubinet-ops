@@ -19,13 +19,15 @@ cd /root/hubinet-ops
 bash deploy/upgrade-0.4.1-from-pve.sh
 ```
 
-The installer accepts no arguments. It backs up every PVE destination, every CT101–CT109 executor/profile, and the complete CT110 application/config/database state before mutation. It creates `/var/lib/hubinet-ops-hostd` as root:root 0700 and defensively creates the PVE task, LXC lock, and LVM backup directories before restarting hostd. The strict hostd sandbox remains enabled.
+The installer accepts no arguments. It backs up every PVE destination, every CT101–CT109 executor/profile, and the complete CT110 application/config/database state before mutation. It creates `/var/lib/hubinet-ops-hostd` as root:root 0700 and defensively creates the PVE task, LXC lock/state, and LVM backup directories before restarting hostd. The strict hostd sandbox remains enabled; `/var/lib/lxc` is writable only because PVE start/reboot creates temporary `rules.seccomp.tmp` files there.
 
 Safe, idempotent `pct push/exec` steps retry rc=129 at most three times. Other return codes fail immediately. A third rc=129 enters the normal global rollback. Running CTs receive executor/profile files through idempotent `install`; stopped CTs are mounted and never started.
 
 The config migrator preserves inventory, addresses, MQTT, existing database, snapshot policy, and snapshots. It aligns CT101–CT109 rollback capability with `manual_rollback_allowed: true`, keeps CT110's self-update policy, and remains idempotent.
 
 Final validation performs only read-only health, inspect, capabilities, state, schema, and snapshot-list calls. The full state JSON is read through stdin, never argv or environment. A failure reports the exact failed condition and invokes rollback.
+
+The backend obtains LXC runtime from PVE independently from guest inspect. Restoring an older snapshot that removes `hubinet-maint` leaves the container correctly reported as running while executor compatibility and guest health show drift. Backend-gated hostd lifecycle/snapshot operations remain available; APT scan/update/repair/verify and guest healthcheck remain blocked until the executor is restored.
 
 ## Home Assistant
 

@@ -20,9 +20,10 @@ ProtectSystem=strict
 # /etc/pve: PVE configuration and snapshot metadata.
 # /var/lib/hubinet-ops-hostd: durable host jobs and recovery events.
 # /run/lock and /run/lxc/lock: PVE/LXC operation locks.
+# /var/lib/lxc: temporary rules.seccomp files created by LXC start/reboot.
 # /var/log/pve/tasks: PVE UPID task records.
 # /etc/lvm/archive and /etc/lvm/backup: LVM metadata safety copies.
-ReadWritePaths=/etc/pve /var/lib/hubinet-ops-hostd /run/lock /var/log/pve/tasks /run/lxc/lock /etc/lvm/archive /etc/lvm/backup
+ReadWritePaths=/etc/pve /var/lib/hubinet-ops-hostd /run/lock /var/log/pve/tasks /run/lxc/lock /var/lib/lxc /etc/lvm/archive /etc/lvm/backup
 
 [Install]
 WantedBy=multi-user.target

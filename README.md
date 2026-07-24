@@ -12,7 +12,7 @@ The production inventory remains exactly VM/CT 100–110. CT101–CT109 use the 
 - MQTT is telemetry/discovery only and has no command topics.
 - The PVE SSH key is restricted to `deploy/pve/hubinet-ops-host`; no shell or command text is accepted.
 - Observation, managed-read, maintenance, lifecycle, host-control, and resource-type files are separate fail-closed controls.
-- Every destructive operation checks capability, runtime, concurrency, unresolved plans, executor protocol/actions/hashes, and snapshot ownership in the backend and PVE boundary.
+- Every destructive operation checks capability, PVE runtime, concurrency, unresolved plans, and snapshot ownership in the backend and PVE boundary. Guest-maintenance actions additionally require the executor protocol/actions/hashes; hostd-only lifecycle and snapshot actions do not.
 - Only Hubinet-owned snapshot names are accepted. New update snapshots use physical alias `pre` and normalize to logical kind `pre-update`; legacy `pre-update` and manual names remain readable.
 - Rich retained attributes remain separately bounded to 10,000 UTF-8 bytes and are deduplicated.
 

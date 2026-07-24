@@ -2,7 +2,7 @@
 
 ## `apt` / LXC
 
-Uses PVE `pct status`, the fixed `hubinet-maint` 0.4.1/protocol 1 actions, Hubinet-owned LXC snapshots, stabilization, configured services, optional Docker requirements, verification, repair policy, and rollback policy. Before any destructive operation and during telemetry refresh the backend verifies required actions, executor hash, profile hash, and profile-validation status—not only a version string. It is valid only for `resource_type: lxc`.
+Uses PVE `pct status`, the fixed `hubinet-maint` 0.4.1/protocol 1 actions, Hubinet-owned LXC snapshots, stabilization, configured services, optional Docker requirements, verification, repair policy, and rollback policy. PVE runtime is probed independently before guest inspection. Scan, preflight, update, repair, verify, and guest healthcheck require the complete executor contract—not only a version string. Hostd-only lifecycle and snapshot operations retain backend/PVE policy gates but deliberately do not depend on files inside the guest. It is valid only for `resource_type: lxc`.
 
 Profiles for CT101–CT109 are versioned in `deploy/managed/profiles`. A schema-valid but insufficient health contract is reported as `insufficient_health_contract`; it blocks automatic health-based rollback but does not invent services. Manual lifecycle/snapshot remains subject to the ordinary backend/PVE guards.
 

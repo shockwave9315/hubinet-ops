@@ -86,6 +86,7 @@ def test_hostd_unit_creates_state_and_has_exact_required_pve_write_paths() -> No
         "/run/lock",
         "/var/log/pve/tasks",
         "/run/lxc/lock",
+        "/var/lib/lxc",
         "/etc/lvm/archive",
         "/etc/lvm/backup",
     }
@@ -93,12 +94,30 @@ def test_hostd_unit_creates_state_and_has_exact_required_pve_write_paths() -> No
         "/var/lib/hubinet-ops-hostd",
         "/var/log/pve/tasks",
         "/run/lxc/lock",
+        "/var/lib/lxc",
         "/etc/lvm/archive",
         "/etc/lvm/backup",
     ):
         assert f"pve_path {path}" in PVE_INSTALLER.read_text(
             encoding="utf-8"
         ).replace('"', "")
+    assert "rules.seccomp" in text
+
+
+def test_hostd_lifecycle_has_bounded_seccomp_temp_write_access() -> None:
+    unit = (
+        ROOT / "deploy" / "pve" / "hubinet-ops-hostd.service"
+    ).read_text(encoding="utf-8")
+    installer = PVE_INSTALLER.read_text(encoding="utf-8")
+    writable = next(
+        line for line in unit.splitlines() if line.startswith("ReadWritePaths=")
+    ).split()
+
+    assert "ProtectSystem=strict" in unit
+    assert "/var/lib/lxc" in writable
+    assert "temporary rules.seccomp files created by LXC start/reboot" in unit
+    assert 'install -d -o root -g root -m 0755' in installer
+    assert '"$(pve_path /var/lib/lxc)"' in installer
 
 
 def test_pct_retry_is_err_trap_safe_and_deployment_uses_idempotent_install() -> None:

@@ -10,6 +10,7 @@ import pytest
 from app.config import Settings
 from app.contracts import REQUIRED_APT_ACTIONS
 from app.database import Database
+from app.executor import ExecutorError
 from app.host_control import HostControlError
 from app.service import OpsService
 
@@ -37,6 +38,17 @@ class CompatibleExecutor:
                 },
             }
         return {"ok": True, "data": {}}
+
+
+class MissingExecutor:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+        self.calls.append(action)
+        raise ExecutorError(
+            "missing guest executor /usr/local/sbin/hubinet-maint (rc=127)"
+        )
 
 
 class FakeHostControl:
@@ -166,12 +178,12 @@ def settings(tmp_path: Path, *, vmid: int = 106, adapter: str = "apt") -> Settin
         name: True
         for name in (
             "refresh", "scan", "approve", "reject", "retry_healthcheck",
-            "start", "shutdown", "reboot", "force_stop", "snapshot_create",
+            "rollback", "start", "shutdown", "reboot", "force_stop", "snapshot_create",
             "snapshot_list", "snapshot_rollback", "snapshot_delete",
         )
     }
     if adapter == "agent_self":
-        for name in ("scan", "retry_healthcheck"):
+        for name in ("scan", "retry_healthcheck", "rollback"):
             capabilities[name] = False
         capabilities["self_update"] = True
     resource: dict[str, Any] = {
@@ -241,6 +253,141 @@ def test_lifecycle_jobs_are_typed_durable_and_terminal(
     assert terminal["progress"] == 100
     assert host.runtime == expected
     assert host.calls[0][0] == operation
+
+
+def test_running_pve_runtime_and_host_operations_survive_missing_guest_executor(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=109)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    existing_snapshot = "hubinet-ops-109-manual-20260724T180227Z"
+    host.snapshots = [
+        {
+            "name": existing_snapshot,
+            "created_at": "2026-07-24T18:02:27+00:00",
+            "kind": "manual",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    executor = MissingExecutor()
+    service = OpsService(
+        cfg,
+        db,
+        executor,  # type: ignore[arg-type]
+        host_control=host,  # type: ignore[arg-type]
+    )
+    prior = service.get_state(109)
+    prior.update(
+        {
+            "last_operation_result": "failed",
+            "last_error": "preserved operation failure",
+        }
+    )
+    service._save_state(109, prior)
+
+    refreshed = service.refresh_container(109)
+
+    assert refreshed["lxc_status"] == "running"
+    assert refreshed["runtime_status"] == "running"
+    assert refreshed["health_status"] == "degraded"
+    assert refreshed["executor_compatible"] is False
+    assert "missing guest executor" in refreshed["executor_contract_error"]
+    assert refreshed["last_error"] == "preserved operation failure"
+
+    service.queue_lifecycle(109, "reboot", "missing-executor-reboot-0001")
+    assert run_queued(service, db)["status"] == "success"
+
+    service.queue_snapshot_create(109, "missing-executor-create-0001")
+    assert run_queued(service, db)["status"] == "success"
+    listing = service.list_snapshots(109)
+    assert listing["latest"] is not None
+
+    service.queue_snapshot_action(
+        109,
+        "delete",
+        existing_snapshot,
+        "missing-executor-delete-0001",
+    )
+    assert run_queued(service, db)["status"] == "success"
+
+    scan = service.scan_container(109)
+    assert scan["status"] == "error"
+    plan = db.create_plan(
+        vmid=109,
+        container_name="ct-109",
+        fingerprint="missing-executor-update",
+        risk="high",
+        payload={"pending_count": 1},
+        ttl_minutes=60,
+    )
+    with pytest.raises(ValueError, match="missing guest executor"):
+        service.approve_active(109, "missing-executor-update-0001")
+    assert db.get_plan(plan["id"])["status"] == "waiting_approval"
+
+    assert [call[0] for call in host.calls] == [
+        "lifecycle_reboot",
+        "snapshot_create",
+        "snapshot_delete",
+    ]
+
+
+def test_successful_hostd_rollback_records_executor_drift_without_failing_restore(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=109)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-109-pre-20260724T180227Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T18:02:27+00:00",
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    executor = MissingExecutor()
+    service = OpsService(
+        cfg,
+        db,
+        executor,  # type: ignore[arg-type]
+        host_control=host,  # type: ignore[arg-type]
+    )
+    assert service.refresh_container(109)["runtime_status"] == "running"
+    plan = db.create_plan(
+        vmid=109,
+        container_name="ct-109",
+        fingerprint="old-snapshot-update",
+        risk="high",
+        payload={"pending_count": 1},
+        ttl_minutes=60,
+    )
+    _, source = db.approve_plan(plan["id"])
+    db.update_plan_status(plan["id"], "failed")
+    db.update_job(
+        source["id"],
+        status="failed",
+        stage="failed",
+        progress=100,
+        snapshot_name=snapshot,
+    )
+    terminal = service.manual_rollback(109)
+    state = service.get_state(109)
+
+    assert terminal["status"] == "success"
+    assert state["operation_status"] == "success"
+    assert state["snapshot_operation_status"] == "success"
+    assert state["runtime_status"] == "running"
+    assert state["lxc_status"] == "running"
+    assert state["executor_compatible"] is False
+    assert "missing guest executor" in state["executor_contract_error"]
+    assert state["verification_status"] == "unknown"
+    assert host.calls[0][0] == "snapshot_rollback"
 
 
 def test_lifecycle_guards_runtime_active_job_plan_and_request_id(tmp_path: Path) -> None:

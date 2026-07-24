@@ -46,6 +46,11 @@ class InventoryExecutor:
     ) -> dict[str, Any]:
         if action == "capabilities":
             return {"ok": True, "data": {}}
+        if action == "status":
+            return {
+                "ok": True,
+                "data": {"runtime_status": "running", "lxc_status": "running"},
+            }
         assert action == "inspect"
         return {
             "ok": True,

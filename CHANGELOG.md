@@ -2,6 +2,9 @@
 
 ## 0.4.1
 
+- allow hostd to write LXC `rules.seccomp.tmp` files under `/var/lib/lxc` while retaining `ProtectSystem=strict`;
+- source LXC runtime from PVE independently of guest executor inspect, so a missing executor degrades guest health without falsely reporting a running CT as stopped;
+- decouple hostd lifecycle and snapshot operations from executor compatibility, keep APT scan/update/repair/verify gates, and record executor drift after a successful rollback without changing the rollback result;
 - create the hostd state directory through systemd and the installer, and extend the strict sandbox only for PVE task logs, LXC locks, and LVM metadata backups required by real snapshot operations;
 - replace unsupported `pct listsnapshot --output-format json` with node-resolved `pvesh` snapshot listing while preserving ownership, `current`, ordering, retention, rollback, and delete semantics;
 - retry only `pct` rc=129 up to three times inside an ERR-trap-safe conditional and install running-CT executors/profiles idempotently;
