@@ -82,6 +82,7 @@ resources:
     repair_actions: []
     required_services: []
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: false
     automatic_rollback: false
     manual_rollback_allowed: false
     manual_snapshot_restore_allowed: false
@@ -122,6 +123,7 @@ resources:
     repair_actions: []
     required_services: [cloudflared.service]
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -147,6 +149,7 @@ resources:
     repair_actions: []
     required_services: [apache2.service, mariadb.service]
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -172,6 +175,7 @@ resources:
     repair_actions: []
     required_services: [mosquitto.service]
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -201,6 +205,7 @@ resources:
       - postgresql@17-main.service
       - redis-server.service
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -226,6 +231,7 @@ resources:
     repair_actions: []
     required_services: []
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -258,6 +264,7 @@ resources:
         - weatherhub-weather-worker-1
         - weatherhub-redis-1
     approval_mode: always
+    pre_update_snapshot: true
     automatic_rollback: true
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -289,6 +296,7 @@ resources:
     repair_actions: []
     required_services: [postgresql@16-main.service, redis-server.service]
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -314,6 +322,7 @@ resources:
     repair_actions: []
     required_services: []
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -339,6 +348,7 @@ resources:
     repair_actions: []
     required_services: []
     docker: {enabled: true, require_health: false, required: []}
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: true
     manual_snapshot_restore_allowed: true
@@ -376,6 +386,7 @@ resources:
     repair_actions: []
     required_services: [hubinet-ops.service]
     docker: {enabled: false, require_health: false, required: []}
+    pre_update_snapshot: false
     automatic_rollback: false
     manual_rollback_allowed: false
     manual_snapshot_restore_allowed: true

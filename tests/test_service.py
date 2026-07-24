@@ -153,8 +153,8 @@ def settings(
                     "name": "weather",
                     "enabled": True,
                     "adapter": "apt",
-                    "criticality": "low",
                     "automatic_rollback": True,
+                    "pre_update_snapshot": True,
                     "manual_rollback_allowed": True,
                     "executor_contract": {
                         "executor_sha256": EXECUTOR_HASH,

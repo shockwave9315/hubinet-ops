@@ -45,6 +45,7 @@ RESOURCE_KEYS = {
     "monitoring",
     "operator_capabilities",
     "approval_mode",
+    "pre_update_snapshot",
     "automatic_rollback",
     "manual_rollback_allowed",
     "manual_snapshot_restore_allowed",
@@ -362,12 +363,19 @@ def validate_config(raw: dict[str, Any]) -> None:
             )
 
         for key in (
+            "pre_update_snapshot",
             "automatic_rollback",
             "manual_rollback_allowed",
             "manual_snapshot_restore_allowed",
         ):
             if key in value and not isinstance(value[key], bool):
                 raise RuntimeError(f"Resource {vmid} {key} must be a boolean")
+        if bool(value.get("automatic_rollback", False)) and not bool(
+            value.get("pre_update_snapshot", False)
+        ):
+            raise RuntimeError(
+                f"Resource {vmid} automatic_rollback requires pre_update_snapshot"
+            )
         if bool(capabilities.get("rollback", False)) and not bool(
             value.get("manual_rollback_allowed", False)
         ):

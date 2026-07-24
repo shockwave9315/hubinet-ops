@@ -744,6 +744,11 @@ def _executor_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
                     "mdi:shield-check-outline",
                 ),
                 _entity_card(
+                    _entity(vmid, cfg, "profile_validation_status"),
+                    "Kontrakt",
+                    "mdi:file-certificate-outline",
+                ),
+                _entity_card(
                     _entity(vmid, cfg, "executor_version"),
                     "Wersja",
                     "mdi:tag-outline",
@@ -867,8 +872,23 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             "{% endfor %}"
         ),
     }
+    health_warning = {
+        "type": "conditional",
+        "conditions": [
+            {
+                "condition": "state",
+                "entity": _entity(vmid, cfg, "profile_validation_status"),
+                "state": "insufficient_health_contract",
+            }
+        ],
+        "card": {
+            "type": "markdown",
+            "content": "⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu, nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.",
+        },
+    }
     status_section = _section(
         _title("Status", f"{_label(vmid, cfg)} · Adapter APT · {cfg['criticality']}"),
+        health_warning,
         _resource_status(vmid, cfg),
         _resource_chips(vmid, cfg),
     )

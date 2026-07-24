@@ -14,7 +14,9 @@
 - shorten new pre-update snapshot names to the `pre` physical alias, normalize it back to logical `pre-update`, retain legacy names, and enforce PVE's 40-character limit;
 - remove timestamp device classes from nullable MQTT diagnostics and make every capability template safe when the capability object or key is absent;
 - correct dashboard visibility for manual snapshots and waiting plans, retain numeric VMID script calls, and regenerate the deterministic dashboard;
-- require complete Home Assistant secrets, reject legacy plan URLs, document the active-plan endpoints, and add an optional checked `--restart-core` workflow while keeping no-restart as the default.
+- require complete Home Assistant secrets, reject legacy plan URLs, document the active-plan endpoints, and add an optional checked `--restart-core` workflow while keeping no-restart as the default;
+- decouple `pre_update_snapshot` policy from `automatic_rollback` so a pre-update safety snapshot can be created independently of the automatic rollback requirement;
+- display an explicit `insufficient_health_contract` warning in the Home Assistant dashboard when a missing healthcheck contract blocks automatic rollback.
 
 ## 0.4.0
 

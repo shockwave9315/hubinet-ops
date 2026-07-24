@@ -53,9 +53,11 @@ def main(target_version: str = "0.4.0") -> int:
             raise SystemExit(f"VMID {vmid} configuration must be an object")
         if vmid == 100:
             cfg["operator_capabilities"] = capabilities(set())
+            cfg["pre_update_snapshot"] = False
         elif vmid <= 109:
             cfg["operator_capabilities"] = capabilities(full)
             cfg["manual_rollback_allowed"] = True
+            cfg["pre_update_snapshot"] = True
             cfg["executor_contract"] = {
                 "executor_sha256": digest(EXECUTOR),
                 "profile_sha256": digest(PROFILES / f"ct{vmid}.json"),
@@ -68,6 +70,7 @@ def main(target_version: str = "0.4.0") -> int:
                  "snapshot_delete", "self_update"}
             )
             cfg.setdefault("snapshot_retention", 5)
+            cfg["pre_update_snapshot"] = False
             cfg["manual_rollback_allowed"] = False
         cfg["manual_snapshot_restore_allowed"] = vmid != 100
     raw.pop("containers", None)

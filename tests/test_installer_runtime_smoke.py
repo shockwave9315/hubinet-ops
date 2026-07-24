@@ -14,9 +14,8 @@ def test_current_release_installer_runtime_smoke() -> None:
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash is unavailable on this platform")
-    smoke = ROOT / "tests" / "shell" / "runtime_smoke_0_4_1.sh"
     result = subprocess.run(
-        [bash, str(smoke)],
+        [bash, "tests/shell/runtime_smoke_0_4_1.sh"],
         cwd=ROOT,
         text=True,
         capture_output=True,

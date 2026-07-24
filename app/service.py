@@ -172,6 +172,7 @@ class OpsService:
             "ip_address": cfg.get("ip_address"),
             "guest_agent": bool(cfg.get("guest_agent", False)),
             "approval_mode": cfg.get("approval_mode", "always"),
+            "pre_update_snapshot": bool(cfg.get("pre_update_snapshot", False)),
             "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
             "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
             "manual_snapshot_restore_allowed": bool(
@@ -1724,6 +1725,7 @@ class OpsService:
         cfg = self._resource(vmid)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         auto_rollback = bool(cfg.get("automatic_rollback", False))
+        pre_update_snapshot = bool(cfg.get("pre_update_snapshot", False))
         snapshot = _snapshot_name(
             vmid,
             "pre-update",
@@ -1769,13 +1771,13 @@ class OpsService:
                     "pending_count": preflight_updates.get("pending_count")
                 },
             )
-            if auto_rollback:
+            if pre_update_snapshot:
                 self.db.update_job(job["id"], snapshot_name=snapshot)
                 emit(
                     stage="snapshot",
                     progress=20,
                     event_type="snapshot_started",
-                    message="Creating rollback snapshot",
+                    message="Creating rollback snapshot" if auto_rollback else "Creating pre-update safety snapshot",
                 )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
                 self._enforce_snapshot_retention(vmid, job)
@@ -1783,7 +1785,7 @@ class OpsService:
                     stage="snapshot",
                     progress=25,
                     event_type="snapshot_created",
-                    message="Rollback snapshot created",
+                    message="Rollback snapshot created" if auto_rollback else "Pre-update safety snapshot created",
                 )
             emit(
                 stage="updating",
@@ -1926,7 +1928,7 @@ class OpsService:
                     "active_job_id": job["id"],
                     "last_update": utc_now(),
                     "last_error": None,
-                    "snapshot_name": snapshot if auto_rollback else None,
+                    "snapshot_name": snapshot if pre_update_snapshot else None,
                     "verification_status": verification_status,
                     "last_verification": self._now().isoformat(),
                     "apt_check_ok": bool(verification_data.get("apt_check_ok", False)),
