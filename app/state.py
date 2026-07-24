@@ -157,6 +157,9 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("last_offline_recovery_id", None)
     state.setdefault("last_offline_recovery_snapshot", None)
     state.setdefault("last_offline_recovery_at", None)
+    state.setdefault("last_offline_recovery_status", None)
+    state.setdefault("last_offline_recovery_error", None)
+    state.setdefault("last_offline_recovery_mutation_started_at", None)
     state["hostname"] = str(state.get("hostname") or "")[:255]
     state["os"] = str(state.get("os") or "")[:255]
     state["uptime_seconds"] = max(0, _safe_int(state.get("uptime_seconds"), 0))

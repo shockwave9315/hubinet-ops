@@ -169,6 +169,7 @@ class HostJobStore:
                     snapshot_name TEXT,
                     operation_type TEXT NOT NULL,
                     started_at TEXT NOT NULL,
+                    mutation_started_at TEXT,
                     status TEXT NOT NULL,
                     result_json TEXT,
                     error TEXT,
@@ -187,6 +188,16 @@ class HostJobStore:
             for name in ("launching_started_at", "launch_deadline_at"):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE host_jobs ADD COLUMN {name} TEXT")
+            recovery_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(recovery_events)"
+                ).fetchall()
+            }
+            if "mutation_started_at" not in recovery_columns:
+                connection.execute(
+                    "ALTER TABLE recovery_events ADD COLUMN mutation_started_at TEXT"
+                )
 
     def create(
         self,
@@ -400,6 +411,32 @@ class HostJobStore:
         persisted = self.get(job_id)
         self._sync_recovery_event(persisted)
         return persisted
+
+    def mark_recovery_mutation_started(self, job_id: str) -> dict[str, Any]:
+        mutation_started_at = utc_now()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE recovery_events "
+                "SET mutation_started_at=COALESCE(mutation_started_at, ?) "
+                "WHERE host_job_id=? AND status='running'",
+                (mutation_started_at, job_id),
+            )
+            if cursor.rowcount != 1:
+                connection.execute("ROLLBACK")
+                raise HostControlError(
+                    "active recovery event is missing before destructive execution"
+                )
+            persisted = connection.execute(
+                "SELECT * FROM recovery_events WHERE host_job_id=?",
+                (job_id,),
+            ).fetchone()
+            connection.execute("COMMIT")
+        if persisted is None:
+            raise HostControlError(
+                "failed to persist recovery mutation-attempt marker"
+            )
+        return self._recovery_row(persisted)
 
     def transition_from_active(
         self,
@@ -700,6 +737,11 @@ class HostJobRunner:
                 job["operation_type"],
             )
             try:
+                if job["operation_type"] in {
+                    "offline_snapshot_restore",
+                    "offline_force_stop",
+                }:
+                    self.store.mark_recovery_mutation_started(job_id)
                 result = self.controller.execute(
                     action,
                     job["vmid"],

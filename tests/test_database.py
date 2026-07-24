@@ -106,6 +106,41 @@ def test_020_database_migrates_without_data_loss(tmp_path: Path) -> None:
     assert reopened.get_resource_state(106)["resource_type"] == "lxc"
 
 
+def test_recovery_event_schema_adds_mutation_started_marker(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy-recovery.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE processed_recovery_events (
+                recovery_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                vmid INTEGER NOT NULL,
+                snapshot_name TEXT,
+                operation_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT,
+                error TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                processed_at TEXT NOT NULL
+            );
+            """
+        )
+
+    Database(path)
+
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(processed_recovery_events)"
+            )
+        }
+    assert "mutation_started_at" in columns
+
+
 def test_events_are_ordered_bounded_monotonic_and_redacted(tmp_path: Path) -> None:
     db = Database(tmp_path / "ops.db")
     job = create_job(db)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import http.client
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -849,10 +850,16 @@ def test_offline_restore_persists_recovery_marker_before_rollback_and_survives_r
     assert len(running) == 1
     assert running[0]["host_job_id"] == job["id"]
     assert running[0]["status"] == "running"
+    assert running[0]["mutation_started_at"] is not None
     assert running[0]["completed_at"] is None
 
     restarted = HostJobStore(database)
-    assert restarted.list_unacknowledged_recovery_events()[0]["status"] == "running"
+    restarted_event = restarted.list_unacknowledged_recovery_events()[0]
+    assert restarted_event["status"] == "running"
+    assert (
+        restarted_event["mutation_started_at"]
+        == running[0]["mutation_started_at"]
+    )
     controller.allow_completion.set()
     assert runner.completed.wait(timeout=5)
     terminal = store.get(job["id"])
@@ -927,6 +934,21 @@ def test_offline_restore_http_requires_recovery_scope_and_explicit_confirmation(
         )
         assert status == 202
         assert payload["operation_type"] == "offline_snapshot_restore"
+        recovery_list = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        recovery_list.request(
+            "GET",
+            "/api/v1/recovery-events",
+            headers={"Authorization": f"Bearer {'b' * 64}"},
+        )
+        response = recovery_list.getresponse()
+        assert response.status == 200
+        events = json.loads(response.read())["events"]
+        recovery_list.close()
+        assert len(events) == 1
+        assert "mutation_started_at" in events[0]
+        assert events[0]["mutation_started_at"] is None
     finally:
         server.shutdown()
         server.server_close()
@@ -982,7 +1004,7 @@ def test_offline_restore_rejects_running_ct110_foreign_snapshot_and_active_host_
     assert runner.started == []
 
 
-def test_recovery_marker_tracks_failure_and_restart_interruption(tmp_path: Path) -> None:
+def test_recovery_marker_tracks_controller_failure(tmp_path: Path) -> None:
     class FailingRecoveryController(RecoveryController):
         def execute(
             self,
@@ -1015,20 +1037,99 @@ def test_recovery_marker_tracks_failure_and_restart_interruption(tmp_path: Path)
     failed = store.list_unacknowledged_recovery_events()[0]
     assert failed["status"] == "failed"
     assert failed["error"] == "exact pct rollback failure"
+    assert failed["mutation_started_at"] is not None
 
-    store.acknowledge_recovery_event(failed["recovery_id"])
-    active, _ = store.create_recovery(
+
+def test_recovery_restart_distinguishes_queued_from_mutation_started(
+    tmp_path: Path,
+) -> None:
+    queued_database = tmp_path / "queued.db"
+    queued_store = HostJobStore(queued_database)
+    queued, _ = queued_store.create_recovery(
         vmid=110,
-        operation_type="offline_force_stop",
-        request_id="offline-interrupted-request-0001",
-        argument=None,
+        operation_type="offline_snapshot_restore",
+        request_id="offline-queued-restart-0001",
+        argument="hubinet-ops-110-manual-20260724T100000Z",
     )
-    store.begin_execution(active["id"])
-    restarted = HostJobStore(database)
-    restarted.reconcile_startup(DummyController())  # type: ignore[arg-type]
-    interrupted = restarted.list_unacknowledged_recovery_events()[0]
+    queued_controller = DummyController()
+    HostJobStore(queued_database).reconcile_startup(queued_controller)  # type: ignore[arg-type]
+    queued_event = HostJobStore(
+        queued_database
+    ).list_unacknowledged_recovery_events()[0]
+    assert queued_event["host_job_id"] == queued["id"]
+    assert queued_event["status"] == "interrupted"
+    assert queued_event["mutation_started_at"] is None
+    assert queued_controller.calls == []
+
+    started_database = tmp_path / "started.db"
+    started_store = HostJobStore(started_database)
+    started, _ = started_store.create_recovery(
+        vmid=110,
+        operation_type="offline_snapshot_restore",
+        request_id="offline-started-restart-0001",
+        argument="hubinet-ops-110-manual-20260724T100000Z",
+    )
+    started_store.begin_execution(started["id"])
+    marked = started_store.mark_recovery_mutation_started(started["id"])
+    assert marked["mutation_started_at"] is not None
+    started_controller = DummyController()
+    HostJobStore(started_database).reconcile_startup(started_controller)  # type: ignore[arg-type]
+    interrupted = HostJobStore(
+        started_database
+    ).list_unacknowledged_recovery_events()[0]
     assert interrupted["status"] == "interrupted"
+    assert interrupted["mutation_started_at"] == marked["mutation_started_at"]
     assert "outcome is unknown" in interrupted["error"]
+    assert started_controller.calls == []
+
+
+def test_hostd_migrates_recovery_events_mutation_marker(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-hostd.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE host_jobs (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                vmid INTEGER NOT NULL,
+                operation_type TEXT NOT NULL,
+                argument TEXT,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                progress INTEGER NOT NULL,
+                result_json TEXT,
+                error TEXT,
+                launching_started_at TEXT,
+                launch_deadline_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(vmid, request_id)
+            );
+            CREATE TABLE recovery_events (
+                recovery_id TEXT PRIMARY KEY,
+                host_job_id TEXT NOT NULL UNIQUE,
+                request_id TEXT NOT NULL,
+                vmid INTEGER NOT NULL,
+                snapshot_name TEXT,
+                operation_type TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_json TEXT,
+                error TEXT,
+                completed_at TEXT,
+                acknowledged_at TEXT
+            );
+            """
+        )
+
+    HostJobStore(database)
+
+    with sqlite3.connect(database) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(recovery_events)")
+        }
+    assert "mutation_started_at" in columns
 
 
 def test_host_job_runner_persists_terminal_result(tmp_path: Path) -> None:

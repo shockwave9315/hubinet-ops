@@ -109,12 +109,24 @@ class Database:
                     result_json TEXT,
                     error TEXT,
                     started_at TEXT NOT NULL,
+                    mutation_started_at TEXT,
                     completed_at TEXT,
                     processed_at TEXT NOT NULL
                 );
                 """
             )
             self._migrate_jobs(conn)
+            recovery_columns = {
+                str(row["name"])
+                for row in conn.execute(
+                    "PRAGMA table_info(processed_recovery_events)"
+                ).fetchall()
+            }
+            if "mutation_started_at" not in recovery_columns:
+                conn.execute(
+                    "ALTER TABLE processed_recovery_events "
+                    "ADD COLUMN mutation_started_at TEXT"
+                )
             self._migrate_container_states(conn)
             conn.execute("PRAGMA user_version=400")
 
@@ -601,8 +613,14 @@ class Database:
         ):
             raise ValueError("Offline restore recovery event has invalid snapshot")
         started_at = str(event.get("started_at") or "")
+        mutation_started_at = (
+            str(event.get("mutation_started_at") or "") or None
+        )
         completed_at = str(event.get("completed_at") or "") or None
         if parse_utc_timestamp(started_at) is None or (
+            mutation_started_at is not None
+            and parse_utc_timestamp(mutation_started_at) is None
+        ) or (
             completed_at is not None and parse_utc_timestamp(completed_at) is None
         ):
             raise ValueError("Recovery event has invalid timestamps")
@@ -624,6 +642,7 @@ class Database:
                     "snapshot_name": snapshot_name,
                     "operation_type": operation_type,
                     "status": status,
+                    "mutation_started_at": mutation_started_at,
                 }
                 if any(
                     persisted_existing.get(key) != value
@@ -635,7 +654,17 @@ class Database:
                     )
                 conn.execute("COMMIT")
                 return persisted_existing, False
-            if status == "succeeded" and operation_type == "offline_snapshot_restore":
+            restore_state_is_untrusted = (
+                operation_type == "offline_snapshot_restore"
+                and (
+                    status == "succeeded"
+                    or (
+                        mutation_started_at is not None
+                        and status in {"failed", "interrupted"}
+                    )
+                )
+            )
+            if restore_state_is_untrusted:
                 conn.execute(
                     "UPDATE plans SET status='superseded' "
                     "WHERE status='waiting_approval'"
@@ -647,7 +676,11 @@ class Database:
                     {
                         "recovery_id": recovery_id,
                         "snapshot_name": snapshot_name,
-                        "recovered": True,
+                        "recovery_status": status,
+                        "recovery_error": error,
+                        "mutation_started_at": mutation_started_at,
+                        "backend_state_invalidated": True,
+                        "recovered": status == "succeeded",
                     }
                 )
                 conn.execute(
@@ -697,6 +730,11 @@ class Database:
                                 "last_offline_recovery_id": recovery_id,
                                 "last_offline_recovery_snapshot": snapshot_name,
                                 "last_offline_recovery_at": completed_at or processed_at,
+                                "last_offline_recovery_status": status,
+                                "last_offline_recovery_error": error,
+                                "last_offline_recovery_mutation_started_at": (
+                                    mutation_started_at
+                                ),
                             }
                         )
                     normalized = normalize_state(state)
@@ -711,8 +749,8 @@ class Database:
             conn.execute(
                 "INSERT INTO processed_recovery_events "
                 "(recovery_id,request_id,vmid,snapshot_name,operation_type,status,"
-                "result_json,error,started_at,completed_at,processed_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "result_json,error,started_at,mutation_started_at,completed_at,processed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     recovery_id,
                     request_id,
@@ -723,6 +761,7 @@ class Database:
                     bounded_json(result_payload),
                     error,
                     started_at,
+                    mutation_started_at,
                     completed_at,
                     processed_at,
                 ),

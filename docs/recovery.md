@@ -16,7 +16,11 @@ After rollback, current verification and remaining-package fields are cleared to
 
 If CT110 is stopped and its backend cannot answer, the separately labeled offline restore is the only snapshot break-glass path. It requires the dedicated recovery token, exact confirmation, stopped runtime, no active hostd job, and an owned rollback-eligible snapshot. It is never selected automatically after a backend error.
 
-Hostd persists the recovery ID, request ID, VMID, snapshot, type, timestamps, status, result, and error outside CT110 before invoking rollback. It retains the event until backend ACK. On the next start, CT110 reads events without mutation, then atomically records each recovery ID, supersedes waiting plans, marks approved plans recovered, interrupts restored queued/running jobs, clears active IDs and verification/package projections, and records the snapshot audit. Only then does it ACK. A crash before ACK causes an idempotent reread, not another restore.
+Hostd persists the recovery ID, request ID, VMID, snapshot, type, timestamps, status, result, and error outside CT110. The event is created while the host job is queued. Immediately before invoking the PVE controller, hostd atomically stores `mutation_started_at`; a failure to persist that marker prevents the controller call. The marker survives hostd and PVE restarts and is exposed by the read-only recovery-events API.
+
+An interrupted queued event without `mutation_started_at` proves that hostd never reached the destructive call boundary, so it is audited but does not invalidate backend state. For `offline_snapshot_restore`, a succeeded event always invalidates restored state. A failed or interrupted event with `mutation_started_at` keeps its true failed/interrupted status and exact error, but its PVE outcome is treated as unknown: the backend conservatively supersedes waiting plans, marks approved plans recovered, interrupts restored queued/running jobs, clears active IDs and verification/package projections, and records the recovery ID, snapshot, original status, error, and mutation timestamp. `offline_force_stop` never triggers snapshot-restore invalidation.
+
+Hostd retains every recovery event until backend ACK. On the next start, CT110 reads events without mutation and commits the event audit plus any required invalidation atomically. Only then does it ACK. A crash after the local commit but before ACK causes an idempotent reread, not another invalidation or restore.
 
 ## Disable MQTT
 

@@ -562,23 +562,12 @@ def test_restore_plan_gate_and_local_job_insert_are_atomic(
     assert host.calls == []
 
 
-def test_startup_consumes_offline_recovery_idempotently_before_any_replay(
+def _seed_recovery_backend(
     tmp_path: Path,
-) -> None:
-    class AckFailOnceHostControl(FakeHostControl):
-        def __init__(self) -> None:
-            super().__init__("running")
-            self.fail_ack = True
-
-        def acknowledge_recovery_event(self, recovery_id: str) -> dict[str, Any]:
-            if self.fail_ack:
-                self.fail_ack = False
-                raise HostControlError("simulated crash before ACK", status="unavailable")
-            return super().acknowledge_recovery_event(recovery_id)
-
+) -> tuple[Database, FakeHostControl, OpsService, dict[str, Any], dict[str, Any], dict[str, Any]]:
     cfg = settings(tmp_path, vmid=110, adapter="agent_self")
     db = Database(cfg.db_path)
-    host = AckFailOnceHostControl()
+    host = FakeHostControl("running")
     service = OpsService(
         cfg, db, CompatibleExecutor(), host_control=host  # type: ignore[arg-type]
     )
@@ -620,22 +609,67 @@ def test_startup_consumes_offline_recovery_idempotently_before_any_replay(
             "update_status": "update_available",
         },
     )
+    return db, host, service, approved_plan, active_job, waiting_plan
+
+
+def _recovery_event(
+    *,
+    recovery_id: str,
+    status: str,
+    operation_type: str = "offline_snapshot_restore",
+    mutation_started_at: str | None = "2026-07-24T11:00:01+00:00",
+) -> dict[str, Any]:
+    snapshot = (
+        "hubinet-ops-110-manual-20260724T100000Z"
+        if operation_type == "offline_snapshot_restore"
+        else None
+    )
+    return {
+        "recovery_id": recovery_id,
+        "host_job_id": "b" * 32,
+        "request_id": f"offline-recovery-{recovery_id[:8]}",
+        "vmid": 110,
+        "snapshot_name": snapshot,
+        "operation_type": operation_type,
+        "started_at": "2026-07-24T11:00:00+00:00",
+        "mutation_started_at": mutation_started_at,
+        "status": status,
+        "result": {"snapshot": snapshot, "action": "rollback"},
+        "error": "hostd restarted; rollback outcome is unknown"
+        if status != "succeeded"
+        else None,
+        "completed_at": "2026-07-24T11:05:00+00:00",
+    }
+
+
+def test_startup_consumes_interrupted_started_recovery_idempotently_before_any_replay(
+    tmp_path: Path,
+) -> None:
+    class AckFailOnceHostControl(FakeHostControl):
+        def __init__(self, source: FakeHostControl) -> None:
+            super().__init__(source.runtime)
+            self.fail_ack = True
+
+        def acknowledge_recovery_event(self, recovery_id: str) -> dict[str, Any]:
+            if self.fail_ack:
+                self.fail_ack = False
+                raise HostControlError("simulated crash before ACK", status="unavailable")
+            return super().acknowledge_recovery_event(recovery_id)
+
+    db, original_host, original_service, approved_plan, active_job, waiting_plan = (
+        _seed_recovery_backend(tmp_path)
+    )
+    host = AckFailOnceHostControl(original_host)
+    service = OpsService(
+        original_service.settings,
+        db,
+        CompatibleExecutor(),
+        host_control=host,  # type: ignore[arg-type]
+    )
     recovery_id = "a" * 32
     snapshot = "hubinet-ops-110-manual-20260724T100000Z"
     host.recovery_events = [
-        {
-            "recovery_id": recovery_id,
-            "host_job_id": "b" * 32,
-            "request_id": "offline-recovery-event-0001",
-            "vmid": 110,
-            "snapshot_name": snapshot,
-            "operation_type": "offline_snapshot_restore",
-            "started_at": "2026-07-24T11:00:00+00:00",
-            "status": "succeeded",
-            "result": {"snapshot": snapshot, "action": "rollback"},
-            "error": None,
-            "completed_at": "2026-07-24T11:05:00+00:00",
-        }
+        _recovery_event(recovery_id=recovery_id, status="interrupted")
     ]
 
     service._consume_offline_recovery_events()
@@ -652,19 +686,106 @@ def test_startup_consumes_offline_recovery_idempotently_before_any_replay(
     assert state["last_verification"] is None
     assert state["apt_check_ok"] is None
     assert state["dpkg_audit_ok"] is None
+    assert state["packages_remaining_count"] is None
     assert state["pending_updates"] is None
     assert state["update_status"] == "unknown"
     assert state["last_offline_recovery_id"] == recovery_id
     assert state["last_offline_recovery_snapshot"] == snapshot
+    assert state["last_offline_recovery_status"] == "interrupted"
+    assert "outcome is unknown" in state["last_offline_recovery_error"]
+    assert state["last_offline_recovery_mutation_started_at"] is not None
     assert host.acknowledged_recovery_ids == []
     assert host.calls == []
 
     service._consume_offline_recovery_events()
 
     assert host.acknowledged_recovery_ids == [recovery_id]
-    assert db.get_processed_recovery_event(recovery_id)["status"] == "succeeded"
+    persisted = db.get_processed_recovery_event(recovery_id)
+    assert persisted["status"] == "interrupted"
+    assert persisted["error"] == "hostd restarted; rollback outcome is unknown"
+    assert persisted["mutation_started_at"] is not None
     assert db.get_job(active_job["id"])["result"]["recovery_id"] == recovery_id
     assert host.calls == []
+
+    changed_contract = dict(host.recovery_events[0])
+    changed_contract["mutation_started_at"] = "2026-07-24T11:00:02+00:00"
+    with pytest.raises(
+        ValueError,
+        match="contract changed after local persistence",
+    ):
+        db.apply_recovery_event(changed_contract)
+
+
+@pytest.mark.parametrize(
+    ("status", "operation_type", "mutation_started_at", "should_invalidate"),
+    [
+        ("succeeded", "offline_snapshot_restore", None, True),
+        (
+            "failed",
+            "offline_snapshot_restore",
+            "2026-07-24T11:00:01+00:00",
+            True,
+        ),
+        ("interrupted", "offline_snapshot_restore", None, False),
+        (
+            "interrupted",
+            "offline_force_stop",
+            "2026-07-24T11:00:01+00:00",
+            False,
+        ),
+    ],
+)
+def test_recovery_invalidation_requires_restore_success_or_started_mutation(
+    tmp_path: Path,
+    status: str,
+    operation_type: str,
+    mutation_started_at: str | None,
+    should_invalidate: bool,
+) -> None:
+    db, host, service, approved_plan, active_job, waiting_plan = (
+        _seed_recovery_backend(tmp_path)
+    )
+    recovery_id = {
+        ("succeeded", "offline_snapshot_restore"): "c" * 32,
+        ("failed", "offline_snapshot_restore"): "d" * 32,
+        ("interrupted", "offline_snapshot_restore"): "e" * 32,
+        ("interrupted", "offline_force_stop"): "f" * 32,
+    }[(status, operation_type)]
+    host.recovery_events = [
+        _recovery_event(
+            recovery_id=recovery_id,
+            status=status,
+            operation_type=operation_type,
+            mutation_started_at=mutation_started_at,
+        )
+    ]
+
+    service._consume_offline_recovery_events()
+
+    assert db.get_processed_recovery_event(recovery_id)["status"] == status
+    assert host.acknowledged_recovery_ids == [recovery_id]
+    assert host.calls == []
+    if should_invalidate:
+        assert db.get_plan(approved_plan["id"])["status"] == "recovered"
+        assert db.get_plan(waiting_plan["id"])["status"] == "superseded"
+        invalidated_job = db.get_job(active_job["id"])
+        assert invalidated_job["status"] == "interrupted"
+        assert invalidated_job["result"]["recovery_status"] == status
+        state = service.get_state(110)
+        assert state["verification_status"] == "unknown"
+        assert state["last_offline_recovery_status"] == status
+        assert state["last_offline_recovery_error"] == (
+            None
+            if status == "succeeded"
+            else "hostd restarted; rollback outcome is unknown"
+        )
+    else:
+        assert db.get_plan(approved_plan["id"])["status"] == "approved"
+        assert db.get_plan(waiting_plan["id"])["status"] == "waiting_approval"
+        assert db.get_job(active_job["id"])["status"] == "queued"
+        state = service.get_state(110)
+        assert state["verification_status"] == "passed"
+        assert state["last_offline_recovery_id"] is None
 
 
 def test_ct110_self_update_requires_plan_approval_and_rechecks_before_rollout(
