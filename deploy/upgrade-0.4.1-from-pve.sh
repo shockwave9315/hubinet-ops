@@ -28,6 +28,7 @@ agent_backup_complete=false
 agent_changes_started=false
 hostd_was_active=false
 hostd_was_enabled=false
+declare -A mounted_cts=()
 
 pve_path() { printf '%s%s' "$PVE_ROOT" "$1"; }
 
@@ -171,14 +172,52 @@ backup_running_ct_file() {
 }
 
 safe_mount() {
-  local vmid="$1" output mountpoint
-  output="$(pct mount "$vmid")"
-  mountpoint="$(sed -n "s/.*'\([^']*\)'.*/\1/p" <<<"$output")"
-  [[ -n "$mountpoint" && "$mountpoint" == /* && "$mountpoint" != / && -d "$mountpoint" ]] || {
+  local vmid="$1" output
+  if ! output="$(pct mount "$vmid")"; then
+    return 1
+  fi
+  mounted_cts[$vmid]=true
+  MOUNTED_PATH="$(sed -n "s/.*'\([^']*\)'.*/\1/p" <<<"$output")"
+  [[ -n "$MOUNTED_PATH" && "$MOUNTED_PATH" == /* && "$MOUNTED_PATH" != / && -d "$MOUNTED_PATH" ]] || {
     echo "Unsafe or unknown mountpoint for CT$vmid" >&2
+    unmount_ct_with_retry "$vmid" || true
     return 1
   }
-  printf '%s' "$mountpoint"
+}
+
+unmount_ct() {
+  local vmid="$1"
+  if [[ "${mounted_cts[$vmid]:-false}" == true ]]; then
+    if pct_retry_129 unmount "$vmid" >/dev/null 2>&1; then
+      unset 'mounted_cts[$vmid]'
+      return 0
+    fi
+    return 1
+  fi
+}
+
+unmount_ct_with_retry() {
+  local vmid="$1"
+  [[ "${mounted_cts[$vmid]:-false}" == true ]] || return 0
+  if unmount_ct "$vmid"; then
+    return 0
+  fi
+  echo "Failed to unmount CT$vmid; retrying pct unmount $vmid" >&2
+  if unmount_ct "$vmid"; then
+    return 0
+  fi
+  echo "CT$vmid remains mounted; manual intervention required: pct unmount $vmid" >&2
+  return 1
+}
+
+cleanup_mounts() {
+  local vmid cleanup_rc=0
+  for vmid in "${!mounted_cts[@]}"; do
+    if ! unmount_ct_with_retry "$vmid"; then
+      cleanup_rc=1
+    fi
+  done
+  return "$cleanup_rc"
 }
 
 backup_managed_ct() {
@@ -189,7 +228,8 @@ backup_managed_ct() {
     backup_running_ct_file "$vmid" /usr/local/sbin/hubinet-maint "$dir/hubinet-maint"
     backup_running_ct_file "$vmid" /etc/hubinet-maint.json "$dir/hubinet-maint.json"
   else
-    mountpoint="$(safe_mount "$vmid")"
+    safe_mount "$vmid"
+    mountpoint="$MOUNTED_PATH"
     if [[ -f "$mountpoint/usr/local/sbin/hubinet-maint" ]]; then
       cp -a "$mountpoint/usr/local/sbin/hubinet-maint" "$dir/hubinet-maint"
     else
@@ -200,7 +240,7 @@ backup_managed_ct() {
     else
       : > "$dir/hubinet-maint.json.absent"
     fi
-    pct unmount "$vmid"
+    unmount_ct_with_retry "$vmid"
   fi
   : > "$dir/backup.complete"
 }
@@ -210,8 +250,8 @@ restore_managed_ct() {
   [[ -f "$dir/backup.complete" ]] || return 0
   status="$(<"$dir/runtime")"
   if [[ "$status" == stopped ]]; then
-    mountpoint="$(safe_mount "$vmid")" || return 1
-    root="$mountpoint"
+    safe_mount "$vmid" || return 1
+    root="$MOUNTED_PATH"
   fi
   if [[ "$status" == running ]]; then
     if [[ -s "$dir/hubinet-maint" ]]; then
@@ -238,7 +278,7 @@ restore_managed_ct() {
       rm -f "$root/etc/hubinet-maint.json"
     fi
     rm -f "$root/usr/local/sbin/.hubinet-maint.new" "$root/etc/.hubinet-maint.new.json"
-    pct unmount "$vmid"
+    unmount_ct_with_retry "$vmid"
   fi
 }
 
@@ -274,7 +314,8 @@ install_managed_ct() {
     pct_retry_129 exec "$vmid" -- rm -f /usr/local/sbin/.hubinet-maint.new /etc/.hubinet-maint.new.json
     payload="$(pct_retry_129 exec "$vmid" -- /usr/local/sbin/hubinet-maint capabilities)"
   else
-    mountpoint="$(safe_mount "$vmid")"
+    safe_mount "$vmid"
+    mountpoint="$MOUNTED_PATH"
     install -d -m 0755 "$mountpoint/usr/local/sbin" "$mountpoint/etc"
     install -m 0755 "$SOURCE_DIR/deploy/managed/hubinet-maint" "$mountpoint/usr/local/sbin/.hubinet-maint.new"
     install -m 0644 "$profile" "$mountpoint/etc/.hubinet-maint.new.json"
@@ -283,7 +324,7 @@ install_managed_ct() {
     mv -f "$mountpoint/usr/local/sbin/.hubinet-maint.new" "$mountpoint/usr/local/sbin/hubinet-maint"
     mv -f "$mountpoint/etc/.hubinet-maint.new.json" "$mountpoint/etc/hubinet-maint.json"
     payload="$(HUBINET_MAINT_CONFIG_PATH="$mountpoint/etc/hubinet-maint.json" python3 "$mountpoint/usr/local/sbin/hubinet-maint" capabilities)"
-    pct unmount "$vmid"
+    unmount_ct_with_retry "$vmid"
   fi
   validate_capabilities "$vmid" "$payload"
 }
@@ -292,6 +333,7 @@ rollback_all() {
   local rc="${1:-1}" failed=false
   trap - ERR INT TERM EXIT
   echo "0.4.1 upgrade failed; restoring all modified layers" >&2
+  if ! cleanup_mounts; then failed=true; fi
   if [[ "$agent_changes_started" == true && "$agent_backup_complete" == true ]]; then
     pct exec "$AGENT_VMID" -- bash -s -- "$AGENT_BACKUP" \
       < "$SOURCE_DIR/deploy/agent/restore-0.3.0.sh" || failed=true
@@ -321,10 +363,23 @@ rollback_all() {
   [[ "$failed" == false ]] || rc=1
   exit "$rc"
 }
+
+exit_cleanup() {
+  local rc="$1"
+  trap - EXIT
+  if ! cleanup_mounts; then
+    rc=1
+  fi
+  rm -f "$ARCHIVE"
+  [[ -z "$TOKEN_STAGE" ]] || rm -f "$TOKEN_STAGE"
+  [[ -z "$HOSTD_ENV_STAGE" ]] || rm -f "$HOSTD_ENV_STAGE"
+  exit "$rc"
+}
+
 trap 'rollback_all $?' ERR
 trap 'rollback_all 130' INT
 trap 'rollback_all 143' TERM
-trap 'rm -f "$ARCHIVE"; [[ -z "$TOKEN_STAGE" ]] || rm -f "$TOKEN_STAGE"; [[ -z "$HOSTD_ENV_STAGE" ]] || rm -f "$HOSTD_ENV_STAGE"' EXIT
+trap 'exit_cleanup $?' EXIT
 
 install -d -m 0700 "$BACKUP/pve" "$BACKUP/managed"
 systemctl is-active --quiet "$HOSTD_SERVICE" && hostd_was_active=true || true

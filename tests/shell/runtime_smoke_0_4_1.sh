@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# trap 'rm -rf "$TMP"' EXIT
 REAL_PYTHON="${HUBINET_OPS_TEST_PYTHON:-$(command -v python3 || command -v python)}"
 
 make_fakes() {
@@ -38,10 +38,22 @@ case "$action" in
     if (( vmid >= 106 && vmid <= 109 )); then echo "status stopped"; else echo "status running"; fi
     ;;
   mount)
+    if [[ "${HUBINET_OPS_FAKE_MOUNT_OUTPUT:-}" == malformed && "$vmid" == 106 ]]; then
+      echo "mounted without a parseable path"
+      exit 0
+    fi
     mkdir -p "$root"
     echo "CT $vmid mounted at '$root'"
     ;;
-  unmount) ;;
+  unmount)
+    count_file="$TEST_CT_ROOT/unmount-$vmid.count"
+    count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+    echo "$count" > "$count_file"
+    if [[ "${HUBINET_OPS_FAKE_UNMOUNT_FAILURES:-0}" -ge "$count" && "$vmid" == 108 ]]; then
+      echo "injected unmount failure" >&2
+      exit 1
+    fi
+    ;;
   pull)
     src="$1"; dst="$2"
     if [[ "$vmid" == 110 && "$src" == /etc/hubinet-ops/config.yaml ]]; then
@@ -116,6 +128,11 @@ esac
 SH
   cat > "$bin/python3" <<'SH'
 #!/usr/bin/env bash
+if [[ "$1" == *"/ct108/usr/local/sbin/hubinet-maint" && "${2:-}" == capabilities && "${FAIL_CAPABILITIES_VMID:-}" == "108" ]]; then
+  echo "FAKE PYTHON INTERCEPTED!" >&2
+  echo '{"ok":false,"data":{}}'
+  exit 0
+fi
 exec "$REAL_PYTHON" "$@"
 SH
   cat > "$bin/install" <<'SH'
@@ -136,6 +153,9 @@ if [[ "$directory" == true ]]; then
 else
   ((${#values[@]} >= 2))
   src="${values[${#values[@]}-2]}"; dst="${values[${#values[@]}-1]}"
+  if [[ -n "${FAIL_INSTALL_MATCH:-}" && "$dst" == *"$FAIL_INSTALL_MATCH"* ]]; then
+    exit 1
+  fi
   mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"
 fi
 SH
@@ -157,6 +177,14 @@ case "$SSH_ORIGINAL_COMMAND" in
   'list-snapshots 106') echo '{"ok":true,"data":{"snapshots":[]}}' ;;
   *) exit 1 ;;
 esac
+SH
+  cat > "$bin/cp" <<'SH'
+#!/usr/bin/env bash
+if [[ -n "${HUBINET_OPS_FAKE_MOUNT_SIGNAL:-}" && "${@: -1}" == *"/managed/ct108/hubinet-maint" ]]; then
+  kill -"${HUBINET_OPS_FAKE_MOUNT_SIGNAL}" $PPID
+  sleep 1
+fi
+exec /usr/bin/cp "$@"
 SH
   chmod +x "$bin"/*
 }
@@ -183,7 +211,7 @@ run_case() {
   HUBINET_OPS_HOSTD_HEALTH_URL="http://hostd.test/health" \
   HUBINET_OPS_VALIDATION_ATTEMPTS=1 \
   HUBINET_OPS_VALIDATION_DELAY=0 \
-    bash "$ROOT/deploy/upgrade-0.4.1-from-pve.sh" >"$case_root/stdout" 2>"$case_root/stderr"
+    bash ${HUBINET_OPS_TEST_BASH_X:+-x} "$ROOT/deploy/upgrade-0.4.1-from-pve.sh" >"$case_root/stdout" 2>"$case_root/stderr"
   rc=$?
   set -e
   printf '%s' "$rc"
@@ -239,3 +267,65 @@ if grep -Eq 'pct (start|stop|shutdown|reboot|snapshot|rollback|delsnapshot)' "$T
 fi
 
 echo "0.4.1 runtime smoke: success, retry and cross-layer rollback passed"
+
+echo "Testing mount tracking and cleanup..."
+set -x
+
+# 1. pct mount succeeds but returns unparseable output: pct unmount is attempted.
+export HUBINET_OPS_FAKE_MOUNT_OUTPUT=malformed
+rc="$(run_case mount_malformed)"
+[[ "$rc" != 0 ]]
+grep -Fq 'pct unmount 106' "$TMP/mount_malformed/actions.log"
+unset HUBINET_OPS_FAKE_MOUNT_OUTPUT
+
+# 2. backup_managed_ct fails after mount but before backup.complete: cleanup unmounts the CT despite restore_managed_ct skipping the incomplete backup.
+export HUBINET_OPS_FAKE_MOUNT_SIGNAL=TERM
+rc="$(run_case backup_fails_after_mount)"
+[[ "$rc" != 0 ]]
+grep -Fq 'pct unmount 106' "$TMP/backup_fails_after_mount/actions.log"
+unset HUBINET_OPS_FAKE_MOUNT_SIGNAL
+
+# 3. install_managed_ct fails after mounting a stopped CT: rollback cleanup unmounts it before restore tries to mount it.
+export FAIL_INSTALL_MATCH="ct106/usr/local/sbin/.hubinet-maint.new"
+rc="$(run_case install_fails_after_mount)"
+[[ "$rc" != 0 ]]
+grep -Fq 'pct unmount 106' "$TMP/install_fails_after_mount/actions.log"
+unset FAIL_INSTALL_MATCH
+
+# 4. rollback restore itself fails while mounted: final EXIT cleanup retries unmount.
+export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/hubinet-maint"
+export HUBINET_OPS_TEST_BASH_X=1
+rc="$(run_case restore_fails_while_mounted 108)"
+unset HUBINET_OPS_TEST_BASH_X
+set +x
+[[ "$rc" != 0 ]]
+grep -Fq 'pct unmount 108' "$TMP/restore_fails_while_mounted/actions.log"
+unset FAIL_CAPABILITIES_VMID FAIL_INSTALL_MATCH
+
+# 5. successful paths leave mounted_cts empty and do not perform duplicate unmounts.
+unmount_count="$(grep -c '^pct unmount 108$' "$TMP/success/actions.log" || echo 0)"
+if [[ "$unmount_count" != 2 ]]; then
+  echo "Expected exactly 2 unmounts for CT108 on success, got $unmount_count" >&2
+  exit 1
+fi
+
+# 6. Persistent unmount failure causes transactional rollback incomplete/non-zero
+export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/.hubinet-maint.new"
+export HUBINET_OPS_FAKE_UNMOUNT_FAILURES=99
+rc="$(run_case unmount_fails_persistently)"
+[[ "$rc" != 0 ]]
+grep -Fq 'manual intervention required: pct unmount 108' "$TMP/unmount_fails_persistently/stderr"
+unset FAIL_INSTALL_MATCH HUBINET_OPS_FAKE_UNMOUNT_FAILURES
+
+# 7. Transient unmount failure is recovered
+export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/.hubinet-maint.new"
+export HUBINET_OPS_FAKE_UNMOUNT_FAILURES=1
+rc="$(run_case unmount_fails_transiently)"
+[[ "$rc" != 0 ]]
+if grep -Fq 'manual intervention required' "$TMP/unmount_fails_transiently/stderr"; then
+  echo "Transient unmount failure was not recovered" >&2
+  exit 1
+fi
+unset FAIL_INSTALL_MATCH HUBINET_OPS_FAKE_UNMOUNT_FAILURES
+
+echo "Mount tracking tests passed"
