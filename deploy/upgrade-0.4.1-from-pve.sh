@@ -29,6 +29,7 @@ agent_changes_started=false
 hostd_was_active=false
 hostd_was_enabled=false
 declare -A mounted_cts=()
+MOUNTED_PATH=""
 
 pve_path() { printf '%s%s' "$PVE_ROOT" "$1"; }
 
@@ -172,17 +173,23 @@ backup_running_ct_file() {
 }
 
 safe_mount() {
-  local vmid="$1" output
+  local vmid="$1" output candidate
+  MOUNTED_PATH=""
+  if [[ "${mounted_cts[$vmid]:-false}" == true ]]; then
+    echo "Refusing to mount CT$vmid again while it remains tracked; manual intervention required: pct unmount $vmid" >&2
+    return 1
+  fi
   if ! output="$(pct mount "$vmid")"; then
     return 1
   fi
   mounted_cts[$vmid]=true
-  MOUNTED_PATH="$(sed -n "s/.*'\([^']*\)'.*/\1/p" <<<"$output")"
-  [[ -n "$MOUNTED_PATH" && "$MOUNTED_PATH" == /* && "$MOUNTED_PATH" != / && -d "$MOUNTED_PATH" ]] || {
+  candidate="$(sed -n "s/.*'\([^']*\)'.*/\1/p" <<<"$output")"
+  [[ -n "$candidate" && "$candidate" == /* && "$candidate" != / && -d "$candidate" ]] || {
     echo "Unsafe or unknown mountpoint for CT$vmid" >&2
     unmount_ct_with_retry "$vmid" || true
     return 1
   }
+  MOUNTED_PATH="$candidate"
 }
 
 unmount_ct() {
@@ -228,7 +235,9 @@ backup_managed_ct() {
     backup_running_ct_file "$vmid" /usr/local/sbin/hubinet-maint "$dir/hubinet-maint"
     backup_running_ct_file "$vmid" /etc/hubinet-maint.json "$dir/hubinet-maint.json"
   else
-    safe_mount "$vmid"
+    if ! safe_mount "$vmid"; then
+      return 1
+    fi
     mountpoint="$MOUNTED_PATH"
     if [[ -f "$mountpoint/usr/local/sbin/hubinet-maint" ]]; then
       cp -a "$mountpoint/usr/local/sbin/hubinet-maint" "$dir/hubinet-maint"
@@ -246,40 +255,81 @@ backup_managed_ct() {
 }
 
 restore_managed_ct() {
-  local vmid="$1" dir="$BACKUP/managed/ct$vmid" status mountpoint root=""
+  local vmid="$1" dir="$BACKUP/managed/ct$vmid" status root="" layer_rc=0
   [[ -f "$dir/backup.complete" ]] || return 0
-  status="$(<"$dir/runtime")"
+  if ! status="$(<"$dir/runtime")"; then
+    echo "Failed to read managed rollback state for CT$vmid" >&2
+    return 1
+  fi
   if [[ "$status" == stopped ]]; then
-    safe_mount "$vmid" || return 1
+    if ! safe_mount "$vmid"; then
+      return 1
+    fi
     root="$MOUNTED_PATH"
   fi
   if [[ "$status" == running ]]; then
     if [[ -s "$dir/hubinet-maint" ]]; then
-      pct_retry_129 push "$vmid" "$dir/hubinet-maint" /usr/local/sbin/hubinet-maint --perms 0755
+      if ! pct_retry_129 push "$vmid" "$dir/hubinet-maint" /usr/local/sbin/hubinet-maint --perms 0755; then
+        echo "Failed to restore CT$vmid:/usr/local/sbin/hubinet-maint" >&2
+        layer_rc=1
+      fi
     else
-      pct_retry_129 exec "$vmid" -- rm -f /usr/local/sbin/hubinet-maint
+      if ! pct_retry_129 exec "$vmid" -- rm -f /usr/local/sbin/hubinet-maint; then
+        echo "Failed to remove CT$vmid:/usr/local/sbin/hubinet-maint during rollback" >&2
+        layer_rc=1
+      fi
     fi
     if [[ -s "$dir/hubinet-maint.json" ]]; then
-      pct_retry_129 push "$vmid" "$dir/hubinet-maint.json" /etc/hubinet-maint.json --perms 0644
+      if ! pct_retry_129 push "$vmid" "$dir/hubinet-maint.json" /etc/hubinet-maint.json --perms 0644; then
+        echo "Failed to restore CT$vmid:/etc/hubinet-maint.json" >&2
+        layer_rc=1
+      fi
     else
-      pct_retry_129 exec "$vmid" -- rm -f /etc/hubinet-maint.json
+      if ! pct_retry_129 exec "$vmid" -- rm -f /etc/hubinet-maint.json; then
+        echo "Failed to remove CT$vmid:/etc/hubinet-maint.json during rollback" >&2
+        layer_rc=1
+      fi
     fi
-    pct_retry_129 exec "$vmid" -- rm -f /usr/local/sbin/.hubinet-maint.new /etc/.hubinet-maint.new.json
+    if ! pct_retry_129 exec "$vmid" -- rm -f /usr/local/sbin/.hubinet-maint.new /etc/.hubinet-maint.new.json; then
+      echo "Failed to remove staged managed files from CT$vmid during rollback" >&2
+      layer_rc=1
+    fi
   else
-    install -d -m 0755 "$root/usr/local/sbin" "$root/etc"
+    if ! install -d -m 0755 "$root/usr/local/sbin" "$root/etc"; then
+      echo "Failed to prepare managed rollback directories for CT$vmid" >&2
+      layer_rc=1
+    fi
     if [[ -s "$dir/hubinet-maint" ]]; then
-      install -m 0755 "$dir/hubinet-maint" "$root/usr/local/sbin/hubinet-maint"
+      if ! install -m 0755 "$dir/hubinet-maint" "$root/usr/local/sbin/hubinet-maint"; then
+        echo "Failed to restore stopped CT$vmid managed executor" >&2
+        layer_rc=1
+      fi
     else
-      rm -f "$root/usr/local/sbin/hubinet-maint"
+      if ! rm -f "$root/usr/local/sbin/hubinet-maint"; then
+        echo "Failed to remove stopped CT$vmid managed executor during rollback" >&2
+        layer_rc=1
+      fi
     fi
     if [[ -s "$dir/hubinet-maint.json" ]]; then
-      install -m 0644 "$dir/hubinet-maint.json" "$root/etc/hubinet-maint.json"
+      if ! install -m 0644 "$dir/hubinet-maint.json" "$root/etc/hubinet-maint.json"; then
+        echo "Failed to restore stopped CT$vmid managed config" >&2
+        layer_rc=1
+      fi
     else
-      rm -f "$root/etc/hubinet-maint.json"
+      if ! rm -f "$root/etc/hubinet-maint.json"; then
+        echo "Failed to remove stopped CT$vmid managed config during rollback" >&2
+        layer_rc=1
+      fi
     fi
-    rm -f "$root/usr/local/sbin/.hubinet-maint.new" "$root/etc/.hubinet-maint.new.json"
-    unmount_ct_with_retry "$vmid"
+    if ! rm -f "$root/usr/local/sbin/.hubinet-maint.new" "$root/etc/.hubinet-maint.new.json"; then
+      echo "Failed to remove staged managed files from stopped CT$vmid during rollback" >&2
+      layer_rc=1
+    fi
+    if ! unmount_ct_with_retry "$vmid"; then
+      layer_rc=1
+    fi
   fi
+  return "$layer_rc"
 }
 
 validate_capabilities() {
@@ -314,7 +364,9 @@ install_managed_ct() {
     pct_retry_129 exec "$vmid" -- rm -f /usr/local/sbin/.hubinet-maint.new /etc/.hubinet-maint.new.json
     payload="$(pct_retry_129 exec "$vmid" -- /usr/local/sbin/hubinet-maint capabilities)"
   else
-    safe_mount "$vmid"
+    if ! safe_mount "$vmid"; then
+      return 1
+    fi
     mountpoint="$MOUNTED_PATH"
     install -d -m 0755 "$mountpoint/usr/local/sbin" "$mountpoint/etc"
     install -m 0755 "$SOURCE_DIR/deploy/managed/hubinet-maint" "$mountpoint/usr/local/sbin/.hubinet-maint.new"
@@ -342,8 +394,18 @@ rollback_all() {
     pct exec "$AGENT_VMID" -- systemctl start hubinet-ops || failed=true
   fi
   for vmid in $(seq 109 -1 101); do
-    restore_managed_ct "$vmid" || failed=true
+    if [[ "${mounted_cts[$vmid]:-false}" == true ]]; then
+      echo "Skipping managed restore for CT$vmid because its tracked mount remains active; run: pct unmount $vmid" >&2
+      failed=true
+      continue
+    fi
+    if ! restore_managed_ct "$vmid"; then
+      echo "Managed rollback restore failed for CT$vmid" >&2
+      failed=true
+    fi
   done
+  if ! cleanup_mounts; then failed=true; fi
+  if ((${#mounted_cts[@]} > 0)); then failed=true; fi
   for destination in "${HOST_DESTINATIONS[@]}"; do
     restore_host_file "$destination" || failed=true
   done

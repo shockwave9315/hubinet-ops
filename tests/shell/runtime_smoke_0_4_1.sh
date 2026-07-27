@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
-# trap 'rm -rf "$TMP"' EXIT
+trap 'rm -rf "$TMP"' EXIT
 REAL_PYTHON="${HUBINET_OPS_TEST_PYTHON:-$(command -v python3 || command -v python)}"
 
 make_fakes() {
@@ -39,6 +39,7 @@ case "$action" in
     ;;
   mount)
     if [[ "${HUBINET_OPS_FAKE_MOUNT_OUTPUT:-}" == malformed && "$vmid" == 106 ]]; then
+      printf 'MARK mount-output-malformed %s\n' "$vmid" >> "$TEST_LOG"
       echo "mounted without a parseable path"
       exit 0
     fi
@@ -49,10 +50,25 @@ case "$action" in
     count_file="$TEST_CT_ROOT/unmount-$vmid.count"
     count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
     echo "$count" > "$count_file"
-    if [[ "${HUBINET_OPS_FAKE_UNMOUNT_FAILURES:-0}" -ge "$count" && "$vmid" == 108 ]]; then
+    inject=false
+    if [[ "${HUBINET_OPS_FAKE_UNMOUNT_VMID:-}" == "$vmid" ]]; then
+      if [[ -z "${HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER:-}" ]] ||
+         grep -Fq "$HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER" "$TEST_LOG"; then
+        inject=true
+      fi
+    fi
+    failure_count_file="$TEST_CT_ROOT/unmount-failure-$vmid.count"
+    failure_count=$(( $(cat "$failure_count_file" 2>/dev/null || echo 0) + 1 ))
+    if [[ "$inject" == true ]]; then
+      echo "$failure_count" > "$failure_count_file"
+    fi
+    if [[ "$inject" == true &&
+          "${HUBINET_OPS_FAKE_UNMOUNT_FAILURES:-0}" -ge "$failure_count" ]]; then
+      printf 'MARK unmount-failure %s %s\n' "$vmid" "$failure_count" >> "$TEST_LOG"
       echo "injected unmount failure" >&2
       exit 1
     fi
+    printf 'MARK unmount-success %s\n' "$vmid" >> "$TEST_LOG"
     ;;
   pull)
     src="$1"; dst="$2"
@@ -154,6 +170,7 @@ else
   ((${#values[@]} >= 2))
   src="${values[${#values[@]}-2]}"; dst="${values[${#values[@]}-1]}"
   if [[ -n "${FAIL_INSTALL_MATCH:-}" && "$dst" == *"$FAIL_INSTALL_MATCH"* ]]; then
+    printf 'MARK install-failure %s\n' "$dst" >> "$TEST_LOG"
     exit 1
   fi
   mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"
@@ -180,9 +197,11 @@ esac
 SH
   cat > "$bin/cp" <<'SH'
 #!/usr/bin/env bash
-if [[ -n "${HUBINET_OPS_FAKE_MOUNT_SIGNAL:-}" && "${@: -1}" == *"/managed/ct108/hubinet-maint" ]]; then
-  kill -"${HUBINET_OPS_FAKE_MOUNT_SIGNAL}" $PPID
-  sleep 1
+printf 'cp %s\n' "$*" >> "$TEST_LOG"
+if [[ -n "${FAIL_BACKUP_COPY_VMID:-}" &&
+      "${@: -1}" == *"/managed/ct${FAIL_BACKUP_COPY_VMID}/hubinet-maint" ]]; then
+  printf 'MARK backup-copy-failure %s\n' "$FAIL_BACKUP_COPY_VMID" >> "$TEST_LOG"
+  exit 1
 fi
 exec /usr/bin/cp "$@"
 SH
@@ -215,6 +234,27 @@ run_case() {
   rc=$?
   set -e
   printf '%s' "$rc"
+}
+
+first_line_after() {
+  local file="$1" pattern="$2" after="${3:-0}"
+  awk -v pattern="$pattern" -v after="$after" 'NR > after && index($0, pattern) { print NR; exit }' "$file"
+}
+
+last_line_before() {
+  local file="$1" pattern="$2" before="$3"
+  awk -v pattern="$pattern" -v before="$before" 'NR < before && index($0, pattern) { line=NR } END { if (line) print line }' "$file"
+}
+
+assert_ordered() {
+  local previous=0 value
+  for value in "$@"; do
+    [[ -n "$value" && "$value" -gt "$previous" ]] || {
+      echo "Expected strictly ordered event lines, got: $*" >&2
+      return 1
+    }
+    previous="$value"
+  done
 }
 
 success_rc="$(run_case success)"
@@ -269,63 +309,139 @@ fi
 echo "0.4.1 runtime smoke: success, retry and cross-layer rollback passed"
 
 echo "Testing mount tracking and cleanup..."
-set -x
 
-# 1. pct mount succeeds but returns unparseable output: pct unmount is attempted.
+# 1. pct mount succeeds, registration precedes rejected parsing, and cleanup
+# unmounts that same VMID without starting managed-file copying.
 export HUBINET_OPS_FAKE_MOUNT_OUTPUT=malformed
 rc="$(run_case mount_malformed)"
 [[ "$rc" != 0 ]]
-grep -Fq 'pct unmount 106' "$TMP/mount_malformed/actions.log"
+mount_log="$TMP/mount_malformed/actions.log"
+malformed_mount="$(first_line_after "$mount_log" 'pct mount 106')"
+malformed_marker="$(first_line_after "$mount_log" 'MARK mount-output-malformed 106' "$malformed_mount")"
+malformed_unmount="$(first_line_after "$mount_log" 'pct unmount 106' "$malformed_marker")"
+assert_ordered "$malformed_mount" "$malformed_marker" "$malformed_unmount"
+grep -Fq 'Unsafe or unknown mountpoint for CT106' "$TMP/mount_malformed/stderr"
+if awk -v after="$malformed_marker" \
+  'NR > after && /cp .*\/ct106\/.* \/.*\/managed\/ct106\// { found=1 } END { exit !found }' \
+  "$mount_log"; then
+  echo "Managed-file copying started after CT106 mountpoint parsing was rejected" >&2
+  exit 1
+fi
 unset HUBINET_OPS_FAKE_MOUNT_OUTPUT
 
-# 2. backup_managed_ct fails after mount but before backup.complete: cleanup unmounts the CT despite restore_managed_ct skipping the incomplete backup.
-export HUBINET_OPS_FAKE_MOUNT_SIGNAL=TERM
+# 2. A backup copy failure for CT108 is marked precisely; backup.complete is
+# absent and the cleanup unmount happens after the injected failure.
+export FAIL_BACKUP_COPY_VMID=108
 rc="$(run_case backup_fails_after_mount)"
 [[ "$rc" != 0 ]]
-grep -Fq 'pct unmount 106' "$TMP/backup_fails_after_mount/actions.log"
-unset HUBINET_OPS_FAKE_MOUNT_SIGNAL
+backup_log="$TMP/backup_fails_after_mount/actions.log"
+backup_mount="$(first_line_after "$backup_log" 'pct mount 108')"
+backup_failure="$(first_line_after "$backup_log" 'MARK backup-copy-failure 108' "$backup_mount")"
+backup_unmount="$(first_line_after "$backup_log" 'pct unmount 108' "$backup_failure")"
+assert_ordered "$backup_mount" "$backup_failure" "$backup_unmount"
+if find "$TMP/backup_fails_after_mount/backups" \
+  -path '*/managed/ct108/backup.complete' -print -quit | grep -q .; then
+  echo "CT108 backup.complete exists despite the injected backup failure" >&2
+  exit 1
+fi
+unset FAIL_BACKUP_COPY_VMID
 
-# 3. install_managed_ct fails after mounting a stopped CT: rollback cleanup unmounts it before restore tries to mount it.
+# 3. An install failure for stopped CT106 is followed by cleanup unmount before
+# rollback restore is allowed to mount CT106 again.
 export FAIL_INSTALL_MATCH="ct106/usr/local/sbin/.hubinet-maint.new"
 rc="$(run_case install_fails_after_mount)"
 [[ "$rc" != 0 ]]
-grep -Fq 'pct unmount 106' "$TMP/install_fails_after_mount/actions.log"
+install_log="$TMP/install_fails_after_mount/actions.log"
+install_failure="$(first_line_after "$install_log" 'MARK install-failure ')"
+install_mount="$(last_line_before "$install_log" 'pct mount 106' "$install_failure")"
+cleanup_unmount="$(first_line_after "$install_log" 'pct unmount 106' "$install_failure")"
+cleanup_success="$(first_line_after "$install_log" 'MARK unmount-success 106' "$cleanup_unmount")"
+restore_mount="$(first_line_after "$install_log" 'pct mount 106' "$cleanup_success")"
+assert_ordered "$install_mount" "$install_failure" "$cleanup_unmount" "$cleanup_success" "$restore_mount"
+if awk -v start="$install_failure" -v finish="$cleanup_success" \
+  'NR > start && NR < finish && $0 == "pct mount 106" { found=1 } END { exit !found }' \
+  "$install_log"; then
+  echo "CT106 was mounted again before its tracked mount was successfully unmounted" >&2
+  exit 1
+fi
 unset FAIL_INSTALL_MATCH
 
-# 4. rollback restore itself fails while mounted: final EXIT cleanup retries unmount.
+# 4. Rollback restore mounts CT108, records a copy failure, preserves the
+# non-zero layer result after its unmount attempts, and the second cleanup
+# retries after the remaining CT restores before finally clearing the map.
 export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/hubinet-maint"
-export HUBINET_OPS_TEST_BASH_X=1
+export HUBINET_OPS_FAKE_UNMOUNT_VMID=108
+export HUBINET_OPS_FAKE_UNMOUNT_FAILURES=2
+export HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER="MARK install-failure"
 rc="$(run_case restore_fails_while_mounted 108)"
-unset HUBINET_OPS_TEST_BASH_X
-set +x
 [[ "$rc" != 0 ]]
-grep -Fq 'pct unmount 108' "$TMP/restore_fails_while_mounted/actions.log"
-unset FAIL_CAPABILITIES_VMID FAIL_INSTALL_MATCH
-
-# 5. successful paths leave mounted_cts empty and do not perform duplicate unmounts.
-unmount_count="$(grep -c '^pct unmount 108$' "$TMP/success/actions.log" || echo 0)"
-if [[ "$unmount_count" != 2 ]]; then
-  echo "Expected exactly 2 unmounts for CT108 on success, got $unmount_count" >&2
+restore_log="$TMP/restore_fails_while_mounted/actions.log"
+restore_failure="$(first_line_after "$restore_log" 'MARK install-failure ')"
+restore_mount="$(last_line_before "$restore_log" 'pct mount 108' "$restore_failure")"
+restore_unmount_1="$(first_line_after "$restore_log" 'MARK unmount-failure 108 1' "$restore_failure")"
+restore_unmount_2="$(first_line_after "$restore_log" 'MARK unmount-failure 108 2' "$restore_unmount_1")"
+later_layer="$(first_line_after "$restore_log" 'pct mount 107' "$restore_unmount_2")"
+final_cleanup_success="$(first_line_after "$restore_log" 'MARK unmount-success 108' "$later_layer")"
+assert_ordered \
+  "$restore_mount" "$restore_failure" "$restore_unmount_1" "$restore_unmount_2" \
+  "$later_layer" "$final_cleanup_success"
+grep -Fq 'Failed to restore stopped CT108 managed executor' \
+  "$TMP/restore_fails_while_mounted/stderr"
+grep -Fq 'Managed rollback restore failed for CT108' \
+  "$TMP/restore_fails_while_mounted/stderr"
+if [[ "$(awk -v after="$restore_failure" \
+  'NR > after && $0 == "pct unmount 108" { count++ } END { print count+0 }' "$restore_log")" != 3 ]]; then
+  echo "CT108 was not removed from mount tracking after the final cleanup succeeded" >&2
   exit 1
 fi
+unset FAIL_CAPABILITIES_VMID FAIL_INSTALL_MATCH
+unset HUBINET_OPS_FAKE_UNMOUNT_VMID HUBINET_OPS_FAKE_UNMOUNT_FAILURES
+unset HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER
 
-# 6. Persistent unmount failure causes transactional rollback incomplete/non-zero
+# 5. Successful paths pair every stopped-CT mount with one successful unmount.
+# Exact counts also prove that EXIT cleanup is a no-op once tracking is empty.
+for vmid in $(seq 106 109); do
+  mount_count="$(grep -c "^pct mount $vmid$" "$TMP/success/actions.log" || true)"
+  unmount_count="$(grep -c "^pct unmount $vmid$" "$TMP/success/actions.log" || true)"
+  unmount_success_count="$(grep -c "^MARK unmount-success $vmid$" "$TMP/success/actions.log" || true)"
+  if [[ "$mount_count" != 2 ||
+        "$unmount_count" != "$mount_count" ||
+        "$unmount_success_count" != "$mount_count" ]]; then
+    echo "CT$vmid success mount accounting is inconsistent: mounts=$mount_count unmounts=$unmount_count successes=$unmount_success_count" >&2
+    exit 1
+  fi
+done
+
+# 6. Persistent unmount failure exhausts both attempts in each cleanup pass,
+# remains tracked across best-effort rollback, never mounts CT108 again, and
+# exits non-zero with the exact manual-intervention command.
 export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/.hubinet-maint.new"
+export HUBINET_OPS_FAKE_UNMOUNT_VMID=108
 export HUBINET_OPS_FAKE_UNMOUNT_FAILURES=99
+export HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER="MARK install-failure"
 rc="$(run_case unmount_fails_persistently)"
 [[ "$rc" != 0 ]]
-grep -Fq 'manual intervention required: pct unmount 108' "$TMP/unmount_fails_persistently/stderr"
-unset FAIL_INSTALL_MATCH HUBINET_OPS_FAKE_UNMOUNT_FAILURES
-
-# 7. Transient unmount failure is recovered
-export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/.hubinet-maint.new"
-export HUBINET_OPS_FAKE_UNMOUNT_FAILURES=1
-rc="$(run_case unmount_fails_transiently)"
-[[ "$rc" != 0 ]]
-if grep -Fq 'manual intervention required' "$TMP/unmount_fails_transiently/stderr"; then
-  echo "Transient unmount failure was not recovered" >&2
+persistent_log="$TMP/unmount_fails_persistently/actions.log"
+persistent_failure="$(first_line_after "$persistent_log" 'MARK install-failure ')"
+if [[ "$(awk -v after="$persistent_failure" \
+  'NR > after && $0 == "pct unmount 108" { count++ } END { print count+0 }' "$persistent_log")" != 4 ]]; then
+  echo "Expected two CT108 unmount attempts in each of the two rollback cleanup passes" >&2
   exit 1
 fi
-unset FAIL_INSTALL_MATCH HUBINET_OPS_FAKE_UNMOUNT_FAILURES
+if awk -v after="$persistent_failure" \
+  'NR > after && $0 == "pct mount 108" { found=1 } END { exit !found }' "$persistent_log"; then
+  echo "Rollback attempted pct mount 108 while CT108 was still tracked" >&2
+  exit 1
+fi
+grep -Fq 'pct mount 107' "$persistent_log"
+grep -Fq 'Skipping managed restore for CT108 because its tracked mount remains active; run: pct unmount 108' \
+  "$TMP/unmount_fails_persistently/stderr"
+manual_message='CT108 remains mounted; manual intervention required: pct unmount 108'
+if [[ "$(grep -Fc "$manual_message" "$TMP/unmount_fails_persistently/stderr")" != 2 ]]; then
+  echo "Expected the exact CT108 manual-intervention message after both failed cleanup passes" >&2
+  exit 1
+fi
+unset FAIL_INSTALL_MATCH HUBINET_OPS_FAKE_UNMOUNT_VMID
+unset HUBINET_OPS_FAKE_UNMOUNT_FAILURES HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER
 
 echo "Mount tracking tests passed"
