@@ -219,7 +219,13 @@ unmount_ct_with_retry() {
 
 cleanup_mounts() {
   local vmid cleanup_rc=0
-  for vmid in "${!mounted_cts[@]}"; do
+  local -a vmids=()
+  if (($# > 0)); then
+    vmids=("$@")
+  else
+    vmids=("${!mounted_cts[@]}")
+  fi
+  for vmid in "${vmids[@]}"; do
     if ! unmount_ct_with_retry "$vmid"; then
       cleanup_rc=1
     fi
@@ -383,6 +389,8 @@ install_managed_ct() {
 
 rollback_all() {
   local rc="${1:-1}" failed=false
+  local -a deferred_managed_restores=()
+  local -a attempted_deferred_restores=()
   trap - ERR INT TERM EXIT
   echo "0.4.1 upgrade failed; restoring all modified layers" >&2
   if ! cleanup_mounts; then failed=true; fi
@@ -395,7 +403,8 @@ rollback_all() {
   fi
   for vmid in $(seq 109 -1 101); do
     if [[ "${mounted_cts[$vmid]:-false}" == true ]]; then
-      echo "Skipping managed restore for CT$vmid because its tracked mount remains active; run: pct unmount $vmid" >&2
+      echo "Deferring managed restore for CT$vmid because its tracked mount remains active; run: pct unmount $vmid" >&2
+      deferred_managed_restores+=("$vmid")
       failed=true
       continue
     fi
@@ -405,6 +414,21 @@ rollback_all() {
     fi
   done
   if ! cleanup_mounts; then failed=true; fi
+  for vmid in "${deferred_managed_restores[@]}"; do
+    if [[ "${mounted_cts[$vmid]:-false}" == true ]]; then
+      echo "Deferred managed restore for CT$vmid remains blocked by its tracked mount; run: pct unmount $vmid" >&2
+      failed=true
+      continue
+    fi
+    attempted_deferred_restores+=("$vmid")
+    if ! restore_managed_ct "$vmid"; then
+      echo "Deferred managed rollback restore failed for CT$vmid" >&2
+      failed=true
+    fi
+  done
+  if ((${#attempted_deferred_restores[@]} > 0)); then
+    if ! cleanup_mounts "${attempted_deferred_restores[@]}"; then failed=true; fi
+  fi
   if ((${#mounted_cts[@]} > 0)); then failed=true; fi
   for destination in "${HOST_DESTINATIONS[@]}"; do
     restore_host_file "$destination" || failed=true

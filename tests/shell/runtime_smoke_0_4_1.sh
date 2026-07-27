@@ -173,8 +173,20 @@ else
     printf 'MARK install-failure %s\n' "$dst" >> "$TEST_LOG"
     exit 1
   fi
+  printf 'install %s -> %s\n' "$src" "$dst" >> "$TEST_LOG"
   mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"
 fi
+SH
+  cat > "$bin/mv" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+src="${@: -2:1}"; dst="${@: -1}"
+printf 'mv %s -> %s\n' "$src" "$dst" >> "$TEST_LOG"
+if [[ -n "${FAIL_MV_MATCH:-}" && "$dst" == *"$FAIL_MV_MATCH"* ]]; then
+  printf 'MARK partial-install-failure %s\n' "$dst" >> "$TEST_LOG"
+  exit 1
+fi
+exec /usr/bin/mv "$@"
 SH
   cat > "$bin/systemctl" <<'SH'
 #!/usr/bin/env bash
@@ -398,7 +410,55 @@ unset FAIL_CAPABILITIES_VMID FAIL_INSTALL_MATCH
 unset HUBINET_OPS_FAKE_UNMOUNT_VMID HUBINET_OPS_FAKE_UNMOUNT_FAILURES
 unset HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER
 
-# 5. Successful paths pair every stopped-CT mount with one successful unmount.
+# 5. A partially modified stopped CT is deferred after the first cleanup
+# exhausts both unmount attempts. Independent restores continue, the delayed
+# cleanup succeeds, and only then is the deferred CT restored exactly once.
+export FAIL_MV_MATCH="ct108/etc/hubinet-maint.json"
+export HUBINET_OPS_FAKE_UNMOUNT_VMID=108
+export HUBINET_OPS_FAKE_UNMOUNT_FAILURES=2
+export HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER="MARK partial-install-failure"
+rc="$(run_case deferred_restore_after_delayed_unmount)"
+[[ "$rc" != 0 ]]
+deferred_log="$TMP/deferred_restore_after_delayed_unmount/actions.log"
+partial_failure="$(first_line_after "$deferred_log" 'MARK partial-install-failure ')"
+partial_executor_mv="$(last_line_before "$deferred_log" '.hubinet-maint.new -> ' "$partial_failure")"
+deferred_unmount_1="$(first_line_after "$deferred_log" 'MARK unmount-failure 108 1' "$partial_failure")"
+deferred_unmount_2="$(first_line_after "$deferred_log" 'MARK unmount-failure 108 2' "$deferred_unmount_1")"
+independent_restore="$(first_line_after "$deferred_log" 'pct mount 107' "$deferred_unmount_2")"
+delayed_unmount_success="$(first_line_after "$deferred_log" 'MARK unmount-success 108' "$independent_restore")"
+deferred_restore_mount="$(first_line_after "$deferred_log" 'pct mount 108' "$delayed_unmount_success")"
+deferred_executor_restore="$(first_line_after "$deferred_log" 'install ' "$deferred_restore_mount")"
+deferred_profile_restore="$(first_line_after "$deferred_log" '/managed/ct108/hubinet-maint.json -> ' "$deferred_executor_restore")"
+deferred_restore_unmount="$(first_line_after "$deferred_log" 'pct unmount 108' "$deferred_profile_restore")"
+deferred_restore_unmount_success="$(first_line_after "$deferred_log" 'MARK unmount-success 108' "$deferred_restore_unmount")"
+assert_ordered \
+  "$partial_executor_mv" "$partial_failure" "$deferred_unmount_1" "$deferred_unmount_2" \
+  "$independent_restore" "$delayed_unmount_success" "$deferred_restore_mount" \
+  "$deferred_executor_restore" "$deferred_profile_restore" \
+  "$deferred_restore_unmount" "$deferred_restore_unmount_success"
+grep -Fq 'Deferring managed restore for CT108 because its tracked mount remains active; run: pct unmount 108' \
+  "$TMP/deferred_restore_after_delayed_unmount/stderr"
+if awk -v start="$partial_failure" -v finish="$delayed_unmount_success" \
+  'NR > start && NR < finish && $0 == "pct mount 108" { found=1 } END { exit !found }' \
+  "$deferred_log"; then
+  echo "Deferred CT108 was remounted before its delayed unmount succeeded" >&2
+  exit 1
+fi
+if [[ "$(grep -Ec 'install .*/managed/ct108/hubinet-maint -> .*/ct108/usr/local/sbin/hubinet-maint$' "$deferred_log")" != 1 ||
+      "$(grep -Ec 'install .*/managed/ct108/hubinet-maint.json -> .*/ct108/etc/hubinet-maint.json$' "$deferred_log")" != 1 ||
+      "$(awk -v after="$delayed_unmount_success" \
+        'NR > after && $0 == "pct mount 108" { count++ } END { print count+0 }' "$deferred_log")" != 1 ]]; then
+  echo "Deferred CT108 managed restore was not executed exactly once" >&2
+  exit 1
+fi
+grep -Fq 'old-executor-108' \
+  "$TMP/deferred_restore_after_delayed_unmount/ct/ct108/usr/local/sbin/hubinet-maint"
+grep -Fq 'old_profile' \
+  "$TMP/deferred_restore_after_delayed_unmount/ct/ct108/etc/hubinet-maint.json"
+unset FAIL_MV_MATCH HUBINET_OPS_FAKE_UNMOUNT_VMID
+unset HUBINET_OPS_FAKE_UNMOUNT_FAILURES HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER
+
+# 6. Successful paths pair every stopped-CT mount with one successful unmount.
 # Exact counts also prove that EXIT cleanup is a no-op once tracking is empty.
 for vmid in $(seq 106 109); do
   mount_count="$(grep -c "^pct mount $vmid$" "$TMP/success/actions.log" || true)"
@@ -412,7 +472,7 @@ for vmid in $(seq 106 109); do
   fi
 done
 
-# 6. Persistent unmount failure exhausts both attempts in each cleanup pass,
+# 7. Persistent unmount failure exhausts both attempts in each cleanup pass,
 # remains tracked across best-effort rollback, never mounts CT108 again, and
 # exits non-zero with the exact manual-intervention command.
 export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/.hubinet-maint.new"
@@ -434,7 +494,9 @@ if awk -v after="$persistent_failure" \
   exit 1
 fi
 grep -Fq 'pct mount 107' "$persistent_log"
-grep -Fq 'Skipping managed restore for CT108 because its tracked mount remains active; run: pct unmount 108' \
+grep -Fq 'Deferring managed restore for CT108 because its tracked mount remains active; run: pct unmount 108' \
+  "$TMP/unmount_fails_persistently/stderr"
+grep -Fq 'Deferred managed restore for CT108 remains blocked by its tracked mount; run: pct unmount 108' \
   "$TMP/unmount_fails_persistently/stderr"
 manual_message='CT108 remains mounted; manual intervention required: pct unmount 108'
 if [[ "$(grep -Fc "$manual_message" "$TMP/unmount_fails_persistently/stderr")" != 2 ]]; then
