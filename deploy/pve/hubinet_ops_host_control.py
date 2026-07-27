@@ -281,7 +281,7 @@ class HostController:
         for item in values if isinstance(values, list) else []:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name") or "")
+            name = str(item.get("snapname") or item.get("name") or "")
             parsed = parse_snapshot(name, vmid)
             created_at = _snapshot_created_at(item, parsed)
             owned = parsed is not None
