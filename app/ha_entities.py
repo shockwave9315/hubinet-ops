@@ -134,6 +134,16 @@ SNAPSHOT_ENTITY_SPECS = (
     EntitySpec("snapshot_restore_allowed", "snapshot_restore_allowed", "Snapshot restore allowed", "{{ 'allowed' if value_json.snapshot_restore_allowed else 'blocked' }}"),
 )
 
+COMMON_RESOURCE_ENTITY_SPECS = (
+    _text(
+        "dashboard_path",
+        "dashboard_path",
+        "Dashboard path",
+        "value_json.dashboard_path",
+        "none",
+    ),
+)
+
 
 LIFECYCLE_CAPABILITY_SPECS = tuple(
     _capability(key)
@@ -345,11 +355,11 @@ def normalize_resource_identity(cfg: Mapping[str, Any]) -> ResourceIdentity:
 def resource_entity_specs(cfg: Mapping[str, Any]) -> tuple[EntitySpec, ...]:
     identity = normalize_resource_identity(cfg)
     if identity == ResourceIdentity("qemu", "haos"):
-        return QEMU_ENTITY_SPECS
+        return QEMU_ENTITY_SPECS + COMMON_RESOURCE_ENTITY_SPECS
     if identity == ResourceIdentity("lxc", "agent_self"):
-        return AGENT_SELF_ENTITY_SPECS
+        return AGENT_SELF_ENTITY_SPECS + COMMON_RESOURCE_ENTITY_SPECS
     if identity == ResourceIdentity("lxc", "apt"):
-        return APT_ENTITY_SPECS
+        return APT_ENTITY_SPECS + COMMON_RESOURCE_ENTITY_SPECS
     raise AssertionError("Supported resource identity has no entity specification")
 
 

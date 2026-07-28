@@ -150,6 +150,36 @@ def test_rest_api_preserves_full_diagnostic_text(tmp_path: Path, monkeypatch) ->
     assert persisted["last_error"] == diagnostic
 
 
+def test_rest_api_preserves_full_dashboard_path(tmp_path: Path, monkeypatch) -> None:
+    dashboard_path = "/hubinet-ops/" + "żółw🙂" * 397
+    config_path = tmp_path / "dashboard-import.yaml"
+    config_path.write_text(
+        "scheduler:\n"
+        "  enabled: false\n"
+        "containers:\n"
+        "  106:\n"
+        "    enabled: true\n"
+        f"    dashboard_path: {dashboard_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "dashboard-import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+    cfg = make_settings(tmp_path)
+    cfg.raw["containers"][106]["dashboard_path"] = dashboard_path
+    db = Database(cfg.db_path)
+    api = main.create_app(cfg, database=db, executor=FakeExecutor())
+
+    response = TestClient(api).get(
+        "/api/v1/containers/106/state",
+        headers={"Authorization": f"Bearer {cfg.api_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["dashboard_path"] == dashboard_path
+
+
 def test_canonical_resources_include_qemu_and_container_alias_filters_it(
     tmp_path: Path,
     monkeypatch,

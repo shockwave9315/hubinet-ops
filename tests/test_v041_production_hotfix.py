@@ -550,7 +550,7 @@ def test_system_sandbox_has_required_kernel_and_mount_boundaries() -> None:
         "--cpus 2",
         "--user 65534:65534",
         "dst=/repo,readonly",
-        "--tmpfs /tmp:rw,nosuid,nodev,size=768m,mode=1777",
+        "--tmpfs /tmp:rw,exec,nosuid,nodev,size=768m,mode=1777",
         "--tmpfs /workspace:rw,nosuid,nodev,noexec,size=128m",
     ):
         assert argument in runner

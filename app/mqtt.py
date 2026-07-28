@@ -272,17 +272,6 @@ class MqttTelemetry:
                     extra=dict(spec.extra),
                     force=force,
                 )
-            self._discovery_sensor(
-                object_id=f"hubinet_ops_{prefix}{vmid}_dashboard_path",
-                unique_id=f"hubinet_ops_{prefix}_{vmid}_dashboard_path",
-                default_entity_id=f"sensor.hubinet_ops_{resource_prefix(vmid, cfg)}_dashboard_path",
-                name="Dashboard path",
-                state_topic=state_topic,
-                value_template="{{ value_json.dashboard_path }}",
-                availability_topic=availability,
-                device=device,
-                force=force,
-            )
             for key in obsolete_discovery_keys(cfg):
                 self._publish_raw(
                     f"{self.discovery_prefix}/sensor/hubinet_ops_{prefix}{vmid}_{key}/config",

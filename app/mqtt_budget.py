@@ -77,7 +77,10 @@ def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
         if item is None or isinstance(item, (bool, int, float)):
             compact[key] = item
         elif isinstance(item, str):
-            compact[key] = sanitize_text(item, limit=2000 if key == "last_error" else 512)
+            compact[key] = sanitize_text(
+                item,
+                limit=2000 if key in {"last_error", "dashboard_path"} else 512,
+            )
 
     for key, fields in {
         "disk": (

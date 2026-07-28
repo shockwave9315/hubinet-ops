@@ -50,7 +50,7 @@ docker run --rm \
   --user 65534:65534 \
   --hostname hubinet-runtime-smoke \
   --mount "type=bind,src=$ROOT,dst=/repo,readonly" \
-  --tmpfs /tmp:rw,nosuid,nodev,size=768m,mode=1777 \
+  --tmpfs /tmp:rw,exec,nosuid,nodev,size=768m,mode=1777 \
   --tmpfs /workspace:rw,nosuid,nodev,noexec,size=128m,mode=0700,uid=65534,gid=65534 \
   --env HOME=/workspace/home \
   --env TMPDIR=/tmp \
