@@ -45,10 +45,14 @@ python scripts/generate_ha_dashboard.py --check
 bash -n deploy/upgrade-0.4.1-from-pve.sh
 bash -n deploy/install-ha-0.4.1-from-pve.sh
 bash -n deploy/pve/hubinet-ops-host
-bash tests/shell/runtime_smoke_0_4_1.sh
+# CI-only sandbox manager: tests/shell/run_runtime_smoke_sandbox.sh
 python scripts/check_tracked_files.py
 ```
 
 Repository tests use fake executors, fake clocks, temporary SQLite databases, and stub commands. They do not contact Proxmox, guests, Home Assistant, or MQTT.
+The deployment runtime smoke is not a local-validation command: pytest invokes the
+system sandbox manager only on a controlled ephemeral GitHub-hosted runner with the
+workflow-owned `HUBINET_OPS_EPHEMERAL_CI=1` marker. Never invoke the internal
+`runtime_smoke_0_4_1.sh` directly.
 
 See [0.4.0 design](docs/design-0.4.0.md), [architecture](docs/architecture.md), [API](docs/api.md), [security](docs/security.md), [resource adapters](docs/resource-adapters.md), [production inventory](docs/production-inventory.md), [MQTT](docs/mqtt.md), [Home Assistant](docs/home-assistant.md), and the [0.4.1 rollout guide](docs/upgrade-0.4.1.md).

@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+[[ "${GITHUB_ACTIONS:-}" == true \
+  && "${HUBINET_OPS_EPHEMERAL_CI:-0}" == 1 \
+  && "${RUNNER_ENVIRONMENT:-}" == github-hosted \
+  && "${GITHUB_RUN_ID:-}" =~ ^[0-9]+$ ]] || {
+  echo "deployment-smoke sandbox is restricted to controlled ephemeral GitHub CI" >&2
+  exit 2
+}
 [[ "$(uname -s)" == Linux ]] || {
   echo "system deployment-smoke sandbox requires Linux" >&2
   exit 2

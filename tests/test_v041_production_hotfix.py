@@ -924,6 +924,10 @@ def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
     pytest_wrapper = (
         ROOT / "tests" / "test_installer_runtime_smoke.py"
     ).read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     runner = SANDBOX_RUNNER.read_text(encoding="utf-8")
     entrypoint = SANDBOX_ENTRYPOINT.read_text(encoding="utf-8")
     smoke = RUNTIME_SMOKE.read_text(encoding="utf-8")
@@ -931,6 +935,18 @@ def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
     assert "SANDBOX_RUNNER" in pytest_wrapper
     assert "runtime_smoke_0_4_1.sh" not in pytest_wrapper
     assert "requires the fail-closed Docker sandbox" in pytest_wrapper
+    for marker in (
+        "GITHUB_ACTIONS",
+        "HUBINET_OPS_EPHEMERAL_CI",
+        "RUNNER_ENVIRONMENT",
+        "GITHUB_RUN_ID",
+    ):
+        assert marker in pytest_wrapper
+        assert marker in runner
+    assert 'HUBINET_OPS_EPHEMERAL_CI: "1"' in workflow
+    assert "bash tests/shell/runtime_smoke_0_4_1.sh" not in readme
+    assert "tests/shell/run_runtime_smoke_sandbox.sh" in readme
+    assert "controlled ephemeral GitHub-hosted runner" in readme
     assert "HUBINET_OPS_SYSTEM_SANDBOX" in smoke
     assert "runtime smoke must execute inside the system sandbox" in smoke
     assert entrypoint.index("sandbox self-test: passed") < entrypoint.index(

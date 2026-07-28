@@ -27,6 +27,8 @@ jobs:
           docker info --format '{{json .SecurityOptions}}'
       - name: Test
         shell: bash
+        env:
+          HUBINET_OPS_EPHEMERAL_CI: "1"
         run: |
           set -o pipefail
           PYTHONPATH="$GITHUB_WORKSPACE" python -m pytest -q --tb=short 2>&1 | tee pytest.log

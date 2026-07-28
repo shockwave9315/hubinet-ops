@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,19 @@ def test_current_release_installer_runtime_smoke() -> None:
         pytest.skip("system deployment-smoke sandbox is unavailable on Windows")
     if not sys.platform.startswith("linux"):
         pytest.skip("system deployment-smoke sandbox is supported only on Linux CI")
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        pytest.skip(
+            "system deployment-smoke sandbox is restricted to controlled ephemeral CI"
+        )
+    assert os.environ.get("HUBINET_OPS_EPHEMERAL_CI") == "1", (
+        "Linux CI must explicitly enable the deployment-smoke sandbox"
+    )
+    assert os.environ.get("RUNNER_ENVIRONMENT") == "github-hosted", (
+        "deployment smoke requires an ephemeral GitHub-hosted runner"
+    )
+    assert os.environ.get("GITHUB_RUN_ID", "").isdigit(), (
+        "deployment smoke requires a GitHub Actions run ID"
+    )
     bash = shutil.which("bash")
     assert bash is not None, "Linux runtime smoke requires bash"
     assert shutil.which("docker") is not None, (
