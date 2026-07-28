@@ -20,6 +20,7 @@ from app.ha_entities import (
 from app.service import _snapshot_name
 from scripts.generate_ha_dashboard import _control_card, _control_conditions
 from scripts.migrate_config_0_4_0 import CAPABILITY_KEYS
+from scripts.validate_hermetic_shell_boundary import validate_file
 from scripts.validate_ha_secrets_0_4_1 import REQUIRED_SECRETS, validate as validate_secrets
 from scripts.validate_rollout_state_0_4_1 import validate as validate_rollout
 
@@ -27,6 +28,7 @@ from scripts.validate_rollout_state_0_4_1 import validate as validate_rollout
 ROOT = Path(__file__).parents[1]
 PVE_INSTALLER = ROOT / "deploy" / "upgrade-0.4.1-from-pve.sh"
 HA_INSTALLER = ROOT / "deploy" / "install-ha-0.4.1-from-pve.sh"
+HERMETIC_SHELL_VALIDATOR = ROOT / "scripts" / "validate_hermetic_shell_boundary.py"
 
 
 def _resources() -> dict[int, dict]:
@@ -168,6 +170,9 @@ def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
         "temporary fake command layer",
         "explicit allowlist of unprivileged local tools",
         "no real network, deployment, container, or hypervisor programs",
+        "must not reference real network, deployment, container, or hypervisor "
+        "programs through absolute paths",
+        "reject such paths before executing the script",
         "temporary directories",
         "no real or private-network endpoints",
         "no production addresses or credentials",
@@ -228,18 +233,101 @@ def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
     ):
         assert marker in smoke
 
+    validator_call = (
+        '"$REAL_PYTHON" \\\n'
+        '  "$ROOT/scripts/validate_hermetic_shell_boundary.py" \\\n'
+        '  "$ROOT/deploy/upgrade-0.4.1-from-pve.sh"'
+    )
+    assert validator_call in smoke
+    assert smoke.index(validator_call) < smoke.index(
+        'success_rc="$(run_case success)"'
+    )
 
-def test_upgrade_script_has_no_absolute_forbidden_command_bypass() -> None:
-    installer = PVE_INSTALLER.read_text(encoding="utf-8")
-    forbidden = (
-        r"apt(?:-get)?|ssh|scp|sftp|rsync|pct|pvesh|qm|lxc-[a-z0-9-]+|"
-        r"systemctl|docker|podman|curl|wget|nc|socat"
+
+@pytest.mark.parametrize(
+    ("shell_line", "command_path"),
+    (
+        ("/usr/bin/curl https://example.invalid", "/usr/bin/curl"),
+        (
+            "if /usr/bin/curl https://example.invalid; then :; fi",
+            "/usr/bin/curl",
+        ),
+        (
+            "elif /usr/bin/curl https://example.invalid; then",
+            "/usr/bin/curl",
+        ),
+        (
+            "while /usr/bin/curl https://example.invalid; do :; done",
+            "/usr/bin/curl",
+        ),
+        (
+            "until /usr/bin/curl https://example.invalid; do :; done",
+            "/usr/bin/curl",
+        ),
+        ("command /usr/bin/ssh example.invalid", "/usr/bin/ssh"),
+        ("exec /usr/bin/scp file example.invalid:/tmp/", "/usr/bin/scp"),
+        ("sudo /usr/sbin/pct status 106", "/usr/sbin/pct"),
+        (
+            "/usr/bin/sudo /usr/sbin/pct status 106",
+            "/usr/bin/sudo",
+        ),
+        ("FOO=bar /bin/systemctl restart example", "/bin/systemctl"),
+        ("(/usr/bin/wget https://example.invalid)", "/usr/bin/wget"),
+        ("$(/usr/bin/nc example.invalid 1234)", "/usr/bin/nc"),
+        ("$EMPTY/usr/bin/curl https://example.invalid", "/usr/bin/curl"),
+    ),
+)
+def test_hermetic_shell_boundary_rejects_absolute_commands(
+    tmp_path: Path,
+    shell_line: str,
+    command_path: str,
+) -> None:
+    script = tmp_path / "unsafe.sh"
+    script.write_text(f"echo safe\n{shell_line}\n", encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    absolute_command = re.compile(
-        rf"(?:^|[;&|]\s*|\$\()\s*/(?:usr/)?s?bin/(?:{forbidden})(?=\s|$)",
-        flags=re.MULTILINE,
+
+    assert completed.returncode == 1
+    assert f"{script}:2: forbidden absolute command path: {command_path}" in (
+        completed.stderr
     )
-    assert absolute_command.search(installer) is None
+
+
+@pytest.mark.parametrize(
+    "shell_line",
+    (
+        "curl http://hostd.test/health",
+        "pct status 106",
+        "systemctl restart hubinet-ops-hostd",
+        "/usr/local/sbin/hubinet-ops-host",
+        "/root/hubinet-ops-backups",
+        "/opt/hubinet-ops/.venv/bin/python",
+    ),
+)
+def test_hermetic_shell_boundary_allows_controlled_references(
+    tmp_path: Path,
+    shell_line: str,
+) -> None:
+    script = tmp_path / "safe.sh"
+    script.write_text(f"{shell_line}\n", encoding="utf-8")
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_current_upgrade_passes_hermetic_shell_boundary() -> None:
+    assert validate_file(PVE_INSTALLER) == []
 
 
 def test_config_migration_is_idempotent_and_rollback_policy_is_consistent(

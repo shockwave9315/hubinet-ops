@@ -366,6 +366,10 @@ assert_ordered() {
   done
 }
 
+"$REAL_PYTHON" \
+  "$ROOT/scripts/validate_hermetic_shell_boundary.py" \
+  "$ROOT/deploy/upgrade-0.4.1-from-pve.sh"
+
 success_rc="$(run_case success)"
 if [[ "$success_rc" != 0 ]]; then
   cat "$TMP/success/stderr" >&2
