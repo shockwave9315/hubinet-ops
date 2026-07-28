@@ -23,5 +23,6 @@ These rules apply to every future coding agent working in this repository.
 
 - Do not contact real Proxmox, LXC, Docker, Home Assistant, MQTT, or private-network endpoints.
 - Use fake executors, fake MQTT clients, fake clocks, temporary directories, and simulated process output.
-- Do not run `apt`, `pct`, `ssh`, Docker, or deployment scripts as part of repository tests.
+- Do not run real `apt`, `pct`, `ssh`, `systemctl`, Docker, deployment operations, or private-network connections as part of repository tests.
+- A deployment script may be executed only by a hermetic smoke harness that sets `HUBINET_OPS_TEST_MODE=1`, replaces every privileged or external command through a temporary fake `PATH`, redirects PVE, archive, backup, mount, and runtime paths into temporary directories, uses no real or private-network endpoints and no production addresses or credentials, fails closed on every unsupported command, and fails if any real lifecycle or snapshot mutation escapes the fakes.
 - Run Python compilation, pytest, `bash -n`, YAML parsing, and tracked-runtime-file checks before publishing.

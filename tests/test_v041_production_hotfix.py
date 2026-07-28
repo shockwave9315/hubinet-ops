@@ -151,6 +151,37 @@ def test_upgrade_rollback_and_exit_share_secret_stage_cleanup() -> None:
     assert "if ! cleanup_secret_stages; then" in exit_cleanup
 
 
+def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
+    policy = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    smoke = (ROOT / "tests" / "shell" / "runtime_smoke_0_4_1.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "Do not run `apt`, `pct`, `ssh`, Docker, or deployment scripts "
+        "as part of repository tests."
+    ) not in policy
+    for requirement in (
+        "`HUBINET_OPS_TEST_MODE=1`",
+        "temporary fake `PATH`",
+        "temporary directories",
+        "no real or private-network endpoints",
+        "no production addresses or credentials",
+        "fails closed on every unsupported command",
+        "real lifecycle or snapshot mutation",
+    ):
+        assert requirement in policy
+    for marker in (
+        'PATH="$case_root/bin:$PATH"',
+        "HUBINET_OPS_TEST_MODE=1",
+        'HUBINET_OPS_TEST_PVE_ROOT="$case_root/pve"',
+        'HUBINET_OPS_BACKUP_ROOT="$case_root/backups"',
+        'echo "unsupported fake pct exec: $*" >&2; exit 1',
+        'echo "unsupported fake pct: $action" >&2; exit 1',
+    ):
+        assert marker in smoke
+
+
 def test_config_migration_is_idempotent_and_rollback_policy_is_consistent(
     tmp_path: Path,
 ) -> None:
