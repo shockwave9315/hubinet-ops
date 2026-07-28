@@ -1,4 +1,7 @@
 FROM python:3.13-bookworm
 
+RUN python -m pip install --no-cache-dir PyYAML==6.0.2 \
+    && python -c "import yaml; assert yaml.__version__ == '6.0.2'"
+
 USER 65534:65534
 WORKDIR /workspace
