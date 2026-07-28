@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -163,23 +164,82 @@ def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
     ) not in policy
     for requirement in (
         "`HUBINET_OPS_TEST_MODE=1`",
-        "temporary fake `PATH`",
+        "isolated `PATH` without inheriting the host `PATH`",
+        "temporary fake command layer",
+        "explicit allowlist of unprivileged local tools",
+        "no real network, deployment, container, or hypervisor programs",
         "temporary directories",
         "no real or private-network endpoints",
         "no production addresses or credentials",
-        "fails closed on every unsupported command",
+        "fail closed on every non-allowlisted command",
         "real lifecycle or snapshot mutation",
     ):
         assert requirement in policy
+
+    safe_tools_match = re.search(
+        r"^SAFE_TOOL_NAMES=\(\s*(.*?)^\)$",
+        smoke,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    assert safe_tools_match is not None
+    safe_tools = set(
+        re.findall(
+            r"^\s*([a-z0-9-]+)\s*$",
+            safe_tools_match.group(1),
+            re.MULTILINE,
+        )
+    )
+    assert {"bash", "awk", "grep", "gzip", "tar", "sha256sum"} <= safe_tools
+    assert not safe_tools & {
+        "apt",
+        "apt-get",
+        "ssh",
+        "scp",
+        "pct",
+        "pvesh",
+        "qm",
+        "docker",
+        "podman",
+        "systemctl",
+        "curl",
+    }
+
+    run_case = smoke[smoke.index("run_case()"):smoke.index("first_line_after()")]
+    assert re.search(
+        r'isolated_path="\$case_root/bin:\$case_root/safe-bin"',
+        run_case,
+    )
+    assert re.search(r'^\s*PATH="\$isolated_path"\s*\\$', run_case, re.MULTILINE)
+    assert ":$PATH" not in run_case
     for marker in (
-        'PATH="$case_root/bin:$PATH"',
         "HUBINET_OPS_TEST_MODE=1",
         'HUBINET_OPS_TEST_PVE_ROOT="$case_root/pve"',
         'HUBINET_OPS_BACKUP_ROOT="$case_root/backups"',
+        'HOST_PATH_SENTINEL="hubinet-host-path-sentinel"',
+        'PATH="$HOST_ONLY_BIN:$ORIGINAL_HOST_PATH" command -v "$HOST_PATH_SENTINEL"',
+        'for tool in "$HOST_PATH_SENTINEL" apt apt-get ssh scp pvesh qm docker podman wget',
+        'for tool in pct systemctl curl python3 install mktemp mv cp wrapper-smoke',
+        'for tool in "${SAFE_TOOL_NAMES[@]}"',
+        'cat > "$bin/pct"',
+        'cat > "$bin/systemctl"',
+        'cat > "$bin/curl"',
         'echo "unsupported fake pct exec: $*" >&2; exit 1',
         'echo "unsupported fake pct: $action" >&2; exit 1',
     ):
         assert marker in smoke
+
+
+def test_upgrade_script_has_no_absolute_forbidden_command_bypass() -> None:
+    installer = PVE_INSTALLER.read_text(encoding="utf-8")
+    forbidden = (
+        r"apt(?:-get)?|ssh|scp|sftp|rsync|pct|pvesh|qm|lxc-[a-z0-9-]+|"
+        r"systemctl|docker|podman|curl|wget|nc|socat"
+    )
+    absolute_command = re.compile(
+        rf"(?:^|[;&|]\s*|\$\()\s*/(?:usr/)?s?bin/(?:{forbidden})(?=\s|$)",
+        flags=re.MULTILINE,
+    )
+    assert absolute_command.search(installer) is None
 
 
 def test_config_migration_is_idempotent_and_rollback_policy_is_consistent(

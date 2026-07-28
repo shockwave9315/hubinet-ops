@@ -4,12 +4,49 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+ORIGINAL_HOST_PATH="$PATH"
+REAL_BASH="$(command -v bash)"
 REAL_PYTHON="${HUBINET_OPS_TEST_PYTHON:-$(command -v python3 || command -v python)}"
+REAL_CP="$(command -v cp)"
+REAL_MV="$(command -v mv)"
+SAFE_TOOL_NAMES=(
+  bash
+  awk
+  basename
+  cat
+  chmod
+  date
+  dirname
+  grep
+  gzip
+  mkdir
+  rm
+  sed
+  seq
+  sha256sum
+  sleep
+  tar
+)
+declare -A SAFE_TOOL_PATHS=()
+for safe_tool in "${SAFE_TOOL_NAMES[@]}"; do
+  SAFE_TOOL_PATHS["$safe_tool"]="$(command -v "$safe_tool")" || {
+    echo "required safe smoke tool is unavailable: $safe_tool" >&2
+    exit 1
+  }
+done
+HOST_ONLY_BIN="$TMP/host-only-bin"
+HOST_PATH_SENTINEL="hubinet-host-path-sentinel"
+mkdir -p "$HOST_ONLY_BIN"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$HOST_ONLY_BIN/$HOST_PATH_SENTINEL"
+chmod +x "$HOST_ONLY_BIN/$HOST_PATH_SENTINEL"
 
 make_fakes() {
-  local root="$1" bin pve ct
-  bin="$root/bin"; pve="$root/pve"; ct="$root/ct"
-  mkdir -p "$bin" "$root/pycompat" "$pve/etc/hubinet-ops" "$pve/usr/local/sbin" "$ct/ct110"
+  local root="$1" bin safe_bin pve ct safe_tool
+  bin="$root/bin"; safe_bin="$root/safe-bin"; pve="$root/pve"; ct="$root/ct"
+  mkdir -p "$bin" "$safe_bin" "$root/pycompat" "$pve/etc/hubinet-ops" "$pve/usr/local/sbin" "$ct/ct110"
+  for safe_tool in "${SAFE_TOOL_NAMES[@]}"; do
+    ln -s "${SAFE_TOOL_PATHS[$safe_tool]}" "$safe_bin/$safe_tool"
+  done
   printf 'LOCK_EX=2\nLOCK_NB=4\ndef flock(*args, **kwargs): return None\n' > "$root/pycompat/fcntl.py"
   cp "$ROOT/config/config.example.yaml" "$ct/ct110/etc-config.yaml"
   printf 'HUBINET_OPS_API_TOKEN=%064d\n' 0 > "$ct/ct110/agent.env"
@@ -215,7 +252,7 @@ if [[ -n "${FAIL_MV_MATCH:-}" && "$dst" == *"$FAIL_MV_MATCH"* ]]; then
   printf 'MARK partial-install-failure %s\n' "$dst" >> "$TEST_LOG"
   exit 1
 fi
-exec /usr/bin/mv "$@"
+exec "$REAL_MV" "$@"
 SH
   cat > "$bin/systemctl" <<'SH'
 #!/usr/bin/env bash
@@ -244,22 +281,53 @@ if [[ -n "${FAIL_BACKUP_COPY_VMID:-}" &&
   printf 'MARK backup-copy-failure %s\n' "$FAIL_BACKUP_COPY_VMID" >> "$TEST_LOG"
   exit 1
 fi
-exec /usr/bin/cp "$@"
+exec "$REAL_CP" "$@"
 SH
   chmod +x "$bin"/*
 }
 
+verify_isolated_path() {
+  local root="$1" isolated_path tool resolved
+  isolated_path="$root/bin:$root/safe-bin"
+
+  PATH="$HOST_ONLY_BIN:$ORIGINAL_HOST_PATH" command -v "$HOST_PATH_SENTINEL" >/dev/null
+  for tool in "$HOST_PATH_SENTINEL" apt apt-get ssh scp pvesh qm docker podman wget; do
+    if PATH="$isolated_path" command -v "$tool" >/dev/null 2>&1; then
+      echo "isolated smoke PATH exposed forbidden host command: $tool" >&2
+      return 1
+    fi
+  done
+  for tool in pct systemctl curl python3 install mktemp mv cp wrapper-smoke; do
+    resolved="$(PATH="$isolated_path" command -v "$tool")"
+    [[ "$resolved" == "$root/bin/$tool" ]] || {
+      echo "fake smoke command escaped case bin: $tool -> $resolved" >&2
+      return 1
+    }
+  done
+  for tool in "${SAFE_TOOL_NAMES[@]}"; do
+    resolved="$(PATH="$isolated_path" command -v "$tool")"
+    [[ "$resolved" == "$root/safe-bin/$tool" ]] || {
+      echo "safe smoke command escaped allowlist: $tool -> $resolved" >&2
+      return 1
+    }
+  done
+}
+
 run_case() {
-  local name="$1" fail_vmid="${2:-}" retry_match="${3:-}" case_root
+  local name="$1" fail_vmid="${2:-}" retry_match="${3:-}" case_root isolated_path
   case_root="$TMP/$name"
   mkdir -p "$case_root"
   make_fakes "$case_root"
+  isolated_path="$case_root/bin:$case_root/safe-bin"
+  verify_isolated_path "$case_root"
   : > "$case_root/actions.log"
   set +e
-  PATH="$case_root/bin:$PATH" \
+  PATH="$isolated_path" \
   TEST_LOG="$case_root/actions.log" \
   TEST_CT_ROOT="$case_root/ct" \
   REAL_PYTHON="$REAL_PYTHON" \
+  REAL_CP="$REAL_CP" \
+  REAL_MV="$REAL_MV" \
   PYTHONPATH="$case_root/pycompat" \
   FAIL_CAPABILITIES_VMID="$fail_vmid" \
   PCT_FAIL_129_ONCE_MATCH="$retry_match" \
@@ -271,7 +339,7 @@ run_case() {
   HUBINET_OPS_HOSTD_HEALTH_URL="http://hostd.test/health" \
   HUBINET_OPS_VALIDATION_ATTEMPTS=1 \
   HUBINET_OPS_VALIDATION_DELAY=0 \
-    bash ${HUBINET_OPS_TEST_BASH_X:+-x} "$ROOT/deploy/upgrade-0.4.1-from-pve.sh" >"$case_root/stdout" 2>"$case_root/stderr"
+    "$REAL_BASH" ${HUBINET_OPS_TEST_BASH_X:+-x} "$ROOT/deploy/upgrade-0.4.1-from-pve.sh" >"$case_root/stdout" 2>"$case_root/stderr"
   rc=$?
   set -e
   printf '%s' "$rc"
