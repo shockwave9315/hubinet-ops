@@ -14,6 +14,17 @@ class Violation(NamedTuple):
     fragment: str
 
 
+class ShellWord(NamedTuple):
+    start: int
+    end: int
+    line: int
+    raw: str
+    value: str
+    assembled: bool
+    dynamic: bool
+    malformed: bool
+
+
 VARIABLE_PREFIX = r"(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})"
 ABSOLUTE_PATH = re.compile(
     rf"(?<![A-Za-z0-9_./:+-])(?:{VARIABLE_PREFIX})?"
@@ -34,10 +45,166 @@ FORBIDDEN_EXECUTABLE_PREFIXES = (
     "/usr/sbin/",
 )
 FORBIDDEN_BASH_NETWORK_PREFIXES = ("/dev/tcp/", "/dev/udp/")
+SHELL_WORD_SEPARATORS = frozenset(" \t\r\n;&|()<>")
 
 
 def _canonical_path(path: str) -> str:
     return posixpath.normpath(re.sub(r"/+", "/", path))
+
+
+def _shell_words(text: str) -> list[ShellWord]:
+    words: list[ShellWord] = []
+    index = 0
+    length = len(text)
+
+    while index < length:
+        while index < length and text[index] in SHELL_WORD_SEPARATORS:
+            index += 1
+        if index >= length:
+            break
+
+        start = index
+        line = text.count("\n", 0, start) + 1
+        value: list[str] = []
+        quote: str | None = None
+        assembled = False
+        dynamic = False
+        malformed = False
+
+        while index < length:
+            character = text[index]
+            if quote is None:
+                if character in SHELL_WORD_SEPARATORS:
+                    break
+                if (
+                    character == "$"
+                    and index + 1 < length
+                    and text[index + 1] in {"'", '"'}
+                ):
+                    assembled = True
+                    dynamic = True
+                    quote = text[index + 1]
+                    index += 2
+                    continue
+                if character in {"'", '"'}:
+                    assembled = True
+                    quote = character
+                    index += 1
+                    continue
+                if character == "\\":
+                    assembled = True
+                    if index + 1 >= length:
+                        malformed = True
+                        index += 1
+                        break
+                    if text[index + 1] == "\n":
+                        index += 2
+                        continue
+                    if (
+                        text[index + 1] == "\r"
+                        and index + 2 < length
+                        and text[index + 2] == "\n"
+                    ):
+                        index += 3
+                        continue
+                    value.append(text[index + 1])
+                    index += 2
+                    continue
+                value.append(character)
+                index += 1
+                continue
+
+            if character == quote:
+                quote = None
+                index += 1
+                continue
+            if quote == '"' and character == "\\":
+                assembled = True
+                if index + 1 >= length:
+                    malformed = True
+                    index += 1
+                    break
+                escaped = text[index + 1]
+                if escaped == "\n":
+                    index += 2
+                    continue
+                if (
+                    escaped == "\r"
+                    and index + 2 < length
+                    and text[index + 2] == "\n"
+                ):
+                    index += 3
+                    continue
+                if escaped in {'$', "`", '"', "\\"}:
+                    value.append(escaped)
+                else:
+                    value.extend(("\\", escaped))
+                index += 2
+                continue
+            value.append(character)
+            index += 1
+
+        if quote is not None:
+            malformed = True
+        words.append(
+            ShellWord(
+                start=start,
+                end=index,
+                line=line,
+                raw=text[start:index],
+                value="".join(value),
+                assembled=assembled,
+                dynamic=dynamic,
+                malformed=malformed,
+            )
+        )
+
+    return words
+
+
+def _display_shell_fragment(fragment: str) -> str:
+    return (
+        fragment.replace("\r", r"\r")
+        .replace("\n", r"\n")
+        .replace("\t", r"\t")
+    )
+
+
+def _shell_word_violations(
+    words: list[ShellWord],
+) -> list[tuple[Violation, int, int]]:
+    results: list[tuple[Violation, int, int]] = []
+    for word in words:
+        if not (word.assembled or word.dynamic or word.malformed):
+            continue
+        for match in ABSOLUTE_PATH.finditer(word.value):
+            path = match.group("path")
+            canonical = _canonical_path(path)
+            if canonical.startswith(FORBIDDEN_BASH_NETWORK_PREFIXES):
+                path_kind = "Bash network device"
+            elif canonical.startswith(FORBIDDEN_EXECUTABLE_PREFIXES):
+                path_kind = "absolute executable path"
+            else:
+                continue
+
+            if word.dynamic:
+                kind = "dynamic shell path construction"
+            elif word.malformed:
+                kind = "ambiguous shell path construction"
+            else:
+                kind = f"shell-assembled {path_kind}"
+            fragment = (
+                f"{_display_shell_fragment(word.raw)} -> {canonical}"
+            )
+            results.append(
+                (
+                    Violation(line=word.line, kind=kind, fragment=fragment),
+                    word.start,
+                    word.end,
+                )
+            )
+            break
+    return results
 
 
 def find_violations(text: str) -> list[Violation]:
@@ -57,6 +224,8 @@ def find_violations(text: str) -> list[Violation]:
         )
         for match in COMMAND_DEFAULT_PATH.finditer(text)
     )
+    words = _shell_words(text)
+    shell_word_violations = _shell_word_violations(words)
     first_line = text.splitlines()[0] if text else ""
     for match in ABSOLUTE_PATH.finditer(text):
         path = match.group("path")
@@ -65,6 +234,11 @@ def find_violations(text: str) -> list[Violation]:
             first_line == ALLOWED_SHEBANG
             and match.start("path") == 2
             and path == "/usr/bin/env"
+        ):
+            continue
+        if any(
+            start <= match.start("path") < end
+            for _, start, end in shell_word_violations
         ):
             continue
         if canonical.startswith(FORBIDDEN_BASH_NETWORK_PREFIXES):
@@ -85,7 +259,21 @@ def find_violations(text: str) -> list[Violation]:
                 fragment=path,
             )
         )
-    return sorted(violations, key=lambda violation: (violation.line, violation.fragment))
+    violations.extend(
+        violation for violation, _, _ in shell_word_violations
+    )
+    unique = {
+        (violation.line, violation.kind, violation.fragment): violation
+        for violation in violations
+    }
+    return sorted(
+        unique.values(),
+        key=lambda violation: (
+            violation.line,
+            violation.fragment,
+            violation.kind,
+        ),
+    )
 
 
 def validate_file(path: Path) -> list[Violation]:

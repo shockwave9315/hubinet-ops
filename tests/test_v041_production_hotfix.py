@@ -482,6 +482,274 @@ def test_hermetic_shell_boundary_rejects_absolute_commands(
 
 
 @pytest.mark.parametrize(
+    ("shell_text", "raw_fragment", "kind", "normalized"),
+    (
+        (
+            "/usr/bi''n/curl https://example.invalid",
+            "/usr/bi''n/curl",
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            '/usr/bi""n/curl https://example.invalid',
+            '/usr/bi""n/curl',
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            '/usr/bi"n"/curl https://example.invalid',
+            '/usr/bi"n"/curl',
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            "/usr/'bin'/curl https://example.invalid",
+            "/usr/'bin'/curl",
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            "'/usr/bi'n/curl https://example.invalid",
+            "'/usr/bi'n/curl",
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            '"/usr/bi"n/curl https://example.invalid',
+            '"/usr/bi"n/curl',
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            "'/usr/bin/curl' https://example.invalid",
+            "'/usr/bin/curl'",
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            '"/usr/bin/curl" https://example.invalid',
+            '"/usr/bin/curl"',
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            "/usr/bi\\n/curl https://example.invalid",
+            "/usr/bi\\n/curl",
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            "/usr/bi\\\nn/curl https://example.invalid",
+            "/usr/bi\\\nn/curl",
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            "/usr/bi\\\nn/../bin/curl https://example.invalid",
+            "/usr/bi\\\nn/../bin/curl",
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            "/bin/''bash -c 'curl https://example.invalid'",
+            "/bin/''bash",
+            "shell-assembled absolute executable path",
+            "/bin/bash",
+        ),
+        (
+            "/sbi''n/reboot",
+            "/sbi''n/reboot",
+            "shell-assembled absolute executable path",
+            "/sbin/reboot",
+        ),
+        (
+            '/usr/sbi""n/pct status 106',
+            '/usr/sbi""n/pct',
+            "shell-assembled absolute executable path",
+            "/usr/sbin/pct",
+        ),
+        (
+            "/de''v/tcp/192.168.4.249/22",
+            "/de''v/tcp/192.168.4.249/22",
+            "shell-assembled Bash network device",
+            "/dev/tcp/192.168.4.249/22",
+        ),
+        (
+            "/dev/tc\\\np/192.168.4.249/22",
+            "/dev/tc\\\np/192.168.4.249/22",
+            "shell-assembled Bash network device",
+            "/dev/tcp/192.168.4.249/22",
+        ),
+        (
+            '/de"v"/udp/192.168.4.249/53',
+            '/de"v"/udp/192.168.4.249/53',
+            "shell-assembled Bash network device",
+            "/dev/udp/192.168.4.249/53",
+        ),
+        (
+            "$'/usr/bin/curl' https://example.invalid",
+            "$'/usr/bin/curl'",
+            "dynamic shell path construction",
+            "/usr/bin/curl",
+        ),
+        (
+            "/usr/$'bin'/curl https://example.invalid",
+            "/usr/$'bin'/curl",
+            "dynamic shell path construction",
+            "/usr/bin/curl",
+        ),
+        (
+            '$"/usr/bin/curl" https://example.invalid',
+            '$"/usr/bin/curl"',
+            "dynamic shell path construction",
+            "/usr/bin/curl",
+        ),
+        (
+            "if /usr/bi''n/curl; then :; fi",
+            "/usr/bi''n/curl",
+            "shell-assembled absolute executable path",
+            "/usr/bin/curl",
+        ),
+        (
+            'command /usr/bi""n/ssh host',
+            '/usr/bi""n/ssh',
+            "shell-assembled absolute executable path",
+            "/usr/bin/ssh",
+        ),
+        (
+            "exec /usr/bi\\\nn/scp file host:/tmp/",
+            "/usr/bi\\\nn/scp",
+            "shell-assembled absolute executable path",
+            "/usr/bin/scp",
+        ),
+        (
+            "FOO=bar /bin/''systemctl restart example",
+            "/bin/''systemctl",
+            "shell-assembled absolute executable path",
+            "/bin/systemctl",
+        ),
+        (
+            "$(/usr/bi''n/nc host 1234)",
+            "/usr/bi''n/nc",
+            "shell-assembled absolute executable path",
+            "/usr/bin/nc",
+        ),
+    ),
+)
+def test_hermetic_shell_boundary_rejects_shell_assembled_paths(
+    tmp_path: Path,
+    shell_text: str,
+    raw_fragment: str,
+    kind: str,
+    normalized: str,
+) -> None:
+    script = tmp_path / "assembled-unsafe.sh"
+    script.write_text(f"echo safe\n{shell_text}\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    displayed = (
+        raw_fragment.replace("\r", r"\r")
+        .replace("\n", r"\n")
+        .replace("\t", r"\t")
+    )
+    assert completed.returncode == 1
+    assert (
+        f"{script}:2: forbidden {kind}: {displayed} -> {normalized}"
+        in completed.stderr
+    )
+    assert completed.stderr.count(f"-> {normalized}") == 1
+
+
+@pytest.mark.parametrize(
+    ("shell_text", "raw_fragment"),
+    (
+        ("'/usr/bin/curl", "'/usr/bin/curl"),
+        ("/usr/bin/curl\\", "/usr/bin/curl\\"),
+    ),
+)
+def test_hermetic_shell_boundary_rejects_ambiguous_absolute_words(
+    tmp_path: Path,
+    shell_text: str,
+    raw_fragment: str,
+) -> None:
+    script = tmp_path / "ambiguous-unsafe.sh"
+    script.write_text(f"echo safe\n{shell_text}", encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert (
+        f"{script}:2: forbidden ambiguous shell path construction: "
+        f"{raw_fragment} -> /usr/bin/curl"
+    ) in completed.stderr
+
+
+def test_hermetic_shell_boundary_reports_multiple_assembled_violations(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "multiple-assembled.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "/usr/bi''n/curl https://example.invalid\n"
+        "/de\"v\"/tcp/192.0.2.1/443\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stderr.count("forbidden shell-assembled") == 2
+    assert f"{script}:2:" in completed.stderr
+    assert f"{script}:3:" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "shell_line",
+    (
+        "echo '/usr/bin/curl'",
+        "printf '%s\\n' \"/usr/bin/curl\"",
+        'message="use /usr/bin/curl only in documentation"',
+    ),
+)
+def test_hermetic_shell_boundary_preserves_fail_closed_quoted_text_policy(
+    tmp_path: Path,
+    shell_line: str,
+) -> None:
+    script = tmp_path / "quoted-path.sh"
+    script.write_text(f"{shell_line}\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert "/usr/bin/curl" in completed.stderr
+
+
+@pytest.mark.parametrize(
     "shell_line",
     (
         "curl http://hostd.test/health",
@@ -650,6 +918,44 @@ def test_hermetic_shell_boundary_rejects_nonexact_or_late_shebang(
         f"{script}:{line}: forbidden absolute executable path: /usr/bin/env"
         in completed.stderr
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "raw_fragment"),
+    (
+        ("#!/usr/bi''n/env bash\n", "#!/usr/bi''n/env"),
+        ('#!"/usr/bin/env" bash\n', '#!"/usr/bin/env"'),
+        ("#!/usr/bin/env ba''sh\n", None),
+    ),
+)
+def test_hermetic_shell_boundary_does_not_expand_exact_shebang_exception(
+    tmp_path: Path,
+    text: str,
+    raw_fragment: str | None,
+) -> None:
+    script = tmp_path / "assembled-shebang.sh"
+    script.write_text(text, encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    if raw_fragment is None:
+        assert (
+            f"{script}:1: forbidden absolute executable path: /usr/bin/env"
+            in completed.stderr
+        )
+    else:
+        assert (
+            f"{script}:1: forbidden shell-assembled absolute executable path: "
+            f"{raw_fragment} -> /usr/bin/env"
+            in completed.stderr
+        )
 
 
 def test_hermetic_shell_boundary_reports_multiple_violations(
