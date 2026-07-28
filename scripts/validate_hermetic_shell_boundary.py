@@ -9,28 +9,52 @@ from typing import NamedTuple
 
 class Violation(NamedTuple):
     line: int
-    command_path: str
+    kind: str
+    fragment: str
 
 
-FORBIDDEN_COMMAND = (
-    r"apt(?:-get)?|ssh|scp|sftp|rsync|pct|pvesh|qm|lxc-[A-Za-z0-9_.+-]+|"
-    r"systemctl|docker|podman|curl|wget|nc|socat|sudo"
-)
 COMMAND_END = r"(?=$|[\s;&|()<>'\"])"
-FORBIDDEN_ABSOLUTE_COMMAND = re.compile(
-    rf"(?P<path>/(?:usr/)?s?bin/(?:{FORBIDDEN_COMMAND}))"
+VARIABLE_PREFIX = r"(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})"
+FORBIDDEN_ABSOLUTE_EXECUTABLE = re.compile(
+    rf"(?:{VARIABLE_PREFIX}|(?<![A-Za-z0-9_./+-]))"
+    rf"(?P<path>/(?:usr/)?s?bin/[^/\s;&|()<>'\"]+)"
     rf"{COMMAND_END}"
 )
+PATH_REFERENCE = re.compile(
+    r"(?P<expansion>\$\{PATH\}|\$PATH\b)"
+    r"|(?P<assignment>\bPATH\s*\+?=)"
+    r"|(?P<keyword>\b(?:export|readonly|declare|typeset|unset)\s+PATH\b)"
+    r"|(?P<name>\bPATH\b)"
+)
+ALLOWED_SHEBANG = "#!/usr/bin/env bash"
 
 
 def find_violations(text: str) -> list[Violation]:
-    return [
+    violations = [
         Violation(
-            line=text.count("\n", 0, match.start("path")) + 1,
-            command_path=match.group("path"),
+            line=text.count("\n", 0, match.start()) + 1,
+            kind="PATH reference",
+            fragment=match.group(0),
         )
-        for match in FORBIDDEN_ABSOLUTE_COMMAND.finditer(text)
+        for match in PATH_REFERENCE.finditer(text)
     ]
+    first_line = text.splitlines()[0] if text else ""
+    for match in FORBIDDEN_ABSOLUTE_EXECUTABLE.finditer(text):
+        path = match.group("path")
+        if (
+            first_line == ALLOWED_SHEBANG
+            and match.start("path") == 2
+            and path == "/usr/bin/env"
+        ):
+            continue
+        violations.append(
+            Violation(
+                line=text.count("\n", 0, match.start("path")) + 1,
+                kind="absolute executable path",
+                fragment=path,
+            )
+        )
+    return sorted(violations, key=lambda violation: (violation.line, violation.fragment))
 
 
 def validate_file(path: Path) -> list[Violation]:
@@ -55,8 +79,8 @@ def main(argv: list[str] | None = None) -> int:
 
     for violation in violations:
         print(
-            f"{args.script}:{violation.line}: forbidden absolute command path: "
-            f"{violation.command_path}",
+            f"{args.script}:{violation.line}: forbidden {violation.kind}: "
+            f"{violation.fragment}",
             file=sys.stderr,
         )
     return 1 if violations else 0

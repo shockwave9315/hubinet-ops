@@ -245,42 +245,128 @@ def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
 
 
 @pytest.mark.parametrize(
-    ("shell_line", "command_path"),
+    ("shell_line", "kind", "fragment"),
     (
-        ("/usr/bin/curl https://example.invalid", "/usr/bin/curl"),
+        (
+            "/usr/bin/curl https://example.invalid",
+            "absolute executable path",
+            "/usr/bin/curl",
+        ),
         (
             "if /usr/bin/curl https://example.invalid; then :; fi",
+            "absolute executable path",
             "/usr/bin/curl",
         ),
         (
             "elif /usr/bin/curl https://example.invalid; then",
+            "absolute executable path",
             "/usr/bin/curl",
         ),
         (
             "while /usr/bin/curl https://example.invalid; do :; done",
+            "absolute executable path",
             "/usr/bin/curl",
         ),
         (
             "until /usr/bin/curl https://example.invalid; do :; done",
+            "absolute executable path",
             "/usr/bin/curl",
         ),
-        ("command /usr/bin/ssh example.invalid", "/usr/bin/ssh"),
-        ("exec /usr/bin/scp file example.invalid:/tmp/", "/usr/bin/scp"),
-        ("sudo /usr/sbin/pct status 106", "/usr/sbin/pct"),
+        (
+            "command /usr/bin/ssh example.invalid",
+            "absolute executable path",
+            "/usr/bin/ssh",
+        ),
+        (
+            "exec /usr/bin/scp file example.invalid:/tmp/",
+            "absolute executable path",
+            "/usr/bin/scp",
+        ),
+        (
+            "sudo /usr/sbin/pct status 106",
+            "absolute executable path",
+            "/usr/sbin/pct",
+        ),
         (
             "/usr/bin/sudo /usr/sbin/pct status 106",
+            "absolute executable path",
             "/usr/bin/sudo",
         ),
-        ("FOO=bar /bin/systemctl restart example", "/bin/systemctl"),
-        ("(/usr/bin/wget https://example.invalid)", "/usr/bin/wget"),
-        ("$(/usr/bin/nc example.invalid 1234)", "/usr/bin/nc"),
-        ("$EMPTY/usr/bin/curl https://example.invalid", "/usr/bin/curl"),
+        (
+            "FOO=bar /bin/systemctl restart example",
+            "absolute executable path",
+            "/bin/systemctl",
+        ),
+        (
+            "(/usr/bin/wget https://example.invalid)",
+            "absolute executable path",
+            "/usr/bin/wget",
+        ),
+        (
+            "$(/usr/bin/nc example.invalid 1234)",
+            "absolute executable path",
+            "/usr/bin/nc",
+        ),
+        (
+            "$EMPTY/usr/bin/curl https://example.invalid",
+            "absolute executable path",
+            "/usr/bin/curl",
+        ),
+        ("PATH=/usr/bin:/bin curl https://example.invalid", "PATH reference", "PATH="),
+        ("PATH+=:/usr/bin", "PATH reference", "PATH+="),
+        ("export PATH=/usr/bin:/bin", "PATH reference", "export PATH"),
+        ("export   PATH=/usr/bin:/bin", "PATH reference", "export   PATH"),
+        ("export\tPATH=/usr/bin:/bin", "PATH reference", "export\tPATH"),
+        ("readonly\nPATH=/usr/bin:/bin", "PATH reference", "readonly\nPATH"),
+        ("readonly PATH=/usr/bin:/bin", "PATH reference", "readonly PATH"),
+        ("declare PATH=/usr/bin:/bin", "PATH reference", "declare PATH"),
+        ("typeset PATH=/usr/bin:/bin", "PATH reference", "typeset PATH"),
+        ("unset PATH", "PATH reference", "unset PATH"),
+        ('echo "$PATH"', "PATH reference", "$PATH"),
+        ('echo "${PATH}"', "PATH reference", "${PATH}"),
+        (
+            "env PATH=/usr/bin:/bin curl https://example.invalid",
+            "PATH reference",
+            "PATH=",
+        ),
+        (
+            "/usr/bin/env PATH=/usr/bin:/bin curl https://example.invalid",
+            "absolute executable path",
+            "/usr/bin/env",
+        ),
+        (
+            "/usr/bin/env -i curl https://example.invalid",
+            "absolute executable path",
+            "/usr/bin/env",
+        ),
+        (
+            "/usr/bin/python3 -c 'print(\"unsafe\")'",
+            "absolute executable path",
+            "/usr/bin/python3",
+        ),
+        (
+            "/usr/bin/perl -e 'print \"unsafe\"'",
+            "absolute executable path",
+            "/usr/bin/perl",
+        ),
+        (
+            "/bin/bash -c 'curl https://example.invalid'",
+            "absolute executable path",
+            "/bin/bash",
+        ),
+        (
+            "/bin/sh -c 'curl https://example.invalid'",
+            "absolute executable path",
+            "/bin/sh",
+        ),
+        ("/sbin/reboot", "absolute executable path", "/sbin/reboot"),
     ),
 )
 def test_hermetic_shell_boundary_rejects_absolute_commands(
     tmp_path: Path,
     shell_line: str,
-    command_path: str,
+    kind: str,
+    fragment: str,
 ) -> None:
     script = tmp_path / "unsafe.sh"
     script.write_text(f"echo safe\n{shell_line}\n", encoding="utf-8")
@@ -293,9 +379,7 @@ def test_hermetic_shell_boundary_rejects_absolute_commands(
     )
 
     assert completed.returncode == 1
-    assert f"{script}:2: forbidden absolute command path: {command_path}" in (
-        completed.stderr
-    )
+    assert f"{script}:2: forbidden {kind}: {fragment}" in completed.stderr
 
 
 @pytest.mark.parametrize(
@@ -328,6 +412,108 @@ def test_hermetic_shell_boundary_allows_controlled_references(
 
 def test_current_upgrade_passes_hermetic_shell_boundary() -> None:
     assert validate_file(PVE_INSTALLER) == []
+
+
+def test_hermetic_shell_boundary_allows_only_exact_first_line_shebang(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "safe-shebang.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "curl http://hostd.test/health\n"
+        "pct status 106\n"
+        "systemctl restart hubinet-ops-hostd\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("text", "line"),
+    (
+        ("echo before\n#!/usr/bin/env bash\n", 2),
+        ("#!/usr/bin/env bash\n/usr/bin/env -i echo unsafe\n", 2),
+        ("#!/usr/bin/env bash -e\n", 1),
+    ),
+)
+def test_hermetic_shell_boundary_rejects_nonexact_or_late_shebang(
+    tmp_path: Path,
+    text: str,
+    line: int,
+) -> None:
+    script = tmp_path / "unsafe-shebang.sh"
+    script.write_text(text, encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert (
+        f"{script}:{line}: forbidden absolute executable path: /usr/bin/env"
+        in completed.stderr
+    )
+
+
+def test_hermetic_shell_boundary_reports_multiple_violations(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "multiple-unsafe.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "export PATH=/usr/bin:/bin\n"
+        "/usr/bin/python3 -c 'print(\"unsafe\")'\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert f"{script}:2: forbidden PATH reference: export PATH" in completed.stderr
+    assert (
+        f"{script}:3: forbidden absolute executable path: /usr/bin/python3"
+        in completed.stderr
+    )
+
+
+@pytest.mark.parametrize("invalid_utf8", (False, True))
+def test_hermetic_shell_boundary_reports_unreadable_input_as_exit_2(
+    tmp_path: Path,
+    invalid_utf8: bool,
+) -> None:
+    script = tmp_path / "invalid.sh"
+    if invalid_utf8:
+        script.write_bytes(b"\xff")
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert f"{script}: unable to validate shell boundary:" in completed.stderr
 
 
 def test_config_migration_is_idempotent_and_rollback_policy_is_consistent(
