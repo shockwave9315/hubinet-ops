@@ -777,6 +777,13 @@ def test_hermetic_shell_boundary_rejects_escaped_dynamic_paths(
         r'/usr/$"bi${part}n"/curl https://example.invalid',
         r'/usr/"bi${part}n"/curl https://example.invalid',
         r"/usr/bi${part}n/curl https://example.invalid",
+        r"/usr/bi$1n/curl https://example.invalid",
+        r'/usr/"bi$1n"/curl https://example.invalid',
+        r"/usr/bi$@n/curl https://example.invalid",
+        r'/usr/"bi$*n"/curl https://example.invalid',
+        r"/usr/bi$!n/curl https://example.invalid",
+        r"/usr/bi${@}n/curl https://example.invalid",
+        r'/usr/"bi${1}n"/curl https://example.invalid',
     ),
 )
 def test_hermetic_shell_boundary_rejects_empty_parameter_path_bypasses(

@@ -25,7 +25,8 @@ class ShellWord(NamedTuple):
     malformed: bool
 
 
-VARIABLE_PREFIX = r"(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})"
+PARAMETER_NAME = r"(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[-!#$?*@])"
+VARIABLE_PREFIX = rf"(?:\${PARAMETER_NAME}|\$\{{{PARAMETER_NAME}\}})"
 SIMPLE_PARAMETER_EXPANSION = re.compile(VARIABLE_PREFIX)
 ABSOLUTE_PATH = re.compile(
     rf"(?<![A-Za-z0-9_./:+-])(?:{VARIABLE_PREFIX})?"
