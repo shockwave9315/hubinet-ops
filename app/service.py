@@ -282,17 +282,12 @@ class OpsService:
                 if state.get("lifecycle_status") != "running":
                     state["expected_lxc_status"] = None
             state["last_refresh"] = utc_now()
-            if (
-                executor_contract_error is not None
-                and state.get("last_operation_result") is None
-            ):
+            preserve_operation_error = self._has_terminal_operation_error(state)
+            if executor_contract_error is not None and not preserve_operation_error:
                 state["last_error"] = executor_contract_error
-            elif (
-                host_runtime_error is not None
-                and state.get("last_operation_result") is None
-            ):
+            elif host_runtime_error is not None and not preserve_operation_error:
                 state["last_error"] = host_runtime_error
-            elif state.get("last_operation_result") is None:
+            elif not preserve_operation_error:
                 state["last_error"] = None
         except ExecutorError as exc:
             state = self.get_state(vmid)
@@ -312,7 +307,7 @@ class OpsService:
                 state["lxc_status"] = host_runtime
                 state["runtime_status"] = host_runtime
             state["last_refresh"] = utc_now()
-            if state.get("last_operation_result") is None:
+            if not self._has_terminal_operation_error(state):
                 state["last_error"] = (
                     executor_contract_error
                     or host_runtime_error
@@ -321,6 +316,17 @@ class OpsService:
         saved = self._save_state(vmid, state)
         self._observe_health(vmid, str(saved.get("health_status", "unknown")))
         return saved
+
+    @staticmethod
+    def _has_terminal_operation_error(state: dict[str, Any]) -> bool:
+        """Keep errors that explain an explicitly unsuccessful operation outcome."""
+
+        return state.get("last_operation_result") in {
+            "failed",
+            "interrupted",
+            "rolled_back",
+            "manual_intervention",
+        }
 
     def refresh_all(self, *, operator: bool = False) -> list[dict[str, Any]]:
         completed = False

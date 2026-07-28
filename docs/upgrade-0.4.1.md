@@ -23,6 +23,8 @@ The installer accepts no arguments. It backs up every PVE destination, every CT1
 
 Safe, idempotent `pct push/exec` steps retry rc=129 at most three times. Other return codes fail immediately. A third rc=129 enters the normal global rollback. Running CTs receive executor/profile files through idempotent `install`; stopped CTs are mounted and never started.
 
+Before CT110 starts, both upgrade and rollback normalize `/etc/hubinet-ops/keys` to `0750 root:hubinetops`, the existing `proxmox_ed25519` to `0600 hubinetops:hubinetops`, and `ssh_known_hosts` to `0640 root:hubinetops`. The existing private key is not regenerated or replaced. Any ownership or mode failure stops the rollout with the agent inactive.
+
 The config migrator preserves inventory, addresses, MQTT, existing database, snapshot policy, and snapshots. It adds `pre_update_snapshot: true` for any container that had `automatic_rollback: true` to preserve the previous safety behavior. It aligns CT101–CT109 rollback capability with `manual_rollback_allowed: true`, keeps CT110's self-update policy, and remains idempotent.
 
 Final validation performs only read-only health, inspect, capabilities, state, schema, and snapshot-list calls. The full state JSON is read through stdin, never argv or environment. A failure reports the exact failed condition and invokes rollback.

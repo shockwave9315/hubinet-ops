@@ -120,6 +120,36 @@ def test_manual_rollback_endpoint_translates_controlled_failures(
     assert conflict.json() == {"detail": "rollback conflict"}
 
 
+def test_rest_api_preserves_full_diagnostic_text(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "diagnostic-import.yaml"
+    config_path.write_text(
+        "scheduler:\n  enabled: false\ncontainers:\n  106:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "diagnostic-import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+    cfg = make_settings(tmp_path)
+    db = Database(cfg.db_path)
+    api = main.create_app(cfg, database=db, executor=FakeExecutor())
+    diagnostic = "transient-" + "x" * 1990
+    state = api.state.service.get_state(106)
+    state["last_error"] = diagnostic
+    api.state.service._save_state(106, state, publish=False)
+
+    response = TestClient(api).get(
+        "/api/v1/containers/106/state",
+        headers={"Authorization": f"Bearer {cfg.api_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["last_error"] == diagnostic
+    persisted = db.get_resource_state(106)
+    assert persisted is not None
+    assert persisted["last_error"] == diagnostic
+
+
 def test_canonical_resources_include_qemu_and_container_alias_filters_it(
     tmp_path: Path,
     monkeypatch,

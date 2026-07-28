@@ -7,7 +7,9 @@ from typing import Any
 import pytest
 
 from app.config import Settings
+from app.contracts import REQUIRED_APT_ACTIONS
 from app.database import Database
+from app.executor import ExecutorError
 from app.service import OpsService
 
 
@@ -41,6 +43,10 @@ def settings(tmp_path: Path) -> Settings:
                         "cooldown_seconds": 900,
                     },
                     "repair_actions": [],
+                    "executor_contract": {
+                        "executor_sha256": "a" * 64,
+                        "profile_sha256": "b" * 64,
+                    },
                     "dashboard_path": "/hubinet-ops/ct-106",
                     "stabilization": {
                         "post_update_timeout_seconds": 1,
@@ -64,6 +70,18 @@ class Executor:
         self.changed_plan = changed_plan
 
     def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+        if action == "capabilities":
+            return {
+                "ok": True,
+                "data": {
+                    "version": "0.4.1",
+                    "protocol_version": 1,
+                    "supported_actions": sorted(REQUIRED_APT_ACTIONS),
+                    "executor_sha256": "a" * 64,
+                    "profile_sha256": "b" * 64,
+                    "profile_validation_status": "valid",
+                },
+            }
         if action == "inspect":
             return {
                 "ok": True,
@@ -144,6 +162,108 @@ def test_successful_refresh_preserves_terminal_operation_error(tmp_path: Path) -
     assert refreshed["health_status"] == "healthy"
     assert refreshed["operation_status"] == "rolled_back"
     assert refreshed["last_error"] == "update failed before rollback"
+
+
+@pytest.mark.parametrize(
+    "last_operation_result",
+    ["failed", "interrupted", "manual_intervention"],
+)
+def test_successful_refresh_preserves_other_terminal_operation_errors(
+    tmp_path: Path,
+    last_operation_result: str,
+) -> None:
+    service, _ = make_service(tmp_path, Executor())
+    state = service.get_state(106)
+    state.update(
+        {
+            "last_operation_result": last_operation_result,
+            "last_error": f"terminal {last_operation_result} error",
+        }
+    )
+    service._save_state(106, state)
+
+    refreshed = service.refresh_container(106)
+
+    assert refreshed["last_operation_result"] == last_operation_result
+    assert refreshed["last_error"] == f"terminal {last_operation_result} error"
+
+
+@pytest.mark.parametrize("last_operation_result", [None, "success"])
+def test_successful_refresh_clears_stale_transient_error(
+    tmp_path: Path,
+    last_operation_result: str | None,
+) -> None:
+    service, db = make_service(tmp_path, Executor())
+    stale_error = (
+        "Host executor returned no valid JSON result (rc=255); ".ljust(260, "x")
+    )
+    assert len(stale_error) == 260
+    state = service.get_state(106)
+    state.update(
+        {
+            "health_status": "healthy",
+            "executor_compatible": True,
+            "last_operation_result": last_operation_result,
+            "last_error": stale_error,
+            "last_job_id": "job-history-is-unchanged",
+            "last_job_event": {
+                "event_type": "completed",
+                "message": "event-history-is-unchanged",
+            },
+        }
+    )
+    service._save_state(106, state)
+
+    refreshed = service.refresh_container(106)
+
+    assert refreshed["health_status"] == "healthy"
+    assert refreshed["last_operation_result"] == last_operation_result
+    assert refreshed["last_error"] is None
+    assert refreshed["last_job_id"] == "job-history-is-unchanged"
+    assert refreshed["last_job_event"]["message"] == "event-history-is-unchanged"
+    persisted = db.get_resource_state(106)
+    assert persisted is not None
+    assert persisted["last_error"] is None
+
+
+def test_transient_refresh_error_is_published_then_replaced_after_recovery(
+    tmp_path: Path,
+) -> None:
+    class FailInspectOnce(Executor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "inspect" and not self.failed:
+                self.failed = True
+                raise ExecutorError("temporary SSH probe failure")
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    class RecordingMqtt:
+        availability = "online"
+
+        def __init__(self) -> None:
+            self.states: list[dict[str, Any]] = []
+
+        def publish_resource_state(self, vmid: int, state: dict[str, Any]) -> None:
+            assert vmid == 106
+            self.states.append(dict(state))
+
+        def publish_agent_state(self, state: dict[str, Any]) -> None:
+            pass
+
+    service, _ = make_service(tmp_path, FailInspectOnce())
+    mqtt = RecordingMqtt()
+    service.mqtt = mqtt
+
+    failed = service.refresh_container(106)
+    recovered = service.refresh_container(106)
+
+    assert "temporary SSH probe failure" in failed["last_error"]
+    assert recovered["last_error"] is None
+    assert mqtt.states[-2]["last_error"] == failed["last_error"]
+    assert mqtt.states[-1]["last_error"] is None
 
 
 def test_scan_preserves_previous_terminal_error(tmp_path: Path) -> None:

@@ -9,7 +9,12 @@ import pytest
 import yaml
 
 from app.ha_entities import (
+    AGENT_SELF_ENTITY_SPECS,
+    APT_ENTITY_SPECS,
+    HA_STATE_MAX_LENGTH,
+    QEMU_ENTITY_SPECS,
     ResourceIdentity,
+    bounded_ha_state_text,
     normalize_resource_identity,
     obsolete_discovery_keys,
     resource_entity_specs,
@@ -210,6 +215,96 @@ def test_agent_last_refresh_discovery_is_nullable_diagnostic_text() -> None:
     assert "device_class" not in payload
     assert payload["entity_category"] == "diagnostic"
     assert "default('unknown', true)" in payload["value_template"]
+
+
+@pytest.mark.parametrize("length", [260, 2000])
+def test_ha_text_state_helper_enforces_limit_without_mutating_source(
+    length: int,
+) -> None:
+    source = "żółw🙂" * length
+    rendered = bounded_ha_state_text(source, "none")
+
+    assert len(rendered) == HA_STATE_MAX_LENGTH
+    assert rendered == source[:HA_STATE_MAX_LENGTH]
+    assert source.endswith("🙂")
+    assert len(source) > HA_STATE_MAX_LENGTH
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_ha_text_state_helper_preserves_none_fallback(value: str | None) -> None:
+    assert bounded_ha_state_text(value, "none") == "none"
+
+
+def test_all_unbounded_diagnostic_entity_states_use_central_ha_limit() -> None:
+    bounded_keys = {
+        "active_job_id",
+        "active_plan_id",
+        "active_plan_status",
+        "api_health",
+        "agent_version",
+        "executor_contract_error",
+        "executor_missing_actions",
+        "executor_profile_sha256",
+        "executor_sha256",
+        "executor_version",
+        "ip_addresses",
+        "guest_agent_status",
+        "last_error",
+        "last_job_event",
+        "last_job_id",
+        "last_operation_result",
+        "last_recovery_scan_result",
+        "latest_snapshot_kind",
+        "latest_snapshot_name",
+        "lifecycle_action",
+        "lifecycle_error",
+        "operation_type",
+        "profile_validation_status",
+        "self_update_release_fingerprint",
+        "self_update_release_id",
+        "self_update_release_version",
+        "service_status",
+        "verification_error",
+    }
+    specs = (
+        list(APT_ENTITY_SPECS)
+        + list(QEMU_ENTITY_SPECS)
+        + list(AGENT_SELF_ENTITY_SPECS)
+    )
+    by_key: dict[str, list[str]] = {}
+    for spec in specs:
+        by_key.setdefault(spec.key, []).append(spec.value_template)
+
+    assert bounded_keys <= set(by_key)
+    for key in bounded_keys:
+        assert all(f"[:{HA_STATE_MAX_LENGTH}]" in template for template in by_key[key])
+
+
+def test_long_diagnostics_remain_full_in_retained_resource_payload() -> None:
+    telemetry = MqttTelemetry(
+        {"enabled": True, "discovery_prefix": "homeassistant"},
+        {106: _resources()[106]},
+    )
+    diagnostic = "diagnostic-" + "x" * 1989
+    secret = "Bearer super-secret-token"
+    telemetry.publish_resource_state(
+        106,
+        {
+            "vmid": 106,
+            "last_error": diagnostic,
+            "verification_error": secret,
+        },
+    )
+    state_item = telemetry._queue.get_nowait()
+    attributes_item = telemetry._queue.get_nowait()
+    assert state_item is not None
+    assert attributes_item is not None
+    payload = json.loads(state_item.payload)
+
+    assert payload["last_error"] == diagnostic
+    assert len(payload["last_error"]) > HA_STATE_MAX_LENGTH
+    assert "super-secret-token" not in state_item.payload
+    assert "super-secret-token" not in attributes_item.payload
 
 
 def test_health_discovery_uses_dedicated_attributes_topic_without_force_update() -> None:

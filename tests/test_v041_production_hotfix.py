@@ -28,6 +28,8 @@ from scripts.validate_rollout_state_0_4_1 import validate as validate_rollout
 ROOT = Path(__file__).parents[1]
 PVE_INSTALLER = ROOT / "deploy" / "upgrade-0.4.1-from-pve.sh"
 HA_INSTALLER = ROOT / "deploy" / "install-ha-0.4.1-from-pve.sh"
+AGENT_INSTALLER = ROOT / "deploy" / "install-agent.sh"
+AGENT_RESTORE = ROOT / "deploy" / "agent" / "restore-0.3.0.sh"
 HERMETIC_SHELL_VALIDATOR = ROOT / "scripts" / "validate_hermetic_shell_boundary.py"
 
 
@@ -74,6 +76,64 @@ def test_041_version_and_database_schema_contract() -> None:
     assert "PRAGMA user_version=400" in (
         ROOT / "app" / "database.py"
     ).read_text(encoding="utf-8")
+
+
+def test_agent_install_provisions_service_readable_private_ssh_key() -> None:
+    text = AGENT_INSTALLER.read_text(encoding="utf-8")
+    key = "/etc/hubinet-ops/keys/proxmox_ed25519"
+
+    assert f"if [[ ! -f {key} ]]; then" in text
+    assert text.count("ssh-keygen -q -t ed25519") == 1
+    assert "normalize_ssh_permissions" in text
+    assert "install -d -m 0750 -o root -g hubinetops /etc/hubinet-ops/keys" in text
+    assert f"chown hubinetops:hubinetops {key}" in text
+    assert f"chmod 0600 {key}" in text
+    assert "chown root:hubinetops /etc/hubinet-ops/ssh_known_hosts" in text
+    assert "chmod 0640 /etc/hubinet-ops/ssh_known_hosts" in text
+    assert not re.search(rf"^chown root:hubinetops {re.escape(key)}$", text, re.MULTILINE)
+    assert not re.search(rf"^chmod 0640 {re.escape(key)}$", text, re.MULTILINE)
+
+    private_mode = int("0600", 8)
+    assert private_mode & 0o400
+    assert private_mode & 0o077 == 0
+
+
+def test_agent_upgrade_normalizes_existing_ssh_metadata_before_start() -> None:
+    text = PVE_INSTALLER.read_text(encoding="utf-8")
+    key = "/etc/hubinet-ops/keys/proxmox_ed25519"
+    normalize = [
+        "install -d -m 0750 -o root -g hubinetops /etc/hubinet-ops/keys",
+        f"test -f {key}",
+        f"chown hubinetops:hubinetops {key}",
+        f"chmod 0600 {key}",
+        "test -f /etc/hubinet-ops/ssh_known_hosts",
+        "chown root:hubinetops /etc/hubinet-ops/ssh_known_hosts",
+        "chmod 0640 /etc/hubinet-ops/ssh_known_hosts",
+    ]
+
+    positions = [text.index(line) for line in normalize]
+    assert positions == sorted(positions)
+    assert positions[-1] < text.index("systemctl start hubinet-ops", positions[-1])
+    remote_install = text[text.index("REMOTE_INSTALL_AGENT") :]
+    assert "ssh-keygen" not in remote_install
+    assert "cat /etc/hubinet-ops/keys/proxmox_ed25519" not in text
+
+
+def test_agent_rollback_normalizes_ssh_metadata_and_fails_closed() -> None:
+    text = AGENT_RESTORE.read_text(encoding="utf-8")
+
+    for fragment in (
+        'install -d -m 0750 -o root -g hubinetops "$ssh_key_dir"',
+        'chown hubinetops:hubinetops "$ssh_private_key"',
+        'chmod 0600 "$ssh_private_key"',
+        'chown root:hubinetops "$ssh_known_hosts"',
+        'chmod 0640 "$ssh_known_hosts"',
+        'echo "Restored agent SSH permissions are incomplete; hubinet-ops remains stopped"',
+        "stop_attempted=false",
+    ):
+        assert fragment in text
+    permissions_end = text.index('chmod 0640 "$ssh_known_hosts"')
+    assert permissions_end < text.index("service_action start", permissions_end)
 
 
 def test_hostd_unit_creates_state_and_has_exact_required_pve_write_paths() -> None:

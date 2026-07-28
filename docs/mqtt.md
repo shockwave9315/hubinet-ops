@@ -15,6 +15,8 @@ During 0.3.x every LXC is dual-published to `hubinet/ops/ct/{vmid}/...`; this pr
 
 0.4.1 publishes nullable dates as ordinary diagnostic sensors rather than timestamp-device-class sensors, so a missing, empty, or null value becomes a normal unknown diagnostic state without Home Assistant's `Invalid state message` warning. Capability templates default a missing `operator_capabilities` object and every missing key to blocked.
 
+Every discovery template whose state can contain diagnostic or externally supplied text bounds the rendered Home Assistant state to 255 Unicode characters. The retained resource payload, SQLite state, and REST API keep the full sanitized diagnostic (within their existing transport/storage budgets); only the individual sensor state is shortened. A successful refresh clears an older transient runtime, compatibility, or inspect error, including after a successful operation, while errors explaining failed, interrupted, rolled-back, or manual-intervention outcomes remain available.
+
 The deprecated `sensor.hubinet_ops_agent_configured_container_count` remains. New counters are `configured_resource_count`, `configured_lxc_count`, and `configured_qemu_count`.
 
 Agent state is published once after a complete inventory refresh instead of once per resource. `agent_last_refresh` is an ISO 8601 UTC timestamp, rounded to seconds, for the completion of the most recent full telemetry cycle. Discovery marks it as a diagnostic timestamp.

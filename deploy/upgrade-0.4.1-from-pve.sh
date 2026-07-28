@@ -633,6 +633,17 @@ chown root:hubinetops /etc/hubinet-ops/config.yaml
 chmod 0640 /etc/hubinet-ops/config.yaml
 chown root:root /etc/hubinet-ops/agent.env
 chmod 0600 /etc/hubinet-ops/agent.env
+install -d -m 0750 -o root -g hubinetops /etc/hubinet-ops/keys
+test -f /etc/hubinet-ops/keys/proxmox_ed25519
+chown hubinetops:hubinetops /etc/hubinet-ops/keys/proxmox_ed25519
+chmod 0600 /etc/hubinet-ops/keys/proxmox_ed25519
+if [[ -f /etc/hubinet-ops/keys/proxmox_ed25519.pub ]]; then
+  chown root:hubinetops /etc/hubinet-ops/keys/proxmox_ed25519.pub
+  chmod 0644 /etc/hubinet-ops/keys/proxmox_ed25519.pub
+fi
+test -f /etc/hubinet-ops/ssh_known_hosts
+chown root:hubinetops /etc/hubinet-ops/ssh_known_hosts
+chmod 0640 /etc/hubinet-ops/ssh_known_hosts
 rm -rf /opt/hubinet-ops/app
 cp -a "$staging/app" /opt/hubinet-ops/app
 chown -R hubinetops:hubinetops /opt/hubinet-ops/app

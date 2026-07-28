@@ -15,6 +15,22 @@ id hubinetops >/dev/null 2>&1 || useradd --system --home /opt/hubinet-ops --shel
 install -d -o hubinetops -g hubinetops /opt/hubinet-ops /var/lib/hubinet-ops
 install -d -m 0750 -o root -g hubinetops /etc/hubinet-ops /etc/hubinet-ops/keys
 
+normalize_ssh_permissions() {
+  install -d -m 0750 -o root -g hubinetops /etc/hubinet-ops/keys
+  chown hubinetops:hubinetops /etc/hubinet-ops/keys/proxmox_ed25519
+  chmod 0600 /etc/hubinet-ops/keys/proxmox_ed25519
+  if [[ -f /etc/hubinet-ops/keys/proxmox_ed25519.pub ]]; then
+    chown root:hubinetops /etc/hubinet-ops/keys/proxmox_ed25519.pub
+    chmod 0644 /etc/hubinet-ops/keys/proxmox_ed25519.pub
+  fi
+  if [[ ! -e /etc/hubinet-ops/ssh_known_hosts ]]; then
+    install -m 0640 -o root -g hubinetops /dev/null /etc/hubinet-ops/ssh_known_hosts
+  else
+    chown root:hubinetops /etc/hubinet-ops/ssh_known_hosts
+    chmod 0640 /etc/hubinet-ops/ssh_known_hosts
+  fi
+}
+
 rsync_available=0
 command -v rsync >/dev/null 2>&1 && rsync_available=1
 rm -rf /opt/hubinet-ops/app /opt/hubinet-ops/requirements.txt
@@ -47,9 +63,7 @@ fi
 if [[ ! -f /etc/hubinet-ops/keys/proxmox_ed25519 ]]; then
   ssh-keygen -q -t ed25519 -N '' -C hubinet-ops-agent -f /etc/hubinet-ops/keys/proxmox_ed25519
 fi
-chown root:hubinetops /etc/hubinet-ops/keys/proxmox_ed25519*
-chmod 0640 /etc/hubinet-ops/keys/proxmox_ed25519
-chmod 0644 /etc/hubinet-ops/keys/proxmox_ed25519.pub
+normalize_ssh_permissions
 
 install -m 0644 "$SOURCE_DIR/deploy/hubinet-ops.service" /etc/systemd/system/hubinet-ops.service
 systemctl daemon-reload

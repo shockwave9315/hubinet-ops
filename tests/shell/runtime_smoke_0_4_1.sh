@@ -140,6 +140,15 @@ PY
       elif grep -q '/api/v1/resources/106/snapshots' <<<"$script"; then
         echo '{"snapshots":[],"latest":null}'
       elif grep -q 'hubinet-ops-0.4.1.tgz' <<<"$script"; then
+        grep -Fq 'install -d -m 0750 -o root -g hubinetops /etc/hubinet-ops/keys' <<<"$script"
+        grep -Fq 'chown hubinetops:hubinetops /etc/hubinet-ops/keys/proxmox_ed25519' <<<"$script"
+        grep -Fq 'chmod 0600 /etc/hubinet-ops/keys/proxmox_ed25519' <<<"$script"
+        grep -Fq 'chown root:hubinetops /etc/hubinet-ops/ssh_known_hosts' <<<"$script"
+        grep -Fq 'chmod 0640 /etc/hubinet-ops/ssh_known_hosts' <<<"$script"
+        permissions_line="$(grep -nF 'chmod 0640 /etc/hubinet-ops/ssh_known_hosts' <<<"$script" | awk -F: 'NR == 1 { print $1 }')"
+        start_line="$(grep -nF 'systemctl start hubinet-ops' <<<"$script" | awk -F: 'NR == 1 { print $1 }')"
+        [[ "$permissions_line" -lt "$start_line" ]]
+        echo AGENT_SSH_PERMISSIONS_NORMALIZED >> "$TEST_LOG"
         mv "$root/etc/hubinet-ops/config.yaml.new" "$TEST_CT_ROOT/ct110/etc-config.yaml"
         mv "$root/etc/hubinet-ops/agent.env.new" "$TEST_CT_ROOT/ct110/agent.env"
         echo AGENT_INSTALLED >> "$TEST_LOG"
@@ -390,6 +399,7 @@ fi
 grep -Fq 'VERSION = "0.4.1"' "$TMP/success/ct/ct101/usr/local/sbin/hubinet-maint"
 grep -Fq 'VERSION = "0.4.1"' "$TMP/success/ct/ct109/usr/local/sbin/hubinet-maint"
 grep -Fq 'AGENT_INSTALLED' "$TMP/success/actions.log"
+grep -Fq 'AGENT_SSH_PERMISSIONS_NORMALIZED' "$TMP/success/actions.log"
 grep -Fq 'VERSION = "0.4.1"' "$TMP/success/pve/usr/local/lib/hubinet-ops/hubinet_ops_hostd.py"
 for policy in snapshot-create-vmids snapshot-restore-vmids snapshot-delete-vmids; do
   cmp "$ROOT/deploy/pve/$policy" "$TMP/success/pve/etc/hubinet-ops/$policy"
