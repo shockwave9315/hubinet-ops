@@ -26,6 +26,7 @@ class ShellWord(NamedTuple):
 
 
 VARIABLE_PREFIX = r"(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})"
+SIMPLE_PARAMETER_EXPANSION = re.compile(VARIABLE_PREFIX)
 ABSOLUTE_PATH = re.compile(
     rf"(?<![A-Za-z0-9_./:+-])(?:{VARIABLE_PREFIX})?"
     r"(?P<path>/[^\s;&|()<>'\"]+)"
@@ -50,6 +51,11 @@ SHELL_WORD_SEPARATORS = frozenset(" \t\r\n;&|()<>")
 
 def _canonical_path(path: str) -> str:
     return posixpath.normpath(re.sub(r"/+", "/", path))
+
+
+def _ansi_c_character(codepoint: int) -> str:
+    # Bash arguments cannot contain NUL; ANSI-C NUL escapes disappear.
+    return "" if codepoint == 0 else chr(codepoint)
 
 
 def _ansi_c_projection(text: str, index: int) -> tuple[str, int]:
@@ -77,7 +83,7 @@ def _ansi_c_projection(text: str, index: int) -> tuple[str, int]:
         while end < len(text) and end < index + 4 and text[end] in "0123456789abcdefABCDEF":
             end += 1
         if end > index + 2:
-            return chr(int(text[index + 2:end], 16)), end
+            return _ansi_c_character(int(text[index + 2:end], 16)), end
 
     if marker in "01234567":
         if marker == "0":
@@ -90,20 +96,30 @@ def _ansi_c_projection(text: str, index: int) -> tuple[str, int]:
             while end < len(text) and end < index + 4 and text[end] in "01234567":
                 end += 1
             digits = text[index + 1:end]
-        return chr(int(digits, 8)), end
+        return _ansi_c_character(int(digits, 8)), end
 
     widths = {"u": 4, "U": 8}
     if marker in widths:
         width = widths[marker]
-        end = index + 2 + width
-        digits = text[index + 2:end]
-        if (
-            len(digits) == width
-            and all(character in "0123456789abcdefABCDEF" for character in digits)
+        end = index + 2
+        slash_end: int | None = None
+        while (
+            end < len(text)
+            and end < index + 2 + width
+            and text[end] in "0123456789abcdefABCDEF"
         ):
+            end += 1
+            if int(text[index + 2:end], 16) == ord("/"):
+                slash_end = end
+        digits = text[index + 2:end]
+        if digits:
+            if slash_end is not None:
+                # Conservatively retain a structural slash if a shorter valid
+                # Unicode escape can assemble a forbidden path.
+                return "/", slash_end
             codepoint = int(digits, 16)
             if codepoint <= sys.maxunicode:
-                return chr(codepoint), end
+                return _ansi_c_character(codepoint), end
 
     return f"\\{marker}", index + 2
 
@@ -146,6 +162,13 @@ def _shell_words(text: str) -> list[ShellWord]:
                     )
                     index += 2
                     continue
+                if character == "$":
+                    expansion = SIMPLE_PARAMETER_EXPANSION.match(text, index)
+                    if expansion is not None:
+                        assembled = True
+                        dynamic = True
+                        index = expansion.end()
+                        continue
                 if character in {"'", '"'}:
                     assembled = True
                     quote = character
@@ -215,6 +238,13 @@ def _shell_words(text: str) -> list[ShellWord]:
                     value.extend(("\\", escaped))
                 index += 2
                 continue
+            if quote in {'"', "locale-double"} and character == "$":
+                expansion = SIMPLE_PARAMETER_EXPANSION.match(text, index)
+                if expansion is not None:
+                    assembled = True
+                    dynamic = True
+                    index = expansion.end()
+                    continue
             value.append(character)
             index += 1
 

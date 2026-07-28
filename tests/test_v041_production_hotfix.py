@@ -373,8 +373,8 @@ def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
         ),
         (
             "$EMPTY/usr/bin/curl https://example.invalid",
-            "absolute executable path",
-            "/usr/bin/curl",
+            "dynamic shell path construction",
+            "$EMPTY/usr/bin/curl -> /usr/bin/curl",
         ),
         ("PATH=/usr/bin:/bin curl https://example.invalid", "PATH reference", "PATH="),
         ("PATH+=:/usr/bin", "PATH reference", "PATH+="),
@@ -721,6 +721,26 @@ def test_hermetic_shell_boundary_rejects_ambiguous_absolute_words(
             "/usr/bin/curl",
         ),
         (
+            r"$'\u2fusr\u2fbin\u2fcurl' https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"$'\U2fusr\U2fbin\U2fcurl' https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"/usr/bi$'\0'n/curl https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"/usr/bi$'\000'n/curl https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"/usr/bi$'\x00'n/curl https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
             r"/de$'\x76'/tcp/192.168.4.249/22",
             "/dev/tcp/192.168.4.249/22",
         ),
@@ -748,6 +768,38 @@ def test_hermetic_shell_boundary_rejects_escaped_dynamic_paths(
         in completed.stderr
     )
     assert f"-> {normalized}" in completed.stderr
+    assert completed.stderr.count("forbidden dynamic shell path construction") == 1
+
+
+@pytest.mark.parametrize(
+    "shell_text",
+    (
+        r'/usr/$"bi${part}n"/curl https://example.invalid',
+        r'/usr/"bi${part}n"/curl https://example.invalid',
+        r"/usr/bi${part}n/curl https://example.invalid",
+    ),
+)
+def test_hermetic_shell_boundary_rejects_empty_parameter_path_bypasses(
+    tmp_path: Path,
+    shell_text: str,
+) -> None:
+    script = tmp_path / "parameter-unsafe.sh"
+    script.write_text(f"echo safe\n{shell_text}\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert (
+        f"{script}:2: forbidden dynamic shell path construction: "
+        in completed.stderr
+    )
+    assert "-> /usr/bin/curl" in completed.stderr
     assert completed.stderr.count("forbidden dynamic shell path construction") == 1
 
 
