@@ -387,6 +387,19 @@ install_managed_ct() {
   validate_capabilities "$vmid" "$payload"
 }
 
+cleanup_secret_stages() {
+  local failed=false
+  if [[ -n "$TOKEN_STAGE" ]]; then
+    rm -f -- "$TOKEN_STAGE" || failed=true
+    TOKEN_STAGE=""
+  fi
+  if [[ -n "$HOSTD_ENV_STAGE" ]]; then
+    rm -f -- "$HOSTD_ENV_STAGE" || failed=true
+    HOSTD_ENV_STAGE=""
+  fi
+  [[ "$failed" == false ]]
+}
+
 rollback_all() {
   local rc="${1:-1}" failed=false
   local -a deferred_managed_restores=()
@@ -445,7 +458,7 @@ rollback_all() {
     systemctl disable "$HOSTD_SERVICE" >/dev/null 2>&1 || true
   fi
   rm -f "$ARCHIVE"
-  [[ -z "$TOKEN_STAGE" ]] || rm -f "$TOKEN_STAGE"
+  cleanup_secret_stages || failed=true
   [[ "$failed" == false ]] || rc=1
   exit "$rc"
 }
@@ -457,8 +470,9 @@ exit_cleanup() {
     rc=1
   fi
   rm -f "$ARCHIVE"
-  [[ -z "$TOKEN_STAGE" ]] || rm -f "$TOKEN_STAGE"
-  [[ -z "$HOSTD_ENV_STAGE" ]] || rm -f "$HOSTD_ENV_STAGE"
+  if ! cleanup_secret_stages; then
+    rc=1
+  fi
   exit "$rc"
 }
 

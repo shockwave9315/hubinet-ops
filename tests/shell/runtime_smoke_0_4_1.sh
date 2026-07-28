@@ -169,6 +169,18 @@ if [[ "$directory" == true ]]; then
 else
   ((${#values[@]} >= 2))
   src="${values[${#values[@]}-2]}"; dst="${values[${#values[@]}-1]}"
+  if [[ -n "${FAIL_INSTALL_ONCE_MATCH:-}" &&
+        "$dst" == *"$FAIL_INSTALL_ONCE_MATCH"* &&
+        ! -e "$TEST_CT_ROOT/install-once-failure-injected" ]]; then
+    if [[ -n "${EXPECT_HOSTD_STAGE_MARKER:-}" ]]; then
+      grep -Fq "$EXPECT_HOSTD_STAGE_MARKER" "$src"
+      [[ "$(grep -Ec '^HUBINET_OPS_HOSTD_(BACKEND_|UPDATE_|RECOVERY_)?TOKEN=' "$src")" == 4 ]]
+      printf 'MARK hostd-stage-populated\n' >> "$TEST_LOG"
+    fi
+    : > "$TEST_CT_ROOT/install-once-failure-injected"
+    printf 'MARK install-once-failure %s\n' "$dst" >> "$TEST_LOG"
+    exit 1
+  fi
   if [[ -n "${FAIL_INSTALL_MATCH:-}" && "$dst" == *"$FAIL_INSTALL_MATCH"* ]]; then
     printf 'MARK install-failure %s\n' "$dst" >> "$TEST_LOG"
     exit 1
@@ -176,6 +188,23 @@ else
   printf 'install %s -> %s\n' "$src" "$dst" >> "$TEST_LOG"
   mkdir -p "$(dirname "$dst")"; cp "$src" "$dst"
 fi
+SH
+  cat > "$bin/mktemp" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+stage_dir="$TEST_CT_ROOT/secret-stages"
+mkdir -p "$stage_dir"
+count_file="$stage_dir/mktemp.count"
+count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+echo "$count" > "$count_file"
+case "$count" in
+  1) stage="$stage_dir/hostd-env.stage" ;;
+  2) stage="$stage_dir/agent-env.stage" ;;
+  *) stage="$stage_dir/stage-$count" ;;
+esac
+: > "$stage"
+printf 'MARK secret-stage-created %s\n' "$(basename "$stage")" >> "$TEST_LOG"
+printf '%s\n' "$stage"
 SH
   cat > "$bin/mv" <<'SH'
 #!/usr/bin/env bash
@@ -378,7 +407,44 @@ if awk -v start="$install_failure" -v finish="$cleanup_success" \
 fi
 unset FAIL_INSTALL_MATCH
 
-# 4. Rollback restore mounts CT108, records a copy failure, preserves the
+# 4. A one-shot hostd.env install failure occurs after both secret stages are
+# populated but before the hostd stage is normally removed. Rollback must
+# remove both stages and still restore the backed-up host files.
+export FAIL_INSTALL_ONCE_MATCH="/etc/hubinet-ops/hostd.env"
+export EXPECT_HOSTD_STAGE_MARKER="hostd-stage-marker"
+export HUBINET_OPS_HOSTD_BACKEND_TOKEN="hostd-stage-marker-backend-000000000001"
+export HUBINET_OPS_HOSTD_UPDATE_TOKEN="hostd-stage-marker-update-0000000000002"
+export HUBINET_OPS_HOSTD_RECOVERY_TOKEN="hostd-stage-marker-recovery-0000000003"
+rc="$(run_case hostd_secret_stage_cleanup)"
+[[ "$rc" != 0 ]]
+secret_log="$TMP/hostd_secret_stage_cleanup/actions.log"
+stage_dir="$TMP/hostd_secret_stage_cleanup/ct/secret-stages"
+grep -Fq 'MARK secret-stage-created hostd-env.stage' "$secret_log"
+grep -Fq 'MARK secret-stage-created agent-env.stage' "$secret_log"
+grep -Fq 'MARK hostd-stage-populated' "$secret_log"
+agent_stage_push="$(first_line_after "$secret_log" '/secret-stages/agent-env.stage')"
+stage_failure="$(first_line_after "$secret_log" 'MARK install-once-failure ')"
+host_restore="$(first_line_after "$secret_log" '/pve/etc/hubinet-ops/hostd.env ' "$stage_failure")"
+assert_ordered "$agent_stage_push" "$stage_failure" "$host_restore"
+grep -Fq '0.4.1 upgrade failed; restoring all modified layers' \
+  "$TMP/hostd_secret_stage_cleanup/stderr"
+[[ ! -e "$stage_dir/hostd-env.stage" ]]
+[[ ! -e "$stage_dir/agent-env.stage" ]]
+if find "$stage_dir" -type f ! -name 'mktemp.count' -print -quit | grep -q .; then
+  echo "Secret staging file remained after rollback" >&2
+  exit 1
+fi
+if grep -Rqs 'hostd-stage-marker' "$stage_dir"; then
+  echo "Test hostd credential marker remained in the staging directory" >&2
+  exit 1
+fi
+grep -Fq 'old-wrapper' \
+  "$TMP/hostd_secret_stage_cleanup/pve/usr/local/sbin/hubinet-ops-host"
+unset FAIL_INSTALL_ONCE_MATCH EXPECT_HOSTD_STAGE_MARKER
+unset HUBINET_OPS_HOSTD_BACKEND_TOKEN HUBINET_OPS_HOSTD_UPDATE_TOKEN
+unset HUBINET_OPS_HOSTD_RECOVERY_TOKEN
+
+# 5. Rollback restore mounts CT108, records a copy failure, preserves the
 # non-zero layer result after its unmount attempts, and the second cleanup
 # retries after the remaining CT restores before finally clearing the map.
 export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/hubinet-maint"
@@ -410,7 +476,7 @@ unset FAIL_CAPABILITIES_VMID FAIL_INSTALL_MATCH
 unset HUBINET_OPS_FAKE_UNMOUNT_VMID HUBINET_OPS_FAKE_UNMOUNT_FAILURES
 unset HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER
 
-# 5. A partially modified stopped CT is deferred after the first cleanup
+# 6. A partially modified stopped CT is deferred after the first cleanup
 # exhausts both unmount attempts. Independent restores continue, the delayed
 # cleanup succeeds, and only then is the deferred CT restored exactly once.
 export FAIL_MV_MATCH="ct108/etc/hubinet-maint.json"
@@ -458,7 +524,7 @@ grep -Fq 'old_profile' \
 unset FAIL_MV_MATCH HUBINET_OPS_FAKE_UNMOUNT_VMID
 unset HUBINET_OPS_FAKE_UNMOUNT_FAILURES HUBINET_OPS_FAKE_UNMOUNT_AFTER_MARKER
 
-# 6. Successful paths pair every stopped-CT mount with one successful unmount.
+# 7. Successful paths pair every stopped-CT mount with one successful unmount.
 # Exact counts also prove that EXIT cleanup is a no-op once tracking is empty.
 for vmid in $(seq 106 109); do
   mount_count="$(grep -c "^pct mount $vmid$" "$TMP/success/actions.log" || true)"
@@ -472,7 +538,7 @@ for vmid in $(seq 106 109); do
   fi
 done
 
-# 7. Persistent unmount failure exhausts both attempts in each cleanup pass,
+# 8. Persistent unmount failure exhausts both attempts in each cleanup pass,
 # remains tracked across best-effort rollback, never mounts CT108 again, and
 # exits non-zero with the exact manual-intervention command.
 export FAIL_INSTALL_MATCH="ct108/usr/local/sbin/.hubinet-maint.new"

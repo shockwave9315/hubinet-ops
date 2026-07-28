@@ -137,6 +137,20 @@ def test_pct_retry_is_err_trap_safe_and_deployment_uses_idempotent_install() -> 
     assert "mv -f /usr/local/sbin/.hubinet-maint.new" not in text
 
 
+def test_upgrade_rollback_and_exit_share_secret_stage_cleanup() -> None:
+    text = PVE_INSTALLER.read_text(encoding="utf-8")
+    helper = text[text.index("cleanup_secret_stages()"):text.index("rollback_all()")]
+    rollback = text[text.index("rollback_all()"):text.index("exit_cleanup()")]
+    exit_cleanup = text[text.index("exit_cleanup()"):text.index("trap 'rollback_all")]
+
+    assert 'rm -f -- "$TOKEN_STAGE"' in helper
+    assert 'rm -f -- "$HOSTD_ENV_STAGE"' in helper
+    assert 'TOKEN_STAGE=""' in helper
+    assert 'HOSTD_ENV_STAGE=""' in helper
+    assert "cleanup_secret_stages || failed=true" in rollback
+    assert "if ! cleanup_secret_stages; then" in exit_cleanup
+
+
 def test_config_migration_is_idempotent_and_rollback_policy_is_consistent(
     tmp_path: Path,
 ) -> None:
