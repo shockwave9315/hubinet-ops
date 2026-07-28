@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
+import pytest
 import yaml
 
 from app.contracts import parse_owned_snapshot_name
@@ -341,3 +344,73 @@ def test_ha_installer_has_safe_optional_core_restart_workflow() -> None:
         command in text
         for command in ("pct start 100", "pct stop 100", "qm start 100", "qm stop 100")
     )
+
+
+def test_ha_installer_normalizes_scp_target_for_ipv6() -> None:
+    text = HA_INSTALLER.read_text(encoding="utf-8")
+
+    assert 'SCP_HOST="$HA_HOST"' in text
+    assert 'if [[ "$SCP_HOST" == *:* ]]; then' in text
+    assert 'SCP_HOST="[$SCP_HOST]"' in text
+    assert 'SCP_TARGET="root@$SCP_HOST"' in text
+    assert text.count('"${SCP_TARGET}:/config/') == 2
+    assert '"root@$HA_HOST:/config/' not in text
+
+
+@pytest.mark.parametrize(
+    ("host", "target"),
+    [
+        ("home-assistant.local", "root@home-assistant.local"),
+        ("192.168.4.100", "root@192.168.4.100"),
+        ("2001:db8::100", "root@[2001:db8::100]"),
+    ],
+)
+def test_ha_installer_passes_exact_scp_destinations(
+    tmp_path: Path,
+    host: str,
+    target: str,
+) -> None:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is unavailable on this platform")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log_path = tmp_path / "scp.args"
+    for name, body in {
+        "python3": "#!/usr/bin/env bash\nexit 0\n",
+        "ssh": "#!/usr/bin/env bash\nexit 0\n",
+        "scp": (
+            "#!/usr/bin/env bash\n"
+            'printf "<%s>" "$@" >> "$HUBINET_OPS_TEST_SCP_LOG"\n'
+            'printf "\\n" >> "$HUBINET_OPS_TEST_SCP_LOG"\n'
+        ),
+    }.items():
+        stub = fake_bin / name
+        stub.write_text(body, encoding="utf-8", newline="\n")
+        stub.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["HUBINET_OPS_TEST_MODE"] = "1"
+    env["HUBINET_OPS_TEST_SCP_LOG"] = str(log_path)
+    completed = subprocess.run(
+        [bash, str(HA_INSTALLER), host, "2222"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    calls = log_path.read_text(encoding="utf-8").splitlines()
+    assert len(calls) == 2
+    assert calls[0].endswith(
+        f"<{target}:/config/packages/hubinet_ops.yaml.new>"
+    )
+    assert calls[1].endswith(
+        f"<{target}:/config/dashboards/hubinet_ops.yaml.new>"
+    )
+    if ":" in host:
+        assert all(f"<root@{host}:/config/" not in call for call in calls)

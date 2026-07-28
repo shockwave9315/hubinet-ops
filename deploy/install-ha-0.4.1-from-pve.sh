@@ -28,6 +28,11 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="/config/backups/hubinet-ops/${STAMP}-before-0.4.1"
 SSH_KEY="${HUBINET_OPS_HA_SSH_KEY:-/root/.ssh/id_ed25519}"
 SSH_ARGS=(-p "$HA_PORT" -i "$SSH_KEY" "root@$HA_HOST")
+SCP_HOST="$HA_HOST"
+if [[ "$SCP_HOST" == *:* ]]; then
+  SCP_HOST="[$SCP_HOST]"
+fi
+SCP_TARGET="root@$SCP_HOST"
 backup_complete=false
 changes_started=false
 
@@ -88,9 +93,9 @@ ssh "${SSH_ARGS[@]}" "set -Eeuo pipefail
 backup_complete=true
 
 scp -P "$HA_PORT" -i "$SSH_KEY" "$SOURCE_DIR/home-assistant/packages/hubinet_ops.yaml" \
-  "root@$HA_HOST:/config/packages/hubinet_ops.yaml.new"
+  "${SCP_TARGET}:/config/packages/hubinet_ops.yaml.new"
 scp -P "$HA_PORT" -i "$SSH_KEY" "$SOURCE_DIR/home-assistant/dashboards/hubinet_ops.yaml" \
-  "root@$HA_HOST:/config/dashboards/hubinet_ops.yaml.new"
+  "${SCP_TARGET}:/config/dashboards/hubinet_ops.yaml.new"
 
 changes_started=true
 ssh "${SSH_ARGS[@]}" '
