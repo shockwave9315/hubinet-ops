@@ -204,6 +204,26 @@ def _shell_word_violations(
                 )
             )
             break
+        else:
+            if word.dynamic and (
+                "/" in word.value
+                or "\\" in word.value
+                or "\\" in word.raw
+            ):
+                results.append(
+                    (
+                        Violation(
+                            line=word.line,
+                            kind="dynamic shell path construction",
+                            fragment=(
+                                f"{_display_shell_fragment(word.raw)} "
+                                "-> <dynamic>"
+                            ),
+                        ),
+                        word.start,
+                        word.end,
+                    )
+                )
     return results
 
 
