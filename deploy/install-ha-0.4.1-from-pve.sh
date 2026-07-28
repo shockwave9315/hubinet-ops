@@ -40,6 +40,29 @@ python3 "$SOURCE_DIR/scripts/validate_yaml.py"
 python3 "$SOURCE_DIR/scripts/generate_ha_dashboard.py" --check
 python3 -m py_compile "$SOURCE_DIR/scripts/validate_ha_secrets_0_4_1.py"
 
+restart_core_and_wait() {
+  local attempts=60 delay=2
+  if [[ ${HUBINET_OPS_TEST_MODE:-0} == 1 ]]; then
+    attempts="${HUBINET_OPS_HA_RESTART_ATTEMPTS:-60}"
+    delay="${HUBINET_OPS_HA_RESTART_DELAY:-2}"
+    [[ "$attempts" =~ ^[1-9][0-9]*$ && "$delay" =~ ^[0-9]+$ ]] || {
+      echo "Invalid Home Assistant restart test timing" >&2
+      return 1
+    }
+  fi
+  ssh "${SSH_ARGS[@]}" "set -Eeuo pipefail
+    ha core restart
+    for ((attempt=1; attempt<=${attempts}; attempt++)); do
+      info=\"\$(ha core info --raw-json 2>/dev/null || true)\"
+      if grep -Eq '\"state\"[[:space:]]*:[[:space:]]*\"running\"' <<<\"\$info\"; then
+        exit 0
+      fi
+      [[ \"\$attempt\" -ge ${attempts} ]] || sleep ${delay}
+    done
+    echo 'Home Assistant Core did not return to running after restart' >&2
+    exit 1"
+}
+
 rollback_ha() {
   local rc="${1:-1}" failed=false
   trap - ERR INT TERM EXIT
@@ -60,6 +83,9 @@ rollback_ha() {
       rm -f /config/packages/hubinet_ops.yaml.new /config/dashboards/hubinet_ops.yaml.new
       ha core check"; then
       echo "ROLLBACK INCOMPLETE: restore HA files from $HA_HOST:$BACKUP_DIR" >&2
+      failed=true
+    elif [[ "$restart_core" == true ]] && ! restart_core_and_wait; then
+      echo "ROLLBACK INCOMPLETE: HA files were restored but Core did not return to running" >&2
       failed=true
     fi
   else
@@ -108,19 +134,7 @@ ssh "${SSH_ARGS[@]}" '
 '
 
 if [[ "$restart_core" == true ]]; then
-  ssh "${SSH_ARGS[@]}" '
-    set -Eeuo pipefail
-    ha core restart
-    for attempt in $(seq 1 60); do
-      info="$(ha core info --raw-json 2>/dev/null || true)"
-      if grep -Eq "\"state\"[[:space:]]*:[[:space:]]*\"running\"" <<<"$info"; then
-        exit 0
-      fi
-      sleep 2
-    done
-    echo "Home Assistant Core did not return to running after restart" >&2
-    exit 1
-  '
+  restart_core_and_wait
 fi
 
 trap - ERR INT TERM EXIT

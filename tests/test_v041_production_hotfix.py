@@ -414,3 +414,122 @@ def test_ha_installer_passes_exact_scp_destinations(
     )
     if ":" in host:
         assert all(f"<root@{host}:/config/" not in call for call in calls)
+
+
+def _run_ha_restart_rollback_scenario(
+    tmp_path: Path,
+    *,
+    rollback_restart: str,
+    restart_requested: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is unavailable on this platform")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    event_log = tmp_path / "events.log"
+    for name, body in {
+        "python3": "#!/usr/bin/env bash\nexit 0\n",
+        "scp": "#!/usr/bin/env bash\nexit 0\n",
+        "ssh": """#!/usr/bin/env bash
+set -Eeuo pipefail
+remote="${@: -1}"
+if [[ "$remote" == *"backup.complete"* ]]; then
+  echo "backup complete" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+elif [[ "$remote" == *"before-0.4.1/secrets.yaml"* ]]; then
+  echo "backup restoration" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+  echo "rollback ha core check" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+elif [[ "$remote" == *"install -m 0644 /config/packages"* ]]; then
+  if [[ "$HUBINET_OPS_TEST_ROLLBACK_RESTART" == "not-requested" ]]; then
+    echo "initial install failure" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+    exit 1
+  fi
+elif [[ "$remote" == *"ha core restart"* ]]; then
+  count_file="$HUBINET_OPS_TEST_RESTART_COUNT"
+  count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+  echo "$count" > "$count_file"
+  if [[ "$count" == 1 ]]; then
+    echo "initial restart failure" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+    exit 1
+  fi
+  echo "rollback restart" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+  if [[ "$HUBINET_OPS_TEST_ROLLBACK_RESTART" == "succeeds" ]]; then
+    echo "rollback Core running" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+    exit 0
+  fi
+  echo "rollback restart failure" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+  exit 1
+fi
+exit 0
+""",
+    }.items():
+        stub = fake_bin / name
+        stub.write_text(body, encoding="utf-8", newline="\n")
+        stub.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["HUBINET_OPS_TEST_MODE"] = "1"
+    env["HUBINET_OPS_HA_RESTART_ATTEMPTS"] = "1"
+    env["HUBINET_OPS_HA_RESTART_DELAY"] = "0"
+    env["HUBINET_OPS_TEST_EVENT_LOG"] = str(event_log)
+    env["HUBINET_OPS_TEST_RESTART_COUNT"] = str(tmp_path / "restart.count")
+    env["HUBINET_OPS_TEST_ROLLBACK_RESTART"] = rollback_restart
+    command = [bash, str(HA_INSTALLER)]
+    if restart_requested:
+        command.append("--restart-core")
+    command.extend(["home-assistant.local", "2222"])
+    return subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("rollback_restart_succeeds", [True, False])
+def test_ha_installer_restart_rollback_restores_core_running(
+    tmp_path: Path,
+    rollback_restart_succeeds: bool,
+) -> None:
+    completed = _run_ha_restart_rollback_scenario(
+        tmp_path,
+        rollback_restart="succeeds" if rollback_restart_succeeds else "fails",
+    )
+    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+
+    assert completed.returncode != 0
+    assert events.count("backup restoration") == 1
+    assert events.count("rollback restart") == 1
+    assert events.index("initial restart failure") < events.index("backup restoration")
+    assert events.index("backup restoration") < events.index("rollback ha core check")
+    assert events.index("rollback ha core check") < events.index("rollback restart")
+    if rollback_restart_succeeds:
+        assert events.index("rollback restart") < events.index("rollback Core running")
+        assert "ROLLBACK INCOMPLETE" not in completed.stderr
+    else:
+        assert "rollback Core running" not in events
+        assert (
+            "ROLLBACK INCOMPLETE: HA files were restored but Core did not return to running"
+            in completed.stderr
+        )
+
+
+def test_ha_installer_restart_rollback_is_not_forced_without_flag(
+    tmp_path: Path,
+) -> None:
+    completed = _run_ha_restart_rollback_scenario(
+        tmp_path,
+        rollback_restart="not-requested",
+        restart_requested=False,
+    )
+    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
+
+    assert completed.returncode != 0
+    assert events.count("backup restoration") == 1
+    assert "rollback restart" not in events
+    assert "rollback Core running" not in events
+    assert "ROLLBACK INCOMPLETE" not in completed.stderr
