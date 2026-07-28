@@ -698,17 +698,38 @@ def test_hermetic_shell_boundary_rejects_ambiguous_absolute_words(
 
 
 @pytest.mark.parametrize(
-    "shell_text",
+    ("shell_text", "normalized"),
     (
-        r"/usr/bi$'\x6e'/curl https://example.invalid",
-        r"$'\x2fusr\x2fbin\x2fcurl' https://example.invalid",
-        r"/usr/b$'\151'n/curl https://example.invalid",
-        r"/de$'\x76'/tcp/192.168.4.249/22",
+        (
+            r"/usr/bi$'\x6e'/curl https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"$'\x2fusr\x2fbin\x2fcurl' https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"/usr/b$'\151'n/curl https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"/usr/bi$'\u006e'/curl https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"/usr/bi$'\U0000006e'/curl https://example.invalid",
+            "/usr/bin/curl",
+        ),
+        (
+            r"/de$'\x76'/tcp/192.168.4.249/22",
+            "/dev/tcp/192.168.4.249/22",
+        ),
     ),
 )
 def test_hermetic_shell_boundary_rejects_escaped_dynamic_paths(
     tmp_path: Path,
     shell_text: str,
+    normalized: str,
 ) -> None:
     script = tmp_path / "escaped-dynamic-unsafe.sh"
     script.write_text(f"echo safe\n{shell_text}\n", encoding="utf-8")
@@ -726,8 +747,34 @@ def test_hermetic_shell_boundary_rejects_escaped_dynamic_paths(
         f"{script}:2: forbidden dynamic shell path construction: "
         in completed.stderr
     )
-    assert "-> <dynamic>" in completed.stderr
+    assert f"-> {normalized}" in completed.stderr
     assert completed.stderr.count("forbidden dynamic shell path construction") == 1
+
+
+@pytest.mark.parametrize(
+    "shell_text",
+    (
+        r"printf '%s' $'line\nbreak'",
+        r"target=$'/opt/hubinet-ops/file'",
+        r"message=$'use \x2fopt for local data'",
+    ),
+)
+def test_hermetic_shell_boundary_allows_benign_ansi_c_words(
+    tmp_path: Path,
+    shell_text: str,
+) -> None:
+    script = tmp_path / "benign-ansi-c.sh"
+    script.write_text(f"{shell_text}\n", encoding="utf-8")
+
+    completed = subprocess.run(
+        [sys.executable, str(HERMETIC_SHELL_VALIDATOR), str(script)],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_hermetic_shell_boundary_reports_multiple_assembled_violations(

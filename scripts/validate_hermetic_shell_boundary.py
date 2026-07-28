@@ -52,6 +52,62 @@ def _canonical_path(path: str) -> str:
     return posixpath.normpath(re.sub(r"/+", "/", path))
 
 
+def _ansi_c_projection(text: str, index: int) -> tuple[str, int]:
+    marker = text[index + 1]
+    simple = {
+        "\\": "\\",
+        "'": "'",
+        '"': '"',
+        "?": "?",
+        "a": "\a",
+        "b": "\b",
+        "e": "\x1b",
+        "E": "\x1b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+    }
+    if marker in simple:
+        return simple[marker], index + 2
+
+    if marker == "x":
+        end = index + 2
+        while end < len(text) and end < index + 4 and text[end] in "0123456789abcdefABCDEF":
+            end += 1
+        if end > index + 2:
+            return chr(int(text[index + 2:end], 16)), end
+
+    if marker in "01234567":
+        if marker == "0":
+            end = index + 2
+            while end < len(text) and end < index + 5 and text[end] in "01234567":
+                end += 1
+            digits = text[index + 2:end] or "0"
+        else:
+            end = index + 2
+            while end < len(text) and end < index + 4 and text[end] in "01234567":
+                end += 1
+            digits = text[index + 1:end]
+        return chr(int(digits, 8)), end
+
+    widths = {"u": 4, "U": 8}
+    if marker in widths:
+        width = widths[marker]
+        end = index + 2 + width
+        digits = text[index + 2:end]
+        if (
+            len(digits) == width
+            and all(character in "0123456789abcdefABCDEF" for character in digits)
+        ):
+            codepoint = int(digits, 16)
+            if codepoint <= sys.maxunicode:
+                return chr(codepoint), end
+
+    return f"\\{marker}", index + 2
+
+
 def _shell_words(text: str) -> list[ShellWord]:
     words: list[ShellWord] = []
     index = 0
@@ -83,7 +139,11 @@ def _shell_words(text: str) -> list[ShellWord]:
                 ):
                     assembled = True
                     dynamic = True
-                    quote = text[index + 1]
+                    quote = (
+                        "ansi-single"
+                        if text[index + 1] == "'"
+                        else "locale-double"
+                    )
                     index += 2
                     continue
                 if character in {"'", '"'}:
@@ -114,11 +174,25 @@ def _shell_words(text: str) -> list[ShellWord]:
                 index += 1
                 continue
 
-            if character == quote:
+            closing_quote = (
+                "'"
+                if quote in {"'", "ansi-single"}
+                else '"'
+            )
+            if character == closing_quote:
                 quote = None
                 index += 1
                 continue
-            if quote == '"' and character == "\\":
+            if quote == "ansi-single" and character == "\\":
+                assembled = True
+                if index + 1 >= length:
+                    malformed = True
+                    index += 1
+                    break
+                projected, index = _ansi_c_projection(text, index)
+                value.append(projected)
+                continue
+            if quote in {'"', "locale-double"} and character == "\\":
                 assembled = True
                 if index + 1 >= length:
                     malformed = True
@@ -204,26 +278,6 @@ def _shell_word_violations(
                 )
             )
             break
-        else:
-            if word.dynamic and (
-                "/" in word.value
-                or "\\" in word.value
-                or "\\" in word.raw
-            ):
-                results.append(
-                    (
-                        Violation(
-                            line=word.line,
-                            kind="dynamic shell path construction",
-                            fragment=(
-                                f"{_display_shell_fragment(word.raw)} "
-                                "-> <dynamic>"
-                            ),
-                        ),
-                        word.start,
-                        word.end,
-                    )
-                )
     return results
 
 
