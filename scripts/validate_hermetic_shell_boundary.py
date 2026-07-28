@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import posixpath
 import re
 import sys
 from typing import NamedTuple
@@ -13,12 +14,10 @@ class Violation(NamedTuple):
     fragment: str
 
 
-COMMAND_END = r"(?=$|[\s;&|()<>'\"])"
 VARIABLE_PREFIX = r"(?:\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})"
-FORBIDDEN_ABSOLUTE_EXECUTABLE = re.compile(
-    rf"(?:{VARIABLE_PREFIX}|(?<![A-Za-z0-9_./+-]))"
-    rf"(?P<path>/(?:usr/)?s?bin/[^/\s;&|()<>'\"]+)"
-    rf"{COMMAND_END}"
+ABSOLUTE_PATH = re.compile(
+    rf"(?<![A-Za-z0-9_./:+-])(?:{VARIABLE_PREFIX})?"
+    r"(?P<path>/[^\s;&|()<>'\"]+)"
 )
 PATH_REFERENCE = re.compile(
     r"(?P<expansion>\$\{PATH\}|\$PATH\b)"
@@ -26,7 +25,19 @@ PATH_REFERENCE = re.compile(
     r"|(?P<keyword>\b(?:export|readonly|declare|typeset|unset)\s+PATH\b)"
     r"|(?P<name>\bPATH\b)"
 )
+COMMAND_DEFAULT_PATH = re.compile(r"\bcommand\s+-p(?:\s|$)")
 ALLOWED_SHEBANG = "#!/usr/bin/env bash"
+FORBIDDEN_EXECUTABLE_PREFIXES = (
+    "/bin/",
+    "/sbin/",
+    "/usr/bin/",
+    "/usr/sbin/",
+)
+FORBIDDEN_BASH_NETWORK_PREFIXES = ("/dev/tcp/", "/dev/udp/")
+
+
+def _canonical_path(path: str) -> str:
+    return posixpath.normpath(re.sub(r"/+", "/", path))
 
 
 def find_violations(text: str) -> list[Violation]:
@@ -38,14 +49,34 @@ def find_violations(text: str) -> list[Violation]:
         )
         for match in PATH_REFERENCE.finditer(text)
     ]
+    violations.extend(
+        Violation(
+            line=text.count("\n", 0, match.start()) + 1,
+            kind="command default PATH escape",
+            fragment=match.group(0).rstrip(),
+        )
+        for match in COMMAND_DEFAULT_PATH.finditer(text)
+    )
     first_line = text.splitlines()[0] if text else ""
-    for match in FORBIDDEN_ABSOLUTE_EXECUTABLE.finditer(text):
+    for match in ABSOLUTE_PATH.finditer(text):
         path = match.group("path")
+        canonical = _canonical_path(path)
         if (
             first_line == ALLOWED_SHEBANG
             and match.start("path") == 2
             and path == "/usr/bin/env"
         ):
+            continue
+        if canonical.startswith(FORBIDDEN_BASH_NETWORK_PREFIXES):
+            violations.append(
+                Violation(
+                    line=text.count("\n", 0, match.start("path")) + 1,
+                    kind="Bash network device",
+                    fragment=path,
+                )
+            )
+            continue
+        if not canonical.startswith(FORBIDDEN_EXECUTABLE_PREFIXES):
             continue
         violations.append(
             Violation(

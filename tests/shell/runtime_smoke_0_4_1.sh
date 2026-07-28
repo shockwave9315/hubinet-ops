@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+[[ "${HUBINET_OPS_SYSTEM_SANDBOX:-0}" == 1 ]] || {
+  echo "runtime smoke must execute inside the system sandbox" >&2
+  exit 2
+}
+[[ "$(id -u)" != 0 ]] || {
+  echo "runtime smoke sandbox must use a non-root user" >&2
+  exit 2
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -324,10 +333,21 @@ verify_isolated_path() {
 
 run_case() {
   local name="$1" fail_vmid="${2:-}" retry_match="${3:-}" case_root isolated_path
+  local test_pve_root test_backup_root test_archive test_wrapper
   case_root="$TMP/$name"
   mkdir -p "$case_root"
   make_fakes "$case_root"
   isolated_path="$case_root/bin:$case_root/safe-bin"
+  test_pve_root="$case_root/pve"
+  test_backup_root="$case_root/backups"
+  test_archive="$case_root/release.tgz"
+  test_wrapper="$case_root/bin/wrapper-smoke"
+  for test_path in \
+    "$test_pve_root" "$test_backup_root" "$test_archive" "$test_wrapper" \
+    "$case_root/ct"
+  do
+    [[ "$test_path" == "$case_root/"* ]]
+  done
   verify_isolated_path "$case_root"
   : > "$case_root/actions.log"
   set +e
@@ -341,10 +361,10 @@ run_case() {
   FAIL_CAPABILITIES_VMID="$fail_vmid" \
   PCT_FAIL_129_ONCE_MATCH="$retry_match" \
   HUBINET_OPS_TEST_MODE=1 \
-  HUBINET_OPS_TEST_PVE_ROOT="$case_root/pve" \
-  HUBINET_OPS_BACKUP_ROOT="$case_root/backups" \
-  HUBINET_OPS_TEST_ARCHIVE="$case_root/release.tgz" \
-  HUBINET_OPS_TEST_WRAPPER_RUNNER="$case_root/bin/wrapper-smoke" \
+  HUBINET_OPS_TEST_PVE_ROOT="$test_pve_root" \
+  HUBINET_OPS_BACKUP_ROOT="$test_backup_root" \
+  HUBINET_OPS_TEST_ARCHIVE="$test_archive" \
+  HUBINET_OPS_TEST_WRAPPER_RUNNER="$test_wrapper" \
   HUBINET_OPS_HOSTD_HEALTH_URL="http://hostd.test/health" \
   HUBINET_OPS_VALIDATION_ATTEMPTS=1 \
   HUBINET_OPS_VALIDATION_DELAY=0 \

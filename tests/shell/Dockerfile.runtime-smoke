@@ -1,0 +1,4 @@
+FROM python:3.13-bookworm
+
+USER 65534:65534
+WORKDIR /workspace

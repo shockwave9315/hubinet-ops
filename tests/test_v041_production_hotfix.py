@@ -31,6 +31,11 @@ HA_INSTALLER = ROOT / "deploy" / "install-ha-0.4.1-from-pve.sh"
 AGENT_INSTALLER = ROOT / "deploy" / "install-agent.sh"
 AGENT_RESTORE = ROOT / "deploy" / "agent" / "restore-0.3.0.sh"
 HERMETIC_SHELL_VALIDATOR = ROOT / "scripts" / "validate_hermetic_shell_boundary.py"
+SANDBOX_RUNNER = ROOT / "tests" / "shell" / "run_runtime_smoke_sandbox.sh"
+SANDBOX_ENTRYPOINT = (
+    ROOT / "tests" / "shell" / "runtime_smoke_sandbox_entrypoint.sh"
+)
+RUNTIME_SMOKE = ROOT / "tests" / "shell" / "runtime_smoke_0_4_1.sh"
 
 
 def _resources() -> dict[int, dict]:
@@ -225,18 +230,17 @@ def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
         "as part of repository tests."
     ) not in policy
     for requirement in (
+        "system-enforced smoke sandbox",
+        "The sandbox is the security boundary",
+        "production script must never execute directly on the pytest host",
+        "Linux must fail closed if the sandbox cannot be created",
+        "static shell validator is defense-in-depth",
         "`HUBINET_OPS_TEST_MODE=1`",
         "isolated `PATH` without inheriting the host `PATH`",
         "temporary fake command layer",
         "explicit allowlist of unprivileged local tools",
         "no real network, deployment, container, or hypervisor programs",
-        "must not reference real network, deployment, container, or hypervisor "
-        "programs through absolute paths",
-        "reject such paths before executing the script",
-        "temporary directories",
-        "no real or private-network endpoints",
         "no production addresses or credentials",
-        "fail closed on every non-allowlisted command",
         "real lifecycle or snapshot mutation",
     ):
         assert requirement in policy
@@ -278,8 +282,8 @@ def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
     assert ":$PATH" not in run_case
     for marker in (
         "HUBINET_OPS_TEST_MODE=1",
-        'HUBINET_OPS_TEST_PVE_ROOT="$case_root/pve"',
-        'HUBINET_OPS_BACKUP_ROOT="$case_root/backups"',
+        'HUBINET_OPS_TEST_PVE_ROOT="$test_pve_root"',
+        'HUBINET_OPS_BACKUP_ROOT="$test_backup_root"',
         'HOST_PATH_SENTINEL="hubinet-host-path-sentinel"',
         'PATH="$HOST_ONLY_BIN:$ORIGINAL_HOST_PATH" command -v "$HOST_PATH_SENTINEL"',
         'for tool in "$HOST_PATH_SENTINEL" apt apt-get ssh scp pvesh qm docker podman wget',
@@ -420,6 +424,41 @@ def test_hermetic_deployment_runtime_smoke_test_boundaries() -> None:
             "/bin/sh",
         ),
         ("/sbin/reboot", "absolute executable path", "/sbin/reboot"),
+        (
+            "command -p curl https://example.invalid",
+            "command default PATH escape",
+            "command -p",
+        ),
+        (
+            "bash -c 'command -p curl https://example.invalid'",
+            "command default PATH escape",
+            "command -p",
+        ),
+        (
+            "/usr//bin/curl https://example.invalid",
+            "absolute executable path",
+            "/usr//bin/curl",
+        ),
+        (
+            "/usr/bin/../bin/curl https://example.invalid",
+            "absolute executable path",
+            "/usr/bin/../bin/curl",
+        ),
+        (
+            "/bin/./sh -c 'curl https://example.invalid'",
+            "absolute executable path",
+            "/bin/./sh",
+        ),
+        (
+            "exec 3<>/dev/tcp/192.168.4.249/22",
+            "Bash network device",
+            "/dev/tcp/192.168.4.249/22",
+        ),
+        (
+            "exec 3<>/dev/udp/192.168.4.249/53",
+            "Bash network device",
+            "/dev/udp/192.168.4.249/53",
+        ),
     ),
 )
 def test_hermetic_shell_boundary_rejects_absolute_commands(
@@ -472,6 +511,91 @@ def test_hermetic_shell_boundary_allows_controlled_references(
 
 def test_current_upgrade_passes_hermetic_shell_boundary() -> None:
     assert validate_file(PVE_INSTALLER) == []
+
+
+def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
+    pytest_wrapper = (
+        ROOT / "tests" / "test_installer_runtime_smoke.py"
+    ).read_text(encoding="utf-8")
+    runner = SANDBOX_RUNNER.read_text(encoding="utf-8")
+    entrypoint = SANDBOX_ENTRYPOINT.read_text(encoding="utf-8")
+    smoke = RUNTIME_SMOKE.read_text(encoding="utf-8")
+
+    assert "SANDBOX_RUNNER" in pytest_wrapper
+    assert "runtime_smoke_0_4_1.sh" not in pytest_wrapper
+    assert "requires the fail-closed Docker sandbox" in pytest_wrapper
+    assert "HUBINET_OPS_SYSTEM_SANDBOX" in smoke
+    assert "runtime smoke must execute inside the system sandbox" in smoke
+    assert entrypoint.index("sandbox self-test: passed") < entrypoint.index(
+        "runtime_smoke_0_4_1.sh"
+    )
+    assert runner.index("docker run --rm") < runner.index(
+        "runtime_smoke_sandbox_entrypoint.sh"
+    )
+
+
+def test_system_sandbox_has_required_kernel_and_mount_boundaries() -> None:
+    runner = SANDBOX_RUNNER.read_text(encoding="utf-8")
+    entrypoint = SANDBOX_ENTRYPOINT.read_text(encoding="utf-8")
+
+    for argument in (
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges=true",
+        "--ipc none",
+        "--pids-limit 256",
+        "--memory 768m",
+        "--memory-swap 768m",
+        "--cpus 2",
+        "--user 65534:65534",
+        "dst=/repo,readonly",
+        "--tmpfs /tmp:rw,nosuid,nodev,size=768m,mode=1777",
+        "--tmpfs /workspace:rw,nosuid,nodev,noexec,size=128m",
+    ):
+        assert argument in runner
+    for forbidden in (
+        "--privileged",
+        "--network host",
+        "--pid host",
+        "--pid=host",
+        "/var/run/docker.sock:",
+        "/run/podman/podman.sock:",
+        "src=/,",
+        "src=$HOME",
+    ):
+        assert forbidden not in runner
+
+    for proof in (
+        "repository is writable",
+        "host filesystem sentinel is visible",
+        "host PID namespace is visible",
+        "/var/run/docker.sock",
+        "/run/podman/podman.sock",
+        "/etc/hubinet-ops",
+        "/root/.ssh",
+        "effective capabilities are not empty",
+        "no-new-privileges is not active",
+        "/dev/tcp/198.51.100.1/9",
+        "/dev/udp/198.51.100.1/53",
+        "socket.create_connection",
+    ):
+        assert proof in entrypoint
+
+
+def test_runtime_smoke_redirects_every_production_path_to_each_case() -> None:
+    smoke = RUNTIME_SMOKE.read_text(encoding="utf-8")
+    run_case = smoke[smoke.index("run_case()"):smoke.index("first_line_after()")]
+
+    for variable in (
+        "test_pve_root",
+        "test_backup_root",
+        "test_archive",
+        "test_wrapper",
+        'TEST_CT_ROOT="$case_root/ct"',
+    ):
+        assert variable in run_case
+    assert '[[ "$test_path" == "$case_root/"* ]]' in run_case
 
 
 def test_hermetic_shell_boundary_allows_only_exact_first_line_shebang(
