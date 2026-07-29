@@ -347,17 +347,62 @@ script:
     alias: "Hubinet Ops — przygotuj plan aktualizacji control plane"
     mode: single
     fields: *lifecycle_vmid_field
+    variables:
+      release_version: "{{ states('sensor.hubinet_ops_ct110_self_update_release_version') }}"
     sequence:
       - choose:
-          - conditions: "{{ vmid | int == 110 }}"
+          - conditions: >-
+              {{ vmid | int == 110
+                 and release_version not in ['none', 'unknown', 'unavailable', ''] }}
             sequence:
               - continue_on_error: true
                 action: rest_command.hubinet_ops_self_update_plan
                 data: {vmid: 110}
                 response_variable: response
+              - variables:
+                  result: "{{ response | default({}, true) }}"
+                  content: "{{ result.get('content', {}) }}"
+                  detail: "{{ content.get('detail', {}) }}"
+                  error_message: >-
+                    {% if detail is mapping %}
+                      {{ detail.get('message', 'Backend odrzucił przygotowanie planu aktualizacji.') }}
+                    {% else %}
+                      {{ detail | default('Backend odrzucił przygotowanie planu aktualizacji.', true) }}
+                    {% endif %}
+              - choose:
+                  - conditions: "{{ result.get('status', 0) not in [200, 202] }}"
+                    sequence:
+                      - action: persistent_notification.create
+                        data:
+                          notification_id: hubinet_ops_self_update_conflict
+                          title: "Hubinet Ops — nie można przygotować planu"
+                          message: >-
+                            {{ error_message }} Sprawdź przygotowane wydanie na PVE,
+                            odśwież stan CT110 i spróbuj ponownie.
+          - conditions: "{{ vmid | int == 110 }}"
+            sequence:
+              - variables:
+                  response:
+                    status: 409
+                    content:
+                      detail:
+                        code: staged_release_missing
+                        message: "Brak przygotowanego wydania"
+              - action: persistent_notification.create
+                data:
+                  notification_id: hubinet_ops_self_update_release_missing
+                  title: "Hubinet Ops — brak przygotowanego wydania"
+                  message: >-
+                    Najpierw przygotuj i zweryfikuj wydanie Hubinet Ops na PVE,
+                    następnie odśwież stan CT110. Żądanie nie zostało wysłane.
         default:
           - variables:
-              response: {status: 403, content: {detail: "Self-update jest dozwolony wyłącznie dla CT110"}}
+              response:
+                status: 403
+                content:
+                  detail:
+                    code: self_update_not_supported
+                    message: "Aktualizacja Hubinet Ops jest dozwolona wyłącznie dla CT110"
       - action: script.hubinet_ops_report_action
         data: {vmid: 110, action_name: "plan aktualizacji control plane", response: "{{ response | default({}) }}"}
 

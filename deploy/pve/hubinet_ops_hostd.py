@@ -1034,7 +1034,18 @@ class HostdHandler(BaseHTTPRequestHandler):
                     "self-update-release", int(release_match.group("vmid"))
                 )
             except (HostControlError, ValueError) as exc:
-                self._send(HTTPStatus.CONFLICT, {"error": str(exc)})
+                message = str(exc)
+                self._send(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "error": message,
+                        "code": (
+                            "staged_release_missing"
+                            if message == "No approved Hubinet Ops release is staged"
+                            else "staged_release_invalid"
+                        ),
+                    },
+                )
                 return
             self._send(HTTPStatus.OK, result)
             return

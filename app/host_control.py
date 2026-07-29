@@ -18,11 +18,13 @@ class HostControlError(RuntimeError):
         status: str | None = None,
         result: dict[str, Any] | None = None,
         http_status: int | None = None,
+        code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.result = dict(result or {})
         self.http_status = http_status
+        self.code = str(code or "") or None
 
 
 class HostControlClient:
@@ -386,5 +388,6 @@ class HostControlClient:
             raise HostControlError(
                 sanitize_text(payload.get("error") or f"HTTP {response.status_code}", limit=1000),
                 http_status=response.status_code,
+                code=sanitize_text(payload.get("code"), limit=100) or None,
             )
         return payload

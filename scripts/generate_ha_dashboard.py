@@ -616,10 +616,14 @@ def _control_conditions(
             )
         return conditions
     if action == "self_update":
+        release_version = _entity(vmid, cfg, "self_update_release_version")
         return [
             _state_condition(runtime, state="running"),
             _state_condition(capability, state="allowed"),
             _state_condition(operation, state_not="waiting_approval"),
+            _state_condition(release_version, state_not="none"),
+            _state_condition(release_version, state_not="unknown"),
+            _state_condition(release_version, state_not="unavailable"),
             *idle,
         ]
     raise ValueError(f"Unsupported operator action: {action}")
@@ -998,6 +1002,36 @@ def _qemu_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     health = _entity(vmid, cfg, "health_status")
+    release_version = _entity(vmid, cfg, "self_update_release_version")
+    missing_release = _section(
+        _title(
+            "Brak przygotowanego wydania",
+            "Najpierw przygotuj i zweryfikuj wydanie Hubinet Ops na PVE, "
+            "następnie odśwież stan CT110.",
+        ),
+        _entity_grid(
+            [
+                {
+                    "type": "conditional",
+                    "conditions": [_state_condition(release_version, state=state)],
+                    "card": {
+                        "type": "custom:mushroom-template-card",
+                        "primary": "Brak przygotowanego wydania",
+                        "secondary": (
+                            "Akcja przygotowania planu jest niedostępna. "
+                            "Wymagany jest staged release na PVE."
+                        ),
+                        "multiline_secondary": True,
+                        "icon": "mdi:package-variant-remove",
+                        "icon_color": "grey",
+                        "tap_action": {"action": "none"},
+                    },
+                }
+                for state in ("none", "unknown", "unavailable")
+            ],
+            columns=1,
+        ),
+    )
     return [
         _section(
             _title(_label(vmid, cfg), "Self-health agenta"),
@@ -1005,6 +1039,7 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
             _resource_chips(vmid, cfg),
         ),
         _controls_section(vmid, cfg),
+        missing_release,
         _ct110_break_glass_section(),
         _section(
             _title(

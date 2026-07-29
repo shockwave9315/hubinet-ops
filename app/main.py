@@ -14,7 +14,7 @@ from .executor import Executor, ExecutorError
 from .host_control import HostControlClient, HostControlError
 from .mqtt import MqttTelemetry, VERSION
 from .resource_adapters import ResourceExecutor
-from .service import OpsService
+from .service import ConflictError, OpsService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -320,8 +320,16 @@ def create_app(
             return service.create_self_update_plan(vmid)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail()) from exc
         except (ValueError, ExecutorError, HostControlError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "self_update_conflict",
+                    "message": str(exc),
+                },
+            ) from exc
 
     @api.post("/api/v1/resources/{vmid}/retry-healthcheck", dependencies=auth)
     @api.post("/api/v1/containers/{vmid}/retry-healthcheck", dependencies=auth)

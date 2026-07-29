@@ -66,6 +66,27 @@ HOST_CONTROL_OPERATION_TYPES = {
 }
 
 
+class ConflictError(ValueError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        required_action: str | None = None,
+    ) -> None:
+        super().__init__(sanitize_text(message, limit=1000))
+        self.code = sanitize_text(code, limit=100)
+        self.required_action = (
+            sanitize_text(required_action, limit=1000) if required_action else None
+        )
+
+    def detail(self) -> dict[str, str]:
+        result = {"code": self.code, "message": str(self)}
+        if self.required_action:
+            result["required_action"] = self.required_action
+        return result
+
+
 class OpsService:
     def __init__(
         self,
@@ -1300,24 +1321,47 @@ class OpsService:
         cfg = self._resource(vmid)
         self._require_capability(vmid, "self_update")
         if vmid != 110 or cfg.get("adapter") != "agent_self":
-            raise ValueError("Self-update is supported only for CT110")
+            raise ConflictError(
+                "self_update_not_supported",
+                "Self-update is supported only for CT110",
+            )
         if self.host_control is None:
-            raise ValueError("CT110 self-update requires independent PVE host control")
+            raise ConflictError(
+                "host_control_unavailable",
+                "CT110 self-update requires independent PVE host control",
+                required_action="Restore the independent PVE host control service.",
+            )
         if self.db.get_active_job(vmid) is not None:
-            raise ValueError("Another job is already active for this resource")
+            raise ConflictError(
+                "active_job_conflict",
+                "Another job is already active for this resource",
+                required_action="Wait for the active job to finish.",
+            )
         release = self._read_self_update_release(vmid)
         fingerprint = str(release["fingerprint"])
         active = self.db.find_active_plan(vmid, fingerprint)
         if active is not None:
             if self._plan_type(active) != "self_update":
-                raise ValueError("Resolve the active plan before CT110 self-update")
+                raise ConflictError(
+                    "active_plan_conflict",
+                    "Resolve the active plan before CT110 self-update",
+                    required_action="Resolve the active update plan.",
+                )
             if active.get("status") != "waiting_approval":
-                raise ValueError("Approved self-update plan is already pending execution")
+                raise ConflictError(
+                    "approved_plan_pending",
+                    "Approved self-update plan is already pending execution",
+                    required_action="Wait for the approved plan to finish.",
+                )
             status = "existing_plan"
         else:
             other = self.db.find_active_plan(vmid)
             if other is not None:
-                raise ValueError("Resolve the active plan before CT110 self-update")
+                raise ConflictError(
+                    "active_plan_conflict",
+                    "Resolve the active plan before CT110 self-update",
+                    required_action="Resolve the active update plan.",
+                )
             payload = {
                 "plan_type": "self_update",
                 "version": str(release["version"]),
@@ -1374,15 +1418,45 @@ class OpsService:
         try:
             release = self.host_control.inspect_self_update_release(vmid)
         except HostControlError as exc:
-            raise ValueError(f"Cannot inspect staged self-update release: {exc}") from exc
+            if (
+                exc.code == "staged_release_missing"
+                or str(exc) == "No approved Hubinet Ops release is staged"
+            ):
+                raise ConflictError(
+                    "staged_release_missing",
+                    "No approved Hubinet Ops release is staged",
+                    required_action=(
+                        "Stage and validate the signed Hubinet Ops release on PVE, "
+                        "then refresh CT110."
+                    ),
+                ) from exc
+            raise ConflictError(
+                (
+                    "staged_release_invalid"
+                    if exc.http_status == 409
+                    else "staged_release_unavailable"
+                ),
+                f"Cannot inspect staged self-update release: {exc}",
+                required_action=(
+                    "Validate the staged release and PVE host control health."
+                ),
+            ) from exc
         required = ("version", "release_id", "fingerprint")
         if not all(isinstance(release.get(key), str) and release[key] for key in required):
-            raise ValueError("Staged self-update release identity is invalid")
+            raise ConflictError(
+                "staged_release_identity_invalid",
+                "Staged self-update release identity is invalid",
+                required_action="Restage a release with complete identity metadata.",
+            )
         fingerprint = str(release["fingerprint"])
         if len(fingerprint) != 64 or any(
             character not in "0123456789abcdef" for character in fingerprint
         ):
-            raise ValueError("Staged self-update release fingerprint is invalid")
+            raise ConflictError(
+                "staged_release_fingerprint_invalid",
+                "Staged self-update release fingerprint is invalid",
+                required_action="Restage and validate the release fingerprint.",
+            )
         return dict(release)
 
     def _validate_self_update_plan(self, job: dict[str, Any]) -> dict[str, Any]:

@@ -53,6 +53,20 @@ def test_dashboard_generator_is_deterministic_and_checked_in() -> None:
     assert DEFAULT_OUTPUT.read_text(encoding="utf-8") == first
 
 
+def test_ct110_self_update_is_unavailable_without_staged_release() -> None:
+    data = _dashboard()
+    ct110 = _text(_view(data, "ct-110"))
+
+    assert "Brak przygotowanego wydania" in ct110
+    assert "Wymagany jest staged" in ct110
+    assert "release na PVE" in ct110
+    conditions = _control_conditions(110, load_resources(DEFAULT_CONFIG)[110], "self_update")
+    rendered = _text(conditions)
+    assert "sensor.hubinet_ops_ct110_self_update_release_version" in rendered
+    for unavailable in ("none", "unknown", "unavailable"):
+        assert f"state_not: {unavailable}" in rendered
+
+
 def test_dashboard_contains_full_inventory_and_legacy_paths() -> None:
     data = _dashboard()
     paths = [view["path"] for view in data["views"]]
