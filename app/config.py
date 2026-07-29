@@ -58,6 +58,7 @@ RESOURCE_KEYS = {
     "os",
     "executor_contract",
     "snapshot_retention",
+    "snapshot_retention_count",
 }
 
 
@@ -298,12 +299,28 @@ def validate_config(raw: dict[str, Any]) -> None:
                 raise RuntimeError(f"Resource {vmid} executor_contract.{key} must be SHA-256")
         if executor_contract and adapter != "apt":
             raise RuntimeError(f"Resource {vmid} executor_contract is supported only for apt")
-        retention = _strict_int(
-            value.get("snapshot_retention", 5),
-            f"Resource {vmid} snapshot_retention",
+        snapshots_enabled = any(
+            bool(capabilities.get(name, False))
+            for name in ("snapshot_create", "snapshot_list", "snapshot_delete")
+        ) or bool(value.get("pre_update_snapshot", False))
+        retention_key = (
+            "snapshot_retention_count"
+            if "snapshot_retention_count" in value
+            else "snapshot_retention"
         )
-        if retention < 1 or retention > 100:
-            raise RuntimeError(f"Resource {vmid} snapshot_retention must be between 1 and 100")
+        retention_value = value.get(retention_key, 3 if snapshots_enabled else 0)
+        if isinstance(retention_value, bool) or not isinstance(retention_value, int):
+            raise RuntimeError(
+                f"Resource {vmid} {retention_key} must be an integer"
+            )
+        retention = _strict_int(
+            retention_value,
+            f"Resource {vmid} {retention_key}",
+        )
+        if retention < 0 or retention > 100:
+            raise RuntimeError(
+                f"Resource {vmid} {retention_key} must be between 0 and 100"
+            )
 
         required_services = value.get("required_services", [])
         if not isinstance(required_services, list) or not all(

@@ -29,6 +29,7 @@ JOB_OPERATION_TYPES = frozenset(
         "snapshot_create",
         "snapshot_rollback",
         "snapshot_delete",
+        "snapshot_prune",
         "retry_healthcheck",
         "self_update",
     }

@@ -178,6 +178,7 @@ class OpsService:
             "manual_snapshot_restore_allowed": bool(
                 cfg.get("manual_snapshot_restore_allowed", False)
             ),
+            "snapshot_retention_count": self._snapshot_retention_count(vmid),
             "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
             "operator_capabilities": self._capabilities(vmid),
             "monitoring": self._monitoring(vmid),
@@ -990,10 +991,10 @@ class OpsService:
                 )
                 self.mqtt.publish_event(vmid, event)
             raise ValueError(warning) from last_error
-        snapshots = [
-            dict(item) for item in snapshots
-            if isinstance(item, dict)
-        ]
+        snapshots = self._managed_snapshot_model(
+            vmid,
+            [dict(item) for item in snapshots if isinstance(item, dict)],
+        )
         snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         owned = [item for item in snapshots if item.get("owned_by_hubinet_ops") is True]
         latest = owned[0] if owned else {}
@@ -1008,6 +1009,7 @@ class OpsService:
                 "snapshot_refresh_required": False,
                 "snapshot_refresh_warning": None,
                 "snapshot_refreshed_at": self._utc_second_timestamp(),
+                "managed_snapshots": owned,
             }
         )
         self._save_state(vmid, state)
@@ -1054,6 +1056,109 @@ class OpsService:
                     self.mqtt.publish_event(vmid, event)
                 raise ValueError(warning)
         return {"snapshots": snapshots, "latest": latest or None}
+
+    def _managed_snapshot_model(
+        self,
+        vmid: int,
+        snapshots: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        jobs = [
+            job for job in self.db.list_jobs(limit=500)
+            if int(job.get("vmid") or 0) == vmid and job.get("snapshot_name")
+        ]
+        plans = [
+            plan for plan in self.db.list_plans(limit=500)
+            if int(plan.get("vmid") or 0) == vmid
+            and str(plan.get("status") or "") in {"waiting_approval", "approved"}
+        ]
+        active_job_names = {
+            str(job["snapshot_name"]): job
+            for job in jobs
+            if str(job.get("status") or "") in {"queued", "running"}
+        }
+        rollback_source_names = self.db.rollback_source_snapshots(vmid)
+        active_plan_names: dict[str, dict[str, Any]] = {}
+        for plan in plans:
+            payload = dict(plan.get("payload") or {})
+            name = str(payload.get("snapshot_name") or "")
+            if name:
+                active_plan_names[name] = plan
+        jobs_by_name: dict[str, dict[str, Any]] = {}
+        for job in jobs:
+            jobs_by_name.setdefault(str(job["snapshot_name"]), job)
+
+        now = self._now().astimezone(UTC)
+        modeled: list[dict[str, Any]] = []
+        for raw in snapshots:
+            item = dict(raw)
+            name = str(item.get("name") or "")
+            parsed = parse_owned_snapshot_name(name, vmid=vmid)
+            owned = item.get("owned_by_hubinet_ops") is True and parsed is not None
+            reasons: list[str] = []
+            related_job = active_job_names.get(name) or jobs_by_name.get(name)
+            related_plan = active_plan_names.get(name)
+            if name in active_job_names:
+                reasons.append("active_job")
+            if name in active_plan_names:
+                reasons.append("active_plan")
+            if name in rollback_source_names:
+                reasons.append("manual_rollback_source")
+            if not owned:
+                reasons.append(
+                    "foreign_snapshot" if parsed is None else "ownership_uncertain"
+                )
+            created = parse_utc_timestamp(item.get("created_at"))
+            age_seconds = (
+                max(0, int((now - created.astimezone(UTC)).total_seconds()))
+                if created is not None
+                else None
+            )
+            kind = (
+                str(item.get("kind") or parsed.get("kind") or "")
+                if parsed is not None
+                else str(item.get("kind") or "unknown")
+            )
+            item.update(
+                {
+                    "physical_name": name,
+                    "logical_type": kind,
+                    "kind": kind,
+                    "vmid": vmid,
+                    "age_seconds": age_seconds,
+                    "protected": bool(reasons),
+                    "protection_reason": reasons[0] if reasons else None,
+                    "protection_reasons": reasons,
+                    "source_job_id": (
+                        str(related_job["id"]) if related_job is not None else None
+                    ),
+                    "source_plan_id": (
+                        str(related_plan["id"])
+                        if related_plan is not None
+                        else str(related_job.get("plan_id") or "") or None
+                        if related_job is not None
+                        else None
+                    ),
+                    "owned_by_hubinet_ops": owned,
+                    "ownership_status": (
+                        "owned" if owned else "foreign" if parsed is None else "uncertain"
+                    ),
+                }
+            )
+            modeled.append(item)
+        return modeled
+
+    def _snapshot_retention_count(self, vmid: int) -> int:
+        cfg = self._resource(vmid)
+        capabilities = self._capabilities(vmid)
+        snapshots_enabled = any(
+            bool(capabilities.get(name, False))
+            for name in ("snapshot_create", "snapshot_list", "snapshot_delete")
+        ) or bool(cfg.get("pre_update_snapshot", False))
+        value = cfg.get(
+            "snapshot_retention_count",
+            cfg.get("snapshot_retention", 3 if snapshots_enabled else 0),
+        )
+        return max(0, min(int(value), 100))
 
     def queue_snapshot_create(
         self,
@@ -1105,6 +1210,32 @@ class OpsService:
         finally:
             lock.release()
 
+    def queue_snapshot_prune(
+        self,
+        vmid: int,
+        mode: str,
+        request_id: str | None = None,
+        *,
+        confirmation: str | None = None,
+    ) -> dict[str, Any]:
+        if mode not in {"oldest", "all_unprotected"}:
+            raise ValueError("Unsupported snapshot pruning mode")
+        if mode == "all_unprotected" and confirmation != "DELETE_ALL_UNPROTECTED":
+            raise ValueError("Exact confirmation DELETE_ALL_UNPROTECTED is required")
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, "snapshot_delete")
+        self._require_capability(vmid, "snapshot_list")
+        self._require_host_control("Snapshot pruning")
+        job, _ = self.db.create_operation_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"resource-{vmid}")),
+            operation_type="snapshot_prune",
+            request_id=request_id or uuid.uuid4().hex,
+            snapshot_name=mode,
+        )
+        self._mark_job_queued(vmid, job)
+        return job
+
     def _queue_snapshot_action_locked(
         self,
         vmid: int,
@@ -1141,6 +1272,10 @@ class OpsService:
             raise ValueError("Resolve the active update plan before snapshot restore")
         if not bool(selected.get(f"{action}_eligible")):
             raise ValueError(f"Snapshot is not {action} eligible")
+        if action == "delete" and bool(selected.get("protected")):
+            raise ValueError(
+                f"Snapshot is protected: {selected.get('protection_reason') or 'policy'}"
+            )
         job, _ = self.db.create_operation_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"ct-{vmid}")),
@@ -2047,6 +2182,7 @@ class OpsService:
             )
             self._save_state(vmid, state)
             self._terminal(job, "success", "success", None)
+            self._enforce_snapshot_retention(vmid, self.db.get_job(job["id"]))
             if final_apt_scan_ok and pending is not None and pending > 0:
                 self._create_followup_plan(vmid, cfg, updates)
             duration = self._best_effort_duration(job)
@@ -2109,6 +2245,7 @@ class OpsService:
             "snapshot_create": "snapshot_creating",
             "snapshot_rollback": "snapshot_rollback",
             "snapshot_delete": "snapshot_deleting",
+            "snapshot_prune": "snapshot_pruning",
             "retry_healthcheck": "healthcheck",
             "self_update": "self_updating",
         }.get(operation_type, "executing")
@@ -2121,6 +2258,8 @@ class OpsService:
         try:
             if operation_type == "retry_healthcheck":
                 result = self._execute_retry_healthcheck(job, emit)
+            elif operation_type == "snapshot_prune":
+                result = self._execute_snapshot_prune(job, emit)
             else:
                 result = self._execute_host_operation(job)
             self._finalize_operation_success(job, result)
@@ -2277,6 +2416,61 @@ class OpsService:
             initial_grace=False,
         )
 
+    def _execute_snapshot_prune(
+        self,
+        job: dict[str, Any],
+        emit: Callable[..., None],
+    ) -> dict[str, Any]:
+        vmid = int(job["vmid"])
+        mode = str(job.get("snapshot_name") or "")
+        listing = self._refresh_snapshot_state(vmid, job=job)
+        candidates = [
+            item
+            for item in reversed(listing["snapshots"])
+            if item.get("owned_by_hubinet_ops") is True
+            and not item.get("protected")
+            and item.get("delete_eligible") is True
+        ]
+        if mode == "oldest":
+            candidates = candidates[:1]
+        elif mode != "all_unprotected":
+            raise ValueError("Snapshot pruning job has an invalid mode")
+        deleted: list[str] = []
+        for index, candidate in enumerate(candidates):
+            name = str(candidate.get("name") or "")
+            refreshed = self._refresh_snapshot_state(vmid, job=job)
+            current = next(
+                (
+                    item
+                    for item in refreshed["snapshots"]
+                    if str(item.get("name") or "") == name
+                ),
+                None,
+            )
+            if (
+                current is None
+                or current.get("owned_by_hubinet_ops") is not True
+                or current.get("protected")
+                or current.get("delete_eligible") is not True
+            ):
+                continue
+            self._require_host_control("Snapshot pruning").execute(
+                "snapshot_delete",
+                vmid,
+                f"{str(job['request_id'])[:96]}-{index}",
+                snapshot_name=name,
+            )
+            deleted.append(name)
+        self._refresh_snapshot_state(vmid, job=job)
+        emit(
+            stage="snapshot_pruning",
+            progress=95,
+            event_type="snapshot_pruning_completed",
+            message="Managed snapshot pruning completed",
+            details={"deleted": deleted, "mode": mode},
+        )
+        return {"deleted": deleted, "deleted_count": len(deleted), "mode": mode}
+
     def _execute_host_operation(self, job: dict[str, Any]) -> dict[str, Any]:
         operation_type = str(job["operation_type"])
         vmid = int(job["vmid"])
@@ -2321,28 +2515,59 @@ class OpsService:
         )
 
     def _enforce_snapshot_retention(self, vmid: int, job: dict[str, Any]) -> None:
-        retention = max(1, int(self._resource(vmid).get("snapshot_retention", 5)))
-        snapshots = [
-            dict(item)
-            for item in self._raw_snapshot_list(vmid)
-            if isinstance(item, dict) and item.get("owned_by_hubinet_ops") is True
-        ]
-        snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-        protected = self.db.rollback_source_snapshots(vmid)
-        protected.add(str(job.get("snapshot_name") or ""))
-        for index, snapshot in enumerate(snapshots[retention:], start=retention):
-            name = str(snapshot.get("name") or "")
-            if not name or name in protected or not snapshot.get("delete_eligible"):
-                continue
-            if self.host_control is not None:
-                self.host_control.execute(
-                    "snapshot_delete",
-                    vmid,
-                    f"retention-{str(job['id'])[:32]}-{index}",
-                    snapshot_name=name,
+        retention = self._snapshot_retention_count(vmid)
+        if retention == 0:
+            return
+        try:
+            listing = self._refresh_snapshot_state(vmid, job=job)
+            managed = [
+                item
+                for item in listing["snapshots"]
+                if item.get("owned_by_hubinet_ops") is True
+            ]
+            for index, snapshot in enumerate(managed[retention:], start=retention):
+                name = str(snapshot.get("name") or "")
+                refreshed = self._refresh_snapshot_state(vmid, job=job)
+                current = next(
+                    (
+                        item
+                        for item in refreshed["snapshots"]
+                        if str(item.get("name") or "") == name
+                    ),
+                    None,
                 )
-            else:
-                self.executor.run("snapshot-delete", vmid, name, timeout=300)
+                if (
+                    current is None
+                    or current.get("owned_by_hubinet_ops") is not True
+                    or current.get("protected")
+                    or current.get("delete_eligible") is not True
+                ):
+                    continue
+                if self.host_control is not None:
+                    self.host_control.execute(
+                        "snapshot_delete",
+                        vmid,
+                        f"retention-{str(job['id'])[:32]}-{index}",
+                        snapshot_name=name,
+                    )
+                else:
+                    self.executor.run("snapshot-delete", vmid, name, timeout=300)
+            self._refresh_snapshot_state(vmid, job=job)
+        except (ExecutorError, HostControlError, ValueError) as exc:
+            warning = sanitize_text(f"Snapshot retention pruning failed: {exc}", limit=2000)
+            LOGGER.warning("%s", warning)
+            current_job = self.db.get_job(str(job["id"]))
+            event = self.db.insert_job_event(
+                job_id=str(job["id"]),
+                vmid=vmid,
+                level="warning",
+                stage=str(current_job.get("stage") or "snapshot"),
+                progress=int(current_job.get("progress") or 0),
+                event_type="snapshot_pruning_failed",
+                message=warning,
+                details={"update_result_preserved": True},
+            )
+            self.mqtt.publish_event(vmid, event)
 
     def _validate_approved_plan(
         self,

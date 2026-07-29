@@ -32,6 +32,10 @@ class OperationRequest(BaseModel):
     )
 
 
+class SnapshotPruneRequest(OperationRequest):
+    confirm: str | None = Field(default=None, max_length=64)
+
+
 def create_app(
     app_settings: Settings,
     *,
@@ -268,6 +272,39 @@ def create_app(
         try:
             return service.queue_snapshot_action(
                 vmid, "delete", name, request.request_id if request else None
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/snapshots/delete-oldest", dependencies=auth)
+    def delete_oldest_snapshot(
+        vmid: int,
+        request: SnapshotPruneRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return service.queue_snapshot_prune(
+                vmid,
+                "oldest",
+                request.request_id if request else None,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/snapshots/delete-unprotected", dependencies=auth)
+    def delete_unprotected_snapshots(
+        vmid: int,
+        request: SnapshotPruneRequest,
+    ) -> dict[str, Any]:
+        try:
+            return service.queue_snapshot_prune(
+                vmid,
+                "all_unprotected",
+                request.request_id,
+                confirmation=request.confirm,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Resource not found") from exc
