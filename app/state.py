@@ -266,6 +266,7 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
         else []
     )
     state.setdefault("executor_last_checked_at", None)
+    state.setdefault("executor_contract_error", None)
     state["snapshot_count"] = max(0, _safe_int(state.get("snapshot_count"), 0))
     state.setdefault("latest_snapshot_name", None)
     state.setdefault("latest_snapshot_at", None)

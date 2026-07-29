@@ -26,6 +26,7 @@ from hubinet_ops_host_control import (  # noqa: E402
     HostPaths,
     HostPolicy,
     owned_snapshot,
+    parse_snapshot,
     run_forced_command,
 )
 from hubinet_ops_hostd import (  # noqa: E402
@@ -108,12 +109,17 @@ class FakeRunner:
         self.status = {101: "stopped", 106: "running", 110: "running"}
         self.snapshots: list[dict[str, Any]] = [
             {
-                "name": "foreign-backup",
+                "snapname": "current",
+                "description": "active LXC state",
+                "current": 1,
+            },
+            {
+                "snapname": "foreign-backup",
                 "description": "not managed by Hubinet Ops",
                 "snaptime": 1_700_000_000,
             },
             {
-                "name": "hubinet-ops-106-manual-20260720T170000Z",
+                "snapname": "hubinet-ops-106-manual-20260720T170000Z",
                 "description": "hubinet-ops;kind=manual;source_job_id=abc12345",
                 "snaptime": 1_721_492_400,
             },
@@ -127,7 +133,11 @@ class FakeRunner:
             self.status[int(argv[2])] = "running"
         elif argv[:2] in (["pct", "shutdown"], ["pct", "stop"]):
             self.status[int(argv[2])] = "stopped"
-        elif argv[:2] == ["pct", "listsnapshot"]:
+        elif (
+            argv[:2] == ["pvesh", "get"]
+            and len(argv) >= 3
+            and argv[2].endswith("/snapshot")
+        ):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.snapshots), "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
@@ -203,15 +213,83 @@ def test_snapshot_list_marks_only_project_snapshots_as_eligible(tmp_path: Path) 
 
     snapshots = controller.execute("list-snapshots", 106)["snapshots"]
 
-    owned = next(item for item in snapshots if item["owned_by_hubinet_ops"])
-    foreign = next(item for item in snapshots if not item["owned_by_hubinet_ops"])
+    assert [
+        "pvesh",
+        "get",
+        "/nodes/pve-a/lxc/106/snapshot",
+        "--output-format",
+        "json",
+    ] in [call[0] for call in runner.calls]
+    assert not any(call[0][:2] == ["pct", "listsnapshot"] for call in runner.calls)
+    owned = next(
+        item
+        for item in snapshots
+        if item["name"] == "hubinet-ops-106-manual-20260720T170000Z"
+    )
+    foreign = next(item for item in snapshots if item["name"] == "foreign-backup")
+    current = next(item for item in snapshots if item["name"] == "current")
+    assert current["name"] == "current"
+    assert current["owned_by_hubinet_ops"] is False
     assert owned["kind"] == "manual"
+    assert owned["created_at"] == "2024-07-20T16:20:00+00:00"
+    assert owned["owned_by_hubinet_ops"] is True
     assert owned["rollback_eligible"] is True
+    assert owned["delete_eligible"] is True
+    assert foreign["owned_by_hubinet_ops"] is False
+    assert foreign["kind"] is None
     assert foreign["rollback_eligible"] is False
     assert foreign["delete_eligible"] is False
+    assert current["rollback_eligible"] is False
+    assert current["delete_eligible"] is False
     assert owned_snapshot(owned["name"], 106)
     with pytest.raises(HostControlError, match="owned"):
         controller.execute("snapshot-delete", 106, "foreign-backup")
+
+
+def test_snapshot_list_falls_back_to_legacy_name(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.snapshots = [{"name": "foreign-legacy"}]
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    snapshots = controller.execute("list-snapshots", 106)["snapshots"]
+
+    assert snapshots[0]["name"] == "foreign-legacy"
+    assert snapshots[0]["owned_by_hubinet_ops"] is False
+
+
+def test_snapshot_list_prefers_snapname_over_legacy_name(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    runner.snapshots = [
+        {
+            "snapname": "foreign-authoritative",
+            "name": "hubinet-ops-106-manual-20260720T170000Z",
+        }
+    ]
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    snapshots = controller.execute("list-snapshots", 106)["snapshots"]
+
+    assert snapshots[0]["name"] == "foreign-authoritative"
+    assert snapshots[0]["owned_by_hubinet_ops"] is False
+
+
+def test_host_snapshot_parser_normalizes_pre_alias_and_preserves_legacy() -> None:
+    current = parse_snapshot(
+        "hubinet-ops-106-pre-20260724T153100Z",
+        106,
+    )
+    legacy = parse_snapshot(
+        "hubinet-ops-106-pre-update-20260724T153100Z",
+        106,
+    )
+    compact_manual = parse_snapshot(
+        "hubinet-ops-999999-man-20260724T153100Z",
+        999999,
+    )
+
+    assert current and current["kind"] == "pre-update"
+    assert legacy and legacy["kind"] == "pre-update"
+    assert compact_manual and compact_manual["kind"] == "manual"
 
 
 def test_pve_snapshot_restore_policy_rejects_owned_snapshot_for_disallowed_vmid(
@@ -244,7 +322,7 @@ def test_ct110_snapshot_restore_works_without_backend_through_explicit_pve_polic
     name = "hubinet-ops-110-manual-20260723T190000Z"
     runner.snapshots = [
         {
-            "name": name,
+            "snapname": name,
             "description": "hubinet-ops;kind=manual;source_job_id=abc12345",
             "snaptime": 1_721_492_400,
         }

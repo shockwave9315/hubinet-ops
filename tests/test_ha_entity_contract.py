@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import queue
 import re
 from pathlib import Path
@@ -9,7 +10,12 @@ import pytest
 import yaml
 
 from app.ha_entities import (
+    AGENT_SELF_ENTITY_SPECS,
+    APT_ENTITY_SPECS,
+    HA_STATE_MAX_LENGTH,
+    QEMU_ENTITY_SPECS,
     ResourceIdentity,
+    bounded_ha_state_text,
     normalize_resource_identity,
     obsolete_discovery_keys,
     resource_entity_specs,
@@ -203,12 +209,180 @@ def test_data_size_discovery_uses_gib_without_changing_raw_backend_bytes() -> No
         assert "1073741824" in payload["value_template"]
 
 
-def test_agent_last_refresh_discovery_is_a_diagnostic_timestamp() -> None:
+def test_agent_last_refresh_discovery_is_nullable_diagnostic_text() -> None:
     configs, _ = _discovery()
     payload = configs["homeassistant/sensor/hubinet_ops_agent_last_refresh/config"]
 
-    assert payload["device_class"] == "timestamp"
+    assert "device_class" not in payload
     assert payload["entity_category"] == "diagnostic"
+    assert "default('unknown', true)" in payload["value_template"]
+
+
+@pytest.mark.parametrize("length", [260, 2000])
+def test_ha_text_state_helper_enforces_limit_without_mutating_source(
+    length: int,
+) -> None:
+    source = "żółw🙂" * length
+    rendered = bounded_ha_state_text(source, "none")
+
+    assert len(rendered) == HA_STATE_MAX_LENGTH
+    assert rendered == source[:HA_STATE_MAX_LENGTH]
+    assert source.endswith("🙂")
+    assert len(source) > HA_STATE_MAX_LENGTH
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_ha_text_state_helper_preserves_none_fallback(value: str | None) -> None:
+    assert bounded_ha_state_text(value, "none") == "none"
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "/hubinet-ops/" + "x" * 247,
+        "/hubinet-ops/" + "x" * 1987,
+        "/hubinet-ops/" + "żółw🙂" * 500,
+    ),
+)
+def test_dashboard_path_ha_state_is_bounded_by_unicode_characters(value: str) -> None:
+    rendered = bounded_ha_state_text(value, "none")
+    specs = resource_entity_specs(_resources()[106])
+    dashboard_spec = next(spec for spec in specs if spec.key == "dashboard_path")
+
+    assert len(value) >= 260
+    assert rendered == value[:HA_STATE_MAX_LENGTH]
+    assert len(rendered) == HA_STATE_MAX_LENGTH
+    assert f"[:{HA_STATE_MAX_LENGTH}]" in dashboard_spec.value_template
+
+
+def test_dashboard_path_discovery_is_unique_and_preserves_stable_ids() -> None:
+    configs, _ = _discovery()
+    resources = _resources()
+
+    for vmid, cfg in resources.items():
+        prefix = resource_prefix(vmid, cfg)
+        topic_suffix = f"hubinet_ops_{prefix}_dashboard_path/config"
+        matches = [
+            payload
+            for topic, payload in configs.items()
+            if topic.endswith(topic_suffix)
+        ]
+        assert len(matches) == 1
+        payload = matches[0]
+        kind = "vm" if cfg["resource_type"] == "qemu" else "ct"
+        assert payload["object_id"] == f"hubinet_ops_{prefix}_dashboard_path"
+        assert payload["unique_id"] == f"hubinet_ops_{kind}_{vmid}_dashboard_path"
+        assert payload["default_entity_id"] == (
+            f"sensor.hubinet_ops_{prefix}_dashboard_path"
+        )
+        assert payload["name"] == "Dashboard path"
+        assert payload["state_topic"] == f"hubinet/ops/resource/{vmid}/state"
+
+
+def test_discovery_has_no_manual_sensor_outside_entity_specs() -> None:
+    source = inspect.getsource(MqttTelemetry.publish_discovery)
+
+    assert source.count("self._discovery_sensor(") == 2
+    assert source.count("value_template=spec.value_template") == 2
+    assert 'value_template="{{ value_json.' not in source
+
+
+def test_all_unbounded_diagnostic_entity_states_use_central_ha_limit() -> None:
+    bounded_keys = {
+        "active_job_id",
+        "active_plan_id",
+        "active_plan_status",
+        "api_health",
+        "agent_version",
+        "dashboard_path",
+        "executor_contract_error",
+        "executor_missing_actions",
+        "executor_profile_sha256",
+        "executor_sha256",
+        "executor_version",
+        "ip_addresses",
+        "guest_agent_status",
+        "last_error",
+        "last_job_event",
+        "last_job_id",
+        "last_operation_result",
+        "last_recovery_scan_result",
+        "latest_snapshot_kind",
+        "latest_snapshot_name",
+        "lifecycle_action",
+        "lifecycle_error",
+        "operation_type",
+        "profile_validation_status",
+        "self_update_release_fingerprint",
+        "self_update_release_id",
+        "self_update_release_version",
+        "service_status",
+        "verification_error",
+    }
+    specs = (
+        list(APT_ENTITY_SPECS)
+        + list(QEMU_ENTITY_SPECS)
+        + list(AGENT_SELF_ENTITY_SPECS)
+        + [
+            spec
+            for cfg in _resources().values()
+            for spec in resource_entity_specs(cfg)
+        ]
+    )
+    by_key: dict[str, list[str]] = {}
+    for spec in specs:
+        by_key.setdefault(spec.key, []).append(spec.value_template)
+
+    assert bounded_keys <= set(by_key)
+    for key in bounded_keys:
+        assert all(f"[:{HA_STATE_MAX_LENGTH}]" in template for template in by_key[key])
+
+
+def test_long_diagnostics_remain_full_in_retained_resource_payload() -> None:
+    telemetry = MqttTelemetry(
+        {"enabled": True, "discovery_prefix": "homeassistant"},
+        {106: _resources()[106]},
+    )
+    diagnostic = "diagnostic-" + "x" * 1989
+    secret = "Bearer super-secret-token"
+    telemetry.publish_resource_state(
+        106,
+        {
+            "vmid": 106,
+            "last_error": diagnostic,
+            "verification_error": secret,
+        },
+    )
+    state_item = telemetry._queue.get_nowait()
+    attributes_item = telemetry._queue.get_nowait()
+    assert state_item is not None
+    assert attributes_item is not None
+    payload = json.loads(state_item.payload)
+
+    assert payload["last_error"] == diagnostic
+    assert len(payload["last_error"]) > HA_STATE_MAX_LENGTH
+    assert "super-secret-token" not in state_item.payload
+    assert "super-secret-token" not in attributes_item.payload
+
+
+def test_long_dashboard_path_remains_full_in_retained_resource_payload() -> None:
+    telemetry = MqttTelemetry(
+        {"enabled": True, "discovery_prefix": "homeassistant"},
+        {106: _resources()[106]},
+    )
+    dashboard_path = "/hubinet-ops/" + "żółw🙂" * 397
+    assert len(dashboard_path) == 1998
+
+    telemetry.publish_resource_state(
+        106,
+        {"vmid": 106, "dashboard_path": dashboard_path},
+    )
+    state_item = telemetry._queue.get_nowait()
+    assert state_item is not None
+    payload = json.loads(state_item.payload)
+
+    assert payload["dashboard_path"] == dashboard_path
+    assert len(payload["dashboard_path"]) > HA_STATE_MAX_LENGTH
 
 
 def test_health_discovery_uses_dedicated_attributes_topic_without_force_update() -> None:

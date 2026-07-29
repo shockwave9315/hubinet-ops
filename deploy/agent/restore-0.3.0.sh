@@ -105,6 +105,31 @@ chown hubinetops:hubinetops "$database" "$database"-* 2>/dev/null || true
 chown -R hubinetops:hubinetops \
   "$(root_path /opt/hubinet-ops/app)" \
   "$(root_path /opt/hubinet-ops/requirements.txt)"
+ssh_key_dir="$(root_path /etc/hubinet-ops/keys)"
+ssh_private_key="$ssh_key_dir/proxmox_ed25519"
+ssh_public_key="$ssh_private_key.pub"
+ssh_known_hosts="$(root_path /etc/hubinet-ops/ssh_known_hosts)"
+ssh_permissions_ok=true
+install -d -m 0750 -o root -g hubinetops "$ssh_key_dir" || ssh_permissions_ok=false
+[[ "$ssh_permissions_ok" == true && -f "$ssh_private_key" ]] || ssh_permissions_ok=false
+if [[ "$ssh_permissions_ok" == true ]]; then
+  chown hubinetops:hubinetops "$ssh_private_key" || ssh_permissions_ok=false
+  chmod 0600 "$ssh_private_key" || ssh_permissions_ok=false
+fi
+if [[ "$ssh_permissions_ok" == true && -f "$ssh_public_key" ]]; then
+  chown root:hubinetops "$ssh_public_key" || ssh_permissions_ok=false
+  chmod 0644 "$ssh_public_key" || ssh_permissions_ok=false
+fi
+[[ "$ssh_permissions_ok" == true && -f "$ssh_known_hosts" ]] || ssh_permissions_ok=false
+if [[ "$ssh_permissions_ok" == true ]]; then
+  chown root:hubinetops "$ssh_known_hosts" || ssh_permissions_ok=false
+  chmod 0640 "$ssh_known_hosts" || ssh_permissions_ok=false
+fi
+if [[ "$ssh_permissions_ok" != true ]]; then
+  stop_attempted=false
+  echo "Restored agent SSH permissions are incomplete; hubinet-ops remains stopped" >&2
+  restore_failed 1
+fi
 systemctl daemon-reload
 service_action start
 

@@ -73,13 +73,13 @@ def test_host_control_health_is_the_only_unauthenticated_request(
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert "Authorization" not in request.headers
-        return httpx.Response(200, json={"status": "ok", "version": "0.4.0"})
+        return httpx.Response(200, json={"status": "ok", "version": "0.4.1"})
 
     client = HostControlClient(
         {"base_url": "http://hostd.invalid", "backend_token_env": "TEST_HOSTD_TOKEN"},
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
-    assert client.health()["version"] == "0.4.0"
+    assert client.health()["version"] == "0.4.1"
 
 
 def test_backend_client_reads_and_acknowledges_recovery_events_with_backend_scope(

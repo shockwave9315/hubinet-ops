@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.database import Database
+from app.host_control import HostControlError
 
 
 class FakeExecutor:
@@ -62,6 +63,121 @@ def test_event_endpoints_require_auth_and_bound_limits(tmp_path: Path, monkeypat
     assert client.get("/api/v1/containers/106/events?limit=201", headers=headers).status_code == 422
     assert client.get("/api/v1/containers/999/events", headers=headers).status_code == 404
     assert client.get("/api/v1/jobs/missing/events", headers=headers).status_code == 404
+
+
+def test_manual_rollback_endpoint_translates_controlled_failures(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "rollback-import.yaml"
+    config_path.write_text(
+        "scheduler:\n  enabled: false\ncontainers:\n  106:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "rollback-import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+    cfg = make_settings(tmp_path)
+    db = Database(cfg.db_path)
+    api = main.create_app(cfg, database=db, executor=FakeExecutor())
+
+    def fail_manual_rollback(vmid: int) -> dict[str, Any]:
+        if vmid == 106:
+            raise HostControlError("hostd unavailable")
+        if vmid == 999:
+            raise KeyError(vmid)
+        raise ValueError("rollback conflict")
+
+    monkeypatch.setattr(
+        api.state.service,
+        "manual_rollback",
+        fail_manual_rollback,
+    )
+    client = TestClient(api)
+    headers = {"Authorization": f"Bearer {cfg.api_token}"}
+
+    unavailable = client.post(
+        "/api/v1/containers/106/rollback",
+        headers=headers,
+    )
+    missing = client.post(
+        "/api/v1/containers/999/rollback",
+        headers=headers,
+    )
+    conflict = client.post(
+        "/api/v1/containers/107/rollback",
+        headers=headers,
+    )
+
+    assert unavailable.status_code == 409
+    assert unavailable.json() == {"detail": "hostd unavailable"}
+    assert unavailable.status_code != 500
+    assert db.list_jobs() == []
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "Container not found"}
+    assert conflict.status_code == 409
+    assert conflict.json() == {"detail": "rollback conflict"}
+
+
+def test_rest_api_preserves_full_diagnostic_text(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "diagnostic-import.yaml"
+    config_path.write_text(
+        "scheduler:\n  enabled: false\ncontainers:\n  106:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "diagnostic-import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+    cfg = make_settings(tmp_path)
+    db = Database(cfg.db_path)
+    api = main.create_app(cfg, database=db, executor=FakeExecutor())
+    diagnostic = "transient-" + "x" * 1990
+    state = api.state.service.get_state(106)
+    state["last_error"] = diagnostic
+    api.state.service._save_state(106, state, publish=False)
+
+    response = TestClient(api).get(
+        "/api/v1/containers/106/state",
+        headers={"Authorization": f"Bearer {cfg.api_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["last_error"] == diagnostic
+    persisted = db.get_resource_state(106)
+    assert persisted is not None
+    assert persisted["last_error"] == diagnostic
+
+
+def test_rest_api_preserves_full_dashboard_path(tmp_path: Path, monkeypatch) -> None:
+    dashboard_path = "/hubinet-ops/" + "żółw🙂" * 397
+    config_path = tmp_path / "dashboard-import.yaml"
+    config_path.write_text(
+        "scheduler:\n"
+        "  enabled: false\n"
+        "containers:\n"
+        "  106:\n"
+        "    enabled: true\n"
+        f"    dashboard_path: {dashboard_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "dashboard-import.db"))
+    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "i" * 64)
+    main = importlib.import_module("app.main")
+    cfg = make_settings(tmp_path)
+    cfg.raw["containers"][106]["dashboard_path"] = dashboard_path
+    db = Database(cfg.db_path)
+    api = main.create_app(cfg, database=db, executor=FakeExecutor())
+
+    response = TestClient(api).get(
+        "/api/v1/containers/106/state",
+        headers={"Authorization": f"Bearer {cfg.api_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["dashboard_path"] == dashboard_path
 
 
 def test_canonical_resources_include_qemu_and_container_alias_filters_it(

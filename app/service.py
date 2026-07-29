@@ -172,6 +172,7 @@ class OpsService:
             "ip_address": cfg.get("ip_address"),
             "guest_agent": bool(cfg.get("guest_agent", False)),
             "approval_mode": cfg.get("approval_mode", "always"),
+            "pre_update_snapshot": bool(cfg.get("pre_update_snapshot", False)),
             "automatic_rollback": bool(cfg.get("automatic_rollback", False)),
             "manual_rollback_allowed": bool(cfg.get("manual_rollback_allowed", False)),
             "manual_snapshot_restore_allowed": bool(
@@ -229,6 +230,38 @@ class OpsService:
             saved = self._save_state(vmid, state)
             self._observe_health(vmid, str(saved.get("health_status", "unknown")))
             return saved
+        host_runtime = "unknown"
+        host_runtime_error: str | None = None
+        if str(cfg.get("resource_type") or "lxc") == "lxc":
+            try:
+                host_status = self._host_status(vmid)
+                host_runtime = str(
+                    host_status.get("lxc_status")
+                    or host_status.get("runtime_status")
+                    or host_status.get("status")
+                    or "unknown"
+                )
+            except ValueError as exc:
+                host_runtime_error = sanitize_text(exc, limit=2000)
+                LOGGER.warning(
+                    "PVE runtime probe failed during refresh CT%s: %s",
+                    vmid,
+                    host_runtime_error,
+                )
+        executor_contract_error: str | None = None
+        if (
+            str(cfg.get("resource_type") or "lxc") == "lxc"
+            and str(cfg.get("adapter") or "apt") == "apt"
+        ):
+            try:
+                self._require_compatible_executor(vmid, publish_state=False)
+            except ExecutorError as exc:
+                executor_contract_error = sanitize_text(exc, limit=2000)
+                LOGGER.warning(
+                    "Executor compatibility probe failed during refresh CT%s: %s",
+                    vmid,
+                    executor_contract_error,
+                )
         try:
             inspected = _executor_data(self.executor.run("inspect", vmid, timeout=120))
             # Inspect may take long enough for a job to reach a terminal state.
@@ -236,31 +269,64 @@ class OpsService:
             # stale operation/plan/job fields captured before that transition.
             state = self.get_state(vmid)
             state.update(inspected)
+            if str(cfg.get("resource_type") or "lxc") == "lxc":
+                state["lxc_status"] = host_runtime
+                state["runtime_status"] = host_runtime
             state["health_status"] = inspected.get(
                 "health_status",
                 inspected.get("health", "unknown"),
             )
-            if inspected.get("runtime_status") == "running" or inspected.get("lxc_status") == "running":
+            if host_runtime == "running":
                 state["intentional_shutdown"] = False
                 state["lifecycle_health_pending"] = False
                 if state.get("lifecycle_status") != "running":
                     state["expected_lxc_status"] = None
             state["last_refresh"] = utc_now()
-            if state.get("last_operation_result") is None:
+            preserve_operation_error = self._has_terminal_operation_error(state)
+            if executor_contract_error is not None and not preserve_operation_error:
+                state["last_error"] = executor_contract_error
+            elif host_runtime_error is not None and not preserve_operation_error:
+                state["last_error"] = host_runtime_error
+            elif not preserve_operation_error:
                 state["last_error"] = None
         except ExecutorError as exc:
             state = self.get_state(vmid)
-            state.update(
-                {
-                    "health_status": "offline",
-                    "health_score": 0,
-                    "last_error": sanitize_text(exc, limit=2000),
-                    "last_refresh": utc_now(),
-                }
-            )
+            guest_error = sanitize_text(exc, limit=2000)
+            if str(cfg.get("resource_type") or "lxc") == "lxc":
+                health = (
+                    "offline"
+                    if host_runtime == "stopped"
+                    else "degraded"
+                    if host_runtime == "running"
+                    else "unknown"
+                )
+            else:
+                health = "offline"
+            state.update({"health_status": health, "health_score": 0})
+            if str(cfg.get("resource_type") or "lxc") == "lxc":
+                state["lxc_status"] = host_runtime
+                state["runtime_status"] = host_runtime
+            state["last_refresh"] = utc_now()
+            if not self._has_terminal_operation_error(state):
+                state["last_error"] = (
+                    executor_contract_error
+                    or host_runtime_error
+                    or guest_error
+                )
         saved = self._save_state(vmid, state)
         self._observe_health(vmid, str(saved.get("health_status", "unknown")))
         return saved
+
+    @staticmethod
+    def _has_terminal_operation_error(state: dict[str, Any]) -> bool:
+        """Keep errors that explain an explicitly unsuccessful operation outcome."""
+
+        return state.get("last_operation_result") in {
+            "failed",
+            "interrupted",
+            "rolled_back",
+            "manual_intervention",
+        }
 
     def refresh_all(self, *, operator: bool = False) -> list[dict[str, Any]]:
         completed = False
@@ -636,7 +702,12 @@ class OpsService:
         self._notify_ha(self._notification("job_queued", vmid))
         return {"plan": plan, "job": job}
 
-    def _require_compatible_executor(self, vmid: int) -> dict[str, Any]:
+    def _require_compatible_executor(
+        self,
+        vmid: int,
+        *,
+        publish_state: bool = True,
+    ) -> dict[str, Any]:
         cfg = self._resource(vmid)
         if cfg.get("adapter", "apt") != "apt":
             raise ExecutorError(f"Resource {vmid} does not use a managed APT executor")
@@ -656,17 +727,21 @@ class OpsService:
         state = self.get_state(vmid)
         state.update(compatibility.state_fields())
         state["executor_last_checked_at"] = self._utc_second_timestamp()
-        self._save_state(vmid, state)
         if not compatibility.compatible:
             installed = compatibility.version or "unknown"
             reasons = "; ".join(compatibility.reasons)
             if executor_error:
                 reasons = f"{executor_error}; {reasons}".strip("; ")
-            raise ExecutorError(
+            message = (
                 f"Executor CT{vmid} is incompatible: required {EXECUTOR_VERSION}/"
                 f"protocol {EXECUTOR_PROTOCOL_VERSION}/verify with configured hashes; "
                 f"installed {installed}. {reasons}"
             )
+            state["executor_contract_error"] = message
+            self._save_state(vmid, state, publish=publish_state)
+            raise ExecutorError(message)
+        state["executor_contract_error"] = None
+        self._save_state(vmid, state, publish=publish_state)
         return payload
 
     def retry_healthcheck(self, vmid: int) -> dict[str, Any]:
@@ -768,9 +843,9 @@ class OpsService:
         if not lock.acquire(blocking=False):
             raise ValueError("Another scan or manual operation is active for this resource")
         try:
-            self._require_compatible_executor(vmid)
             if not bool(cfg.get("manual_rollback_allowed", False)):
                 raise ValueError("Manual rollback is not allowed by resource policy")
+            host_control = self._require_host_control("Manual rollback")
             if self.db.get_active_job(vmid) is not None:
                 raise ValueError("Another job is already active for this resource")
             source = self.db.get_latest_job(vmid)
@@ -778,9 +853,37 @@ class OpsService:
                 raise ValueError("No rollback snapshot is available")
             if source["status"] not in {"failed", "blocked", "interrupted"}:
                 raise ValueError("Rollback is only allowed after a failed operation")
+            snapshot_name = str(source["snapshot_name"])
+            selected = next(
+                (
+                    item
+                    for item in host_control.list_snapshots(vmid)
+                    if str(item.get("name") or "") == snapshot_name
+                ),
+                None,
+            )
+            if (
+                selected is None
+                or selected.get("owned_by_hubinet_ops") is not True
+                or selected.get("rollback_eligible") is not True
+                or parse_owned_snapshot_name(snapshot_name, vmid=vmid) is None
+            ):
+                raise ValueError(
+                    "Recorded rollback snapshot is missing, foreign, or ineligible"
+                )
+            host_status = self._host_status(vmid)
+            runtime = str(
+                host_status.get("lxc_status")
+                or host_status.get("runtime_status")
+                or "unknown"
+            )
+            if runtime not in {"running", "stopped"}:
+                raise ValueError(
+                    f"Cannot establish PVE runtime before rollback: {runtime}"
+                )
             job = self.db.create_manual_rollback_job(source["id"])
             self.db.update_job(job["id"], status="running", stage="rollback", progress=1)
-            self._rollback(job, str(source.get("error") or "Manual rollback requested"))
+            self._run_operation_job(job)
             return self.db.get_job(job["id"])
         finally:
             lock.release()
@@ -818,10 +921,7 @@ class OpsService:
         if cfg.get("resource_type") != "lxc":
             raise ValueError("Lifecycle is supported only for LXC resources")
         self._require_capability(vmid, capability)
-        if cfg.get("adapter") == "apt":
-            self._require_compatible_executor(vmid)
-        elif vmid != 110 or self.host_control is None:
-            raise ValueError("CT110 lifecycle requires independent PVE host control")
+        self._require_host_control("Lifecycle")
         if self.db.find_active_plan(vmid) is not None and action != "start":
             raise ValueError("Resolve the active update plan before lifecycle control")
         status = self._host_status(vmid)
@@ -844,16 +944,8 @@ class OpsService:
         if cfg.get("resource_type") != "lxc":
             raise ValueError("Snapshots are supported only for LXC resources")
         self._require_capability(vmid, "snapshot_list")
-        if self.host_control is not None:
-            snapshots = self.host_control.list_snapshots(vmid)
-        elif cfg.get("adapter") == "apt":
-            snapshots = list(
-                _executor_data(self.executor.run("list-snapshots", vmid, timeout=60)).get(
-                    "snapshots", []
-                )
-            )
-        else:
-            raise ValueError("CT110 snapshots require independent PVE host control")
+        host_control = self._require_host_control("Snapshot listing")
+        snapshots = host_control.list_snapshots(vmid)
         snapshots = [
             dict(item) for item in snapshots
             if isinstance(item, dict)
@@ -892,13 +984,12 @@ class OpsService:
         request_id: str | None = None,
     ) -> dict[str, Any]:
         cfg = self._resource(vmid)
+        if cfg.get("resource_type") != "lxc":
+            raise ValueError("Snapshots are supported only for LXC resources")
         self._require_capability(vmid, "snapshot_create")
-        if cfg.get("adapter") == "apt":
-            self._require_compatible_executor(vmid)
-        elif vmid != 110 or self.host_control is None:
-            raise ValueError("CT110 snapshots require independent PVE host control")
+        self._require_host_control("Snapshot creation")
         stamp = self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
-        name = f"hubinet-ops-{vmid}-manual-{stamp}"
+        name = _snapshot_name(vmid, "manual", stamp)
         job, _ = self.db.create_operation_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"ct-{vmid}")),
@@ -939,7 +1030,10 @@ class OpsService:
             raise ValueError("Unsupported snapshot action")
         capability = "snapshot_rollback" if action == "rollback" else "snapshot_delete"
         cfg = self._resource(vmid)
+        if cfg.get("resource_type") != "lxc":
+            raise ValueError("Snapshots are supported only for LXC resources")
         self._require_capability(vmid, capability)
+        self._require_host_control("Snapshot operation")
         if action == "rollback" and not bool(
             cfg.get("manual_snapshot_restore_allowed", False)
         ):
@@ -957,10 +1051,6 @@ class OpsService:
             raise ValueError("Resolve the active update plan before snapshot restore")
         if not bool(selected.get(f"{action}_eligible")):
             raise ValueError(f"Snapshot is not {action} eligible")
-        if cfg.get("adapter") == "apt":
-            self._require_compatible_executor(vmid)
-        elif vmid != 110 or self.host_control is None:
-            raise ValueError("CT110 snapshots require independent PVE host control")
         job, _ = self.db.create_operation_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"ct-{vmid}")),
@@ -1104,6 +1194,13 @@ class OpsService:
             }
         )
         self._save_state(vmid, state)
+
+    def _require_host_control(self, operation: str) -> HostControlClient:
+        if self.host_control is None:
+            raise ValueError(
+                f"{operation} requires independent PVE host control"
+            )
+        return self.host_control
 
     def _host_status(self, vmid: int) -> dict[str, Any]:
         try:
@@ -1634,9 +1731,11 @@ class OpsService:
         cfg = self._resource(vmid)
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         auto_rollback = bool(cfg.get("automatic_rollback", False))
-        snapshot = (
-            f"hubinet-ops-{vmid}-pre-update-"
-            f"{self._now().astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}"
+        pre_update_snapshot = bool(cfg.get("pre_update_snapshot", False))
+        snapshot = _snapshot_name(
+            vmid,
+            "pre-update",
+            self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ"),
         )
         emit = self._emitter(job)
         emit(
@@ -1678,13 +1777,13 @@ class OpsService:
                     "pending_count": preflight_updates.get("pending_count")
                 },
             )
-            if auto_rollback:
+            if pre_update_snapshot:
                 self.db.update_job(job["id"], snapshot_name=snapshot)
                 emit(
                     stage="snapshot",
                     progress=20,
                     event_type="snapshot_started",
-                    message="Creating rollback snapshot",
+                    message="Creating rollback snapshot" if auto_rollback else "Creating pre-update safety snapshot",
                 )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
                 self._enforce_snapshot_retention(vmid, job)
@@ -1692,7 +1791,7 @@ class OpsService:
                     stage="snapshot",
                     progress=25,
                     event_type="snapshot_created",
-                    message="Rollback snapshot created",
+                    message="Rollback snapshot created" if auto_rollback else "Pre-update safety snapshot created",
                 )
             emit(
                 stage="updating",
@@ -1835,7 +1934,7 @@ class OpsService:
                     "active_job_id": job["id"],
                     "last_update": utc_now(),
                     "last_error": None,
-                    "snapshot_name": snapshot if auto_rollback else None,
+                    "snapshot_name": snapshot if pre_update_snapshot else None,
                     "verification_status": verification_status,
                     "last_verification": self._now().isoformat(),
                     "apt_check_ok": bool(verification_data.get("apt_check_ok", False)),
@@ -1995,6 +2094,22 @@ class OpsService:
                     job["id"],
                     exc,
                 )
+            if (
+                operation_type == "snapshot_rollback"
+                and str(self._resource(vmid).get("adapter") or "apt") == "apt"
+            ):
+                try:
+                    self._require_compatible_executor(vmid)
+                except ExecutorError as exc:
+                    # A restored snapshot may legitimately predate the managed
+                    # executor. Hostd already completed the rollback; record the
+                    # drift without rewriting the successful destructive outcome.
+                    LOGGER.warning(
+                        "Executor drift detected after successful snapshot rollback "
+                        "for CT%s: %s",
+                        vmid,
+                        exc,
+                    )
         elif operation_type == "retry_healthcheck":
             state.update(result)
             state["health_status"] = result.get(
@@ -2062,42 +2177,20 @@ class OpsService:
         operation_type = str(job["operation_type"])
         vmid = int(job["vmid"])
         snapshot_name = job.get("snapshot_name")
-        if self.host_control is not None:
-            if operation_type == "self_update":
-                release = self._validate_self_update_plan(job)
-                return self.host_control.execute(
-                    operation_type,
-                    vmid,
-                    str(job["request_id"]),
-                    release_fingerprint=str(release["fingerprint"]),
-                )
-            return self.host_control.execute(
+        host_control = self._require_host_control("Host operation")
+        if operation_type == "self_update":
+            release = self._validate_self_update_plan(job)
+            return host_control.execute(
                 operation_type,
                 vmid,
                 str(job["request_id"]),
-                snapshot_name=str(snapshot_name) if snapshot_name else None,
+                release_fingerprint=str(release["fingerprint"]),
             )
-        cfg = self._resource(vmid)
-        if cfg.get("adapter") != "apt":
-            raise ValueError("Independent PVE host control is required")
-        action = {
-            "lifecycle_start": "start",
-            "lifecycle_shutdown": "shutdown",
-            "lifecycle_reboot": "reboot",
-            "lifecycle_force_stop": "force-stop",
-            "snapshot_create": "snapshot-create",
-            "snapshot_rollback": "snapshot-rollback",
-            "snapshot_delete": "snapshot-delete",
-        }.get(operation_type)
-        if action is None:
-            raise ValueError("Operation requires independent PVE host control")
-        return _executor_data(
-            self.executor.run(
-                action,
-                vmid,
-                str(snapshot_name) if snapshot_name else None,
-                timeout=1800,
-            )
+        return host_control.execute(
+            operation_type,
+            vmid,
+            str(job["request_id"]),
+            snapshot_name=str(snapshot_name) if snapshot_name else None,
         )
 
     def _approved_self_update_release(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -2118,9 +2211,9 @@ class OpsService:
         if self.host_control is not None:
             return self.host_control.list_snapshots(vmid)
         return list(
-            _executor_data(self.executor.run("list-snapshots", vmid, timeout=60)).get(
-                "snapshots", []
-            )
+            _executor_data(
+                self.executor.run("list-snapshots", vmid, timeout=60)
+            ).get("snapshots", [])
         )
 
     def _enforce_snapshot_retention(self, vmid: int, job: dict[str, Any]) -> None:
@@ -2533,7 +2626,13 @@ class OpsService:
             on_event=on_event,
         )
 
-    def _save_state(self, vmid: int, state: dict[str, Any]) -> dict[str, Any]:
+    def _save_state(
+        self,
+        vmid: int,
+        state: dict[str, Any],
+        *,
+        publish: bool = True,
+    ) -> dict[str, Any]:
         state = normalize_state(self._decorate_state(vmid, state))
         events = self.db.list_container_events(vmid, 50)
         state["recent_job_events"] = events
@@ -2558,7 +2657,8 @@ class OpsService:
         )
         state["docker"] = docker
         saved = self.db.upsert_resource_state(vmid, state)
-        self.mqtt.publish_resource_state(vmid, saved)
+        if publish:
+            self.mqtt.publish_resource_state(vmid, saved)
         self._publish_agent_state_if_changed()
         return saved
 
@@ -2894,6 +2994,16 @@ def _executor_data(result: Any) -> dict[str, Any]:
         return {}
     data = result.get("data")
     return dict(data) if isinstance(data, dict) else {}
+
+
+def _snapshot_name(vmid: int, kind: str, stamp: str) -> str:
+    physical_kind = "pre" if kind == "pre-update" else "manual"
+    name = f"hubinet-ops-{int(vmid)}-{physical_kind}-{stamp}"
+    if len(name) > 40 and physical_kind == "manual":
+        name = f"hubinet-ops-{int(vmid)}-man-{stamp}"
+    if len(name) > 40:
+        raise ValueError("Generated snapshot name exceeds the PVE 40 character limit")
+    return name
 
 
 def _fingerprint(data: dict[str, Any]) -> str:

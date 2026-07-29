@@ -79,7 +79,7 @@ class WorkflowExecutor:
             return {
                 "ok": True,
                 "data": {
-                    "version": "0.4.0",
+                    "version": "0.4.1",
                     "protocol_version": 1,
                     "supported_actions": sorted(REQUIRED_APT_ACTIONS),
                     "executor_sha256": EXECUTOR_HASH,
@@ -153,8 +153,8 @@ def settings(
                     "name": "weather",
                     "enabled": True,
                     "adapter": "apt",
-                    "criticality": "low",
                     "automatic_rollback": True,
+                    "pre_update_snapshot": True,
                     "manual_rollback_allowed": True,
                     "executor_contract": {
                         "executor_sha256": EXECUTOR_HASH,
@@ -238,7 +238,7 @@ def test_observation_only_monitoring_is_independent_from_operator_policy(
 
     assert refreshed["health_status"] == "healthy"
     assert scanned["status"] == "up_to_date"
-    assert executor.actions == ["inspect", "scan"]
+    assert executor.actions == ["status", "capabilities", "inspect", "scan"]
     assert db.find_active_plan(101) is None
     with pytest.raises(ValueError, match="refresh.*blocked"):
         service.refresh_container(101, operator=True)
@@ -348,6 +348,16 @@ def test_agent_self_state_adds_inventory_jobs_and_mqtt_without_secrets(
         db_path=tmp_path / "self.db",
         api_token="t" * 64,
     )
+    vm100_executor = WorkflowExecutor(
+        [{"qemu_status": "running", "health_status": "healthy"}]
+    )
+    vm100_service = OpsService(
+        cfg,
+        Database(cfg.db_path),
+        vm100_executor,
+    )
+    assert vm100_service.refresh_container(100)["health_status"] == "healthy"
+    assert vm100_executor.actions == ["inspect"]
     executor = WorkflowExecutor(
         [
             {
@@ -363,6 +373,7 @@ def test_agent_self_state_adds_inventory_jobs_and_mqtt_without_secrets(
 
     state = service.refresh_container(110)
 
+    assert executor.actions == ["status", "inspect"]
     assert state["configured_resource_count"] == 2
     assert state["configured_lxc_count"] == 1
     assert state["configured_qemu_count"] == 1
@@ -378,6 +389,7 @@ def service_with(
     repair: bool = True,
     post_update_timeout: int = 1,
     database: Database | None = None,
+    host_control: Any = None,
 ) -> tuple[OpsService, Database]:
     cfg = settings(tmp_path, repair=repair, post_update_timeout=post_update_timeout)
     db = database or Database(cfg.db_path)
@@ -388,9 +400,64 @@ def service_with(
         monotonic=clock.monotonic,
         sleep=clock.sleep,
     )
-    service = OpsService(cfg, db, executor, stabilizer=stabilizer)  # type: ignore[arg-type]
+    service = OpsService(
+        cfg,
+        db,
+        executor,
+        stabilizer=stabilizer,
+        host_control=host_control,
+    )  # type: ignore[arg-type]
     service._ensure_initial_states()
     return service, db
+
+
+def test_refresh_probes_and_persists_compatible_executor_contract(
+    tmp_path: Path,
+) -> None:
+    executor = WorkflowExecutor([docker_state(3)])
+    service, _ = service_with(tmp_path, executor)
+
+    state = service.refresh_container(106)
+
+    assert executor.actions[:3] == ["status", "capabilities", "inspect"]
+    assert state["executor_compatible"] is True
+    assert state["executor_version"] == "0.4.1"
+    assert state["executor_protocol_version"] == 1
+    assert state["executor_sha256"] == EXECUTOR_HASH
+    assert state["executor_profile_sha256"] == PROFILE_HASH
+    assert state["profile_validation_status"] == "valid"
+    assert state["health_status"] == "healthy"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("version", "0.4.0", "version 0.4.0 != 0.4.1"),
+        ("executor_sha256", "c" * 64, "executor sha256 mismatch"),
+    ],
+)
+def test_refresh_keeps_inspect_when_executor_contract_is_incompatible(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    class IncompatibleExecutor(WorkflowExecutor):
+        def run(self, action: str, vmid: int, **kwargs: Any) -> dict[str, Any]:
+            result = super().run(action, vmid, **kwargs)
+            if action == "capabilities":
+                result["data"][field] = value
+            return result
+
+    executor = IncompatibleExecutor([docker_state(3)])
+    service, _ = service_with(tmp_path, executor)
+
+    state = service.refresh_container(106)
+
+    assert executor.actions[:3] == ["status", "capabilities", "inspect"]
+    assert state["executor_compatible"] is False
+    assert state["health_status"] == "healthy"
+    assert message in state["last_error"]
 
 
 def approved_job(service: OpsService, db: Database) -> dict[str, Any]:
@@ -472,7 +539,7 @@ def test_executor_data_null_is_safe_across_refresh_scan_and_lifecycle(
 
     assert service.refresh_container(106)["health_status"] == "unknown"
     assert service.scan_container(106)["status"] == "up_to_date"
-    with pytest.raises(ValueError, match="expected running, got unknown"):
+    with pytest.raises(ValueError, match="requires a running container.*unknown"):
         service.lifecycle_container(106, "reboot")
 
     class NullInitialStatusExecutor(WorkflowExecutor):
@@ -597,7 +664,15 @@ def test_update_0_2_3_3_succeeds_without_repair_or_rollback(tmp_path: Path) -> N
     assert result["status"] == "success"
     assert "repair" not in executor.actions
     assert "rollback" not in executor.actions
-    assert service.get_state(106)["update_status"] == "up_to_date"
+    state = service.get_state(106)
+    assert state["operation_status"] == "success"
+    assert state["job_stage"] == "completed"
+    assert state["last_operation_result"] == "success"
+    assert state["update_status"] == "up_to_date"
+    assert state["pending_updates"] == 0
+    assert state["verification_status"] == "passed"
+    assert state["snapshot_name"].startswith("hubinet-ops-106-pre-")
+    assert len(state["snapshot_name"]) <= 40
 
 
 def test_timeout_invokes_repair_and_repair_success_prevents_rollback(
@@ -790,8 +865,41 @@ def test_interrupted_job_is_reconciled_into_container_state(tmp_path: Path) -> N
 
 
 def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> None:
+    snapshot = "hubinet-ops-106-pre-20260724T180227Z"
+
+    class RollbackHost:
+        def status(self, vmid: int) -> dict[str, Any]:
+            return {"lxc_status": "running", "runtime_status": "running"}
+
+        def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": snapshot,
+                    "owned_by_hubinet_ops": True,
+                    "rollback_eligible": True,
+                    "delete_eligible": True,
+                }
+            ]
+
+        def execute(
+            self,
+            operation_type: str,
+            vmid: int,
+            request_id: str,
+            *,
+            snapshot_name: str | None = None,
+            release_fingerprint: str | None = None,
+        ) -> dict[str, Any]:
+            assert operation_type == "snapshot_rollback"
+            assert snapshot_name == snapshot
+            return {"lxc_status": "running", "runtime_status": "running"}
+
     executor = WorkflowExecutor([docker_state(0), docker_state(3), docker_state(3)])
-    service, db = service_with(tmp_path, executor)
+    service, db = service_with(
+        tmp_path,
+        executor,
+        host_control=RollbackHost(),
+    )
     plan = db.create_plan(
         vmid=106,
         container_name="weather",
@@ -806,11 +914,12 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
         status="failed",
         stage="failed",
         progress=100,
-        snapshot_name="snap-safe",
+        snapshot_name=snapshot,
     )
     result = service.manual_rollback(106)
-    assert result["status"] == "rolled_back"
-    assert "rollback" in executor.actions
+    assert result["status"] == "success"
+    assert "rollback" not in executor.actions
+    assert "capabilities" in executor.actions
 
     service.settings.raw["containers"][106]["manual_rollback_allowed"] = False
     with pytest.raises(ValueError, match="not allowed"):

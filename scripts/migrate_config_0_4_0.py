@@ -27,8 +27,10 @@ def capabilities(enabled: set[str]) -> dict[str, bool]:
     return {name: name in enabled for name in CAPABILITY_KEYS}
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Migrate an existing Hubinet Ops config to 0.4.0")
+def main(target_version: str = "0.4.0") -> int:
+    parser = argparse.ArgumentParser(
+        description=f"Migrate an existing Hubinet Ops config to {target_version}"
+    )
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--host-control-url", required=True)
@@ -41,7 +43,9 @@ def main() -> int:
         raise SystemExit("Agent configuration has no resources inventory")
     normalized = {int(vmid): cfg for vmid, cfg in resources.items()}
     if set(normalized) != set(range(100, 111)):
-        raise SystemExit("0.4.0 migration requires the unchanged inventory VMID 100-110")
+        raise SystemExit(
+            f"{target_version} migration requires the unchanged inventory VMID 100-110"
+        )
 
     full = set(CAPABILITY_KEYS) - {"self_update"}
     for vmid, cfg in normalized.items():
@@ -49,8 +53,11 @@ def main() -> int:
             raise SystemExit(f"VMID {vmid} configuration must be an object")
         if vmid == 100:
             cfg["operator_capabilities"] = capabilities(set())
+            cfg["pre_update_snapshot"] = False
         elif vmid <= 109:
             cfg["operator_capabilities"] = capabilities(full)
+            cfg["manual_rollback_allowed"] = True
+            cfg["pre_update_snapshot"] = True
             cfg["executor_contract"] = {
                 "executor_sha256": digest(EXECUTOR),
                 "profile_sha256": digest(PROFILES / f"ct{vmid}.json"),
@@ -63,6 +70,7 @@ def main() -> int:
                  "snapshot_delete", "self_update"}
             )
             cfg.setdefault("snapshot_retention", 5)
+            cfg["pre_update_snapshot"] = False
             cfg["manual_rollback_allowed"] = False
         cfg["manual_snapshot_restore_allowed"] = vmid != 100
     raw.pop("containers", None)

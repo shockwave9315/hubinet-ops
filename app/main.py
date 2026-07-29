@@ -307,7 +307,7 @@ def create_app(
             return service.manual_rollback(vmid)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Container not found") from exc
-        except ValueError as exc:
+        except (ValueError, HostControlError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @api.get("/api/v1/plans", dependencies=auth)

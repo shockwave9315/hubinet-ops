@@ -92,7 +92,14 @@ class FakeExecutor:
     ) -> dict[str, Any]:
         self.actions.append((action, vmid, argument))
         if action == "status":
-            status = self.statuses.pop(0)
+            if self.statuses:
+                status = self.statuses.pop(0)
+            else:
+                pending = self.inspect_states.get(vmid) or []
+                status = str(
+                    (pending[0] if pending else {}).get("lxc_status")
+                    or "running"
+                )
             return {
                 "ok": True,
                 "data": {"status": status, "lxc_status": status},
@@ -106,7 +113,7 @@ class FakeExecutor:
             return {
                 "ok": True,
                 "data": {
-                    "version": "0.4.0",
+                    "version": "0.4.1",
                     "protocol_version": 1,
                     "supported_actions": [
                         "capabilities",
@@ -225,7 +232,7 @@ def test_intentional_shutdown_clears_after_running_telemetry_and_later_offline_i
             return super().run(action, vmid, argument, timeout, on_event)
 
     executor = InspectExecutor()
-    executor.statuses = ["running", "stopped"]
+    executor.statuses = ["running", "stopped", "running", "stopped"]
     executor.inspect_states[106] = [healthy()]
     service, _ = make_service(tmp_path, executor)
 
@@ -327,7 +334,19 @@ def test_api_requires_auth_denies_ct101_and_never_executes_invalid_vmid(
     executor.statuses = ["stopped", "running"]
     cfg = settings(tmp_path)
     db = Database(cfg.db_path)
-    client = TestClient(main.create_app(cfg, database=db, executor=executor))
+
+    class ApiHostControl:
+        def status(self, vmid: int) -> dict[str, Any]:
+            return {"lxc_status": "stopped", "runtime_status": "stopped"}
+
+    client = TestClient(
+        main.create_app(
+            cfg,
+            database=db,
+            executor=executor,
+            host_control=ApiHostControl(),  # type: ignore[arg-type]
+        )
+    )
     headers = {"Authorization": f"Bearer {cfg.api_token}"}
 
     assert client.post("/api/v1/containers/106/start").status_code == 401

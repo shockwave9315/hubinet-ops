@@ -417,6 +417,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT101 · Cloudflared · Adapter APT · high
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct101_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct101_health_status
       primary: CT101 · Cloudflared
@@ -696,7 +705,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct101_operation_status
+          entity: sensor.hubinet_ops_ct101_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct101_capability_approve
@@ -723,7 +732,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct101_operation_status
+          entity: sensor.hubinet_ops_ct101_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct101_capability_reject
@@ -780,9 +789,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct101_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct101_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct101_active_job_id
           state: none
@@ -1065,6 +1071,11 @@ views:
         icon: mdi:shield-check-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct101_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct101_executor_version
         name: Wersja
         icon: mdi:tag-outline
@@ -1275,6 +1286,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT102 · MariaDB · Adapter APT · critical
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct102_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct102_health_status
       primary: CT102 · MariaDB
@@ -1554,7 +1574,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct102_operation_status
+          entity: sensor.hubinet_ops_ct102_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct102_capability_approve
@@ -1581,7 +1601,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct102_operation_status
+          entity: sensor.hubinet_ops_ct102_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct102_capability_reject
@@ -1638,9 +1658,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct102_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct102_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct102_active_job_id
           state: none
@@ -1923,6 +1940,11 @@ views:
         icon: mdi:shield-check-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct102_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct102_executor_version
         name: Wersja
         icon: mdi:tag-outline
@@ -2133,6 +2155,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT103 · MQTT · Adapter APT · critical
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct103_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct103_health_status
       primary: CT103 · MQTT
@@ -2412,7 +2443,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct103_operation_status
+          entity: sensor.hubinet_ops_ct103_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct103_capability_approve
@@ -2439,7 +2470,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct103_operation_status
+          entity: sensor.hubinet_ops_ct103_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct103_capability_reject
@@ -2496,9 +2527,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct103_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct103_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct103_active_job_id
           state: none
@@ -2781,6 +2809,11 @@ views:
         icon: mdi:shield-check-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct103_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct103_executor_version
         name: Wersja
         icon: mdi:tag-outline
@@ -2991,6 +3024,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT104 · Nextcloud · Adapter APT · critical
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct104_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct104_health_status
       primary: CT104 · Nextcloud
@@ -3270,7 +3312,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct104_operation_status
+          entity: sensor.hubinet_ops_ct104_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct104_capability_approve
@@ -3297,7 +3339,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct104_operation_status
+          entity: sensor.hubinet_ops_ct104_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct104_capability_reject
@@ -3354,9 +3396,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct104_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct104_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct104_active_job_id
           state: none
@@ -3639,6 +3678,11 @@ views:
         icon: mdi:shield-check-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct104_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct104_executor_version
         name: Wersja
         icon: mdi:tag-outline
@@ -3849,6 +3893,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT105 · AdGuard Home · Adapter APT · critical
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct105_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct105_health_status
       primary: CT105 · AdGuard Home
@@ -4128,7 +4181,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct105_operation_status
+          entity: sensor.hubinet_ops_ct105_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct105_capability_approve
@@ -4155,7 +4208,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct105_operation_status
+          entity: sensor.hubinet_ops_ct105_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct105_capability_reject
@@ -4212,9 +4265,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct105_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct105_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct105_active_job_id
           state: none
@@ -4497,6 +4547,11 @@ views:
         icon: mdi:shield-check-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct105_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct105_executor_version
         name: Wersja
         icon: mdi:tag-outline
@@ -4707,6 +4762,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT106 · WeatherHub · Adapter APT · low
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct106_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct106_health_status
       primary: CT106 · WeatherHub
@@ -4986,7 +5050,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct106_operation_status
+          entity: sensor.hubinet_ops_ct106_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct106_capability_approve
@@ -5013,7 +5077,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct106_operation_status
+          entity: sensor.hubinet_ops_ct106_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct106_capability_reject
@@ -5070,9 +5134,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct106_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct106_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct106_active_job_id
           state: none
@@ -5355,6 +5416,11 @@ views:
         icon: mdi:shield-check-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct106_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct106_executor_version
         name: Wersja
         icon: mdi:tag-outline
@@ -5584,6 +5650,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT107 · Immich · Adapter APT · high
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct107_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct107_health_status
       primary: CT107 · Immich
@@ -5863,7 +5938,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct107_operation_status
+          entity: sensor.hubinet_ops_ct107_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct107_capability_approve
@@ -5890,7 +5965,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct107_operation_status
+          entity: sensor.hubinet_ops_ct107_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct107_capability_reject
@@ -5947,9 +6022,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct107_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct107_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct107_active_job_id
           state: none
@@ -6232,6 +6304,11 @@ views:
         icon: mdi:shield-check-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct107_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct107_executor_version
         name: Wersja
         icon: mdi:tag-outline
@@ -6442,6 +6519,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT108 · DDNS · Adapter APT · medium
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct108_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct108_health_status
       primary: CT108 · DDNS
@@ -6721,7 +6807,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct108_operation_status
+          entity: sensor.hubinet_ops_ct108_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct108_capability_approve
@@ -6748,7 +6834,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct108_operation_status
+          entity: sensor.hubinet_ops_ct108_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct108_capability_reject
@@ -6805,9 +6891,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct108_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct108_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct108_active_job_id
           state: none
@@ -7090,6 +7173,11 @@ views:
         icon: mdi:shield-check-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct108_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct108_executor_version
         name: Wersja
         icon: mdi:tag-outline
@@ -7300,6 +7388,15 @@ views:
     - type: custom:mushroom-title-card
       title: Status
       subtitle: CT109 · Pompa · Adapter APT · critical
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct109_profile_validation_status
+        state: insufficient_health_contract
+      card:
+        type: markdown
+        content: ⚠️ **Brak pełnego kontraktu zdrowia aplikacji.** Zautomatyzowane sprawdzanie zdrowia bada jedynie stan systemu,
+          nie aplikację. Automatyczny rollback w przypadku awarii usług jest wyłączony.
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_ct109_health_status
       primary: CT109 · Pompa
@@ -7579,7 +7676,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct109_operation_status
+          entity: sensor.hubinet_ops_ct109_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct109_capability_approve
@@ -7606,7 +7703,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct109_operation_status
+          entity: sensor.hubinet_ops_ct109_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct109_capability_reject
@@ -7663,9 +7760,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct109_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct109_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct109_active_job_id
           state: none
@@ -7946,6 +8040,11 @@ views:
         entity: sensor.hubinet_ops_ct109_executor_compatible
         name: Zgodność
         icon: mdi:shield-check-outline
+        icon_color: blue
+      - type: custom:mushroom-entity-card
+        entity: sensor.hubinet_ops_ct109_profile_validation_status
+        name: Kontrakt
+        icon: mdi:file-certificate-outline
         icon_color: blue
       - type: custom:mushroom-entity-card
         entity: sensor.hubinet_ops_ct109_executor_version
@@ -8414,7 +8513,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct110_operation_status
+          entity: sensor.hubinet_ops_ct110_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct110_capability_approve
@@ -8441,7 +8540,7 @@ views:
       - type: conditional
         conditions:
         - condition: state
-          entity: sensor.hubinet_ops_ct110_operation_status
+          entity: sensor.hubinet_ops_ct110_active_plan_status
           state: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct110_capability_reject
@@ -8470,9 +8569,6 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct110_capability_snapshot_create
           state: allowed
-        - condition: state
-          entity: sensor.hubinet_ops_ct110_operation_status
-          state_not: waiting_approval
         - condition: state
           entity: sensor.hubinet_ops_ct110_active_job_id
           state: none

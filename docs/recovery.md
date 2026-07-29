@@ -7,12 +7,17 @@
 3. Check whether the latest events show initial grace, Docker unavailable, container counts, repair, rollback wait, or rollback timeout.
 4. Use the dashboard `Refresh` action. It performs inspect only and cannot approve or update.
 5. Use `Retry healthcheck` only after services have had time to recover. It creates an idempotent durable `retry_healthcheck` job with its own events.
-6. Manual update rollback is allowed only after a failed/blocked/interrupted update job with its recorded snapshot and `manual_rollback_allowed`.
+6. Automatic rollback requires an existing snapshot and the per-container `automatic_rollback` policy. A missing or insufficient healthcheck contract will block automatic rollback and leave the job failed.
+7. Manual update rollback is allowed only after a failed/blocked/interrupted update job with its recorded snapshot and `manual_rollback_allowed`.
 7. Normal explicit snapshot restore goes through the backend and uses only a listed rollback-eligible Hubinet-owned snapshot. The backend atomically rechecks policy, capability, ownership, waiting/approved plans, and global active work while inserting the local job; PVE independently enforces `snapshot-restore-vmids`.
 
 An agent restart reattaches hostd-backed lifecycle, snapshot, and self-update work through authenticated read-only lookup by VMID/request ID, validates the operation and argument, and polls the same durable host job. If the host job is missing or mismatched, the backend marks the local outcome interrupted/unknown and never submits a replacement. Locally executed work still uses read-only observation and is interrupted when completion cannot be proven. Host jobs remain in hostd's independent SQLite store while CT110 is offline.
 
 After rollback, current verification and remaining-package fields are cleared to unknown/null rather than presenting pre-rollback success. The failed verification remains in job events. A recovery scan may create a new plan with a new ID and fingerprint; the rolled-back plan is never reused.
+
+After a successful hostd snapshot rollback the backend performs a best-effort executor contract probe. A snapshot may predate `hubinet-maint`; missing or stale executor files are recorded as drift while the rollback remains successful. LXC runtime continues to come from PVE, and scan/update remain blocked until the managed executor is restored.
+
+PVE limits snapshot names to 40 characters. New automatic update snapshots use `hubinet-ops-<vmid>-pre-<UTC timestamp>` and are reported with logical kind `pre-update`. Existing `hubinet-ops-<vmid>-pre-update-<UTC timestamp>` snapshots remain owned and eligible. Normal manual names use `manual`; the generator uses the compact `man` physical alias only when required for a six-digit VMID, and the parser reports logical kind `manual`.
 
 If CT110 is stopped and its backend cannot answer, the separately labeled offline restore is the only snapshot break-glass path. It requires the dedicated recovery token, exact confirmation, stopped runtime, no active hostd job, and an owned rollback-eligible snapshot. It is never selected automatically after a backend error.
 

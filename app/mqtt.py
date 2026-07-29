@@ -20,7 +20,7 @@ from .security import sanitize_data, sanitize_text
 from .mqtt_budget import bounded_attributes, bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,7 @@ class MqttTelemetry:
         self._client_factory = client_factory
         self._client: Any = None
         # Two complete discovery passes must fit during reconnect without
-        # evicting retained cleanup messages as the 0.4.0 entity contract grows.
+        # evicting retained cleanup messages as the 0.4.x entity contract grows.
         self._queue: queue.Queue[PublishItem | None] = queue.Queue(maxsize=2000)
         self._cache: dict[str, str] = {}
         self._connected = threading.Event()
@@ -272,17 +272,6 @@ class MqttTelemetry:
                     extra=dict(spec.extra),
                     force=force,
                 )
-            self._discovery_sensor(
-                object_id=f"hubinet_ops_{prefix}{vmid}_dashboard_path",
-                unique_id=f"hubinet_ops_{prefix}_{vmid}_dashboard_path",
-                default_entity_id=f"sensor.hubinet_ops_{resource_prefix(vmid, cfg)}_dashboard_path",
-                name="Dashboard path",
-                state_topic=state_topic,
-                value_template="{{ value_json.dashboard_path }}",
-                availability_topic=availability,
-                device=device,
-                force=force,
-            )
             for key in obsolete_discovery_keys(cfg):
                 self._publish_raw(
                     f"{self.discovery_prefix}/sensor/hubinet_ops_{prefix}{vmid}_{key}/config",

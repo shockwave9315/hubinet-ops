@@ -21,8 +21,14 @@ jobs:
         run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Compile agent
         run: python -m compileall app
+      - name: Verify deployment smoke sandbox support
+        run: |
+          docker version
+          docker info --format '{{json .SecurityOptions}}'
       - name: Test
         shell: bash
+        env:
+          HUBINET_OPS_EPHEMERAL_CI: "1"
         run: |
           set -o pipefail
           PYTHONPATH="$GITHUB_WORKSPACE" python -m pytest -q --tb=short 2>&1 | tee pytest.log
