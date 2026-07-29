@@ -66,6 +66,51 @@ def test_host_control_client_bounds_response_contract_and_never_accepts_command_
         client.execute("pct_exec", 106, "request-12345678")
 
 
+@pytest.mark.parametrize(
+    ("operation_type", "include_ram"),
+    [("snapshot_create", False), ("snapshot_create_ram", True)],
+)
+def test_host_control_client_sends_typed_qemu_include_ram(
+    monkeypatch: pytest.MonkeyPatch,
+    operation_type: str,
+    include_ram: bool,
+) -> None:
+    monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "POST":
+            assert json.loads(request.content) == {
+                "request_id": "vm100-snapshot-request",
+                "name": "hubinet-ops-100-manual-20260729T120000Z",
+                "include_ram": include_ram,
+            }
+            return httpx.Response(202, json={"id": "job1", "status": "queued"})
+        return httpx.Response(
+            200,
+            json={"id": "job1", "status": "succeeded", "result": {}},
+        )
+
+    client = HostControlClient(
+        {
+            "base_url": "http://hostd.invalid",
+            "backend_token_env": "TEST_HOSTD_TOKEN",
+            "poll_interval_seconds": 0.001,
+        },
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _seconds: None,
+    )
+
+    client.execute(
+        operation_type,
+        100,
+        "vm100-snapshot-request",
+        snapshot_name="hubinet-ops-100-manual-20260729T120000Z",
+    )
+    assert requests[0].url.path == "/api/v1/resources/100/snapshots"
+
+
 def test_host_control_health_is_the_only_unauthenticated_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

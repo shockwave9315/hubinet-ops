@@ -26,6 +26,12 @@ recorder:
       - sensor.hubinet_ops_ct109_job_progress
       - sensor.hubinet_ops_ct110_job_progress
 
+input_boolean:
+  hubinet_ops_vm100_snapshot_include_ram:
+    name: Dołącz stan RAM
+    icon: mdi:memory
+    initial: false
+
 rest_command:
   hubinet_ops_scan_container:
     url: !secret hubinet_ops_scan_url
@@ -117,7 +123,7 @@ rest_command:
     method: POST
     headers: *hubinet_auth_headers
     payload: >-
-      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-create"}
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-create","include_ram":{{ include_ram | default(false) | bool | lower }}}
     timeout: 30
 
   hubinet_ops_snapshot_restore:
@@ -269,10 +275,16 @@ script:
     alias: "Hubinet Ops — utwórz snapshot"
     mode: single
     fields: *lifecycle_vmid_field
+    variables:
+      include_ram: >-
+        {{ is_state('input_boolean.hubinet_ops_vm100_snapshot_include_ram', 'on')
+           if (vmid | int) == 100 else false }}
     sequence:
       - continue_on_error: true
         action: rest_command.hubinet_ops_snapshot_create
-        data: {vmid: "{{ vmid | int }}"}
+        data:
+          vmid: "{{ vmid | int }}"
+          include_ram: "{{ include_ram }}"
         response_variable: response
       - action: script.hubinet_ops_report_action
         data: {vmid: "{{ vmid | int }}", action_name: "utworzenie snapshotu", response: "{{ response | default({}) }}"}

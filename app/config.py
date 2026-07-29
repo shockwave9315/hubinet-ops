@@ -253,6 +253,9 @@ def validate_config(raw: dict[str, Any]) -> None:
                     "start",
                     "shutdown",
                     "reboot",
+                    "force_stop",
+                    "snapshot_rollback",
+                    "self_update",
                 )
                 if bool(capabilities.get(name, False))
             }

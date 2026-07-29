@@ -166,7 +166,7 @@ def test_recovery_delay_above_default_cooldown_uses_safe_dynamic_default() -> No
     validate_config(config)
 
 
-def test_example_policy_enables_full_lxc_control_and_keeps_vm100_denied() -> None:
+def test_example_policy_enables_full_lxc_control_and_limits_vm100_to_snapshots() -> None:
     import yaml
     from pathlib import Path
 
@@ -175,7 +175,10 @@ def test_example_policy_enables_full_lxc_control_and_keeps_vm100_denied() -> Non
     vm100 = raw["resources"][100]["operator_capabilities"]
     ct101 = raw["resources"][101]["operator_capabilities"]
     ct110 = raw["resources"][110]["operator_capabilities"]
-    assert vm100 and not any(vm100.values())
+    assert {
+        name for name, enabled in vm100.items() if enabled
+    } == {"snapshot_create", "snapshot_list", "snapshot_delete"}
+    assert raw["resources"][100]["snapshot_retention_count"] == 3
     assert all(value for name, value in ct101.items() if name != "self_update")
     assert ct101["self_update"] is False
     assert ct110["start"] is True

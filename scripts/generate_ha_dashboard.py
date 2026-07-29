@@ -594,6 +594,51 @@ def _observation_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _qemu_snapshot_controls(vmid: int) -> dict[str, Any]:
+    include_ram = "input_boolean.hubinet_ops_vm100_snapshot_include_ram"
+    return _section(
+        _title(
+            "Tworzenie snapshota VM100",
+            "Aktualizacje, lifecycle i restore pozostają zablokowane",
+        ),
+        _entity_grid(
+            [
+                {
+                    "type": "tile",
+                    "entity": include_ram,
+                    "name": "Dołącz stan RAM",
+                    "icon": "mdi:memory",
+                },
+                {
+                    "type": "custom:mushroom-template-card",
+                    "entity": include_ram,
+                    "primary": "Utwórz snapshot",
+                    "secondary": (
+                        "{{ 'Stan RAM zostanie dołączony' if is_state(entity, 'on') "
+                        "else 'Bez stanu RAM (opcja domyślna)' }}"
+                    ),
+                    "icon": "mdi:camera-plus-outline",
+                    "icon_color": "purple",
+                    "tap_action": {
+                        "action": "perform-action",
+                        "perform_action": "script.hubinet_ops_snapshot_create",
+                        "data": {"vmid": vmid},
+                        "confirmation": {
+                            "title": "Utwórz snapshot VM100",
+                            "text": (
+                                "{{ 'Snapshot obejmie stan RAM.' "
+                                "if is_state('input_boolean.hubinet_ops_vm100_snapshot_include_ram', 'on') "
+                                "else 'Snapshot nie obejmie stanu RAM.' }}"
+                            ),
+                        },
+                    },
+                },
+            ],
+            columns=2,
+        ),
+    )
+
+
 def _control_card(vmid: int, action: str) -> dict[str, Any]:
     names = {
         "start": "Uruchom",
@@ -1285,13 +1330,28 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _qemu_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
+    sections = [
         _section(
             _title(_label(vmid, cfg), "HAOS · obserwacja QEMU"),
             _resource_status(vmid, cfg),
             _resource_chips(vmid, cfg),
         ),
-        _observation_section(vmid, cfg),
+        _section(
+            _title("Sterowanie", "Backend pozostaje źródłem prawdy"),
+            {
+                "type": "custom:mushroom-template-card",
+                "entity": _entity(vmid, cfg, "health_status"),
+                "primary": "Tryb obserwacji z bezpiecznym zarządzaniem snapshotami",
+                "secondary": (
+                    "Aktualizacje APT, lifecycle i restore VM100 są zablokowane. "
+                    "Dostępne są wyłącznie snapshoty należące do Hubinet Ops."
+                ),
+                "multiline_secondary": True,
+                "icon": "mdi:eye-lock-outline",
+                "color": "blue-grey",
+                "tap_action": {"action": "more-info"},
+            },
+        ),
         _section(
             _title("CPU i pamięć", "Metryki dostarczane przez Proxmox"),
             _entity_grid(
@@ -1351,6 +1411,11 @@ def _qemu_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             ),
         ),
     ]
+    if cfg["operator_capabilities"].get("snapshot_create", False):
+        sections.insert(2, _qemu_snapshot_controls(vmid))
+    if cfg["operator_capabilities"].get("snapshot_list", False):
+        sections.insert(3, _snapshot_section(vmid, cfg))
+    return sections
 
 
 def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:

@@ -135,10 +135,11 @@ class HostControlClient:
                     f"Self-update bearer token is missing from {self.update_token_env}"
                 )
             body["fingerprint"] = release_fingerprint
-        elif operation_type == "snapshot_create":
+        elif operation_type in {"snapshot_create", "snapshot_create_ram"}:
             method = "POST"
             path = f"/api/v1/resources/{int(vmid)}/snapshots"
             body["name"] = snapshot_name
+            body["include_ram"] = operation_type == "snapshot_create_ram"
         elif operation_type == "snapshot_rollback":
             method = "POST"
             path = (

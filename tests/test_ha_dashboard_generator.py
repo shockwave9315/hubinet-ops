@@ -176,7 +176,7 @@ def test_mushroom_chips_use_semantic_colors_without_generic_red_fallback() -> No
     assert "yellow" in status_card["badge_color"]
 
 
-def test_vm100_has_qemu_metrics_but_no_apt_or_controls() -> None:
+def test_vm100_has_qemu_metrics_and_only_guarded_snapshot_controls() -> None:
     text = _text(_view(_dashboard(), "vm-100"))
 
     assert "Agent gościa QEMU" in text
@@ -184,7 +184,13 @@ def test_vm100_has_qemu_metrics_but_no_apt_or_controls() -> None:
     assert "sensor.hubinet_ops_vm100_ip_addresses" in text
     assert "pending_update_count" not in text
     assert "Pakiety APT" not in text
-    assert "perform-action" not in text
+    assert "script.hubinet_ops_snapshot_create" in text
+    assert "script.hubinet_ops_snapshot_delete_oldest" in text
+    assert "script.hubinet_ops_snapshot_delete_unprotected" in text
+    assert "input_boolean.hubinet_ops_vm100_snapshot_include_ram" in text
+    assert "Snapshot nie obejmie stanu RAM" in text
+    for forbidden in ("snapshot_restore", "start_container", "shutdown_container", "scan_container"):
+        assert forbidden not in text
     assert "Tryb obserwacji" in text
 
 
@@ -209,7 +215,7 @@ def test_ct110_has_only_supported_self_metrics() -> None:
     assert "script.hubinet_ops_scan_container" not in text
 
 
-def test_all_lxc_views_have_policy_scoped_controls_and_vm100_has_none() -> None:
+def test_all_lxc_views_have_policy_scoped_controls_and_vm100_has_only_snapshots() -> None:
     data = _dashboard()
     apt_services = {
         "script.hubinet_ops_start_container",
@@ -236,8 +242,12 @@ def test_all_lxc_views_have_policy_scoped_controls_and_vm100_has_none() -> None:
         }
         assert services == apt_services
         assert _text(view).count("perform-action") == 14
-    assert "perform-action" not in _text(_view(data, "vm-100"))
-    assert "Tryb obserwacji" in _text(_view(data, "vm-100"))
+    vm100 = _text(_view(data, "vm-100"))
+    assert vm100.count("perform-action") == 3
+    assert "script.hubinet_ops_snapshot_create" in vm100
+    assert "script.hubinet_ops_snapshot_delete_oldest" in vm100
+    assert "script.hubinet_ops_snapshot_delete_unprotected" in vm100
+    assert "Tryb obserwacji" in vm100
 
 
 def test_lxc_control_guards_and_dangerous_confirmations_are_explicit() -> None:

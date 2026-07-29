@@ -78,10 +78,10 @@ def policy(
             managed=_write(tmp_path / "managed", "101\n106\n"),
             maintenance=_write(tmp_path / "maintenance", "101\n106\n"),
             lifecycle=_write(tmp_path / "lifecycle", "101\n106\n110\n"),
-            host_control=_write(tmp_path / "host-control", "101\n106\n110\n"),
+            host_control=_write(tmp_path / "host-control", "100\n101\n106\n110\n"),
             snapshot_create=_write(
                 tmp_path / "snapshot-create",
-                "101\n106\n110\n",
+                "100\n101\n106\n110\n",
             ),
             snapshot_restore=_write(
                 tmp_path / "snapshot-restore",
@@ -89,7 +89,7 @@ def policy(
             ),
             snapshot_delete=_write(
                 tmp_path / "snapshot-delete",
-                "101\n106\n110\n",
+                "100\n101\n106\n110\n",
             ),
             resource_types=_write(
                 tmp_path / "types",
@@ -106,7 +106,7 @@ def policy(
 class FakeRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
-        self.status = {101: "stopped", 106: "running", 110: "running"}
+        self.status = {100: "running", 101: "stopped", 106: "running", 110: "running"}
         self.snapshots: list[dict[str, Any]] = [
             {
                 "snapname": "current",
@@ -153,6 +153,17 @@ def test_policy_has_independent_observation_managed_lifecycle_and_snapshot_guard
         current.validate("update", 110)
     with pytest.raises(HostControlError, match="lifecycle"):
         current.validate("start", 100)
+    assert current.validate(
+        "snapshot-create",
+        100,
+        "hubinet-ops-100-manual-20260729T120000Z",
+    )[3] == "qemu"
+    with pytest.raises(HostControlError, match="restore"):
+        current.validate(
+            "snapshot-rollback",
+            100,
+            "hubinet-ops-100-manual-20260729T120000Z",
+        )
     with pytest.raises(HostControlError, match="owned"):
         current.validate("snapshot-rollback", 106, "foreign-backup")
     with pytest.raises(HostControlError, match="Action not allowed"):
@@ -378,6 +389,62 @@ def test_snapshot_create_uses_validated_name_and_auditable_description(tmp_path:
     assert argv[:4] == ["pct", "snapshot", "106", name]
     assert "source_job_id=abcd1234" in argv[-1]
     assert result["owned_by_hubinet_ops"] is True
+
+
+@pytest.mark.parametrize(
+    ("action", "vmstate"),
+    [("snapshot-create", "0"), ("snapshot-create-ram", "1")],
+)
+def test_vm100_qemu_snapshot_uses_exact_typed_argv(
+    tmp_path: Path,
+    action: str,
+    vmstate: str,
+) -> None:
+    runner = FakeRunner()
+    controller = HostController(policy(tmp_path), runner=runner)
+    name = "hubinet-ops-100-manual-20260729T120000Z"
+
+    result = controller.execute(action, 100, name, source_job_id="abcd1234")
+
+    argv = next(call[0] for call in runner.calls if call[0][:2] == ["qm", "snapshot"])
+    assert argv == [
+        "qm",
+        "snapshot",
+        "100",
+        name,
+        "--description",
+        (
+            "hubinet-ops;kind=manual;created_at=2026-07-29T12:00:00+00:00;"
+            "source_job_id=abcd1234"
+        ),
+        "--vmstate",
+        vmstate,
+    ]
+    assert result["include_ram"] is (vmstate == "1")
+    assert all(call[1]["shell"] is False for call in runner.calls)
+
+
+def test_vm100_qemu_snapshot_list_and_delete_use_exact_argv(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    name = "hubinet-ops-100-manual-20260729T120000Z"
+    runner.snapshots = [{"snapname": name, "snaptime": 1785326400}]
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    snapshots = controller.execute("list-snapshots", 100)["snapshots"]
+    controller.execute("snapshot-delete", 100, name)
+
+    assert [
+        "pvesh",
+        "get",
+        "/nodes/pve-a/qemu/100/snapshot",
+        "--output-format",
+        "json",
+    ] in [call[0] for call in runner.calls]
+    assert ["qm", "delsnapshot", "100", name] in [
+        call[0] for call in runner.calls
+    ]
+    assert snapshots[0]["delete_eligible"] is True
+    assert snapshots[0]["rollback_eligible"] is False
 
 
 def test_forced_command_rejects_command_text_and_unknown_arguments(tmp_path: Path) -> None:
@@ -1232,6 +1299,7 @@ def test_host_job_runner_persists_terminal_result(tmp_path: Path) -> None:
     ("operation_type", "argument"),
     [
         ("snapshot_create", "hubinet-ops-110-manual-20260723T220000Z"),
+        ("snapshot_create_ram", "hubinet-ops-100-manual-20260723T220000Z"),
         ("snapshot_rollback", "hubinet-ops-110-manual-20260723T220000Z"),
         ("snapshot_delete", "hubinet-ops-110-manual-20260723T220000Z"),
         ("lifecycle_shutdown", None),
@@ -1285,6 +1353,7 @@ def test_live_job_polling_is_read_only_until_worker_finishes(
     assert terminal["status"] == "succeeded"
     assert terminal["result"]["action"] == {
         "snapshot_create": "snapshot-create",
+        "snapshot_create_ram": "snapshot-create-ram",
         "snapshot_rollback": "snapshot-rollback",
         "snapshot_delete": "snapshot-delete",
         "lifecycle_shutdown": "shutdown",

@@ -27,6 +27,7 @@ JOB_OPERATION_TYPES = frozenset(
         "lifecycle_reboot",
         "lifecycle_force_stop",
         "snapshot_create",
+        "snapshot_create_ram",
         "snapshot_rollback",
         "snapshot_delete",
         "snapshot_prune",

@@ -36,7 +36,12 @@ MANAGED_ACTIONS = {
     "repair": "repair",
     "verify": "verify",
 }
-SNAPSHOT_ACTIONS = {"snapshot-create", "snapshot-rollback", "snapshot-delete"}
+SNAPSHOT_ACTIONS = {
+    "snapshot-create",
+    "snapshot-create-ram",
+    "snapshot-rollback",
+    "snapshot-delete",
+}
 ALIASES = {
     "snapshot": "snapshot-create",
     "rollback": "snapshot-rollback",
@@ -110,10 +115,11 @@ class HostPolicy:
             if resource_type != "lxc" or vmid not in self.lifecycle:
                 raise HostControlError("VMID not lifecycle allowed")
         if normalized in SNAPSHOT_ACTIONS:
-            if resource_type != "lxc" or vmid not in self.host_control:
+            if vmid not in self.host_control:
                 raise HostControlError("VMID not host-control allowed")
             action_policy = {
                 "snapshot-create": (self.snapshot_create, "snapshot create"),
+                "snapshot-create-ram": (self.snapshot_create, "snapshot create"),
                 "snapshot-rollback": (self.snapshot_restore, "snapshot restore"),
                 "snapshot-delete": (self.snapshot_delete, "snapshot delete"),
             }[normalized]
@@ -121,6 +127,10 @@ class HostPolicy:
                 raise HostControlError(
                     f"VMID not {action_policy[1]} allowed by PVE policy"
                 )
+            if normalized == "snapshot-create-ram" and resource_type != "qemu":
+                raise HostControlError("RAM snapshot is allowed only for QEMU")
+            if normalized == "snapshot-rollback" and resource_type != "lxc":
+                raise HostControlError("Snapshot restore is allowed only for LXC")
         if normalized in {"self-update", "self-update-release"} and vmid != 110:
             raise HostControlError("Self-update is allowed only for CT110")
         if normalized in SNAPSHOT_ACTIONS:
@@ -180,11 +190,17 @@ class HostController:
         if action in LIFECYCLE_ACTIONS:
             return self._lifecycle(vmid, action)
         if action == "list-snapshots":
-            if resource_type != "lxc" or vmid not in self.policy.host_control:
+            if vmid not in self.policy.host_control:
                 raise HostControlError("Snapshot listing is not allowed")
-            return {"snapshots": self.list_snapshots(vmid)}
-        if action == "snapshot-create":
-            return self._snapshot_create(vmid, str(argument), source_job_id)
+            return {"snapshots": self.list_snapshots(vmid, resource_type)}
+        if action in {"snapshot-create", "snapshot-create-ram"}:
+            return self._snapshot_create(
+                vmid,
+                str(argument),
+                source_job_id,
+                resource_type=resource_type,
+                include_ram=action == "snapshot-create-ram",
+            )
         if action == "snapshot-rollback":
             snapshot = self._require_owned_existing_snapshot(vmid, str(argument))
             if not snapshot["rollback_eligible"]:
@@ -209,10 +225,17 @@ class HostController:
                 "lxc_status": "running" if was_running else "stopped",
             }
         if action == "snapshot-delete":
-            snapshot = self._require_owned_existing_snapshot(vmid, str(argument))
+            snapshot = self._require_owned_existing_snapshot(
+                vmid, str(argument), resource_type
+            )
             if not snapshot["delete_eligible"]:
                 raise HostControlError("Snapshot is not delete eligible")
-            self._run(["pct", "delsnapshot", str(vmid), str(argument)], timeout=300)
+            argv = (
+                ["pct", "delsnapshot", str(vmid), str(argument)]
+                if resource_type == "lxc"
+                else ["qm", "delsnapshot", str(vmid), str(argument)]
+            )
+            self._run(argv, timeout=300)
             return {"snapshot": argument, "action": "delete"}
         if action == "self-update":
             script = self.policy.paths.self_update
@@ -261,13 +284,18 @@ class HostController:
             sys.stderr.write(completed.stderr[-8000:])
         return int(completed.returncode or 0)
 
-    def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
+    def list_snapshots(
+        self, vmid: int, resource_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        resource_type = resource_type or self.policy.resource_types.get(vmid)
+        if resource_type not in RESOURCE_TYPES:
+            raise HostControlError("Unknown resource type")
         node = self._resolve_node()
         raw = self._run(
             [
                 "pvesh",
                 "get",
-                f"/nodes/{node}/lxc/{vmid}/snapshot",
+                f"/nodes/{node}/{resource_type}/{vmid}/snapshot",
                 "--output-format",
                 "json",
             ],
@@ -293,8 +321,15 @@ class HostController:
                     "created_at": created_at,
                     "kind": parsed["kind"] if parsed else None,
                     "owned_by_hubinet_ops": owned,
-                    "rollback_eligible": owned and not current,
-                    "delete_eligible": owned and not current,
+                    "rollback_eligible": (
+                        owned
+                        and not current
+                        and resource_type == "lxc"
+                        and vmid in self.policy.snapshot_restore
+                    ),
+                    "delete_eligible": (
+                        owned and not current and vmid in self.policy.snapshot_delete
+                    ),
                     "source_job_id": _description_job_id(item.get("description")),
                 }
             )
@@ -417,6 +452,9 @@ class HostController:
         vmid: int,
         name: str,
         source_job_id: str | None,
+        *,
+        resource_type: str,
+        include_ram: bool,
     ) -> dict[str, Any]:
         parsed = parse_snapshot(name, vmid)
         if parsed is None:
@@ -426,10 +464,21 @@ class HostController:
             f"kind={parsed['kind']};created_at={_name_created_at(parsed)};"
             f"source_job_id={source_job_id or ''}"
         )
-        self._run(
-            ["pct", "snapshot", str(vmid), name, "--description", description],
-            timeout=600,
+        argv = (
+            ["pct", "snapshot", str(vmid), name, "--description", description]
+            if resource_type == "lxc"
+            else [
+                "qm",
+                "snapshot",
+                str(vmid),
+                name,
+                "--description",
+                description,
+                "--vmstate",
+                "1" if include_ram else "0",
+            ]
         )
+        self._run(argv, timeout=600)
         return {
             "name": name,
             "description": description,
@@ -437,10 +486,13 @@ class HostController:
             "kind": parsed["kind"],
             "owned_by_hubinet_ops": True,
             "source_job_id": source_job_id,
+            "include_ram": include_ram,
         }
 
-    def _require_owned_existing_snapshot(self, vmid: int, name: str) -> dict[str, Any]:
-        for snapshot in self.list_snapshots(vmid):
+    def _require_owned_existing_snapshot(
+        self, vmid: int, name: str, resource_type: str = "lxc"
+    ) -> dict[str, Any]:
+        for snapshot in self.list_snapshots(vmid, resource_type):
             if snapshot["name"] == name:
                 if not snapshot["owned_by_hubinet_ops"]:
                     break

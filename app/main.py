@@ -36,6 +36,10 @@ class SnapshotPruneRequest(OperationRequest):
     confirm: str | None = Field(default=None, max_length=64)
 
 
+class SnapshotCreateRequest(OperationRequest):
+    include_ram: bool = Field(default=False, strict=True)
+
+
 def create_app(
     app_settings: Settings,
     *,
@@ -238,10 +242,14 @@ def create_app(
     @api.post("/api/v1/resources/{vmid}/snapshots", dependencies=auth)
     def create_snapshot(
         vmid: int,
-        request: OperationRequest | None = None,
+        request: SnapshotCreateRequest | None = None,
     ) -> dict[str, Any]:
         try:
-            return service.queue_snapshot_create(vmid, request.request_id if request else None)
+            return service.queue_snapshot_create(
+                vmid,
+                request.request_id if request else None,
+                include_ram=request.include_ram if request else False,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Resource not found") from exc
         except (ValueError, ExecutorError, HostControlError) as exc:

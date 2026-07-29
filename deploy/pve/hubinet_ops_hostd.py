@@ -723,6 +723,7 @@ class HostJobRunner:
                 "lifecycle_reboot": "reboot",
                 "lifecycle_force_stop": "force-stop",
                 "snapshot_create": "snapshot-create",
+                "snapshot_create_ram": "snapshot-create-ram",
                 "snapshot_rollback": "snapshot-rollback",
                 "snapshot_delete": "snapshot-delete",
                 "self_update": "self-update",
@@ -851,6 +852,7 @@ class HostdApplication:
             "lifecycle_reboot": "reboot",
             "lifecycle_force_stop": "force-stop",
             "snapshot_create": "snapshot-create",
+            "snapshot_create_ram": "snapshot-create-ram",
             "snapshot_rollback": "snapshot-rollback",
             "snapshot_delete": "snapshot-delete",
             "self_update": "self-update",
@@ -1156,7 +1158,12 @@ class HostdHandler(BaseHTTPRequestHandler):
                 )
             elif snapshot_match and snapshot_match.group("name") is None:
                 vmid = int(snapshot_match.group("vmid"))
-                operation_type = "snapshot_create"
+                include_ram = payload.get("include_ram", False)
+                if not isinstance(include_ram, bool):
+                    raise ValueError("include_ram must be a boolean")
+                operation_type = (
+                    "snapshot_create_ram" if include_ram else "snapshot_create"
+                )
                 argument = str(payload.get("name", ""))
                 job, created = self.app.submit(
                     vmid=vmid,

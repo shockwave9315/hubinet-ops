@@ -278,7 +278,10 @@ QEMU_ENTITY_SPECS = (
     _text("ip_addresses", "ip_addresses", "Primary IP", "value_json.primary_ip_address", "unknown"),
     _timestamp("last_refresh", "last_refresh", "Last refresh", "value_json.last_refresh"),
     _text("last_error", "last_error", "Last error", "value_json.last_error", "none"),
-)
+) + tuple(
+    _capability(key)
+    for key in ("snapshot_create", "snapshot_list", "snapshot_delete")
+) + SNAPSHOT_ENTITY_SPECS
 
 
 AGENT_SELF_ENTITY_SPECS = (

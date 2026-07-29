@@ -64,7 +64,7 @@ resources:
     guest_agent: true
     os: HAOS 16.0
     monitoring: {inspect: true, update_scan: false}
-    operator_capabilities: &deny_all
+    operator_capabilities:
       refresh: false
       scan: false
       approve: false
@@ -75,11 +75,12 @@ resources:
       shutdown: false
       reboot: false
       force_stop: false
-      snapshot_create: false
-      snapshot_list: false
+      snapshot_create: true
+      snapshot_list: true
       snapshot_rollback: false
-      snapshot_delete: false
+      snapshot_delete: true
       self_update: false
+    snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
     repair_actions: []
     required_services: []

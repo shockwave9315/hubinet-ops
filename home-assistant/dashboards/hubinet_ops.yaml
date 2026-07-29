@@ -884,16 +884,234 @@ views:
     cards:
     - type: custom:mushroom-title-card
       title: Sterowanie
-      subtitle: Polityka backendu jest źródłem prawdy
+      subtitle: Backend pozostaje źródłem prawdy
     - type: custom:mushroom-template-card
       entity: sensor.hubinet_ops_vm100_health_status
-      primary: Tryb obserwacji — sterowanie zablokowane przez politykę backendu
-      secondary: Telemetria i diagnostyka pozostają dostępne.
+      primary: Tryb obserwacji z bezpiecznym zarządzaniem snapshotami
+      secondary: Aktualizacje APT, lifecycle i restore VM100 są zablokowane. Dostępne są wyłącznie snapshoty należące do Hubinet
+        Ops.
       multiline_secondary: true
       icon: mdi:eye-lock-outline
       color: blue-grey
       tap_action:
         action: more-info
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Tworzenie snapshota VM100
+      subtitle: Aktualizacje, lifecycle i restore pozostają zablokowane
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: tile
+        entity: input_boolean.hubinet_ops_vm100_snapshot_include_ram
+        name: Dołącz stan RAM
+        icon: mdi:memory
+      - type: custom:mushroom-template-card
+        entity: input_boolean.hubinet_ops_vm100_snapshot_include_ram
+        primary: Utwórz snapshot
+        secondary: '{{ ''Stan RAM zostanie dołączony'' if is_state(entity, ''on'') else ''Bez stanu RAM (opcja domyślna)''
+          }}'
+        icon: mdi:camera-plus-outline
+        icon_color: purple
+        tap_action:
+          action: perform-action
+          perform_action: script.hubinet_ops_snapshot_create
+          data:
+            vmid: 100
+          confirmation:
+            title: Utwórz snapshot VM100
+            text: '{{ ''Snapshot obejmie stan RAM.'' if is_state(''input_boolean.hubinet_ops_vm100_snapshot_include_ram'',
+              ''on'') else ''Snapshot nie obejmie stanu RAM.'' }}'
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
+      title: Snapshoty
+      subtitle: Wyłącznie punkty należące do Hubinet Ops · retencja i ochrona po stronie backendu
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-template-card
+        entity: sensor.hubinet_ops_vm100_snapshot_count
+        primary: Liczba snapshotów
+        secondary: '{% set labels = {''healthy'': ''sprawny'', ''degraded'': ''obniżony'', ''critical'': ''krytyczny'', ''offline'':
+          ''offline'', ''running'': ''uruchomiony'', ''stopped'': ''zatrzymany'', ''active'': ''aktywna'', ''available'':
+          ''dostępny'', ''unavailable'': ''niedostępny'', ''update_available'': ''dostępna aktualizacja'', ''up_to_date'':
+          ''aktualny'', ''waiting_approval'': ''oczekuje na zatwierdzenie'', ''idle'': ''bezczynne'', ''success'': ''zakończono
+          pomyślnie'', ''passed'': ''zakończono pomyślnie'', ''failed'': ''niepowodzenie'', ''blocked'': ''zablokowane'',
+          ''allowed'': ''dozwolone'', ''compatible'': ''zgodny'', ''incompatible'': ''niezgodny'', ''valid'': ''prawidłowy'',
+          ''none'': ''brak'', ''unknown'': ''Brak danych'', ''high'': ''wysoki'', ''medium'': ''średni'', ''low'': ''niski'',
+          ''warning'': ''ostrzeżenie'', ''scanning'': ''skanowanie'', ''queued'': ''w kolejce'', ''completed'': ''zakończone'',
+          ''rolled_back'': ''przywrócono snapshot'', ''manual_intervention'': ''wymagana interwencja'', ''insufficient_health_contract'':
+          ''Ograniczona weryfikacja'', ''snapshot_delete'': ''Usuwanie snapshota'', ''recovery_scan'': ''Skan odzyskiwania'',
+          ''break_glass_recovery'': ''Awaryjne odzyskiwanie'', ''self_update'': ''Plan aktualizacji Hubinet Ops'', ''pre-update'':
+          ''przed aktualizacją'', ''manual'': ''ręczny'', ''ok'': ''prawidłowy'', ''yes'': ''tak'', ''no'': ''nie''} %}{%
+          set value = states(entity) %}{{ ''Brak danych'' if value in [''unknown'', ''unavailable'', ''none'', ''None'', '''']
+          else labels.get(value, value | replace(''_'', '' '')) }}}}'
+        icon: '{% set value = states(entity) %}{{ ''mdi:check-circle'' if value in [''healthy'', ''up_to_date'', ''success'',
+          ''passed'', ''valid'', ''compatible''] else ''mdi:update'' if value == ''update_available'' else ''mdi:clock-outline''
+          if value == ''waiting_approval'' else ''mdi:sync'' if value in [''running'', ''scanning''] else ''mdi:alert'' if
+          value in [''failed'', ''critical'', ''incompatible''] else ''mdi:alert-outline'' if value in [''warning'', ''degraded'',
+          ''insufficient_health_contract''] else ''mdi:help-circle-outline'' if value in [''unknown'', ''unavailable'', ''none'',
+          ''None'', ''''] else ''mdi:camera-burst'' }}'
+        icon_color: '{% set value = states(entity) %}{{ ''green'' if value in [''healthy'', ''up_to_date'', ''success'', ''passed'',
+          ''valid'', ''compatible'', ''allowed''] else ''orange'' if value == ''update_available'' else ''yellow'' if value
+          in [''waiting_approval'', ''warning'', ''degraded'', ''insufficient_health_contract''] else ''blue'' if value in
+          [''running'', ''scanning''] else ''red'' if value in [''failed'', ''critical'', ''incompatible'', ''blocked''] else
+          ''grey'' if value in [''unknown'', ''unavailable'', ''none'', ''None'', ''''] else ''blue'' }}'
+        fill_container: true
+        multiline_secondary: true
+        tap_action:
+          action: more-info
+      - type: custom:mushroom-template-card
+        entity: sensor.hubinet_ops_vm100_latest_snapshot_name
+        primary: Ostatni snapshot
+        secondary: '{% set labels = {''healthy'': ''sprawny'', ''degraded'': ''obniżony'', ''critical'': ''krytyczny'', ''offline'':
+          ''offline'', ''running'': ''uruchomiony'', ''stopped'': ''zatrzymany'', ''active'': ''aktywna'', ''available'':
+          ''dostępny'', ''unavailable'': ''niedostępny'', ''update_available'': ''dostępna aktualizacja'', ''up_to_date'':
+          ''aktualny'', ''waiting_approval'': ''oczekuje na zatwierdzenie'', ''idle'': ''bezczynne'', ''success'': ''zakończono
+          pomyślnie'', ''passed'': ''zakończono pomyślnie'', ''failed'': ''niepowodzenie'', ''blocked'': ''zablokowane'',
+          ''allowed'': ''dozwolone'', ''compatible'': ''zgodny'', ''incompatible'': ''niezgodny'', ''valid'': ''prawidłowy'',
+          ''none'': ''brak'', ''unknown'': ''Brak danych'', ''high'': ''wysoki'', ''medium'': ''średni'', ''low'': ''niski'',
+          ''warning'': ''ostrzeżenie'', ''scanning'': ''skanowanie'', ''queued'': ''w kolejce'', ''completed'': ''zakończone'',
+          ''rolled_back'': ''przywrócono snapshot'', ''manual_intervention'': ''wymagana interwencja'', ''insufficient_health_contract'':
+          ''Ograniczona weryfikacja'', ''snapshot_delete'': ''Usuwanie snapshota'', ''recovery_scan'': ''Skan odzyskiwania'',
+          ''break_glass_recovery'': ''Awaryjne odzyskiwanie'', ''self_update'': ''Plan aktualizacji Hubinet Ops'', ''pre-update'':
+          ''przed aktualizacją'', ''manual'': ''ręczny'', ''ok'': ''prawidłowy'', ''yes'': ''tak'', ''no'': ''nie''} %}{%
+          set value = states(entity) %}{{ ''Brak danych'' if value in [''unknown'', ''unavailable'', ''none'', ''None'', '''']
+          else labels.get(value, value | replace(''_'', '' '')) }}}}'
+        icon: '{% set value = states(entity) %}{{ ''mdi:check-circle'' if value in [''healthy'', ''up_to_date'', ''success'',
+          ''passed'', ''valid'', ''compatible''] else ''mdi:update'' if value == ''update_available'' else ''mdi:clock-outline''
+          if value == ''waiting_approval'' else ''mdi:sync'' if value in [''running'', ''scanning''] else ''mdi:alert'' if
+          value in [''failed'', ''critical'', ''incompatible''] else ''mdi:alert-outline'' if value in [''warning'', ''degraded'',
+          ''insufficient_health_contract''] else ''mdi:help-circle-outline'' if value in [''unknown'', ''unavailable'', ''none'',
+          ''None'', ''''] else ''mdi:camera-outline'' }}'
+        icon_color: '{% set value = states(entity) %}{{ ''green'' if value in [''healthy'', ''up_to_date'', ''success'', ''passed'',
+          ''valid'', ''compatible'', ''allowed''] else ''orange'' if value == ''update_available'' else ''yellow'' if value
+          in [''waiting_approval'', ''warning'', ''degraded'', ''insufficient_health_contract''] else ''blue'' if value in
+          [''running'', ''scanning''] else ''red'' if value in [''failed'', ''critical'', ''incompatible'', ''blocked''] else
+          ''grey'' if value in [''unknown'', ''unavailable'', ''none'', ''None'', ''''] else ''blue'' }}'
+        fill_container: true
+        multiline_secondary: true
+        tap_action:
+          action: more-info
+      - type: custom:mushroom-template-card
+        entity: sensor.hubinet_ops_vm100_latest_snapshot_kind
+        primary: Typ
+        secondary: '{% set labels = {''healthy'': ''sprawny'', ''degraded'': ''obniżony'', ''critical'': ''krytyczny'', ''offline'':
+          ''offline'', ''running'': ''uruchomiony'', ''stopped'': ''zatrzymany'', ''active'': ''aktywna'', ''available'':
+          ''dostępny'', ''unavailable'': ''niedostępny'', ''update_available'': ''dostępna aktualizacja'', ''up_to_date'':
+          ''aktualny'', ''waiting_approval'': ''oczekuje na zatwierdzenie'', ''idle'': ''bezczynne'', ''success'': ''zakończono
+          pomyślnie'', ''passed'': ''zakończono pomyślnie'', ''failed'': ''niepowodzenie'', ''blocked'': ''zablokowane'',
+          ''allowed'': ''dozwolone'', ''compatible'': ''zgodny'', ''incompatible'': ''niezgodny'', ''valid'': ''prawidłowy'',
+          ''none'': ''brak'', ''unknown'': ''Brak danych'', ''high'': ''wysoki'', ''medium'': ''średni'', ''low'': ''niski'',
+          ''warning'': ''ostrzeżenie'', ''scanning'': ''skanowanie'', ''queued'': ''w kolejce'', ''completed'': ''zakończone'',
+          ''rolled_back'': ''przywrócono snapshot'', ''manual_intervention'': ''wymagana interwencja'', ''insufficient_health_contract'':
+          ''Ograniczona weryfikacja'', ''snapshot_delete'': ''Usuwanie snapshota'', ''recovery_scan'': ''Skan odzyskiwania'',
+          ''break_glass_recovery'': ''Awaryjne odzyskiwanie'', ''self_update'': ''Plan aktualizacji Hubinet Ops'', ''pre-update'':
+          ''przed aktualizacją'', ''manual'': ''ręczny'', ''ok'': ''prawidłowy'', ''yes'': ''tak'', ''no'': ''nie''} %}{%
+          set value = states(entity) %}{{ ''Brak danych'' if value in [''unknown'', ''unavailable'', ''none'', ''None'', '''']
+          else labels.get(value, value | replace(''_'', '' '')) }}}}'
+        icon: '{% set value = states(entity) %}{{ ''mdi:check-circle'' if value in [''healthy'', ''up_to_date'', ''success'',
+          ''passed'', ''valid'', ''compatible''] else ''mdi:update'' if value == ''update_available'' else ''mdi:clock-outline''
+          if value == ''waiting_approval'' else ''mdi:sync'' if value in [''running'', ''scanning''] else ''mdi:alert'' if
+          value in [''failed'', ''critical'', ''incompatible''] else ''mdi:alert-outline'' if value in [''warning'', ''degraded'',
+          ''insufficient_health_contract''] else ''mdi:help-circle-outline'' if value in [''unknown'', ''unavailable'', ''none'',
+          ''None'', ''''] else ''mdi:shape-outline'' }}'
+        icon_color: '{% set value = states(entity) %}{{ ''green'' if value in [''healthy'', ''up_to_date'', ''success'', ''passed'',
+          ''valid'', ''compatible'', ''allowed''] else ''orange'' if value == ''update_available'' else ''yellow'' if value
+          in [''waiting_approval'', ''warning'', ''degraded'', ''insufficient_health_contract''] else ''blue'' if value in
+          [''running'', ''scanning''] else ''red'' if value in [''failed'', ''critical'', ''incompatible'', ''blocked''] else
+          ''grey'' if value in [''unknown'', ''unavailable'', ''none'', ''None'', ''''] else ''blue'' }}'
+        fill_container: true
+        multiline_secondary: true
+        tap_action:
+          action: more-info
+      - type: custom:mushroom-template-card
+        entity: sensor.hubinet_ops_vm100_latest_snapshot_at
+        primary: Utworzony
+        secondary: '{% set value = states(entity) %}{% if value in [''unknown'', ''unavailable'', ''none'', ''None'', '''']
+          %}Brak danych{% else %}{% set stamp = as_timestamp(value, none) %}{{ stamp | timestamp_custom(''%d.%m.%Y %H:%M'',
+          true) if stamp is not none else ''Nieprawidłowa data'' }}{% endif %}'
+        icon: mdi:calendar-clock
+        color: blue-grey
+        tap_action:
+          action: more-info
+      - type: custom:mushroom-template-card
+        entity: sensor.hubinet_ops_vm100_snapshot_operation_status
+        primary: Ostatnia operacja
+        secondary: '{% set labels = {''healthy'': ''sprawny'', ''degraded'': ''obniżony'', ''critical'': ''krytyczny'', ''offline'':
+          ''offline'', ''running'': ''uruchomiony'', ''stopped'': ''zatrzymany'', ''active'': ''aktywna'', ''available'':
+          ''dostępny'', ''unavailable'': ''niedostępny'', ''update_available'': ''dostępna aktualizacja'', ''up_to_date'':
+          ''aktualny'', ''waiting_approval'': ''oczekuje na zatwierdzenie'', ''idle'': ''bezczynne'', ''success'': ''zakończono
+          pomyślnie'', ''passed'': ''zakończono pomyślnie'', ''failed'': ''niepowodzenie'', ''blocked'': ''zablokowane'',
+          ''allowed'': ''dozwolone'', ''compatible'': ''zgodny'', ''incompatible'': ''niezgodny'', ''valid'': ''prawidłowy'',
+          ''none'': ''brak'', ''unknown'': ''Brak danych'', ''high'': ''wysoki'', ''medium'': ''średni'', ''low'': ''niski'',
+          ''warning'': ''ostrzeżenie'', ''scanning'': ''skanowanie'', ''queued'': ''w kolejce'', ''completed'': ''zakończone'',
+          ''rolled_back'': ''przywrócono snapshot'', ''manual_intervention'': ''wymagana interwencja'', ''insufficient_health_contract'':
+          ''Ograniczona weryfikacja'', ''snapshot_delete'': ''Usuwanie snapshota'', ''recovery_scan'': ''Skan odzyskiwania'',
+          ''break_glass_recovery'': ''Awaryjne odzyskiwanie'', ''self_update'': ''Plan aktualizacji Hubinet Ops'', ''pre-update'':
+          ''przed aktualizacją'', ''manual'': ''ręczny'', ''ok'': ''prawidłowy'', ''yes'': ''tak'', ''no'': ''nie''} %}{%
+          set value = states(entity) %}{{ ''Brak danych'' if value in [''unknown'', ''unavailable'', ''none'', ''None'', '''']
+          else labels.get(value, value | replace(''_'', '' '')) }}}}'
+        icon: '{% set value = states(entity) %}{{ ''mdi:check-circle'' if value in [''healthy'', ''up_to_date'', ''success'',
+          ''passed'', ''valid'', ''compatible''] else ''mdi:update'' if value == ''update_available'' else ''mdi:clock-outline''
+          if value == ''waiting_approval'' else ''mdi:sync'' if value in [''running'', ''scanning''] else ''mdi:alert'' if
+          value in [''failed'', ''critical'', ''incompatible''] else ''mdi:alert-outline'' if value in [''warning'', ''degraded'',
+          ''insufficient_health_contract''] else ''mdi:help-circle-outline'' if value in [''unknown'', ''unavailable'', ''none'',
+          ''None'', ''''] else ''mdi:progress-check'' }}'
+        icon_color: '{% set value = states(entity) %}{{ ''green'' if value in [''healthy'', ''up_to_date'', ''success'', ''passed'',
+          ''valid'', ''compatible'', ''allowed''] else ''orange'' if value == ''update_available'' else ''yellow'' if value
+          in [''waiting_approval'', ''warning'', ''degraded'', ''insufficient_health_contract''] else ''blue'' if value in
+          [''running'', ''scanning''] else ''red'' if value in [''failed'', ''critical'', ''incompatible'', ''blocked''] else
+          ''grey'' if value in [''unknown'', ''unavailable'', ''none'', ''None'', ''''] else ''blue'' }}'
+        fill_container: true
+        multiline_secondary: true
+        tap_action:
+          action: more-info
+    - type: markdown
+      title: Ostatnie snapshoty Hubinet Ops
+      content: '{% set snapshots = state_attr(''sensor.hubinet_ops_vm100_health_status'', ''managed_snapshots'') or [] %}
+
+        {% for snapshot in snapshots[:5] %}{% set stamp = as_timestamp(snapshot.get(''created_at''), none) %}- **{{ ''Przed
+        aktualizacją'' if snapshot.get(''logical_type'') == ''pre-update'' else ''Ręczny'' }}** · {{ stamp | timestamp_custom(''%d.%m.%Y
+        %H:%M'', true) if stamp is not none else ''Brak danych'' }} · {{ ''chroniony: '' ~ (snapshot.get(''protection_reason'')
+        or ''polityka'') if snapshot.get(''protected'') else ''niechroniony'' }}
+
+        {% endfor %}{% if not snapshots %}Brak zarządzanych snapshotów lub wymagane jest odświeżenie.{% endif %}'
+    - type: grid
+      columns: 2
+      square: false
+      cards:
+      - type: custom:mushroom-template-card
+        primary: Usuń najstarszy
+        secondary: Najstarszy niechroniony snapshot Hubinet Ops
+        icon: mdi:delete-clock-outline
+        icon_color: orange
+        tap_action:
+          action: perform-action
+          perform_action: script.hubinet_ops_snapshot_delete_oldest
+          data:
+            vmid: 100
+          confirmation:
+            title: Usuń najstarszy snapshot
+            text: Backend ponownie sprawdzi własność i ochronę przed usunięciem.
+      - type: custom:mushroom-template-card
+        primary: Usuń niechronione
+        secondary: Wszystkie niechronione snapshoty Hubinet Ops
+        icon: mdi:delete-sweep-outline
+        icon_color: red
+        tap_action:
+          action: perform-action
+          perform_action: script.hubinet_ops_snapshot_delete_unprotected
+          data:
+            vmid: 100
+          confirmation:
+            title: Usuń wszystkie niechronione
+            text: Potwierdzasz usunięcie wszystkich aktualnie niechronionych snapshotów Hubinet Ops. Backend ponownie sprawdzi
+              ochronę każdego wpisu.
   - type: grid
     cards:
     - type: custom:mushroom-title-card

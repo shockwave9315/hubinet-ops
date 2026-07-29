@@ -111,7 +111,7 @@ class FakeHostControl:
             self.runtime = "stopped"
         elif operation_type == "lifecycle_reboot":
             self.runtime = "running"
-        elif operation_type == "snapshot_create":
+        elif operation_type in {"snapshot_create", "snapshot_create_ram"}:
             assert snapshot_name
             self.snapshots.insert(
                 0,

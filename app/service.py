@@ -60,6 +60,7 @@ HOST_CONTROL_OPERATION_TYPES = {
     "lifecycle_reboot",
     "lifecycle_force_stop",
     "snapshot_create",
+    "snapshot_create_ram",
     "snapshot_rollback",
     "snapshot_delete",
     "self_update",
@@ -963,8 +964,8 @@ class OpsService:
 
     def list_snapshots(self, vmid: int) -> dict[str, Any]:
         cfg = self._resource(vmid)
-        if cfg.get("resource_type") != "lxc":
-            raise ValueError("Snapshots are supported only for LXC resources")
+        if cfg.get("resource_type") not in {"lxc", "qemu"}:
+            raise ValueError("Snapshots are not supported for this resource type")
         self._require_capability(vmid, "snapshot_list")
         return self._refresh_snapshot_state(vmid)
 
@@ -1185,12 +1186,18 @@ class OpsService:
         self,
         vmid: int,
         request_id: str | None = None,
+        *,
+        include_ram: bool = False,
     ) -> dict[str, Any]:
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
             raise ValueError("A scan or manual operation is active for this resource")
         try:
-            return self._queue_snapshot_create_locked(vmid, request_id)
+            return self._queue_snapshot_create_locked(
+                vmid,
+                request_id,
+                include_ram=include_ram,
+            )
         finally:
             lock.release()
 
@@ -1198,10 +1205,17 @@ class OpsService:
         self,
         vmid: int,
         request_id: str | None = None,
+        *,
+        include_ram: bool = False,
     ) -> dict[str, Any]:
         cfg = self._resource(vmid)
-        if cfg.get("resource_type") != "lxc":
-            raise ValueError("Snapshots are supported only for LXC resources")
+        resource_type = str(cfg.get("resource_type") or "")
+        if resource_type not in {"lxc", "qemu"}:
+            raise ValueError("Snapshots are not supported for this resource type")
+        if not isinstance(include_ram, bool):
+            raise ValueError("include_ram must be a boolean")
+        if include_ram and resource_type != "qemu":
+            raise ValueError("include_ram is supported only for QEMU snapshots")
         self._require_capability(vmid, "snapshot_create")
         self._require_host_control("Snapshot creation")
         stamp = self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -1209,7 +1223,11 @@ class OpsService:
         job, _ = self.db.create_operation_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"ct-{vmid}")),
-            operation_type="snapshot_create",
+            operation_type=(
+                "snapshot_create_ram"
+                if include_ram
+                else "snapshot_create"
+            ),
             request_id=request_id or uuid.uuid4().hex,
             snapshot_name=name,
         )
@@ -1272,8 +1290,8 @@ class OpsService:
             raise ValueError("Unsupported snapshot action")
         capability = "snapshot_rollback" if action == "rollback" else "snapshot_delete"
         cfg = self._resource(vmid)
-        if cfg.get("resource_type") != "lxc":
-            raise ValueError("Snapshots are supported only for LXC resources")
+        if cfg.get("resource_type") not in {"lxc", "qemu"}:
+            raise ValueError("Snapshots are not supported for this resource type")
         self._require_capability(vmid, capability)
         self._require_host_control("Snapshot operation")
         if action == "rollback" and not bool(
@@ -1917,13 +1935,21 @@ class OpsService:
                     expected = "running" if operation_type == "lifecycle_start" else "stopped"
                     succeeded = actual == expected
                     result = {"runtime_status": actual, "reconciled": True}
-                elif operation_type in {"snapshot_create", "snapshot_delete"}:
+                elif operation_type in {
+                    "snapshot_create",
+                    "snapshot_create_ram",
+                    "snapshot_delete",
+                }:
                     listing = self.list_snapshots(int(job["vmid"]))
                     exists = any(
                         item.get("name") == job.get("snapshot_name")
                         for item in listing["snapshots"]
                     )
-                    succeeded = exists if operation_type == "snapshot_create" else not exists
+                    succeeded = (
+                        exists
+                        if operation_type in {"snapshot_create", "snapshot_create_ram"}
+                        else not exists
+                    )
                     result = {"snapshot_exists": exists, "reconciled": True}
             except Exception as exc:
                 LOGGER.warning("Startup reconciliation failed for job %s: %s", job["id"], exc)
@@ -2317,6 +2343,7 @@ class OpsService:
             "lifecycle_reboot": "rebooting",
             "lifecycle_force_stop": "force_stopping",
             "snapshot_create": "snapshot_creating",
+            "snapshot_create_ram": "snapshot_creating",
             "snapshot_rollback": "snapshot_rollback",
             "snapshot_delete": "snapshot_deleting",
             "snapshot_prune": "snapshot_pruning",
@@ -2406,7 +2433,7 @@ class OpsService:
                     exc,
                 )
             if (
-                operation_type == "snapshot_create"
+                operation_type in {"snapshot_create", "snapshot_create_ram"}
                 and enforce_snapshot_retention
                 and snapshot_refreshed
             ):
