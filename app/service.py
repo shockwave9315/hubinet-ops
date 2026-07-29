@@ -944,8 +944,52 @@ class OpsService:
         if cfg.get("resource_type") != "lxc":
             raise ValueError("Snapshots are supported only for LXC resources")
         self._require_capability(vmid, "snapshot_list")
-        host_control = self._require_host_control("Snapshot listing")
-        snapshots = host_control.list_snapshots(vmid)
+        return self._refresh_snapshot_state(vmid)
+
+    def _refresh_snapshot_state(
+        self,
+        vmid: int,
+        *,
+        job: dict[str, Any] | None = None,
+        required_name: str | None = None,
+        required_kind: str | None = None,
+        attempts: int = 3,
+    ) -> dict[str, Any]:
+        last_error: ExecutorError | HostControlError | ValueError | None = None
+        snapshots: list[dict[str, Any]] = []
+        for _attempt in range(max(1, min(int(attempts), 5))):
+            try:
+                snapshots = self._raw_snapshot_list(vmid)
+                break
+            except (ExecutorError, HostControlError, ValueError) as exc:
+                last_error = exc
+        else:
+            warning = sanitize_text(
+                f"Snapshot refresh failed after mutation: {last_error}",
+                limit=2000,
+            )
+            state = self.get_state(vmid)
+            state.update(
+                {
+                    "snapshot_state_stale": True,
+                    "snapshot_refresh_required": True,
+                    "snapshot_refresh_warning": warning,
+                }
+            )
+            self._save_state(vmid, state)
+            if job is not None:
+                event = self.db.insert_job_event(
+                    job_id=str(job["id"]),
+                    vmid=vmid,
+                    level="warning",
+                    stage=str(self.db.get_job(str(job["id"])).get("stage") or "snapshot"),
+                    progress=int(self.db.get_job(str(job["id"])).get("progress") or 0),
+                    event_type="snapshot_refresh_failed",
+                    message=warning,
+                    details={"refresh_required": True, "attempts": max(1, min(int(attempts), 5))},
+                )
+                self.mqtt.publish_event(vmid, event)
+            raise ValueError(warning) from last_error
         snapshots = [
             dict(item) for item in snapshots
             if isinstance(item, dict)
@@ -960,9 +1004,55 @@ class OpsService:
                 "latest_snapshot_name": latest.get("name"),
                 "latest_snapshot_at": latest.get("created_at"),
                 "latest_snapshot_kind": latest.get("kind"),
+                "snapshot_state_stale": False,
+                "snapshot_refresh_required": False,
+                "snapshot_refresh_warning": None,
+                "snapshot_refreshed_at": self._utc_second_timestamp(),
             }
         )
         self._save_state(vmid, state)
+        if required_name is not None:
+            confirmed = next(
+                (
+                    item
+                    for item in owned
+                    if str(item.get("name") or "") == required_name
+                ),
+                None,
+            )
+            parsed = parse_owned_snapshot_name(required_name, vmid=vmid)
+            if (
+                confirmed is None
+                or parsed is None
+                or confirmed.get("owned_by_hubinet_ops") is not True
+                or str(confirmed.get("kind") or parsed.get("kind") or "") != str(required_kind or "")
+            ):
+                warning = (
+                    f"Created snapshot {required_name} could not be confirmed "
+                    f"as an owned VMID {vmid} {required_kind or ''} snapshot"
+                ).strip()
+                state = self.get_state(vmid)
+                state.update(
+                    {
+                        "snapshot_state_stale": True,
+                        "snapshot_refresh_required": True,
+                        "snapshot_refresh_warning": warning,
+                    }
+                )
+                self._save_state(vmid, state)
+                if job is not None:
+                    event = self.db.insert_job_event(
+                        job_id=str(job["id"]),
+                        vmid=vmid,
+                        level="error",
+                        stage="snapshot",
+                        progress=int(self.db.get_job(str(job["id"])).get("progress") or 0),
+                        event_type="snapshot_confirmation_failed",
+                        message=warning,
+                        details={"snapshot_name": required_name, "kind": required_kind},
+                    )
+                    self.mqtt.publish_event(vmid, event)
+                raise ValueError(warning)
         return {"snapshots": snapshots, "latest": latest or None}
 
     def queue_snapshot_create(
@@ -1786,7 +1876,15 @@ class OpsService:
                     message="Creating rollback snapshot" if auto_rollback else "Creating pre-update safety snapshot",
                 )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
-                self._enforce_snapshot_retention(vmid, job)
+                try:
+                    self._refresh_snapshot_state(
+                        vmid,
+                        job=job,
+                        required_name=snapshot,
+                        required_kind="pre-update",
+                    )
+                except ValueError as exc:
+                    raise ExecutorError(str(exc)) from exc
                 emit(
                     stage="snapshot",
                     progress=25,
@@ -2050,8 +2148,6 @@ class OpsService:
     ) -> None:
         vmid = int(job["vmid"])
         operation_type = str(job["operation_type"])
-        if operation_type == "snapshot_create" and enforce_snapshot_retention:
-            self._enforce_snapshot_retention(vmid, job)
         self.db.update_job(job["id"], result=result)
         state = self.get_state(vmid)
         if operation_type.startswith("lifecycle_"):
@@ -2086,14 +2182,22 @@ class OpsService:
                     }
                 )
             self._save_state(vmid, state)
+            snapshot_refreshed = False
             try:
-                self.list_snapshots(vmid)
+                self._refresh_snapshot_state(vmid, job=job)
+                snapshot_refreshed = True
             except (ExecutorError, HostControlError, ValueError) as exc:
                 LOGGER.warning(
                     "Read-only snapshot refresh failed after completed job %s: %s",
                     job["id"],
                     exc,
                 )
+            if (
+                operation_type == "snapshot_create"
+                and enforce_snapshot_retention
+                and snapshot_refreshed
+            ):
+                self._enforce_snapshot_retention(vmid, job)
             if (
                 operation_type == "snapshot_rollback"
                 and str(self._resource(vmid).get("adapter") or "apt") == "apt"
@@ -2416,6 +2520,14 @@ class OpsService:
                 }
             )
             self._save_state(vmid, state)
+            try:
+                self._refresh_snapshot_state(vmid, job=job)
+            except (ExecutorError, HostControlError, ValueError) as exc:
+                LOGGER.warning(
+                    "Read-only snapshot refresh failed after automatic rollback job %s: %s",
+                    job["id"],
+                    exc,
+                )
             self._terminal(job, "rolled_back", "rolled_back", cause)
             self._notify_ha(self._notification("job_rolled_back", vmid))
         except ExecutorError as rollback_error:

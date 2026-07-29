@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from app.database import Database
+from app.executor import ExecutorError
+from app.host_control import HostControlError
+from app.service import OpsService
+from tests.test_lifecycle_snapshots import (
+    FakeHostControl,
+    CompatibleExecutor,
+    run_queued,
+    settings as lifecycle_settings,
+)
+from tests.test_service import WorkflowExecutor, settings as update_settings
+
+
+class SnapshotUpdateExecutor(WorkflowExecutor):
+    def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+        if action == "scan":
+            self.actions.append(action)
+            return {
+                "ok": True,
+                "data": {
+                    "pending_count": 3,
+                    "packages": [{"name": "systemd"}],
+                    "fingerprint": self.preflight_fingerprint,
+                },
+            }
+        return super().run(action, vmid, argument, timeout, on_event)
+
+
+def _approved_update(
+    tmp_path: Path,
+    executor: SnapshotUpdateExecutor,
+) -> tuple[OpsService, Database, dict[str, Any]]:
+    cfg = update_settings(tmp_path)
+    cfg.raw["containers"][106]["pre_update_snapshot"] = True
+    cfg.raw["containers"][106]["automatic_rollback"] = False
+    db = Database(cfg.db_path)
+    service = OpsService(cfg, db, executor)
+    scanned = service.scan_container(106)
+    approved = service.approve(scanned["plan"]["id"])
+    return service, db, approved["job"]
+
+
+def test_pre_update_snapshot_is_refreshed_and_visible_before_apt_mutation(
+    tmp_path: Path,
+) -> None:
+    executor = SnapshotUpdateExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+
+    service._run_job(db.get_job(job["id"]))
+
+    assert executor.actions.index("snapshot") < executor.actions.index("list-snapshots")
+    assert executor.actions.index("list-snapshots") < executor.actions.index("update")
+    state = service.get_state(106)
+    assert state["snapshot_count"] == 1
+    assert state["latest_snapshot_name"] == db.get_job(job["id"])["snapshot_name"]
+    assert state["latest_snapshot_kind"] == "pre-update"
+    assert state["snapshot_state_stale"] is False
+
+
+def test_unconfirmed_pre_update_snapshot_blocks_before_apt_mutation(
+    tmp_path: Path,
+) -> None:
+    class MissingFromListingExecutor(SnapshotUpdateExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "list-snapshots":
+                self.actions.append(action)
+                return {"ok": True, "data": {"snapshots": []}}
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = MissingFromListingExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+
+    service._run_job(db.get_job(job["id"]))
+
+    assert "update" not in executor.actions
+    assert db.get_job(job["id"])["status"] == "blocked"
+    state = service.get_state(106)
+    assert state["snapshot_state_stale"] is True
+    assert state["snapshot_refresh_required"] is True
+    assert any(
+        event["event_type"] == "snapshot_confirmation_failed"
+        for event in db.list_job_events(job["id"])
+    )
+
+
+def test_manual_snapshot_create_and_delete_refresh_canonical_state(
+    tmp_path: Path,
+) -> None:
+    cfg = lifecycle_settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl()
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    created = service.queue_snapshot_create(106, "manual-create-refresh-0001")
+    run_queued(service, db)
+    assert service.get_state(106)["snapshot_count"] == 1
+    assert service.get_state(106)["latest_snapshot_name"] == created["snapshot_name"]
+
+    service.queue_snapshot_action(
+        106,
+        "delete",
+        created["snapshot_name"],
+        "manual-delete-refresh-0001",
+    )
+    run_queued(service, db)
+    assert service.get_state(106)["snapshot_count"] == 0
+    assert service.get_state(106)["latest_snapshot_name"] is None
+
+
+def test_refresh_failure_keeps_successful_mutation_and_marks_state_stale(
+    tmp_path: Path,
+) -> None:
+    class RefreshFailingHost(FakeHostControl):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_listing = False
+            self.list_calls = 0
+
+        def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
+            self.list_calls += 1
+            if self.fail_listing:
+                raise HostControlError("temporary snapshot read failure", status="unavailable")
+            return super().list_snapshots(vmid)
+
+        def execute(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            result = super().execute(*args, **kwargs)
+            if args[0] == "snapshot_create":
+                self.fail_listing = True
+            return result
+
+    cfg = lifecycle_settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = RefreshFailingHost()
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+    queued = service.queue_snapshot_create(106, "manual-create-stale-0001")
+
+    terminal = run_queued(service, db)
+
+    assert terminal["status"] == "success"
+    assert len(host.snapshots) == 1
+    assert host.list_calls == 3
+    state = service.get_state(106)
+    assert state["snapshot_state_stale"] is True
+    assert state["snapshot_refresh_required"] is True
+    assert "temporary snapshot read failure" in state["snapshot_refresh_warning"]
+    assert any(
+        event["event_type"] == "snapshot_refresh_failed"
+        and event["level"] == "warning"
+        for event in db.list_job_events(queued["id"])
+    )
+
+
+def test_automatic_rollback_refreshes_snapshot_state(tmp_path: Path) -> None:
+    class FailingAfterSnapshotExecutor(SnapshotUpdateExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "update":
+                self.actions.append(action)
+                raise ExecutorError("update failed")
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = FailingAfterSnapshotExecutor()
+    cfg = update_settings(tmp_path)
+    cfg.raw["containers"][106]["pre_update_snapshot"] = True
+    cfg.raw["containers"][106]["automatic_rollback"] = True
+    db = Database(cfg.db_path)
+    service = OpsService(cfg, db, executor)
+    scanned = service.scan_container(106)
+    job = service.approve(scanned["plan"]["id"])["job"]
+
+    service._run_job(db.get_job(job["id"]))
+
+    assert db.get_job(job["id"])["status"] == "rolled_back"
+    assert executor.actions.count("list-snapshots") >= 2
+    assert service.get_state(106)["snapshot_state_stale"] is False

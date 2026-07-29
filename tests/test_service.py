@@ -65,6 +65,7 @@ class WorkflowExecutor:
         self.last = self.inspect_states[-1]
         self.actions: list[str] = []
         self.preflight_fingerprint = preflight_fingerprint
+        self.snapshots: list[dict[str, Any]] = []
 
     def run(
         self,
@@ -110,6 +111,28 @@ class WorkflowExecutor:
                     "fingerprint": "none",
                 },
             }
+        if action == "snapshot":
+            assert argument
+            kind = "pre-update" if "-pre-" in argument else "manual"
+            self.snapshots.insert(
+                0,
+                {
+                    "name": argument,
+                    "created_at": "2026-07-29T00:00:00+00:00",
+                    "kind": kind,
+                    "owned_by_hubinet_ops": True,
+                    "rollback_eligible": True,
+                    "delete_eligible": True,
+                },
+            )
+            return {"ok": True, "data": {}}
+        if action == "list-snapshots":
+            return {"ok": True, "data": {"snapshots": list(self.snapshots)}}
+        if action in {"delete-snapshot", "snapshot-delete"}:
+            self.snapshots = [
+                item for item in self.snapshots if item.get("name") != argument
+            ]
+            return {"ok": True, "data": {}}
         if action == "verify":
             return {
                 "ok": True,
