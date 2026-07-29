@@ -952,10 +952,10 @@ def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
     assert "HUBINET_OPS_SYSTEM_SANDBOX" in smoke
     assert "runtime smoke must execute inside the system sandbox" in smoke
     assert entrypoint.index("sandbox self-test: passed") < entrypoint.index(
-        "runtime_smoke_0_4_1.sh"
+        "runtime_smoke_0_4_2.sh"
     )
-    assert entrypoint.index("runtime_smoke_0_4_1.sh") < entrypoint.index(
-        "runtime_smoke_ha_0_4_1.sh"
+    assert entrypoint.index("runtime_smoke_0_4_2.sh") < entrypoint.index(
+        "runtime_smoke_ha_0_4_2.sh"
     )
     assert "exec /bin/bash" not in entrypoint
     for marker in (
