@@ -98,8 +98,8 @@ trap 'rollback_ha $?' ERR
 trap 'rollback_ha 130' INT
 trap 'rollback_ha 143' TERM
 
-ssh "${SSH_ARGS[@]}" "python3 - /config/secrets.yaml" \
-  < "$SOURCE_DIR/scripts/validate_ha_secrets_0_4_1.py"
+ssh "${SSH_ARGS[@]}" 'cat /config/secrets.yaml' |
+  python3 "$SOURCE_DIR/scripts/validate_ha_secrets_0_4_1.py" -
 
 ssh "${SSH_ARGS[@]}" '
   set -Eeuo pipefail
