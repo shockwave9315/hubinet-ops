@@ -124,7 +124,12 @@ def test_retention_keeps_exact_count_and_never_deletes_foreign_or_protected(
     )
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
 
-    service._enforce_snapshot_retention(106, current)
+    service._terminal_with_snapshot_retention(
+        current,
+        job_status="success",
+        result="success",
+        error=None,
+    )
 
     remaining = {item["name"] for item in host.snapshots}
     assert snapshots[0]["name"] in remaining
@@ -153,7 +158,12 @@ def test_retention_zero_disables_automatic_pruning(tmp_path: Path) -> None:
     )
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
 
-    service._enforce_snapshot_retention(106, job)
+    service._terminal_with_snapshot_retention(
+        job,
+        job_status="success",
+        result="success",
+        error=None,
+    )
 
     assert len(host.snapshots) == 2
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
@@ -326,8 +336,18 @@ def test_pruning_failure_is_warning_and_does_not_change_successful_update(
     service._run_job(db.get_job(job["id"]))
 
     assert db.get_job(job["id"])["status"] == "success"
+    prune = next(
+        item
+        for item in db.list_jobs()
+        if item["operation_type"] == "snapshot_prune"
+    )
+    assert prune["status"] == "failed"
+    assert any(
+        event["event_type"] == "job_failed"
+        for event in db.list_job_events(prune["id"])
+    )
     assert any(
         event["event_type"] == "snapshot_pruning_failed"
         and event["level"] == "warning"
-        for event in db.list_job_events(job["id"])
+        for event in db.list_job_events(prune["id"])
     )

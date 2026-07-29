@@ -88,6 +88,10 @@ class ConflictError(ValueError):
         return result
 
 
+class SnapshotPruneOutcomeUnknown(RuntimeError):
+    """Keep a prune job active when a child deletion cannot be reconciled safely."""
+
+
 class OpsService:
     def __init__(
         self,
@@ -1272,6 +1276,15 @@ class OpsService:
             request_id=request_id or uuid.uuid4().hex,
             snapshot_name=mode,
         )
+        self.db.update_job(
+            str(job["id"]),
+            result=self._new_snapshot_prune_state(
+                mode=mode,
+                retention_target=None,
+                source_job_id=None,
+            ),
+        )
+        job = self.db.get_job(str(job["id"]))
         self._mark_job_queued(vmid, job)
         return job
 
@@ -1918,6 +1931,9 @@ class OpsService:
     def _reconcile_startup_jobs(self) -> None:
         for job in self.db.active_jobs():
             operation_type = str(job.get("operation_type") or "update")
+            if operation_type == "snapshot_prune":
+                self._reconcile_snapshot_prune(job)
+                continue
             if (
                 self.host_control is not None
                 and operation_type in HOST_CONTROL_OPERATION_TYPES
@@ -1963,6 +1979,28 @@ class OpsService:
                     "failed",
                     "Agent restarted during the operation; it was not replayed",
                 )
+
+    def _reconcile_snapshot_prune(self, job: dict[str, Any]) -> None:
+        emit = self._emitter(job)
+        try:
+            result = self._execute_snapshot_prune(job, emit, reconciling=True)
+            self._finalize_operation_success(
+                self.db.get_job(str(job["id"])),
+                result,
+                enforce_snapshot_retention=False,
+            )
+        except SnapshotPruneOutcomeUnknown as exc:
+            LOGGER.warning(
+                "Snapshot prune job %s remains active pending manual reconciliation: %s",
+                job["id"],
+                exc,
+            )
+        except (ExecutorError, HostControlError, ValueError) as exc:
+            self._record_snapshot_prune_failure(job, exc)
+            self._finalize_operation_failure(
+                self.db.get_job(str(job["id"])),
+                exc,
+            )
 
     def _consume_offline_recovery_events(self) -> None:
         if self.host_control is None:
@@ -2281,8 +2319,12 @@ class OpsService:
                 }
             )
             self._save_state(vmid, state)
-            self._terminal(job, "success", "success", None)
-            self._enforce_snapshot_retention(vmid, self.db.get_job(job["id"]))
+            self._terminal_with_snapshot_retention(
+                self.db.get_job(job["id"]),
+                job_status="success",
+                result="success",
+                error=None,
+            )
             if final_apt_scan_ok and pending is not None and pending > 0:
                 self._create_followup_plan(vmid, cfg, updates)
             duration = self._best_effort_duration(job)
@@ -2364,7 +2406,16 @@ class OpsService:
             else:
                 result = self._execute_host_operation(job)
             self._finalize_operation_success(job, result)
+        except SnapshotPruneOutcomeUnknown as exc:
+            LOGGER.warning(
+                "Snapshot prune job %s remains active because its child outcome "
+                "is unknown: %s",
+                job["id"],
+                exc,
+            )
         except (ExecutorError, HostControlError, ValueError) as exc:
+            if operation_type == "snapshot_prune":
+                self._record_snapshot_prune_failure(job, exc)
             if isinstance(exc, HostControlError) and exc.status in {
                 "interrupted",
                 "not_found",
@@ -2390,6 +2441,7 @@ class OpsService:
         operation_type = str(job["operation_type"])
         self.db.update_job(job["id"], result=result)
         state = self.get_state(vmid)
+        snapshot_refreshed = False
         if operation_type.startswith("lifecycle_"):
             runtime = str(
                 result.get("lxc_status")
@@ -2422,7 +2474,6 @@ class OpsService:
                     }
                 )
             self._save_state(vmid, state)
-            snapshot_refreshed = False
             try:
                 self._refresh_snapshot_state(vmid, job=job)
                 snapshot_refreshed = True
@@ -2432,12 +2483,6 @@ class OpsService:
                     job["id"],
                     exc,
                 )
-            if (
-                operation_type in {"snapshot_create", "snapshot_create_ram"}
-                and enforce_snapshot_retention
-                and snapshot_refreshed
-            ):
-                self._enforce_snapshot_retention(vmid, job)
             if (
                 operation_type == "snapshot_rollback"
                 and str(self._resource(vmid).get("adapter") or "apt") == "apt"
@@ -2463,7 +2508,19 @@ class OpsService:
             self._save_state(vmid, state)
         else:
             self._save_state(vmid, state)
-        self._terminal(job, "success", "success", None)
+        if (
+            operation_type in {"snapshot_create", "snapshot_create_ram"}
+            and enforce_snapshot_retention
+            and snapshot_refreshed
+        ):
+            self._terminal_with_snapshot_retention(
+                self.db.get_job(str(job["id"])),
+                job_status="success",
+                result="success",
+                error=None,
+            )
+        else:
+            self._terminal(job, "success", "success", None)
 
     def _finalize_operation_failure(
         self,
@@ -2521,48 +2578,53 @@ class OpsService:
         self,
         job: dict[str, Any],
         emit: Callable[..., None],
+        *,
+        reconciling: bool = False,
     ) -> dict[str, Any]:
         vmid = int(job["vmid"])
-        mode = str(job.get("snapshot_name") or "")
-        listing = self._refresh_snapshot_state(vmid, job=job)
-        candidates = [
-            item
-            for item in reversed(listing["snapshots"])
-            if item.get("owned_by_hubinet_ops") is True
-            and not item.get("protected")
-            and item.get("delete_eligible") is True
-        ]
-        if mode == "oldest":
-            candidates = candidates[:1]
-        elif mode != "all_unprotected":
-            raise ValueError("Snapshot pruning job has an invalid mode")
-        deleted: list[str] = []
-        for index, candidate in enumerate(candidates):
-            name = str(candidate.get("name") or "")
-            refreshed = self._refresh_snapshot_state(vmid, job=job)
-            current = next(
-                (
-                    item
-                    for item in refreshed["snapshots"]
-                    if str(item.get("name") or "") == name
-                ),
-                None,
-            )
-            if (
-                current is None
-                or current.get("owned_by_hubinet_ops") is not True
-                or current.get("protected")
-                or current.get("delete_eligible") is not True
-            ):
+        state = self._load_snapshot_prune_state(job)
+        mode = str(state["mode"])
+        while str(state.get("phase")) != "completed":
+            current = state.get("current")
+            if isinstance(current, dict):
+                try:
+                    self._resume_snapshot_prune_child(
+                        job,
+                        state,
+                        reconciling=reconciling,
+                    )
+                except HostControlError as exc:
+                    if exc.status != "failed":
+                        self._hold_snapshot_prune_unknown(job, state, exc)
+                    raise
+                reconciling = False
+                state = self._load_snapshot_prune_state(
+                    self.db.get_job(str(job["id"]))
+                )
                 continue
-            self._require_host_control("Snapshot pruning").execute(
-                "snapshot_delete",
-                vmid,
-                f"{str(job['request_id'])[:96]}-{index}",
-                snapshot_name=name,
-            )
-            deleted.append(name)
-        self._refresh_snapshot_state(vmid, job=job)
+
+            state["phase"] = "selecting"
+            self._persist_snapshot_prune_state(job, state)
+            listing = self._refresh_snapshot_state(vmid, job=job)
+            candidate = self._select_snapshot_prune_candidate(state, listing)
+            if candidate is None:
+                state["phase"] = "refreshing"
+                self._persist_snapshot_prune_state(job, state)
+                self._refresh_snapshot_state(vmid, job=job)
+                state["phase"] = "completed"
+                self._persist_snapshot_prune_state(job, state)
+                break
+            name = str(candidate["name"])
+            state["current"] = {
+                "snapshot_name": name,
+                "request_id": self._snapshot_prune_child_request_id(job, name),
+                "phase": "prepared",
+            }
+            state["phase"] = "child_prepared"
+            self._persist_snapshot_prune_state(job, state)
+            reconciling = False
+
+        deleted = [str(name) for name in state.get("deleted", [])]
         emit(
             stage="snapshot_pruning",
             progress=95,
@@ -2571,6 +2633,315 @@ class OpsService:
             details={"deleted": deleted, "mode": mode},
         )
         return {"deleted": deleted, "deleted_count": len(deleted), "mode": mode}
+
+    def _new_snapshot_prune_state(
+        self,
+        *,
+        mode: str,
+        retention_target: int | None,
+        source_job_id: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "prune_version": 1,
+            "mode": mode,
+            "retention_target": retention_target,
+            "source_job_id": source_job_id,
+            "deleted": [],
+            "current": None,
+            "phase": "selecting",
+        }
+
+    def _load_snapshot_prune_state(
+        self,
+        job: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw = job.get("result")
+        if not isinstance(raw, dict) or raw.get("prune_version") != 1:
+            if str(job.get("status")) == "queued":
+                mode = str(job.get("snapshot_name") or "")
+                state = self._new_snapshot_prune_state(
+                    mode=mode,
+                    retention_target=(
+                        self._snapshot_retention_count(int(job["vmid"]))
+                        if mode == "retention"
+                        else None
+                    ),
+                    source_job_id=None,
+                )
+                self._persist_snapshot_prune_state(job, state)
+                return state
+            raise SnapshotPruneOutcomeUnknown(
+                "Active legacy prune job has no persisted child contract"
+            )
+        state = dict(raw)
+        mode = str(state.get("mode") or "")
+        if mode not in {"all_unprotected", "oldest", "retention"}:
+            raise ValueError("Snapshot pruning job has an invalid persisted mode")
+        if str(job.get("snapshot_name") or "") != mode:
+            raise ValueError("Snapshot pruning mode changed after persistence")
+        target = state.get("retention_target")
+        if mode == "retention":
+            if not isinstance(target, int) or isinstance(target, bool) or not 0 <= target <= 100:
+                raise ValueError("Snapshot pruning retention target is invalid")
+        elif target is not None:
+            raise ValueError("Manual snapshot pruning has an unexpected retention target")
+        deleted = state.get("deleted")
+        if not isinstance(deleted, list) or len(deleted) > 100:
+            raise ValueError("Snapshot pruning deleted list is invalid")
+        for name in deleted:
+            if parse_owned_snapshot_name(str(name), vmid=int(job["vmid"])) is None:
+                raise ValueError("Snapshot pruning deleted list contains an invalid snapshot")
+        current = state.get("current")
+        if current is not None:
+            if not isinstance(current, dict):
+                raise ValueError("Snapshot pruning current child is invalid")
+            name = str(current.get("snapshot_name") or "")
+            request_id = str(current.get("request_id") or "")
+            if (
+                parse_owned_snapshot_name(name, vmid=int(job["vmid"])) is None
+                or request_id != self._snapshot_prune_child_request_id(job, name)
+                or str(current.get("phase") or "")
+                not in {"prepared", "submitted", "remote_succeeded", "unknown"}
+            ):
+                raise ValueError("Snapshot pruning current child contract is invalid")
+        return state
+
+    def _persist_snapshot_prune_state(
+        self,
+        job: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        self.db.update_job(str(job["id"]), result=state)
+
+    @staticmethod
+    def _snapshot_prune_child_request_id(
+        job: dict[str, Any],
+        snapshot_name: str,
+    ) -> str:
+        digest = hashlib.sha256(snapshot_name.encode("utf-8")).hexdigest()[:20]
+        return f"prune-{str(job['id'])[:32]}-{digest}"
+
+    def _select_snapshot_prune_candidate(
+        self,
+        state: dict[str, Any],
+        listing: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        managed = [
+            item
+            for item in listing["snapshots"]
+            if item.get("owned_by_hubinet_ops") is True
+        ]
+        mode = str(state["mode"])
+        if mode == "retention":
+            target = int(state["retention_target"])
+            pool = managed[target:]
+        elif mode == "oldest":
+            if state.get("deleted"):
+                return None
+            pool = managed
+        else:
+            pool = managed
+        deleted = {str(name) for name in state.get("deleted", [])}
+        return next(
+            (
+                item
+                for item in reversed(pool)
+                if str(item.get("name") or "") not in deleted
+                and item.get("owned_by_hubinet_ops") is True
+                and item.get("protected") is not True
+                and item.get("delete_eligible") is True
+            ),
+            None,
+        )
+
+    def _resume_snapshot_prune_child(
+        self,
+        job: dict[str, Any],
+        state: dict[str, Any],
+        *,
+        reconciling: bool,
+    ) -> None:
+        vmid = int(job["vmid"])
+        current = dict(state["current"])
+        name = str(current["snapshot_name"])
+        request_id = str(current["request_id"])
+        host_control = self._require_host_control("Snapshot pruning")
+        child_phase = str(current["phase"])
+        remote_succeeded = child_phase == "remote_succeeded"
+
+        if not remote_succeeded and (reconciling or child_phase in {"submitted", "unknown"}):
+            try:
+                host_control.wait_existing_job(
+                    "snapshot_delete",
+                    vmid,
+                    request_id,
+                    snapshot_name=name,
+                )
+                remote_succeeded = True
+            except HostControlError as exc:
+                if exc.status != "not_found":
+                    raise
+                try:
+                    listing = self._refresh_snapshot_state(vmid, job=job)
+                except (ExecutorError, HostControlError, ValueError) as refresh_error:
+                    self._hold_snapshot_prune_unknown(job, state, refresh_error)
+                target = next(
+                    (
+                        item
+                        for item in listing["snapshots"]
+                        if str(item.get("name") or "") == name
+                    ),
+                    None,
+                )
+                if target is None:
+                    remote_succeeded = True
+                else:
+                    self._validate_snapshot_prune_target(vmid, name, target)
+                    current["phase"] = "submitted"
+                    state["current"] = current
+                    state["phase"] = "child_submitted"
+                    self._persist_snapshot_prune_state(job, state)
+                    host_control.execute(
+                        "snapshot_delete",
+                        vmid,
+                        request_id,
+                        snapshot_name=name,
+                    )
+                    remote_succeeded = True
+        elif not remote_succeeded:
+            listing = self._refresh_snapshot_state(vmid, job=job)
+            target = next(
+                (
+                    item
+                    for item in listing["snapshots"]
+                    if str(item.get("name") or "") == name
+                ),
+                None,
+            )
+            if target is None:
+                remote_succeeded = True
+            else:
+                self._validate_snapshot_prune_target(vmid, name, target)
+                current["phase"] = "submitted"
+                state["current"] = current
+                state["phase"] = "child_submitted"
+                self._persist_snapshot_prune_state(job, state)
+                host_control.execute(
+                    "snapshot_delete",
+                    vmid,
+                    request_id,
+                    snapshot_name=name,
+                )
+                remote_succeeded = True
+
+        if remote_succeeded:
+            current["phase"] = "remote_succeeded"
+            state["current"] = current
+            state["phase"] = "child_remote_succeeded"
+            self._persist_snapshot_prune_state(job, state)
+            try:
+                listing = self._refresh_snapshot_state(vmid, job=job)
+            except (ExecutorError, HostControlError, ValueError) as refresh_error:
+                self._hold_snapshot_prune_unknown(job, state, refresh_error)
+            if any(
+                str(item.get("name") or "") == name
+                for item in listing["snapshots"]
+            ):
+                self._hold_snapshot_prune_unknown(
+                    job,
+                    state,
+                    HostControlError(
+                        "Snapshot delete reported success but the snapshot is still present",
+                        status="contract_mismatch",
+                    ),
+                )
+            deleted = [str(item) for item in state.get("deleted", [])]
+            if name not in deleted:
+                deleted.append(name)
+            state["deleted"] = deleted
+            state["current"] = None
+            state["phase"] = "selecting"
+            self._persist_snapshot_prune_state(job, state)
+
+    @staticmethod
+    def _validate_snapshot_prune_target(
+        vmid: int,
+        name: str,
+        target: dict[str, Any],
+    ) -> None:
+        if (
+            parse_owned_snapshot_name(name, vmid=vmid) is None
+            or int(target.get("vmid") or 0) != vmid
+            or target.get("owned_by_hubinet_ops") is not True
+            or target.get("protected") is True
+            or target.get("delete_eligible") is not True
+        ):
+            raise ValueError("Snapshot is no longer eligible for managed pruning")
+
+    def _hold_snapshot_prune_unknown(
+        self,
+        job: dict[str, Any],
+        state: dict[str, Any],
+        error: ExecutorError | HostControlError | ValueError,
+    ) -> None:
+        current = state.get("current")
+        if isinstance(current, dict):
+            current = dict(current)
+            current["phase"] = "unknown"
+            state["current"] = current
+        state["phase"] = "unknown"
+        state["reconciliation_error"] = sanitize_text(error, limit=1000)
+        self._persist_snapshot_prune_state(job, state)
+        current_job = self.db.get_job(str(job["id"]))
+        event = self.db.insert_job_event(
+            job_id=str(job["id"]),
+            vmid=int(job["vmid"]),
+            level="warning",
+            stage="snapshot_pruning",
+            progress=int(current_job.get("progress") or 0),
+            event_type="snapshot_pruning_outcome_unknown",
+            message=(
+                "Snapshot deletion outcome is unknown; the durable prune job "
+                "remains active and blocks destructive operations"
+            ),
+            details={
+                "snapshot_name": (
+                    str(current.get("snapshot_name")) if isinstance(current, dict) else None
+                ),
+                "manual_intervention_required": True,
+            },
+        )
+        self.mqtt.publish_event(int(job["vmid"]), event)
+        raise SnapshotPruneOutcomeUnknown(str(error)) from error
+
+    def _record_snapshot_prune_failure(
+        self,
+        job: dict[str, Any],
+        error: ExecutorError | HostControlError | ValueError,
+    ) -> None:
+        current = self.db.get_job(str(job["id"]))
+        prune_state = (
+            dict(current["result"])
+            if isinstance(current.get("result"), dict)
+            else {}
+        )
+        event = self.db.insert_job_event(
+            job_id=str(job["id"]),
+            vmid=int(job["vmid"]),
+            level="warning",
+            stage="snapshot_pruning",
+            progress=int(current.get("progress") or 0),
+            event_type="snapshot_pruning_failed",
+            message=sanitize_text(
+                f"Managed snapshot pruning failed: {error}",
+                limit=1000,
+            ),
+            details={
+                "source_job_id": prune_state.get("source_job_id"),
+                "source_result_preserved": True,
+            },
+        )
+        self.mqtt.publish_event(int(job["vmid"]), event)
 
     def _execute_host_operation(self, job: dict[str, Any]) -> dict[str, Any]:
         operation_type = str(job["operation_type"])
@@ -2614,61 +2985,6 @@ class OpsService:
                 self.executor.run("list-snapshots", vmid, timeout=60)
             ).get("snapshots", [])
         )
-
-    def _enforce_snapshot_retention(self, vmid: int, job: dict[str, Any]) -> None:
-        retention = self._snapshot_retention_count(vmid)
-        if retention == 0:
-            return
-        try:
-            listing = self._refresh_snapshot_state(vmid, job=job)
-            managed = [
-                item
-                for item in listing["snapshots"]
-                if item.get("owned_by_hubinet_ops") is True
-            ]
-            for index, snapshot in enumerate(managed[retention:], start=retention):
-                name = str(snapshot.get("name") or "")
-                refreshed = self._refresh_snapshot_state(vmid, job=job)
-                current = next(
-                    (
-                        item
-                        for item in refreshed["snapshots"]
-                        if str(item.get("name") or "") == name
-                    ),
-                    None,
-                )
-                if (
-                    current is None
-                    or current.get("owned_by_hubinet_ops") is not True
-                    or current.get("protected")
-                    or current.get("delete_eligible") is not True
-                ):
-                    continue
-                if self.host_control is not None:
-                    self.host_control.execute(
-                        "snapshot_delete",
-                        vmid,
-                        f"retention-{str(job['id'])[:32]}-{index}",
-                        snapshot_name=name,
-                    )
-                else:
-                    self.executor.run("snapshot-delete", vmid, name, timeout=300)
-            self._refresh_snapshot_state(vmid, job=job)
-        except (ExecutorError, HostControlError, ValueError) as exc:
-            warning = sanitize_text(f"Snapshot retention pruning failed: {exc}", limit=2000)
-            LOGGER.warning("%s", warning)
-            current_job = self.db.get_job(str(job["id"]))
-            event = self.db.insert_job_event(
-                job_id=str(job["id"]),
-                vmid=vmid,
-                level="warning",
-                stage=str(current_job.get("stage") or "snapshot"),
-                progress=int(current_job.get("progress") or 0),
-                event_type="snapshot_pruning_failed",
-                message=warning,
-                details={"update_result_preserved": True},
-            )
-            self.mqtt.publish_event(vmid, event)
 
     def _validate_approved_plan(
         self,
@@ -2884,13 +3200,6 @@ class OpsService:
             )
             return
         job = current
-        operation = {
-            "success": "success",
-            "rolled_back": "rolled_back",
-            "manual_intervention": "manual_intervention",
-            "failed": "failed",
-            "interrupted": "unknown",
-        }[result]
         event = self.db.insert_job_event(
             job_id=job["id"],
             vmid=int(job["vmid"]),
@@ -2914,6 +3223,68 @@ class OpsService:
             progress=100,
             error=error,
         )
+        self._publish_terminal_transition(
+            job,
+            job_status=job_status,
+            result=result,
+            error=error,
+            event=event,
+        )
+
+    def _terminal_with_snapshot_retention(
+        self,
+        job: dict[str, Any],
+        *,
+        job_status: str,
+        result: str,
+        error: str | None,
+    ) -> dict[str, Any]:
+        retention_target = self._snapshot_retention_count(int(job["vmid"]))
+        if retention_target == 0:
+            self._terminal(job, job_status, result, error)
+            return self.db.get_job(str(job["id"]))
+        prune_request_id = f"retention-{str(job['id'])}"
+        source, prune, event = self.db.terminalize_job_with_snapshot_prune(
+            str(job["id"]),
+            source_status=job_status,
+            terminal_result=result,
+            error=error,
+            prune_request_id=prune_request_id,
+            prune_result=self._new_snapshot_prune_state(
+                mode="retention",
+                retention_target=retention_target,
+                source_job_id=str(job["id"]),
+            ),
+        )
+        self._publish_terminal_transition(
+            source,
+            job_status=job_status,
+            result=result,
+            error=error,
+            event=event,
+            next_job=prune,
+        )
+        self.mqtt.publish_job(int(prune["vmid"]), prune, force=True)
+        self._run_operation_job(self.db.next_queued_job() or prune)
+        return prune
+
+    def _publish_terminal_transition(
+        self,
+        job: dict[str, Any],
+        *,
+        job_status: str,
+        result: str,
+        error: str | None,
+        event: dict[str, Any],
+        next_job: dict[str, Any] | None = None,
+    ) -> None:
+        operation = {
+            "success": "success",
+            "rolled_back": "rolled_back",
+            "manual_intervention": "manual_intervention",
+            "failed": "failed",
+            "interrupted": "unknown",
+        }[result]
         plan_status: str | None = None
         if job.get("plan_id"):
             plan = self.db.get_plan(job["plan_id"])
@@ -2931,12 +3302,24 @@ class OpsService:
         suppress_recovery = result in {"success", "rolled_back"}
         state.update(
             {
-                "active_job_id": None,
+                "active_job_id": (
+                    str(next_job["id"]) if next_job is not None else None
+                ),
                 "last_job_id": job["id"],
-                "operation_type": job.get("operation_type", "update"),
-                "operation_status": operation,
-                "job_stage": event["stage"],
-                "job_progress": 100,
+                "operation_type": (
+                    str(next_job["operation_type"])
+                    if next_job is not None
+                    else job.get("operation_type", "update")
+                ),
+                "operation_status": (
+                    str(next_job["status"]) if next_job is not None else operation
+                ),
+                "job_stage": (
+                    str(next_job["stage"]) if next_job is not None else event["stage"]
+                ),
+                "job_progress": (
+                    int(next_job["progress"]) if next_job is not None else 100
+                ),
                 "last_operation_result": result,
                 "last_error": (
                     sanitize_text(error, limit=2000)

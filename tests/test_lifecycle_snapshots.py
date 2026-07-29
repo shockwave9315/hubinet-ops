@@ -522,9 +522,20 @@ def test_snapshot_retention_never_deletes_foreign_or_active_rollback_source(tmp_
         request_id="rollback-source-0001", snapshot_name=owned[-1]["name"],
     )
     db.update_job(source["id"], status="failed", stage="failed", progress=100)
-    current = {"id": "c" * 32, "snapshot_name": owned[0]["name"]}
+    current, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="snapshot_create",
+        request_id="retention-followup-source-0001",
+        snapshot_name=owned[0]["name"],
+    )
 
-    service._enforce_snapshot_retention(106, current)
+    service._terminal_with_snapshot_retention(
+        current,
+        job_status="success",
+        result="success",
+        error=None,
+    )
 
     remaining = {item["name"] for item in host.snapshots}
     assert "foreign-backup" in remaining

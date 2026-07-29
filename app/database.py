@@ -851,6 +851,139 @@ class Database:
             conn.execute(f"UPDATE jobs SET {assignments} WHERE id=?", values)
         return self.get_job(job_id)
 
+    def terminalize_job_with_snapshot_prune(
+        self,
+        source_job_id: str,
+        *,
+        source_status: str,
+        terminal_result: str,
+        error: str | None,
+        prune_request_id: str,
+        prune_result: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Atomically finish a source operation and enqueue its retention follow-up."""
+        if source_status not in {
+            "blocked",
+            "failed",
+            "interrupted",
+            "recovered",
+            "rolled_back",
+            "success",
+        }:
+            raise ValueError("Invalid terminal source status")
+        if terminal_result not in {
+            "failed",
+            "interrupted",
+            "manual_intervention",
+            "rolled_back",
+            "success",
+        }:
+            raise ValueError("Invalid terminal result")
+        if not REQUEST_ID_RE.fullmatch(prune_request_id):
+            raise ValueError("Invalid snapshot prune request_id")
+        now = utc_now()
+        prune_id = uuid.uuid4().hex
+        event_level = (
+            "error"
+            if terminal_result in {"failed", "manual_intervention"}
+            else "warning"
+            if terminal_result == "interrupted"
+            else "info"
+        )
+        event_stage = (
+            "completed"
+            if terminal_result in {"success", "rolled_back"}
+            else "failed"
+        )
+        event_message = sanitize_text(
+            error or f"Job finished: {terminal_result}",
+            limit=1000,
+        )
+        safe_error = sanitize_text(error, limit=2000) if error else None
+        raw_prune_result = bounded_json(prune_result)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            source = conn.execute(
+                "SELECT * FROM jobs WHERE id=?",
+                (source_job_id,),
+            ).fetchone()
+            if source is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(source_job_id)
+            if str(source["status"]) not in {"queued", "running"}:
+                conn.execute("ROLLBACK")
+                raise ValueError("Source job is already terminal")
+            other_active = conn.execute(
+                "SELECT 1 FROM jobs "
+                "WHERE status IN ('queued','running') AND id<>? LIMIT 1",
+                (source_job_id,),
+            ).fetchone()
+            if other_active is not None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Another destructive maintenance job is active")
+            existing = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
+                (int(source["vmid"]), prune_request_id),
+            ).fetchone()
+            if existing is not None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Snapshot prune handoff request_id already exists")
+            conn.execute(
+                "UPDATE jobs SET status=?,stage=?,progress=100,error=?,updated_at=? "
+                "WHERE id=?",
+                (
+                    source_status,
+                    event_stage,
+                    safe_error,
+                    now,
+                    source_job_id,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO jobs "
+                "(id,request_id,operation_type,plan_id,vmid,container_name,status,"
+                "stage,progress,snapshot_name,result,created_at,updated_at) "
+                "VALUES(?,?, 'snapshot_prune',NULL,?,?,'queued','queued',0,"
+                "'retention',?,?,?)",
+                (
+                    prune_id,
+                    prune_request_id,
+                    int(source["vmid"]),
+                    str(source["container_name"]),
+                    raw_prune_result,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO job_events"
+                "(job_id,vmid,created_at,level,stage,progress,event_type,message,"
+                "details_json) VALUES(?,?,?,?,?,100,?,?,?)",
+                (
+                    source_job_id,
+                    int(source["vmid"]),
+                    now,
+                    event_level,
+                    event_stage,
+                    f"job_{terminal_result}",
+                    event_message,
+                    bounded_json(
+                        {
+                            "snapshot_prune_job_id": prune_id,
+                            "snapshot_prune_request_id": prune_request_id,
+                        },
+                        limit=16_000,
+                    ),
+                ),
+            )
+            event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute("COMMIT")
+        return (
+            self.get_job(source_job_id),
+            self.get_job(prune_id),
+            self.get_job_event(event_id),
+        )
+
     def upsert_container_state(self, vmid: int, payload: dict[str, Any]) -> dict[str, Any]:
         updated_at = utc_now()
         payload = normalize_state(payload)
