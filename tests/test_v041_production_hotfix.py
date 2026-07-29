@@ -969,6 +969,15 @@ def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
         'cat > "$case_root/fake-bin/scp"',
         "unsupported fake ssh invocation",
         "unsupported fake scp invocation",
+        "install-failure-no-restart",
+        "initial-restart-failure-rollback-restart-success",
+        "initial-restart-failure-rollback-restart-failure",
+        "success-hostname",
+        "success-ipv4",
+        "success-ipv6",
+        "TEST_EXPECTED_SSH_TARGET",
+        "TEST_EXPECTED_SCP_TARGET",
+        "REJECTED_SSH",
         '"$ROOT/scripts/validate_hermetic_shell_boundary.py"',
         '"$ROOT/deploy/install-ha-0.4.1-from-pve.sh"',
         "0.4.1 HA installer runtime smoke: passed",
@@ -976,7 +985,14 @@ def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
         assert marker in ha_smoke
     assert ha_smoke.index(
         '"$ROOT/scripts/validate_hermetic_shell_boundary.py"'
-    ) < ha_smoke.index("run_case success-no-restart")
+    ) < ha_smoke.index("assert_success_target")
+    for loose_match in (
+        "*test -s /config/secrets.yaml*",
+        "*install -d -m 0700 *",
+        "*install -m 0644 /config/packages/hubinet_ops.yaml.new*",
+        "*ha core restart*",
+    ):
+        assert loose_match not in ha_smoke
     assert runner.index("docker run --rm") < runner.index(
         "runtime_smoke_sandbox_entrypoint.sh"
     )
