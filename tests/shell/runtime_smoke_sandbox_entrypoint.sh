@@ -81,3 +81,5 @@ PY
 echo "sandbox self-test: passed"
 /bin/bash /repo/tests/shell/runtime_smoke_0_4_1.sh
 /bin/bash /repo/tests/shell/runtime_smoke_ha_0_4_1.sh
+/bin/bash /repo/tests/shell/runtime_smoke_0_4_2.sh
+/bin/bash /repo/tests/shell/runtime_smoke_ha_0_4_2.sh

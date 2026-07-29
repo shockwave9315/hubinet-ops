@@ -1,8 +1,8 @@
-# Hubinet Ops 0.4.1
+# Hubinet Ops 0.4.2
 
-Hubinet Ops is a policy-controlled Proxmox inventory, telemetry, lifecycle, snapshot, and manually approved APT maintenance service. Version 0.4.1 hardens the production 0.4.0 rollout while keeping VM100 Home Assistant observation-only.
+Hubinet Ops is a policy-controlled Proxmox inventory, telemetry, lifecycle, snapshot, and manually approved APT maintenance service. Version 0.4.2 stabilizes the production 0.4.1 release with coherent snapshot state and retention, a responsive Polish Home Assistant UI, bounded MQTT telemetry churn, and guarded QEMU snapshots for VM100.
 
-The production inventory remains exactly VM/CT 100–110. CT101–CT109 use the versioned `hubinet-maint` 0.4.1 compatibility contract for APT operations. Lifecycle and Hubinet-owned snapshots are available for CT101–CT110. CT110 uses an independent PVE `hubinet-ops-hostd`, so Home Assistant can start it while its in-guest API is offline.
+The production inventory remains exactly VM/CT 100–110. CT101–CT109 retain the `hubinet-maint` 0.4.1/protocol 1 compatibility contract because 0.4.2 does not change that protocol. Lifecycle and Hubinet-owned snapshots are available for CT101–CT110. VM100 remains observation-only except for typed create/list/delete of Hubinet-owned QEMU snapshots; update, lifecycle, and restore stay blocked.
 
 ## Safety model
 
@@ -30,8 +30,8 @@ The production inventory remains exactly VM/CT 100–110. CT101–CT109 use the 
 - `deploy/install-ha-0.3.1-from-pve.sh`: transactional package/dashboard patch; checks but never restarts HA.
 - `deploy/upgrade-0.4.0-from-pve.sh`: transactional hostd/wrapper, CT101–CT109 executor/profile, CT110 application/config/database rollout.
 - `deploy/install-ha-0.4.0-from-pve.sh`: transactional HA package/dashboard rollout with `ha core check` and no automatic restart.
-- `deploy/upgrade-0.4.1-from-pve.sh`: 0.3.2/0.4.0 → 0.4.1 production hotfix with rc=129 retry, strict hostd sandbox paths, fresh telemetry diagnostics, and schema 400 preservation.
-- `deploy/install-ha-0.4.1-from-pve.sh`: complete HA secrets/endpoint preflight, transactional package/dashboard install, and optional `--restart-core`.
+- `deploy/upgrade-0.4.2-from-pve.sh`: 0.4.1 → 0.4.2 transactional production stabilization with schema 400 preservation.
+- `deploy/install-ha-0.4.2-from-pve.sh`: complete HA secrets/endpoint preflight, transactional package/dashboard install, and optional `--restart-core`.
 
 ## Local validation
 
@@ -42,8 +42,8 @@ python -m py_compile deploy/managed/hubinet-maint deploy/pve/hubinet_ops_host_co
 python scripts/validate_managed_profiles.py
 python scripts/validate_yaml.py
 python scripts/generate_ha_dashboard.py --check
-bash -n deploy/upgrade-0.4.1-from-pve.sh
-bash -n deploy/install-ha-0.4.1-from-pve.sh
+bash -n deploy/upgrade-0.4.2-from-pve.sh
+bash -n deploy/install-ha-0.4.2-from-pve.sh
 bash -n deploy/pve/hubinet-ops-host
 # CI-only sandbox manager: tests/shell/run_runtime_smoke_sandbox.sh
 python scripts/check_tracked_files.py
@@ -55,4 +55,4 @@ system sandbox manager only on a controlled ephemeral GitHub-hosted runner with 
 workflow-owned `HUBINET_OPS_EPHEMERAL_CI=1` marker. Never invoke the internal
 `runtime_smoke_0_4_1.sh` directly.
 
-See [0.4.0 design](docs/design-0.4.0.md), [architecture](docs/architecture.md), [API](docs/api.md), [security](docs/security.md), [resource adapters](docs/resource-adapters.md), [production inventory](docs/production-inventory.md), [MQTT](docs/mqtt.md), [Home Assistant](docs/home-assistant.md), and the [0.4.1 rollout guide](docs/upgrade-0.4.1.md).
+See [0.4.0 design](docs/design-0.4.0.md), [architecture](docs/architecture.md), [API](docs/api.md), [security](docs/security.md), [resource adapters](docs/resource-adapters.md), [production inventory](docs/production-inventory.md), [MQTT](docs/mqtt.md), [Home Assistant](docs/home-assistant.md), and the [0.4.2 rollout guide](docs/upgrade-0.4.2.md).

@@ -65,7 +65,7 @@ def _fresh_payload() -> dict:
 
 
 def test_041_version_and_database_schema_contract() -> None:
-    assert 'VERSION = "0.4.1"' in (ROOT / "app" / "mqtt.py").read_text(
+    assert 'VERSION = "0.4.2"' in (ROOT / "app" / "mqtt.py").read_text(
         encoding="utf-8"
     )
     assert 'EXECUTOR_VERSION = "0.4.1"' in (
@@ -74,7 +74,7 @@ def test_041_version_and_database_schema_contract() -> None:
     assert 'VERSION = "0.4.1"' in (
         ROOT / "deploy" / "managed" / "hubinet-maint"
     ).read_text(encoding="utf-8")
-    assert 'VERSION = "0.4.1"' in (
+    assert 'VERSION = "0.4.2"' in (
         ROOT / "deploy" / "pve" / "hubinet_ops_hostd.py"
     ).read_text(encoding="utf-8")
     assert "PRAGMA user_version=400" in (

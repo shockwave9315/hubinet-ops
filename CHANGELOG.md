@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.2
+
+- refresh and confirm canonical snapshot state after every mutation, blocking package changes when a pre-update snapshot cannot be confirmed;
+- add managed snapshot inventory, protection-aware retention, explicit pruning jobs, and safe bulk deletion;
+- return structured self-update conflicts and surface missing staged releases clearly in Home Assistant;
+- rebuild the generated dashboard as a responsive Polish operational center with semantic status presentation and readable byte units;
+- suppress insignificant MQTT CPU churn with a 0.5 percentage-point deadband and five-minute heartbeat while preserving immediate safety transitions;
+- allow VM100 only typed QEMU snapshot create/list/delete operations, with optional RAM state and no update, lifecycle, or restore expansion;
+- add transactional 0.4.1 → 0.4.2 backend/PVE and Home Assistant installers while preserving SQLite schema 400 and executor contract 0.4.1/protocol 1.
+
 ## 0.4.1
 
 - allow hostd to write LXC `rules.seccomp.tmp` files under `/var/lib/lxc` while retaining `ProtectSystem=strict`;

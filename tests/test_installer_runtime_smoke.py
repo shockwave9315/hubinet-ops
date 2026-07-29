@@ -54,3 +54,11 @@ def test_current_release_installer_runtime_smoke() -> None:
         "0.4.1 HA installer runtime smoke: passed"
         in result.stdout.splitlines()
     )
+    assert (
+        "0.4.2 runtime smoke: success, retry and cross-layer rollback passed"
+        in result.stdout.splitlines()
+    )
+    assert (
+        "0.4.2 HA installer runtime smoke: passed"
+        in result.stdout.splitlines()
+    )

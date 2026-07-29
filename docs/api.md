@@ -1,4 +1,4 @@
-# REST API 0.4.1
+# REST API 0.4.2
 
 Every `/api/v1` route requires `Authorization: Bearer …`. Unknown resources return 404. Policy, compatibility, state, ownership, idempotency, or concurrency conflicts return an explicit 409; no endpoint accepts command text.
 

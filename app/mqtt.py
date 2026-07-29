@@ -21,7 +21,7 @@ from .security import sanitize_data, sanitize_text
 from .mqtt_budget import bounded_attributes, bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 
 @dataclass(frozen=True)
