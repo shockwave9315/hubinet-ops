@@ -1356,6 +1356,38 @@ def test_ha_secret_contract_reports_all_missing_and_rejects_legacy_urls() -> Non
     }
 
 
+@pytest.mark.parametrize("source", ["-", "file"])
+def test_ha_secret_validator_accepts_stdin_and_file_path(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    example = (
+        ROOT / "home-assistant" / "secrets.example.yaml"
+    ).read_text(encoding="utf-8")
+    command = [sys.executable, str(ROOT / "scripts" / "validate_ha_secrets_0_4_1.py")]
+    if source == "-":
+        command.append("-")
+        input_text = example
+    else:
+        secrets_file = tmp_path / "secrets.yaml"
+        secrets_file.write_text(example, encoding="utf-8")
+        command.append(str(secrets_file))
+        input_text = None
+
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+
+
 def test_ha_installer_has_safe_optional_core_restart_workflow() -> None:
     text = HA_INSTALLER.read_text(encoding="utf-8")
     assert "[--restart-core]" in text
@@ -1365,10 +1397,150 @@ def test_ha_installer_has_safe_optional_core_restart_workflow() -> None:
     assert "ha core info --raw-json" in text
     assert "new scripts are unavailable until Core is restarted" in text
     assert "SUPERVISOR_TOKEN" not in text
+    assert """ssh "${SSH_ARGS[@]}" 'cat /config/secrets.yaml' |""" in text
+    assert 'validate_ha_secrets_0_4_1.py" -' in text
+    assert 'ssh "${SSH_ARGS[@]}" "python3' not in text
     assert not any(
         command in text
         for command in ("pct start 100", "pct stop 100", "qm start 100", "qm stop 100")
     )
+
+
+def _run_ha_secrets_preflight(
+    tmp_path: Path,
+    *,
+    secrets_text: str,
+    fail_secret_read: bool = False,
+    restart_requested: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is unavailable on this platform")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    secrets_path = tmp_path / "remote-secrets.yaml"
+    secrets_path.write_text(secrets_text, encoding="utf-8")
+    event_log = tmp_path / "events.log"
+    for name, body in {
+        "scp": (
+            "#!/usr/bin/env bash\n"
+            'echo "scp $*" >> "$HUBINET_OPS_TEST_EVENT_LOG"\n'
+        ),
+        "ssh": """#!/usr/bin/env bash
+set -Eeuo pipefail
+remote="${@: -1}"
+printf 'ssh <%s>\\n' "$remote" >> "$HUBINET_OPS_TEST_EVENT_LOG"
+if [[ "$remote" == *python3* ]]; then
+  echo "python3 is unavailable on Home Assistant OS" >&2
+  exit 127
+fi
+if [[ "$remote" == "cat /config/secrets.yaml" ]]; then
+  if [[ "$HUBINET_OPS_TEST_FAIL_SECRET_READ" == 1 ]]; then
+    echo "simulated SSH read failure" >&2
+    exit 42
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\\n' "$line"
+  done < "$HUBINET_OPS_TEST_SECRETS_PATH"
+fi
+exit 0
+""",
+    }.items():
+        stub = fake_bin / name
+        stub.write_text(body, encoding="utf-8", newline="\n")
+        stub.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    env["HUBINET_OPS_TEST_MODE"] = "1"
+    env["HUBINET_OPS_TEST_EVENT_LOG"] = str(event_log)
+    env["HUBINET_OPS_TEST_SECRETS_PATH"] = str(secrets_path)
+    env["HUBINET_OPS_TEST_FAIL_SECRET_READ"] = "1" if fail_secret_read else "0"
+    command = [bash, str(HA_INSTALLER)]
+    if restart_requested:
+        command.append("--restart-core")
+    command.extend(["home-assistant.local", "2222"])
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    events = event_log.read_text(encoding="utf-8").splitlines()
+    return completed, events
+
+
+@pytest.mark.parametrize("restart_requested", [False, True])
+def test_ha_installer_validates_remote_secrets_locally_without_remote_python(
+    tmp_path: Path,
+    restart_requested: bool,
+) -> None:
+    example = (
+        ROOT / "home-assistant" / "secrets.example.yaml"
+    ).read_text(encoding="utf-8")
+    completed, events = _run_ha_secrets_preflight(
+        tmp_path,
+        secrets_text=example,
+        restart_requested=restart_requested,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert events.count("ssh <cat /config/secrets.yaml>") == 1
+    assert not any("python3" in event for event in events)
+    restart_calls = [event for event in events if "ha core restart" in event]
+    assert len(restart_calls) == int(restart_requested)
+    assert (
+        "Home Assistant Core was restarted"
+        if restart_requested
+        else "Home Assistant Core was not restarted"
+    ) in completed.stdout
+
+
+def test_ha_installer_rejects_missing_secret_before_backup_without_leaking_input(
+    tmp_path: Path,
+) -> None:
+    secret_marker = "do-not-print-this-secret"
+    example = (
+        ROOT / "home-assistant" / "secrets.example.yaml"
+    ).read_text(encoding="utf-8")
+    incomplete = "\n".join(
+        line
+        for line in example.splitlines()
+        if not line.startswith("hubinet_ops_force_stop_url:")
+    )
+    incomplete += f"\nunused_secret_marker: {secret_marker}\n"
+
+    completed, events = _run_ha_secrets_preflight(
+        tmp_path,
+        secrets_text=incomplete,
+    )
+
+    assert completed.returncode != 0
+    assert "hubinet_ops_force_stop_url" in completed.stderr
+    assert secret_marker not in completed.stdout
+    assert secret_marker not in completed.stderr
+    assert not any("backup.complete" in event for event in events)
+    assert not any(event.startswith("scp ") for event in events)
+    assert not any("before-0.4.1/secrets.yaml" in event for event in events)
+
+
+def test_ha_installer_stops_when_ssh_secret_read_fails(
+    tmp_path: Path,
+) -> None:
+    completed, events = _run_ha_secrets_preflight(
+        tmp_path,
+        secrets_text="not-read: true\n",
+        fail_secret_read=True,
+    )
+
+    assert completed.returncode != 0
+    assert "simulated SSH read failure" in completed.stderr
+    assert not any("backup.complete" in event for event in events)
+    assert not any(event.startswith("scp ") for event in events)
+    assert not any("before-0.4.1/secrets.yaml" in event for event in events)
 
 
 def test_ha_installer_normalizes_scp_target_for_ipv6() -> None:

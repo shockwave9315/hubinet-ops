@@ -69,12 +69,29 @@ def main() -> int:
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} SECRETS_FILE", file=sys.stderr)
         return 2
-    path = Path(sys.argv[1])
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        print(f"Cannot read Home Assistant secrets file: {exc}", file=sys.stderr)
-        return 1
+    source = sys.argv[1]
+    if source == "-":
+        try:
+            text = sys.stdin.buffer.read().decode("utf-8")
+        except UnicodeError:
+            print(
+                "Cannot read Home Assistant secrets from stdin: invalid UTF-8",
+                file=sys.stderr,
+            )
+            return 1
+        except OSError as exc:
+            print(
+                f"Cannot read Home Assistant secrets from stdin: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        path = Path(source)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"Cannot read Home Assistant secrets file: {exc}", file=sys.stderr)
+            return 1
     errors = validate(text)
     if errors:
         print("\n".join(errors), file=sys.stderr)
