@@ -45,6 +45,8 @@ mqtt:
   reconnect_min_seconds: 2
   reconnect_max_seconds: 60
   retain_state: true
+  cpu_publish_deadband_percent: 0.5
+  telemetry_heartbeat_seconds: 300
 
 home_assistant:
   webhook_url: ""

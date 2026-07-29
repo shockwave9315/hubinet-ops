@@ -473,6 +473,22 @@ def validate_config(raw: dict[str, Any]) -> None:
         raise RuntimeError("MQTT reconnect delays must be positive")
     if reconnect_min > reconnect_max:
         raise RuntimeError("mqtt.reconnect_min_seconds cannot exceed reconnect_max_seconds")
+    cpu_deadband = _finite_float(
+        mqtt.get("cpu_publish_deadband_percent", 0.5),
+        "mqtt.cpu_publish_deadband_percent",
+    )
+    if cpu_deadband < 0.1 or cpu_deadband > 100:
+        raise RuntimeError(
+            "mqtt.cpu_publish_deadband_percent must be between 0.1 and 100"
+        )
+    telemetry_heartbeat = _strict_int(
+        mqtt.get("telemetry_heartbeat_seconds", 300),
+        "mqtt.telemetry_heartbeat_seconds",
+    )
+    if telemetry_heartbeat < 60 or telemetry_heartbeat > 3600:
+        raise RuntimeError(
+            "mqtt.telemetry_heartbeat_seconds must be between 60 and 3600"
+        )
 
     host_control = raw.get("host_control") or {}
     if not isinstance(host_control, dict):
