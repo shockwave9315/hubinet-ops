@@ -136,6 +136,22 @@ rest_command:
       {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-delete"}
     timeout: 30
 
+  hubinet_ops_snapshot_delete_oldest:
+    url: !secret hubinet_ops_snapshot_delete_oldest_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-delete-oldest"}
+    timeout: 30
+
+  hubinet_ops_snapshot_delete_unprotected:
+    url: !secret hubinet_ops_snapshot_delete_unprotected_url
+    method: POST
+    headers: *hubinet_auth_headers
+    payload: >-
+      {"request_id":"ha-{{ utcnow().strftime('%Y%m%dT%H%M%S') }}-{{ vmid | int }}-snap-delete-unprotected","confirm":"DELETE_ALL_UNPROTECTED"}
+    timeout: 30
+
   hubinet_ops_host_start:
     url: !secret hubinet_ops_host_start_url
     method: POST
@@ -300,6 +316,36 @@ script:
               response: {status: 409, content: {detail: "Brak snapshotu Hubinet Ops do usunięcia"}}
       - action: script.hubinet_ops_report_action
         data: {vmid: "{{ vmid | int }}", action_name: "usunięcie snapshotu", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_snapshot_delete_oldest:
+    alias: "Hubinet Ops — usuń najstarszy niechroniony snapshot"
+    mode: single
+    fields: *lifecycle_vmid_field
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_snapshot_delete_oldest
+        data: {vmid: "{{ vmid | int }}"}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data:
+          vmid: "{{ vmid | int }}"
+          action_name: "usunięcie najstarszego snapshota"
+          response: "{{ response | default({}) }}"
+
+  hubinet_ops_snapshot_delete_unprotected:
+    alias: "Hubinet Ops — usuń wszystkie niechronione snapshoty"
+    mode: single
+    fields: *lifecycle_vmid_field
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_snapshot_delete_unprotected
+        data: {vmid: "{{ vmid | int }}"}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data:
+          vmid: "{{ vmid | int }}"
+          action_name: "usunięcie niechronionych snapshotów"
+          response: "{{ response | default({}) }}"
 
   hubinet_ops_offline_snapshot_restore_ct110:
     alias: "Hubinet Ops — AWARYJNE przywrócenie CT110 offline"

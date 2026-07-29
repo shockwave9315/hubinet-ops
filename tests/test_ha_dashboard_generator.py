@@ -173,13 +173,13 @@ def test_mushroom_chips_use_semantic_colors_without_generic_red_fallback() -> No
         and "badge_color" in item
     )
     assert "degraded" in status_card["badge_color"]
-    assert "amber" in status_card["badge_color"]
+    assert "yellow" in status_card["badge_color"]
 
 
 def test_vm100_has_qemu_metrics_but_no_apt_or_controls() -> None:
     text = _text(_view(_dashboard(), "vm-100"))
 
-    assert "QEMU Guest Agent" in text
+    assert "Agent gościa QEMU" in text
     assert "sensor.hubinet_ops_vm100_guest_agent" in text
     assert "sensor.hubinet_ops_vm100_ip_addresses" in text
     assert "pending_update_count" not in text
@@ -202,7 +202,7 @@ def test_ct110_has_only_supported_self_metrics() -> None:
     for unsupported in ("cpu_usage", "network_received", "network_sent"):
         assert f"sensor.hubinet_ops_ct110_{unsupported}" not in text
     assert "pending_update_count" not in text
-    assert text.count("perform-action") == 13
+    assert text.count("perform-action") == 15
     assert "script.hubinet_ops_self_update" in text
     assert "script.hubinet_ops_approve_container" in text
     assert "script.hubinet_ops_reject_container" in text
@@ -235,7 +235,7 @@ def test_all_lxc_views_have_policy_scoped_controls_and_vm100_has_none() -> None:
             and (item.get("card") or {}).get("tap_action", {}).get("perform_action")
         }
         assert services == apt_services
-        assert _text(view).count("perform-action") == 12
+        assert _text(view).count("perform-action") == 14
     assert "perform-action" not in _text(_view(data, "vm-100"))
     assert "Tryb obserwacji" in _text(_view(data, "vm-100"))
 
@@ -309,7 +309,7 @@ def test_apt_views_have_resources_updates_verification_packages_and_optional_doc
     data = _dashboard()
     apt = _text(_view(data, "ct-101"))
     for title in (
-        "Zasoby", "Aktualizacje", "Historia i diagnostyka", "Pakiety i logi", "Logi live",
+        "Zasoby", "Aktualizacje", "Historia i diagnostyka", "Pakiety i logi", "Logi na żywo",
     ):
         assert title in apt
     assert "Weryfikacja końcowa" in apt

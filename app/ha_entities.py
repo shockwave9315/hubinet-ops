@@ -76,7 +76,7 @@ def _numeric(
     )
 
 
-def _gib_numeric(
+def _byte_numeric(
     key: str,
     suffix: str,
     name: str,
@@ -91,11 +91,11 @@ def _gib_numeric(
         (
             "{{ none if "
             f"{path} is not defined or {path} is none "
-            f"else (({path} | float) / 1073741824) | round(2) }}}}"
+            f"else ({path} | int) }}}}"
         ),
         {
             "device_class": "data_size",
-            "unit_of_measurement": "GiB",
+            "unit_of_measurement": "B",
             "state_class": state_class,
         },
     )
@@ -223,6 +223,7 @@ APT_ENTITY_SPECS = (
     _timestamp("last_scan", "last_scan", "Last scan", "value_json.last_scan"),
     _timestamp("last_refresh", "last_refresh", "Last refresh", "value_json.last_refresh"),
     _timestamp("last_update", "last_update", "Last update", "value_json.last_update"),
+    _timestamp("last_terminal_at", "last_terminal_at", "Last terminal operation", "value_json.last_terminal_at"),
     _text("last_error", "last_error", "Last error", "value_json.last_error", "none"),
     _text("last_operation_result", "last_operation_result", "Last operation result", "value_json.last_operation_result", "none"),
     EntitySpec("rollback_allowed", "rollback_allowed", "Rollback allowed", "{{ 'allowed' if value_json.rollback_allowed else 'blocked' }}"),
@@ -267,12 +268,12 @@ QEMU_ENTITY_SPECS = (
     _numeric("uptime_seconds", "uptime", "Uptime", "value_json.uptime_seconds", "s"),
     _numeric("cpu_usage", "cpu_usage", "CPU usage", "value_json.cpu.usage_percent", "%"),
     EntitySpec("cpu_cores", "cpu_cores", "CPU cores", "{{ value_json.cpu.cores | default(none) }}"),
-    _gib_numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes"),
-    _gib_numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes"),
-    _gib_numeric("disk_used_bytes", "disk_used", "Disk used", "value_json.disk.used_bytes"),
-    _gib_numeric("disk_total_bytes", "disk_total", "Disk total", "value_json.disk.total_bytes"),
-    _gib_numeric("network_in_bytes", "network_received", "Network received", "value_json.network.in_bytes", state_class="total_increasing"),
-    _gib_numeric("network_out_bytes", "network_sent", "Network sent", "value_json.network.out_bytes", state_class="total_increasing"),
+    _byte_numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes"),
+    _byte_numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes"),
+    _byte_numeric("disk_used_bytes", "disk_used", "Disk used", "value_json.disk.used_bytes"),
+    _byte_numeric("disk_total_bytes", "disk_total", "Disk total", "value_json.disk.total_bytes"),
+    _byte_numeric("network_in_bytes", "network_received", "Network received", "value_json.network.in_bytes", state_class="total_increasing"),
+    _byte_numeric("network_out_bytes", "network_sent", "Network sent", "value_json.network.out_bytes", state_class="total_increasing"),
     _text("guest_agent_status", "guest_agent", "Guest Agent", "value_json.guest_agent_status", "unknown", empty_is_missing=False),
     _text("ip_addresses", "ip_addresses", "Primary IP", "value_json.primary_ip_address", "unknown"),
     _timestamp("last_refresh", "last_refresh", "Last refresh", "value_json.last_refresh"),
@@ -288,12 +289,12 @@ AGENT_SELF_ENTITY_SPECS = (
     _numeric("uptime_seconds", "uptime", "Uptime", "value_json.uptime_seconds", "s"),
     EntitySpec("cpu_cores", "cpu_cores", "CPU cores", "{{ value_json.cpu.cores | default(none) }}"),
     EntitySpec("cpu_load_1m", "cpu_load_1m", "CPU load 1m", "{{ value_json.cpu.load_1m | default(none) }}"),
-    _gib_numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes"),
-    _gib_numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes"),
-    _gib_numeric("memory_available_bytes", "memory_available", "Memory available", "value_json.memory.available_bytes"),
-    _gib_numeric("disk_used_bytes", "disk_used", "Disk used", "value_json.disk.used_bytes"),
-    _gib_numeric("disk_total_bytes", "disk_total", "Disk total", "value_json.disk.total_bytes"),
-    _gib_numeric("disk_free_bytes", "disk_free", "Disk free", "value_json.disk.free_bytes"),
+    _byte_numeric("memory_used_bytes", "memory_used", "Memory used", "value_json.memory.used_bytes"),
+    _byte_numeric("memory_total_bytes", "memory_total", "Memory total", "value_json.memory.total_bytes"),
+    _byte_numeric("memory_available_bytes", "memory_available", "Memory available", "value_json.memory.available_bytes"),
+    _byte_numeric("disk_used_bytes", "disk_used", "Disk used", "value_json.disk.used_bytes"),
+    _byte_numeric("disk_total_bytes", "disk_total", "Disk total", "value_json.disk.total_bytes"),
+    _byte_numeric("disk_free_bytes", "disk_free", "Disk free", "value_json.disk.free_bytes"),
     _text("service_status", "service_status", "Service status", "value_json.service_status", "unknown", empty_is_missing=False),
     _text("api_health", "api_health", "API health", "value_json.api_health", "unknown", empty_is_missing=False),
     _text("agent_version", "agent_version", "Agent version", "value_json.agent_version", "unknown", empty_is_missing=False),
@@ -302,6 +303,8 @@ AGENT_SELF_ENTITY_SPECS = (
     _text("last_error", "last_error", "Last error", "value_json.last_error", "none"),
     EntitySpec("operation_status", "operation_status", "Operation status", "{{ value_json.operation_status | default('idle') }}"),
     _text("operation_type", "operation_type", "Operation type", "value_json.operation_type", "none"),
+    _text("last_operation_result", "last_operation_result", "Last operation result", "value_json.last_operation_result", "none"),
+    _timestamp("last_terminal_at", "last_terminal_at", "Last terminal operation", "value_json.last_terminal_at"),
     _text("active_plan_id", "active_plan_id", "Active plan ID", "value_json.active_plan_id", "none"),
     _text("active_plan_status", "active_plan_status", "Active plan status", "value_json.active_plan_status", "none"),
     _text("self_update_release_id", "self_update_release_id", "Self-update release ID", "value_json.self_update_release_id", "none"),

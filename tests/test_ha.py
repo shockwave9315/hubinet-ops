@@ -285,7 +285,7 @@ def test_ct110_direct_host_commands_are_limited_to_start_and_explicit_recovery()
 def test_dashboard_has_bounded_safe_reverse_chronological_logs_and_packages() -> None:
     text = DASHBOARD.read_text(encoding="utf-8")
 
-    assert text.count("title: Logi live") == 9
+    assert text.count("title: Logi na żywo") == 9
     assert text.count("recent_job_events") >= 9
     assert text.count("events[-10:] | reverse") == 9
     assert text.count("replace(''|'', ''¦'')") == 10

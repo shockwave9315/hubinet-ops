@@ -349,6 +349,15 @@ class HostController:
             (item.get("cpu") for item in resources if _same_vmid(item.get("vmid"), vmid)),
             None,
         ))
+        raw_disk_used = current.get("disk")
+        try:
+            disk_used = int(raw_disk_used) if raw_disk_used is not None else None
+        except (TypeError, ValueError):
+            disk_used = None
+        # Proxmox reports disk=0 for QEMU guests when it has no filesystem
+        # usage source. Zero is therefore unknown here, not a measured 0 B.
+        if disk_used is not None and disk_used <= 0:
+            disk_used = None
         return {
             **status,
             "adapter": "haos",
@@ -358,7 +367,11 @@ class HostController:
             "uptime_seconds": max(0, int(current.get("uptime") or 0)),
             "cpu": {"usage": cpu, "cores": current.get("cpus")},
             "memory": {"used_bytes": current.get("mem"), "total_bytes": current.get("maxmem")},
-            "disk": {"used_bytes": current.get("disk"), "total_bytes": current.get("maxdisk")},
+            "disk": {
+                "used_bytes": disk_used,
+                "total_bytes": current.get("maxdisk"),
+                "usage_known": disk_used is not None,
+            },
             "network": {"in_bytes": current.get("netin"), "out_bytes": current.get("netout")},
         }
 

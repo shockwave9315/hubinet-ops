@@ -162,10 +162,12 @@ def test_dashboard_policy_controls_verification_recovery_and_navigation_only_pus
         assert service in ct101
     for label in ("Uruchom", "Wyłącz łagodnie", "Uruchom ponownie"):
         assert f"primary: {label}" in ct106
-    for forbidden in ("destroy", "terminal", "console"):
+    for forbidden in ("destroy", "console"):
         assert forbidden not in dashboard.lower()
+    assert "perform_action: terminal" not in dashboard.lower()
+    assert "navigation_path: terminal" not in dashboard.lower()
     assert "title: Weryfikacja końcowa" in ct106
-    assert "title: Recovery scan" in ct106
+    assert "title: Skan odzyskiwania" in ct106
     assert "confirmation:" in ct106
     assert "recovery_notification_suppressed_until" in package
     assert "state_attr(trigger.entity_id, 'recovery_notification_suppressed_until')" in package
