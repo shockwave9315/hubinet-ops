@@ -2,10 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 import json
-import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 
@@ -36,6 +34,7 @@ SANDBOX_ENTRYPOINT = (
     ROOT / "tests" / "shell" / "runtime_smoke_sandbox_entrypoint.sh"
 )
 RUNTIME_SMOKE = ROOT / "tests" / "shell" / "runtime_smoke_0_4_1.sh"
+HA_RUNTIME_SMOKE = ROOT / "tests" / "shell" / "runtime_smoke_ha_0_4_1.sh"
 
 
 def _resources() -> dict[int, dict]:
@@ -919,6 +918,7 @@ def test_hermetic_shell_boundary_allows_controlled_references(
 
 def test_current_upgrade_passes_hermetic_shell_boundary() -> None:
     assert validate_file(PVE_INSTALLER) == []
+    assert validate_file(HA_INSTALLER) == []
 
 
 def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
@@ -932,6 +932,7 @@ def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
     runner = SANDBOX_RUNNER.read_text(encoding="utf-8")
     entrypoint = SANDBOX_ENTRYPOINT.read_text(encoding="utf-8")
     smoke = RUNTIME_SMOKE.read_text(encoding="utf-8")
+    ha_smoke = HA_RUNTIME_SMOKE.read_text(encoding="utf-8")
 
     assert "SANDBOX_RUNNER" in pytest_wrapper
     assert "runtime_smoke_0_4_1.sh" not in pytest_wrapper
@@ -953,9 +954,44 @@ def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
     assert entrypoint.index("sandbox self-test: passed") < entrypoint.index(
         "runtime_smoke_0_4_1.sh"
     )
+    assert entrypoint.index("runtime_smoke_0_4_1.sh") < entrypoint.index(
+        "runtime_smoke_ha_0_4_1.sh"
+    )
+    assert "exec /bin/bash" not in entrypoint
+    for marker in (
+        "HUBINET_OPS_SYSTEM_SANDBOX",
+        '[[ "$(id -u)" != 0 ]]',
+        'isolated_path="$case_root/fake-bin:$case_root/safe-bin"',
+        '"$REAL_ENV" -i',
+        'PATH="$isolated_path"',
+        'ln -s "$REAL_PYTHON" "$case_root/fake-bin/python3"',
+        'cat > "$case_root/fake-bin/ssh"',
+        'cat > "$case_root/fake-bin/scp"',
+        "unsupported fake ssh invocation",
+        "unsupported fake scp invocation",
+        '"$ROOT/scripts/validate_hermetic_shell_boundary.py"',
+        '"$ROOT/deploy/install-ha-0.4.1-from-pve.sh"',
+        "0.4.1 HA installer runtime smoke: passed",
+    ):
+        assert marker in ha_smoke
+    assert ha_smoke.index(
+        '"$ROOT/scripts/validate_hermetic_shell_boundary.py"'
+    ) < ha_smoke.index("run_case success-no-restart")
     assert runner.index("docker run --rm") < runner.index(
         "runtime_smoke_sandbox_entrypoint.sh"
     )
+
+
+def test_ha_installer_is_not_executed_by_host_pytest() -> None:
+    source = Path(__file__).read_text(encoding="utf-8")
+
+    for forbidden in (
+        "_run_ha_" + "secrets_preflight",
+        "_run_ha_" + "restart_rollback_scenario",
+        "[bash, str(" + "HA_INSTALLER)",
+    ):
+        assert forbidden not in source
+    assert "runtime_smoke_ha_0_4_1.sh" in source
 
 
 def test_system_sandbox_has_required_kernel_and_mount_boundaries() -> None:
@@ -1406,143 +1442,6 @@ def test_ha_installer_has_safe_optional_core_restart_workflow() -> None:
     )
 
 
-def _run_ha_secrets_preflight(
-    tmp_path: Path,
-    *,
-    secrets_text: str,
-    fail_secret_read: bool = False,
-    restart_requested: bool = False,
-) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-    bash = shutil.which("bash")
-    if bash is None:
-        pytest.skip("bash is unavailable on this platform")
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    secrets_path = tmp_path / "remote-secrets.yaml"
-    secrets_path.write_text(secrets_text, encoding="utf-8")
-    event_log = tmp_path / "events.log"
-    for name, body in {
-        "scp": (
-            "#!/usr/bin/env bash\n"
-            'echo "scp $*" >> "$HUBINET_OPS_TEST_EVENT_LOG"\n'
-        ),
-        "ssh": """#!/usr/bin/env bash
-set -Eeuo pipefail
-remote="${@: -1}"
-printf 'ssh <%s>\\n' "$remote" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-if [[ "$remote" == *python3* ]]; then
-  echo "python3 is unavailable on Home Assistant OS" >&2
-  exit 127
-fi
-if [[ "$remote" == "cat /config/secrets.yaml" ]]; then
-  if [[ "$HUBINET_OPS_TEST_FAIL_SECRET_READ" == 1 ]]; then
-    echo "simulated SSH read failure" >&2
-    exit 42
-  fi
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    printf '%s\\n' "$line"
-  done < "$HUBINET_OPS_TEST_SECRETS_PATH"
-fi
-exit 0
-""",
-    }.items():
-        stub = fake_bin / name
-        stub.write_text(body, encoding="utf-8", newline="\n")
-        stub.chmod(0o755)
-
-    env = os.environ.copy()
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["HUBINET_OPS_TEST_MODE"] = "1"
-    env["HUBINET_OPS_TEST_EVENT_LOG"] = str(event_log)
-    env["HUBINET_OPS_TEST_SECRETS_PATH"] = str(secrets_path)
-    env["HUBINET_OPS_TEST_FAIL_SECRET_READ"] = "1" if fail_secret_read else "0"
-    command = [bash, str(HA_INSTALLER)]
-    if restart_requested:
-        command.append("--restart-core")
-    command.extend(["home-assistant.local", "2222"])
-    completed = subprocess.run(
-        command,
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    events = event_log.read_text(encoding="utf-8").splitlines()
-    return completed, events
-
-
-@pytest.mark.parametrize("restart_requested", [False, True])
-def test_ha_installer_validates_remote_secrets_locally_without_remote_python(
-    tmp_path: Path,
-    restart_requested: bool,
-) -> None:
-    example = (
-        ROOT / "home-assistant" / "secrets.example.yaml"
-    ).read_text(encoding="utf-8")
-    completed, events = _run_ha_secrets_preflight(
-        tmp_path,
-        secrets_text=example,
-        restart_requested=restart_requested,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert events.count("ssh <cat /config/secrets.yaml>") == 1
-    assert not any("python3" in event for event in events)
-    restart_calls = [event for event in events if "ha core restart" in event]
-    assert len(restart_calls) == int(restart_requested)
-    assert (
-        "Home Assistant Core was restarted"
-        if restart_requested
-        else "Home Assistant Core was not restarted"
-    ) in completed.stdout
-
-
-def test_ha_installer_rejects_missing_secret_before_backup_without_leaking_input(
-    tmp_path: Path,
-) -> None:
-    secret_marker = "do-not-print-this-secret"
-    example = (
-        ROOT / "home-assistant" / "secrets.example.yaml"
-    ).read_text(encoding="utf-8")
-    incomplete = "\n".join(
-        line
-        for line in example.splitlines()
-        if not line.startswith("hubinet_ops_force_stop_url:")
-    )
-    incomplete += f"\nunused_secret_marker: {secret_marker}\n"
-
-    completed, events = _run_ha_secrets_preflight(
-        tmp_path,
-        secrets_text=incomplete,
-    )
-
-    assert completed.returncode != 0
-    assert "hubinet_ops_force_stop_url" in completed.stderr
-    assert secret_marker not in completed.stdout
-    assert secret_marker not in completed.stderr
-    assert not any("backup.complete" in event for event in events)
-    assert not any(event.startswith("scp ") for event in events)
-    assert not any("before-0.4.1/secrets.yaml" in event for event in events)
-
-
-def test_ha_installer_stops_when_ssh_secret_read_fails(
-    tmp_path: Path,
-) -> None:
-    completed, events = _run_ha_secrets_preflight(
-        tmp_path,
-        secrets_text="not-read: true\n",
-        fail_secret_read=True,
-    )
-
-    assert completed.returncode != 0
-    assert "simulated SSH read failure" in completed.stderr
-    assert not any("backup.complete" in event for event in events)
-    assert not any(event.startswith("scp ") for event in events)
-    assert not any("before-0.4.1/secrets.yaml" in event for event in events)
-
-
 def test_ha_installer_normalizes_scp_target_for_ipv6() -> None:
     text = HA_INSTALLER.read_text(encoding="utf-8")
 
@@ -1552,181 +1451,3 @@ def test_ha_installer_normalizes_scp_target_for_ipv6() -> None:
     assert 'SCP_TARGET="root@$SCP_HOST"' in text
     assert text.count('"${SCP_TARGET}:/config/') == 2
     assert '"root@$HA_HOST:/config/' not in text
-
-
-@pytest.mark.parametrize(
-    ("host", "target"),
-    [
-        ("home-assistant.local", "root@home-assistant.local"),
-        ("192.168.4.100", "root@192.168.4.100"),
-        ("2001:db8::100", "root@[2001:db8::100]"),
-    ],
-)
-def test_ha_installer_passes_exact_scp_destinations(
-    tmp_path: Path,
-    host: str,
-    target: str,
-) -> None:
-    bash = shutil.which("bash")
-    if bash is None:
-        pytest.skip("bash is unavailable on this platform")
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    log_path = tmp_path / "scp.args"
-    for name, body in {
-        "python3": "#!/usr/bin/env bash\nexit 0\n",
-        "ssh": "#!/usr/bin/env bash\nexit 0\n",
-        "scp": (
-            "#!/usr/bin/env bash\n"
-            'printf "<%s>" "$@" >> "$HUBINET_OPS_TEST_SCP_LOG"\n'
-            'printf "\\n" >> "$HUBINET_OPS_TEST_SCP_LOG"\n'
-        ),
-    }.items():
-        stub = fake_bin / name
-        stub.write_text(body, encoding="utf-8", newline="\n")
-        stub.chmod(0o755)
-
-    env = os.environ.copy()
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["HUBINET_OPS_TEST_MODE"] = "1"
-    env["HUBINET_OPS_TEST_SCP_LOG"] = str(log_path)
-    completed = subprocess.run(
-        [bash, str(HA_INSTALLER), host, "2222"],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    calls = log_path.read_text(encoding="utf-8").splitlines()
-    assert len(calls) == 2
-    assert calls[0].endswith(
-        f"<{target}:/config/packages/hubinet_ops.yaml.new>"
-    )
-    assert calls[1].endswith(
-        f"<{target}:/config/dashboards/hubinet_ops.yaml.new>"
-    )
-    if ":" in host:
-        assert all(f"<root@{host}:/config/" not in call for call in calls)
-
-
-def _run_ha_restart_rollback_scenario(
-    tmp_path: Path,
-    *,
-    rollback_restart: str,
-    restart_requested: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    bash = shutil.which("bash")
-    if bash is None:
-        pytest.skip("bash is unavailable on this platform")
-
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    event_log = tmp_path / "events.log"
-    for name, body in {
-        "python3": "#!/usr/bin/env bash\nexit 0\n",
-        "scp": "#!/usr/bin/env bash\nexit 0\n",
-        "ssh": """#!/usr/bin/env bash
-set -Eeuo pipefail
-remote="${@: -1}"
-if [[ "$remote" == *"backup.complete"* ]]; then
-  echo "backup complete" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-elif [[ "$remote" == *"before-0.4.1/secrets.yaml"* ]]; then
-  echo "backup restoration" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-  echo "rollback ha core check" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-elif [[ "$remote" == *"install -m 0644 /config/packages"* ]]; then
-  if [[ "$HUBINET_OPS_TEST_ROLLBACK_RESTART" == "not-requested" ]]; then
-    echo "initial install failure" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-    exit 1
-  fi
-elif [[ "$remote" == *"ha core restart"* ]]; then
-  count_file="$HUBINET_OPS_TEST_RESTART_COUNT"
-  count=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
-  echo "$count" > "$count_file"
-  if [[ "$count" == 1 ]]; then
-    echo "initial restart failure" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-    exit 1
-  fi
-  echo "rollback restart" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-  if [[ "$HUBINET_OPS_TEST_ROLLBACK_RESTART" == "succeeds" ]]; then
-    echo "rollback Core running" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-    exit 0
-  fi
-  echo "rollback restart failure" >> "$HUBINET_OPS_TEST_EVENT_LOG"
-  exit 1
-fi
-exit 0
-""",
-    }.items():
-        stub = fake_bin / name
-        stub.write_text(body, encoding="utf-8", newline="\n")
-        stub.chmod(0o755)
-
-    env = os.environ.copy()
-    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
-    env["HUBINET_OPS_TEST_MODE"] = "1"
-    env["HUBINET_OPS_HA_RESTART_ATTEMPTS"] = "1"
-    env["HUBINET_OPS_HA_RESTART_DELAY"] = "0"
-    env["HUBINET_OPS_TEST_EVENT_LOG"] = str(event_log)
-    env["HUBINET_OPS_TEST_RESTART_COUNT"] = str(tmp_path / "restart.count")
-    env["HUBINET_OPS_TEST_ROLLBACK_RESTART"] = rollback_restart
-    command = [bash, str(HA_INSTALLER)]
-    if restart_requested:
-        command.append("--restart-core")
-    command.extend(["home-assistant.local", "2222"])
-    return subprocess.run(
-        command,
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-
-@pytest.mark.parametrize("rollback_restart_succeeds", [True, False])
-def test_ha_installer_restart_rollback_restores_core_running(
-    tmp_path: Path,
-    rollback_restart_succeeds: bool,
-) -> None:
-    completed = _run_ha_restart_rollback_scenario(
-        tmp_path,
-        rollback_restart="succeeds" if rollback_restart_succeeds else "fails",
-    )
-    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
-
-    assert completed.returncode != 0
-    assert events.count("backup restoration") == 1
-    assert events.count("rollback restart") == 1
-    assert events.index("initial restart failure") < events.index("backup restoration")
-    assert events.index("backup restoration") < events.index("rollback ha core check")
-    assert events.index("rollback ha core check") < events.index("rollback restart")
-    if rollback_restart_succeeds:
-        assert events.index("rollback restart") < events.index("rollback Core running")
-        assert "ROLLBACK INCOMPLETE" not in completed.stderr
-    else:
-        assert "rollback Core running" not in events
-        assert (
-            "ROLLBACK INCOMPLETE: HA files were restored but Core did not return to running"
-            in completed.stderr
-        )
-
-
-def test_ha_installer_restart_rollback_is_not_forced_without_flag(
-    tmp_path: Path,
-) -> None:
-    completed = _run_ha_restart_rollback_scenario(
-        tmp_path,
-        rollback_restart="not-requested",
-        restart_requested=False,
-    )
-    events = (tmp_path / "events.log").read_text(encoding="utf-8").splitlines()
-
-    assert completed.returncode != 0
-    assert events.count("backup restoration") == 1
-    assert "rollback restart" not in events
-    assert "rollback Core running" not in events
-    assert "ROLLBACK INCOMPLETE" not in completed.stderr
