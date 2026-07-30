@@ -35,6 +35,7 @@ class RestartablePruneHost(FakeHostControl):
         self.interrupt_after_remote_success = False
         self.complete_running_on_wait = False
         self.wait_error: HostControlError | None = None
+        self.execute_error: HostControlError | None = None
         self.delete_submissions: list[tuple[str, str]] = []
 
     def execute(
@@ -67,6 +68,8 @@ class RestartablePruneHost(FakeHostControl):
             (operation_type, vmid, request_id, snapshot_name, release_fingerprint)
         )
         self.delete_submissions.append((request_id, snapshot_name))
+        if self.execute_error is not None:
+            raise self.execute_error
         if snapshot_name == self.interrupt_name:
             status = "succeeded" if self.interrupt_after_remote_success else "running"
             self.existing_jobs[request_id] = {
@@ -396,6 +399,64 @@ def test_failed_child_delete_fails_prune_but_preserves_durable_source(
     service._reconcile_startup_jobs()
 
     assert db.get_job(job["id"])["status"] == "failed"
+    assert {item["name"] for item in host.snapshots} == {target["name"]}
+
+
+@pytest.mark.parametrize("http_status", [400, 409])
+def test_direct_nontransient_child_rejection_fails_prune_and_releases_lock(
+    tmp_path: Path,
+    http_status: int,
+) -> None:
+    service, db, host, job = _service(tmp_path, mode="oldest")
+    target = _owned(
+        106,
+        "20260727T120000Z",
+        created_at="2026-07-27T12:00:00+00:00",
+    )
+    host.snapshots = [target]
+    host.execute_error = HostControlError(
+        "child request rejected",
+        status=None,
+        http_status=http_status,
+        code="request_rejected",
+    )
+    running = db.next_queued_job()
+    assert running is not None
+
+    service._run_job(running)
+
+    terminal = db.get_job(job["id"])
+    assert terminal["status"] == "failed"
+    assert terminal["result"]["current"]["snapshot_name"] == target["name"]
+    assert "child request rejected" in str(terminal["error"])
+    assert db.active_job_count() == 0
+    assert {item["name"] for item in host.snapshots} == {target["name"]}
+
+
+def test_direct_http_500_child_error_stays_active_as_unknown(
+    tmp_path: Path,
+) -> None:
+    service, db, host, job = _service(tmp_path, mode="oldest")
+    target = _owned(
+        106,
+        "20260727T120000Z",
+        created_at="2026-07-27T12:00:00+00:00",
+    )
+    host.snapshots = [target]
+    host.execute_error = HostControlError(
+        "hostd internal error",
+        status=None,
+        http_status=500,
+    )
+    running = db.next_queued_job()
+    assert running is not None
+
+    service._run_job(running)
+
+    persisted = db.get_job(job["id"])
+    assert persisted["status"] == "running"
+    assert persisted["result"]["phase"] == "unknown"
+    assert db.active_job_count() == 1
     assert {item["name"] for item in host.snapshots} == {target["name"]}
 
 

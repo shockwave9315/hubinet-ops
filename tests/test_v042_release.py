@@ -117,3 +117,77 @@ def test_041_config_migration_is_idempotent_and_preserves_custom_retention(
     assert migrated["resources"][106]["snapshot_retention_count"] == 7
     assert migrated["mqtt"]["cpu_publish_deadband_percent"] == 0.5
     assert migrated["mqtt"]["telemetry_heartbeat_seconds"] == 300
+
+
+def test_041_config_migration_preserves_explicit_safety_policy(
+    tmp_path: Path,
+) -> None:
+    source = yaml.safe_load(
+        (ROOT / "config/config.example.yaml").read_text(encoding="utf-8")
+    )
+    vm100_capabilities = source["resources"][100]["operator_capabilities"]
+    vm100_capabilities["refresh"] = True
+    vm100_capabilities["start"] = False
+    vm106 = source["resources"][106]
+    disabled = {
+        "rollback",
+        "start",
+        "shutdown",
+        "reboot",
+        "force_stop",
+        "snapshot_create",
+        "snapshot_list",
+        "snapshot_rollback",
+        "snapshot_delete",
+    }
+    for capability in disabled:
+        vm106["operator_capabilities"][capability] = False
+    vm106["manual_rollback_allowed"] = False
+    vm106["manual_snapshot_restore_allowed"] = False
+    vm106["pre_update_snapshot"] = False
+    input_path = tmp_path / "config-041-custom-policy.yaml"
+    first = tmp_path / "config-042-custom-policy.yaml"
+    second = tmp_path / "config-042-custom-policy-again.yaml"
+    input_path.write_text(
+        yaml.safe_dump(source, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    command = [
+        sys.executable,
+        str(ROOT / "scripts/migrate_config_0_4_2.py"),
+        str(input_path),
+        str(first),
+        "--host-control-url",
+        "http://192.0.2.10:8741",
+    ]
+    subprocess.run(command, check=True, cwd=ROOT)
+    subprocess.run(
+        [
+            *command[:2],
+            str(first),
+            str(second),
+            *command[4:],
+        ],
+        check=True,
+        cwd=ROOT,
+    )
+
+    migrated = yaml.safe_load(first.read_text(encoding="utf-8"))
+    repeated = yaml.safe_load(second.read_text(encoding="utf-8"))
+    assert migrated == repeated
+    migrated_vm106 = migrated["resources"][106]
+    assert all(
+        migrated_vm106["operator_capabilities"][name] is False
+        for name in disabled
+    )
+    assert migrated_vm106["manual_rollback_allowed"] is False
+    assert migrated_vm106["manual_snapshot_restore_allowed"] is False
+    assert migrated_vm106["pre_update_snapshot"] is False
+    migrated_vm100 = migrated["resources"][100]["operator_capabilities"]
+    assert migrated_vm100["refresh"] is True
+    assert migrated_vm100["start"] is False
+    assert all(
+        migrated_vm100[name] is True
+        for name in ("snapshot_create", "snapshot_list", "snapshot_delete")
+    )

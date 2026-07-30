@@ -2589,7 +2589,7 @@ class OpsService:
                         reconciling=reconciling,
                     )
                 except HostControlError as exc:
-                    if exc.status != "failed":
+                    if not self._is_definitive_snapshot_prune_failure(exc):
                         self._hold_snapshot_prune_unknown(job, state, exc)
                     raise
                 reconciling = False
@@ -2885,6 +2885,17 @@ class OpsService:
             state["current"] = None
             state["phase"] = "selecting"
             self._persist_snapshot_prune_state(job, state)
+
+    @staticmethod
+    def _is_definitive_snapshot_prune_failure(error: HostControlError) -> bool:
+        if error.status == "failed":
+            return True
+        return (
+            error.status is None
+            and error.http_status is not None
+            and 400 <= error.http_status < 500
+            and error.http_status not in {408, 429}
+        )
 
     @staticmethod
     def _validate_snapshot_prune_target(
