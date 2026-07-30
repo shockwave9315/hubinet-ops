@@ -21,6 +21,8 @@ REQUIRED_SECRETS = (
     "hubinet_ops_snapshot_create_url",
     "hubinet_ops_snapshot_restore_url",
     "hubinet_ops_snapshot_delete_url",
+    "hubinet_ops_snapshot_delete_oldest_url",
+    "hubinet_ops_snapshot_delete_unprotected_url",
     "hubinet_ops_authorization",
     "hubinet_ops_host_start_url",
     "hubinet_ops_host_authorization",

@@ -278,6 +278,18 @@ write_secrets() {
       done < "$ROOT/home-assistant/secrets.example.yaml" > "$destination"
       printf 'unused_secret_marker: sandbox-secret-marker-041\n' >> "$destination"
       ;;
+    missing-snapshot-delete-oldest)
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == hubinet_ops_snapshot_delete_oldest_url:* ]] ||
+          printf '%s\n' "$line"
+      done < "$ROOT/home-assistant/secrets.example.yaml" > "$destination"
+      ;;
+    missing-snapshot-delete-unprotected)
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == hubinet_ops_snapshot_delete_unprotected_url:* ]] ||
+          printf '%s\n' "$line"
+      done < "$ROOT/home-assistant/secrets.example.yaml" > "$destination"
+      ;;
     legacy)
       while IFS= read -r line || [[ -n "$line" ]]; do
         case "$line" in
@@ -345,10 +357,29 @@ run_case() {
 assert_before_mutation() {
   local case_root="$1"
   if grep -Eq \
-    '^(BACKUP|SCP_PACKAGE|SCP_DASHBOARD|INSTALL|RESTART|WAIT_RUNNING|RESTORE_)' \
+    '^(BACKUP|SCP_PACKAGE|SCP_DASHBOARD|INSTALL|INITIAL_CHECK|RESTART|WAIT_RUNNING|RESTORE_)' \
     "$case_root/events.log"; then
     fail "preflight failure reached backup, SCP, install, restart, or restore"
   fi
+}
+
+assert_missing_secret_preflight() {
+  local name="$1" variant="$2" secret="$3"
+  local case_root="$TMP/$name"
+
+  run_case \
+    "$name" \
+    "$variant" \
+    0 \
+    home-assistant.local \
+    root@home-assistant.local \
+    success
+  [[ "$(< "$case_root/rc")" != 0 ]] ||
+    fail "$secret was accepted"
+  grep -Fq " - $secret" "$case_root/stderr"
+  [[ "$(grep -c '^SECRET_READ$' "$case_root/events.log")" == 1 ]] ||
+    fail "$name did not read secrets.yaml exactly once"
+  assert_before_mutation "$case_root"
 }
 
 assert_event_order() {
@@ -435,6 +466,15 @@ if grep -Fq sandbox-secret-marker-041 \
   "$TMP/missing-secret/stdout" "$TMP/missing-secret/stderr"; then
   fail "secret marker leaked to installer output"
 fi
+
+assert_missing_secret_preflight \
+  missing-snapshot-delete-oldest \
+  missing-snapshot-delete-oldest \
+  hubinet_ops_snapshot_delete_oldest_url
+assert_missing_secret_preflight \
+  missing-snapshot-delete-unprotected \
+  missing-snapshot-delete-unprotected \
+  hubinet_ops_snapshot_delete_unprotected_url
 
 run_case \
   legacy-endpoints \

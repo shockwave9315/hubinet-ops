@@ -37,8 +37,15 @@ Review and provision every key in `home-assistant/secrets.example.yaml`. In part
 
 - approve URL: `/api/v1/resources/{{ vmid }}/plans/approve-active`;
 - reject URL: `/api/v1/resources/{{ vmid }}/plans/reject-active`;
+- delete-oldest snapshot URL: `/api/v1/resources/{{ vmid }}/snapshots/delete-oldest`;
+- delete-unprotected snapshots URL: `/api/v1/resources/{{ vmid }}/snapshots/delete-unprotected`;
 - backend, general hostd, and recovery authorizations remain separate;
 - no token value is printed by the installer.
+
+An existing 0.4.1 `secrets.yaml` does not contain the two snapshot-prune URLs.
+The operator must deliberately add both values before running the 0.4.2 Home
+Assistant installer. The installer validates the complete file before backup,
+copy, or installation and fails closed when either value is missing or empty.
 
 Install and validate without restarting Core:
 
