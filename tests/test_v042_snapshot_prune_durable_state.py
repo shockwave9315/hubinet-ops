@@ -237,6 +237,67 @@ def test_retry_before_execution_and_after_progress_never_resets_state(
     assert db.get_job(job["id"]) == before
 
 
+@pytest.mark.parametrize(
+    "legacy_result",
+    [
+        None,
+        {
+            "deleted": ["hubinet-ops-106-manual-20260730T120000Z"],
+            "deleted_count": 1,
+            "mode": "oldest",
+        },
+    ],
+)
+def test_retry_preserves_pre_durable_manual_prune_job(
+    tmp_path: Path,
+    legacy_result: dict[str, Any] | None,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = RestartablePruneHost(db)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+    job, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="snapshot_prune",
+        request_id="legacy-manual-prune-retry-0001",
+        snapshot_name="oldest",
+    )
+    db.update_job(job["id"], status="success", progress=100, result=legacy_result)
+    before = db.get_job(job["id"])
+
+    retried = service.queue_snapshot_prune(
+        106,
+        "oldest",
+        "legacy-manual-prune-retry-0001",
+    )
+
+    assert retried == before
+    assert db.get_job(job["id"]) == before
+    assert host.delete_submissions == []
+
+
+def test_retry_preserves_v1_manual_prune_state_without_migration(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = RestartablePruneHost(db)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+    job = _queue_all(service, "legacy-v1-manual-retry-0001")
+    legacy_state = dict(job["result"])
+    legacy_state.pop("deleted_count")
+    legacy_state.pop("deleted_history_truncated")
+    legacy_state["prune_version"] = 1
+    db.update_job(job["id"], status="running", progress=37, result=legacy_state)
+    before = db.get_job(job["id"])
+
+    retried = _queue_all(service, "legacy-v1-manual-retry-0001")
+
+    assert retried == before
+    assert db.get_job(job["id"]) == before
+
+
 def test_retry_completed_delete_oldest_does_not_delete_next_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -326,7 +387,7 @@ def test_snapshot_prune_retry_rejects_immutable_contract_mismatch(
     assert persisted == job
 
     changed_version = dict(job["result"])
-    changed_version["prune_version"] = SNAPSHOT_PRUNE_STATE_VERSION - 1
+    changed_version["prune_version"] = 0
     db.update_job(job["id"], result=changed_version)
     with pytest.raises(ValueError, match="snapshot prune contract"):
         db.create_snapshot_prune_job(
@@ -397,6 +458,50 @@ def test_retention_handoff_retry_reuses_followup_without_mutation(
         job["operation_type"] == "snapshot_prune"
         for job in db.list_jobs()
     ) == 1
+
+
+def test_retention_handoff_retry_preserves_v1_followup_without_mutation(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="snapshot_create",
+        request_id="legacy-handoff-source-0001",
+        snapshot_name="hubinet-ops-106-manual-20260730T120000Z",
+    )
+    request_id = f"retention-{source['id']}"
+    _terminal, prune, _event, _created = db.terminalize_job_with_snapshot_prune(
+        source["id"],
+        source_status="success",
+        terminal_result="success",
+        error=None,
+        prune_request_id=request_id,
+        retention_target=2,
+    )
+    legacy_state = dict(prune["result"])
+    legacy_state.pop("deleted_count")
+    legacy_state.pop("deleted_history_truncated")
+    legacy_state["prune_version"] = 1
+    db.update_job(prune["id"], status="running", progress=43, result=legacy_state)
+    before = db.get_job(prune["id"])
+
+    _source_retry, prune_retry, _event_retry, created_retry = (
+        db.terminalize_job_with_snapshot_prune(
+            source["id"],
+            source_status="success",
+            terminal_result="success",
+            error=None,
+            prune_request_id=request_id,
+            retention_target=2,
+        )
+    )
+
+    assert created_retry is False
+    assert prune_retry == before
+    assert db.get_job(prune["id"]) == before
 
 
 def test_all_unprotected_prunes_150_with_bounded_audit_history(

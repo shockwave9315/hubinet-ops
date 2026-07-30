@@ -1242,12 +1242,21 @@ def _snapshot_prune_contract_matches(
     source_job_id: str | None,
 ) -> bool:
     result = job.get("result")
-    return (
+    base_contract_matches = (
         job.get("operation_type") == "snapshot_prune"
         and int(job.get("vmid") or 0) == int(vmid)
         and job.get("snapshot_name") == mode
-        and isinstance(result, dict)
-        and result.get("prune_version") == SNAPSHOT_PRUNE_STATE_VERSION
+    )
+    if not base_contract_matches:
+        return False
+    if not isinstance(result, dict) or "prune_version" not in result:
+        return (
+            mode in {"all_unprotected", "oldest"}
+            and retention_target is None
+            and source_job_id is None
+        )
+    return (
+        result.get("prune_version") in {1, SNAPSHOT_PRUNE_STATE_VERSION}
         and result.get("mode") == mode
         and result.get("retention_target") == retention_target
         and result.get("source_job_id") == source_job_id
