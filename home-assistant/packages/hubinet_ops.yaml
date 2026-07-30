@@ -405,13 +405,9 @@ script:
     alias: "Hubinet Ops — przygotuj plan aktualizacji control plane"
     mode: single
     fields: *lifecycle_vmid_field
-    variables:
-      release_version: "{{ states('sensor.hubinet_ops_ct110_self_update_release_version') }}"
     sequence:
       - choose:
-          - conditions: >-
-              {{ vmid | int == 110
-                 and release_version not in ['none', 'unknown', 'unavailable', ''] }}
+          - conditions: "{{ vmid | int == 110 }}"
             sequence:
               - continue_on_error: true
                 action: rest_command.hubinet_ops_self_update_plan
@@ -421,6 +417,7 @@ script:
                   result: "{{ response | default({}, true) }}"
                   content: "{{ result.get('content', {}) }}"
                   detail: "{{ content.get('detail', {}) }}"
+                  error_code: "{{ detail.get('code', '') if detail is mapping else '' }}"
                   error_message: >-
                     {% if detail is mapping %}
                       {{ detail.get('message', 'Backend odrzucił przygotowanie planu aktualizacji.') }}
@@ -435,24 +432,11 @@ script:
                           notification_id: hubinet_ops_self_update_conflict
                           title: "Hubinet Ops — nie można przygotować planu"
                           message: >-
-                            {{ error_message }} Sprawdź przygotowane wydanie na PVE,
-                            odśwież stan CT110 i spróbuj ponownie.
-          - conditions: "{{ vmid | int == 110 }}"
-            sequence:
-              - variables:
-                  response:
-                    status: 409
-                    content:
-                      detail:
-                        code: staged_release_missing
-                        message: "Brak przygotowanego wydania"
-              - action: persistent_notification.create
-                data:
-                  notification_id: hubinet_ops_self_update_release_missing
-                  title: "Hubinet Ops — brak przygotowanego wydania"
-                  message: >-
-                    Najpierw przygotuj i zweryfikuj wydanie Hubinet Ops na PVE,
-                    następnie odśwież stan CT110. Żądanie nie zostało wysłane.
+                            {% if error_code == 'staged_release_missing' %}
+                              Brak przygotowanego wydania: {{ error_message }}
+                            {% else %}
+                              {{ error_message }}
+                            {% endif %}
         default:
           - variables:
               response:

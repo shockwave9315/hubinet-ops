@@ -4,10 +4,13 @@ import importlib
 from pathlib import Path
 from typing import Any
 
+import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from app.database import Database
 from app.host_control import HostControlError
+from scripts.validate_yaml import HomeAssistantLoader
 from tests.test_lifecycle_snapshots import (
     CompatibleExecutor,
     FakeHostControl,
@@ -104,19 +107,48 @@ def test_real_self_update_plan_conflict_has_stable_error_code(
     assert response.json()["detail"]["required_action"]
 
 
-def test_ha_self_update_preflight_skips_request_and_notifies_in_polish() -> None:
-    package = Path("home-assistant/packages/hubinet_ops.yaml").read_text(
-        encoding="utf-8"
+def _ha_self_update_script() -> dict[str, Any]:
+    package = yaml.load(
+        Path("home-assistant/packages/hubinet_ops.yaml").read_text(encoding="utf-8"),
+        Loader=HomeAssistantLoader,
     )
-    script = package.split("  hubinet_ops_self_update:\n", 1)[1].split(
-        "\n  hubinet_ops_scan_container:", 1
-    )[0]
+    return package["script"]["hubinet_ops_self_update"]
 
-    assert "self_update_release_version" in script
-    assert "release_version not in ['none', 'unknown', 'unavailable', '']" in script
+
+@pytest.mark.parametrize("release_state", ["none", "unknown", "unavailable"])
+def test_ha_self_update_requests_backend_when_release_sensor_is_missing(
+    release_state: str,
+) -> None:
+    script = _ha_self_update_script()
+    branch = script["sequence"][0]["choose"][0]
+
+    assert release_state in {"none", "unknown", "unavailable"}
+    assert branch["conditions"] == "{{ vmid | int == 110 }}"
+    assert branch["sequence"][0]["action"] == "rest_command.hubinet_ops_self_update_plan"
+    assert "self_update_release_version" not in str(script)
+
+
+def test_ha_self_update_does_not_request_backend_for_other_vmids() -> None:
+    script = _ha_self_update_script()
+    choose_step = script["sequence"][0]
+    choose = choose_step["choose"]
+
+    assert len(choose) == 1
+    assert choose[0]["conditions"] == "{{ vmid | int == 110 }}"
+    assert choose[0]["sequence"][0]["action"] == (
+        "rest_command.hubinet_ops_self_update_plan"
+    )
+    assert choose_step["default"][0]["variables"]["response"]["status"] == 403
+
+
+def test_ha_self_update_presents_structured_backend_conflicts() -> None:
+    script = str(_ha_self_update_script())
+
+    assert "detail.get('code', '')" in script
+    assert "detail.get('message'," in script
+    assert "staged_release_missing" in script
     assert "Brak przygotowanego wydania" in script
-    assert "Żądanie nie zostało wysłane" in script
-    assert "persistent_notification.create" in script
+    assert "error_message" in script
     assert "Backend odrzucił przygotowanie planu aktualizacji" in script
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 import yaml
 
 from scripts.generate_ha_dashboard import (
@@ -53,18 +54,83 @@ def test_dashboard_generator_is_deterministic_and_checked_in() -> None:
     assert DEFAULT_OUTPUT.read_text(encoding="utf-8") == first
 
 
-def test_ct110_self_update_is_unavailable_without_staged_release() -> None:
+def test_ct110_self_update_control_does_not_depend_on_staged_release() -> None:
     data = _dashboard()
     ct110 = _text(_view(data, "ct-110"))
 
     assert "Brak przygotowanego wydania" in ct110
-    assert "Wymagany jest staged" in ct110
-    assert "release na PVE" in ct110
+    assert "Przygotuj plan aktualizacji" in ct110
+    assert "backend odczyta" in ct110
+    assert "release" in ct110
+    assert "PVE" in ct110
     conditions = _control_conditions(110, load_resources(DEFAULT_CONFIG)[110], "self_update")
     rendered = _text(conditions)
-    assert "sensor.hubinet_ops_ct110_self_update_release_version" in rendered
-    for unavailable in ("none", "unknown", "unavailable"):
-        assert f"state_not: {unavailable}" in rendered
+    assert "sensor.hubinet_ops_ct110_self_update_release_version" not in rendered
+    for required in (
+        "sensor.hubinet_ops_ct110_runtime_status",
+        "sensor.hubinet_ops_ct110_capability_self_update",
+        "sensor.hubinet_ops_ct110_operation_status",
+        "sensor.hubinet_ops_ct110_active_job_id",
+        "sensor.hubinet_ops_ct110_lifecycle_status",
+    ):
+        assert required in rendered
+
+
+def test_ct110_missing_release_warning_is_three_complete_conditional_sections() -> None:
+    sections = _view(_dashboard(), "ct-110")["sections"]
+    warnings = [
+        section
+        for section in sections
+        if any(
+            card.get("title") == "Brak przygotowanego wydania"
+            for card in section["cards"]
+        )
+    ]
+
+    assert len(warnings) == 3
+    states = []
+    for section in warnings:
+        assert section["type"] == "grid"
+        assert len(section["visibility"]) == 1
+        condition = section["visibility"][0]
+        assert condition["entity"] == (
+            "sensor.hubinet_ops_ct110_self_update_release_version"
+        )
+        states.append(condition["state"])
+        assert section["cards"][0]["type"] == "custom:mushroom-title-card"
+        assert section["cards"][0]["subtitle"]
+        assert section["cards"][1]["primary"] == "Brak przygotowanego wydania"
+    assert states == ["none", "unknown", "unavailable"]
+
+
+@pytest.mark.parametrize(
+    ("release_state", "expected_visible"),
+    [
+        ("none", 1),
+        ("unknown", 1),
+        ("unavailable", 1),
+        ("0.4.2", 0),
+    ],
+)
+def test_ct110_missing_release_warning_visibility_is_logical_or(
+    release_state: str,
+    expected_visible: int,
+) -> None:
+    sections = _view(_dashboard(), "ct-110")["sections"]
+    warnings = [
+        section
+        for section in sections
+        if section.get("visibility")
+        and section["visibility"][0]["entity"]
+        == "sensor.hubinet_ops_ct110_self_update_release_version"
+    ]
+
+    visible = [
+        section
+        for section in warnings
+        if section["visibility"][0]["state"] == release_state
+    ]
+    assert len(visible) == expected_visible
 
 
 def test_dashboard_contains_full_inventory_and_legacy_paths() -> None:
