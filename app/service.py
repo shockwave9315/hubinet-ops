@@ -16,6 +16,8 @@ from .config import Settings
 from .contracts import (
     EXECUTOR_PROTOCOL_VERSION,
     EXECUTOR_VERSION,
+    SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT,
+    SNAPSHOT_PRUNE_STATE_VERSION,
     evaluate_executor_contract,
     parse_owned_snapshot_name,
 )
@@ -1269,23 +1271,16 @@ class OpsService:
         self._require_capability(vmid, "snapshot_delete")
         self._require_capability(vmid, "snapshot_list")
         self._require_host_control("Snapshot pruning")
-        job, _ = self.db.create_operation_job(
+        job, created = self.db.create_snapshot_prune_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"resource-{vmid}")),
-            operation_type="snapshot_prune",
             request_id=request_id or uuid.uuid4().hex,
-            snapshot_name=mode,
+            mode=mode,
+            retention_target=None,
+            source_job_id=None,
         )
-        self.db.update_job(
-            str(job["id"]),
-            result=self._new_snapshot_prune_state(
-                mode=mode,
-                retention_target=None,
-                source_job_id=None,
-            ),
-        )
-        job = self.db.get_job(str(job["id"]))
-        self._mark_job_queued(vmid, job)
+        if created:
+            self._mark_job_queued(vmid, job)
         return job
 
     def _queue_snapshot_action_locked(
@@ -2625,55 +2620,52 @@ class OpsService:
             reconciling = False
 
         deleted = [str(name) for name in state.get("deleted", [])]
+        deleted_count = int(state["deleted_count"])
         emit(
             stage="snapshot_pruning",
             progress=95,
             event_type="snapshot_pruning_completed",
             message="Managed snapshot pruning completed",
-            details={"deleted": deleted, "mode": mode},
+            details={
+                "deleted": deleted,
+                "deleted_count": deleted_count,
+                "deleted_history_truncated": bool(
+                    state["deleted_history_truncated"]
+                ),
+                "mode": mode,
+            },
         )
-        return {"deleted": deleted, "deleted_count": len(deleted), "mode": mode}
-
-    def _new_snapshot_prune_state(
-        self,
-        *,
-        mode: str,
-        retention_target: int | None,
-        source_job_id: str | None,
-    ) -> dict[str, Any]:
-        return {
-            "prune_version": 1,
-            "mode": mode,
-            "retention_target": retention_target,
-            "source_job_id": source_job_id,
-            "deleted": [],
-            "current": None,
-            "phase": "selecting",
-        }
+        return dict(state)
 
     def _load_snapshot_prune_state(
         self,
         job: dict[str, Any],
     ) -> dict[str, Any]:
         raw = job.get("result")
-        if not isinstance(raw, dict) or raw.get("prune_version") != 1:
-            if str(job.get("status")) == "queued":
-                mode = str(job.get("snapshot_name") or "")
-                state = self._new_snapshot_prune_state(
-                    mode=mode,
-                    retention_target=(
-                        self._snapshot_retention_count(int(job["vmid"]))
-                        if mode == "retention"
-                        else None
-                    ),
-                    source_job_id=None,
-                )
-                self._persist_snapshot_prune_state(job, state)
-                return state
+        if not isinstance(raw, dict):
             raise SnapshotPruneOutcomeUnknown(
-                "Active legacy prune job has no persisted child contract"
+                "Snapshot prune job has no persisted durable contract"
             )
         state = dict(raw)
+        if state.get("prune_version") == 1:
+            legacy_deleted = state.get("deleted")
+            if not isinstance(legacy_deleted, list):
+                raise SnapshotPruneOutcomeUnknown(
+                    "Legacy snapshot prune job has invalid deletion history"
+                )
+            state["prune_version"] = SNAPSHOT_PRUNE_STATE_VERSION
+            state["deleted_count"] = len(legacy_deleted)
+            state["deleted"] = legacy_deleted[
+                -SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT:
+            ]
+            state["deleted_history_truncated"] = (
+                len(legacy_deleted) > len(state["deleted"])
+            )
+            self._persist_snapshot_prune_state(job, state)
+        elif state.get("prune_version") != SNAPSHOT_PRUNE_STATE_VERSION:
+            raise SnapshotPruneOutcomeUnknown(
+                "Snapshot prune job has an unsupported durable state version"
+            )
         mode = str(state.get("mode") or "")
         if mode not in {"all_unprotected", "oldest", "retention"}:
             raise ValueError("Snapshot pruning job has an invalid persisted mode")
@@ -2683,14 +2675,44 @@ class OpsService:
         if mode == "retention":
             if not isinstance(target, int) or isinstance(target, bool) or not 0 <= target <= 100:
                 raise ValueError("Snapshot pruning retention target is invalid")
+            if not state.get("source_job_id"):
+                raise ValueError("Snapshot pruning source job is invalid")
         elif target is not None:
             raise ValueError("Manual snapshot pruning has an unexpected retention target")
+        elif state.get("source_job_id") is not None:
+            raise ValueError("Manual snapshot pruning has an unexpected source job")
         deleted = state.get("deleted")
-        if not isinstance(deleted, list) or len(deleted) > 100:
+        if (
+            not isinstance(deleted, list)
+            or len(deleted) > SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT
+        ):
             raise ValueError("Snapshot pruning deleted list is invalid")
         for name in deleted:
             if parse_owned_snapshot_name(str(name), vmid=int(job["vmid"])) is None:
                 raise ValueError("Snapshot pruning deleted list contains an invalid snapshot")
+        deleted_count = state.get("deleted_count")
+        if (
+            isinstance(deleted_count, bool)
+            or not isinstance(deleted_count, int)
+            or deleted_count < len(deleted)
+        ):
+            raise ValueError("Snapshot pruning deleted count is invalid")
+        history_truncated = state.get("deleted_history_truncated")
+        if (
+            not isinstance(history_truncated, bool)
+            or history_truncated != (deleted_count > len(deleted))
+        ):
+            raise ValueError("Snapshot pruning deletion history metadata is invalid")
+        if str(state.get("phase") or "") not in {
+            "selecting",
+            "child_prepared",
+            "child_submitted",
+            "child_remote_succeeded",
+            "unknown",
+            "refreshing",
+            "completed",
+        }:
+            raise ValueError("Snapshot pruning phase is invalid")
         current = state.get("current")
         if current is not None:
             if not isinstance(current, dict):
@@ -2736,18 +2758,16 @@ class OpsService:
             target = int(state["retention_target"])
             pool = managed[target:]
         elif mode == "oldest":
-            if state.get("deleted"):
+            if int(state["deleted_count"]) > 0:
                 return None
             pool = managed
         else:
             pool = managed
-        deleted = {str(name) for name in state.get("deleted", [])}
         return next(
             (
                 item
                 for item in reversed(pool)
-                if str(item.get("name") or "") not in deleted
-                and item.get("owned_by_hubinet_ops") is True
+                if item.get("owned_by_hubinet_ops") is True
                 and item.get("protected") is not True
                 and item.get("delete_eligible") is True
             ),
@@ -2856,9 +2876,12 @@ class OpsService:
                     ),
                 )
             deleted = [str(item) for item in state.get("deleted", [])]
-            if name not in deleted:
-                deleted.append(name)
-            state["deleted"] = deleted
+            deleted.append(name)
+            state["deleted_count"] = int(state["deleted_count"]) + 1
+            state["deleted"] = deleted[-SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT:]
+            state["deleted_history_truncated"] = (
+                int(state["deleted_count"]) > len(state["deleted"])
+            )
             state["current"] = None
             state["phase"] = "selecting"
             self._persist_snapshot_prune_state(job, state)
@@ -3244,18 +3267,16 @@ class OpsService:
             self._terminal(job, job_status, result, error)
             return self.db.get_job(str(job["id"]))
         prune_request_id = f"retention-{str(job['id'])}"
-        source, prune, event = self.db.terminalize_job_with_snapshot_prune(
+        source, prune, event, created = self.db.terminalize_job_with_snapshot_prune(
             str(job["id"]),
             source_status=job_status,
             terminal_result=result,
             error=error,
             prune_request_id=prune_request_id,
-            prune_result=self._new_snapshot_prune_state(
-                mode="retention",
-                retention_target=retention_target,
-                source_job_id=str(job["id"]),
-            ),
+            retention_target=retention_target,
         )
+        if not created:
+            return prune
         self._publish_terminal_transition(
             source,
             job_status=job_status,

@@ -12,6 +12,7 @@ from typing import Any
 from .contracts import (
     JOB_OPERATION_TYPES,
     REQUEST_ID_RE,
+    SNAPSHOT_PRUNE_STATE_VERSION,
     parse_owned_snapshot_name,
 )
 from .security import bounded_json, sanitize_data, sanitize_text
@@ -579,6 +580,72 @@ class Database:
             conn.execute("COMMIT")
         return self.get_job(job_id), True
 
+    def create_snapshot_prune_job(
+        self,
+        *,
+        vmid: int,
+        container_name: str,
+        request_id: str,
+        mode: str,
+        retention_target: int | None,
+        source_job_id: str | None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically create a queued prune job with its complete durable state."""
+        initial_result = _initial_snapshot_prune_result(
+            mode=mode,
+            retention_target=retention_target,
+            source_job_id=source_job_id,
+        )
+        if not REQUEST_ID_RE.fullmatch(str(request_id)):
+            raise ValueError("Invalid request_id")
+        raw_result = bounded_json(initial_result)
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
+                (vmid, request_id),
+            ).fetchone()
+            if existing is not None:
+                job = _decode_job(existing)
+                if not _snapshot_prune_contract_matches(
+                    job,
+                    vmid=vmid,
+                    mode=mode,
+                    retention_target=retention_target,
+                    source_job_id=source_job_id,
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError(
+                        "request_id was already used for another snapshot prune contract"
+                    )
+                conn.execute("COMMIT")
+                return job, False
+            if conn.execute(
+                "SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1"
+            ).fetchone():
+                conn.execute("ROLLBACK")
+                raise ValueError("Another destructive maintenance job is active")
+            job_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO jobs "
+                "(id,request_id,operation_type,plan_id,vmid,container_name,status,"
+                "stage,progress,snapshot_name,result,created_at,updated_at) "
+                "VALUES(?,?,'snapshot_prune',NULL,?,?,'queued','queued',0,?,?,?,?)",
+                (
+                    job_id,
+                    request_id,
+                    vmid,
+                    container_name,
+                    mode,
+                    raw_result,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(job_id), True
+
     def apply_recovery_event(
         self,
         event: dict[str, Any],
@@ -859,8 +926,8 @@ class Database:
         terminal_result: str,
         error: str | None,
         prune_request_id: str,
-        prune_result: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        retention_target: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
         """Atomically finish a source operation and enqueue its retention follow-up."""
         if source_status not in {
             "blocked",
@@ -900,6 +967,11 @@ class Database:
             limit=1000,
         )
         safe_error = sanitize_text(error, limit=2000) if error else None
+        prune_result = _initial_snapshot_prune_result(
+            mode="retention",
+            retention_target=retention_target,
+            source_job_id=source_job_id,
+        )
         raw_prune_result = bounded_json(prune_result)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -910,6 +982,38 @@ class Database:
             if source is None:
                 conn.execute("ROLLBACK")
                 raise KeyError(source_job_id)
+            existing = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
+                (int(source["vmid"]), prune_request_id),
+            ).fetchone()
+            if existing is not None:
+                prune = _decode_job(existing)
+                if (
+                    str(source["status"]) != source_status
+                    or not _snapshot_prune_contract_matches(
+                        prune,
+                        vmid=int(source["vmid"]),
+                        mode="retention",
+                        retention_target=retention_target,
+                        source_job_id=source_job_id,
+                    )
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError(
+                        "Snapshot prune handoff request_id has a mismatched contract"
+                    )
+                event = _find_snapshot_prune_handoff_event(
+                    conn,
+                    source_job_id=source_job_id,
+                    prune_job_id=str(prune["id"]),
+                    prune_request_id=prune_request_id,
+                    terminal_result=terminal_result,
+                )
+                if event is None:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Snapshot prune handoff event is missing")
+                conn.execute("COMMIT")
+                return _decode_job(source), prune, event, False
             if str(source["status"]) not in {"queued", "running"}:
                 conn.execute("ROLLBACK")
                 raise ValueError("Source job is already terminal")
@@ -921,13 +1025,6 @@ class Database:
             if other_active is not None:
                 conn.execute("ROLLBACK")
                 raise ValueError("Another destructive maintenance job is active")
-            existing = conn.execute(
-                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
-                (int(source["vmid"]), prune_request_id),
-            ).fetchone()
-            if existing is not None:
-                conn.execute("ROLLBACK")
-                raise ValueError("Snapshot prune handoff request_id already exists")
             conn.execute(
                 "UPDATE jobs SET status=?,stage=?,progress=100,error=?,updated_at=? "
                 "WHERE id=?",
@@ -982,6 +1079,7 @@ class Database:
             self.get_job(source_job_id),
             self.get_job(prune_id),
             self.get_job_event(event_id),
+            True,
         )
 
     def upsert_container_state(self, vmid: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1102,6 +1200,83 @@ class Database:
 
     def list_resource_events(self, vmid: int, limit: int = 50) -> list[dict[str, Any]]:
         return self.list_container_events(vmid, limit)
+
+
+def _initial_snapshot_prune_result(
+    *,
+    mode: str,
+    retention_target: int | None,
+    source_job_id: str | None,
+) -> dict[str, Any]:
+    if mode not in {"all_unprotected", "oldest", "retention"}:
+        raise ValueError("Invalid snapshot pruning mode")
+    if mode == "retention":
+        if (
+            isinstance(retention_target, bool)
+            or not isinstance(retention_target, int)
+            or not 0 <= retention_target <= 100
+            or not source_job_id
+        ):
+            raise ValueError("Invalid snapshot retention prune contract")
+    elif retention_target is not None or source_job_id is not None:
+        raise ValueError("Manual snapshot pruning has an invalid source contract")
+    return {
+        "prune_version": SNAPSHOT_PRUNE_STATE_VERSION,
+        "mode": mode,
+        "retention_target": retention_target,
+        "source_job_id": source_job_id,
+        "deleted": [],
+        "deleted_count": 0,
+        "deleted_history_truncated": False,
+        "current": None,
+        "phase": "selecting",
+    }
+
+
+def _snapshot_prune_contract_matches(
+    job: dict[str, Any],
+    *,
+    vmid: int,
+    mode: str,
+    retention_target: int | None,
+    source_job_id: str | None,
+) -> bool:
+    result = job.get("result")
+    return (
+        job.get("operation_type") == "snapshot_prune"
+        and int(job.get("vmid") or 0) == int(vmid)
+        and job.get("snapshot_name") == mode
+        and isinstance(result, dict)
+        and result.get("prune_version") == SNAPSHOT_PRUNE_STATE_VERSION
+        and result.get("mode") == mode
+        and result.get("retention_target") == retention_target
+        and result.get("source_job_id") == source_job_id
+    )
+
+
+def _find_snapshot_prune_handoff_event(
+    conn: sqlite3.Connection,
+    *,
+    source_job_id: str,
+    prune_job_id: str,
+    prune_request_id: str,
+    terminal_result: str,
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        "SELECT * FROM job_events WHERE job_id=? ORDER BY id DESC",
+        (source_job_id,),
+    ).fetchall()
+    for row in rows:
+        event = _decode_event(row)
+        details = event.get("details")
+        if (
+            event.get("event_type") == f"job_{terminal_result}"
+            and isinstance(details, dict)
+            and details.get("snapshot_prune_job_id") == prune_job_id
+            and details.get("snapshot_prune_request_id") == prune_request_id
+        ):
+            return event
+    return None
 
 
 def utc_now() -> str:
