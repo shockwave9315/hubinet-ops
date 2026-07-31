@@ -67,6 +67,10 @@ HOST_CONTROL_OPERATION_TYPES = {
     "snapshot_delete",
     "self_update",
 }
+BACKEND_ONLY_EVENT_TYPES = {
+    "snapshot_created",
+    "snapshot_mutation_succeeded",
+}
 
 
 class ConflictError(ValueError):
@@ -1170,12 +1174,10 @@ class OpsService:
                             candidate
                             for candidate in snapshot_jobs
                             if str(candidate.get("operation_type") or "") == "update"
-                            and self.db.has_job_event(
+                            and self.db.has_snapshot_proof(
                                 str(candidate["id"]),
-                                {
-                                    "snapshot_mutation_succeeded",
-                                    "snapshot_created",
-                                },
+                                vmid,
+                                name,
                             )
                         ),
                         None,
@@ -3550,6 +3552,9 @@ class OpsService:
 
         def on_event(item: dict[str, Any]) -> None:
             raw_details = item.get("details")
+            event_type = str(item.get("event_type", "executor_event"))
+            if event_type in BACKEND_ONLY_EVENT_TYPES:
+                event_type = f"executor_{event_type}"
             emit(
                 stage=action_stage,
                 progress=_safe_int(
@@ -3557,7 +3562,7 @@ class OpsService:
                     STAGE_PROGRESS.get(action_stage, 0),
                 ),
                 level=str(item.get("level", "info")),
-                event_type=str(item.get("event_type", "executor_event")),
+                event_type=event_type,
                 message=str(item.get("message", "")),
                 details=raw_details if isinstance(raw_details, dict) else {},
             )

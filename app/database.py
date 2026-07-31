@@ -1202,18 +1202,38 @@ class Database:
             ).fetchall()
         return [_decode_event(row) for row in reversed(rows)]
 
-    def has_job_event(self, job_id: str, event_types: set[str]) -> bool:
-        requested = tuple(sorted(str(value) for value in event_types if str(value)))
-        if not requested:
+    def has_snapshot_proof(
+        self,
+        job_id: str,
+        vmid: int,
+        snapshot_name: str,
+    ) -> bool:
+        parsed = parse_owned_snapshot_name(snapshot_name, vmid=int(vmid))
+        if parsed is None or parsed.get("kind") != "pre-update":
             return False
-        placeholders = ",".join("?" for _value in requested)
         with self._lock, self._connect() as conn:
-            row = conn.execute(
-                f"SELECT 1 FROM job_events WHERE job_id=? "
-                f"AND event_type IN ({placeholders}) LIMIT 1",
-                (str(job_id), *requested),
-            ).fetchone()
-        return row is not None
+            rows = conn.execute(
+                "SELECT event_type,details_json FROM job_events "
+                "WHERE job_id=? AND event_type IN "
+                "('snapshot_mutation_succeeded','snapshot_created') "
+                "AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND vmid=? "
+                "AND operation_type='update' AND snapshot_name=?) "
+                "ORDER BY id DESC",
+                (str(job_id), str(job_id), int(vmid), str(snapshot_name)),
+            ).fetchall()
+        for row in rows:
+            if str(row["event_type"]) == "snapshot_created":
+                return True
+            try:
+                details = json.loads(row["details_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if (
+                isinstance(details, dict)
+                and str(details.get("snapshot_name") or "") == snapshot_name
+            ):
+                return True
+        return False
 
     def list_container_events(self, vmid: int, limit: int = 50) -> list[dict[str, Any]]:
         bounded = min(max(int(limit), 1), 200)

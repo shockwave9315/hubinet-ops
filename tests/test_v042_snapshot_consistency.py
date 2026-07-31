@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from app.database import Database
 from app.executor import ExecutorError
 from app.host_control import HostControlError
@@ -101,12 +103,102 @@ def test_snapshot_executor_failure_before_mutation_marker_leaves_snapshot_uncert
     modeled = service._refresh_snapshot_state(106)["snapshots"][0]
 
     assert db.get_job(job["id"])["status"] == "blocked"
-    assert not db.has_job_event(job["id"], {"snapshot_mutation_succeeded"})
+    assert not any(
+        event["event_type"] == "snapshot_mutation_succeeded"
+        for event in db.list_job_events(job["id"])
+    )
     assert modeled["owned_by_hubinet_ops"] is False
     assert modeled["ownership_status"] == "uncertain"
     assert modeled["protected"] is True
     assert modeled["delete_eligible"] is False
     assert modeled["rollback_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    ("reserved_type", "malformed_details"),
+    [
+        ("snapshot_mutation_succeeded", False),
+        ("snapshot_created", False),
+        ("snapshot_mutation_succeeded", True),
+    ],
+)
+def test_executor_cannot_spoof_backend_snapshot_proof_before_failure(
+    tmp_path: Path,
+    reserved_type: str,
+    malformed_details: bool,
+) -> None:
+    class SpoofingSnapshotExecutor(SnapshotUpdateExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "snapshot":
+                self.actions.append(action)
+                assert on_event is not None
+                on_event(
+                    {
+                        "event_type": "snapshot_executor_progress",
+                        "message": "Snapshot command started",
+                        "details": {"snapshot_name": argument},
+                    }
+                )
+                on_event(
+                    {
+                        "event_type": reserved_type,
+                        "message": "Untrusted executor claim",
+                        "details": (
+                            ["malformed", argument]
+                            if malformed_details
+                            else {"snapshot_name": argument}
+                        ),
+                    }
+                )
+                self.snapshots.append(
+                    {
+                        "name": argument,
+                        "created_at": "2026-07-29T00:00:00+00:00",
+                        "kind": "pre-update",
+                        "owned_by_hubinet_ops": True,
+                        "rollback_eligible": True,
+                        "delete_eligible": True,
+                    }
+                )
+                raise ExecutorError("snapshot executor failed after spoofed event")
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = SpoofingSnapshotExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+    service.settings.raw["containers"][106]["operator_capabilities"].update(
+        {"snapshot_list": True, "snapshot_delete": True}
+    )
+
+    service._run_job(db.get_job(job["id"]))
+    events = db.list_job_events(job["id"])
+    modeled = service._refresh_snapshot_state(106)["snapshots"][0]
+    host = FakeHostControl("running")
+    host.snapshots = list(executor.snapshots)
+    service.host_control = host
+    service.queue_snapshot_prune(106, "oldest", "spoofed-proof-prune-0001")
+    prune = run_queued(service, db)
+
+    assert db.get_job(job["id"])["status"] == "blocked"
+    assert not any(event["event_type"] == reserved_type for event in events)
+    forwarded = next(
+        event
+        for event in events
+        if event["event_type"] == f"executor_{reserved_type}"
+    )
+    assert forwarded["details"] == (
+        {}
+        if malformed_details
+        else {"snapshot_name": db.get_job(job["id"])["snapshot_name"]}
+    )
+    assert any(
+        event["event_type"] == "snapshot_executor_progress" for event in events
+    )
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["rollback_eligible"] is False
+    assert modeled["delete_eligible"] is False
+    assert prune["result"]["deleted"] == []
+    assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
 def test_unconfirmed_pre_update_snapshot_blocks_before_apt_mutation(

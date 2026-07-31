@@ -341,7 +341,100 @@ def test_pre_update_mutation_marker_bootstraps_confirmation_and_survives_restart
     assert before_final_event["snapshots"][0]["owned_by_hubinet_ops"] is True
     assert after_restart["owned_by_hubinet_ops"] is True
     assert after_restart["source_job_id"] == source["id"]
-    assert not db.has_job_event(source["id"], {"snapshot_created"})
+    assert not any(
+        event["event_type"] == "snapshot_created"
+        for event in db.list_job_events(source["id"])
+    )
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {},
+        {"snapshot_name": ""},
+        {"snapshot_name": "hubinet-ops-106-pre-20260729T000000Z"},
+    ],
+)
+def test_pre_update_mutation_marker_requires_exact_snapshot_name(
+    tmp_path: Path,
+    details: dict[str, Any],
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = _owned(
+        106,
+        "20260729T125500Z",
+        kind="pre-update",
+        created_at="2026-07-29T12:55:00+00:00",
+    )
+    host.snapshots = [snapshot]
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="update",
+        request_id="invalid-pre-update-proof-details-0001",
+        snapshot_name=snapshot["name"],
+    )
+    db.insert_job_event(
+        job_id=source["id"],
+        vmid=106,
+        level="info",
+        stage="snapshot",
+        progress=24,
+        event_type="snapshot_mutation_succeeded",
+        message="Pre-update snapshot mutation completed",
+        details=details,
+    )
+
+    modeled = OpsService(
+        cfg, db, CompatibleExecutor(), host_control=host
+    ).list_snapshots(106)["snapshots"][0]
+
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["protected"] is True
+    assert modeled["delete_eligible"] is False
+    assert modeled["rollback_eligible"] is False
+
+
+def test_historical_snapshot_created_without_details_remains_valid_proof(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = _owned(
+        106,
+        "20260729T125700Z",
+        kind="pre-update",
+        created_at="2026-07-29T12:57:00+00:00",
+    )
+    host.snapshots = [snapshot]
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="update",
+        request_id="historical-snapshot-created-proof-0001",
+        snapshot_name=snapshot["name"],
+    )
+    db.insert_job_event(
+        job_id=source["id"],
+        vmid=106,
+        level="info",
+        stage="snapshot",
+        progress=25,
+        event_type="snapshot_created",
+        message="Rollback snapshot created",
+    )
+
+    modeled = OpsService(
+        cfg, db, CompatibleExecutor(), host_control=host
+    ).list_snapshots(106)["snapshots"][0]
+
+    assert modeled["owned_by_hubinet_ops"] is True
+    assert modeled["source_job_id"] == source["id"]
+    assert modeled["rollback_eligible"] is True
 
 
 @pytest.mark.parametrize(
