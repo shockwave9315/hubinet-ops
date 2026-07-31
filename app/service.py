@@ -2217,6 +2217,16 @@ class OpsService:
                     message="Creating rollback snapshot" if auto_rollback else "Creating pre-update safety snapshot",
                 )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
+                try:
+                    self.db.record_pre_update_snapshot_proof(
+                        str(job["id"]),
+                        vmid,
+                        snapshot,
+                    )
+                except Exception as exc:
+                    raise ExecutorError(
+                        f"Failed to persist pre-update snapshot proof: {exc}"
+                    ) from exc
                 emit(
                     stage="snapshot",
                     progress=24,

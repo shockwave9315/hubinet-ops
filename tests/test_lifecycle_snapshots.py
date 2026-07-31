@@ -413,21 +413,10 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
     db.update_plan_status(plan["id"], "failed")
     db.update_job(
         source["id"],
-        status="failed",
-        stage="failed",
-        progress=100,
         snapshot_name=snapshot,
     )
-    db.insert_job_event(
-        job_id=source["id"],
-        vmid=109,
-        level="info",
-        stage="snapshot",
-        progress=25,
-        event_type="snapshot_created",
-        message="Pre-update snapshot created",
-        details={"snapshot_name": snapshot},
-    )
+    db.record_pre_update_snapshot_proof(source["id"], 109, snapshot)
+    db.update_job(source["id"], status="failed", stage="failed", progress=100)
     terminal = service.manual_rollback(109)
     state = service.get_state(109)
 
@@ -543,17 +532,8 @@ def test_legacy_manual_rollback_requires_snapshot_owned_by_exact_source_update(
         request_id="proven-older-update-source-0001",
         snapshot_name=snapshot,
     )
+    db.record_pre_update_snapshot_proof(proven["id"], 109, snapshot)
     db.update_job(proven["id"], status="failed", stage="failed", progress=100)
-    db.insert_job_event(
-        job_id=proven["id"],
-        vmid=109,
-        level="info",
-        stage="snapshot",
-        progress=25,
-        event_type="snapshot_created",
-        message="Pre-update snapshot created",
-        details={"snapshot_name": snapshot},
-    )
     source, _ = db.create_operation_job(
         vmid=109,
         container_name="ct-109",

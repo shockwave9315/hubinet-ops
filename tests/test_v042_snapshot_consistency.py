@@ -15,7 +15,7 @@ from tests.test_lifecycle_snapshots import (
     run_queued,
     settings as lifecycle_settings,
 )
-from tests.test_service import WorkflowExecutor, settings as update_settings
+from tests.test_service import WorkflowExecutor, docker_state, settings as update_settings
 
 
 class SnapshotUpdateExecutor(WorkflowExecutor):
@@ -62,6 +62,13 @@ def test_pre_update_snapshot_is_refreshed_and_visible_before_apt_mutation(
     assert state["latest_snapshot_name"] == db.get_job(job["id"])["snapshot_name"]
     assert state["latest_snapshot_kind"] == "pre-update"
     assert state["snapshot_state_stale"] is False
+    proof = db.get_job(job["id"])["result"]["snapshot_proof"]
+    assert proof == {
+        "version": 1,
+        "vmid": 106,
+        "snapshot_name": db.get_job(job["id"])["snapshot_name"],
+        "kind": "pre-update",
+    }
     events = db.list_job_events(job["id"])
     mutation_index = next(
         index
@@ -112,6 +119,73 @@ def test_snapshot_executor_failure_before_mutation_marker_leaves_snapshot_uncert
     assert modeled["protected"] is True
     assert modeled["delete_eligible"] is False
     assert modeled["rollback_eligible"] is False
+
+
+def test_snapshot_proof_persistence_failure_blocks_update_without_replaying_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = SnapshotUpdateExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+    monkeypatch.setattr(
+        db,
+        "record_pre_update_snapshot_proof",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("simulated proof write failure")
+        ),
+    )
+
+    service._run_job(db.get_job(job["id"]))
+    after_failure = db.get_job(job["id"])
+    modeled = service._refresh_snapshot_state(106)["snapshots"][0]
+    restarted = OpsService(service.settings, db, executor)
+    after_restart = restarted._refresh_snapshot_state(106)["snapshots"][0]
+
+    assert after_failure["status"] == "blocked"
+    assert "update" not in executor.actions
+    assert executor.actions.count("snapshot") == 1
+    assert "snapshot_proof" not in dict(after_failure.get("result") or {})
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert after_restart["owned_by_hubinet_ops"] is False
+    assert after_restart["ownership_status"] == "uncertain"
+
+
+def test_executor_snapshot_result_cannot_create_or_overwrite_backend_proof(
+    tmp_path: Path,
+) -> None:
+    class SpoofingResultExecutor(SnapshotUpdateExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            result = super().run(action, vmid, argument, timeout, on_event)
+            if action == "snapshot":
+                return {
+                    "ok": True,
+                    "data": {
+                        "snapshot_proof": {
+                            "version": 1,
+                            "vmid": 999,
+                            "snapshot_name": "executor-controlled",
+                            "kind": "pre-update",
+                        }
+                    },
+                }
+            return result
+
+    executor = SpoofingResultExecutor(
+        [docker_state(3), docker_state(3), docker_state(3)]
+    )
+    service, db, job = _approved_update(tmp_path, executor)
+
+    service._run_job(db.get_job(job["id"]))
+    terminal = db.get_job(job["id"])
+    proof = terminal["result"]["snapshot_proof"]
+
+    assert proof == {
+        "version": 1,
+        "vmid": 106,
+        "snapshot_name": terminal["snapshot_name"],
+        "kind": "pre-update",
+    }
+    assert proof["snapshot_name"] != "executor-controlled"
 
 
 @pytest.mark.parametrize(

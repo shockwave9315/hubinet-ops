@@ -917,19 +917,90 @@ class Database:
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unknown job fields: {unknown}")
-        fields["updated_at"] = utc_now()
-        assignments = ", ".join(f"{key}=?" for key in fields)
-        values = []
-        for key, value in fields.items():
-            if key == "result" and isinstance(value, (dict, list)):
-                value = bounded_json(value)
-            elif key == "error" and value is not None:
-                value = sanitize_text(value, limit=2000)
-            values.append(value)
-        values.append(job_id)
         with self._lock, self._connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(job_id)
+            if "result" in fields:
+                existing = _result_dict(current["result"])
+                proof = (
+                    existing.get("snapshot_proof")
+                    if existing is not None
+                    and _snapshot_proof_matches(
+                        existing.get("snapshot_proof"),
+                        vmid=int(current["vmid"]),
+                        snapshot_name=str(current["snapshot_name"] or ""),
+                    )
+                    else None
+                )
+                incoming = fields["result"]
+                if isinstance(incoming, dict):
+                    merged = dict(incoming)
+                    merged.pop("snapshot_proof", None)
+                    if proof is not None:
+                        merged["snapshot_proof"] = proof
+                    fields["result"] = merged
+                elif proof is not None:
+                    fields["result"] = existing
+            fields["updated_at"] = utc_now()
+            assignments = ", ".join(f"{key}=?" for key in fields)
+            values = []
+            for key, value in fields.items():
+                if key == "result" and isinstance(value, (dict, list)):
+                    value = bounded_json(value)
+                elif key == "error" and value is not None:
+                    value = sanitize_text(value, limit=2000)
+                values.append(value)
+            values.append(job_id)
             conn.execute(f"UPDATE jobs SET {assignments} WHERE id=?", values)
         return self.get_job(job_id)
+
+    def record_pre_update_snapshot_proof(
+        self,
+        job_id: str,
+        vmid: int,
+        snapshot_name: str,
+    ) -> dict[str, Any]:
+        parsed = parse_owned_snapshot_name(snapshot_name, vmid=int(vmid))
+        if parsed is None or parsed.get("kind") != "pre-update":
+            raise ValueError("Snapshot proof requires an exact pre-update snapshot name")
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE id=?",
+                (str(job_id),),
+            ).fetchone()
+            if job is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(job_id)
+            if (
+                int(job["vmid"]) != int(vmid)
+                or str(job["operation_type"]) != "update"
+                or str(job["snapshot_name"] or "") != str(snapshot_name)
+                or str(job["status"]) not in {"queued", "running"}
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("Snapshot proof does not match an active update job")
+            result = _result_dict(job["result"])
+            if result is None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Active update job result is malformed")
+            result["snapshot_proof"] = {
+                "version": 1,
+                "vmid": int(vmid),
+                "snapshot_name": str(snapshot_name),
+                "kind": "pre-update",
+            }
+            conn.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
+                (bounded_json(result), now, str(job_id)),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(str(job_id))
 
     def terminalize_job_with_snapshot_prune(
         self,
@@ -1212,28 +1283,19 @@ class Database:
         if parsed is None or parsed.get("kind") != "pre-update":
             return False
         with self._lock, self._connect() as conn:
-            rows = conn.execute(
-                "SELECT event_type,details_json FROM job_events "
-                "WHERE job_id=? AND event_type IN "
-                "('snapshot_mutation_succeeded','snapshot_created') "
-                "AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND vmid=? "
-                "AND operation_type='update' AND snapshot_name=?) "
-                "ORDER BY id DESC",
-                (str(job_id), str(job_id), int(vmid), str(snapshot_name)),
-            ).fetchall()
-        for row in rows:
-            if str(row["event_type"]) == "snapshot_created":
-                return True
-            try:
-                details = json.loads(row["details_json"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if (
-                isinstance(details, dict)
-                and str(details.get("snapshot_name") or "") == snapshot_name
-            ):
-                return True
-        return False
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE id=? AND vmid=? "
+                "AND operation_type='update' AND snapshot_name=?",
+                (str(job_id), int(vmid), str(snapshot_name)),
+            ).fetchone()
+        if job is None:
+            return False
+        result = _result_dict(job["result"])
+        return result is not None and _snapshot_proof_matches(
+            result.get("snapshot_proof"),
+            vmid=int(vmid),
+            snapshot_name=str(snapshot_name),
+        )
 
     def list_container_events(self, vmid: int, limit: int = 50) -> list[dict[str, Any]]:
         bounded = min(max(int(limit), 1), 200)
@@ -1336,6 +1398,40 @@ def _find_snapshot_prune_handoff_event(
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _result_dict(value: Any) -> dict[str, Any] | None:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return dict(decoded) if isinstance(decoded, dict) else None
+
+
+def _snapshot_proof_matches(
+    value: Any,
+    *,
+    vmid: int,
+    snapshot_name: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    version = value.get("version")
+    proof_vmid = value.get("vmid")
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version == 1
+        and isinstance(proof_vmid, int)
+        and not isinstance(proof_vmid, bool)
+        and proof_vmid == int(vmid)
+        and str(value.get("snapshot_name") or "") == str(snapshot_name)
+        and str(value.get("kind") or "") == "pre-update"
+    )
 
 
 def _decode_plan(row: sqlite3.Row) -> dict[str, Any]:

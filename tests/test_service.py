@@ -934,22 +934,11 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
     _, source = db.approve_plan(plan["id"])
     db.update_job(
         source["id"],
-        status="failed",
-        stage="failed",
-        progress=100,
         snapshot_name=snapshot,
     )
+    db.record_pre_update_snapshot_proof(source["id"], 106, snapshot)
+    db.update_job(source["id"], status="failed", stage="failed", progress=100)
     db.update_plan_status(plan["id"], "failed")
-    db.insert_job_event(
-        job_id=source["id"],
-        vmid=106,
-        level="info",
-        stage="snapshot",
-        progress=25,
-        event_type="snapshot_created",
-        message="Pre-update snapshot created",
-        details={"snapshot_name": snapshot},
-    )
     result = service.manual_rollback(106)
     assert result["status"] == "success"
     assert "rollback" not in executor.actions
