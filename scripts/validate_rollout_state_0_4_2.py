@@ -64,17 +64,30 @@ def validate(payload: Any, not_before: datetime) -> list[str]:
 
     vm100 = resources.get("100")
     if isinstance(vm100, dict):
-        usage = (vm100.get("cpu") or {}).get("usage_percent")
+        cpu = vm100.get("cpu")
+        cpu_is_object = cpu is None or isinstance(cpu, dict)
+        usage = cpu.get("usage_percent") if isinstance(cpu, dict) else None
         valid_usage = (
-            not isinstance(usage, bool)
+            cpu_is_object
+            and not isinstance(usage, bool)
             and isinstance(usage, (int, float))
             and math.isfinite(usage)
             and 0 <= usage <= 100
         )
-        if vm100.get("health_status") != "healthy" or not valid_usage:
+        qemu_status = vm100.get("qemu_status")
+        health_status = vm100.get("health_status")
+        valid = False
+        if qemu_status == "running":
+            valid = health_status == "healthy" and valid_usage
+        elif qemu_status == "stopped":
+            valid = health_status == "offline" and (
+                (cpu_is_object and usage is None) or valid_usage
+            )
+        if not valid:
             errors.append(
                 "bad_vm100="
-                f"health:{vm100.get('health_status')!r},cpu_usage:{usage!r}"
+                f"qemu_status:{qemu_status!r},health:{health_status!r},"
+                f"cpu_usage:{usage!r}"
             )
     if isinstance(resources.get("106"), dict):
         health = resources["106"].get("health_status")

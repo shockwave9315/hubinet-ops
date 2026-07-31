@@ -138,10 +138,15 @@ case "$action" in
       if grep -q '/api/v1/state' <<<"$script"; then
         "$REAL_PYTHON" - <<'PY'
 import json
+import os
 resources={}
+vm100_status=os.environ.get("HUBINET_OPS_FAKE_VM100_STATUS", "running")
 for vmid in range(100,111):
     state={"vmid":vmid,"last_refresh":"2099-01-01T00:00:00+00:00","health_status":"healthy","health_score":100}
-    if vmid==100: state["cpu"]={"usage_percent":3.05257}
+    if vmid==100:
+        state["qemu_status"]=vm100_status
+        if vm100_status=="running": state["cpu"]={"usage_percent":3.05257}
+        else: state["health_status"]="offline"
     if 101 <= vmid <= 109: state.update(executor_compatible=True,executor_version="0.4.1",executor_protocol_version=1)
     resources[str(vmid)]=state
 print(json.dumps({"version":"0.4.2","resources":resources}))
@@ -412,6 +417,18 @@ assert_ordered() {
 success_rc="$(run_case success)"
 if [[ "$success_rc" != 0 ]]; then
   cat "$TMP/success/stderr" >&2
+  exit 1
+fi
+
+export HUBINET_OPS_FAKE_VM100_STATUS=stopped
+stopped_vm_rc="$(run_case stopped_vm)"
+unset HUBINET_OPS_FAKE_VM100_STATUS
+if [[ "$stopped_vm_rc" != 0 ]]; then
+  cat "$TMP/stopped_vm/stderr" >&2
+  exit 1
+fi
+if grep -Eq 'pct (start|stop|shutdown|reboot) 100' "$TMP/stopped_vm/actions.log"; then
+  echo "upgrade changed intentionally stopped VM100 lifecycle state" >&2
   exit 1
 fi
 

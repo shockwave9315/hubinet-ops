@@ -16,15 +16,18 @@ if __name__ == "__main__":
     preserved_policy_by_vmid = {}
     for raw_vmid, resource in source_resources.items():
         if isinstance(resource, dict):
+            configured_capabilities = resource.get("operator_capabilities")
+            if not isinstance(configured_capabilities, dict):
+                configured_capabilities = {}
             preserved_policy_by_vmid[int(raw_vmid)] = {
-                key: resource[key]
-                for key in (
-                    "operator_capabilities",
-                    "manual_rollback_allowed",
-                    "manual_snapshot_restore_allowed",
-                    "pre_update_snapshot",
-                )
-                if key in resource
+                "operator_capabilities": configured_capabilities,
+                "manual_rollback_allowed": resource.get(
+                    "manual_rollback_allowed", False
+                ),
+                "manual_snapshot_restore_allowed": resource.get(
+                    "manual_snapshot_restore_allowed", False
+                ),
+                "pre_update_snapshot": resource.get("pre_update_snapshot", False),
             }
             configured = resource.get(
                 "snapshot_retention_count",
@@ -50,8 +53,7 @@ if __name__ == "__main__":
             "manual_snapshot_restore_allowed",
             "pre_update_snapshot",
         ):
-            if key in preserved:
-                resource[key] = preserved[key]
+            resource[key] = preserved.get(key, False)
     vm100 = resources[100]
     vm100["operator_capabilities"]["snapshot_create"] = True
     vm100["operator_capabilities"]["snapshot_list"] = True
