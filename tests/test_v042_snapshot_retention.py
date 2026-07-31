@@ -93,6 +93,17 @@ def _record_snapshot_source(
                 now,
             ),
         )
+    if resolved_operation == "update":
+        db.insert_job_event(
+            job_id=source_id,
+            vmid=resolved_vmid,
+            level="info",
+            stage="snapshot",
+            progress=25,
+            event_type="snapshot_created",
+            message="Pre-update snapshot created",
+            details={"snapshot_name": resolved_name},
+        )
     return db.get_job(source_id)
 
 
@@ -252,6 +263,166 @@ def test_pre_update_snapshot_uses_exact_update_job_and_remains_rollback_eligible
     assert modeled["owned_by_hubinet_ops"] is True
     assert modeled["rollback_eligible"] is True
     assert queued["snapshot_name"] == snapshot["name"]
+
+
+def test_pre_update_snapshot_requires_durable_mutation_event_and_prune_skips_it(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = _owned(
+        106,
+        "20260729T124000Z",
+        kind="pre-update",
+        created_at="2026-07-29T12:40:00+00:00",
+    )
+    host.snapshots = [snapshot]
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="update",
+        request_id="pre-update-without-proof-0001",
+        snapshot_name=snapshot["name"],
+    )
+    db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    modeled = service.list_snapshots(106)["snapshots"][0]
+
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["protected"] is True
+    assert modeled["delete_eligible"] is False
+    assert modeled["rollback_eligible"] is False
+    service.queue_snapshot_prune(106, "oldest", "skip-unproven-pre-update-0001")
+    terminal = run_queued(service, db)
+    assert terminal["result"]["deleted"] == []
+    assert not any(call[0] == "snapshot_delete" for call in host.calls)
+
+
+def test_pre_update_mutation_marker_bootstraps_confirmation_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = _owned(
+        106,
+        "20260729T125000Z",
+        kind="pre-update",
+        created_at="2026-07-29T12:50:00+00:00",
+    )
+    host.snapshots = [snapshot]
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="update",
+        request_id="pre-update-mutation-marker-0001",
+        snapshot_name=snapshot["name"],
+    )
+    db.insert_job_event(
+        job_id=source["id"],
+        vmid=106,
+        level="info",
+        stage="snapshot",
+        progress=24,
+        event_type="snapshot_mutation_succeeded",
+        message="Pre-update snapshot mutation completed",
+        details={"snapshot_name": snapshot["name"]},
+    )
+
+    before_final_event = OpsService(
+        cfg, db, CompatibleExecutor(), host_control=host
+    )._refresh_snapshot_state(106, required_name=snapshot["name"], required_kind="pre-update")
+    restarted = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+    after_restart = restarted.list_snapshots(106)["snapshots"][0]
+
+    assert before_final_event["snapshots"][0]["owned_by_hubinet_ops"] is True
+    assert after_restart["owned_by_hubinet_ops"] is True
+    assert after_restart["source_job_id"] == source["id"]
+    assert not db.has_job_event(source["id"], {"snapshot_created"})
+
+
+@pytest.mark.parametrize(
+    "malformed_result",
+    ["legacy-text", ["source_job_id", "wrong"], 7, None, "{not-json"],
+)
+def test_malformed_manual_snapshot_result_is_uncertain_and_never_pruned(
+    tmp_path: Path,
+    malformed_result: Any,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl()
+    snapshot = _owned(
+        106,
+        "20260729T130000Z",
+        created_at="2026-07-29T13:00:00+00:00",
+    )
+    host.snapshots = [snapshot]
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="snapshot_create",
+        request_id="malformed-manual-source-0001",
+        snapshot_name=snapshot["name"],
+    )
+    db.update_job(source["id"], status="success", result=malformed_result)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    modeled = service.list_snapshots(106)["snapshots"][0]
+
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["protected"] is True
+    assert modeled["delete_eligible"] is False
+    assert modeled["rollback_eligible"] is False
+    service.queue_snapshot_prune(106, "oldest", "skip-malformed-manual-0001")
+    terminal = run_queued(service, db)
+    assert terminal["result"]["deleted"] == []
+    assert not any(call[0] == "snapshot_delete" for call in host.calls)
+
+
+def test_malformed_newer_candidate_does_not_hide_valid_manual_source(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl()
+    snapshot = _owned(
+        106,
+        "20260729T131000Z",
+        created_at="2026-07-29T13:10:00+00:00",
+    )
+    host.snapshots = [snapshot]
+    valid, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="snapshot_create",
+        request_id="valid-older-manual-source-0001",
+        snapshot_name=snapshot["name"],
+    )
+    db.update_job(
+        valid["id"],
+        status="success",
+        result={"source_job_id": snapshot["source_job_id"]},
+    )
+    malformed, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="snapshot_create",
+        request_id="malformed-newer-manual-source-0001",
+        snapshot_name=snapshot["name"],
+    )
+    db.update_job(malformed["id"], status="success", result="legacy-text")
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    modeled = service.list_snapshots(106)["snapshots"][0]
+
+    assert modeled["owned_by_hubinet_ops"] is True
+    assert modeled["source_job_id"] == valid["id"]
+    assert modeled["delete_eligible"] is True
 
 
 def test_snapshot_list_exposes_complete_managed_model_and_protection(

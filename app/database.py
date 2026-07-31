@@ -1202,6 +1202,19 @@ class Database:
             ).fetchall()
         return [_decode_event(row) for row in reversed(rows)]
 
+    def has_job_event(self, job_id: str, event_types: set[str]) -> bool:
+        requested = tuple(sorted(str(value) for value in event_types if str(value)))
+        if not requested:
+            return False
+        placeholders = ",".join("?" for _value in requested)
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                f"SELECT 1 FROM job_events WHERE job_id=? "
+                f"AND event_type IN ({placeholders}) LIMIT 1",
+                (str(job_id), *requested),
+            ).fetchone()
+        return row is not None
+
     def list_container_events(self, vmid: int, limit: int = 50) -> list[dict[str, Any]]:
         bounded = min(max(int(limit), 1), 200)
         with self._lock, self._connect() as conn:

@@ -418,6 +418,16 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
         progress=100,
         snapshot_name=snapshot,
     )
+    db.insert_job_event(
+        job_id=source["id"],
+        vmid=109,
+        level="info",
+        stage="snapshot",
+        progress=25,
+        event_type="snapshot_created",
+        message="Pre-update snapshot created",
+        details={"snapshot_name": snapshot},
+    )
     terminal = service.manual_rollback(109)
     state = service.get_state(109)
 
@@ -430,6 +440,137 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
     assert "missing guest executor" in state["executor_contract_error"]
     assert state["verification_status"] == "unknown"
     assert host.calls[0][0] == "snapshot_rollback"
+
+
+@pytest.mark.parametrize(
+    "operation_type",
+    ["snapshot_delete", "snapshot_create", "snapshot_rollback"],
+)
+def test_legacy_manual_rollback_rejects_non_update_source_without_side_effects(
+    tmp_path: Path,
+    operation_type: str,
+) -> None:
+    cfg = settings(tmp_path, vmid=109)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-109-pre-20260724T181000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T18:10:00+00:00",
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    source, _ = db.create_operation_job(
+        vmid=109,
+        container_name="ct-109",
+        operation_type=operation_type,
+        request_id=f"wrong-rollback-source-{operation_type}",
+        snapshot_name=snapshot,
+    )
+    source = db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    before = dict(source)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    with pytest.raises(ValueError, match="No rollback snapshot"):
+        service.manual_rollback(109)
+
+    assert db.get_job(source["id"]) == before
+    assert db.list_jobs() == [before]
+    assert host.calls == []
+
+
+def test_legacy_manual_rollback_rejects_update_without_durable_snapshot_proof(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=109)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-109-pre-20260724T182000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T18:20:00+00:00",
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    source, _ = db.create_operation_job(
+        vmid=109,
+        container_name="ct-109",
+        operation_type="update",
+        request_id="update-without-snapshot-proof-0001",
+        snapshot_name=snapshot,
+    )
+    source = db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    before = dict(source)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
+        service.manual_rollback(109)
+
+    assert db.get_job(source["id"]) == before
+    assert db.list_jobs() == [before]
+    assert host.calls == []
+
+
+def test_legacy_manual_rollback_requires_snapshot_owned_by_exact_source_update(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=109)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-109-pre-20260724T183000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T18:30:00+00:00",
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    proven, _ = db.create_operation_job(
+        vmid=109,
+        container_name="ct-109",
+        operation_type="update",
+        request_id="proven-older-update-source-0001",
+        snapshot_name=snapshot,
+    )
+    db.update_job(proven["id"], status="failed", stage="failed", progress=100)
+    db.insert_job_event(
+        job_id=proven["id"],
+        vmid=109,
+        level="info",
+        stage="snapshot",
+        progress=25,
+        event_type="snapshot_created",
+        message="Pre-update snapshot created",
+        details={"snapshot_name": snapshot},
+    )
+    source, _ = db.create_operation_job(
+        vmid=109,
+        container_name="ct-109",
+        operation_type="update",
+        request_id="unproven-latest-update-source-0001",
+        snapshot_name=snapshot,
+    )
+    source = db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    before = dict(source)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
+        service.manual_rollback(109)
+
+    assert db.get_job(source["id"]) == before
+    assert not any(job["operation_type"] == "snapshot_rollback" for job in db.list_jobs())
+    assert host.calls == []
 
 
 def test_lifecycle_guards_runtime_active_job_plan_and_request_id(tmp_path: Path) -> None:

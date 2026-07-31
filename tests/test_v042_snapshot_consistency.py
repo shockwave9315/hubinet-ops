@@ -60,6 +60,53 @@ def test_pre_update_snapshot_is_refreshed_and_visible_before_apt_mutation(
     assert state["latest_snapshot_name"] == db.get_job(job["id"])["snapshot_name"]
     assert state["latest_snapshot_kind"] == "pre-update"
     assert state["snapshot_state_stale"] is False
+    events = db.list_job_events(job["id"])
+    mutation_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "snapshot_mutation_succeeded"
+    )
+    created_index = next(
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "snapshot_created"
+    )
+    assert mutation_index < created_index
+
+
+def test_snapshot_executor_failure_before_mutation_marker_leaves_snapshot_uncertain(
+    tmp_path: Path,
+) -> None:
+    class FailingSnapshotExecutor(SnapshotUpdateExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action == "snapshot":
+                self.actions.append(action)
+                self.snapshots.append(
+                    {
+                        "name": argument,
+                        "created_at": "2026-07-29T00:00:00+00:00",
+                        "kind": "pre-update",
+                        "owned_by_hubinet_ops": True,
+                        "rollback_eligible": True,
+                        "delete_eligible": True,
+                    }
+                )
+                raise ExecutorError("snapshot executor failed")
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = FailingSnapshotExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+
+    service._run_job(db.get_job(job["id"]))
+    modeled = service._refresh_snapshot_state(106)["snapshots"][0]
+
+    assert db.get_job(job["id"])["status"] == "blocked"
+    assert not db.has_job_event(job["id"], {"snapshot_mutation_succeeded"})
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["protected"] is True
+    assert modeled["delete_eligible"] is False
+    assert modeled["rollback_eligible"] is False
 
 
 def test_unconfirmed_pre_update_snapshot_blocks_before_apt_mutation(

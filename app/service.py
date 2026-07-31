@@ -877,16 +877,29 @@ class OpsService:
             host_control = self._require_host_control("Manual rollback")
             if self.db.get_active_job(vmid) is not None:
                 raise ValueError("Another job is already active for this resource")
+            if self.db.find_active_plan(vmid) is not None:
+                raise ValueError("Resolve the active update plan before rollback")
             source = self.db.get_latest_job(vmid)
-            if source is None or not source.get("snapshot_name"):
+            if (
+                source is None
+                or int(source.get("vmid") or 0) != vmid
+                or str(source.get("operation_type") or "") != "update"
+                or not source.get("snapshot_name")
+            ):
                 raise ValueError("No rollback snapshot is available")
             if source["status"] not in {"failed", "blocked", "interrupted"}:
                 raise ValueError("Rollback is only allowed after a failed operation")
             snapshot_name = str(source["snapshot_name"])
+            parsed = parse_owned_snapshot_name(snapshot_name, vmid=vmid)
+            if parsed is None or parsed.get("kind") != "pre-update":
+                raise ValueError(
+                    "Recorded rollback snapshot is missing, foreign, or ineligible"
+                )
+            refreshed = self._refresh_snapshot_state(vmid)
             selected = next(
                 (
                     item
-                    for item in host_control.list_snapshots(vmid)
+                    for item in refreshed["snapshots"]
                     if str(item.get("name") or "") == snapshot_name
                 ),
                 None,
@@ -895,7 +908,9 @@ class OpsService:
                 selected is None
                 or selected.get("owned_by_hubinet_ops") is not True
                 or selected.get("rollback_eligible") is not True
-                or parse_owned_snapshot_name(snapshot_name, vmid=vmid) is None
+                or str(selected.get("source_job_id") or "") != str(source["id"])
+                or int(selected.get("vmid") or 0) != vmid
+                or str(selected.get("kind") or "") != "pre-update"
             ):
                 raise ValueError(
                     "Recorded rollback snapshot is missing, foreign, or ineligible"
@@ -1138,8 +1153,10 @@ class OpsService:
                             if str(candidate.get("operation_type") or "")
                             in {"snapshot_create", "snapshot_create_ram"}
                             and str(
-                                dict(candidate.get("result") or {}).get(
-                                    "source_job_id"
+                                (
+                                    candidate["result"].get("source_job_id")
+                                    if isinstance(candidate.get("result"), dict)
+                                    else None
                                 )
                                 or ""
                             )
@@ -1153,6 +1170,13 @@ class OpsService:
                             candidate
                             for candidate in snapshot_jobs
                             if str(candidate.get("operation_type") or "") == "update"
+                            and self.db.has_job_event(
+                                str(candidate["id"]),
+                                {
+                                    "snapshot_mutation_succeeded",
+                                    "snapshot_created",
+                                },
+                            )
                         ),
                         None,
                     )
@@ -2191,6 +2215,13 @@ class OpsService:
                     message="Creating rollback snapshot" if auto_rollback else "Creating pre-update safety snapshot",
                 )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
+                emit(
+                    stage="snapshot",
+                    progress=24,
+                    event_type="snapshot_mutation_succeeded",
+                    message="Pre-update snapshot mutation completed",
+                    details={"snapshot_name": snapshot},
+                )
                 try:
                     self._refresh_snapshot_state(
                         vmid,
