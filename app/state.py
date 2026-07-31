@@ -35,6 +35,7 @@ JOB_STAGES = {
     "snapshot_creating",
     "snapshot_rollback",
     "snapshot_deleting",
+    "snapshot_pruning",
     "self_updating",
     "executing",
     "repair",

@@ -151,6 +151,41 @@ def _service(
     return service, db, host, job
 
 
+def test_snapshot_pruning_event_stage_is_persisted_and_unknown_fails_closed(
+    tmp_path: Path,
+) -> None:
+    db = Database(tmp_path / "ops.db")
+    job, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="snapshot_prune",
+        request_id="snapshot-prune-stage-test-0001",
+    )
+    event = db.insert_job_event(
+        job_id=job["id"],
+        vmid=106,
+        level="info",
+        stage="snapshot_pruning",
+        progress=50,
+        event_type="snapshot_pruning",
+        message="Pruning snapshots",
+    )
+
+    assert event["stage"] == "snapshot_pruning"
+    assert db.get_job(job["id"])["stage"] == "snapshot_pruning"
+    unknown = db.insert_job_event(
+        job_id=job["id"],
+        vmid=106,
+        level="info",
+        stage="truly_unknown_stage",
+        progress=51,
+        event_type="unknown_stage",
+        message="Unknown stage",
+    )
+    assert unknown["stage"] == "idle"
+    assert db.get_job(job["id"])["stage"] == "idle"
+
+
 def _start_and_interrupt(
     service: OpsService,
     db: Database,
@@ -455,6 +490,7 @@ def test_direct_http_500_child_error_stays_active_as_unknown(
 
     persisted = db.get_job(job["id"])
     assert persisted["status"] == "running"
+    assert persisted["stage"] == "snapshot_pruning"
     assert persisted["result"]["phase"] == "unknown"
     assert db.active_job_count() == 1
     assert {item["name"] for item in host.snapshots} == {target["name"]}
@@ -526,14 +562,17 @@ def test_ambiguous_remote_outcome_stays_active_and_fail_closed(
 
     persisted = db.get_job(job["id"])
     assert persisted["status"] == "running"
+    assert persisted["stage"] == "snapshot_pruning"
     assert persisted["result"]["phase"] == "unknown"
     assert db.active_job_count() == 1
     with pytest.raises(ValueError, match="Another destructive"):
         service.queue_snapshot_create(106, "blocked-unknown-prune-0001")
-    assert any(
-        event["event_type"] == "snapshot_pruning_outcome_unknown"
+    outcome_unknown = next(
+        event
         for event in db.list_job_events(job["id"])
+        if event["event_type"] == "snapshot_pruning_outcome_unknown"
     )
+    assert outcome_unknown["stage"] == "snapshot_pruning"
 
 
 def test_retention_zero_terminalizes_source_without_followup(

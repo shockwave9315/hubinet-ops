@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.state import display_status, normalize_state
+from app.state import JOB_STAGES, display_status, normalize_state
 
 
 @pytest.mark.parametrize(
@@ -171,6 +171,29 @@ def test_running_operation_preserves_active_job() -> None:
     assert state["active_job_id"] == "active-job"
     assert state["job_stage"] == "updating"
     assert state["job_progress"] == 42
+
+
+def test_snapshot_pruning_stage_is_registered_and_normalized() -> None:
+    assert "snapshot_pruning" in JOB_STAGES
+    state = normalize_state(
+        {
+            "operation_status": "running",
+            "job_stage": "snapshot_pruning",
+            "job_progress": 55,
+            "active_job_id": "snapshot-prune-job",
+        }
+    )
+    unknown = normalize_state(
+        {
+            "operation_status": "running",
+            "job_stage": "truly_unknown_stage",
+            "active_job_id": "unknown-stage-job",
+        }
+    )
+
+    assert state["job_stage"] == "snapshot_pruning"
+    assert state["active_job_id"] == "snapshot-prune-job"
+    assert unknown["job_stage"] == "idle"
 
 
 def test_legacy_state_defaults_to_lxc_apt_contract() -> None:
