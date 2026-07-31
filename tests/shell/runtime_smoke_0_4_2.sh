@@ -50,8 +50,9 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$HOST_ONLY_BIN/$HOST_PATH_SENTINEL"
 chmod +x "$HOST_ONLY_BIN/$HOST_PATH_SENTINEL"
 
 make_fakes() {
-  local root="$1" bin safe_bin pve ct safe_tool
+  local root="$1" bin safe_bin pve ct safe_tool hostd_bind
   bin="$root/bin"; safe_bin="$root/safe-bin"; pve="$root/pve"; ct="$root/ct"
+  hostd_bind="${HUBINET_OPS_FAKE_HOSTD_BIND:-192.0.2.10}"
   mkdir -p "$bin" "$safe_bin" "$root/pycompat" "$pve/etc/hubinet-ops" "$pve/usr/local/sbin" "$ct/ct110"
   for safe_tool in "${SAFE_TOOL_NAMES[@]}"; do
     ln -s "${SAFE_TOOL_PATHS[$safe_tool]}" "$safe_bin/$safe_tool"
@@ -59,7 +60,7 @@ make_fakes() {
   printf 'LOCK_EX=2\nLOCK_NB=4\ndef flock(*args, **kwargs): return None\n' > "$root/pycompat/fcntl.py"
   cp "$ROOT/config/config.example.yaml" "$ct/ct110/etc-config.yaml"
   printf 'HUBINET_OPS_API_TOKEN=%064d\n' 0 > "$ct/ct110/agent.env"
-  printf '{"bind":"192.0.2.10","port":8741,"database":"/var/lib/hubinet-ops-hostd/jobs.db","client_allowlist":[]}\n' > "$pve/etc/hubinet-ops/hostd.json"
+  printf '{"bind":"%s","port":8741,"database":"/var/lib/hubinet-ops-hostd/jobs.db","client_allowlist":[]}\n' "$hostd_bind" > "$pve/etc/hubinet-ops/hostd.json"
   printf 'HUBINET_OPS_HOSTD_TOKEN=%064d\n' 1 > "$pve/etc/hubinet-ops/hostd.env"
   printf 'old-wrapper\n' > "$pve/usr/local/sbin/hubinet-ops-host"
   for vmid in $(seq 101 110); do
@@ -289,6 +290,7 @@ exit 0
 SH
 cat > "$bin/curl" <<'SH'
 #!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$TEST_LOG"
 if [[ -f "$TEST_PVE_ROOT/usr/local/lib/hubinet-ops/hubinet_ops_hostd.py" ]] &&
    grep -Fq 'VERSION = "0.4.2"' "$TEST_PVE_ROOT/usr/local/lib/hubinet-ops/hubinet_ops_hostd.py"; then
   echo '{"status":"ok","version":"0.4.2"}'
@@ -380,7 +382,7 @@ run_case() {
   HUBINET_OPS_BACKUP_ROOT="$test_backup_root" \
   HUBINET_OPS_TEST_ARCHIVE="$test_archive" \
   HUBINET_OPS_TEST_WRAPPER_RUNNER="$test_wrapper" \
-  HUBINET_OPS_HOSTD_HEALTH_URL="http://hostd.test/health" \
+  HUBINET_OPS_HOST_CONTROL_URL="${HUBINET_OPS_FAKE_HOST_CONTROL_URL:-}" \
   HUBINET_OPS_VALIDATION_ATTEMPTS=1 \
   HUBINET_OPS_VALIDATION_DELAY=0 \
     "$REAL_BASH" ${HUBINET_OPS_TEST_BASH_X:+-x} "$ROOT/deploy/upgrade-0.4.2-from-pve.sh" >"$case_root/stdout" 2>"$case_root/stderr"
@@ -417,6 +419,51 @@ assert_ordered() {
 success_rc="$(run_case success)"
 if [[ "$success_rc" != 0 ]]; then
   cat "$TMP/success/stderr" >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'curl -fsS --max-time 5 http://192.0.2.10:8741/health' "$TMP/success/actions.log")" != 2 ]]; then
+  echo "IPv4 host-control healthchecks did not reuse the canonical URL" >&2
+  exit 1
+fi
+
+export HUBINET_OPS_FAKE_HOSTD_BIND="2001:db8::10"
+ipv6_rc="$(run_case ipv6)"
+unset HUBINET_OPS_FAKE_HOSTD_BIND
+if [[ "$ipv6_rc" != 0 ]]; then
+  cat "$TMP/ipv6/stderr" >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'curl -fsS --max-time 5 http://[2001:db8::10]:8741/health' "$TMP/ipv6/actions.log")" != 2 ]]; then
+  echo "IPv6 host-control healthchecks did not use the bracketed canonical URL" >&2
+  exit 1
+fi
+
+export HUBINET_OPS_FAKE_HOSTD_BIND="::"
+export HUBINET_OPS_FAKE_HOST_CONTROL_URL="http://[2001:db8::20]:8741/"
+wildcard_override_rc="$(run_case wildcard_override)"
+unset HUBINET_OPS_FAKE_HOST_CONTROL_URL
+if [[ "$wildcard_override_rc" != 0 ]]; then
+  cat "$TMP/wildcard_override/stderr" >&2
+  exit 1
+fi
+if [[ "$(grep -Fc 'curl -fsS --max-time 5 http://[2001:db8::20]:8741/health' "$TMP/wildcard_override/actions.log")" != 2 ]] ||
+   grep -Fq '//health' "$TMP/wildcard_override/actions.log" ||
+   grep -Fq 'http://:::8741' "$TMP/wildcard_override/actions.log"; then
+  echo "Explicit wildcard-bind host-control URL was not reused canonically" >&2
+  exit 1
+fi
+
+wildcard_missing_rc="$(run_case wildcard_missing)"
+unset HUBINET_OPS_FAKE_HOSTD_BIND
+if [[ "$wildcard_missing_rc" == 0 ]]; then
+  echo "wildcard IPv6 bind unexpectedly passed without an explicit host-control URL" >&2
+  exit 1
+fi
+grep -Fq 'HUBINET_OPS_HOST_CONTROL_URL is required for wildcard bind' \
+  "$TMP/wildcard_missing/stderr"
+if grep -Eq 'MARK (secret-stage-created|hostd-stage-populated)|AGENT_INSTALLED' \
+  "$TMP/wildcard_missing/actions.log"; then
+  echo "wildcard-bind validation failed after changes started" >&2
   exit 1
 fi
 

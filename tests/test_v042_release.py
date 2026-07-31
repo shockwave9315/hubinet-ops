@@ -58,6 +58,26 @@ def test_upgrade_is_exactly_041_to_042_transactional_and_read_only_at_validation
         assert forbidden not in validation
 
 
+def test_upgrade_reuses_canonical_host_control_health_url() -> None:
+    text = UPGRADE.read_text(encoding="utf-8")
+    smoke = (ROOT / "tests/shell/runtime_smoke_0_4_2.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert text.count('"${HOST_CONTROL_URL%/}/health"') == 2
+    assert "HUBINET_OPS_HOSTD_HEALTH_URL" not in text
+    assert 'host=f"[{bind}]" if ":" in bind else bind' in text
+    assert "HUBINET_OPS_HOST_CONTROL_URL is required for wildcard bind" in text
+    for marker in (
+        "http://192.0.2.10:8741/health",
+        "http://[2001:db8::10]:8741/health",
+        "http://[2001:db8::20]:8741/",
+        "http://:::8741",
+        "wildcard_missing",
+    ):
+        assert marker in smoke
+
+
 def test_ha_installer_is_transactional_and_keeps_secrets_on_stdin() -> None:
     text = HA_INSTALLER.read_text(encoding="utf-8")
     assert "${STAMP}-before-0.4.2" in text

@@ -126,7 +126,8 @@ import json, sys
 cfg=json.load(open(sys.argv[1], encoding="utf-8"))
 bind=str(cfg["bind"])
 if bind in {"0.0.0.0", "::"}: raise SystemExit("HUBINET_OPS_HOST_CONTROL_URL is required for wildcard bind")
-print(f"http://{bind}:{int(cfg.get('port',8741))}")
+host=f"[{bind}]" if ":" in bind else bind
+print(f"http://{host}:{int(cfg.get('port',8741))}")
 PY
 )"
 fi
@@ -619,17 +620,7 @@ if lxc.get("ok") is not True or lxc.get("data", {}).get("resource_type") != "lxc
 if snapshots.get("ok") is not True or not isinstance(snapshots.get("data", {}).get("snapshots"), list): raise SystemExit("invalid read-only snapshot list")
 PY
 
-hostd_health_url="${HUBINET_OPS_HOSTD_HEALTH_URL:-}"
-if [[ -z "$hostd_health_url" ]]; then
-  hostd_health_url="$(python3 - "$(pve_path "$HOSTD_CONFIG")" <<'PY'
-import json, sys
-cfg=json.load(open(sys.argv[1], encoding="utf-8"))
-bind=cfg["bind"]
-print(f"http://{bind}:{int(cfg.get('port',8741))}/health")
-PY
-)"
-fi
-hostd_health="$(curl -fsS --max-time 5 "$hostd_health_url")"
+hostd_health="$(curl -fsS --max-time 5 "${HOST_CONTROL_URL%/}/health")"
 python3 - "$hostd_health" <<'PY'
 import json, sys
 data=json.loads(sys.argv[1])
