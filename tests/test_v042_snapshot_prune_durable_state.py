@@ -20,7 +20,7 @@ from tests.test_v042_snapshot_prune_restart import (
     RestartablePruneHost,
     SimulatedBackendRestart,
 )
-from tests.test_v042_snapshot_retention import _owned
+from tests.test_v042_snapshot_retention import _owned, _record_snapshot_sources
 
 
 def _managed_snapshots(vmid: int, count: int) -> list[dict[str, Any]]:
@@ -305,6 +305,7 @@ def test_retry_completed_delete_oldest_does_not_delete_next_snapshot(
     db = Database(cfg.db_path)
     host = RestartablePruneHost(db)
     host.snapshots = _managed_snapshots(106, 3)
+    _record_snapshot_sources(db, host.snapshots)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     job = service.queue_snapshot_prune(
         106,
@@ -530,6 +531,7 @@ def test_all_unprotected_prunes_150_with_bounded_audit_history(
     db.update_job(rollback["id"], status="failed")
     host = RestartablePruneHost(db)
     host.snapshots = _managed_snapshots(106, 150) + [protected, foreign]
+    _record_snapshot_sources(db, host.snapshots)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     job = _queue_all(service, "large-all-unprotected-0001")
 
@@ -563,6 +565,7 @@ def test_restart_and_retry_after_deletion_100_continue_without_duplicate(
     host = RestartablePruneHost(db)
     snapshots = _managed_snapshots(106, 150)
     host.snapshots = snapshots
+    _record_snapshot_sources(db, host.snapshots)
     host.interrupt_name = snapshots[-101]["name"]
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     job = _queue_all(service, "large-restart-after-100-0001")
@@ -609,6 +612,7 @@ def test_retention_prunes_more_than_100_snapshots(
     db = Database(cfg.db_path)
     host = RestartablePruneHost(db)
     host.snapshots = _managed_snapshots(106, 160)
+    _record_snapshot_sources(db, host.snapshots)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     source, _ = db.create_operation_job(
         vmid=106,

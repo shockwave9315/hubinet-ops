@@ -120,7 +120,11 @@ class FakeRunner:
             },
             {
                 "snapname": "hubinet-ops-106-manual-20260720T170000Z",
-                "description": "hubinet-ops;kind=manual;source_job_id=abc12345",
+                "description": (
+                    "hubinet-ops;kind=manual;"
+                    "created_at=2026-07-20T17:00:00+00:00;"
+                    "source_job_id=abc12345"
+                ),
                 "snaptime": 1_721_492_400,
             },
         ]
@@ -257,6 +261,55 @@ def test_snapshot_list_marks_only_project_snapshots_as_eligible(tmp_path: Path) 
         controller.execute("snapshot-delete", 106, "foreign-backup")
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        "",
+        "hubinet-ops",
+        "hubinet-ops;kind=manual;created_at=2026-07-20T17:00:00+00:00",
+        (
+            "hubinet-ops;kind=manual;kind=manual;"
+            "created_at=2026-07-20T17:00:00+00:00;source_job_id=abc12345"
+        ),
+        (
+            "hubinet-ops;kind=pre-update;"
+            "created_at=2026-07-20T17:00:00+00:00;source_job_id=abc12345"
+        ),
+        (
+            "hubinet-ops;kind=manual;"
+            "created_at=2026-07-20T17:00:01+00:00;source_job_id=abc12345"
+        ),
+        (
+            "hubinet-ops;kind=manual;"
+            "created_at=2026-07-20T17:00:00+00:00;source_job_id=not-a-job"
+        ),
+    ],
+)
+def test_name_only_or_invalid_snapshot_metadata_is_never_host_owned(
+    tmp_path: Path,
+    description: str,
+) -> None:
+    runner = FakeRunner()
+    name = "hubinet-ops-106-manual-20260720T170000Z"
+    runner.snapshots = [{"snapname": name, "description": description}]
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    snapshot = controller.execute("list-snapshots", 106)["snapshots"][0]
+
+    assert snapshot["owned_by_hubinet_ops"] is False
+    assert snapshot["ownership_status"] == "uncertain"
+    assert snapshot["delete_eligible"] is False
+    assert snapshot["rollback_eligible"] is False
+    with pytest.raises(HostControlError, match="does not exist"):
+        controller.execute("snapshot-delete", 106, name)
+    with pytest.raises(HostControlError, match="does not exist"):
+        controller.execute("snapshot-rollback", 106, name)
+    assert not any(
+        call[0][:2] in (["pct", "delsnapshot"], ["pct", "rollback"])
+        for call in runner.calls
+    )
+
+
 def test_snapshot_list_falls_back_to_legacy_name(tmp_path: Path) -> None:
     runner = FakeRunner()
     runner.snapshots = [{"name": "foreign-legacy"}]
@@ -334,7 +387,11 @@ def test_ct110_snapshot_restore_works_without_backend_through_explicit_pve_polic
     runner.snapshots = [
         {
             "snapname": name,
-            "description": "hubinet-ops;kind=manual;source_job_id=abc12345",
+            "description": (
+                "hubinet-ops;kind=manual;"
+                "created_at=2026-07-23T19:00:00+00:00;"
+                "source_job_id=abc12345"
+            ),
             "snaptime": 1_721_492_400,
         }
     ]
@@ -427,7 +484,17 @@ def test_vm100_qemu_snapshot_uses_exact_typed_argv(
 def test_vm100_qemu_snapshot_list_and_delete_use_exact_argv(tmp_path: Path) -> None:
     runner = FakeRunner()
     name = "hubinet-ops-100-manual-20260729T120000Z"
-    runner.snapshots = [{"snapname": name, "snaptime": 1785326400}]
+    runner.snapshots = [
+        {
+            "snapname": name,
+            "description": (
+                "hubinet-ops;kind=manual;"
+                "created_at=2026-07-29T12:00:00+00:00;"
+                "source_job_id=abc12345"
+            ),
+            "snaptime": 1785326400,
+        }
+    ]
     controller = HostController(policy(tmp_path), runner=runner)
 
     snapshots = controller.execute("list-snapshots", 100)["snapshots"]

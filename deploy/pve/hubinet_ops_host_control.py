@@ -311,8 +311,12 @@ class HostController:
                 continue
             name = str(item.get("snapname") or item.get("name") or "")
             parsed = parse_snapshot(name, vmid)
+            metadata = _snapshot_description_metadata(
+                item.get("description"),
+                parsed,
+            )
             created_at = _snapshot_created_at(item, parsed)
-            owned = parsed is not None
+            owned = metadata is not None
             current = bool(item.get("current")) or name == "current"
             snapshots.append(
                 {
@@ -321,6 +325,9 @@ class HostController:
                     "created_at": created_at,
                     "kind": parsed["kind"] if parsed else None,
                     "owned_by_hubinet_ops": owned,
+                    "ownership_status": (
+                        "owned" if owned else "uncertain" if parsed else "foreign"
+                    ),
                     "rollback_eligible": (
                         owned
                         and not current
@@ -330,7 +337,9 @@ class HostController:
                     "delete_eligible": (
                         owned and not current and vmid in self.policy.snapshot_delete
                     ),
-                    "source_job_id": _description_job_id(item.get("description")),
+                    "source_job_id": (
+                        metadata.get("source_job_id") if metadata else None
+                    ),
                 }
             )
         return sorted(
@@ -459,6 +468,10 @@ class HostController:
         parsed = parse_snapshot(name, vmid)
         if parsed is None:
             raise HostControlError("Invalid Hubinet Ops snapshot name")
+        if parsed["kind"] == "manual" and source_job_id is None:
+            raise HostControlError(
+                "Manual snapshot creation requires a durable source job ID"
+            )
         description = (
             "hubinet-ops;"
             f"kind={parsed['kind']};created_at={_name_created_at(parsed)};"
@@ -643,9 +656,39 @@ def _name_created_at(parsed: dict[str, str]) -> str:
     ).isoformat()
 
 
-def _description_job_id(value: Any) -> str | None:
-    match = re.search(r"(?:^|;)source_job_id=([a-f0-9]{8,64})(?:;|$)", str(value or ""))
-    return match.group(1) if match else None
+def _snapshot_description_metadata(
+    value: Any,
+    parsed: dict[str, str] | None,
+) -> dict[str, str | None] | None:
+    if parsed is None:
+        return None
+    parts = str(value or "").split(";")
+    if not parts or parts[0] != "hubinet-ops":
+        return None
+    fields: dict[str, str] = {}
+    for part in parts[1:]:
+        if part.count("=") != 1:
+            return None
+        key, field_value = part.split("=", 1)
+        if key not in {"kind", "created_at", "source_job_id"} or key in fields:
+            return None
+        fields[key] = field_value
+    if set(fields) != {"kind", "created_at", "source_job_id"}:
+        return None
+    if fields["kind"] != parsed["kind"]:
+        return None
+    if fields["created_at"] != _name_created_at(parsed):
+        return None
+    source_job_id = fields["source_job_id"] or None
+    if source_job_id is not None and not SOURCE_JOB_RE.fullmatch(source_job_id):
+        return None
+    if parsed["kind"] == "manual" and source_job_id is None:
+        return None
+    return {
+        "kind": fields["kind"],
+        "created_at": fields["created_at"],
+        "source_job_id": source_job_id,
+    }
 
 
 def main() -> int:

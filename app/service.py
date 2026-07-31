@@ -1090,9 +1090,18 @@ class OpsService:
         vmid: int,
         snapshots: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        jobs_by_snapshot = {
+            str(item.get("name") or ""): self.db.find_snapshot_jobs(
+                vmid,
+                str(item.get("name") or ""),
+            )
+            for item in snapshots
+            if str(item.get("name") or "")
+        }
         jobs = [
-            job for job in self.db.list_jobs(limit=500)
-            if int(job.get("vmid") or 0) == vmid and job.get("snapshot_name")
+            job
+            for snapshot_jobs in jobs_by_snapshot.values()
+            for job in snapshot_jobs
         ]
         plans = [
             plan for plan in self.db.list_plans(limit=500)
@@ -1111,19 +1120,49 @@ class OpsService:
             name = str(payload.get("snapshot_name") or "")
             if name:
                 active_plan_names[name] = plan
-        jobs_by_name: dict[str, dict[str, Any]] = {}
-        for job in jobs:
-            jobs_by_name.setdefault(str(job["snapshot_name"]), job)
-
         now = self._now().astimezone(UTC)
         modeled: list[dict[str, Any]] = []
         for raw in snapshots:
             item = dict(raw)
             name = str(item.get("name") or "")
             parsed = parse_owned_snapshot_name(name, vmid=vmid)
-            owned = item.get("owned_by_hubinet_ops") is True and parsed is not None
+            snapshot_jobs = jobs_by_snapshot.get(name, [])
+            host_source_job_id = str(item.get("source_job_id") or "") or None
+            durable_source: dict[str, Any] | None = None
+            if item.get("owned_by_hubinet_ops") is True and parsed is not None:
+                if parsed["kind"] == "manual" and host_source_job_id is not None:
+                    durable_source = next(
+                        (
+                            candidate
+                            for candidate in snapshot_jobs
+                            if str(candidate.get("operation_type") or "")
+                            in {"snapshot_create", "snapshot_create_ram"}
+                            and str(
+                                dict(candidate.get("result") or {}).get(
+                                    "source_job_id"
+                                )
+                                or ""
+                            )
+                            == host_source_job_id
+                        ),
+                        None,
+                    )
+                elif parsed["kind"] == "pre-update":
+                    durable_source = next(
+                        (
+                            candidate
+                            for candidate in snapshot_jobs
+                            if str(candidate.get("operation_type") or "") == "update"
+                        ),
+                        None,
+                    )
+            owned = durable_source is not None
             reasons: list[str] = []
-            related_job = active_job_names.get(name) or jobs_by_name.get(name)
+            related_job = (
+                active_job_names.get(name)
+                or durable_source
+                or (snapshot_jobs[0] if snapshot_jobs else None)
+            )
             related_plan = active_plan_names.get(name)
             if name in active_job_names:
                 reasons.append("active_job")
@@ -1159,6 +1198,7 @@ class OpsService:
                     "source_job_id": (
                         str(related_job["id"]) if related_job is not None else None
                     ),
+                    "host_source_job_id": host_source_job_id,
                     "source_plan_id": (
                         str(related_plan["id"])
                         if related_plan is not None
@@ -1167,6 +1207,12 @@ class OpsService:
                         else None
                     ),
                     "owned_by_hubinet_ops": owned,
+                    "rollback_eligible": (
+                        owned and item.get("rollback_eligible") is True
+                    ),
+                    "delete_eligible": (
+                        owned and item.get("delete_eligible") is True
+                    ),
                     "ownership_status": (
                         "owned" if owned else "foreign" if parsed is None else "uncertain"
                     ),
@@ -2063,7 +2109,8 @@ class OpsService:
             self._finalize_operation_success(
                 job,
                 result,
-                enforce_snapshot_retention=False,
+                enforce_snapshot_retention=operation_type
+                in {"snapshot_create", "snapshot_create_ram"},
             )
         except (HostControlError, ValueError) as exc:
             LOGGER.warning(
@@ -2470,7 +2517,22 @@ class OpsService:
                 )
             self._save_state(vmid, state)
             try:
-                self._refresh_snapshot_state(vmid, job=job)
+                self._refresh_snapshot_state(
+                    vmid,
+                    job=job,
+                    required_name=(
+                        str(job.get("snapshot_name") or "")
+                        if operation_type
+                        in {"snapshot_create", "snapshot_create_ram"}
+                        else None
+                    ),
+                    required_kind=(
+                        "manual"
+                        if operation_type
+                        in {"snapshot_create", "snapshot_create_ram"}
+                        else None
+                    ),
+                )
                 snapshot_refreshed = True
             except (ExecutorError, HostControlError, ValueError) as exc:
                 LOGGER.warning(

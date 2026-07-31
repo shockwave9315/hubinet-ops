@@ -15,7 +15,7 @@ from tests.test_lifecycle_snapshots import (
     FakeHostControl,
     settings,
 )
-from tests.test_v042_snapshot_retention import _owned
+from tests.test_v042_snapshot_retention import _owned, _record_snapshot_sources
 from tests.test_v042_snapshot_consistency import (
     SnapshotUpdateExecutor,
     _approved_update,
@@ -217,6 +217,7 @@ def test_restart_reattaches_first_running_child_and_keeps_outer_job_active(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target]
+    _record_snapshot_sources(db, host.snapshots)
 
     persisted = _start_and_interrupt(service, db, host, target["name"])
     child_request_id = persisted["result"]["current"]["request_id"]
@@ -258,6 +259,7 @@ def test_restart_after_remote_success_does_not_submit_duplicate_delete(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target]
+    _record_snapshot_sources(db, host.snapshots)
     persisted = _start_and_interrupt(
         service,
         db,
@@ -289,6 +291,7 @@ def test_restart_before_submission_resubmits_stable_child_request(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target]
+    _record_snapshot_sources(db, host.snapshots)
     request_id = service._snapshot_prune_child_request_id(job, target["name"])
     state = dict(job["result"])
     state.update(
@@ -330,6 +333,7 @@ def test_restart_between_bulk_deletions_resumes_from_durable_deleted_list(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [newest, middle, oldest]
+    _record_snapshot_sources(db, host.snapshots)
     host.interrupt_name = middle["name"]
     running = db.next_queued_job()
     assert running is not None
@@ -364,6 +368,7 @@ def test_restart_after_last_delete_before_final_refresh_finishes_canonical_state
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target]
+    _record_snapshot_sources(db, host.snapshots)
     original_persist = service._persist_snapshot_prune_state
     interrupted = False
 
@@ -413,6 +418,7 @@ def test_failed_child_delete_fails_prune_but_preserves_durable_source(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target]
+    _record_snapshot_sources(db, host.snapshots)
     request_id = service._snapshot_prune_child_request_id(job, target["name"])
     state = dict(job["result"])
     state.update(
@@ -449,6 +455,7 @@ def test_direct_nontransient_child_rejection_fails_prune_and_releases_lock(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target]
+    _record_snapshot_sources(db, host.snapshots)
     host.execute_error = HostControlError(
         "child request rejected",
         status=None,
@@ -478,6 +485,7 @@ def test_direct_http_500_child_error_stays_active_as_unknown(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target]
+    _record_snapshot_sources(db, host.snapshots)
     host.execute_error = HostControlError(
         "hostd internal error",
         status=None,
@@ -508,6 +516,7 @@ def test_missing_remote_job_is_resubmitted_only_when_target_still_exists(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target] if target_present else []
+    _record_snapshot_sources(db, host.snapshots)
     request_id = service._snapshot_prune_child_request_id(job, target["name"])
     state = dict(job["result"])
     state.update(
@@ -540,6 +549,7 @@ def test_ambiguous_remote_outcome_stays_active_and_fail_closed(
         created_at="2026-07-27T12:00:00+00:00",
     )
     host.snapshots = [target]
+    _record_snapshot_sources(db, host.snapshots)
     request_id = service._snapshot_prune_child_request_id(job, target["name"])
     state = dict(job["result"])
     state.update(
@@ -630,6 +640,7 @@ def test_manual_snapshot_creation_hands_off_to_durable_retention_job(
             created_at="2026-07-27T12:00:00+00:00",
         ),
     ]
+    _record_snapshot_sources(db, host.snapshots)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     source = service.queue_snapshot_create(106, "create-retention-handoff-0001")
     running = db.next_queued_job()
@@ -666,6 +677,7 @@ def test_successful_update_hands_off_to_hostd_retention_job(
     service, db, source = _approved_update(tmp_path, executor)
     host = RestartablePruneHost(db)
     host.snapshots = executor.snapshots
+    _record_snapshot_sources(db, host.snapshots)
     service.host_control = host
     service.settings.raw["containers"][106]["snapshot_retention_count"] = 1
     service.settings.raw["containers"][106].pop("snapshot_retention", None)
@@ -727,6 +739,7 @@ def test_prune_failure_does_not_rewrite_successful_create_source(
             created_at="2026-07-28T12:00:00+00:00",
         )
     ]
+    _record_snapshot_sources(db, host.snapshots)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     source = service.queue_snapshot_create(106, "create-prune-failure-0001")
     running = db.next_queued_job()

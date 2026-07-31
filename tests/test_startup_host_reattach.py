@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -11,6 +12,7 @@ from app.config import Settings
 from app.database import Database
 from app.host_control import HostControlClient
 from app.service import OpsService
+from tests.test_v042_snapshot_retention import _record_snapshot_source
 
 
 class NoopExecutor:
@@ -130,6 +132,15 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
         request_id,
         snapshot_name=snapshot,
     )
+    source_job_id = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()[:32]
+    _record_snapshot_source(
+        db,
+        {
+            "name": snapshot,
+            "kind": "manual",
+            "source_job_id": source_job_id,
+        },
+    )
     db.upsert_container_state(
         110,
         {
@@ -175,6 +186,7 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
                         {
                             "name": snapshot,
                             "owned_by_hubinet_ops": True,
+                            "source_job_id": source_job_id,
                             "rollback_eligible": True,
                             "delete_eligible": True,
                         }
@@ -351,6 +363,99 @@ def test_missing_remote_job_interrupts_without_replaying_submit(
 
 @pytest.mark.parametrize(
     "operation_type",
+    ["snapshot_create", "snapshot_create_ram"],
+)
+@pytest.mark.parametrize("retention_target", [0, 1])
+def test_successful_snapshot_create_reattach_applies_retention_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation_type: str,
+    retention_target: int,
+) -> None:
+    case_dir = tmp_path / f"{operation_type}-{retention_target}"
+    case_dir.mkdir()
+    cfg = _settings(case_dir)
+    cfg.raw["resources"][110]["snapshot_retention_count"] = retention_target
+    cfg.raw["resources"][110].pop("snapshot_retention", None)
+    db = Database(cfg.db_path)
+    request_id = f"reattach-{operation_type.replace('_', '-')}-{retention_target}-0001"
+    snapshot = "hubinet-ops-110-manual-20260730T120000Z"
+    host_source_job_id = "a" * 32
+    local_job = _create_active_job(
+        db,
+        operation_type,
+        request_id,
+        snapshot_name=snapshot,
+    )
+    remote = {
+        "id": host_source_job_id,
+        "vmid": 110,
+        "request_id": request_id,
+        "operation_type": operation_type,
+        "argument": snapshot,
+        "status": "succeeded",
+        "stage": "complete",
+        "result": {
+            "name": snapshot,
+            "kind": "manual",
+            "source_job_id": host_source_job_id,
+        },
+        "error": None,
+    }
+    physical = {
+        "name": snapshot,
+        "description": (
+            "hubinet-ops;kind=manual;"
+            "created_at=2026-07-30T12:00:00+00:00;"
+            f"source_job_id={host_source_job_id}"
+        ),
+        "created_at": "2026-07-30T12:00:00+00:00",
+        "kind": "manual",
+        "owned_by_hubinet_ops": True,
+        "ownership_status": "owned",
+        "rollback_eligible": True,
+        "delete_eligible": True,
+        "source_job_id": host_source_job_id,
+    }
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.startswith("/api/v1/jobs/by-request/"):
+            return httpx.Response(200, json=remote)
+        if request.url.path == "/api/v1/resources/110/snapshots":
+            return httpx.Response(200, json={"snapshots": [physical]})
+        raise AssertionError(
+            f"unexpected request: {request.method} {request.url.path}"
+        )
+
+    service = OpsService(
+        cfg,
+        db,
+        NoopExecutor(),  # type: ignore[arg-type]
+        host_control=_client(monkeypatch, handler),
+    )
+
+    service._reconcile_startup_jobs()
+    request_count = len(requests)
+    service._reconcile_startup_jobs()
+
+    source = db.get_job(local_job["id"])
+    prunes = [
+        job for job in db.list_jobs() if job["operation_type"] == "snapshot_prune"
+    ]
+    assert source["status"] == "success"
+    assert source["result"]["source_job_id"] == host_source_job_id
+    assert len(prunes) == (1 if retention_target else 0)
+    if retention_target:
+        assert prunes[0]["result"]["source_job_id"] == source["id"]
+        assert prunes[0]["result"]["retention_target"] == retention_target
+    assert len(requests) == request_count
+    assert not [request for request in requests if request.method != "GET"]
+
+
+@pytest.mark.parametrize(
+    "operation_type",
     [
         "lifecycle_start",
         "lifecycle_shutdown",
@@ -432,6 +537,9 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
         f"/api/v1/jobs/by-request/110/{request_id}"
     )
     assert not [request for request in requests if request.method != "GET"]
+    assert not any(
+        job["operation_type"] == "snapshot_prune" for job in db.list_jobs()
+    )
 
 
 def test_self_update_startup_reattaches_by_request_without_execute_post(

@@ -493,6 +493,19 @@ class Database:
             ).fetchall()
         return {str(row["snapshot_name"]) for row in rows if row["snapshot_name"]}
 
+    def find_snapshot_jobs(
+        self,
+        vmid: int,
+        snapshot_name: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND snapshot_name=? "
+                "ORDER BY created_at DESC, id DESC",
+                (int(vmid), str(snapshot_name)),
+            ).fetchall()
+        return [_decode_job(row) for row in rows]
+
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
