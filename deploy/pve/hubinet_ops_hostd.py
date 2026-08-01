@@ -24,10 +24,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from hubinet_ops_host_control import HostControlError, HostController
+from hubinet_ops_host_control import (
+    HostControlError,
+    HostController,
+    snapshot_identity_argument,
+)
 from hubinet_ops_release import ReleaseError, read_marker, remove_marker, write_marker
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 MAX_REQUEST_BYTES = 16 * 1024
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 SNAPSHOT_PATH_RE = re.compile(
@@ -77,6 +81,16 @@ def _runtime_status(payload: Any) -> str:
     if status not in {"running", "stopped"}:
         raise HostControlError("status response has no valid LXC runtime state")
     return status
+
+
+def _snapshot_identity_name(argument: str | None) -> str | None:
+    try:
+        value = json.loads(str(argument or ""))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    return str(value.get("snapshot_name") or "") or None
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -313,7 +327,11 @@ class HostJobStore:
                     job_id,
                     request_id,
                     vmid,
-                    argument if operation_type == "offline_snapshot_restore" else None,
+                    (
+                        _snapshot_identity_name(argument)
+                        if operation_type == "offline_snapshot_restore"
+                        else None
+                    ),
                     operation_type,
                     now,
                 ),
@@ -480,6 +498,20 @@ class HostJobStore:
         self._sync_recovery_event(persisted)
         return persisted
 
+    def mark_outcome_unknown(self, job_id: str, error: str) -> dict[str, Any]:
+        """Keep a possibly-mutated host job active so the global lock is retained."""
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE host_jobs SET status='running',stage='outcome_unknown',error=?,"
+                "updated_at=? WHERE id=? AND status='running'",
+                (str(error)[:4096], utc_now(), str(job_id)),
+            )
+        if cursor.rowcount != 1:
+            return self.get(job_id)
+        persisted = self.get(job_id)
+        self._sync_recovery_event(persisted)
+        return persisted
+
     def begin_self_update_launch(
         self,
         job_id: str,
@@ -552,6 +584,10 @@ class HostJobStore:
             return job
         if job["operation_type"] == "self_update":
             return self.refresh_self_update_result(job_id)
+        if job["status"] == "queued":
+            # begin_execution is the durable mutation boundary. A queued job has
+            # not crossed it and may be started exactly once by main() below.
+            return job
 
         result: dict[str, Any] | None = None
         terminal = "interrupted"
@@ -585,14 +621,16 @@ class HostJobStore:
                     )
             except Exception as exc:  # reconciliation must never repeat the operation
                 message = f"status reconciliation failed: {exc}"
-        return self.transition_from_active(
-            job["id"],
-            status=terminal,
-            stage="complete" if terminal == "succeeded" else "interrupted",
-            progress=100,
-            result=result,
-            error=message,
-        )
+        if terminal == "succeeded":
+            return self.transition_from_active(
+                job["id"],
+                status="succeeded",
+                stage="complete",
+                progress=100,
+                result=result,
+                error=None,
+            )
+        return self.mark_outcome_unknown(job["id"], str(message))
 
     def refresh_self_update_result(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
@@ -661,6 +699,10 @@ class HostJobStore:
             message = f"{exc}; rollout outcome is unknown"
             remove = True
 
+        if terminal == "interrupted":
+            # Missing/late supervisor evidence cannot prove that rollout did not
+            # start. Keep the host job active and retain the global lock.
+            return self.mark_outcome_unknown(job["id"], str(message))
         persisted = self.transition_from_active(
             job["id"],
             status=terminal,
@@ -723,6 +765,7 @@ class HostJobRunner:
                 "lifecycle_reboot": "reboot",
                 "lifecycle_force_stop": "force-stop",
                 "snapshot_create": "snapshot-create",
+                "snapshot_create_ram": "snapshot-create-ram",
                 "snapshot_rollback": "snapshot-rollback",
                 "snapshot_delete": "snapshot-delete",
                 "self_update": "self-update",
@@ -851,6 +894,7 @@ class HostdApplication:
             "lifecycle_reboot": "reboot",
             "lifecycle_force_stop": "force-stop",
             "snapshot_create": "snapshot-create",
+            "snapshot_create_ram": "snapshot-create-ram",
             "snapshot_rollback": "snapshot-rollback",
             "snapshot_delete": "snapshot-delete",
             "self_update": "self-update",
@@ -883,7 +927,6 @@ class HostdApplication:
             "offline_snapshot_restore": "snapshot-rollback",
             "offline_force_stop": "force-stop",
         }[operation_type]
-        self.runner.controller.policy.validate(action, vmid, argument)
         with self._submit_lock:
             try:
                 existing = self.store.get_by_request_id(vmid, request_id)
@@ -892,7 +935,14 @@ class HostdApplication:
             if existing is not None:
                 if (
                     existing["operation_type"] != operation_type
-                    or existing["argument"] != argument
+                    or (
+                        operation_type == "offline_snapshot_restore"
+                        and _snapshot_identity_name(existing.get("argument")) != argument
+                    )
+                    or (
+                        operation_type == "offline_force_stop"
+                        and existing["argument"] is not None
+                    )
                 ):
                     raise ValueError(
                         "request_id was already used for another operation"
@@ -924,6 +974,34 @@ class HostdApplication:
                     raise HostControlError(
                         "offline restore requires an owned rollback-eligible snapshot"
                     )
+                source_job_id = str(snapshot.get("source_job_id") or "")
+                try:
+                    source_job = self.store.get(source_job_id)
+                except KeyError as exc:
+                    raise HostControlError(
+                        "offline restore snapshot has no durable create job"
+                    ) from exc
+                result = source_job.get("result")
+                if (
+                    source_job.get("operation_type")
+                    not in {"snapshot_create", "snapshot_create_ram"}
+                    or source_job.get("status") != "succeeded"
+                    or not isinstance(result, dict)
+                    or result.get("name") != argument
+                    or result.get("source_job_id") != source_job_id
+                    or result.get("pve_snaptime") != snapshot.get("pve_snaptime")
+                ):
+                    raise HostControlError(
+                        "offline restore snapshot identity is not backed by its create job"
+                    )
+                argument = snapshot_identity_argument(
+                    vmid=vmid,
+                    snapshot_name=str(snapshot["name"]),
+                    kind=str(snapshot.get("kind") or ""),
+                    expected_source_job_id=source_job_id,
+                    expected_pve_snaptime=snapshot.get("pve_snaptime"),
+                )
+            self.runner.controller.policy.validate(action, vmid, argument)
             job, created = self.store.create_recovery(
                 vmid=vmid,
                 operation_type=operation_type,
@@ -1034,7 +1112,18 @@ class HostdHandler(BaseHTTPRequestHandler):
                     "self-update-release", int(release_match.group("vmid"))
                 )
             except (HostControlError, ValueError) as exc:
-                self._send(HTTPStatus.CONFLICT, {"error": str(exc)})
+                message = str(exc)
+                self._send(
+                    HTTPStatus.CONFLICT,
+                    {
+                        "error": message,
+                        "code": (
+                            "staged_release_missing"
+                            if message == "No approved Hubinet Ops release is staged"
+                            else "staged_release_invalid"
+                        ),
+                    },
+                )
                 return
             self._send(HTTPStatus.OK, result)
             return
@@ -1136,7 +1225,16 @@ class HostdHandler(BaseHTTPRequestHandler):
             }:
                 vmid = int(snapshot_match.group("vmid"))
                 operation_type = "snapshot_rollback"
-                argument = unquote(snapshot_match.group("name"))
+                snapshot_name = unquote(snapshot_match.group("name"))
+                argument = snapshot_identity_argument(
+                    vmid=vmid,
+                    snapshot_name=snapshot_name,
+                    kind=str(payload.get("kind") or ""),
+                    expected_source_job_id=str(
+                        payload.get("expected_source_job_id") or ""
+                    ),
+                    expected_pve_snaptime=payload.get("expected_pve_snaptime"),
+                )
                 job, created = self.app.submit(
                     vmid=vmid,
                     operation_type=operation_type,
@@ -1145,7 +1243,12 @@ class HostdHandler(BaseHTTPRequestHandler):
                 )
             elif snapshot_match and snapshot_match.group("name") is None:
                 vmid = int(snapshot_match.group("vmid"))
-                operation_type = "snapshot_create"
+                include_ram = payload.get("include_ram", False)
+                if not isinstance(include_ram, bool):
+                    raise ValueError("include_ram must be a boolean")
+                operation_type = (
+                    "snapshot_create_ram" if include_ram else "snapshot_create"
+                )
                 argument = str(payload.get("name", ""))
                 job, created = self.app.submit(
                     vmid=vmid,
@@ -1173,11 +1276,21 @@ class HostdHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._body()
+            vmid = int(match.group("vmid"))
+            snapshot_name = unquote(match.group("name"))
             job, created = self.app.submit(
-                vmid=int(match.group("vmid")),
+                vmid=vmid,
                 operation_type="snapshot_delete",
                 request_id=str(payload.get("request_id") or uuid.uuid4().hex),
-                argument=unquote(match.group("name")),
+                argument=snapshot_identity_argument(
+                    vmid=vmid,
+                    snapshot_name=snapshot_name,
+                    kind=str(payload.get("kind") or ""),
+                    expected_source_job_id=str(
+                        payload.get("expected_source_job_id") or ""
+                    ),
+                    expected_pve_snaptime=payload.get("expected_pve_snaptime"),
+                ),
             )
         except ValueError as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -1259,6 +1372,8 @@ def main() -> int:
         update_token,
         recovery_token,
     )
+    for queued_job in store.queued():
+        application.runner.start(str(queued_job["id"]))
     serve(config, application)
     return 0
 

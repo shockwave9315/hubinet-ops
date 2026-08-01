@@ -65,7 +65,7 @@ def _fresh_payload() -> dict:
 
 
 def test_041_version_and_database_schema_contract() -> None:
-    assert 'VERSION = "0.4.1"' in (ROOT / "app" / "mqtt.py").read_text(
+    assert 'VERSION = "0.4.2"' in (ROOT / "app" / "mqtt.py").read_text(
         encoding="utf-8"
     )
     assert 'EXECUTOR_VERSION = "0.4.1"' in (
@@ -74,7 +74,7 @@ def test_041_version_and_database_schema_contract() -> None:
     assert 'VERSION = "0.4.1"' in (
         ROOT / "deploy" / "managed" / "hubinet-maint"
     ).read_text(encoding="utf-8")
-    assert 'VERSION = "0.4.1"' in (
+    assert 'VERSION = "0.4.2"' in (
         ROOT / "deploy" / "pve" / "hubinet_ops_hostd.py"
     ).read_text(encoding="utf-8")
     assert "PRAGMA user_version=400" in (
@@ -952,10 +952,10 @@ def test_runtime_smoke_uses_system_sandbox_as_the_only_execution_path() -> None:
     assert "HUBINET_OPS_SYSTEM_SANDBOX" in smoke
     assert "runtime smoke must execute inside the system sandbox" in smoke
     assert entrypoint.index("sandbox self-test: passed") < entrypoint.index(
-        "runtime_smoke_0_4_1.sh"
+        "runtime_smoke_0_4_2.sh"
     )
-    assert entrypoint.index("runtime_smoke_0_4_1.sh") < entrypoint.index(
-        "runtime_smoke_ha_0_4_1.sh"
+    assert entrypoint.index("runtime_smoke_0_4_2.sh") < entrypoint.index(
+        "runtime_smoke_ha_0_4_2.sh"
     )
     assert "exec /bin/bash" not in entrypoint
     for marker in (

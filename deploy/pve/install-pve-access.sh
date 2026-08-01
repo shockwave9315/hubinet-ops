@@ -25,16 +25,16 @@ for required in observation-vmids managed-vmids maintenance-vmids lifecycle-vmid
   }
 done
 cmp -s "$SOURCE_DIR/managed-vmids" "$SOURCE_DIR/maintenance-vmids" || {
-  echo "Managed and maintenance allowlists must match for 0.4.1" >&2
+  echo "Managed and maintenance allowlists must match for 0.4.2" >&2
   exit 1
 }
-cmp -s "$SOURCE_DIR/lifecycle-vmids" "$SOURCE_DIR/host-control-vmids" || {
-  echo "Lifecycle and host-control allowlists must match for 0.4.1" >&2
+cmp -s "$SOURCE_DIR/lifecycle-vmids" "$SOURCE_DIR/snapshot-restore-vmids" || {
+  echo "Lifecycle and snapshot restore allowlists must match for 0.4.2" >&2
   exit 1
 }
-for policy in snapshot-create-vmids snapshot-restore-vmids snapshot-delete-vmids; do
+for policy in snapshot-create-vmids snapshot-delete-vmids; do
   cmp -s "$SOURCE_DIR/host-control-vmids" "$SOURCE_DIR/$policy" || {
-    echo "$policy must match host-control-vmids for 0.4.1" >&2
+    echo "$policy must match host-control-vmids for 0.4.2" >&2
     exit 1
   }
 done

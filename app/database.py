@@ -12,6 +12,7 @@ from typing import Any
 from .contracts import (
     JOB_OPERATION_TYPES,
     REQUEST_ID_RE,
+    SNAPSHOT_PRUNE_STATE_VERSION,
     parse_owned_snapshot_name,
 )
 from .security import bounded_json, sanitize_data, sanitize_text
@@ -492,6 +493,19 @@ class Database:
             ).fetchall()
         return {str(row["snapshot_name"]) for row in rows if row["snapshot_name"]}
 
+    def find_snapshot_jobs(
+        self,
+        vmid: int,
+        snapshot_name: str,
+    ) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND snapshot_name=? "
+                "ORDER BY created_at DESC, id DESC",
+                (int(vmid), str(snapshot_name)),
+            ).fetchall()
+        return [_decode_job(row) for row in rows]
+
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
@@ -523,6 +537,7 @@ class Database:
         request_id: str,
         plan_id: str | None = None,
         snapshot_name: str | None = None,
+        result: dict[str, Any] | None = None,
         require_no_active_plan: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         if operation_type not in JOB_OPERATION_TYPES:
@@ -542,6 +557,14 @@ class Database:
                     job["operation_type"] != operation_type
                     or job.get("plan_id") != plan_id
                     or job.get("snapshot_name") != snapshot_name
+                    or (
+                        result is not None
+                        and (
+                            not isinstance(job.get("result"), dict)
+                            or job["result"].get("expected_snapshot_identity")
+                            != result.get("expected_snapshot_identity")
+                        )
+                    )
                 ):
                     conn.execute("ROLLBACK")
                     raise ValueError("request_id was already used for another operation")
@@ -570,10 +593,79 @@ class Database:
             conn.execute(
                 "INSERT INTO jobs "
                 "(id,request_id,operation_type,plan_id,vmid,container_name,status,stage,progress,"
-                "snapshot_name,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued','queued',0,?,?,?)",
+                "snapshot_name,result,created_at,updated_at) VALUES(?,?,?,?,?,?,'queued','queued',0,?,?,?,?)",
                 (
                     job_id, request_id, operation_type, plan_id, vmid, container_name,
-                    snapshot_name, now, now,
+                    snapshot_name,
+                    bounded_json(result) if result is not None else None,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(job_id), True
+
+    def create_snapshot_prune_job(
+        self,
+        *,
+        vmid: int,
+        container_name: str,
+        request_id: str,
+        mode: str,
+        retention_target: int | None,
+        source_job_id: str | None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Atomically create a queued prune job with its complete durable state."""
+        initial_result = _initial_snapshot_prune_result(
+            mode=mode,
+            retention_target=retention_target,
+            source_job_id=source_job_id,
+        )
+        if not REQUEST_ID_RE.fullmatch(str(request_id)):
+            raise ValueError("Invalid request_id")
+        raw_result = bounded_json(initial_result)
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
+                (vmid, request_id),
+            ).fetchone()
+            if existing is not None:
+                job = _decode_job(existing)
+                if not _snapshot_prune_contract_matches(
+                    job,
+                    vmid=vmid,
+                    mode=mode,
+                    retention_target=retention_target,
+                    source_job_id=source_job_id,
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError(
+                        "request_id was already used for another snapshot prune contract"
+                    )
+                conn.execute("COMMIT")
+                return job, False
+            if conn.execute(
+                "SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1"
+            ).fetchone():
+                conn.execute("ROLLBACK")
+                raise ValueError("Another destructive maintenance job is active")
+            job_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT INTO jobs "
+                "(id,request_id,operation_type,plan_id,vmid,container_name,status,"
+                "stage,progress,snapshot_name,result,created_at,updated_at) "
+                "VALUES(?,?,'snapshot_prune',NULL,?,?,'queued','queued',0,?,?,?,?)",
+                (
+                    job_id,
+                    request_id,
+                    vmid,
+                    container_name,
+                    mode,
+                    raw_result,
+                    now,
+                    now,
                 ),
             )
             conn.execute("COMMIT")
@@ -793,8 +885,18 @@ class Database:
         )
         return value
 
-    def create_manual_rollback_job(self, source_job_id: str) -> dict[str, Any]:
-        return self.create_followup_job(source_job_id, stage="rollback", progress=1)
+    def create_manual_rollback_job(
+        self,
+        source_job_id: str,
+        *,
+        expected_snapshot_identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.create_followup_job(
+            source_job_id,
+            stage="rollback",
+            progress=1,
+            result={"expected_snapshot_identity": expected_snapshot_identity},
+        )
 
     def create_followup_job(
         self,
@@ -802,6 +904,7 @@ class Database:
         *,
         stage: str,
         progress: int,
+        result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         source = self.get_job(source_job_id)
         job_id = uuid.uuid4().hex
@@ -813,8 +916,8 @@ class Database:
             ).fetchone():
                 raise ValueError("Another destructive maintenance job is active")
             conn.execute(
-                "INSERT INTO jobs(id,request_id,operation_type,plan_id,vmid,container_name,status,stage,progress,snapshot_name,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs(id,request_id,operation_type,plan_id,vmid,container_name,status,stage,progress,snapshot_name,result,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     job_id,
                     request_id,
@@ -826,6 +929,7 @@ class Database:
                     stage,
                     max(0, min(99, int(progress))),
                     source.get("snapshot_name"),
+                    bounded_json(result) if result is not None else None,
                     now,
                     now,
                 ),
@@ -837,19 +941,469 @@ class Database:
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"Unknown job fields: {unknown}")
-        fields["updated_at"] = utc_now()
-        assignments = ", ".join(f"{key}=?" for key in fields)
-        values = []
-        for key, value in fields.items():
-            if key == "result" and isinstance(value, (dict, list)):
-                value = bounded_json(value)
-            elif key == "error" and value is not None:
-                value = sanitize_text(value, limit=2000)
-            values.append(value)
-        values.append(job_id)
         with self._lock, self._connect() as conn:
+            current = conn.execute(
+                "SELECT * FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(job_id)
+            if "result" in fields:
+                existing = _result_dict(current["result"])
+                proof = (
+                    existing.get("snapshot_proof")
+                    if existing is not None
+                    and _stored_snapshot_proof_matches_job(
+                        existing.get("snapshot_proof"),
+                        vmid=int(current["vmid"]),
+                        snapshot_name=str(current["snapshot_name"] or ""),
+                    )
+                    else None
+                )
+                expected_identity = (
+                    existing.get("expected_snapshot_identity")
+                    if existing is not None
+                    and _valid_expected_snapshot_identity(
+                        existing.get("expected_snapshot_identity"),
+                        vmid=int(current["vmid"]),
+                        snapshot_name=str(current["snapshot_name"] or ""),
+                    )
+                    else None
+                )
+                automatic_rollback = (
+                    existing.get("automatic_rollback")
+                    if existing is not None
+                    and _valid_automatic_rollback_contract(
+                        existing.get("automatic_rollback"),
+                        job_id=str(current["id"]),
+                        vmid=int(current["vmid"]),
+                        snapshot_name=str(current["snapshot_name"] or ""),
+                    )
+                    else None
+                )
+                pre_update_create = (
+                    existing.get("pre_update_snapshot_create")
+                    if existing is not None
+                    and _valid_pre_update_create_contract(
+                        existing.get("pre_update_snapshot_create"),
+                        job_id=str(current["id"]),
+                        vmid=int(current["vmid"]),
+                        snapshot_name=str(current["snapshot_name"] or ""),
+                    )
+                    else None
+                )
+                incoming = fields["result"]
+                if isinstance(incoming, dict):
+                    merged = dict(incoming)
+                    merged.pop("snapshot_proof", None)
+                    if proof is not None:
+                        merged["snapshot_proof"] = proof
+                    merged.pop("expected_snapshot_identity", None)
+                    if expected_identity is not None:
+                        merged["expected_snapshot_identity"] = expected_identity
+                    merged.pop("automatic_rollback", None)
+                    if automatic_rollback is not None:
+                        merged["automatic_rollback"] = automatic_rollback
+                    merged.pop("pre_update_snapshot_create", None)
+                    if pre_update_create is not None:
+                        merged["pre_update_snapshot_create"] = pre_update_create
+                    fields["result"] = merged
+                elif (
+                    proof is not None
+                    or expected_identity is not None
+                    or automatic_rollback is not None
+                    or pre_update_create is not None
+                ):
+                    fields["result"] = existing
+            fields["updated_at"] = utc_now()
+            assignments = ", ".join(f"{key}=?" for key in fields)
+            values = []
+            for key, value in fields.items():
+                if key == "result" and isinstance(value, (dict, list)):
+                    value = bounded_json(value)
+                elif key == "error" and value is not None:
+                    value = sanitize_text(value, limit=2000)
+                values.append(value)
+            values.append(job_id)
             conn.execute(f"UPDATE jobs SET {assignments} WHERE id=?", values)
         return self.get_job(job_id)
+
+    def persist_pre_update_create_contract(
+        self,
+        job_id: str,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (str(job_id),)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(job_id)
+            if (
+                str(row["operation_type"]) != "update"
+                or str(row["status"]) not in {"queued", "running"}
+                or not _valid_pre_update_create_contract(
+                    contract,
+                    job_id=str(row["id"]),
+                    vmid=int(row["vmid"]),
+                    snapshot_name=str(row["snapshot_name"] or ""),
+                )
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("Pre-update create contract is malformed")
+            result = _result_dict(row["result"])
+            if result is None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Update job result is malformed")
+            previous = result.get("pre_update_snapshot_create")
+            if previous is not None:
+                if not _valid_pre_update_create_contract(
+                    previous,
+                    job_id=str(row["id"]),
+                    vmid=int(row["vmid"]),
+                    snapshot_name=str(row["snapshot_name"] or ""),
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Stored pre-update create contract is malformed")
+                if any(
+                    previous.get(key) != contract.get(key)
+                    for key in ("version", "request_id", "snapshot_name")
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Pre-update create contract identity changed")
+                transitions = {
+                    "prepared": {"prepared", "submitting", "definitive_failed"},
+                    "submitting": {"submitting", "remote_observed", "outcome_unknown", "remote_succeeded", "definitive_failed"},
+                    "remote_observed": {"remote_observed", "outcome_unknown", "remote_succeeded", "definitive_failed"},
+                    "outcome_unknown": {"outcome_unknown", "remote_observed", "remote_succeeded", "definitive_failed"},
+                    "remote_succeeded": {"remote_succeeded", "confirming", "definitive_failed"},
+                    "confirming": {"confirming", "completed", "definitive_failed"},
+                    "completed": {"completed"},
+                    "definitive_failed": {"definitive_failed"},
+                }
+                if str(contract["phase"]) not in transitions[str(previous["phase"])]:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Invalid pre-update create phase transition")
+                if (
+                    previous.get("host_job_id") is not None
+                    and previous.get("host_job_id") != contract.get("host_job_id")
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Pre-update create host job ID changed")
+            result["pre_update_snapshot_create"] = dict(contract)
+            conn.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
+                (bounded_json(result), now, str(job_id)),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(str(job_id))
+
+    def persist_automatic_rollback_contract(
+        self,
+        job_id: str,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a backend-owned automatic rollback transition atomically."""
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (str(job_id),)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(job_id)
+            if (
+                str(row["operation_type"]) != "update"
+                or str(row["status"]) not in {"queued", "running"}
+                or not _valid_automatic_rollback_contract(
+                    contract,
+                    job_id=str(row["id"]),
+                    vmid=int(row["vmid"]),
+                    snapshot_name=str(row["snapshot_name"] or ""),
+                )
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("Automatic rollback contract is malformed")
+            result = _result_dict(row["result"])
+            if result is None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Update job result is malformed")
+            previous = result.get("automatic_rollback")
+            if previous is not None:
+                if not _valid_automatic_rollback_contract(
+                    previous,
+                    job_id=str(row["id"]),
+                    vmid=int(row["vmid"]),
+                    snapshot_name=str(row["snapshot_name"] or ""),
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Stored automatic rollback contract is malformed")
+                immutable = (
+                    "version",
+                    "request_id",
+                    "snapshot_name",
+                    "expected_snapshot_identity",
+                )
+                if any(previous.get(key) != contract.get(key) for key in immutable):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Automatic rollback contract identity changed")
+                transitions = {
+                    "prepared": {"prepared", "submitting", "definitive_failed"},
+                    "submitting": {
+                        "submitting", "remote_observed", "outcome_unknown",
+                        "remote_succeeded", "definitive_failed",
+                    },
+                    "remote_observed": {
+                        "remote_observed", "outcome_unknown", "remote_succeeded",
+                        "definitive_failed",
+                    },
+                    "outcome_unknown": {
+                        "outcome_unknown", "remote_observed", "remote_succeeded",
+                        "definitive_failed",
+                    },
+                    "remote_succeeded": {"remote_succeeded", "stabilizing"},
+                    "stabilizing": {"stabilizing", "stabilized", "definitive_failed"},
+                    "stabilized": {"stabilized", "completed", "definitive_failed"},
+                    "completed": {"completed"},
+                    "definitive_failed": {"definitive_failed"},
+                }
+                if str(contract["phase"]) not in transitions[str(previous["phase"])]:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Invalid automatic rollback phase transition")
+                previous_host_job_id = previous.get("host_job_id")
+                if (
+                    previous_host_job_id is not None
+                    and contract.get("host_job_id") != previous_host_job_id
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Automatic rollback host job ID changed")
+            result["automatic_rollback"] = dict(contract)
+            conn.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
+                (bounded_json(result), now, str(job_id)),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(str(job_id))
+
+    def record_pre_update_snapshot_proof(
+        self,
+        job_id: str,
+        vmid: int,
+        snapshot_name: str,
+        host_source_job_id: str,
+        pve_snaptime: int,
+    ) -> dict[str, Any]:
+        parsed = parse_owned_snapshot_name(snapshot_name, vmid=int(vmid))
+        if parsed is None or parsed.get("kind") != "pre-update":
+            raise ValueError("Snapshot proof requires an exact pre-update snapshot name")
+        if not re.fullmatch(r"[a-f0-9]{32}", str(host_source_job_id)):
+            raise ValueError("Snapshot proof requires an exact host source job ID")
+        if (
+            isinstance(pve_snaptime, bool)
+            or not isinstance(pve_snaptime, int)
+            or pve_snaptime <= 0
+        ):
+            raise ValueError("Snapshot proof requires an exact PVE snaptime")
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE id=?",
+                (str(job_id),),
+            ).fetchone()
+            if job is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(job_id)
+            if (
+                int(job["vmid"]) != int(vmid)
+                or str(job["operation_type"]) != "update"
+                or str(job["snapshot_name"] or "") != str(snapshot_name)
+                or str(job["status"]) not in {"queued", "running"}
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("Snapshot proof does not match an active update job")
+            result = _result_dict(job["result"])
+            if result is None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Active update job result is malformed")
+            result["snapshot_proof"] = {
+                "version": 3,
+                "vmid": int(vmid),
+                "snapshot_name": str(snapshot_name),
+                "kind": "pre-update",
+                "host_source_job_id": str(host_source_job_id),
+                "pve_snaptime": pve_snaptime,
+            }
+            conn.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
+                (bounded_json(result), now, str(job_id)),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(str(job_id))
+
+    def terminalize_job_with_snapshot_prune(
+        self,
+        source_job_id: str,
+        *,
+        source_status: str,
+        terminal_result: str,
+        error: str | None,
+        prune_request_id: str,
+        retention_target: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bool]:
+        """Atomically finish a source operation and enqueue its retention follow-up."""
+        if source_status not in {
+            "blocked",
+            "failed",
+            "interrupted",
+            "recovered",
+            "rolled_back",
+            "success",
+        }:
+            raise ValueError("Invalid terminal source status")
+        if terminal_result not in {
+            "failed",
+            "interrupted",
+            "manual_intervention",
+            "rolled_back",
+            "success",
+        }:
+            raise ValueError("Invalid terminal result")
+        if not REQUEST_ID_RE.fullmatch(prune_request_id):
+            raise ValueError("Invalid snapshot prune request_id")
+        now = utc_now()
+        prune_id = uuid.uuid4().hex
+        event_level = (
+            "error"
+            if terminal_result in {"failed", "manual_intervention"}
+            else "warning"
+            if terminal_result == "interrupted"
+            else "info"
+        )
+        event_stage = (
+            "completed"
+            if terminal_result in {"success", "rolled_back"}
+            else "failed"
+        )
+        event_message = sanitize_text(
+            error or f"Job finished: {terminal_result}",
+            limit=1000,
+        )
+        safe_error = sanitize_text(error, limit=2000) if error else None
+        prune_result = _initial_snapshot_prune_result(
+            mode="retention",
+            retention_target=retention_target,
+            source_job_id=source_job_id,
+        )
+        raw_prune_result = bounded_json(prune_result)
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            source = conn.execute(
+                "SELECT * FROM jobs WHERE id=?",
+                (source_job_id,),
+            ).fetchone()
+            if source is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(source_job_id)
+            existing = conn.execute(
+                "SELECT * FROM jobs WHERE vmid=? AND request_id=?",
+                (int(source["vmid"]), prune_request_id),
+            ).fetchone()
+            if existing is not None:
+                prune = _decode_job(existing)
+                if (
+                    str(source["status"]) != source_status
+                    or not _snapshot_prune_contract_matches(
+                        prune,
+                        vmid=int(source["vmid"]),
+                        mode="retention",
+                        retention_target=retention_target,
+                        source_job_id=source_job_id,
+                    )
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError(
+                        "Snapshot prune handoff request_id has a mismatched contract"
+                    )
+                event = _find_snapshot_prune_handoff_event(
+                    conn,
+                    source_job_id=source_job_id,
+                    prune_job_id=str(prune["id"]),
+                    prune_request_id=prune_request_id,
+                    terminal_result=terminal_result,
+                )
+                if event is None:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Snapshot prune handoff event is missing")
+                conn.execute("COMMIT")
+                return _decode_job(source), prune, event, False
+            if str(source["status"]) not in {"queued", "running"}:
+                conn.execute("ROLLBACK")
+                raise ValueError("Source job is already terminal")
+            other_active = conn.execute(
+                "SELECT 1 FROM jobs "
+                "WHERE status IN ('queued','running') AND id<>? LIMIT 1",
+                (source_job_id,),
+            ).fetchone()
+            if other_active is not None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Another destructive maintenance job is active")
+            conn.execute(
+                "UPDATE jobs SET status=?,stage=?,progress=100,error=?,updated_at=? "
+                "WHERE id=?",
+                (
+                    source_status,
+                    event_stage,
+                    safe_error,
+                    now,
+                    source_job_id,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO jobs "
+                "(id,request_id,operation_type,plan_id,vmid,container_name,status,"
+                "stage,progress,snapshot_name,result,created_at,updated_at) "
+                "VALUES(?,?, 'snapshot_prune',NULL,?,?,'queued','queued',0,"
+                "'retention',?,?,?)",
+                (
+                    prune_id,
+                    prune_request_id,
+                    int(source["vmid"]),
+                    str(source["container_name"]),
+                    raw_prune_result,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO job_events"
+                "(job_id,vmid,created_at,level,stage,progress,event_type,message,"
+                "details_json) VALUES(?,?,?,?,?,100,?,?,?)",
+                (
+                    source_job_id,
+                    int(source["vmid"]),
+                    now,
+                    event_level,
+                    event_stage,
+                    f"job_{terminal_result}",
+                    event_message,
+                    bounded_json(
+                        {
+                            "snapshot_prune_job_id": prune_id,
+                            "snapshot_prune_request_id": prune_request_id,
+                        },
+                        limit=16_000,
+                    ),
+                ),
+            )
+            event_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            conn.execute("COMMIT")
+        return (
+            self.get_job(source_job_id),
+            self.get_job(prune_id),
+            self.get_job_event(event_id),
+            True,
+        )
 
     def upsert_container_state(self, vmid: int, payload: dict[str, Any]) -> dict[str, Any]:
         updated_at = utc_now()
@@ -958,6 +1512,41 @@ class Database:
             ).fetchall()
         return [_decode_event(row) for row in reversed(rows)]
 
+    def has_snapshot_proof(
+        self,
+        job_id: str,
+        vmid: int,
+        snapshot_name: str,
+        host_source_job_id: str,
+        pve_snaptime: int,
+    ) -> bool:
+        parsed = parse_owned_snapshot_name(snapshot_name, vmid=int(vmid))
+        if (
+            parsed is None
+            or parsed.get("kind") != "pre-update"
+            or not re.fullmatch(r"[a-f0-9]{32}", str(host_source_job_id))
+            or isinstance(pve_snaptime, bool)
+            or not isinstance(pve_snaptime, int)
+            or pve_snaptime <= 0
+        ):
+            return False
+        with self._lock, self._connect() as conn:
+            job = conn.execute(
+                "SELECT * FROM jobs WHERE id=? AND vmid=? "
+                "AND operation_type='update' AND snapshot_name=?",
+                (str(job_id), int(vmid), str(snapshot_name)),
+            ).fetchone()
+        if job is None:
+            return False
+        result = _result_dict(job["result"])
+        return result is not None and _snapshot_proof_matches(
+            result.get("snapshot_proof"),
+            vmid=int(vmid),
+            snapshot_name=str(snapshot_name),
+            host_source_job_id=str(host_source_job_id),
+            pve_snaptime=pve_snaptime,
+        )
+
     def list_container_events(self, vmid: int, limit: int = 50) -> list[dict[str, Any]]:
         bounded = min(max(int(limit), 1), 200)
         with self._lock, self._connect() as conn:
@@ -971,8 +1560,275 @@ class Database:
         return self.list_container_events(vmid, limit)
 
 
+def _initial_snapshot_prune_result(
+    *,
+    mode: str,
+    retention_target: int | None,
+    source_job_id: str | None,
+) -> dict[str, Any]:
+    if mode not in {"all_unprotected", "oldest", "retention"}:
+        raise ValueError("Invalid snapshot pruning mode")
+    if mode == "retention":
+        if (
+            isinstance(retention_target, bool)
+            or not isinstance(retention_target, int)
+            or not 0 <= retention_target <= 100
+            or not source_job_id
+        ):
+            raise ValueError("Invalid snapshot retention prune contract")
+    elif retention_target is not None or source_job_id is not None:
+        raise ValueError("Manual snapshot pruning has an invalid source contract")
+    return {
+        "prune_version": SNAPSHOT_PRUNE_STATE_VERSION,
+        "mode": mode,
+        "retention_target": retention_target,
+        "source_job_id": source_job_id,
+        "deleted": [],
+        "deleted_count": 0,
+        "deleted_history_truncated": False,
+        "current": None,
+        "phase": "selecting",
+    }
+
+
+def _snapshot_prune_contract_matches(
+    job: dict[str, Any],
+    *,
+    vmid: int,
+    mode: str,
+    retention_target: int | None,
+    source_job_id: str | None,
+) -> bool:
+    result = job.get("result")
+    base_contract_matches = (
+        job.get("operation_type") == "snapshot_prune"
+        and int(job.get("vmid") or 0) == int(vmid)
+        and job.get("snapshot_name") == mode
+    )
+    if not base_contract_matches:
+        return False
+    if not isinstance(result, dict) or "prune_version" not in result:
+        return (
+            mode in {"all_unprotected", "oldest"}
+            and retention_target is None
+            and source_job_id is None
+        )
+    return (
+        result.get("prune_version") in {1, 2, SNAPSHOT_PRUNE_STATE_VERSION}
+        and result.get("mode") == mode
+        and result.get("retention_target") == retention_target
+        and result.get("source_job_id") == source_job_id
+    )
+
+
+def _find_snapshot_prune_handoff_event(
+    conn: sqlite3.Connection,
+    *,
+    source_job_id: str,
+    prune_job_id: str,
+    prune_request_id: str,
+    terminal_result: str,
+) -> dict[str, Any] | None:
+    rows = conn.execute(
+        "SELECT * FROM job_events WHERE job_id=? ORDER BY id DESC",
+        (source_job_id,),
+    ).fetchall()
+    for row in rows:
+        event = _decode_event(row)
+        details = event.get("details")
+        if (
+            event.get("event_type") == f"job_{terminal_result}"
+            and isinstance(details, dict)
+            and details.get("snapshot_prune_job_id") == prune_job_id
+            and details.get("snapshot_prune_request_id") == prune_request_id
+        ):
+            return event
+    return None
+
+
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _result_dict(value: Any) -> dict[str, Any] | None:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return dict(decoded) if isinstance(decoded, dict) else None
+
+
+def _snapshot_proof_matches(
+    value: Any,
+    *,
+    vmid: int,
+    snapshot_name: str,
+    host_source_job_id: str,
+    pve_snaptime: int,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    version = value.get("version")
+    proof_vmid = value.get("vmid")
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version == 3
+        and isinstance(proof_vmid, int)
+        and not isinstance(proof_vmid, bool)
+        and proof_vmid == int(vmid)
+        and str(value.get("snapshot_name") or "") == str(snapshot_name)
+        and str(value.get("kind") or "") == "pre-update"
+        and re.fullmatch(
+            r"[a-f0-9]{32}",
+            str(value.get("host_source_job_id") or ""),
+        )
+        is not None
+        and str(value.get("host_source_job_id")) == str(host_source_job_id)
+        and isinstance(value.get("pve_snaptime"), int)
+        and not isinstance(value.get("pve_snaptime"), bool)
+        and value.get("pve_snaptime") == pve_snaptime
+        and pve_snaptime > 0
+    )
+
+
+def _stored_snapshot_proof_matches_job(
+    value: Any,
+    *,
+    vmid: int,
+    snapshot_name: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    version = value.get("version")
+    proof_vmid = value.get("vmid")
+    common = (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and isinstance(proof_vmid, int)
+        and not isinstance(proof_vmid, bool)
+        and proof_vmid == int(vmid)
+        and str(value.get("snapshot_name") or "") == str(snapshot_name)
+        and str(value.get("kind") or "") == "pre-update"
+    )
+    if not common:
+        return False
+    if version == 1:
+        return True
+    if version == 2:
+        return re.fullmatch(
+            r"[a-f0-9]{32}",
+            str(value.get("host_source_job_id") or ""),
+        ) is not None
+    pve_snaptime = value.get("pve_snaptime")
+    return (
+        version == 3
+        and re.fullmatch(
+            r"[a-f0-9]{32}",
+            str(value.get("host_source_job_id") or ""),
+        ) is not None
+        and isinstance(pve_snaptime, int)
+        and not isinstance(pve_snaptime, bool)
+        and pve_snaptime > 0
+    )
+
+
+def _valid_expected_snapshot_identity(
+    value: Any,
+    *,
+    vmid: int,
+    snapshot_name: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    identity_vmid = value.get("vmid")
+    snaptime = value.get("pve_snaptime")
+    return (
+        value.get("version") == 1
+        and isinstance(identity_vmid, int)
+        and not isinstance(identity_vmid, bool)
+        and identity_vmid == int(vmid)
+        and str(value.get("snapshot_name") or "") == snapshot_name
+        and str(value.get("kind") or "") in {"manual", "pre-update"}
+        and re.fullmatch(
+            r"[a-f0-9]{32}",
+            str(value.get("host_source_job_id") or ""),
+        ) is not None
+        and isinstance(snaptime, int)
+        and not isinstance(snaptime, bool)
+        and snaptime > 0
+    )
+
+
+def _valid_automatic_rollback_contract(
+    value: Any,
+    *,
+    job_id: str,
+    vmid: int,
+    snapshot_name: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    phases = {
+        "prepared",
+        "submitting",
+        "remote_observed",
+        "outcome_unknown",
+        "remote_succeeded",
+        "stabilizing",
+        "stabilized",
+        "completed",
+        "definitive_failed",
+    }
+    host_job_id = value.get("host_job_id")
+    return (
+        value.get("version") == 1
+        and str(value.get("request_id") or "") == f"automatic-rollback-{job_id}"
+        and str(value.get("phase") or "") in phases
+        and str(value.get("snapshot_name") or "") == snapshot_name
+        and _valid_expected_snapshot_identity(
+            value.get("expected_snapshot_identity"),
+            vmid=vmid,
+            snapshot_name=snapshot_name,
+        )
+        and (host_job_id is None or re.fullmatch(r"[a-f0-9]{32}", str(host_job_id)))
+        and (value.get("last_error") is None or isinstance(value.get("last_error"), str))
+    )
+
+
+def _valid_pre_update_create_contract(
+    value: Any,
+    *,
+    job_id: str,
+    vmid: int,
+    snapshot_name: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    host_job_id = value.get("host_job_id")
+    identity = value.get("snapshot_identity")
+    return (
+        value.get("version") == 1
+        and value.get("request_id") == f"pre-update-snapshot-{job_id}"
+        and value.get("phase") in {
+            "prepared", "submitting", "remote_observed", "outcome_unknown",
+            "remote_succeeded", "completed", "definitive_failed",
+            "confirming",
+        }
+        and value.get("snapshot_name") == snapshot_name
+        and (host_job_id is None or re.fullmatch(r"[a-f0-9]{32}", str(host_job_id)))
+        and (
+            identity is None
+            or _valid_expected_snapshot_identity(
+                identity, vmid=vmid, snapshot_name=snapshot_name
+            )
+        )
+        and (value.get("last_error") is None or isinstance(value.get("last_error"), str))
+    )
 
 
 def _decode_plan(row: sqlite3.Row) -> dict[str, Any]:

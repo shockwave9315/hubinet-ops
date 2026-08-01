@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 import yaml
 
 from scripts.generate_ha_dashboard import (
@@ -51,6 +52,85 @@ def test_dashboard_generator_is_deterministic_and_checked_in() -> None:
 
     assert first == second
     assert DEFAULT_OUTPUT.read_text(encoding="utf-8") == first
+
+
+def test_ct110_self_update_control_does_not_depend_on_staged_release() -> None:
+    data = _dashboard()
+    ct110 = _text(_view(data, "ct-110"))
+
+    assert "Brak przygotowanego wydania" in ct110
+    assert "Przygotuj plan aktualizacji" in ct110
+    assert "backend odczyta" in ct110
+    assert "release" in ct110
+    assert "PVE" in ct110
+    conditions = _control_conditions(110, load_resources(DEFAULT_CONFIG)[110], "self_update")
+    rendered = _text(conditions)
+    assert "sensor.hubinet_ops_ct110_self_update_release_version" not in rendered
+    for required in (
+        "sensor.hubinet_ops_ct110_runtime_status",
+        "sensor.hubinet_ops_ct110_capability_self_update",
+        "sensor.hubinet_ops_ct110_operation_status",
+        "sensor.hubinet_ops_ct110_active_job_id",
+        "sensor.hubinet_ops_ct110_lifecycle_status",
+    ):
+        assert required in rendered
+
+
+def test_ct110_missing_release_warning_is_three_complete_conditional_sections() -> None:
+    sections = _view(_dashboard(), "ct-110")["sections"]
+    warnings = [
+        section
+        for section in sections
+        if any(
+            card.get("title") == "Brak przygotowanego wydania"
+            for card in section["cards"]
+        )
+    ]
+
+    assert len(warnings) == 3
+    states = []
+    for section in warnings:
+        assert section["type"] == "grid"
+        assert len(section["visibility"]) == 1
+        condition = section["visibility"][0]
+        assert condition["entity"] == (
+            "sensor.hubinet_ops_ct110_self_update_release_version"
+        )
+        states.append(condition["state"])
+        assert section["cards"][0]["type"] == "custom:mushroom-title-card"
+        assert section["cards"][0]["subtitle"]
+        assert section["cards"][1]["primary"] == "Brak przygotowanego wydania"
+    assert states == ["none", "unknown", "unavailable"]
+
+
+@pytest.mark.parametrize(
+    ("release_state", "expected_visible"),
+    [
+        ("none", 1),
+        ("unknown", 1),
+        ("unavailable", 1),
+        ("0.4.2", 0),
+    ],
+)
+def test_ct110_missing_release_warning_visibility_is_logical_or(
+    release_state: str,
+    expected_visible: int,
+) -> None:
+    sections = _view(_dashboard(), "ct-110")["sections"]
+    warnings = [
+        section
+        for section in sections
+        if section.get("visibility")
+        and section["visibility"][0]["entity"]
+        == "sensor.hubinet_ops_ct110_self_update_release_version"
+    ]
+
+    visible = [
+        section
+        for section in warnings
+        if section["visibility"][0]["state"] == release_state
+    ]
+    assert len(visible) == expected_visible
 
 
 def test_dashboard_contains_full_inventory_and_legacy_paths() -> None:
@@ -159,18 +239,24 @@ def test_mushroom_chips_use_semantic_colors_without_generic_red_fallback() -> No
         and "badge_color" in item
     )
     assert "degraded" in status_card["badge_color"]
-    assert "amber" in status_card["badge_color"]
+    assert "yellow" in status_card["badge_color"]
 
 
-def test_vm100_has_qemu_metrics_but_no_apt_or_controls() -> None:
+def test_vm100_has_qemu_metrics_and_only_guarded_snapshot_controls() -> None:
     text = _text(_view(_dashboard(), "vm-100"))
 
-    assert "QEMU Guest Agent" in text
+    assert "Agent gościa QEMU" in text
     assert "sensor.hubinet_ops_vm100_guest_agent" in text
     assert "sensor.hubinet_ops_vm100_ip_addresses" in text
     assert "pending_update_count" not in text
     assert "Pakiety APT" not in text
-    assert "perform-action" not in text
+    assert "script.hubinet_ops_snapshot_create" in text
+    assert "script.hubinet_ops_snapshot_delete_oldest" in text
+    assert "script.hubinet_ops_snapshot_delete_unprotected" in text
+    assert "input_boolean.hubinet_ops_vm100_snapshot_include_ram" in text
+    assert "Snapshot nie obejmie stanu RAM" in text
+    for forbidden in ("snapshot_restore", "start_container", "shutdown_container", "scan_container"):
+        assert forbidden not in text
     assert "Tryb obserwacji" in text
 
 
@@ -188,14 +274,14 @@ def test_ct110_has_only_supported_self_metrics() -> None:
     for unsupported in ("cpu_usage", "network_received", "network_sent"):
         assert f"sensor.hubinet_ops_ct110_{unsupported}" not in text
     assert "pending_update_count" not in text
-    assert text.count("perform-action") == 13
+    assert text.count("perform-action") == 15
     assert "script.hubinet_ops_self_update" in text
     assert "script.hubinet_ops_approve_container" in text
     assert "script.hubinet_ops_reject_container" in text
     assert "script.hubinet_ops_scan_container" not in text
 
 
-def test_all_lxc_views_have_policy_scoped_controls_and_vm100_has_none() -> None:
+def test_all_lxc_views_have_policy_scoped_controls_and_vm100_has_only_snapshots() -> None:
     data = _dashboard()
     apt_services = {
         "script.hubinet_ops_start_container",
@@ -221,9 +307,13 @@ def test_all_lxc_views_have_policy_scoped_controls_and_vm100_has_none() -> None:
             and (item.get("card") or {}).get("tap_action", {}).get("perform_action")
         }
         assert services == apt_services
-        assert _text(view).count("perform-action") == 12
-    assert "perform-action" not in _text(_view(data, "vm-100"))
-    assert "Tryb obserwacji" in _text(_view(data, "vm-100"))
+        assert _text(view).count("perform-action") == 14
+    vm100 = _text(_view(data, "vm-100"))
+    assert vm100.count("perform-action") == 3
+    assert "script.hubinet_ops_snapshot_create" in vm100
+    assert "script.hubinet_ops_snapshot_delete_oldest" in vm100
+    assert "script.hubinet_ops_snapshot_delete_unprotected" in vm100
+    assert "Tryb obserwacji" in vm100
 
 
 def test_lxc_control_guards_and_dangerous_confirmations_are_explicit() -> None:
@@ -295,7 +385,7 @@ def test_apt_views_have_resources_updates_verification_packages_and_optional_doc
     data = _dashboard()
     apt = _text(_view(data, "ct-101"))
     for title in (
-        "Zasoby", "Aktualizacje", "Historia i diagnostyka", "Pakiety i logi", "Logi live",
+        "Zasoby", "Aktualizacje", "Historia i diagnostyka", "Pakiety i logi", "Logi na żywo",
     ):
         assert title in apt
     assert "Weryfikacja końcowa" in apt

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import hashlib
 from pathlib import Path
 import threading
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 import pytest
 
 from app.config import Settings
-from app.contracts import REQUIRED_APT_ACTIONS
+from app.contracts import REQUIRED_APT_ACTIONS, parse_owned_snapshot_name
 from app.database import Database
 from app.executor import ExecutorError
 from app.host_control import HostControlError
@@ -17,6 +18,30 @@ from app.service import OpsService
 
 EXECUTOR_HASH = "a" * 64
 PROFILE_HASH = "b" * 64
+
+
+def record_owned_snapshot_sources(
+    db: Database,
+    snapshots: list[dict[str, Any]],
+) -> None:
+    from tests.test_v042_snapshot_retention import _record_snapshot_sources
+
+    for snapshot in snapshots:
+        if snapshot.get("owned_by_hubinet_ops") is True and not snapshot.get(
+            "pve_snaptime"
+        ):
+            snapshot["pve_snaptime"] = int(
+                datetime.fromisoformat(str(snapshot["created_at"])).timestamp()
+            )
+        if (
+            snapshot.get("owned_by_hubinet_ops") is True
+            and snapshot.get("kind") != "pre-update"
+            and not snapshot.get("source_job_id")
+        ):
+            snapshot["source_job_id"] = hashlib.sha256(
+                str(snapshot["name"]).encode("utf-8")
+            ).hexdigest()[:32]
+    _record_snapshot_sources(db, snapshots)
 
 
 class CompatibleExecutor:
@@ -94,7 +119,11 @@ class FakeHostControl:
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed=None,
     ) -> dict[str, Any]:
         self.calls.append(
             (
@@ -105,27 +134,60 @@ class FakeHostControl:
                 release_fingerprint,
             )
         )
+        if on_observed is not None:
+            on_observed(
+                {
+                    "id": hashlib.sha256(
+                        f"host:{vmid}:{request_id}".encode("utf-8")
+                    ).hexdigest()[:32]
+                }
+            )
         if operation_type == "lifecycle_start":
             self.runtime = "running"
         elif operation_type in {"lifecycle_shutdown", "lifecycle_force_stop"}:
             self.runtime = "stopped"
         elif operation_type == "lifecycle_reboot":
             self.runtime = "running"
-        elif operation_type == "snapshot_create":
+        elif operation_type in {"snapshot_create", "snapshot_create_ram"}:
             assert snapshot_name
+            parsed = parse_owned_snapshot_name(snapshot_name, vmid=vmid)
+            assert parsed is not None
+            created_at = datetime.strptime(
+                parsed["timestamp"],
+                "%Y%m%dT%H%M%SZ",
+            ).replace(tzinfo=UTC).isoformat()
+            pve_snaptime = int(datetime.fromisoformat(created_at).timestamp())
+            host_source_job_id = hashlib.sha256(
+                f"{vmid}:{request_id}:{snapshot_name}".encode("utf-8")
+            ).hexdigest()[:32]
+            description = (
+                f"hubinet-ops;kind={parsed['kind']};created_at={created_at};"
+                f"source_job_id={host_source_job_id}"
+            )
             self.snapshots.insert(
                 0,
                 {
                     "name": snapshot_name,
-                    "description": "hubinet-ops",
-                    "created_at": "2026-07-20T19:20:00+00:00",
-                    "kind": "manual",
+                    "description": description,
+                    "created_at": created_at,
+                    "kind": parsed["kind"],
                     "owned_by_hubinet_ops": True,
                     "rollback_eligible": True,
                     "delete_eligible": True,
-                    "source_job_id": request_id,
+                    "source_job_id": host_source_job_id,
+                    "pve_snaptime": pve_snaptime,
                 },
             )
+            return {
+                "name": snapshot_name,
+                "description": description,
+                "created_at": created_at,
+                "kind": parsed["kind"],
+                "owned_by_hubinet_ops": True,
+                "source_job_id": host_source_job_id,
+                "pve_snaptime": pve_snaptime,
+                "include_ram": operation_type == "snapshot_create_ram",
+            }
         elif operation_type == "snapshot_delete":
             self.snapshots = [item for item in self.snapshots if item["name"] != snapshot_name]
         elif operation_type == "self_update":
@@ -145,7 +207,11 @@ class FakeHostControl:
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed=None,
     ) -> dict[str, Any]:
         self.reattach_calls.append(
             (
@@ -161,6 +227,14 @@ class FakeHostControl:
             raise HostControlError(
                 "Host control job was not found; operation outcome is unknown",
                 status="not_found",
+            )
+        if on_observed is not None:
+            on_observed(
+                {
+                    "id": str(existing.get("id") or hashlib.sha256(
+                        f"host:{vmid}:{request_id}".encode("utf-8")
+                    ).hexdigest()[:32])
+                }
             )
         status = str(existing.get("status") or "succeeded")
         result = dict(existing.get("result") or {})
@@ -272,6 +346,7 @@ def test_running_pve_runtime_and_host_operations_survive_missing_guest_executor(
             "delete_eligible": True,
         }
     ]
+    record_owned_snapshot_sources(db, host.snapshots)
     executor = MissingExecutor()
     service = OpsService(
         cfg,
@@ -349,6 +424,7 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
             "owned_by_hubinet_ops": True,
             "rollback_eligible": True,
             "delete_eligible": True,
+            "source_job_id": "a" * 32,
         }
     ]
     executor = MissingExecutor()
@@ -371,11 +447,14 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
     db.update_plan_status(plan["id"], "failed")
     db.update_job(
         source["id"],
-        status="failed",
-        stage="failed",
-        progress=100,
         snapshot_name=snapshot,
     )
+    snaptime = int(datetime.fromisoformat("2026-07-24T18:02:27+00:00").timestamp())
+    host.snapshots[0]["pve_snaptime"] = snaptime
+    db.record_pre_update_snapshot_proof(
+        source["id"], 109, snapshot, "a" * 32, snaptime
+    )
+    db.update_job(source["id"], status="failed", stage="failed", progress=100)
     terminal = service.manual_rollback(109)
     state = service.get_state(109)
 
@@ -388,6 +467,134 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
     assert "missing guest executor" in state["executor_contract_error"]
     assert state["verification_status"] == "unknown"
     assert host.calls[0][0] == "snapshot_rollback"
+
+
+@pytest.mark.parametrize(
+    "operation_type",
+    ["snapshot_delete", "snapshot_create", "snapshot_rollback"],
+)
+def test_legacy_manual_rollback_rejects_non_update_source_without_side_effects(
+    tmp_path: Path,
+    operation_type: str,
+) -> None:
+    cfg = settings(tmp_path, vmid=109)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-109-pre-20260724T181000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T18:10:00+00:00",
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+        }
+    ]
+    source, _ = db.create_operation_job(
+        vmid=109,
+        container_name="ct-109",
+        operation_type=operation_type,
+        request_id=f"wrong-rollback-source-{operation_type}",
+        snapshot_name=snapshot,
+    )
+    source = db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    before = dict(source)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    with pytest.raises(ValueError, match="No rollback snapshot"):
+        service.manual_rollback(109)
+
+    assert db.get_job(source["id"]) == before
+    assert db.list_jobs() == [before]
+    assert host.calls == []
+
+
+def test_legacy_manual_rollback_rejects_update_without_durable_snapshot_proof(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=109)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-109-pre-20260724T182000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T18:20:00+00:00",
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+            "source_job_id": "b" * 32,
+        }
+    ]
+    source, _ = db.create_operation_job(
+        vmid=109,
+        container_name="ct-109",
+        operation_type="update",
+        request_id="update-without-snapshot-proof-0001",
+        snapshot_name=snapshot,
+    )
+    source = db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    before = dict(source)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
+        service.manual_rollback(109)
+
+    assert db.get_job(source["id"]) == before
+    assert db.list_jobs() == [before]
+    assert host.calls == []
+
+
+def test_legacy_manual_rollback_requires_snapshot_owned_by_exact_source_update(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=109)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = "hubinet-ops-109-pre-20260724T183000Z"
+    host.snapshots = [
+        {
+            "name": snapshot,
+            "created_at": "2026-07-24T18:30:00+00:00",
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "rollback_eligible": True,
+            "delete_eligible": True,
+            "source_job_id": "b" * 32,
+        }
+    ]
+    proven, _ = db.create_operation_job(
+        vmid=109,
+        container_name="ct-109",
+        operation_type="update",
+        request_id="proven-older-update-source-0001",
+        snapshot_name=snapshot,
+    )
+    snaptime = int(datetime.fromisoformat("2026-07-24T18:30:00+00:00").timestamp())
+    host.snapshots[0]["pve_snaptime"] = snaptime
+    db.record_pre_update_snapshot_proof(
+        proven["id"], 109, snapshot, "b" * 32, snaptime
+    )
+    db.update_job(proven["id"], status="failed", stage="failed", progress=100)
+    source, _ = db.create_operation_job(
+        vmid=109,
+        container_name="ct-109",
+        operation_type="update",
+        request_id="unproven-latest-update-source-0001",
+        snapshot_name=snapshot,
+    )
+    source = db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    before = dict(source)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
+        service.manual_rollback(109)
+
+    assert db.get_job(source["id"]) == before
+    assert not any(job["operation_type"] == "snapshot_rollback" for job in db.list_jobs())
+    assert host.calls == []
 
 
 def test_lifecycle_guards_runtime_active_job_plan_and_request_id(tmp_path: Path) -> None:
@@ -516,15 +723,27 @@ def test_snapshot_retention_never_deletes_foreign_or_active_rollback_source(tmp_
             "delete_eligible": False,
         }
     ]
+    record_owned_snapshot_sources(db, owned)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)  # type: ignore[arg-type]
     source, _ = db.create_operation_job(
         vmid=106, container_name="ct-106", operation_type="snapshot_rollback",
         request_id="rollback-source-0001", snapshot_name=owned[-1]["name"],
     )
     db.update_job(source["id"], status="failed", stage="failed", progress=100)
-    current = {"id": "c" * 32, "snapshot_name": owned[0]["name"]}
+    current, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="snapshot_create",
+        request_id="retention-followup-source-0001",
+        snapshot_name=owned[0]["name"],
+    )
 
-    service._enforce_snapshot_retention(106, current)
+    service._terminal_with_snapshot_retention(
+        current,
+        job_status="success",
+        result="success",
+        error=None,
+    )
 
     remaining = {item["name"] for item in host.snapshots}
     assert "foreign-backup" in remaining
@@ -585,6 +804,7 @@ def test_ct110_explicit_snapshot_restore_uses_independent_policy_offline(
             "delete_eligible": True,
         }
     ]
+    record_owned_snapshot_sources(db, host.snapshots)
     executor = CompatibleExecutor()
     service = OpsService(cfg, db, executor, host_control=host)  # type: ignore[arg-type]
 
@@ -624,6 +844,7 @@ def test_ct110_restore_is_blocked_by_waiting_plan_and_queued_self_update(
             "delete_eligible": True,
         }
     ]
+    record_owned_snapshot_sources(db, host.snapshots)
     service = OpsService(
         cfg, db, CompatibleExecutor(), host_control=host  # type: ignore[arg-type]
     )
@@ -660,6 +881,7 @@ def test_restore_plan_gate_and_local_job_insert_are_atomic(
             "delete_eligible": True,
         }
     ]
+    record_owned_snapshot_sources(db, host.snapshots)
     service = OpsService(
         cfg, db, CompatibleExecutor(), host_control=host  # type: ignore[arg-type]
     )
@@ -705,7 +927,9 @@ def test_restore_plan_gate_and_local_job_insert_are_atomic(
     assert len(outcome) == 1
     assert isinstance(outcome[0], ValueError)
     assert "active update plan" in str(outcome[0])
-    assert db.list_jobs() == []
+    assert not any(
+        job["operation_type"] == "snapshot_rollback" for job in db.list_jobs()
+    )
     assert host.calls == []
 
 

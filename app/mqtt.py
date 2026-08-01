@@ -4,6 +4,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -20,7 +21,7 @@ from .security import sanitize_data, sanitize_text
 from .mqtt_budget import bounded_attributes, bounded_state
 
 LOGGER = logging.getLogger("hubinet_ops.mqtt")
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class MqttTelemetry:
         resources: dict[int, dict[str, Any]],
         *,
         client_factory: Callable[..., Any] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.config = dict(config or {})
         self.resources = resources
@@ -49,6 +51,19 @@ class MqttTelemetry:
         )
         self.retain_state = bool(self.config.get("retain_state", True))
         self._client_factory = client_factory
+        self._monotonic = monotonic
+        self.cpu_deadband_percent = max(
+            0.1,
+            min(float(self.config.get("cpu_publish_deadband_percent", 0.5)), 100.0),
+        )
+        self.telemetry_heartbeat_seconds = max(
+            60,
+            min(
+                int(self.config.get("telemetry_heartbeat_seconds", 300)),
+                3600,
+            ),
+        )
+        self._resource_publications: dict[int, dict[str, Any]] = {}
         self._client: Any = None
         # Two complete discovery passes must fit during reconnect without
         # evicting retained cleanup messages as the 0.4.x entity contract grows.
@@ -150,13 +165,24 @@ class MqttTelemetry:
         force: bool = False,
     ) -> None:
         payload = bounded_state(state)
+        cpu = payload.get("cpu")
+        if isinstance(cpu, dict) and isinstance(
+            cpu.get("usage_percent"), (int, float)
+        ):
+            cpu["usage_percent"] = round(float(cpu["usage_percent"]), 1)
         attributes = bounded_attributes(state)
-        self._publish_json(
-            f"{self.base_topic}/resource/{int(vmid)}/state",
+        publish_state, heartbeat = self._should_publish_resource_state(
+            int(vmid),
             payload,
-            retain=self.retain_state,
             force=force,
         )
+        if publish_state:
+            self._publish_json(
+                f"{self.base_topic}/resource/{int(vmid)}/state",
+                payload,
+                retain=self.retain_state,
+                force=force or heartbeat,
+            )
         self._publish_json(
             f"{self.base_topic}/resource/{int(vmid)}/attributes",
             attributes,
@@ -164,18 +190,83 @@ class MqttTelemetry:
             force=force,
         )
         if self._is_lxc(vmid):
-            self._publish_json(
-                f"{self.base_topic}/ct/{int(vmid)}/state",
-                payload,
-                retain=self.retain_state,
-                force=force,
-            )
+            if publish_state:
+                self._publish_json(
+                    f"{self.base_topic}/ct/{int(vmid)}/state",
+                    payload,
+                    retain=self.retain_state,
+                    force=force or heartbeat,
+                )
             self._publish_json(
                 f"{self.base_topic}/ct/{int(vmid)}/attributes",
                 attributes,
                 retain=self.retain_state,
                 force=force,
             )
+
+    def _should_publish_resource_state(
+        self,
+        vmid: int,
+        payload: dict[str, Any],
+        *,
+        force: bool,
+    ) -> tuple[bool, bool]:
+        now = self._monotonic()
+        cpu = payload.get("cpu")
+        current_cpu = (
+            float(cpu["usage_percent"])
+            if isinstance(cpu, dict)
+            and isinstance(cpu.get("usage_percent"), (int, float))
+            else None
+        )
+        safety = dict(payload)
+        for key in (
+            "cpu",
+            "memory",
+            "disk",
+            "network",
+            "uptime_seconds",
+            "last_refresh",
+        ):
+            safety.pop(key, None)
+        signature = json.dumps(
+            safety,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        previous = self._resource_publications.get(vmid)
+        heartbeat = bool(
+            previous is not None
+            and now - float(previous["published_at"])
+            >= self.telemetry_heartbeat_seconds
+        )
+        cpu_transition = bool(
+            previous is not None
+            and (
+                (current_cpu is None) != (previous["cpu_percent"] is None)
+                or (
+                    current_cpu is not None
+                    and previous["cpu_percent"] is not None
+                    and abs(current_cpu - float(previous["cpu_percent"]))
+                    >= self.cpu_deadband_percent
+                )
+            )
+        )
+        publish = bool(
+            force
+            or previous is None
+            or signature != previous["safety_signature"]
+            or cpu_transition
+            or heartbeat
+        )
+        if publish:
+            self._resource_publications[vmid] = {
+                "safety_signature": signature,
+                "cpu_percent": current_cpu,
+                "published_at": now,
+            }
+        return publish, heartbeat
 
     def publish_job(self, vmid: int, job: dict[str, Any], *, force: bool = False) -> None:
         self._publish_json(

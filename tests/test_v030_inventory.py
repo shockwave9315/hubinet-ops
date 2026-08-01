@@ -28,7 +28,11 @@ def test_production_inventory_is_exact_and_fail_closed() -> None:
     assert resources[100]["guest_agent"] is True
     assert resources[110]["adapter"] == "agent_self"
     assert resources[106]["manual_rollback_allowed"] is True
-    assert not any(resources[100]["operator_capabilities"].values())
+    assert {
+        name
+        for name, enabled in resources[100]["operator_capabilities"].items()
+        if enabled
+    } == {"snapshot_create", "snapshot_list", "snapshot_delete"}
     for vmid in range(101, 110):
         capabilities = resources[vmid]["operator_capabilities"]
         assert all(value for name, value in capabilities.items() if name != "self_update")

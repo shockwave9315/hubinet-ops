@@ -8,6 +8,7 @@ import threading
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import Any, Callable
 
 import httpx
@@ -16,6 +17,8 @@ from .config import Settings
 from .contracts import (
     EXECUTOR_PROTOCOL_VERSION,
     EXECUTOR_VERSION,
+    SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT,
+    SNAPSHOT_PRUNE_STATE_VERSION,
     evaluate_executor_contract,
     parse_owned_snapshot_name,
 )
@@ -24,7 +27,11 @@ from .executor import Executor, ExecutorError
 from .host_control import HostControlClient, HostControlError
 from .mqtt import MqttTelemetry, VERSION
 from .security import sanitize_data, sanitize_text
-from .stabilization import StabilizationPolicy, Stabilizer
+from .stabilization import (
+    StabilizationInterrupted,
+    StabilizationPolicy,
+    Stabilizer,
+)
 from .state import normalize_state
 from .time_utils import parse_utc_timestamp
 
@@ -60,10 +67,74 @@ HOST_CONTROL_OPERATION_TYPES = {
     "lifecycle_reboot",
     "lifecycle_force_stop",
     "snapshot_create",
+    "snapshot_create_ram",
     "snapshot_rollback",
     "snapshot_delete",
     "self_update",
 }
+BACKEND_ONLY_EVENT_TYPES = {
+    "snapshot_created",
+    "snapshot_mutation_succeeded",
+}
+
+
+class HostJobOutcome(str, Enum):
+    DEFINITIVE_FAILURE = "definitive_failure"
+    OUTCOME_UNKNOWN = "outcome_unknown"
+    REMOTE_SUCCEEDED = "remote_succeeded"
+
+
+def classify_host_job_error(
+    error: HostControlError | ValueError,
+    *,
+    submit_started: bool,
+) -> HostJobOutcome:
+    """Classify a typed host job without confusing transport loss with failure."""
+    if isinstance(error, ValueError):
+        return HostJobOutcome.DEFINITIVE_FAILURE
+    if error.status in {"failed", "contract_mismatch"}:
+        return HostJobOutcome.DEFINITIVE_FAILURE
+    if error.http_status in {400, 409, 422}:
+        return HostJobOutcome.DEFINITIVE_FAILURE
+    if (
+        not submit_started
+        and error.http_status is not None
+        and 400 <= error.http_status < 500
+        and error.http_status not in {408, 429}
+    ):
+        return HostJobOutcome.DEFINITIVE_FAILURE
+    if submit_started:
+        return HostJobOutcome.OUTCOME_UNKNOWN
+    return HostJobOutcome.DEFINITIVE_FAILURE
+
+
+class ConflictError(ValueError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        required_action: str | None = None,
+    ) -> None:
+        super().__init__(sanitize_text(message, limit=1000))
+        self.code = sanitize_text(code, limit=100)
+        self.required_action = (
+            sanitize_text(required_action, limit=1000) if required_action else None
+        )
+
+    def detail(self) -> dict[str, str]:
+        result = {"code": self.code, "message": str(self)}
+        if self.required_action:
+            result["required_action"] = self.required_action
+        return result
+
+
+class SnapshotPruneOutcomeUnknown(RuntimeError):
+    """Keep a prune job active when a child deletion cannot be reconciled safely."""
+
+
+class HostOperationOutcomeUnknown(RuntimeError):
+    """A durable host mutation may have happened and must only be reconciled."""
 
 
 class OpsService:
@@ -178,6 +249,7 @@ class OpsService:
             "manual_snapshot_restore_allowed": bool(
                 cfg.get("manual_snapshot_restore_allowed", False)
             ),
+            "snapshot_retention_count": self._snapshot_retention_count(vmid),
             "dashboard_path": cfg.get("dashboard_path", f"/hubinet-ops/ct-{vmid}"),
             "operator_capabilities": self._capabilities(vmid),
             "monitoring": self._monitoring(vmid),
@@ -199,7 +271,6 @@ class OpsService:
                 if item.get("resource_type", "lxc") == "lxc"
             },
         }
-
     def get_state(self, vmid: int) -> dict[str, Any]:
         self._resource(vmid)
         state = self.db.get_resource_state(vmid)
@@ -848,16 +919,29 @@ class OpsService:
             host_control = self._require_host_control("Manual rollback")
             if self.db.get_active_job(vmid) is not None:
                 raise ValueError("Another job is already active for this resource")
+            if self.db.find_active_plan(vmid) is not None:
+                raise ValueError("Resolve the active update plan before rollback")
             source = self.db.get_latest_job(vmid)
-            if source is None or not source.get("snapshot_name"):
+            if (
+                source is None
+                or int(source.get("vmid") or 0) != vmid
+                or str(source.get("operation_type") or "") != "update"
+                or not source.get("snapshot_name")
+            ):
                 raise ValueError("No rollback snapshot is available")
             if source["status"] not in {"failed", "blocked", "interrupted"}:
                 raise ValueError("Rollback is only allowed after a failed operation")
             snapshot_name = str(source["snapshot_name"])
+            parsed = parse_owned_snapshot_name(snapshot_name, vmid=vmid)
+            if parsed is None or parsed.get("kind") != "pre-update":
+                raise ValueError(
+                    "Recorded rollback snapshot is missing, foreign, or ineligible"
+                )
+            refreshed = self._refresh_snapshot_state(vmid)
             selected = next(
                 (
                     item
-                    for item in host_control.list_snapshots(vmid)
+                    for item in refreshed["snapshots"]
                     if str(item.get("name") or "") == snapshot_name
                 ),
                 None,
@@ -866,7 +950,9 @@ class OpsService:
                 selected is None
                 or selected.get("owned_by_hubinet_ops") is not True
                 or selected.get("rollback_eligible") is not True
-                or parse_owned_snapshot_name(snapshot_name, vmid=vmid) is None
+                or str(selected.get("source_job_id") or "") != str(source["id"])
+                or int(selected.get("vmid") or 0) != vmid
+                or str(selected.get("kind") or "") != "pre-update"
             ):
                 raise ValueError(
                     "Recorded rollback snapshot is missing, foreign, or ineligible"
@@ -881,7 +967,15 @@ class OpsService:
                 raise ValueError(
                     f"Cannot establish PVE runtime before rollback: {runtime}"
                 )
-            job = self.db.create_manual_rollback_job(source["id"])
+            job = self.db.create_manual_rollback_job(
+                source["id"],
+                expected_snapshot_identity=self._snapshot_identity(
+                    vmid,
+                    selected,
+                    expected_name=snapshot_name,
+                    expected_kind="pre-update",
+                ),
+            )
             self.db.update_job(job["id"], status="running", stage="rollback", progress=1)
             self._run_operation_job(job)
             return self.db.get_job(job["id"])
@@ -941,15 +1035,59 @@ class OpsService:
 
     def list_snapshots(self, vmid: int) -> dict[str, Any]:
         cfg = self._resource(vmid)
-        if cfg.get("resource_type") != "lxc":
-            raise ValueError("Snapshots are supported only for LXC resources")
+        if cfg.get("resource_type") not in {"lxc", "qemu"}:
+            raise ValueError("Snapshots are not supported for this resource type")
         self._require_capability(vmid, "snapshot_list")
-        host_control = self._require_host_control("Snapshot listing")
-        snapshots = host_control.list_snapshots(vmid)
-        snapshots = [
-            dict(item) for item in snapshots
-            if isinstance(item, dict)
-        ]
+        return self._refresh_snapshot_state(vmid)
+
+    def _refresh_snapshot_state(
+        self,
+        vmid: int,
+        *,
+        job: dict[str, Any] | None = None,
+        required_name: str | None = None,
+        required_kind: str | None = None,
+        attempts: int = 3,
+    ) -> dict[str, Any]:
+        last_error: ExecutorError | HostControlError | ValueError | None = None
+        snapshots: list[dict[str, Any]] = []
+        for _attempt in range(max(1, min(int(attempts), 5))):
+            try:
+                snapshots = self._raw_snapshot_list(vmid)
+                break
+            except (ExecutorError, HostControlError, ValueError) as exc:
+                last_error = exc
+        else:
+            warning = sanitize_text(
+                f"Snapshot refresh failed after mutation: {last_error}",
+                limit=2000,
+            )
+            state = self.get_state(vmid)
+            state.update(
+                {
+                    "snapshot_state_stale": True,
+                    "snapshot_refresh_required": True,
+                    "snapshot_refresh_warning": warning,
+                }
+            )
+            self._save_state(vmid, state)
+            if job is not None:
+                event = self.db.insert_job_event(
+                    job_id=str(job["id"]),
+                    vmid=vmid,
+                    level="warning",
+                    stage=str(self.db.get_job(str(job["id"])).get("stage") or "snapshot"),
+                    progress=int(self.db.get_job(str(job["id"])).get("progress") or 0),
+                    event_type="snapshot_refresh_failed",
+                    message=warning,
+                    details={"refresh_required": True, "attempts": max(1, min(int(attempts), 5))},
+                )
+                self.mqtt.publish_event(vmid, event)
+            raise ValueError(warning) from last_error
+        snapshots = self._managed_snapshot_model(
+            vmid,
+            [dict(item) for item in snapshots if isinstance(item, dict)],
+        )
         snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         owned = [item for item in snapshots if item.get("owned_by_hubinet_ops") is True]
         latest = owned[0] if owned else {}
@@ -960,21 +1098,245 @@ class OpsService:
                 "latest_snapshot_name": latest.get("name"),
                 "latest_snapshot_at": latest.get("created_at"),
                 "latest_snapshot_kind": latest.get("kind"),
+                "snapshot_state_stale": False,
+                "snapshot_refresh_required": False,
+                "snapshot_refresh_warning": None,
+                "snapshot_refreshed_at": self._utc_second_timestamp(),
+                "managed_snapshots": owned,
             }
         )
         self._save_state(vmid, state)
+        if required_name is not None:
+            confirmed = next(
+                (
+                    item
+                    for item in owned
+                    if str(item.get("name") or "") == required_name
+                ),
+                None,
+            )
+            parsed = parse_owned_snapshot_name(required_name, vmid=vmid)
+            if (
+                confirmed is None
+                or parsed is None
+                or confirmed.get("owned_by_hubinet_ops") is not True
+                or str(confirmed.get("kind") or parsed.get("kind") or "") != str(required_kind or "")
+            ):
+                warning = (
+                    f"Created snapshot {required_name} could not be confirmed "
+                    f"as an owned VMID {vmid} {required_kind or ''} snapshot"
+                ).strip()
+                state = self.get_state(vmid)
+                state.update(
+                    {
+                        "snapshot_state_stale": True,
+                        "snapshot_refresh_required": True,
+                        "snapshot_refresh_warning": warning,
+                    }
+                )
+                self._save_state(vmid, state)
+                if job is not None:
+                    event = self.db.insert_job_event(
+                        job_id=str(job["id"]),
+                        vmid=vmid,
+                        level="error",
+                        stage="snapshot",
+                        progress=int(self.db.get_job(str(job["id"])).get("progress") or 0),
+                        event_type="snapshot_confirmation_failed",
+                        message=warning,
+                        details={"snapshot_name": required_name, "kind": required_kind},
+                    )
+                    self.mqtt.publish_event(vmid, event)
+                raise ValueError(warning)
         return {"snapshots": snapshots, "latest": latest or None}
+
+    def _managed_snapshot_model(
+        self,
+        vmid: int,
+        snapshots: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        jobs_by_snapshot = {
+            str(item.get("name") or ""): self.db.find_snapshot_jobs(
+                vmid,
+                str(item.get("name") or ""),
+            )
+            for item in snapshots
+            if str(item.get("name") or "")
+        }
+        jobs = [
+            job
+            for snapshot_jobs in jobs_by_snapshot.values()
+            for job in snapshot_jobs
+        ]
+        plans = [
+            plan for plan in self.db.list_plans(limit=500)
+            if int(plan.get("vmid") or 0) == vmid
+            and str(plan.get("status") or "") in {"waiting_approval", "approved"}
+        ]
+        active_job_names = {
+            str(job["snapshot_name"]): job
+            for job in jobs
+            if str(job.get("status") or "") in {"queued", "running"}
+        }
+        rollback_source_names = self.db.rollback_source_snapshots(vmid)
+        active_plan_names: dict[str, dict[str, Any]] = {}
+        for plan in plans:
+            payload = dict(plan.get("payload") or {})
+            name = str(payload.get("snapshot_name") or "")
+            if name:
+                active_plan_names[name] = plan
+        now = self._now().astimezone(UTC)
+        modeled: list[dict[str, Any]] = []
+        for raw in snapshots:
+            item = dict(raw)
+            name = str(item.get("name") or "")
+            parsed = parse_owned_snapshot_name(name, vmid=vmid)
+            snapshot_jobs = jobs_by_snapshot.get(name, [])
+            host_source_job_id = str(item.get("source_job_id") or "") or None
+            pve_snaptime = item.get("pve_snaptime")
+            durable_source: dict[str, Any] | None = None
+            if (
+                item.get("owned_by_hubinet_ops") is True
+                and parsed is not None
+                and isinstance(pve_snaptime, int)
+                and not isinstance(pve_snaptime, bool)
+                and pve_snaptime > 0
+            ):
+                if parsed["kind"] == "manual" and host_source_job_id is not None:
+                    durable_source = next(
+                        (
+                            candidate
+                            for candidate in snapshot_jobs
+                            if str(candidate.get("operation_type") or "")
+                            in {"snapshot_create", "snapshot_create_ram"}
+                            and str(
+                                (
+                                    candidate["result"].get("source_job_id")
+                                    if isinstance(candidate.get("result"), dict)
+                                    else None
+                                )
+                                or ""
+                            )
+                            == host_source_job_id
+                            and isinstance(candidate.get("result"), dict)
+                            and candidate["result"].get("pve_snaptime")
+                            == pve_snaptime
+                            and candidate["result"].get("name") == name
+                            and candidate["result"].get("kind") == "manual"
+                        ),
+                        None,
+                    )
+                elif parsed["kind"] == "pre-update":
+                    durable_source = next(
+                        (
+                            candidate
+                            for candidate in snapshot_jobs
+                            if str(candidate.get("operation_type") or "") == "update"
+                            and self.db.has_snapshot_proof(
+                                str(candidate["id"]),
+                                vmid,
+                                name,
+                                host_source_job_id,
+                                pve_snaptime,
+                            )
+                        ),
+                        None,
+                    )
+            owned = durable_source is not None
+            reasons: list[str] = []
+            related_job = (
+                active_job_names.get(name)
+                or durable_source
+                or (snapshot_jobs[0] if snapshot_jobs else None)
+            )
+            related_plan = active_plan_names.get(name)
+            if name in active_job_names:
+                reasons.append("active_job")
+            if name in active_plan_names:
+                reasons.append("active_plan")
+            if name in rollback_source_names:
+                reasons.append("manual_rollback_source")
+            if not owned:
+                reasons.append(
+                    "foreign_snapshot" if parsed is None else "ownership_uncertain"
+                )
+            created = parse_utc_timestamp(item.get("created_at"))
+            age_seconds = (
+                max(0, int((now - created.astimezone(UTC)).total_seconds()))
+                if created is not None
+                else None
+            )
+            kind = (
+                str(item.get("kind") or parsed.get("kind") or "")
+                if parsed is not None
+                else str(item.get("kind") or "unknown")
+            )
+            item.update(
+                {
+                    "physical_name": name,
+                    "logical_type": kind,
+                    "kind": kind,
+                    "vmid": vmid,
+                    "age_seconds": age_seconds,
+                    "protected": bool(reasons),
+                    "protection_reason": reasons[0] if reasons else None,
+                    "protection_reasons": reasons,
+                    "source_job_id": (
+                        str(related_job["id"]) if related_job is not None else None
+                    ),
+                    "host_source_job_id": host_source_job_id,
+                    "pve_snaptime": pve_snaptime,
+                    "source_plan_id": (
+                        str(related_plan["id"])
+                        if related_plan is not None
+                        else str(related_job.get("plan_id") or "") or None
+                        if related_job is not None
+                        else None
+                    ),
+                    "owned_by_hubinet_ops": owned,
+                    "rollback_eligible": (
+                        owned and item.get("rollback_eligible") is True
+                    ),
+                    "delete_eligible": (
+                        owned and item.get("delete_eligible") is True
+                    ),
+                    "ownership_status": (
+                        "owned" if owned else "foreign" if parsed is None else "uncertain"
+                    ),
+                }
+            )
+            modeled.append(item)
+        return modeled
+
+    def _snapshot_retention_count(self, vmid: int) -> int:
+        cfg = self._resource(vmid)
+        capabilities = self._capabilities(vmid)
+        snapshots_enabled = any(
+            bool(capabilities.get(name, False))
+            for name in ("snapshot_create", "snapshot_list", "snapshot_delete")
+        ) or bool(cfg.get("pre_update_snapshot", False))
+        value = cfg.get(
+            "snapshot_retention_count",
+            cfg.get("snapshot_retention", 3 if snapshots_enabled else 0),
+        )
+        return max(0, min(int(value), 100))
 
     def queue_snapshot_create(
         self,
         vmid: int,
         request_id: str | None = None,
+        *,
+        include_ram: bool = False,
     ) -> dict[str, Any]:
         lock = self._scan_locks[vmid]
         if not lock.acquire(blocking=False):
             raise ValueError("A scan or manual operation is active for this resource")
         try:
-            return self._queue_snapshot_create_locked(vmid, request_id)
+            return self._queue_snapshot_create_locked(
+                vmid,
+                request_id,
+                include_ram=include_ram,
+            )
         finally:
             lock.release()
 
@@ -982,10 +1344,17 @@ class OpsService:
         self,
         vmid: int,
         request_id: str | None = None,
+        *,
+        include_ram: bool = False,
     ) -> dict[str, Any]:
         cfg = self._resource(vmid)
-        if cfg.get("resource_type") != "lxc":
-            raise ValueError("Snapshots are supported only for LXC resources")
+        resource_type = str(cfg.get("resource_type") or "")
+        if resource_type not in {"lxc", "qemu"}:
+            raise ValueError("Snapshots are not supported for this resource type")
+        if not isinstance(include_ram, bool):
+            raise ValueError("include_ram must be a boolean")
+        if include_ram and resource_type != "qemu":
+            raise ValueError("include_ram is supported only for QEMU snapshots")
         self._require_capability(vmid, "snapshot_create")
         self._require_host_control("Snapshot creation")
         stamp = self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -993,7 +1362,11 @@ class OpsService:
         job, _ = self.db.create_operation_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"ct-{vmid}")),
-            operation_type="snapshot_create",
+            operation_type=(
+                "snapshot_create_ram"
+                if include_ram
+                else "snapshot_create"
+            ),
             request_id=request_id or uuid.uuid4().hex,
             snapshot_name=name,
         )
@@ -1015,6 +1388,34 @@ class OpsService:
         finally:
             lock.release()
 
+    def queue_snapshot_prune(
+        self,
+        vmid: int,
+        mode: str,
+        request_id: str | None = None,
+        *,
+        confirmation: str | None = None,
+    ) -> dict[str, Any]:
+        if mode not in {"oldest", "all_unprotected"}:
+            raise ValueError("Unsupported snapshot pruning mode")
+        if mode == "all_unprotected" and confirmation != "DELETE_ALL_UNPROTECTED":
+            raise ValueError("Exact confirmation DELETE_ALL_UNPROTECTED is required")
+        cfg = self._resource(vmid)
+        self._require_capability(vmid, "snapshot_delete")
+        self._require_capability(vmid, "snapshot_list")
+        self._require_host_control("Snapshot pruning")
+        job, created = self.db.create_snapshot_prune_job(
+            vmid=vmid,
+            container_name=str(cfg.get("name", f"resource-{vmid}")),
+            request_id=request_id or uuid.uuid4().hex,
+            mode=mode,
+            retention_target=None,
+            source_job_id=None,
+        )
+        if created:
+            self._mark_job_queued(vmid, job)
+        return job
+
     def _queue_snapshot_action_locked(
         self,
         vmid: int,
@@ -1030,8 +1431,8 @@ class OpsService:
             raise ValueError("Unsupported snapshot action")
         capability = "snapshot_rollback" if action == "rollback" else "snapshot_delete"
         cfg = self._resource(vmid)
-        if cfg.get("resource_type") != "lxc":
-            raise ValueError("Snapshots are supported only for LXC resources")
+        if cfg.get("resource_type") not in {"lxc", "qemu"}:
+            raise ValueError("Snapshots are not supported for this resource type")
         self._require_capability(vmid, capability)
         self._require_host_control("Snapshot operation")
         if action == "rollback" and not bool(
@@ -1051,12 +1452,23 @@ class OpsService:
             raise ValueError("Resolve the active update plan before snapshot restore")
         if not bool(selected.get(f"{action}_eligible")):
             raise ValueError(f"Snapshot is not {action} eligible")
+        if action == "delete" and bool(selected.get("protected")):
+            raise ValueError(
+                f"Snapshot is protected: {selected.get('protection_reason') or 'policy'}"
+            )
         job, _ = self.db.create_operation_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"ct-{vmid}")),
             operation_type=operation_type,
             request_id=request_id or uuid.uuid4().hex,
             snapshot_name=str(selected["name"]),
+            result={
+                "expected_snapshot_identity": self._snapshot_identity(
+                    vmid,
+                    selected,
+                    expected_name=str(selected["name"]),
+                )
+            },
             require_no_active_plan=action == "rollback",
         )
         self._mark_job_queued(vmid, job)
@@ -1075,24 +1487,47 @@ class OpsService:
         cfg = self._resource(vmid)
         self._require_capability(vmid, "self_update")
         if vmid != 110 or cfg.get("adapter") != "agent_self":
-            raise ValueError("Self-update is supported only for CT110")
+            raise ConflictError(
+                "self_update_not_supported",
+                "Self-update is supported only for CT110",
+            )
         if self.host_control is None:
-            raise ValueError("CT110 self-update requires independent PVE host control")
+            raise ConflictError(
+                "host_control_unavailable",
+                "CT110 self-update requires independent PVE host control",
+                required_action="Restore the independent PVE host control service.",
+            )
         if self.db.get_active_job(vmid) is not None:
-            raise ValueError("Another job is already active for this resource")
+            raise ConflictError(
+                "active_job_conflict",
+                "Another job is already active for this resource",
+                required_action="Wait for the active job to finish.",
+            )
         release = self._read_self_update_release(vmid)
         fingerprint = str(release["fingerprint"])
         active = self.db.find_active_plan(vmid, fingerprint)
         if active is not None:
             if self._plan_type(active) != "self_update":
-                raise ValueError("Resolve the active plan before CT110 self-update")
+                raise ConflictError(
+                    "active_plan_conflict",
+                    "Resolve the active plan before CT110 self-update",
+                    required_action="Resolve the active update plan.",
+                )
             if active.get("status") != "waiting_approval":
-                raise ValueError("Approved self-update plan is already pending execution")
+                raise ConflictError(
+                    "approved_plan_pending",
+                    "Approved self-update plan is already pending execution",
+                    required_action="Wait for the approved plan to finish.",
+                )
             status = "existing_plan"
         else:
             other = self.db.find_active_plan(vmid)
             if other is not None:
-                raise ValueError("Resolve the active plan before CT110 self-update")
+                raise ConflictError(
+                    "active_plan_conflict",
+                    "Resolve the active plan before CT110 self-update",
+                    required_action="Resolve the active update plan.",
+                )
             payload = {
                 "plan_type": "self_update",
                 "version": str(release["version"]),
@@ -1149,15 +1584,45 @@ class OpsService:
         try:
             release = self.host_control.inspect_self_update_release(vmid)
         except HostControlError as exc:
-            raise ValueError(f"Cannot inspect staged self-update release: {exc}") from exc
+            if (
+                exc.code == "staged_release_missing"
+                or str(exc) == "No approved Hubinet Ops release is staged"
+            ):
+                raise ConflictError(
+                    "staged_release_missing",
+                    "No approved Hubinet Ops release is staged",
+                    required_action=(
+                        "Stage and validate the signed Hubinet Ops release on PVE, "
+                        "then refresh CT110."
+                    ),
+                ) from exc
+            raise ConflictError(
+                (
+                    "staged_release_invalid"
+                    if exc.http_status == 409
+                    else "staged_release_unavailable"
+                ),
+                f"Cannot inspect staged self-update release: {exc}",
+                required_action=(
+                    "Validate the staged release and PVE host control health."
+                ),
+            ) from exc
         required = ("version", "release_id", "fingerprint")
         if not all(isinstance(release.get(key), str) and release[key] for key in required):
-            raise ValueError("Staged self-update release identity is invalid")
+            raise ConflictError(
+                "staged_release_identity_invalid",
+                "Staged self-update release identity is invalid",
+                required_action="Restage a release with complete identity metadata.",
+            )
         fingerprint = str(release["fingerprint"])
         if len(fingerprint) != 64 or any(
             character not in "0123456789abcdef" for character in fingerprint
         ):
-            raise ValueError("Staged self-update release fingerprint is invalid")
+            raise ConflictError(
+                "staged_release_fingerprint_invalid",
+                "Staged self-update release fingerprint is invalid",
+                required_action="Restage and validate the release fingerprint.",
+            )
         return dict(release)
 
     def _validate_self_update_plan(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -1589,6 +2054,54 @@ class OpsService:
                     current.get("status"),
                 )
                 return
+            result = current.get("result")
+            automatic = (
+                result.get("automatic_rollback") if isinstance(result, dict) else None
+            )
+            pre_update_create = (
+                result.get("pre_update_snapshot_create")
+                if isinstance(result, dict)
+                else None
+            )
+            if isinstance(automatic, dict) and automatic.get("phase") in {
+                "submitting", "remote_observed", "outcome_unknown",
+                "remote_succeeded", "stabilizing", "stabilized",
+            }:
+                self._hold_automatic_rollback_unknown(
+                    current,
+                    dict(automatic),
+                    "Unhandled worker error after automatic rollback submit boundary",
+                )
+                return
+            if isinstance(pre_update_create, dict) and pre_update_create.get("phase") in {
+                "submitting", "remote_observed", "outcome_unknown",
+                "remote_succeeded", "confirming",
+            }:
+                self._hold_embedded_host_unknown(
+                    current,
+                    "pre_update_snapshot_create",
+                    "Unhandled worker error after pre-update snapshot submit boundary",
+                )
+                return
+            if (
+                str(current.get("operation_type") or "") in HOST_CONTROL_OPERATION_TYPES
+                and str(current.get("stage") or "") in {
+                    "host_submitting", "host_remote_observed",
+                    "host_outcome_unknown", "host_remote_succeeded",
+                }
+            ):
+                if str(current.get("stage")) == "host_remote_succeeded":
+                    LOGGER.warning(
+                        "Worker error after durable remote success for job %s; "
+                        "startup will finalize without another POST",
+                        current["id"],
+                    )
+                    return
+                self._hold_host_operation_unknown(
+                    current,
+                    "Unhandled worker error after host submit boundary",
+                )
+                return
             self._terminal(
                 current,
                 "failed",
@@ -1601,11 +2114,63 @@ class OpsService:
     def _reconcile_startup_jobs(self) -> None:
         for job in self.db.active_jobs():
             operation_type = str(job.get("operation_type") or "update")
+            result = job.get("result")
+            pre_update_create = (
+                result.get("pre_update_snapshot_create")
+                if isinstance(result, dict)
+                else None
+            )
+            if (
+                operation_type == "update"
+                and isinstance(pre_update_create, dict)
+                and pre_update_create.get("phase") != "completed"
+            ):
+                # The embedded create state machine decides whether prepared may
+                # submit or submitting+ may only perform read-only reconciliation.
+                if pre_update_create.get("phase") in {
+                    "prepared", "submitting", "remote_observed", "outcome_unknown",
+                    "remote_succeeded", "confirming",
+                }:
+                    self._run_job(job)
+                else:
+                    self._hold_embedded_host_unknown(
+                        job,
+                        "pre_update_snapshot_create",
+                        "Backend restarted after host snapshot success but before "
+                        "durable physical confirmation",
+                    )
+                continue
+            if (
+                operation_type == "update"
+                and str(job.get("stage") or "")
+                in {"rollback", "rollback_wait", "rollback_healthcheck"}
+            ):
+                self._reattach_automatic_rollback(job)
+                continue
+            if operation_type == "snapshot_prune":
+                self._reconcile_snapshot_prune(job)
+                continue
             if (
                 self.host_control is not None
                 and operation_type in HOST_CONTROL_OPERATION_TYPES
             ):
-                self._reattach_host_control_job(job)
+                initial_host_stages = {
+                    "starting", "shutting_down", "rebooting", "force_stopping",
+                    "snapshot_creating", "snapshot_rollback", "snapshot_deleting",
+                    "self_updating",
+                }
+                if (
+                    str(job.get("stage") or "") == "queued"
+                    or (
+                        str(job.get("stage") or "") in initial_host_stages
+                        and int(job.get("progress") or 0) <= 5
+                    )
+                ):
+                    self._reattach_host_control_job(
+                        job, allow_submit_if_not_found=True
+                    )
+                else:
+                    self._reattach_host_control_job(job)
                 continue
             succeeded = False
             result: dict[str, Any] | None = None
@@ -1618,13 +2183,21 @@ class OpsService:
                     expected = "running" if operation_type == "lifecycle_start" else "stopped"
                     succeeded = actual == expected
                     result = {"runtime_status": actual, "reconciled": True}
-                elif operation_type in {"snapshot_create", "snapshot_delete"}:
+                elif operation_type in {
+                    "snapshot_create",
+                    "snapshot_create_ram",
+                    "snapshot_delete",
+                }:
                     listing = self.list_snapshots(int(job["vmid"]))
                     exists = any(
                         item.get("name") == job.get("snapshot_name")
                         for item in listing["snapshots"]
                     )
-                    succeeded = exists if operation_type == "snapshot_create" else not exists
+                    succeeded = (
+                        exists
+                        if operation_type in {"snapshot_create", "snapshot_create_ram"}
+                        else not exists
+                    )
                     result = {"snapshot_exists": exists, "reconciled": True}
             except Exception as exc:
                 LOGGER.warning("Startup reconciliation failed for job %s: %s", job["id"], exc)
@@ -1638,6 +2211,28 @@ class OpsService:
                     "failed",
                     "Agent restarted during the operation; it was not replayed",
                 )
+
+    def _reconcile_snapshot_prune(self, job: dict[str, Any]) -> None:
+        emit = self._emitter(job)
+        try:
+            result = self._execute_snapshot_prune(job, emit, reconciling=True)
+            self._finalize_operation_success(
+                self.db.get_job(str(job["id"])),
+                result,
+                enforce_snapshot_retention=False,
+            )
+        except SnapshotPruneOutcomeUnknown as exc:
+            LOGGER.warning(
+                "Snapshot prune job %s remains active pending manual reconciliation: %s",
+                job["id"],
+                exc,
+            )
+        except (ExecutorError, HostControlError, ValueError) as exc:
+            self._record_snapshot_prune_failure(job, exc)
+            self._finalize_operation_failure(
+                self.db.get_job(str(job["id"])),
+                exc,
+            )
 
     def _consume_offline_recovery_events(self) -> None:
         if self.host_control is None:
@@ -1683,7 +2278,12 @@ class OpsService:
                 )
                 raise
 
-    def _reattach_host_control_job(self, job: dict[str, Any]) -> None:
+    def _reattach_host_control_job(
+        self,
+        job: dict[str, Any],
+        *,
+        allow_submit_if_not_found: bool = False,
+    ) -> None:
         operation_type = str(job["operation_type"])
         snapshot_name = (
             str(job["snapshot_name"])
@@ -1692,20 +2292,48 @@ class OpsService:
         )
         release_fingerprint: str | None = None
         try:
+            if str(job.get("stage") or "") == "host_remote_succeeded":
+                result = job.get("result")
+                self._finalize_operation_success(
+                    job,
+                    dict(result) if isinstance(result, dict) else {},
+                    enforce_snapshot_retention=operation_type
+                    in {"snapshot_create", "snapshot_create_ram"},
+                )
+                return
             if operation_type == "self_update":
                 release = self._approved_self_update_release(job)
                 release_fingerprint = str(release["fingerprint"])
+            identity = (
+                self._expected_snapshot_identity_from_job(job)
+                if operation_type in {"snapshot_rollback", "snapshot_delete"}
+                else None
+            )
             result = self.host_control.wait_existing_job(
                 operation_type,
                 int(job["vmid"]),
                 str(job["request_id"]),
                 snapshot_name=snapshot_name,
+                snapshot_kind=(str(identity["kind"]) if identity else None),
+                expected_source_job_id=(
+                    str(identity["host_source_job_id"]) if identity else None
+                ),
+                expected_pve_snaptime=(
+                    int(identity["pve_snaptime"]) if identity else None
+                ),
                 release_fingerprint=release_fingerprint,
+                on_observed=lambda remote: self.db.update_job(
+                    str(job["id"]), stage="host_remote_observed"
+                ),
+            )
+            self.db.update_job(
+                str(job["id"]), result=result, stage="host_remote_succeeded"
             )
             self._finalize_operation_success(
                 job,
                 result,
-                enforce_snapshot_retention=False,
+                enforce_snapshot_retention=operation_type
+                in {"snapshot_create", "snapshot_create_ram"},
             )
         except (HostControlError, ValueError) as exc:
             LOGGER.warning(
@@ -1713,15 +2341,22 @@ class OpsService:
                 job["id"],
                 exc,
             )
-            if isinstance(exc, HostControlError) and exc.status == "failed":
+            if (
+                allow_submit_if_not_found
+                and isinstance(exc, HostControlError)
+                and exc.status == "not_found"
+            ):
+                self._run_operation_job(job)
+                return
+            outcome = classify_host_job_error(
+                exc, submit_started=not allow_submit_if_not_found
+            )
+            if outcome is HostJobOutcome.DEFINITIVE_FAILURE:
                 self._finalize_operation_failure(job, exc)
                 return
-            self._finalize_operation_failure(
-                job,
-                exc,
-                job_status="interrupted",
-                terminal_result="interrupted",
-            )
+            if isinstance(exc, HostControlError) and exc.result:
+                self.db.update_job(str(job["id"]), result=exc.result)
+            self._hold_host_operation_unknown(job, str(exc))
 
     def _run_job(self, job: dict[str, Any]) -> None:
         if str(job.get("operation_type") or "update") != "update":
@@ -1732,7 +2367,7 @@ class OpsService:
         policy = StabilizationPolicy.from_config(cfg.get("stabilization"))
         auto_rollback = bool(cfg.get("automatic_rollback", False))
         pre_update_snapshot = bool(cfg.get("pre_update_snapshot", False))
-        snapshot = _snapshot_name(
+        snapshot = str(job.get("snapshot_name") or "") or _snapshot_name(
             vmid,
             "pre-update",
             self._now().astimezone(UTC).strftime("%Y%m%dT%H%M%SZ"),
@@ -1785,14 +2420,95 @@ class OpsService:
                     event_type="snapshot_started",
                     message="Creating rollback snapshot" if auto_rollback else "Creating pre-update safety snapshot",
                 )
-                self._execute("snapshot", vmid, 600, emit, snapshot)
-                self._enforce_snapshot_retention(vmid, job)
+                contract = self._pre_update_create_contract(job, required=False)
+                if contract is not None and contract.get("phase") == "completed":
+                    snapshot_identity = dict(contract["snapshot_identity"])
+                else:
+                    snapshot_identity = self._continue_pre_update_snapshot_create(
+                        job, snapshot
+                    )
+                    contract = self._pre_update_create_contract(job)
+                    contract["phase"] = "confirming"
+                    contract["last_error"] = None
+                    self.db.persist_pre_update_create_contract(
+                        str(job["id"]), contract
+                    )
+                try:
+                    self._confirm_physical_pre_update_snapshot(
+                        vmid,
+                        snapshot,
+                        str(snapshot_identity["host_source_job_id"]),
+                        int(snapshot_identity["pve_snaptime"]),
+                    )
+                except (ExecutorError, HostControlError, ValueError) as exc:
+                    warning = sanitize_text(
+                        f"Created snapshot {snapshot} could not be physically confirmed: {exc}",
+                        limit=2000,
+                    )
+                    state = self.get_state(vmid)
+                    state.update(
+                        {
+                            "snapshot_state_stale": True,
+                            "snapshot_refresh_required": True,
+                            "snapshot_refresh_warning": warning,
+                        }
+                    )
+                    self._save_state(vmid, state)
+                    event = self.db.insert_job_event(
+                        job_id=str(job["id"]),
+                        vmid=vmid,
+                        level="error",
+                        stage="snapshot",
+                        progress=int(
+                            self.db.get_job(str(job["id"])).get("progress") or 0
+                        ),
+                        event_type="snapshot_confirmation_failed",
+                        message=warning,
+                        details={"snapshot_name": snapshot, "kind": "pre-update"},
+                    )
+                    self.mqtt.publish_event(vmid, event)
+                    raise ExecutorError(warning) from exc
+                try:
+                    self.db.record_pre_update_snapshot_proof(
+                        str(job["id"]),
+                        vmid,
+                        snapshot,
+                        str(snapshot_identity["host_source_job_id"]),
+                        int(snapshot_identity["pve_snaptime"]),
+                    )
+                except Exception as exc:
+                    raise ExecutorError(
+                        f"Failed to persist pre-update snapshot proof: {exc}"
+                    ) from exc
+                try:
+                    self._refresh_snapshot_state(
+                        vmid,
+                        job=job,
+                        required_name=snapshot,
+                        required_kind="pre-update",
+                    )
+                except ValueError as exc:
+                    raise ExecutorError(str(exc)) from exc
+                emit(
+                    stage="snapshot",
+                    progress=24,
+                    event_type="snapshot_mutation_succeeded",
+                    message="Pre-update snapshot mutation completed",
+                    details={"snapshot_name": snapshot},
+                )
                 emit(
                     stage="snapshot",
                     progress=25,
                     event_type="snapshot_created",
                     message="Rollback snapshot created" if auto_rollback else "Pre-update safety snapshot created",
                 )
+                contract = self._pre_update_create_contract(job)
+                if contract.get("phase") != "completed":
+                    contract["phase"] = "completed"
+                    contract["last_error"] = None
+                    self.db.persist_pre_update_create_contract(
+                        str(job["id"]), contract
+                    )
             emit(
                 stage="updating",
                 progress=30,
@@ -1948,7 +2664,12 @@ class OpsService:
                 }
             )
             self._save_state(vmid, state)
-            self._terminal(job, "success", "success", None)
+            self._terminal_with_snapshot_retention(
+                self.db.get_job(job["id"]),
+                job_status="success",
+                result="success",
+                error=None,
+            )
             if final_apt_scan_ok and pending is not None and pending > 0:
                 self._create_followup_plan(vmid, cfg, updates)
             duration = self._best_effort_duration(job)
@@ -1968,6 +2689,9 @@ class OpsService:
                     duration_seconds=duration,
                 )
             )
+        except HostOperationOutcomeUnknown as exc:
+            LOGGER.warning("Update job %s remains active: %s", job["id"], exc)
+            return
         except ExecutorError as exc:
             current_job = self.db.get_job(job["id"])
             if str(current_job.get("status")) in TERMINAL_JOB_STATUSES:
@@ -2009,8 +2733,10 @@ class OpsService:
             "lifecycle_reboot": "rebooting",
             "lifecycle_force_stop": "force_stopping",
             "snapshot_create": "snapshot_creating",
+            "snapshot_create_ram": "snapshot_creating",
             "snapshot_rollback": "snapshot_rollback",
             "snapshot_delete": "snapshot_deleting",
+            "snapshot_prune": "snapshot_pruning",
             "retry_healthcheck": "healthcheck",
             "self_update": "self_updating",
         }.get(operation_type, "executing")
@@ -2023,23 +2749,77 @@ class OpsService:
         try:
             if operation_type == "retry_healthcheck":
                 result = self._execute_retry_healthcheck(job, emit)
+            elif operation_type == "snapshot_prune":
+                result = self._execute_snapshot_prune(job, emit)
             else:
+                self.db.update_job(str(job["id"]), stage="host_submitting")
                 result = self._execute_host_operation(job)
-            self._finalize_operation_success(job, result)
-        except (ExecutorError, HostControlError, ValueError) as exc:
-            if isinstance(exc, HostControlError) and exc.status in {
-                "interrupted",
-                "not_found",
-                "unavailable",
-            }:
-                self._finalize_operation_failure(
-                    job,
-                    exc,
-                    job_status="interrupted",
-                    terminal_result="interrupted",
+                self.db.update_job(
+                    str(job["id"]), result=result, stage="host_remote_succeeded"
                 )
+            self._finalize_operation_success(job, result)
+        except SnapshotPruneOutcomeUnknown as exc:
+            LOGGER.warning(
+                "Snapshot prune job %s remains active because its child outcome "
+                "is unknown: %s",
+                job["id"],
+                exc,
+            )
+        except (ExecutorError, HostControlError, ValueError) as exc:
+            if operation_type == "snapshot_prune":
+                self._record_snapshot_prune_failure(job, exc)
+            submit_started = str(
+                self.db.get_job(str(job["id"])).get("stage") or ""
+            ) in {
+                "host_submitting", "host_remote_observed",
+                "host_outcome_unknown", "host_remote_succeeded",
+            }
+            if (
+                isinstance(exc, HostControlError)
+                and classify_host_job_error(exc, submit_started=submit_started)
+                is HostJobOutcome.OUTCOME_UNKNOWN
+            ):
+                if exc.result:
+                    self.db.update_job(str(job["id"]), result=exc.result)
+                self._hold_host_operation_unknown(job, str(exc))
             else:
                 self._finalize_operation_failure(job, exc)
+
+    def _hold_host_operation_unknown(
+        self,
+        job: dict[str, Any],
+        error: str,
+    ) -> None:
+        current = self.db.update_job(
+            str(job["id"]),
+            stage="host_outcome_unknown",
+            error=sanitize_text(error, limit=2000),
+        )
+        events = self.db.list_job_events(str(job["id"]), limit=200)
+        if not any(event.get("event_type") == "host_operation_outcome_unknown" for event in events):
+            event = self.db.insert_job_event(
+                job_id=str(job["id"]),
+                vmid=int(job["vmid"]),
+                level="warning",
+                stage="host_reconciliation",
+                progress=int(current.get("progress") or 5),
+                event_type="host_operation_outcome_unknown",
+                message=(
+                    "Host operation outcome is unknown; read-only reconciliation "
+                    "is required and destructive operations remain blocked"
+                ),
+                details={"request_id": job.get("request_id"), "reconciliation_required": True},
+            )
+            self.mqtt.publish_event(int(job["vmid"]), event)
+        state = self.get_state(int(job["vmid"]))
+        state.update(
+            {
+                "active_job_id": str(job["id"]),
+                "operation_status": "reconciliation_required",
+                "last_error": sanitize_text(error, limit=2000),
+            }
+        )
+        self._save_state(int(job["vmid"]), state)
 
     def _finalize_operation_success(
         self,
@@ -2050,10 +2830,9 @@ class OpsService:
     ) -> None:
         vmid = int(job["vmid"])
         operation_type = str(job["operation_type"])
-        if operation_type == "snapshot_create" and enforce_snapshot_retention:
-            self._enforce_snapshot_retention(vmid, job)
         self.db.update_job(job["id"], result=result)
         state = self.get_state(vmid)
+        snapshot_refreshed = False
         if operation_type.startswith("lifecycle_"):
             runtime = str(
                 result.get("lxc_status")
@@ -2087,7 +2866,23 @@ class OpsService:
                 )
             self._save_state(vmid, state)
             try:
-                self.list_snapshots(vmid)
+                self._refresh_snapshot_state(
+                    vmid,
+                    job=job,
+                    required_name=(
+                        str(job.get("snapshot_name") or "")
+                        if operation_type
+                        in {"snapshot_create", "snapshot_create_ram"}
+                        else None
+                    ),
+                    required_kind=(
+                        "manual"
+                        if operation_type
+                        in {"snapshot_create", "snapshot_create_ram"}
+                        else None
+                    ),
+                )
+                snapshot_refreshed = True
             except (ExecutorError, HostControlError, ValueError) as exc:
                 LOGGER.warning(
                     "Read-only snapshot refresh failed after completed job %s: %s",
@@ -2119,7 +2914,19 @@ class OpsService:
             self._save_state(vmid, state)
         else:
             self._save_state(vmid, state)
-        self._terminal(job, "success", "success", None)
+        if (
+            operation_type in {"snapshot_create", "snapshot_create_ram"}
+            and enforce_snapshot_retention
+            and snapshot_refreshed
+        ):
+            self._terminal_with_snapshot_retention(
+                self.db.get_job(str(job["id"])),
+                job_status="success",
+                result="success",
+                error=None,
+            )
+        else:
+            self._terminal(job, "success", "success", None)
 
     def _finalize_operation_failure(
         self,
@@ -2173,24 +2980,468 @@ class OpsService:
             initial_grace=False,
         )
 
-    def _execute_host_operation(self, job: dict[str, Any]) -> dict[str, Any]:
+    def _execute_snapshot_prune(
+        self,
+        job: dict[str, Any],
+        emit: Callable[..., None],
+        *,
+        reconciling: bool = False,
+    ) -> dict[str, Any]:
+        vmid = int(job["vmid"])
+        state = self._load_snapshot_prune_state(job)
+        mode = str(state["mode"])
+        while str(state.get("phase")) != "completed":
+            current = state.get("current")
+            if isinstance(current, dict):
+                try:
+                    self._resume_snapshot_prune_child(
+                        job,
+                        state,
+                        reconciling=reconciling,
+                    )
+                except HostControlError as exc:
+                    if not self._is_definitive_snapshot_prune_failure(exc):
+                        self._hold_snapshot_prune_unknown(job, state, exc)
+                    raise
+                reconciling = False
+                state = self._load_snapshot_prune_state(
+                    self.db.get_job(str(job["id"]))
+                )
+                continue
+
+            state["phase"] = "selecting"
+            self._persist_snapshot_prune_state(job, state)
+            listing = self._refresh_snapshot_state(vmid, job=job)
+            candidate = self._select_snapshot_prune_candidate(state, listing)
+            if candidate is None:
+                state["phase"] = "refreshing"
+                self._persist_snapshot_prune_state(job, state)
+                self._refresh_snapshot_state(vmid, job=job)
+                state["phase"] = "completed"
+                self._persist_snapshot_prune_state(job, state)
+                break
+            name = str(candidate["name"])
+            state["current"] = {
+                "snapshot_name": name,
+                "expected_snapshot_identity": self._snapshot_identity(
+                    vmid,
+                    candidate,
+                    expected_name=name,
+                ),
+                "request_id": self._snapshot_prune_child_request_id(job, name),
+                "phase": "prepared",
+            }
+            state["phase"] = "child_prepared"
+            self._persist_snapshot_prune_state(job, state)
+            reconciling = False
+
+        deleted = [str(name) for name in state.get("deleted", [])]
+        deleted_count = int(state["deleted_count"])
+        emit(
+            stage="snapshot_pruning",
+            progress=95,
+            event_type="snapshot_pruning_completed",
+            message="Managed snapshot pruning completed",
+            details={
+                "deleted": deleted,
+                "deleted_count": deleted_count,
+                "deleted_history_truncated": bool(
+                    state["deleted_history_truncated"]
+                ),
+                "mode": mode,
+            },
+        )
+        return dict(state)
+
+    def _load_snapshot_prune_state(
+        self,
+        job: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw = job.get("result")
+        if not isinstance(raw, dict):
+            raise SnapshotPruneOutcomeUnknown(
+                "Snapshot prune job has no persisted durable contract"
+            )
+        state = dict(raw)
+        if state.get("prune_version") in {1, 2}:
+            legacy_deleted = state.get("deleted")
+            if not isinstance(legacy_deleted, list):
+                raise SnapshotPruneOutcomeUnknown(
+                    "Legacy snapshot prune job has invalid deletion history"
+                )
+            if state.get("current") is not None:
+                raise SnapshotPruneOutcomeUnknown(
+                    "Legacy active snapshot prune has no durable physical identity"
+                )
+            state["prune_version"] = SNAPSHOT_PRUNE_STATE_VERSION
+            state["deleted_count"] = len(legacy_deleted)
+            state["deleted"] = legacy_deleted[
+                -SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT:
+            ]
+            state["deleted_history_truncated"] = (
+                len(legacy_deleted) > len(state["deleted"])
+            )
+            self._persist_snapshot_prune_state(job, state)
+        elif state.get("prune_version") != SNAPSHOT_PRUNE_STATE_VERSION:
+            raise SnapshotPruneOutcomeUnknown(
+                "Snapshot prune job has an unsupported durable state version"
+            )
+        mode = str(state.get("mode") or "")
+        if mode not in {"all_unprotected", "oldest", "retention"}:
+            raise ValueError("Snapshot pruning job has an invalid persisted mode")
+        if str(job.get("snapshot_name") or "") != mode:
+            raise ValueError("Snapshot pruning mode changed after persistence")
+        target = state.get("retention_target")
+        if mode == "retention":
+            if not isinstance(target, int) or isinstance(target, bool) or not 0 <= target <= 100:
+                raise ValueError("Snapshot pruning retention target is invalid")
+            if not state.get("source_job_id"):
+                raise ValueError("Snapshot pruning source job is invalid")
+        elif target is not None:
+            raise ValueError("Manual snapshot pruning has an unexpected retention target")
+        elif state.get("source_job_id") is not None:
+            raise ValueError("Manual snapshot pruning has an unexpected source job")
+        deleted = state.get("deleted")
+        if (
+            not isinstance(deleted, list)
+            or len(deleted) > SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT
+        ):
+            raise ValueError("Snapshot pruning deleted list is invalid")
+        for name in deleted:
+            if parse_owned_snapshot_name(str(name), vmid=int(job["vmid"])) is None:
+                raise ValueError("Snapshot pruning deleted list contains an invalid snapshot")
+        deleted_count = state.get("deleted_count")
+        if (
+            isinstance(deleted_count, bool)
+            or not isinstance(deleted_count, int)
+            or deleted_count < len(deleted)
+        ):
+            raise ValueError("Snapshot pruning deleted count is invalid")
+        history_truncated = state.get("deleted_history_truncated")
+        if (
+            not isinstance(history_truncated, bool)
+            or history_truncated != (deleted_count > len(deleted))
+        ):
+            raise ValueError("Snapshot pruning deletion history metadata is invalid")
+        if str(state.get("phase") or "") not in {
+            "selecting",
+            "child_prepared",
+            "child_submitted",
+            "child_remote_succeeded",
+            "unknown",
+            "refreshing",
+            "completed",
+        }:
+            raise ValueError("Snapshot pruning phase is invalid")
+        current = state.get("current")
+        if current is not None:
+            if not isinstance(current, dict):
+                raise ValueError("Snapshot pruning current child is invalid")
+            name = str(current.get("snapshot_name") or "")
+            request_id = str(current.get("request_id") or "")
+            if (
+                parse_owned_snapshot_name(name, vmid=int(job["vmid"])) is None
+                or request_id != self._snapshot_prune_child_request_id(job, name)
+                or str(current.get("phase") or "")
+                not in {"prepared", "submitted", "remote_succeeded", "unknown"}
+            ):
+                raise ValueError("Snapshot pruning current child contract is invalid")
+            identity = current.get("expected_snapshot_identity")
+            if not isinstance(identity, dict):
+                raise SnapshotPruneOutcomeUnknown(
+                    "Snapshot pruning child has no durable expected identity"
+                )
+            self._expected_snapshot_identity_from_job(
+                {
+                    **job,
+                    "snapshot_name": name,
+                    "result": {"expected_snapshot_identity": identity},
+                }
+            )
+        return state
+
+    def _persist_snapshot_prune_state(
+        self,
+        job: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        self.db.update_job(str(job["id"]), result=state)
+
+    @staticmethod
+    def _snapshot_prune_child_request_id(
+        job: dict[str, Any],
+        snapshot_name: str,
+    ) -> str:
+        digest = hashlib.sha256(snapshot_name.encode("utf-8")).hexdigest()[:20]
+        return f"prune-{str(job['id'])[:32]}-{digest}"
+
+    def _select_snapshot_prune_candidate(
+        self,
+        state: dict[str, Any],
+        listing: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        managed = [
+            item
+            for item in listing["snapshots"]
+            if item.get("owned_by_hubinet_ops") is True
+        ]
+        mode = str(state["mode"])
+        if mode == "retention":
+            target = int(state["retention_target"])
+            pool = managed[target:]
+        elif mode == "oldest":
+            if int(state["deleted_count"]) > 0:
+                return None
+            pool = managed
+        else:
+            pool = managed
+        return next(
+            (
+                item
+                for item in reversed(pool)
+                if item.get("owned_by_hubinet_ops") is True
+                and item.get("protected") is not True
+                and item.get("delete_eligible") is True
+            ),
+            None,
+        )
+
+    def _resume_snapshot_prune_child(
+        self,
+        job: dict[str, Any],
+        state: dict[str, Any],
+        *,
+        reconciling: bool,
+    ) -> None:
+        vmid = int(job["vmid"])
+        current = dict(state["current"])
+        name = str(current["snapshot_name"])
+        request_id = str(current["request_id"])
+        identity = self._expected_snapshot_identity_from_job(
+            {
+                **job,
+                "snapshot_name": name,
+                "result": {
+                    "expected_snapshot_identity": current.get(
+                        "expected_snapshot_identity"
+                    )
+                },
+            }
+        )
+        host_control = self._require_host_control("Snapshot pruning")
+        child_phase = str(current["phase"])
+        remote_succeeded = child_phase == "remote_succeeded"
+
+        if not remote_succeeded and child_phase in {"submitted", "unknown"}:
+            try:
+                host_control.wait_existing_job(
+                    "snapshot_delete",
+                    vmid,
+                    request_id,
+                    snapshot_name=name,
+                    snapshot_kind=str(identity["kind"]),
+                    expected_source_job_id=str(identity["host_source_job_id"]),
+                    expected_pve_snaptime=int(identity["pve_snaptime"]),
+                )
+                remote_succeeded = True
+            except HostControlError as exc:
+                # Once submitted was persisted, even not_found cannot prove that
+                # the original DELETE never reached hostd. Reconciliation is
+                # read-only and must never issue a duplicate POST/DELETE.
+                raise
+        elif not remote_succeeded:
+            listing = self._refresh_snapshot_state(vmid, job=job)
+            target = next(
+                (
+                    item
+                    for item in listing["snapshots"]
+                    if str(item.get("name") or "") == name
+                ),
+                None,
+            )
+            if target is None:
+                remote_succeeded = True
+            else:
+                self._validate_snapshot_prune_target(vmid, name, target)
+                current["phase"] = "submitted"
+                state["current"] = current
+                state["phase"] = "child_submitted"
+                self._persist_snapshot_prune_state(job, state)
+                host_control.execute(
+                    "snapshot_delete",
+                    vmid,
+                    request_id,
+                    snapshot_name=name,
+                    snapshot_kind=str(identity["kind"]),
+                    expected_source_job_id=str(identity["host_source_job_id"]),
+                    expected_pve_snaptime=int(identity["pve_snaptime"]),
+                )
+                remote_succeeded = True
+
+        if remote_succeeded:
+            current["phase"] = "remote_succeeded"
+            state["current"] = current
+            state["phase"] = "child_remote_succeeded"
+            self._persist_snapshot_prune_state(job, state)
+            try:
+                listing = self._refresh_snapshot_state(vmid, job=job)
+            except (ExecutorError, HostControlError, ValueError) as refresh_error:
+                self._hold_snapshot_prune_unknown(job, state, refresh_error)
+            if any(
+                str(item.get("name") or "") == name
+                for item in listing["snapshots"]
+            ):
+                self._hold_snapshot_prune_unknown(
+                    job,
+                    state,
+                    HostControlError(
+                        "Snapshot delete reported success but the snapshot is still present",
+                        status="contract_mismatch",
+                    ),
+                )
+            deleted = [str(item) for item in state.get("deleted", [])]
+            deleted.append(name)
+            state["deleted_count"] = int(state["deleted_count"]) + 1
+            state["deleted"] = deleted[-SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT:]
+            state["deleted_history_truncated"] = (
+                int(state["deleted_count"]) > len(state["deleted"])
+            )
+            state["current"] = None
+            state["phase"] = "selecting"
+            self._persist_snapshot_prune_state(job, state)
+
+    @staticmethod
+    def _is_definitive_snapshot_prune_failure(error: HostControlError) -> bool:
+        return (
+            classify_host_job_error(error, submit_started=True)
+            is HostJobOutcome.DEFINITIVE_FAILURE
+        )
+
+    @staticmethod
+    def _validate_snapshot_prune_target(
+        vmid: int,
+        name: str,
+        target: dict[str, Any],
+    ) -> None:
+        if (
+            parse_owned_snapshot_name(name, vmid=vmid) is None
+            or int(target.get("vmid") or 0) != vmid
+            or target.get("owned_by_hubinet_ops") is not True
+            or target.get("protected") is True
+            or target.get("delete_eligible") is not True
+        ):
+            raise ValueError("Snapshot is no longer eligible for managed pruning")
+
+    def _hold_snapshot_prune_unknown(
+        self,
+        job: dict[str, Any],
+        state: dict[str, Any],
+        error: ExecutorError | HostControlError | ValueError,
+    ) -> None:
+        current = state.get("current")
+        if isinstance(current, dict):
+            current = dict(current)
+            current["phase"] = "unknown"
+            state["current"] = current
+        state["phase"] = "unknown"
+        state["reconciliation_error"] = sanitize_text(error, limit=1000)
+        self._persist_snapshot_prune_state(job, state)
+        current_job = self.db.get_job(str(job["id"]))
+        event = self.db.insert_job_event(
+            job_id=str(job["id"]),
+            vmid=int(job["vmid"]),
+            level="warning",
+            stage="snapshot_pruning",
+            progress=int(current_job.get("progress") or 0),
+            event_type="snapshot_pruning_outcome_unknown",
+            message=(
+                "Snapshot deletion outcome is unknown; the durable prune job "
+                "remains active and blocks destructive operations"
+            ),
+            details={
+                "snapshot_name": (
+                    str(current.get("snapshot_name")) if isinstance(current, dict) else None
+                ),
+                "manual_intervention_required": True,
+            },
+        )
+        self.mqtt.publish_event(int(job["vmid"]), event)
+        raise SnapshotPruneOutcomeUnknown(str(error)) from error
+
+    def _record_snapshot_prune_failure(
+        self,
+        job: dict[str, Any],
+        error: ExecutorError | HostControlError | ValueError,
+    ) -> None:
+        current = self.db.get_job(str(job["id"]))
+        prune_state = (
+            dict(current["result"])
+            if isinstance(current.get("result"), dict)
+            else {}
+        )
+        event = self.db.insert_job_event(
+            job_id=str(job["id"]),
+            vmid=int(job["vmid"]),
+            level="warning",
+            stage="snapshot_pruning",
+            progress=int(current.get("progress") or 0),
+            event_type="snapshot_pruning_failed",
+            message=sanitize_text(
+                f"Managed snapshot pruning failed: {error}",
+                limit=1000,
+            ),
+            details={
+                "source_job_id": prune_state.get("source_job_id"),
+                "source_result_preserved": True,
+            },
+        )
+        self.mqtt.publish_event(int(job["vmid"]), event)
+
+    def _execute_host_operation(
+        self,
+        job: dict[str, Any],
+        *,
+        on_observed: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         operation_type = str(job["operation_type"])
         vmid = int(job["vmid"])
         snapshot_name = job.get("snapshot_name")
         host_control = self._require_host_control("Host operation")
         if operation_type == "self_update":
             release = self._validate_self_update_plan(job)
+            kwargs: dict[str, Any] = {
+                "release_fingerprint": str(release["fingerprint"]),
+            }
+            if on_observed is not None:
+                kwargs["on_observed"] = on_observed
             return host_control.execute(
                 operation_type,
                 vmid,
                 str(job["request_id"]),
-                release_fingerprint=str(release["fingerprint"]),
+                **kwargs,
             )
+        identity = (
+            self._expected_snapshot_identity_from_job(job)
+            if operation_type in {"snapshot_rollback", "snapshot_delete"}
+            else None
+        )
+        identity_kwargs = (
+            {
+                "snapshot_kind": str(identity["kind"]),
+                "expected_source_job_id": str(identity["host_source_job_id"]),
+                "expected_pve_snaptime": int(identity["pve_snaptime"]),
+            }
+            if identity
+            else {}
+        )
+        if on_observed is not None:
+            identity_kwargs["on_observed"] = on_observed
         return host_control.execute(
             operation_type,
             vmid,
             str(job["request_id"]),
             snapshot_name=str(snapshot_name) if snapshot_name else None,
+            **identity_kwargs,
         )
 
     def _approved_self_update_release(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -2216,29 +3467,332 @@ class OpsService:
             ).get("snapshots", [])
         )
 
-    def _enforce_snapshot_retention(self, vmid: int, job: dict[str, Any]) -> None:
-        retention = max(1, int(self._resource(vmid).get("snapshot_retention", 5)))
-        snapshots = [
-            dict(item)
-            for item in self._raw_snapshot_list(vmid)
-            if isinstance(item, dict) and item.get("owned_by_hubinet_ops") is True
-        ]
-        snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
-        protected = self.db.rollback_source_snapshots(vmid)
-        protected.add(str(job.get("snapshot_name") or ""))
-        for index, snapshot in enumerate(snapshots[retention:], start=retention):
-            name = str(snapshot.get("name") or "")
-            if not name or name in protected or not snapshot.get("delete_eligible"):
-                continue
-            if self.host_control is not None:
-                self.host_control.execute(
-                    "snapshot_delete",
+    def _pre_update_create_contract(
+        self,
+        job: dict[str, Any],
+        *,
+        required: bool = True,
+    ) -> dict[str, Any] | None:
+        current = self.db.get_job(str(job["id"]))
+        result = current.get("result")
+        contract = (
+            result.get("pre_update_snapshot_create")
+            if isinstance(result, dict)
+            else None
+        )
+        if contract is None and not required:
+            return None
+        if not isinstance(contract, dict):
+            raise ValueError("Update job has no durable pre-update create contract")
+        if (
+            contract.get("version") != 1
+            or contract.get("request_id") != f"pre-update-snapshot-{current['id']}"
+            or contract.get("snapshot_name") != current.get("snapshot_name")
+            or contract.get("phase") not in {
+                "prepared", "submitting", "remote_observed", "outcome_unknown",
+                "remote_succeeded", "confirming", "completed", "definitive_failed",
+            }
+        ):
+            raise ValueError("Pre-update create durable contract is malformed")
+        return dict(contract)
+
+    def _observe_pre_update_create(
+        self,
+        job: dict[str, Any],
+        remote: dict[str, Any],
+    ) -> None:
+        contract = self._pre_update_create_contract(job)
+        host_job_id = str(remote.get("id") or "")
+        if not self._valid_host_source_job_id(host_job_id):
+            raise HostControlError(
+                "Host snapshot create returned an invalid job ID",
+                status="contract_mismatch",
+            )
+        contract.update(
+            {"phase": "remote_observed", "host_job_id": host_job_id, "last_error": None}
+        )
+        self.db.persist_pre_update_create_contract(str(job["id"]), contract)
+
+    def _continue_pre_update_snapshot_create(
+        self,
+        job: dict[str, Any],
+        snapshot_name: str,
+    ) -> dict[str, Any]:
+        vmid = int(job["vmid"])
+        contract = self._pre_update_create_contract(job, required=False)
+        if contract is None:
+            contract = {
+                "version": 1,
+                "request_id": f"pre-update-snapshot-{job['id']}",
+                "phase": "prepared",
+                "snapshot_name": snapshot_name,
+                "host_job_id": None,
+                "snapshot_identity": None,
+                "last_error": None,
+            }
+            self.db.persist_pre_update_create_contract(str(job["id"]), contract)
+        try:
+            host = self._require_host_control("Pre-update snapshot creation")
+            if contract["phase"] == "prepared":
+                contract["phase"] = "submitting"
+                self.db.persist_pre_update_create_contract(str(job["id"]), contract)
+                host_result = host.execute(
+                    "snapshot_create",
                     vmid,
-                    f"retention-{str(job['id'])[:32]}-{index}",
-                    snapshot_name=name,
+                    str(contract["request_id"]),
+                    snapshot_name=snapshot_name,
                 )
+            elif contract["phase"] in {"submitting", "remote_observed", "outcome_unknown"}:
+                host_result = host.wait_existing_job(
+                    "snapshot_create",
+                    vmid,
+                    str(contract["request_id"]),
+                    snapshot_name=snapshot_name,
+                )
+            elif contract["phase"] in {"remote_succeeded", "confirming"}:
+                identity = contract.get("snapshot_identity")
+                if not isinstance(identity, dict):
+                    raise ValueError("Pre-update create result identity is missing")
+                return dict(identity)
             else:
-                self.executor.run("snapshot-delete", vmid, name, timeout=300)
+                raise ValueError("Pre-update create cannot continue from terminal phase")
+            identity = self._pre_update_snapshot_identity(
+                host_result, vmid=vmid, snapshot_name=snapshot_name
+            )
+            contract = self._pre_update_create_contract(job)
+            contract.update(
+                {
+                    "phase": "remote_succeeded",
+                    "snapshot_identity": identity,
+                    "last_error": None,
+                }
+            )
+            self.db.persist_pre_update_create_contract(str(job["id"]), contract)
+            return identity
+        except (HostControlError, ValueError) as exc:
+            contract = self._pre_update_create_contract(job)
+            if (
+                classify_host_job_error(exc, submit_started=contract["phase"] != "prepared")
+                is HostJobOutcome.DEFINITIVE_FAILURE
+            ):
+                contract.update({"phase": "definitive_failed", "last_error": str(exc)})
+                self.db.persist_pre_update_create_contract(str(job["id"]), contract)
+                raise ExecutorError(
+                    f"Pre-update snapshot host operation failed: {exc}"
+                ) from exc
+            contract.update({"phase": "outcome_unknown", "last_error": str(exc)})
+            self.db.persist_pre_update_create_contract(str(job["id"]), contract)
+            self._hold_embedded_host_unknown(job, "pre_update_snapshot_create", str(exc))
+            raise HostOperationOutcomeUnknown(str(exc)) from exc
+
+    def _hold_embedded_host_unknown(
+        self,
+        job: dict[str, Any],
+        contract_name: str,
+        error: str,
+    ) -> None:
+        events = self.db.list_job_events(str(job["id"]), limit=200)
+        event_type = f"{contract_name}_outcome_unknown"
+        if not any(event.get("event_type") == event_type for event in events):
+            event = self.db.insert_job_event(
+                job_id=str(job["id"]),
+                vmid=int(job["vmid"]),
+                level="warning",
+                stage=(
+                    "rollback"
+                    if contract_name.startswith("automatic_rollback")
+                    else "snapshot"
+                ),
+                progress=int(self.db.get_job(str(job["id"])).get("progress") or 20),
+                event_type=event_type,
+                message=(
+                    "Embedded host operation outcome is unknown; read-only reconciliation "
+                    "is required and destructive operations remain blocked"
+                ),
+                details={"reconciliation_required": True},
+            )
+            self.mqtt.publish_event(int(job["vmid"]), event)
+        state = self.get_state(int(job["vmid"]))
+        state.update(
+            {
+                "active_job_id": str(job["id"]),
+                "operation_status": "reconciliation_required",
+                "last_error": sanitize_text(error, limit=2000),
+            }
+        )
+        self._save_state(int(job["vmid"]), state)
+
+    def _confirm_physical_pre_update_snapshot(
+        self,
+        vmid: int,
+        snapshot_name: str,
+        host_source_job_id: str,
+        pve_snaptime: int,
+    ) -> dict[str, Any]:
+        """Confirm an exact host-owned snapshot without consulting durable proof."""
+        try:
+            snapshots = self._raw_snapshot_list(vmid)
+        except (AttributeError, TypeError) as exc:
+            raise ValueError("Physical snapshot listing is malformed") from exc
+        if not isinstance(snapshots, list) or any(
+            not isinstance(item, dict) for item in snapshots
+        ):
+            raise ValueError("Physical snapshot listing is malformed")
+        matches = [
+            item
+            for item in snapshots
+            if isinstance(item.get("name"), str)
+            and item["name"] == snapshot_name
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "Physical snapshot listing must contain exactly one matching snapshot"
+            )
+        snapshot = dict(matches[0])
+        parsed = parse_owned_snapshot_name(snapshot_name, vmid=vmid)
+        if parsed is None or parsed.get("kind") != "pre-update":
+            raise ValueError("Physical snapshot name is not an exact pre-update name")
+        if snapshot.get("kind") != "pre-update":
+            raise ValueError("Physical snapshot kind is not pre-update")
+        if snapshot.get("owned_by_hubinet_ops") is not True:
+            raise ValueError("Physical snapshot is foreign or ownership is uncertain")
+        physical_source_job_id = str(snapshot.get("source_job_id") or "")
+        if not self._valid_host_source_job_id(physical_source_job_id):
+            raise ValueError("Physical snapshot source job ID is missing or malformed")
+        if physical_source_job_id != host_source_job_id:
+            raise ValueError("Physical snapshot source job ID does not match host result")
+        if snapshot.get("pve_snaptime") != pve_snaptime:
+            raise ValueError("Physical snapshot PVE snaptime does not match host result")
+        if (
+            "ownership_status" in snapshot
+            and snapshot.get("ownership_status") != "owned"
+        ):
+            raise ValueError("Physical snapshot ownership status is not owned")
+        if "vmid" in snapshot:
+            raw_vmid = snapshot.get("vmid")
+            if isinstance(raw_vmid, bool):
+                raise ValueError("Physical snapshot VMID is malformed")
+            try:
+                physical_vmid = int(raw_vmid)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Physical snapshot VMID is malformed") from exc
+            if physical_vmid != int(vmid):
+                raise ValueError("Physical snapshot VMID conflicts with the resource")
+        return snapshot
+
+    @classmethod
+    def _snapshot_identity(
+        cls,
+        vmid: int,
+        snapshot: dict[str, Any],
+        *,
+        expected_name: str | None = None,
+        expected_kind: str | None = None,
+    ) -> dict[str, Any]:
+        name = str(snapshot.get("name") or "")
+        parsed = parse_owned_snapshot_name(name, vmid=vmid)
+        kind = str(snapshot.get("kind") or "")
+        source_job_id = str(snapshot.get("host_source_job_id") or snapshot.get("source_job_id") or "")
+        snaptime = snapshot.get("pve_snaptime")
+        if (
+            parsed is None
+            or kind != parsed.get("kind")
+            or (expected_name is not None and name != expected_name)
+            or (expected_kind is not None and kind != expected_kind)
+            or snapshot.get("owned_by_hubinet_ops") is not True
+            or not cls._valid_host_source_job_id(source_job_id)
+            or isinstance(snaptime, bool)
+            or not isinstance(snaptime, int)
+            or snaptime <= 0
+        ):
+            raise ValueError("Snapshot has no valid physical identity")
+        return {
+            "version": 1,
+            "vmid": int(vmid),
+            "snapshot_name": name,
+            "kind": kind,
+            "host_source_job_id": source_job_id,
+            "pve_snaptime": snaptime,
+        }
+
+    @classmethod
+    def _expected_snapshot_identity_from_job(
+        cls,
+        job: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = job.get("result")
+        identity = (
+            result.get("expected_snapshot_identity")
+            if isinstance(result, dict)
+            else None
+        )
+        if not isinstance(identity, dict):
+            raise ValueError("Snapshot operation has no durable expected identity")
+        modeled = {
+            "name": identity.get("snapshot_name"),
+            "kind": identity.get("kind"),
+            "source_job_id": identity.get("host_source_job_id"),
+            "pve_snaptime": identity.get("pve_snaptime"),
+            "owned_by_hubinet_ops": True,
+        }
+        validated = cls._snapshot_identity(
+            int(job["vmid"]),
+            modeled,
+            expected_name=str(job.get("snapshot_name") or ""),
+        )
+        if identity.get("version") != 1 or identity.get("vmid") != int(job["vmid"]):
+            raise ValueError("Snapshot operation expected identity is malformed")
+        return validated
+
+    @staticmethod
+    def _valid_host_source_job_id(value: str) -> bool:
+        return (
+            len(value) == 32
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    @classmethod
+    def _pre_update_snapshot_identity(
+        cls,
+        result: dict[str, Any],
+        *,
+        vmid: int,
+        snapshot_name: str,
+    ) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise ValueError("Host snapshot result is malformed")
+        if str(result.get("name") or "") != snapshot_name:
+            raise ValueError("Host snapshot result name does not match the request")
+        if str(result.get("kind") or "") != "pre-update":
+            raise ValueError("Host snapshot result kind is not pre-update")
+        if "vmid" in result:
+            result_vmid = result.get("vmid")
+            if isinstance(result_vmid, bool):
+                raise ValueError("Host snapshot result VMID is malformed")
+            try:
+                parsed_vmid = int(result_vmid)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Host snapshot result VMID is malformed") from exc
+            if parsed_vmid != int(vmid):
+                raise ValueError("Host snapshot result VMID does not match the request")
+        source_job_id = str(result.get("source_job_id") or "")
+        if not cls._valid_host_source_job_id(source_job_id):
+            raise ValueError("Host snapshot result source job ID is missing or malformed")
+        snaptime = result.get("pve_snaptime")
+        if (
+            isinstance(snaptime, bool)
+            or not isinstance(snaptime, int)
+            or snaptime <= 0
+        ):
+            raise ValueError("Host snapshot result PVE snaptime is missing or malformed")
+        return {
+            "version": 1,
+            "vmid": int(vmid),
+            "snapshot_name": snapshot_name,
+            "kind": "pre-update",
+            "host_source_job_id": source_job_id,
+            "pve_snaptime": snaptime,
+        }
 
     def _validate_approved_plan(
         self,
@@ -2361,6 +3915,17 @@ class OpsService:
             return
         emit = self._emitter(job)
         try:
+            try:
+                self._refresh_snapshot_state(
+                    vmid,
+                    job=job,
+                    required_name=snapshot,
+                    required_kind="pre-update",
+                )
+            except (HostControlError, ValueError) as exc:
+                raise ExecutorError(
+                    f"Rollback snapshot ownership could not be confirmed: {exc}"
+                ) from exc
             emit(
                 stage="rollback",
                 progress=88,
@@ -2368,20 +3933,299 @@ class OpsService:
                 event_type="rollback_started",
                 message="Rollback started",
             )
-            self._execute("rollback", vmid, 1200, emit, snapshot)
-            emit(
-                stage="rollback_wait",
-                progress=90,
-                event_type="rollback_wait",
-                message="Waiting for LXC, systemd, and Docker after rollback",
+            refreshed = self._refresh_snapshot_state(
+                vmid,
+                job=job,
+                required_name=snapshot,
+                required_kind="pre-update",
             )
-            health = self.stabilizer.wait(
-                vmid=vmid,
-                phase="rollback",
-                timeout_seconds=policy.post_rollback_timeout_seconds,
-                policy=policy,
-                emit=emit,
+            selected = next(
+                item
+                for item in refreshed["snapshots"]
+                if item.get("name") == snapshot
             )
+            identity = self._snapshot_identity(
+                vmid,
+                selected,
+                expected_name=snapshot,
+                expected_kind="pre-update",
+            )
+            proof = self._pre_update_identity_from_job(job)
+            if identity != proof:
+                raise ExecutorError("Rollback snapshot physical identity changed")
+            contract = {
+                "version": 1,
+                "request_id": f"automatic-rollback-{job['id']}",
+                "phase": "prepared",
+                "snapshot_name": snapshot,
+                "expected_snapshot_identity": identity,
+                "host_job_id": None,
+                "last_error": None,
+            }
+            self.db.persist_automatic_rollback_contract(str(job["id"]), contract)
+            self._continue_automatic_rollback(job, cause, emit, policy)
+        except (ExecutorError, HostControlError, ValueError) as rollback_error:
+            try:
+                durable = self._automatic_rollback_contract(job)
+            except ValueError:
+                durable = None
+            if isinstance(durable, dict) and durable.get("phase") == "stabilizing":
+                if isinstance(rollback_error, StabilizationInterrupted) or (
+                    isinstance(rollback_error, ExecutorError) and self._stop.is_set()
+                ):
+                    self._hold_automatic_rollback_unknown(
+                        job, durable, str(rollback_error)
+                    )
+                    return
+                if isinstance(rollback_error, ExecutorError):
+                    self._transition_automatic_rollback(
+                        job,
+                        durable,
+                        "definitive_failed",
+                        last_error=str(rollback_error),
+                    )
+                    self._fail_automatic_rollback(job, cause, rollback_error)
+                    return
+            if isinstance(durable, dict) and durable.get("phase") in {
+                "submitting", "remote_observed", "outcome_unknown",
+                "remote_succeeded", "stabilizing", "stabilized",
+            }:
+                self._hold_automatic_rollback_unknown(
+                    job, durable, str(rollback_error)
+                )
+                return
+            self._fail_automatic_rollback(job, cause, rollback_error)
+
+    def _automatic_rollback_contract(self, job: dict[str, Any]) -> dict[str, Any]:
+        current = self.db.get_job(str(job["id"]))
+        result = current.get("result")
+        contract = result.get("automatic_rollback") if isinstance(result, dict) else None
+        if not isinstance(contract, dict):
+            raise ValueError("Update job has no durable automatic rollback contract")
+        identity = self._pre_update_identity_from_job(current)
+        if (
+            contract.get("version") != 1
+            or contract.get("request_id") != f"automatic-rollback-{current['id']}"
+            or contract.get("snapshot_name") != current.get("snapshot_name")
+            or contract.get("expected_snapshot_identity") != identity
+            or contract.get("phase") not in {
+                "prepared", "submitting", "remote_observed", "outcome_unknown",
+                "remote_succeeded", "stabilizing", "stabilized", "completed",
+                "definitive_failed",
+            }
+        ):
+            raise ValueError("Automatic rollback durable contract is malformed")
+        return dict(contract)
+
+    def _transition_automatic_rollback(
+        self,
+        job: dict[str, Any],
+        contract: dict[str, Any],
+        phase: str,
+        *,
+        host_job_id: str | None = None,
+        last_error: str | None = None,
+        stabilization_result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        updated = dict(contract)
+        updated["phase"] = phase
+        if host_job_id is not None:
+            updated["host_job_id"] = host_job_id
+        updated["last_error"] = (
+            sanitize_text(last_error, limit=1000) if last_error else None
+        )
+        if stabilization_result is not None:
+            updated["stabilization_result"] = dict(stabilization_result)
+        persisted = self.db.persist_automatic_rollback_contract(
+            str(job["id"]), updated
+        )
+        return dict(persisted["result"]["automatic_rollback"])
+
+    def _observe_automatic_rollback(
+        self,
+        job: dict[str, Any],
+        remote: dict[str, Any],
+    ) -> None:
+        contract = self._automatic_rollback_contract(job)
+        host_job_id = str(remote.get("id") or "")
+        if not self._valid_host_source_job_id(host_job_id):
+            raise HostControlError(
+                "Host control lookup returned an invalid job ID",
+                status="contract_mismatch",
+            )
+        self._transition_automatic_rollback(
+            job, contract, "remote_observed", host_job_id=host_job_id
+        )
+
+    def _continue_automatic_rollback(
+        self,
+        job: dict[str, Any],
+        cause: str,
+        emit: Callable[..., None],
+        policy: StabilizationPolicy,
+    ) -> None:
+        contract = self._automatic_rollback_contract(job)
+        phase = str(contract["phase"])
+        identity = dict(contract["expected_snapshot_identity"])
+        try:
+            if phase == "prepared":
+                host = self._require_host_control("Automatic rollback")
+                contract = self._transition_automatic_rollback(
+                    job, contract, "submitting"
+                )
+                result = host.execute(
+                    "snapshot_rollback",
+                    int(job["vmid"]),
+                    str(contract["request_id"]),
+                    snapshot_name=str(identity["snapshot_name"]),
+                    snapshot_kind=str(identity["kind"]),
+                    expected_source_job_id=str(identity["host_source_job_id"]),
+                    expected_pve_snaptime=int(identity["pve_snaptime"]),
+                    on_observed=lambda remote: self._observe_automatic_rollback(
+                        job, remote
+                    ),
+                )
+            elif phase in {"submitting", "remote_observed", "outcome_unknown"}:
+                host = self._require_host_control("Automatic rollback")
+                result = host.wait_existing_job(
+                    "snapshot_rollback",
+                    int(job["vmid"]),
+                    str(contract["request_id"]),
+                    snapshot_name=str(identity["snapshot_name"]),
+                    snapshot_kind=str(identity["kind"]),
+                    expected_source_job_id=str(identity["host_source_job_id"]),
+                    expected_pve_snaptime=int(identity["pve_snaptime"]),
+                    on_observed=lambda remote: self._observe_automatic_rollback(
+                        job, remote
+                    ),
+                )
+            elif phase in {
+                "remote_succeeded", "stabilizing", "stabilized", "completed"
+            }:
+                result = {}
+            else:
+                return
+            contract = self._automatic_rollback_contract(job)
+            if str(contract["phase"]) not in {
+                "remote_succeeded", "stabilizing", "stabilized", "completed"
+            }:
+                contract = self._transition_automatic_rollback(
+                    job, contract, "remote_succeeded"
+                )
+            self._finish_automatic_rollback(job, cause, emit, policy)
+        except HostControlError as exc:
+            contract = self._automatic_rollback_contract(job)
+            outcome = classify_host_job_error(exc, submit_started=True)
+            if outcome is HostJobOutcome.OUTCOME_UNKNOWN:
+                self._hold_automatic_rollback_unknown(job, contract, str(exc))
+                return
+            self._transition_automatic_rollback(
+                job, contract, "definitive_failed", last_error=str(exc)
+            )
+            self._fail_automatic_rollback(job, cause, exc)
+
+    def _hold_automatic_rollback_unknown(
+        self,
+        job: dict[str, Any],
+        contract: dict[str, Any],
+        error: str,
+    ) -> None:
+        if str(contract.get("phase")) in {"remote_succeeded", "stabilizing", "stabilized"}:
+            contract = self._transition_automatic_rollback(
+                job, contract, str(contract["phase"]), last_error=error
+            )
+        else:
+            contract = self._transition_automatic_rollback(
+                job, contract, "outcome_unknown", last_error=error
+            )
+        existing = self.db.list_job_events(str(job["id"]), limit=200)
+        if not any(
+            event.get("event_type") == "automatic_rollback_outcome_unknown"
+            for event in existing
+        ):
+            event = self.db.insert_job_event(
+                job_id=str(job["id"]),
+                vmid=int(job["vmid"]),
+                level="warning",
+                stage="rollback",
+                progress=int(self.db.get_job(str(job["id"])).get("progress") or 88),
+                event_type="automatic_rollback_outcome_unknown",
+                message=(
+                    "Automatic rollback outcome is unknown; read-only reconciliation "
+                    "is required and destructive operations remain blocked"
+                ),
+                details={"request_id": contract["request_id"], "reconciliation_required": True},
+            )
+            self.mqtt.publish_event(int(job["vmid"]), event)
+        state = self.get_state(int(job["vmid"]))
+        state.update(
+            {
+                "operation_status": "reconciliation_required",
+                "last_error": sanitize_text(error, limit=2000),
+                "active_job_id": str(job["id"]),
+            }
+        )
+        self._save_state(int(job["vmid"]), state)
+
+    def _fail_automatic_rollback(
+        self,
+        job: dict[str, Any],
+        cause: str,
+        rollback_error: Exception,
+    ) -> None:
+        error = f"Original failure: {cause}; rollback failure: {rollback_error}"
+        self.db.update_plan_status(str(job["plan_id"]), "failed")
+        self._terminal(job, "failed", "manual_intervention", error)
+        self._notify_ha(
+            self._notification(
+                "manual_intervention_required", int(job["vmid"]), error=error
+            )
+        )
+
+    def _finish_automatic_rollback(
+        self,
+        job: dict[str, Any],
+        cause: str,
+        emit: Callable[..., None],
+        policy: StabilizationPolicy,
+    ) -> None:
+        vmid = int(job["vmid"])
+        snapshot = str(self.db.get_job(job["id"]).get("snapshot_name") or "")
+        try:
+            contract = self._automatic_rollback_contract(job)
+            if str(contract["phase"]) in {"remote_succeeded", "stabilizing"}:
+                contract = self._transition_automatic_rollback(
+                    job, contract, "stabilizing"
+                )
+                emit(
+                    stage="rollback_wait",
+                    progress=90,
+                    event_type="rollback_wait",
+                    message="Waiting for LXC, systemd, and Docker after rollback",
+                )
+                health = self.stabilizer.wait(
+                    vmid=vmid,
+                    phase="rollback",
+                    timeout_seconds=policy.post_rollback_timeout_seconds,
+                    policy=policy,
+                    emit=emit,
+                )
+                contract = self._transition_automatic_rollback(
+                    job,
+                    contract,
+                    "stabilized",
+                    stabilization_result=health,
+                )
+            elif str(contract["phase"]) == "stabilized":
+                health = dict(contract.get("stabilization_result") or {})
+                if not health:
+                    raise ValueError("Automatic rollback stabilization result is missing")
+            elif str(contract["phase"]) == "completed":
+                self._terminal(job, "rolled_back", "rolled_back", cause)
+                self._notify_ha(self._notification("job_rolled_back", vmid))
+                return
+            else:
+                return
             emit(
                 stage="rollback_healthcheck",
                 progress=98,
@@ -2416,19 +4260,97 @@ class OpsService:
                 }
             )
             self._save_state(vmid, state)
+            try:
+                self._refresh_snapshot_state(vmid, job=job)
+            except (ExecutorError, HostControlError, ValueError) as exc:
+                LOGGER.warning(
+                    "Read-only snapshot refresh failed after automatic rollback job %s: %s",
+                    job["id"],
+                    exc,
+                )
+            contract = self._transition_automatic_rollback(
+                job, contract, "completed", stabilization_result=health
+            )
             self._terminal(job, "rolled_back", "rolled_back", cause)
             self._notify_ha(self._notification("job_rolled_back", vmid))
-        except ExecutorError as rollback_error:
-            error = f"Original failure: {cause}; rollback failure: {rollback_error}"
-            self.db.update_plan_status(job["plan_id"], "failed")
-            self._terminal(job, "failed", "manual_intervention", error)
-            self._notify_ha(
-                self._notification(
-                    "manual_intervention_required",
-                    vmid,
-                    error=error,
-                )
+        except (ExecutorError, ValueError):
+            raise
+
+    def _pre_update_identity_from_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        current = self.db.get_job(str(job["id"]))
+        result = current.get("result")
+        proof = result.get("snapshot_proof") if isinstance(result, dict) else None
+        if not isinstance(proof, dict) or proof.get("version") != 3:
+            raise ValueError("Update job has no current snapshot proof")
+        identity = {
+            "version": 1,
+            "vmid": proof.get("vmid"),
+            "snapshot_name": proof.get("snapshot_name"),
+            "kind": proof.get("kind"),
+            "host_source_job_id": proof.get("host_source_job_id"),
+            "pve_snaptime": proof.get("pve_snaptime"),
+        }
+        validated = self._snapshot_identity(
+            int(current["vmid"]),
+            {
+                "name": identity["snapshot_name"],
+                "kind": identity["kind"],
+                "host_source_job_id": identity["host_source_job_id"],
+                "pve_snaptime": identity["pve_snaptime"],
+                "owned_by_hubinet_ops": True,
+            },
+            expected_name=str(current.get("snapshot_name") or ""),
+            expected_kind="pre-update",
+        )
+        if identity.get("vmid") != int(current["vmid"]):
+            raise ValueError("Update snapshot proof VMID changed")
+        return validated
+
+    def _reattach_automatic_rollback(self, job: dict[str, Any]) -> None:
+        vmid = int(job["vmid"])
+        cause = str(job.get("error") or "Update failed")
+        try:
+            self._continue_automatic_rollback(
+                job,
+                cause,
+                self._emitter(job),
+                StabilizationPolicy.from_config(
+                    self._resource(vmid).get("stabilization")
+                ),
             )
+        except (ExecutorError, HostControlError, ValueError) as exc:
+            LOGGER.error("Automatic rollback reconciliation failed closed: %s", exc)
+            try:
+                contract = self._automatic_rollback_contract(job)
+            except ValueError:
+                current = self.db.get_job(str(job["id"]))
+                result = dict(current.get("result") or {})
+                result["automatic_rollback_reconciliation_error"] = sanitize_text(
+                    exc, limit=1000
+                )
+                self.db.update_job(
+                    str(job["id"]), result=result, error=str(exc)
+                )
+                self._hold_embedded_host_unknown(
+                    job, "automatic_rollback_contract", str(exc)
+                )
+                return
+            if str(contract.get("phase")) == "stabilizing":
+                if isinstance(exc, StabilizationInterrupted) or (
+                    isinstance(exc, ExecutorError) and self._stop.is_set()
+                ):
+                    self._hold_automatic_rollback_unknown(job, contract, str(exc))
+                    return
+                if isinstance(exc, ExecutorError):
+                    self._transition_automatic_rollback(
+                        job,
+                        contract,
+                        "definitive_failed",
+                        last_error=str(exc),
+                    )
+                    self._fail_automatic_rollback(job, cause, exc)
+                    return
+            self._hold_automatic_rollback_unknown(job, contract, str(exc))
 
     def _terminal(
         self,
@@ -2446,13 +4368,6 @@ class OpsService:
             )
             return
         job = current
-        operation = {
-            "success": "success",
-            "rolled_back": "rolled_back",
-            "manual_intervention": "manual_intervention",
-            "failed": "failed",
-            "interrupted": "unknown",
-        }[result]
         event = self.db.insert_job_event(
             job_id=job["id"],
             vmid=int(job["vmid"]),
@@ -2476,6 +4391,66 @@ class OpsService:
             progress=100,
             error=error,
         )
+        self._publish_terminal_transition(
+            job,
+            job_status=job_status,
+            result=result,
+            error=error,
+            event=event,
+        )
+
+    def _terminal_with_snapshot_retention(
+        self,
+        job: dict[str, Any],
+        *,
+        job_status: str,
+        result: str,
+        error: str | None,
+    ) -> dict[str, Any]:
+        retention_target = self._snapshot_retention_count(int(job["vmid"]))
+        if retention_target == 0:
+            self._terminal(job, job_status, result, error)
+            return self.db.get_job(str(job["id"]))
+        prune_request_id = f"retention-{str(job['id'])}"
+        source, prune, event, created = self.db.terminalize_job_with_snapshot_prune(
+            str(job["id"]),
+            source_status=job_status,
+            terminal_result=result,
+            error=error,
+            prune_request_id=prune_request_id,
+            retention_target=retention_target,
+        )
+        if not created:
+            return prune
+        self._publish_terminal_transition(
+            source,
+            job_status=job_status,
+            result=result,
+            error=error,
+            event=event,
+            next_job=prune,
+        )
+        self.mqtt.publish_job(int(prune["vmid"]), prune, force=True)
+        self._run_operation_job(self.db.next_queued_job() or prune)
+        return prune
+
+    def _publish_terminal_transition(
+        self,
+        job: dict[str, Any],
+        *,
+        job_status: str,
+        result: str,
+        error: str | None,
+        event: dict[str, Any],
+        next_job: dict[str, Any] | None = None,
+    ) -> None:
+        operation = {
+            "success": "success",
+            "rolled_back": "rolled_back",
+            "manual_intervention": "manual_intervention",
+            "failed": "failed",
+            "interrupted": "unknown",
+        }[result]
         plan_status: str | None = None
         if job.get("plan_id"):
             plan = self.db.get_plan(job["plan_id"])
@@ -2493,12 +4468,24 @@ class OpsService:
         suppress_recovery = result in {"success", "rolled_back"}
         state.update(
             {
-                "active_job_id": None,
+                "active_job_id": (
+                    str(next_job["id"]) if next_job is not None else None
+                ),
                 "last_job_id": job["id"],
-                "operation_type": job.get("operation_type", "update"),
-                "operation_status": operation,
-                "job_stage": event["stage"],
-                "job_progress": 100,
+                "operation_type": (
+                    str(next_job["operation_type"])
+                    if next_job is not None
+                    else job.get("operation_type", "update")
+                ),
+                "operation_status": (
+                    str(next_job["status"]) if next_job is not None else operation
+                ),
+                "job_stage": (
+                    str(next_job["stage"]) if next_job is not None else event["stage"]
+                ),
+                "job_progress": (
+                    int(next_job["progress"]) if next_job is not None else 100
+                ),
                 "last_operation_result": result,
                 "last_error": (
                     sanitize_text(error, limit=2000)
@@ -2604,6 +4591,9 @@ class OpsService:
 
         def on_event(item: dict[str, Any]) -> None:
             raw_details = item.get("details")
+            event_type = str(item.get("event_type", "executor_event"))
+            if event_type in BACKEND_ONLY_EVENT_TYPES:
+                event_type = f"executor_{event_type}"
             emit(
                 stage=action_stage,
                 progress=_safe_int(
@@ -2611,7 +4601,7 @@ class OpsService:
                     STAGE_PROGRESS.get(action_stage, 0),
                 ),
                 level=str(item.get("level", "info")),
-                event_type=str(item.get("event_type", "executor_event")),
+                event_type=event_type,
                 message=str(item.get("message", "")),
                 details=raw_details if isinstance(raw_details, dict) else {},
             )
@@ -2693,11 +4683,45 @@ class OpsService:
         )
         active_job = self.db.get_active_job(vmid)
         if active_job:
+            active_result = active_job.get("result")
+            automatic = (
+                active_result.get("automatic_rollback")
+                if isinstance(active_result, dict)
+                else None
+            )
+            pre_update_create = (
+                active_result.get("pre_update_snapshot_create")
+                if isinstance(active_result, dict)
+                else None
+            )
+            reconciliation_required = (
+                str(active_job.get("stage") or "") in {
+                    "host_outcome_unknown", "host_reconciliation"
+                }
+                or (
+                    isinstance(automatic, dict)
+                    and automatic.get("phase") in {"outcome_unknown", "stabilizing"}
+                )
+                or (
+                    isinstance(pre_update_create, dict)
+                    and pre_update_create.get("phase") in {
+                        "outcome_unknown", "remote_succeeded", "confirming"
+                    }
+                )
+                or (
+                    isinstance(active_result, dict)
+                    and bool(active_result.get("automatic_rollback_reconciliation_error"))
+                )
+            )
             state.update(
                 {
                     "active_job_id": active_job["id"],
                     "operation_type": active_job.get("operation_type", "update"),
-                    "operation_status": "running",
+                    "operation_status": (
+                        "reconciliation_required"
+                        if reconciliation_required
+                        else "running"
+                    ),
                     "job_stage": active_job["stage"],
                     "job_progress": active_job.get("progress", 0),
                 }
@@ -2707,6 +4731,20 @@ class OpsService:
             agent_summary.pop("last_refresh", None)
             state.update(agent_summary)
             state["mqtt_availability"] = self.mqtt.availability
+            if active_job:
+                state.update(
+                    {
+                        "active_job_id": active_job["id"],
+                        "operation_type": active_job.get("operation_type", "update"),
+                        "operation_status": (
+                            "reconciliation_required"
+                            if reconciliation_required
+                            else "running"
+                        ),
+                        "job_stage": active_job["stage"],
+                        "job_progress": active_job.get("progress", 0),
+                    }
+                )
         return state
 
     def _base_state(self, vmid: int) -> dict[str, Any]:

@@ -11,7 +11,7 @@ Canonical retained/resource topics are:
 
 During 0.3.x every LXC is dual-published to `hubinet/ops/ct/{vmid}/...`; this preserves CT101/CT106 consumers. Discovery keeps `sensor.hubinet_ops_ct101_*` and `sensor.hubinet_ops_ct106_*`. New LXC use `ctXYZ`; VM100 uses `vm100` and the QEMU device model. CT110 uses the Hubinet Ops Agent model.
 
-0.4.x publishes scalar discovery entities for executor version/protocol/compatibility/hashes/missing actions/check time, operator capabilities, operation type, lifecycle timing, and snapshot summary. MQTT publishes only `snapshot_count`, latest snapshot name/time/kind, and snapshot operation status—not the complete snapshot list or full job log.
+0.4.x publishes scalar discovery entities for executor version/protocol/compatibility/hashes/missing actions/check time, operator capabilities, operation type, lifecycle timing, and snapshot summary. The bounded health attributes projection also carries the ten newest managed snapshot entries for the static dashboard.
 
 0.4.1 publishes nullable dates as ordinary diagnostic sensors rather than timestamp-device-class sensors, so a missing, empty, or null value becomes a normal unknown diagnostic state without Home Assistant's `Invalid state message` warning. Capability templates default a missing `operator_capabilities` object and every missing key to blocked.
 
@@ -24,3 +24,5 @@ Agent state is published once after a complete inventory refresh instead of once
 Only the health sensor receives rich JSON attributes, from the dedicated retained `attributes` topic rather than the changing resource state topic. This payload contains only bounded package updates, recent job events, recent warnings, payload metadata, and optional failed units. It is independently limited to 10,000 UTF-8 bytes and published only when its serialized content changes; CPU, RAM, disk, network, uptime, refresh time, health score, and runtime status remain available through their own state-backed sensors without becoming health attributes. Reconnect republishes both the current state and attributes with force enabled.
 
 The dashboard still reads `updates`, `recent_job_events`, and `recent_warnings` from that dedicated attributes projection. Active plan/job IDs and progress are separate sensors, so a telemetry-only metric refresh cannot churn `health_status` attributes in Recorder.
+
+In 0.4.2 CPU state is rounded to one decimal place. Changes below 0.5 percentage point are suppressed until the five-minute heartbeat. The first state after start and availability, runtime, health, error, or operation transitions publish immediately. Canonical API refresh remains independent and is never throttled.

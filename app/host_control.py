@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Any, Callable
@@ -8,6 +9,7 @@ from urllib.parse import quote
 import httpx
 
 from .security import sanitize_text
+from .contracts import parse_owned_snapshot_name
 
 
 class HostControlError(RuntimeError):
@@ -18,11 +20,13 @@ class HostControlError(RuntimeError):
         status: str | None = None,
         result: dict[str, Any] | None = None,
         http_status: int | None = None,
+        code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.result = dict(result or {})
         self.http_status = http_status
+        self.code = str(code or "") or None
 
 
 class HostControlClient:
@@ -116,7 +120,11 @@ class HostControlClient:
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"request_id": request_id}
         if operation_type.startswith("lifecycle_"):
@@ -133,19 +141,38 @@ class HostControlClient:
                     f"Self-update bearer token is missing from {self.update_token_env}"
                 )
             body["fingerprint"] = release_fingerprint
-        elif operation_type == "snapshot_create":
+        elif operation_type in {"snapshot_create", "snapshot_create_ram"}:
             method = "POST"
             path = f"/api/v1/resources/{int(vmid)}/snapshots"
             body["name"] = snapshot_name
+            body["include_ram"] = operation_type == "snapshot_create_ram"
         elif operation_type == "snapshot_rollback":
             method = "POST"
             path = (
                 f"/api/v1/resources/{int(vmid)}/snapshots/"
                 f"{quote(str(snapshot_name), safe='')}/restore"
             )
+            body.update(
+                self._snapshot_identity_body(
+                    vmid=vmid,
+                    snapshot_name=snapshot_name,
+                    snapshot_kind=snapshot_kind,
+                    expected_source_job_id=expected_source_job_id,
+                    expected_pve_snaptime=expected_pve_snaptime,
+                )
+            )
         elif operation_type == "snapshot_delete":
             method = "DELETE"
             path = f"/api/v1/resources/{int(vmid)}/snapshots/{quote(str(snapshot_name), safe='')}"
+            body.update(
+                self._snapshot_identity_body(
+                    vmid=vmid,
+                    snapshot_name=snapshot_name,
+                    snapshot_kind=snapshot_kind,
+                    expected_source_job_id=expected_source_job_id,
+                    expected_pve_snaptime=expected_pve_snaptime,
+                )
+            )
         else:
             raise HostControlError("Unsupported host operation")
         submitted = self._request(
@@ -159,7 +186,31 @@ class HostControlClient:
         job_id = str(submitted.get("id") or "")
         if not job_id:
             raise HostControlError("Host control did not return a job ID")
-        return self._wait_for_terminal(job_id, submitted)
+        def validate(remote: dict[str, Any]) -> None:
+            self._validate_existing_contract(
+                remote,
+                operation_type=operation_type,
+                vmid=vmid,
+                request_id=request_id,
+                snapshot_name=snapshot_name,
+                snapshot_kind=snapshot_kind,
+                expected_source_job_id=expected_source_job_id,
+                expected_pve_snaptime=expected_pve_snaptime,
+                release_fingerprint=release_fingerprint,
+            )
+
+        validate(submitted)
+        if on_observed is not None:
+            on_observed(dict(submitted))
+        result = self._wait_for_terminal(job_id, submitted, validate=validate)
+        if operation_type in {"snapshot_create", "snapshot_create_ram"}:
+            self._validate_snapshot_create_result(
+                result,
+                job_id,
+                vmid=vmid,
+                snapshot_name=str(snapshot_name or ""),
+            )
+        return result
 
     def find_job_by_request_id(
         self,
@@ -199,7 +250,11 @@ class HostControlClient:
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         deadline = self.monotonic() + self.operation_timeout
         current = self._retry_read(
@@ -211,7 +266,6 @@ class HostControlClient:
                 "Host control job was not found; operation outcome is unknown",
                 status="not_found",
             )
-
         def validate(remote: dict[str, Any]) -> None:
             self._validate_existing_contract(
                 remote,
@@ -219,6 +273,9 @@ class HostControlClient:
                 vmid=vmid,
                 request_id=request_id,
                 snapshot_name=snapshot_name,
+                snapshot_kind=snapshot_kind,
+                expected_source_job_id=expected_source_job_id,
+                expected_pve_snaptime=expected_pve_snaptime,
                 release_fingerprint=release_fingerprint,
             )
 
@@ -229,12 +286,68 @@ class HostControlClient:
                 "Host control lookup returned no job ID",
                 status="contract_mismatch",
             )
-        return self._wait_for_terminal(
+        if on_observed is not None:
+            on_observed(dict(current))
+        result = self._wait_for_terminal(
             job_id,
             current,
             deadline=deadline,
             validate=validate,
         )
+        if operation_type in {"snapshot_create", "snapshot_create_ram"}:
+            self._validate_snapshot_create_result(
+                result,
+                job_id,
+                vmid=vmid,
+                snapshot_name=str(snapshot_name or ""),
+            )
+        return result
+
+    @staticmethod
+    def _validate_snapshot_create_result(
+        result: dict[str, Any],
+        host_job_id: str,
+        *,
+        vmid: int,
+        snapshot_name: str,
+    ) -> None:
+        parsed = parse_owned_snapshot_name(snapshot_name, vmid=vmid)
+        if (
+            parsed is None
+            or result.get("name") != snapshot_name
+            or result.get("kind") != parsed.get("kind")
+            or (
+                "vmid" in result
+                and (
+                    isinstance(result.get("vmid"), bool)
+                    or result.get("vmid") != int(vmid)
+                )
+            )
+        ):
+            raise HostControlError(
+                "Host snapshot result does not match the create request",
+                status="contract_mismatch",
+            )
+        source_job_id = str(result.get("source_job_id") or "")
+        if (
+            len(host_job_id) != 32
+            or any(char not in "0123456789abcdef" for char in host_job_id)
+            or source_job_id != host_job_id
+        ):
+            raise HostControlError(
+                "Host snapshot result source job ID does not match its host job",
+                status="contract_mismatch",
+            )
+        snaptime = result.get("pve_snaptime")
+        if (
+            isinstance(snaptime, bool)
+            or not isinstance(snaptime, int)
+            or snaptime <= 0
+        ):
+            raise HostControlError(
+                "Host snapshot result has no valid PVE snaptime",
+                status="contract_mismatch",
+            )
 
     def _wait_for_terminal(
         self,
@@ -313,6 +426,9 @@ class HostControlClient:
         vmid: int,
         request_id: str,
         snapshot_name: str | None,
+        snapshot_kind: str | None,
+        expected_source_job_id: str | None,
+        expected_pve_snaptime: int | None,
         release_fingerprint: str | None,
     ) -> None:
         try:
@@ -325,8 +441,16 @@ class HostControlClient:
         expected_argument: str | None = None
         if operation_type == "self_update":
             expected_argument = release_fingerprint
-        elif operation_type.startswith("snapshot_"):
+        elif operation_type in {"snapshot_create", "snapshot_create_ram"}:
             expected_argument = snapshot_name
+        elif operation_type in {"snapshot_rollback", "snapshot_delete"}:
+            expected_argument = HostControlClient._snapshot_identity_argument(
+                vmid=vmid,
+                snapshot_name=snapshot_name,
+                snapshot_kind=snapshot_kind,
+                expected_source_job_id=expected_source_job_id,
+                expected_pve_snaptime=expected_pve_snaptime,
+            )
         remote_argument = current.get("argument")
         if remote_argument is None and operation_type == "self_update":
             remote_argument = current.get("fingerprint")
@@ -351,6 +475,61 @@ class HostControlClient:
                 "Host control job contract mismatch: " + ", ".join(mismatches),
                 status="contract_mismatch",
             )
+
+    @staticmethod
+    def _snapshot_identity_body(
+        *,
+        vmid: int,
+        snapshot_name: str | None,
+        snapshot_kind: str | None,
+        expected_source_job_id: str | None,
+        expected_pve_snaptime: int | None,
+    ) -> dict[str, Any]:
+        HostControlClient._snapshot_identity_argument(
+            vmid=vmid,
+            snapshot_name=snapshot_name,
+            snapshot_kind=snapshot_kind,
+            expected_source_job_id=expected_source_job_id,
+            expected_pve_snaptime=expected_pve_snaptime,
+        )
+        return {
+            "kind": snapshot_kind,
+            "expected_source_job_id": expected_source_job_id,
+            "expected_pve_snaptime": expected_pve_snaptime,
+        }
+
+    @staticmethod
+    def _snapshot_identity_argument(
+        *,
+        vmid: int,
+        snapshot_name: str | None,
+        snapshot_kind: str | None,
+        expected_source_job_id: str | None,
+        expected_pve_snaptime: int | None,
+    ) -> str:
+        if snapshot_kind not in {"manual", "pre-update"}:
+            raise HostControlError("Snapshot mutation requires an exact kind")
+        source = str(expected_source_job_id or "")
+        if len(source) != 32 or any(char not in "0123456789abcdef" for char in source):
+            raise HostControlError("Snapshot mutation requires an exact source job ID")
+        if (
+            isinstance(expected_pve_snaptime, bool)
+            or not isinstance(expected_pve_snaptime, int)
+            or expected_pve_snaptime <= 0
+        ):
+            raise HostControlError("Snapshot mutation requires an exact PVE snaptime")
+        return json.dumps(
+            {
+                "expected_pve_snaptime": expected_pve_snaptime,
+                "expected_source_job_id": source,
+                "kind": snapshot_kind,
+                "snapshot_name": str(snapshot_name or ""),
+                "version": 1,
+                "vmid": int(vmid),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     def _request(
         self,
@@ -386,5 +565,6 @@ class HostControlClient:
             raise HostControlError(
                 sanitize_text(payload.get("error") or f"HTTP {response.status_code}", limit=1000),
                 http_status=response.status_code,
+                code=sanitize_text(payload.get("code"), limit=100) or None,
             )
         return payload

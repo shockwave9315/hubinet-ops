@@ -14,7 +14,7 @@ from .executor import Executor, ExecutorError
 from .host_control import HostControlClient, HostControlError
 from .mqtt import MqttTelemetry, VERSION
 from .resource_adapters import ResourceExecutor
-from .service import OpsService
+from .service import ConflictError, OpsService
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -30,6 +30,14 @@ class OperationRequest(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$",
     )
+
+
+class SnapshotPruneRequest(OperationRequest):
+    confirm: str | None = Field(default=None, max_length=64)
+
+
+class SnapshotCreateRequest(OperationRequest):
+    include_ram: bool = Field(default=False, strict=True)
 
 
 def create_app(
@@ -234,10 +242,14 @@ def create_app(
     @api.post("/api/v1/resources/{vmid}/snapshots", dependencies=auth)
     def create_snapshot(
         vmid: int,
-        request: OperationRequest | None = None,
+        request: SnapshotCreateRequest | None = None,
     ) -> dict[str, Any]:
         try:
-            return service.queue_snapshot_create(vmid, request.request_id if request else None)
+            return service.queue_snapshot_create(
+                vmid,
+                request.request_id if request else None,
+                include_ram=request.include_ram if request else False,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Resource not found") from exc
         except (ValueError, ExecutorError, HostControlError) as exc:
@@ -274,6 +286,39 @@ def create_app(
         except (ValueError, ExecutorError, HostControlError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @api.post("/api/v1/resources/{vmid}/snapshots/delete-oldest", dependencies=auth)
+    def delete_oldest_snapshot(
+        vmid: int,
+        request: SnapshotPruneRequest | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return service.queue_snapshot_prune(
+                vmid,
+                "oldest",
+                request.request_id if request else None,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @api.post("/api/v1/resources/{vmid}/snapshots/delete-unprotected", dependencies=auth)
+    def delete_unprotected_snapshots(
+        vmid: int,
+        request: SnapshotPruneRequest,
+    ) -> dict[str, Any]:
+        try:
+            return service.queue_snapshot_prune(
+                vmid,
+                "all_unprotected",
+                request.request_id,
+                confirmation=request.confirm,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except (ValueError, ExecutorError, HostControlError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @api.post("/api/v1/resources/{vmid}/self-update", dependencies=auth)
     def self_update_resource(
         vmid: int,
@@ -283,8 +328,16 @@ def create_app(
             return service.create_self_update_plan(vmid)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail="Resource not found") from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail()) from exc
         except (ValueError, ExecutorError, HostControlError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "self_update_conflict",
+                    "message": str(exc),
+                },
+            ) from exc
 
     @api.post("/api/v1/resources/{vmid}/retry-healthcheck", dependencies=auth)
     @api.post("/api/v1/containers/{vmid}/retry-healthcheck", dependencies=auth)

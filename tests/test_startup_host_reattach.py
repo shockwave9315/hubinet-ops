@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -11,6 +12,36 @@ from app.config import Settings
 from app.database import Database
 from app.host_control import HostControlClient
 from app.service import OpsService
+from tests.test_v042_snapshot_retention import _record_snapshot_source
+
+
+PVE_SNAPTIME = 1_785_286_400
+
+
+def _expected_identity(snapshot_name: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "vmid": 110,
+        "snapshot_name": snapshot_name,
+        "kind": "manual",
+        "host_source_job_id": hashlib.sha256(
+            snapshot_name.encode("utf-8")
+        ).hexdigest()[:32],
+        "pve_snaptime": PVE_SNAPTIME,
+    }
+
+
+def _remote_argument(operation_type: str, snapshot_name: str | None) -> str | None:
+    if operation_type not in {"snapshot_rollback", "snapshot_delete"}:
+        return snapshot_name
+    identity = _expected_identity(str(snapshot_name))
+    return HostControlClient._snapshot_identity_argument(
+        vmid=110,
+        snapshot_name=str(snapshot_name),
+        snapshot_kind="manual",
+        expected_source_job_id=str(identity["host_source_job_id"]),
+        expected_pve_snaptime=int(identity["pve_snaptime"]),
+    )
 
 
 class NoopExecutor:
@@ -105,6 +136,12 @@ def _create_active_job(
         operation_type=operation_type,
         request_id=request_id,
         snapshot_name=snapshot_name,
+        result=(
+            {"expected_snapshot_identity": _expected_identity(snapshot_name)}
+            if snapshot_name is not None
+            and operation_type in {"snapshot_rollback", "snapshot_delete"}
+            else None
+        ),
     )
     if status == "running":
         return db.update_job(
@@ -130,6 +167,16 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
         request_id,
         snapshot_name=snapshot,
     )
+    source_job_id = hashlib.sha256(snapshot.encode("utf-8")).hexdigest()[:32]
+    _record_snapshot_source(
+        db,
+        {
+            "name": snapshot,
+            "kind": "manual",
+            "source_job_id": source_job_id,
+            "pve_snaptime": PVE_SNAPTIME,
+        },
+    )
     db.upsert_container_state(
         110,
         {
@@ -151,7 +198,7 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
         "vmid": 110,
         "request_id": request_id,
         "operation_type": "snapshot_rollback",
-        "argument": snapshot,
+        "argument": _remote_argument("snapshot_rollback", snapshot),
         "status": "running",
         "stage": "executing",
         "result": None,
@@ -174,7 +221,10 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
                     "snapshots": [
                         {
                             "name": snapshot,
+                            "kind": "manual",
                             "owned_by_hubinet_ops": True,
+                            "source_job_id": source_job_id,
+                            "pve_snaptime": PVE_SNAPTIME,
                             "rollback_eligible": True,
                             "delete_eligible": True,
                         }
@@ -222,10 +272,11 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
     assert failures == []
     terminal = db.get_job(local_job["id"])
     assert terminal["status"] == "success"
-    assert terminal["result"] == {
-        "action": "rollback",
-        "snapshot_name": snapshot,
-    }
+    assert terminal["result"]["action"] == "rollback"
+    assert terminal["result"]["snapshot_name"] == snapshot
+    assert terminal["result"]["expected_snapshot_identity"] == _expected_identity(
+        snapshot
+    )
     state = service.get_state(110)
     assert state["snapshot_operation_status"] == "success"
     assert state["verification_status"] == "unknown"
@@ -247,7 +298,7 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
     ("remote_status", "expected_local_status", "expected_operation_status"),
     [
         ("failed", "failed", "failed"),
-        ("interrupted", "interrupted", "unknown"),
+        ("interrupted", "running", "reconciliation_required"),
     ],
 )
 def test_startup_reattach_propagates_remote_terminal_error_and_result(
@@ -284,7 +335,7 @@ def test_startup_reattach_propagates_remote_terminal_error_and_result(
                 "vmid": 110,
                 "request_id": request_id,
                 "operation_type": "snapshot_rollback",
-                "argument": snapshot,
+                "argument": _remote_argument("snapshot_rollback", snapshot),
                 "status": remote_status,
                 "stage": remote_status,
                 "result": remote_result,
@@ -302,18 +353,23 @@ def test_startup_reattach_propagates_remote_terminal_error_and_result(
 
     terminal = db.get_job(local_job["id"])
     assert terminal["status"] == expected_local_status
-    assert terminal["result"] == remote_result
+    assert {
+        key: terminal["result"][key] for key in remote_result
+    } == remote_result
+    assert terminal["result"]["expected_snapshot_identity"] == _expected_identity(
+        snapshot
+    )
     assert terminal["error"] == remote_error
     state = service.get_state(110)
     assert state["snapshot_operation_status"] == (
-        "failed" if remote_status == "failed" else "unknown"
+        "failed" if remote_status == "failed" else "idle"
     )
     assert state["operation_status"] == expected_operation_status
     assert [request.method for request in requests] == ["GET"]
 
 
 @pytest.mark.parametrize("local_status", ["queued", "running"])
-def test_missing_remote_job_interrupts_without_replaying_submit(
+def test_missing_remote_job_preserves_unknown_and_only_prepared_may_submit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     local_status: str,
@@ -342,11 +398,108 @@ def test_missing_remote_job_interrupts_without_replaying_submit(
     service._reconcile_startup_jobs()
 
     terminal = db.get_job(local_job["id"])
-    assert terminal["status"] == "interrupted"
+    assert terminal["status"] == local_status
     assert terminal["result"] is None
-    assert "outcome is unknown" in terminal["error"]
-    assert service.get_state(110)["operation_status"] == "unknown"
-    assert [request.method for request in requests] == ["GET"]
+    assert terminal["error"]
+    assert service.get_state(110)["operation_status"] == "reconciliation_required"
+    assert [request.method for request in requests] == (
+        ["GET", "POST"] if local_status == "queued" else ["GET"]
+    )
+
+
+@pytest.mark.parametrize(
+    "operation_type",
+    ["snapshot_create", "snapshot_create_ram"],
+)
+@pytest.mark.parametrize("retention_target", [0, 1])
+def test_successful_snapshot_create_reattach_applies_retention_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation_type: str,
+    retention_target: int,
+) -> None:
+    case_dir = tmp_path / f"{operation_type}-{retention_target}"
+    case_dir.mkdir()
+    cfg = _settings(case_dir)
+    cfg.raw["resources"][110]["snapshot_retention_count"] = retention_target
+    cfg.raw["resources"][110].pop("snapshot_retention", None)
+    db = Database(cfg.db_path)
+    request_id = f"reattach-{operation_type.replace('_', '-')}-{retention_target}-0001"
+    snapshot = "hubinet-ops-110-manual-20260730T120000Z"
+    host_source_job_id = "a" * 32
+    local_job = _create_active_job(
+        db,
+        operation_type,
+        request_id,
+        snapshot_name=snapshot,
+    )
+    remote = {
+        "id": host_source_job_id,
+        "vmid": 110,
+        "request_id": request_id,
+        "operation_type": operation_type,
+        "argument": _remote_argument(operation_type, snapshot),
+        "status": "succeeded",
+        "stage": "complete",
+        "result": {
+            "name": snapshot,
+            "kind": "manual",
+            "source_job_id": host_source_job_id,
+            "pve_snaptime": PVE_SNAPTIME,
+        },
+        "error": None,
+    }
+    physical = {
+        "name": snapshot,
+        "description": (
+            "hubinet-ops;kind=manual;"
+            "created_at=2026-07-30T12:00:00+00:00;"
+            f"source_job_id={host_source_job_id}"
+        ),
+        "created_at": "2026-07-30T12:00:00+00:00",
+        "kind": "manual",
+        "owned_by_hubinet_ops": True,
+        "ownership_status": "owned",
+        "rollback_eligible": True,
+        "delete_eligible": True,
+        "source_job_id": host_source_job_id,
+        "pve_snaptime": PVE_SNAPTIME,
+    }
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.startswith("/api/v1/jobs/by-request/"):
+            return httpx.Response(200, json=remote)
+        if request.url.path == "/api/v1/resources/110/snapshots":
+            return httpx.Response(200, json={"snapshots": [physical]})
+        raise AssertionError(
+            f"unexpected request: {request.method} {request.url.path}"
+        )
+
+    service = OpsService(
+        cfg,
+        db,
+        NoopExecutor(),  # type: ignore[arg-type]
+        host_control=_client(monkeypatch, handler),
+    )
+
+    service._reconcile_startup_jobs()
+    request_count = len(requests)
+    service._reconcile_startup_jobs()
+
+    source = db.get_job(local_job["id"])
+    prunes = [
+        job for job in db.list_jobs() if job["operation_type"] == "snapshot_prune"
+    ]
+    assert source["status"] == "success"
+    assert source["result"]["source_job_id"] == host_source_job_id
+    assert len(prunes) == (1 if retention_target else 0)
+    if retention_target:
+        assert prunes[0]["result"]["source_job_id"] == source["id"]
+        assert prunes[0]["result"]["retention_target"] == retention_target
+    assert len(requests) == request_count
+    assert not [request for request in requests if request.method != "GET"]
 
 
 @pytest.mark.parametrize(
@@ -382,6 +535,7 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
         request_id,
         snapshot_name=snapshot,
     )
+    host_job_id = hashlib.sha256(operation_type.encode("utf-8")).hexdigest()[:32]
     remote_result = (
         {
             "lxc_status": (
@@ -394,7 +548,17 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
             )
         }
         if operation_type.startswith("lifecycle_")
-        else {"snapshot_name": snapshot, "operation": operation_type}
+        else {
+            "name": snapshot,
+            "kind": "manual",
+            "pve_snaptime": PVE_SNAPTIME,
+            "operation": operation_type,
+            **(
+                {"source_job_id": host_job_id}
+                if operation_type == "snapshot_create"
+                else {}
+            ),
+        }
     )
     requests: list[httpx.Request] = []
 
@@ -404,11 +568,11 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
             return httpx.Response(
                 200,
                 json={
-                    "id": f"host-{operation_type}",
+                    "id": host_job_id,
                     "vmid": 110,
                     "request_id": request_id,
                     "operation_type": operation_type,
-                    "argument": snapshot,
+                    "argument": _remote_argument(operation_type, snapshot),
                     "status": "succeeded",
                     "stage": "complete",
                     "result": remote_result,
@@ -432,6 +596,9 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
         f"/api/v1/jobs/by-request/110/{request_id}"
     )
     assert not [request for request in requests if request.method != "GET"]
+    assert not any(
+        job["operation_type"] == "snapshot_prune" for job in db.list_jobs()
+    )
 
 
 def test_self_update_startup_reattaches_by_request_without_execute_post(

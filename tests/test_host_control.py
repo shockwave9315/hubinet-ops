@@ -28,6 +28,7 @@ from hubinet_ops_host_control import (  # noqa: E402
     owned_snapshot,
     parse_snapshot,
     run_forced_command,
+    snapshot_identity_argument,
 )
 from hubinet_ops_hostd import (  # noqa: E402
     HostdApplication,
@@ -78,10 +79,10 @@ def policy(
             managed=_write(tmp_path / "managed", "101\n106\n"),
             maintenance=_write(tmp_path / "maintenance", "101\n106\n"),
             lifecycle=_write(tmp_path / "lifecycle", "101\n106\n110\n"),
-            host_control=_write(tmp_path / "host-control", "101\n106\n110\n"),
+            host_control=_write(tmp_path / "host-control", "100\n101\n106\n110\n"),
             snapshot_create=_write(
                 tmp_path / "snapshot-create",
-                "101\n106\n110\n",
+                "100\n101\n106\n110\n",
             ),
             snapshot_restore=_write(
                 tmp_path / "snapshot-restore",
@@ -89,7 +90,7 @@ def policy(
             ),
             snapshot_delete=_write(
                 tmp_path / "snapshot-delete",
-                "101\n106\n110\n",
+                "100\n101\n106\n110\n",
             ),
             resource_types=_write(
                 tmp_path / "types",
@@ -106,7 +107,7 @@ def policy(
 class FakeRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
-        self.status = {101: "stopped", 106: "running", 110: "running"}
+        self.status = {100: "running", 101: "stopped", 106: "running", 110: "running"}
         self.snapshots: list[dict[str, Any]] = [
             {
                 "snapname": "current",
@@ -120,7 +121,11 @@ class FakeRunner:
             },
             {
                 "snapname": "hubinet-ops-106-manual-20260720T170000Z",
-                "description": "hubinet-ops;kind=manual;source_job_id=abc12345",
+                "description": (
+                    "hubinet-ops;kind=manual;"
+                    "created_at=2026-07-20T17:00:00+00:00;"
+                    "source_job_id=abc12345"
+                ),
                 "snaptime": 1_721_492_400,
             },
         ]
@@ -133,6 +138,15 @@ class FakeRunner:
             self.status[int(argv[2])] = "running"
         elif argv[:2] in (["pct", "shutdown"], ["pct", "stop"]):
             self.status[int(argv[2])] = "stopped"
+        elif argv[:2] in (["pct", "snapshot"], ["qm", "snapshot"]):
+            description = argv[argv.index("--description") + 1]
+            self.snapshots.append(
+                {
+                    "snapname": argv[3],
+                    "description": description,
+                    "snaptime": 1_785_329_640,
+                }
+            )
         elif (
             argv[:2] == ["pvesh", "get"]
             and len(argv) >= 3
@@ -140,6 +154,23 @@ class FakeRunner:
         ):
             return subprocess.CompletedProcess(argv, 0, json.dumps(self.snapshots), "")
         return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def snapshot_identity(
+    vmid: int,
+    name: str,
+    *,
+    source_job_id: str = "abc12345",
+    pve_snaptime: int = 1_721_492_400,
+    kind: str = "manual",
+) -> str:
+    return snapshot_identity_argument(
+        vmid=vmid,
+        snapshot_name=name,
+        kind=kind,
+        expected_source_job_id=source_job_id,
+        expected_pve_snaptime=pve_snaptime,
+    )
 
 
 def test_policy_has_independent_observation_managed_lifecycle_and_snapshot_guards(
@@ -153,7 +184,18 @@ def test_policy_has_independent_observation_managed_lifecycle_and_snapshot_guard
         current.validate("update", 110)
     with pytest.raises(HostControlError, match="lifecycle"):
         current.validate("start", 100)
-    with pytest.raises(HostControlError, match="owned"):
+    assert current.validate(
+        "snapshot-create",
+        100,
+        "hubinet-ops-100-manual-20260729T120000Z",
+    )[3] == "qemu"
+    with pytest.raises(HostControlError, match="restore"):
+        current.validate(
+            "snapshot-rollback",
+            100,
+            "hubinet-ops-100-manual-20260729T120000Z",
+        )
+    with pytest.raises(HostControlError, match="physical identity"):
         current.validate("snapshot-rollback", 106, "foreign-backup")
     with pytest.raises(HostControlError, match="Action not allowed"):
         current.validate("exec", 106, "id")
@@ -242,8 +284,58 @@ def test_snapshot_list_marks_only_project_snapshots_as_eligible(tmp_path: Path) 
     assert current["rollback_eligible"] is False
     assert current["delete_eligible"] is False
     assert owned_snapshot(owned["name"], 106)
-    with pytest.raises(HostControlError, match="owned"):
+    with pytest.raises(HostControlError, match="physical identity"):
         controller.execute("snapshot-delete", 106, "foreign-backup")
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "",
+        "hubinet-ops",
+        "hubinet-ops;kind=manual;created_at=2026-07-20T17:00:00+00:00",
+        (
+            "hubinet-ops;kind=manual;kind=manual;"
+            "created_at=2026-07-20T17:00:00+00:00;source_job_id=abc12345"
+        ),
+        (
+            "hubinet-ops;kind=pre-update;"
+            "created_at=2026-07-20T17:00:00+00:00;source_job_id=abc12345"
+        ),
+        (
+            "hubinet-ops;kind=manual;"
+            "created_at=2026-07-20T17:00:01+00:00;source_job_id=abc12345"
+        ),
+        (
+            "hubinet-ops;kind=manual;"
+            "created_at=2026-07-20T17:00:00+00:00;source_job_id=not-a-job"
+        ),
+    ],
+)
+def test_name_only_or_invalid_snapshot_metadata_is_never_host_owned(
+    tmp_path: Path,
+    description: str,
+) -> None:
+    runner = FakeRunner()
+    name = "hubinet-ops-106-manual-20260720T170000Z"
+    runner.snapshots = [{"snapname": name, "description": description}]
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    snapshot = controller.execute("list-snapshots", 106)["snapshots"][0]
+
+    assert snapshot["owned_by_hubinet_ops"] is False
+    assert snapshot["ownership_status"] == "uncertain"
+    assert snapshot["delete_eligible"] is False
+    assert snapshot["rollback_eligible"] is False
+    identity = snapshot_identity(106, name)
+    with pytest.raises(HostControlError, match="does not exist|identity"):
+        controller.execute("snapshot-delete", 106, identity)
+    with pytest.raises(HostControlError, match="does not exist|identity"):
+        controller.execute("snapshot-rollback", 106, identity)
+    assert not any(
+        call[0][:2] in (["pct", "delsnapshot"], ["pct", "rollback"])
+        for call in runner.calls
+    )
 
 
 def test_snapshot_list_falls_back_to_legacy_name(tmp_path: Path) -> None:
@@ -311,7 +403,7 @@ def test_pve_snapshot_restore_policy_rejects_owned_snapshot_for_disallowed_vmid(
 def test_pve_snapshot_restore_always_rejects_foreign_snapshot(tmp_path: Path) -> None:
     controller = HostController(policy(tmp_path), runner=FakeRunner())
 
-    with pytest.raises(HostControlError, match="not owned"):
+    with pytest.raises(HostControlError, match="physical identity"):
         controller.execute("snapshot-rollback", 110, "foreign-backup")
 
 
@@ -323,13 +415,17 @@ def test_ct110_snapshot_restore_works_without_backend_through_explicit_pve_polic
     runner.snapshots = [
         {
             "snapname": name,
-            "description": "hubinet-ops;kind=manual;source_job_id=abc12345",
+            "description": (
+                "hubinet-ops;kind=manual;"
+                "created_at=2026-07-23T19:00:00+00:00;"
+                "source_job_id=abc12345"
+            ),
             "snaptime": 1_721_492_400,
         }
     ]
     controller = HostController(policy(tmp_path), runner=runner)
 
-    result = controller.execute("snapshot-rollback", 110, name)
+    result = controller.execute("snapshot-rollback", 110, snapshot_identity(110, name))
 
     assert result["action"] == "rollback"
     assert ["pct", "rollback", "110", name] in [call[0] for call in runner.calls]
@@ -363,7 +459,42 @@ def test_active_host_job_blocks_explicit_snapshot_restore(tmp_path: Path) -> Non
             vmid=110,
             operation_type="snapshot_rollback",
             request_id="request-ct110-explicit-restore",
-            argument="hubinet-ops-110-manual-20260723T190000Z",
+            argument=snapshot_identity(
+                110,
+                "hubinet-ops-110-manual-20260723T190000Z",
+            ),
+        )
+
+
+def test_hostd_request_id_cannot_be_reused_with_different_snapshot_identity(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = DummyController()
+    runner = RecordingHostJobRunner(controller)
+    application = HostdApplication(
+        HostdConfig("127.0.0.1", 0, tmp_path / "jobs.db", frozenset()),
+        store,
+        runner,  # type: ignore[arg-type]
+        "g" * 64,
+        "b" * 64,
+        "u" * 64,
+        "r" * 64,
+    )
+    name = "hubinet-ops-110-manual-20260723T190000Z"
+    application.submit(
+        vmid=110,
+        operation_type="snapshot_rollback",
+        request_id="identity-idempotency-request-0001",
+        argument=snapshot_identity(110, name, pve_snaptime=1785329640),
+    )
+
+    with pytest.raises(ValueError, match="another operation"):
+        application.submit(
+            vmid=110,
+            operation_type="snapshot_rollback",
+            request_id="identity-idempotency-request-0001",
+            argument=snapshot_identity(110, name, pve_snaptime=1785329641),
         )
 
 
@@ -378,6 +509,165 @@ def test_snapshot_create_uses_validated_name_and_auditable_description(tmp_path:
     assert argv[:4] == ["pct", "snapshot", "106", name]
     assert "source_job_id=abcd1234" in argv[-1]
     assert result["owned_by_hubinet_ops"] is True
+
+
+def test_snapshot_create_fails_closed_when_pve_listing_has_no_snaptime(
+    tmp_path: Path,
+) -> None:
+    class MissingSnaptimeRunner(FakeRunner):
+        def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            result = super().__call__(argv, **kwargs)
+            if argv[:2] in (["pct", "snapshot"], ["qm", "snapshot"]):
+                self.snapshots[-1].pop("snaptime", None)
+            return result
+
+    controller = HostController(policy(tmp_path), runner=MissingSnaptimeRunner())
+    with pytest.raises(HostControlError, match="physical identity mismatch"):
+        controller.execute(
+            "snapshot-create",
+            106,
+            "hubinet-ops-106-manual-20260720T191500Z",
+            source_job_id="abcd1234",
+        )
+
+
+@pytest.mark.parametrize(
+    ("action", "vmstate"),
+    [("snapshot-create", "0"), ("snapshot-create-ram", "1")],
+)
+def test_vm100_qemu_snapshot_uses_exact_typed_argv(
+    tmp_path: Path,
+    action: str,
+    vmstate: str,
+) -> None:
+    runner = FakeRunner()
+    controller = HostController(policy(tmp_path), runner=runner)
+    name = "hubinet-ops-100-manual-20260729T120000Z"
+
+    result = controller.execute(action, 100, name, source_job_id="abcd1234")
+
+    argv = next(call[0] for call in runner.calls if call[0][:2] == ["qm", "snapshot"])
+    assert argv == [
+        "qm",
+        "snapshot",
+        "100",
+        name,
+        "--description",
+        (
+            "hubinet-ops;kind=manual;created_at=2026-07-29T12:00:00+00:00;"
+            "source_job_id=abcd1234"
+        ),
+        "--vmstate",
+        vmstate,
+    ]
+    assert result["include_ram"] is (vmstate == "1")
+    assert all(call[1]["shell"] is False for call in runner.calls)
+
+
+def test_vm100_qemu_snapshot_list_and_delete_use_exact_argv(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    name = "hubinet-ops-100-manual-20260729T120000Z"
+    runner.snapshots = [
+        {
+            "snapname": name,
+            "description": (
+                "hubinet-ops;kind=manual;"
+                "created_at=2026-07-29T12:00:00+00:00;"
+                "source_job_id=abc12345"
+            ),
+            "snaptime": 1785326400,
+        }
+    ]
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    snapshots = controller.execute("list-snapshots", 100)["snapshots"]
+    controller.execute(
+        "snapshot-delete",
+        100,
+        snapshot_identity(
+            100,
+            name,
+            pve_snaptime=1785326400,
+        ),
+    )
+
+    assert [
+        "pvesh",
+        "get",
+        "/nodes/pve-a/qemu/100/snapshot",
+        "--output-format",
+        "json",
+    ] in [call[0] for call in runner.calls]
+    assert ["qm", "delsnapshot", "100", name] in [
+        call[0] for call in runner.calls
+    ]
+    assert snapshots[0]["delete_eligible"] is True
+    assert snapshots[0]["rollback_eligible"] is False
+
+
+@pytest.mark.parametrize(
+    ("action", "forbidden_argv"),
+    [
+        ("snapshot-delete", ["pct", "delsnapshot"]),
+        ("snapshot-rollback", ["pct", "rollback"]),
+    ],
+)
+def test_snapshot_mutation_rechecks_snaptime_immediately_before_pve_command(
+    tmp_path: Path,
+    action: str,
+    forbidden_argv: list[str],
+) -> None:
+    class ReplacingRunner(FakeRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.snapshot_reads = 0
+
+        def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if argv[:2] == ["pvesh", "get"] and argv[2].endswith("/snapshot"):
+                self.snapshot_reads += 1
+                if self.snapshot_reads == 2:
+                    self.snapshots[0]["snaptime"] += 1
+            return super().__call__(argv, **kwargs)
+
+    runner = ReplacingRunner()
+    name = "hubinet-ops-106-manual-20260720T170000Z"
+    runner.snapshots = [
+        {
+            "snapname": name,
+            "description": (
+                "hubinet-ops;kind=manual;created_at=2026-07-20T17:00:00+00:00;"
+                "source_job_id=abc12345"
+            ),
+            "snaptime": 1_721_492_400,
+        }
+    ]
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    with pytest.raises(HostControlError, match="identity changed"):
+        controller.execute(action, 106, snapshot_identity(106, name))
+
+    assert not any(call[0][:2] == forbidden_argv for call in runner.calls)
+
+
+def test_snapshot_without_direct_pve_snaptime_is_informational_only(
+    tmp_path: Path,
+) -> None:
+    runner = FakeRunner()
+    runner.snapshots = [
+        {
+            "snapname": "hubinet-ops-106-manual-20260720T170000Z",
+            "description": (
+                "hubinet-ops;kind=manual;created_at=2026-07-20T17:00:00+00:00;"
+                "source_job_id=abc12345"
+            ),
+        }
+    ]
+    snapshot = HostController(policy(tmp_path), runner=runner).list_snapshots(106)[0]
+    assert snapshot["created_at"] == "2026-07-20T17:00:00+00:00"
+    assert snapshot["pve_snaptime"] is None
+    assert snapshot["owned_by_hubinet_ops"] is False
+    assert snapshot["rollback_eligible"] is False
+    assert snapshot["delete_eligible"] is False
 
 
 def test_forced_command_rejects_command_text_and_unknown_arguments(tmp_path: Path) -> None:
@@ -483,6 +773,8 @@ class RecoveryController(DummyController):
         self.rollback_started = threading.Event()
         self.allow_completion = threading.Event()
         self.snapshot_name = "hubinet-ops-110-manual-20260724T120000Z"
+        self.snapshot_source_job_id = ""
+        self.snapshot_pve_snaptime = 1_785_286_400
 
     def execute(
         self,
@@ -500,17 +792,29 @@ class RecoveryController(DummyController):
                         "name": self.snapshot_name,
                         "owned_by_hubinet_ops": True,
                         "rollback_eligible": True,
+                        "kind": "manual",
+                        "source_job_id": self.snapshot_source_job_id,
+                        "pve_snaptime": self.snapshot_pve_snaptime,
                     }
                 ]
             }
         if action == "snapshot-rollback":
             self.calls.append((action, vmid, argument, source_job_id))
+            identity = json.loads(str(argument))
+            if (
+                identity.get("snapshot_name") != self.snapshot_name
+                or identity.get("expected_source_job_id")
+                != self.snapshot_source_job_id
+                or identity.get("expected_pve_snaptime")
+                != self.snapshot_pve_snaptime
+            ):
+                raise HostControlError("Physical snapshot identity changed before mutation")
             self.rollback_started.set()
             if not self.allow_completion.wait(timeout=5):
                 raise RuntimeError("test did not release offline restore")
             return {
                 "action": "rollback",
-                "snapshot": argument,
+                "snapshot": json.loads(str(argument))["snapshot_name"],
                 "lxc_status": "stopped",
             }
         return super().execute(
@@ -519,6 +823,32 @@ class RecoveryController(DummyController):
             argument,
             source_job_id=source_job_id,
         )
+
+
+def seed_recovery_snapshot_job(
+    store: HostJobStore,
+    controller: RecoveryController,
+) -> dict[str, Any]:
+    job, _ = store.create(
+        vmid=110,
+        operation_type="snapshot_create",
+        request_id="recovery-source-create-request-0001",
+        argument=controller.snapshot_name,
+    )
+    store.begin_execution(job["id"])
+    controller.snapshot_source_job_id = str(job["id"])
+    return store.transition_from_active(
+        job["id"],
+        status="succeeded",
+        stage="complete",
+        progress=100,
+        result={
+            "name": controller.snapshot_name,
+            "kind": "manual",
+            "source_job_id": job["id"],
+            "pve_snaptime": controller.snapshot_pve_snaptime,
+        },
+    )
 
 
 @pytest.mark.parametrize("initial_status", ["queued", "running"])
@@ -856,7 +1186,14 @@ def test_backend_scope_submits_restore_and_general_scope_still_starts_ct110(
             "POST",
             "/api/v1/resources/110/snapshots/"
             "hubinet-ops-110-manual-20260724T120000Z/restore",
-            body=json.dumps({"request_id": "backend-restore-request-0001"}),
+            body=json.dumps(
+                {
+                    "request_id": "backend-restore-request-0001",
+                    "kind": "manual",
+                    "expected_source_job_id": "a" * 32,
+                    "expected_pve_snaptime": 1785329640,
+                }
+            ),
             headers={
                 "Authorization": f"Bearer {'b' * 64}",
                 "Content-Type": "application/json",
@@ -905,6 +1242,7 @@ def test_offline_restore_persists_recovery_marker_before_rollback_and_survives_r
     database = tmp_path / "jobs.db"
     store = HostJobStore(database)
     controller = RecoveryController()
+    seed_recovery_snapshot_job(store, controller)
     runner = NotifyingHostJobRunner(store, controller)
     application = HostdApplication(
         HostdConfig("127.0.0.1", 0, database, frozenset()),
@@ -953,6 +1291,7 @@ def test_offline_restore_http_requires_recovery_scope_and_explicit_confirmation(
 ) -> None:
     store = HostJobStore(tmp_path / "jobs.db")
     controller = RecoveryController()
+    seed_recovery_snapshot_job(store, controller)
     runner = RecordingHostJobRunner(controller)
     application = HostdApplication(
         HostdConfig("127.0.0.1", 0, tmp_path / "jobs.db", frozenset()),
@@ -1035,11 +1374,43 @@ def test_offline_restore_http_requires_recovery_scope_and_explicit_confirmation(
     assert runner.started == [payload["id"]]
 
 
+def test_offline_restore_rejects_replaced_target_before_physical_rollback(
+    tmp_path: Path,
+) -> None:
+    store = HostJobStore(tmp_path / "jobs.db")
+    controller = RecoveryController()
+    seed_recovery_snapshot_job(store, controller)
+    recording = RecordingHostJobRunner(controller)
+    application = HostdApplication(
+        HostdConfig("127.0.0.1", 0, tmp_path / "jobs.db", frozenset()),
+        store,
+        recording,  # type: ignore[arg-type]
+        "g" * 64,
+        "b" * 64,
+        "u" * 64,
+        "r" * 64,
+    )
+    job, _ = application.submit_recovery(
+        vmid=110,
+        operation_type="offline_snapshot_restore",
+        request_id="offline-replaced-target-request-0001",
+        argument=controller.snapshot_name,
+    )
+    controller.snapshot_pve_snaptime += 1
+
+    terminal = HostJobRunner(store, controller).run(job["id"])  # type: ignore[arg-type]
+
+    assert terminal["status"] == "failed"
+    assert "identity changed" in terminal["error"]
+    assert controller.rollback_started.is_set() is False
+
+
 def test_offline_restore_rejects_running_ct110_foreign_snapshot_and_active_host_job(
     tmp_path: Path,
 ) -> None:
     store = HostJobStore(tmp_path / "jobs.db")
     controller = RecoveryController()
+    seed_recovery_snapshot_job(store, controller)
     runner = RecordingHostJobRunner(controller)
     application = HostdApplication(
         HostdConfig("127.0.0.1", 0, tmp_path / "jobs.db", frozenset()),
@@ -1135,7 +1506,7 @@ def test_recovery_restart_distinguishes_queued_from_mutation_started(
         queued_database
     ).list_unacknowledged_recovery_events()[0]
     assert queued_event["host_job_id"] == queued["id"]
-    assert queued_event["status"] == "interrupted"
+    assert queued_event["status"] == "queued"
     assert queued_event["mutation_started_at"] is None
     assert queued_controller.calls == []
 
@@ -1155,7 +1526,7 @@ def test_recovery_restart_distinguishes_queued_from_mutation_started(
     interrupted = HostJobStore(
         started_database
     ).list_unacknowledged_recovery_events()[0]
-    assert interrupted["status"] == "interrupted"
+    assert interrupted["status"] == "running"
     assert interrupted["mutation_started_at"] == marked["mutation_started_at"]
     assert "outcome is unknown" in interrupted["error"]
     assert started_controller.calls == []
@@ -1232,6 +1603,7 @@ def test_host_job_runner_persists_terminal_result(tmp_path: Path) -> None:
     ("operation_type", "argument"),
     [
         ("snapshot_create", "hubinet-ops-110-manual-20260723T220000Z"),
+        ("snapshot_create_ram", "hubinet-ops-100-manual-20260723T220000Z"),
         ("snapshot_rollback", "hubinet-ops-110-manual-20260723T220000Z"),
         ("snapshot_delete", "hubinet-ops-110-manual-20260723T220000Z"),
         ("lifecycle_shutdown", None),
@@ -1285,6 +1657,7 @@ def test_live_job_polling_is_read_only_until_worker_finishes(
     assert terminal["status"] == "succeeded"
     assert terminal["result"]["action"] == {
         "snapshot_create": "snapshot-create",
+        "snapshot_create_ram": "snapshot-create-ram",
         "snapshot_rollback": "snapshot-rollback",
         "snapshot_delete": "snapshot-delete",
         "lifecycle_shutdown": "shutdown",
@@ -1381,6 +1754,7 @@ def test_startup_reconciliation_after_store_recreation_uses_runtime_without_repl
         operation_type=operation_type,
         request_id=f"request-{operation_type}-0004",
     )
+    store.begin_execution(job["id"])
 
     restarted = HostJobStore(tmp_path / "jobs.db")
     reconciled = restarted.reconcile_startup(controller)  # type: ignore[arg-type]
@@ -1413,7 +1787,7 @@ def test_startup_reconciliation_after_store_recreation_uses_runtime_without_repl
     "operation_type",
     ["snapshot_create", "snapshot_rollback", "snapshot_delete"],
 )
-def test_snapshot_job_at_real_startup_is_interrupted_without_replay(
+def test_snapshot_job_at_real_startup_stays_active_unknown_without_replay(
     tmp_path: Path,
     operation_type: str,
 ) -> None:
@@ -1430,9 +1804,16 @@ def test_snapshot_job_at_real_startup_is_interrupted_without_replay(
 
     reconciled = restarted.reconcile_startup(controller)  # type: ignore[arg-type]
 
-    assert reconciled[0]["status"] == "interrupted"
+    assert reconciled[0]["status"] == "running"
+    assert reconciled[0]["stage"] == "outcome_unknown"
     assert "outcome is unknown" in reconciled[0]["error"]
     assert controller.calls == []
+    with pytest.raises(HostControlError, match="another destructive host job is active"):
+        restarted.create(
+            vmid=110,
+            operation_type="lifecycle_force_stop",
+            request_id=f"blocked-after-{operation_type}",
+        )
 
 
 def test_reboot_reconciliation_is_unknown_even_when_lxc_is_running(
@@ -1446,13 +1827,15 @@ def test_reboot_reconciliation_is_unknown_even_when_lxc_is_running(
         operation_type="lifecycle_reboot",
         request_id="request-reboot-0004",
     )
+    store.begin_execution(job["id"])
 
     reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
-    assert reconciled[0]["status"] == "interrupted"
+    assert reconciled[0]["status"] == "running"
+    assert reconciled[0]["stage"] == "outcome_unknown"
     assert "cannot prove" in reconciled[0]["error"]
     assert controller.calls == []
-    assert store.get(job["id"])["status"] == "interrupted"
+    assert store.get(job["id"])["status"] == "running"
 
 
 def test_status_reconciliation_falls_back_to_runtime_status(
@@ -1465,11 +1848,12 @@ def test_status_reconciliation_falls_back_to_runtime_status(
         "runtime_status": "running",
         "lxc_status": "",
     }
-    store.create(
+    job, _ = store.create(
         vmid=110,
         operation_type="lifecycle_start",
         request_id="request-runtime-fallback-0004",
     )
+    store.begin_execution(job["id"])
 
     reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
@@ -1494,15 +1878,17 @@ def test_status_reconciliation_reports_controlled_unknown_for_invalid_payload_or
         controller.status_error = failure
     else:
         controller.status_payload = failure
-    store.create(
+    job, _ = store.create(
         vmid=110,
         operation_type="lifecycle_start",
         request_id="request-invalid-status-0004",
     )
+    store.begin_execution(job["id"])
 
     reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
-    assert reconciled[0]["status"] == "interrupted"
+    assert reconciled[0]["status"] == "running"
+    assert reconciled[0]["stage"] == "outcome_unknown"
     assert reconciled[0]["error"].startswith("status reconciliation failed:")
 
 
@@ -1572,7 +1958,7 @@ def test_self_update_result_survives_hostd_store_recreation(
     assert not (results / f"{job['id']}.json").exists()
 
 
-def test_self_update_without_supervisor_marker_is_interrupted_unknown(
+def test_self_update_without_supervisor_marker_stays_active_unknown(
     tmp_path: Path,
 ) -> None:
     store = HostJobStore(tmp_path / "jobs.db", tmp_path / "results")
@@ -1593,7 +1979,8 @@ def test_self_update_without_supervisor_marker_is_interrupted_unknown(
         tmp_path / "results",
     ).reconcile_startup(DummyController())[0]  # type: ignore[arg-type]
 
-    assert terminal["status"] == "interrupted"
+    assert terminal["status"] == "running"
+    assert terminal["stage"] == "outcome_unknown"
     assert "outcome is unknown" in terminal["error"]
 
 

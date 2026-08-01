@@ -27,8 +27,10 @@ JOB_OPERATION_TYPES = frozenset(
         "lifecycle_reboot",
         "lifecycle_force_stop",
         "snapshot_create",
+        "snapshot_create_ram",
         "snapshot_rollback",
         "snapshot_delete",
+        "snapshot_prune",
         "retry_healthcheck",
         "self_update",
     }
@@ -40,6 +42,8 @@ SNAPSHOT_NAME_RE = re.compile(
 )
 SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
+SNAPSHOT_PRUNE_STATE_VERSION = 3
+SNAPSHOT_PRUNE_DELETED_HISTORY_LIMIT = 50
 
 
 @dataclass(frozen=True)

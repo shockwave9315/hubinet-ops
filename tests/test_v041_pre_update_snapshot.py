@@ -6,10 +6,17 @@ from pathlib import Path
 from app.config import Settings
 from app.database import Database
 from app.executor import ExecutorError
+from app.host_control import HostControlError
 from app.service import OpsService
 from app.config import validate_config
 from app.stabilization import Stabilizer
-from tests.test_service import WorkflowExecutor, settings, docker_state, FakeClock
+from tests.test_service import (
+    FakeClock,
+    UpdateSnapshotHost,
+    WorkflowExecutor,
+    docker_state,
+    settings,
+)
 import threading
 
 def create_ops(tmp_path: Path, **kwargs) -> tuple[OpsService, WorkflowExecutor, Database]:
@@ -43,7 +50,12 @@ def create_ops(tmp_path: Path, **kwargs) -> tuple[OpsService, WorkflowExecutor, 
         return WorkflowExecutor.run(executor, action, vmid, *args, **kwargs)
         
     executor.run = test_executor
-    service = OpsService(cfg, db, executor)
+    service = OpsService(
+        cfg,
+        db,
+        executor,
+        host_control=UpdateSnapshotHost(),
+    )
     service.stabilizer = Stabilizer(
         executor,
         threading.Event(),
@@ -91,7 +103,8 @@ def test_pre_update_snapshot_policy_no_auto_rollback(tmp_path: Path) -> None:
 
     service._run_job(db.get_job(job_id))
     
-    assert "snapshot" in executor.actions
+    assert "snapshot" not in executor.actions
+    assert len(service.host_control.snapshots) == 1
     assert "update" in executor.actions
     assert "preflight" in executor.actions
     
@@ -136,7 +149,8 @@ def test_pre_update_snapshot_policy_failed_update(tmp_path: Path) -> None:
 
     service._run_job(db.get_job(job_id))
     
-    assert "snapshot" in executor.actions
+    assert "snapshot" not in executor.actions
+    assert len(service.host_control.snapshots) == 1
     assert "update" in executor.actions
     assert "repair" not in executor.actions  # No repair/rollback because auto_rollback is false
     assert "rollback" not in executor.actions
@@ -186,9 +200,14 @@ def test_pre_update_snapshot_policy_auto_rollback(tmp_path: Path) -> None:
 
     service._run_job(db.get_job(job_id))
     
-    assert "snapshot" in executor.actions
+    assert "snapshot" not in executor.actions
+    assert len(service.host_control.snapshots) == 1
     assert "update" in executor.actions
-    assert "rollback" in executor.actions  # Auto rollback!
+    assert "rollback" not in executor.actions
+    assert any(
+        call[0] == "snapshot_rollback"
+        for call in service.host_control.calls
+    )
     final_job = db.get_job(job_id)
     assert final_job["status"] == "rolled_back"
     state = service.get_state(106)
@@ -237,8 +256,6 @@ def test_pre_update_snapshot_policy_snapshot_failure(tmp_path: Path) -> None:
     
     def failing_executor(action, vmid, *args, **kwargs):
         executor.actions.append(action)
-        if action == "snapshot":
-            raise ExecutorError("snapshot failed")
         if action == "scan":
             return {
                 "ok": True,
@@ -252,6 +269,10 @@ def test_pre_update_snapshot_policy_snapshot_failure(tmp_path: Path) -> None:
         return WorkflowExecutor.run(executor, action, vmid, *args, **kwargs)
         
     executor.run = failing_executor
+    def failing_host_snapshot(*args, **kwargs):
+        raise HostControlError("snapshot failed", status="failed")
+
+    service.host_control.execute = failing_host_snapshot
     
     plan = service.scan_container(106)
     if "plan" not in plan:
@@ -261,7 +282,7 @@ def test_pre_update_snapshot_policy_snapshot_failure(tmp_path: Path) -> None:
 
     service._run_job(db.get_job(job_id))
     
-    assert "snapshot" in executor.actions
+    assert "snapshot" not in executor.actions
     assert "update" not in executor.actions
     
     final_job = db.get_job(job_id)

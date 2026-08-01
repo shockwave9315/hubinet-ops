@@ -183,7 +183,7 @@ def test_numeric_discovery_never_falls_back_to_unknown_string() -> None:
     assert "available_bytes" not in state["memory"]
 
 
-def test_data_size_discovery_uses_gib_without_changing_raw_backend_bytes() -> None:
+def test_data_size_discovery_preserves_raw_backend_bytes() -> None:
     state = bounded_state(
         {
             "memory": {"used_bytes": 5_838_413_824, "total_bytes": 34_359_738_368},
@@ -204,9 +204,10 @@ def test_data_size_discovery_uses_gib_without_changing_raw_backend_bytes() -> No
     ):
         payload = configs[topic]
         assert payload["device_class"] == "data_size"
-        assert payload["unit_of_measurement"] == "GiB"
+        assert payload["unit_of_measurement"] == "B"
         assert payload["state_class"] in {"measurement", "total_increasing"}
-        assert "1073741824" in payload["value_template"]
+        assert "1073741824" not in payload["value_template"]
+        assert "| int" in payload["value_template"]
 
 
 def test_agent_last_refresh_discovery_is_nullable_diagnostic_text() -> None:
@@ -429,8 +430,9 @@ def test_dashboard_attributes_have_an_independent_ten_kib_budget() -> None:
         "recent_job_events",
         "recent_warnings",
         "attribute_payload",
-        "failed_units",
-    }
+            "failed_units",
+            "managed_snapshots",
+        }
     for forbidden in (
         "last_refresh",
         "uptime_seconds",

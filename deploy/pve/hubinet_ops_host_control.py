@@ -19,6 +19,7 @@ SNAPSHOT_RE = re.compile(
     r"(?P<kind>pre-update|pre|manual|man)-(?P<stamp>[0-9]{8}T[0-9]{6}Z)$"
 )
 SOURCE_JOB_RE = re.compile(r"^[a-f0-9]{8,64}$")
+SNAPSHOT_IDENTITY_VERSION = 1
 RESOURCE_TYPES = {"lxc", "qemu"}
 READ_ONLY_ACTIONS = {
     "status",
@@ -36,7 +37,12 @@ MANAGED_ACTIONS = {
     "repair": "repair",
     "verify": "verify",
 }
-SNAPSHOT_ACTIONS = {"snapshot-create", "snapshot-rollback", "snapshot-delete"}
+SNAPSHOT_ACTIONS = {
+    "snapshot-create",
+    "snapshot-create-ram",
+    "snapshot-rollback",
+    "snapshot-delete",
+}
 ALIASES = {
     "snapshot": "snapshot-create",
     "rollback": "snapshot-rollback",
@@ -110,10 +116,11 @@ class HostPolicy:
             if resource_type != "lxc" or vmid not in self.lifecycle:
                 raise HostControlError("VMID not lifecycle allowed")
         if normalized in SNAPSHOT_ACTIONS:
-            if resource_type != "lxc" or vmid not in self.host_control:
+            if vmid not in self.host_control:
                 raise HostControlError("VMID not host-control allowed")
             action_policy = {
                 "snapshot-create": (self.snapshot_create, "snapshot create"),
+                "snapshot-create-ram": (self.snapshot_create, "snapshot create"),
                 "snapshot-rollback": (self.snapshot_restore, "snapshot restore"),
                 "snapshot-delete": (self.snapshot_delete, "snapshot delete"),
             }[normalized]
@@ -121,11 +128,18 @@ class HostPolicy:
                 raise HostControlError(
                     f"VMID not {action_policy[1]} allowed by PVE policy"
                 )
+            if normalized == "snapshot-create-ram" and resource_type != "qemu":
+                raise HostControlError("RAM snapshot is allowed only for QEMU")
+            if normalized == "snapshot-rollback" and resource_type != "lxc":
+                raise HostControlError("Snapshot restore is allowed only for LXC")
         if normalized in {"self-update", "self-update-release"} and vmid != 110:
             raise HostControlError("Self-update is allowed only for CT110")
         if normalized in SNAPSHOT_ACTIONS:
-            if not argument or not owned_snapshot(argument, vmid):
-                raise HostControlError("Snapshot is not owned by Hubinet Ops")
+            if normalized in {"snapshot-create", "snapshot-create-ram"}:
+                if not argument or not owned_snapshot(argument, vmid):
+                    raise HostControlError("Snapshot is not owned by Hubinet Ops")
+            else:
+                _parse_snapshot_identity(argument, vmid=vmid)
         elif normalized == "self-update":
             if not argument or not FINGERPRINT_RE.fullmatch(argument):
                 raise HostControlError("Self-update requires an approved release fingerprint")
@@ -180,20 +194,33 @@ class HostController:
         if action in LIFECYCLE_ACTIONS:
             return self._lifecycle(vmid, action)
         if action == "list-snapshots":
-            if resource_type != "lxc" or vmid not in self.policy.host_control:
+            if vmid not in self.policy.host_control:
                 raise HostControlError("Snapshot listing is not allowed")
-            return {"snapshots": self.list_snapshots(vmid)}
-        if action == "snapshot-create":
-            return self._snapshot_create(vmid, str(argument), source_job_id)
+            return {"snapshots": self.list_snapshots(vmid, resource_type)}
+        if action in {"snapshot-create", "snapshot-create-ram"}:
+            return self._snapshot_create(
+                vmid,
+                str(argument),
+                source_job_id,
+                resource_type=resource_type,
+                include_ram=action == "snapshot-create-ram",
+            )
         if action == "snapshot-rollback":
-            snapshot = self._require_owned_existing_snapshot(vmid, str(argument))
+            identity = _parse_snapshot_identity(argument, vmid=vmid)
+            snapshot = self._require_exact_existing_snapshot(
+                vmid, identity, resource_type
+            )
             if not snapshot["rollback_eligible"]:
                 raise HostControlError("Snapshot is not restore eligible")
             was_running = self._status(vmid, "lxc")["lxc_status"] == "running"
             if was_running:
                 self._lifecycle(vmid, "shutdown")
             try:
-                self._run(["pct", "rollback", str(vmid), str(argument)], timeout=900)
+                self._require_exact_existing_snapshot(vmid, identity, resource_type)
+                self._run(
+                    ["pct", "rollback", str(vmid), identity["snapshot_name"]],
+                    timeout=900,
+                )
             except Exception:
                 if was_running:
                     try:
@@ -204,16 +231,32 @@ class HostController:
             if was_running:
                 self._lifecycle(vmid, "start")
             return {
-                "snapshot": argument,
+                "snapshot": identity["snapshot_name"],
                 "action": "rollback",
+                "expected_source_job_id": identity["expected_source_job_id"],
+                "expected_pve_snaptime": identity["expected_pve_snaptime"],
                 "lxc_status": "running" if was_running else "stopped",
             }
         if action == "snapshot-delete":
-            snapshot = self._require_owned_existing_snapshot(vmid, str(argument))
+            identity = _parse_snapshot_identity(argument, vmid=vmid)
+            snapshot = self._require_exact_existing_snapshot(
+                vmid, identity, resource_type
+            )
             if not snapshot["delete_eligible"]:
                 raise HostControlError("Snapshot is not delete eligible")
-            self._run(["pct", "delsnapshot", str(vmid), str(argument)], timeout=300)
-            return {"snapshot": argument, "action": "delete"}
+            argv = (
+                ["pct", "delsnapshot", str(vmid), identity["snapshot_name"]]
+                if resource_type == "lxc"
+                else ["qm", "delsnapshot", str(vmid), identity["snapshot_name"]]
+            )
+            self._require_exact_existing_snapshot(vmid, identity, resource_type)
+            self._run(argv, timeout=300)
+            return {
+                "snapshot": identity["snapshot_name"],
+                "action": "delete",
+                "expected_source_job_id": identity["expected_source_job_id"],
+                "expected_pve_snaptime": identity["expected_pve_snaptime"],
+            }
         if action == "self-update":
             script = self.policy.paths.self_update
             if not script.is_file():
@@ -261,13 +304,18 @@ class HostController:
             sys.stderr.write(completed.stderr[-8000:])
         return int(completed.returncode or 0)
 
-    def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
+    def list_snapshots(
+        self, vmid: int, resource_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        resource_type = resource_type or self.policy.resource_types.get(vmid)
+        if resource_type not in RESOURCE_TYPES:
+            raise HostControlError("Unknown resource type")
         node = self._resolve_node()
         raw = self._run(
             [
                 "pvesh",
                 "get",
-                f"/nodes/{node}/lxc/{vmid}/snapshot",
+                f"/nodes/{node}/{resource_type}/{vmid}/snapshot",
                 "--output-format",
                 "json",
             ],
@@ -283,19 +331,38 @@ class HostController:
                 continue
             name = str(item.get("snapname") or item.get("name") or "")
             parsed = parse_snapshot(name, vmid)
+            metadata = _snapshot_description_metadata(
+                item.get("description"),
+                parsed,
+            )
             created_at = _snapshot_created_at(item, parsed)
-            owned = parsed is not None
+            pve_snaptime = _pve_snaptime(item)
+            owned = metadata is not None and pve_snaptime is not None
             current = bool(item.get("current")) or name == "current"
             snapshots.append(
                 {
                     "name": name[:128],
+                    "vmid": vmid,
                     "description": str(item.get("description") or "")[:1000],
                     "created_at": created_at,
+                    "pve_snaptime": pve_snaptime,
                     "kind": parsed["kind"] if parsed else None,
                     "owned_by_hubinet_ops": owned,
-                    "rollback_eligible": owned and not current,
-                    "delete_eligible": owned and not current,
-                    "source_job_id": _description_job_id(item.get("description")),
+                    "ownership_status": (
+                        "owned" if owned else "uncertain" if parsed else "foreign"
+                    ),
+                    "rollback_eligible": (
+                        owned
+                        and not current
+                        and resource_type == "lxc"
+                        and vmid in self.policy.snapshot_restore
+                    ),
+                    "delete_eligible": (
+                        owned and not current and vmid in self.policy.snapshot_delete
+                    ),
+                    "source_job_id": (
+                        metadata.get("source_job_id") if metadata else None
+                    ),
                 }
             )
         return sorted(
@@ -349,6 +416,15 @@ class HostController:
             (item.get("cpu") for item in resources if _same_vmid(item.get("vmid"), vmid)),
             None,
         ))
+        raw_disk_used = current.get("disk")
+        try:
+            disk_used = int(raw_disk_used) if raw_disk_used is not None else None
+        except (TypeError, ValueError):
+            disk_used = None
+        # Proxmox reports disk=0 for QEMU guests when it has no filesystem
+        # usage source. Zero is therefore unknown here, not a measured 0 B.
+        if disk_used is not None and disk_used <= 0:
+            disk_used = None
         return {
             **status,
             "adapter": "haos",
@@ -358,7 +434,11 @@ class HostController:
             "uptime_seconds": max(0, int(current.get("uptime") or 0)),
             "cpu": {"usage": cpu, "cores": current.get("cpus")},
             "memory": {"used_bytes": current.get("mem"), "total_bytes": current.get("maxmem")},
-            "disk": {"used_bytes": current.get("disk"), "total_bytes": current.get("maxdisk")},
+            "disk": {
+                "used_bytes": disk_used,
+                "total_bytes": current.get("maxdisk"),
+                "usage_known": disk_used is not None,
+            },
             "network": {"in_bytes": current.get("netin"), "out_bytes": current.get("netout")},
         }
 
@@ -404,35 +484,93 @@ class HostController:
         vmid: int,
         name: str,
         source_job_id: str | None,
+        *,
+        resource_type: str,
+        include_ram: bool,
     ) -> dict[str, Any]:
         parsed = parse_snapshot(name, vmid)
         if parsed is None:
             raise HostControlError("Invalid Hubinet Ops snapshot name")
+        if source_job_id is None:
+            raise HostControlError(
+                "Snapshot creation requires a durable source job ID"
+            )
         description = (
             "hubinet-ops;"
             f"kind={parsed['kind']};created_at={_name_created_at(parsed)};"
             f"source_job_id={source_job_id or ''}"
         )
-        self._run(
-            ["pct", "snapshot", str(vmid), name, "--description", description],
-            timeout=600,
+        argv = (
+            ["pct", "snapshot", str(vmid), name, "--description", description]
+            if resource_type == "lxc"
+            else [
+                "qm",
+                "snapshot",
+                str(vmid),
+                name,
+                "--description",
+                description,
+                "--vmstate",
+                "1" if include_ram else "0",
+            ]
         )
+        self._run(argv, timeout=600)
+        matches = [
+            item
+            for item in self.list_snapshots(vmid, resource_type)
+            if item.get("name") == name
+        ]
+        if len(matches) != 1:
+            raise HostControlError(
+                "Snapshot create could not confirm exactly one physical snapshot"
+            )
+        snapshot = dict(matches[0])
+        if (
+            snapshot.get("kind") != parsed["kind"]
+            or snapshot.get("source_job_id") != source_job_id
+            or snapshot.get("owned_by_hubinet_ops") is not True
+            or _valid_pve_snaptime(snapshot.get("pve_snaptime")) is None
+        ):
+            raise HostControlError("Snapshot create physical identity mismatch")
         return {
-            "name": name,
-            "description": description,
-            "created_at": _name_created_at(parsed),
-            "kind": parsed["kind"],
-            "owned_by_hubinet_ops": True,
-            "source_job_id": source_job_id,
+            **snapshot,
+            "include_ram": include_ram,
         }
 
-    def _require_owned_existing_snapshot(self, vmid: int, name: str) -> dict[str, Any]:
-        for snapshot in self.list_snapshots(vmid):
+    def _require_owned_existing_snapshot(
+        self, vmid: int, name: str, resource_type: str = "lxc"
+    ) -> dict[str, Any]:
+        for snapshot in self.list_snapshots(vmid, resource_type):
             if snapshot["name"] == name:
                 if not snapshot["owned_by_hubinet_ops"]:
                     break
                 return snapshot
         raise HostControlError("Hubinet Ops snapshot does not exist")
+
+    def _require_exact_existing_snapshot(
+        self,
+        vmid: int,
+        identity: dict[str, Any],
+        resource_type: str,
+    ) -> dict[str, Any]:
+        matches = [
+            snapshot
+            for snapshot in self.list_snapshots(vmid, resource_type)
+            if snapshot.get("name") == identity["snapshot_name"]
+        ]
+        if len(matches) != 1:
+            raise HostControlError("Expected physical snapshot does not exist exactly once")
+        snapshot = matches[0]
+        if (
+            snapshot.get("owned_by_hubinet_ops") is not True
+            or snapshot.get("kind") != identity["kind"]
+            or snapshot.get("source_job_id")
+            != identity["expected_source_job_id"]
+            or snapshot.get("pve_snaptime")
+            != identity["expected_pve_snaptime"]
+        ):
+            raise HostControlError("Physical snapshot identity changed before mutation")
+        return snapshot
 
     def _require_running(self, vmid: int) -> None:
         if self._status(vmid, "lxc")["lxc_status"] != "running":
@@ -562,14 +700,78 @@ def _usage_share(value: Any) -> float | None:
 
 
 def _snapshot_created_at(item: dict[str, Any], parsed: dict[str, str] | None) -> str | None:
-    try:
-        if item.get("snaptime") is not None:
-            return datetime.fromtimestamp(int(item["snaptime"]), UTC).replace(
+    pve_snaptime = _pve_snaptime(item)
+    if pve_snaptime is not None:
+        try:
+            return datetime.fromtimestamp(pve_snaptime, UTC).replace(
                 microsecond=0
             ).isoformat()
-    except (TypeError, ValueError, OSError, OverflowError):
-        pass
+        except (OSError, OverflowError):
+            pass
     return _name_created_at(parsed) if parsed else None
+
+
+def _valid_pve_snaptime(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _pve_snaptime(item: dict[str, Any]) -> int | None:
+    return _valid_pve_snaptime(item.get("snaptime"))
+
+
+def snapshot_identity_argument(
+    *,
+    vmid: int,
+    snapshot_name: str,
+    kind: str,
+    expected_source_job_id: str,
+    expected_pve_snaptime: int,
+) -> str:
+    parsed = parse_snapshot(snapshot_name, vmid)
+    if parsed is None or parsed["kind"] != kind:
+        raise HostControlError("Snapshot identity has an invalid name or kind")
+    if not SOURCE_JOB_RE.fullmatch(str(expected_source_job_id)):
+        raise HostControlError("Snapshot identity has an invalid source job ID")
+    if _valid_pve_snaptime(expected_pve_snaptime) is None:
+        raise HostControlError("Snapshot identity has an invalid PVE snaptime")
+    return json.dumps(
+        {
+            "expected_pve_snaptime": expected_pve_snaptime,
+            "expected_source_job_id": expected_source_job_id,
+            "kind": kind,
+            "snapshot_name": snapshot_name,
+            "version": SNAPSHOT_IDENTITY_VERSION,
+            "vmid": int(vmid),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _parse_snapshot_identity(value: Any, *, vmid: int) -> dict[str, Any]:
+    try:
+        decoded = json.loads(str(value or ""))
+    except json.JSONDecodeError as exc:
+        raise HostControlError("Snapshot mutation requires a durable physical identity") from exc
+    if not isinstance(decoded, dict):
+        raise HostControlError("Snapshot mutation identity is malformed")
+    try:
+        canonical = snapshot_identity_argument(
+            vmid=vmid,
+            snapshot_name=str(decoded.get("snapshot_name") or ""),
+            kind=str(decoded.get("kind") or ""),
+            expected_source_job_id=str(decoded.get("expected_source_job_id") or ""),
+            expected_pve_snaptime=decoded.get("expected_pve_snaptime"),
+        )
+    except HostControlError:
+        raise
+    if (
+        decoded.get("version") != SNAPSHOT_IDENTITY_VERSION
+        or decoded.get("vmid") != int(vmid)
+        or str(value) != canonical
+    ):
+        raise HostControlError("Snapshot mutation identity contract is not canonical")
+    return decoded
 
 
 def _name_created_at(parsed: dict[str, str]) -> str:
@@ -578,9 +780,39 @@ def _name_created_at(parsed: dict[str, str]) -> str:
     ).isoformat()
 
 
-def _description_job_id(value: Any) -> str | None:
-    match = re.search(r"(?:^|;)source_job_id=([a-f0-9]{8,64})(?:;|$)", str(value or ""))
-    return match.group(1) if match else None
+def _snapshot_description_metadata(
+    value: Any,
+    parsed: dict[str, str] | None,
+) -> dict[str, str | None] | None:
+    if parsed is None:
+        return None
+    parts = str(value or "").split(";")
+    if not parts or parts[0] != "hubinet-ops":
+        return None
+    fields: dict[str, str] = {}
+    for part in parts[1:]:
+        if part.count("=") != 1:
+            return None
+        key, field_value = part.split("=", 1)
+        if key not in {"kind", "created_at", "source_job_id"} or key in fields:
+            return None
+        fields[key] = field_value
+    if set(fields) != {"kind", "created_at", "source_job_id"}:
+        return None
+    if fields["kind"] != parsed["kind"]:
+        return None
+    if fields["created_at"] != _name_created_at(parsed):
+        return None
+    source_job_id = fields["source_job_id"] or None
+    if source_job_id is not None and not SOURCE_JOB_RE.fullmatch(source_job_id):
+        return None
+    if parsed["kind"] == "manual" and source_job_id is None:
+        return None
+    return {
+        "kind": fields["kind"],
+        "created_at": fields["created_at"],
+        "source_job_id": source_job_id,
+    }
 
 
 def main() -> int:

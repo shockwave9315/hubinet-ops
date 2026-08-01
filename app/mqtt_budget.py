@@ -10,6 +10,7 @@ HA_ATTRIBUTE_FIELDS = (
     "updates",
     "recent_job_events",
     "recent_warnings",
+    "managed_snapshots",
     "attribute_payload",
     "failed_units",
 )
@@ -66,12 +67,33 @@ def _event_preview(value: Any) -> dict[str, Any]:
     return preview
 
 
+def _snapshot_preview(value: Any) -> dict[str, Any]:
+    snapshot = value if isinstance(value, dict) else {}
+    preview: dict[str, Any] = {}
+    for key, limit in (
+        ("physical_name", 128),
+        ("logical_type", 32),
+        ("created_at", 64),
+        ("protection_reason", 64),
+        ("source_job_id", 64),
+        ("source_plan_id", 64),
+    ):
+        if key in snapshot and snapshot.get(key) is not None:
+            preview[key] = sanitize_text(snapshot.get(key), limit=limit)
+    for key in ("vmid", "age_seconds"):
+        if key in snapshot and snapshot.get(key) is not None:
+            preview[key] = max(0, _safe_int(snapshot.get(key), 0))
+    preview["protected"] = snapshot.get("protected") is True
+    preview["owned_by_hubinet_ops"] = snapshot.get("owned_by_hubinet_ops") is True
+    return preview
+
+
 def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for key, item in state.items():
         if key in {
             "recent_job_events", "updates", "failed_units", "ip_addresses",
-            "recent_warnings",
+            "recent_warnings", "managed_snapshots",
         }:
             continue
         if item is None or isinstance(item, (bool, int, float)):
@@ -154,6 +176,11 @@ def _compact_state_base(state: dict[str, Any]) -> dict[str, Any]:
     compact["recent_warnings"] = [
         sanitize_text(item, limit=500)
         for item in _sequence(state.get("recent_warnings"))[-20:]
+    ]
+    compact["managed_snapshots"] = [
+        _snapshot_preview(item)
+        for item in _sequence(state.get("managed_snapshots"))[:10]
+        if isinstance(item, dict)
     ]
     return compact
 
@@ -345,6 +372,11 @@ def bounded_attributes(value: dict[str, Any]) -> dict[str, Any]:
     source["failed_units"] = [
         sanitize_text(item, limit=160)
         for item in _sequence(source.get("failed_units"))[:20]
+    ]
+    source["managed_snapshots"] = [
+        _snapshot_preview(item)
+        for item in _sequence(source.get("managed_snapshots"))[:10]
+        if isinstance(item, dict)
     ]
     bounded = bounded_state(source)
     attributes = {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,7 +13,11 @@ from app.contracts import REQUIRED_APT_ACTIONS
 from app.database import Database
 from app.executor import ExecutorError
 from app.service import OpsService
-from app.stabilization import StabilizationPolicy, Stabilizer
+from app.stabilization import (
+    StabilizationInterrupted,
+    StabilizationPolicy,
+    Stabilizer,
+)
 
 
 EXECUTOR_HASH = "a" * 64
@@ -28,6 +33,58 @@ class FakeClock:
 
     def sleep(self, seconds: float) -> None:
         self.now += seconds
+
+
+class UpdateSnapshotHost:
+    def __init__(self) -> None:
+        self.snapshots: list[dict[str, Any]] = []
+        self.calls: list[tuple[str, int, str]] = []
+
+    def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
+        return [dict(item) for item in self.snapshots]
+
+    def execute(
+        self,
+        operation_type: str,
+        vmid: int,
+        request_id: str,
+        *,
+        snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
+        release_fingerprint: str | None = None,
+        on_observed=None,
+    ) -> dict[str, Any]:
+        self.calls.append((operation_type, vmid, request_id))
+        if on_observed is not None:
+            on_observed(
+                {
+                    "id": hashlib.sha256(
+                        f"host:{vmid}:{request_id}".encode("utf-8")
+                    ).hexdigest()[:32]
+                }
+            )
+        if operation_type == "snapshot_rollback":
+            assert snapshot_kind == "pre-update"
+            assert expected_source_job_id
+            assert expected_pve_snaptime
+            return {"lxc_status": "running", "runtime_status": "running"}
+        assert operation_type == "snapshot_create"
+        assert snapshot_name is not None
+        source_job_id = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:32]
+        snapshot = {
+            "name": snapshot_name,
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "ownership_status": "owned",
+            "rollback_eligible": True,
+            "delete_eligible": True,
+            "source_job_id": source_job_id,
+            "pve_snaptime": 1785329640,
+        }
+        self.snapshots.insert(0, snapshot)
+        return dict(snapshot)
 
 
 def docker_state(healthy: int) -> dict[str, Any]:
@@ -65,6 +122,7 @@ class WorkflowExecutor:
         self.last = self.inspect_states[-1]
         self.actions: list[str] = []
         self.preflight_fingerprint = preflight_fingerprint
+        self.snapshots: list[dict[str, Any]] = []
 
     def run(
         self,
@@ -110,6 +168,28 @@ class WorkflowExecutor:
                     "fingerprint": "none",
                 },
             }
+        if action == "snapshot":
+            assert argument
+            kind = "pre-update" if "-pre-" in argument else "manual"
+            self.snapshots.insert(
+                0,
+                {
+                    "name": argument,
+                    "created_at": "2026-07-29T00:00:00+00:00",
+                    "kind": kind,
+                    "owned_by_hubinet_ops": True,
+                    "rollback_eligible": True,
+                    "delete_eligible": True,
+                },
+            )
+            return {"ok": True, "data": {}}
+        if action == "list-snapshots":
+            return {"ok": True, "data": {"snapshots": list(self.snapshots)}}
+        if action in {"delete-snapshot", "snapshot-delete"}:
+            self.snapshots = [
+                item for item in self.snapshots if item.get("name") != argument
+            ]
+            return {"ok": True, "data": {}}
         if action == "verify":
             return {
                 "ok": True,
@@ -470,6 +550,8 @@ def approved_job(service: OpsService, db: Database) -> dict[str, Any]:
         ttl_minutes=60,
     )
     service.approve(plan["id"])
+    if service.host_control is None:
+        service.host_control = UpdateSnapshotHost()  # type: ignore[assignment]
     job = db.next_queued_job()
     assert job is not None
     return job
@@ -635,6 +717,50 @@ def test_stabilization_treats_null_executor_data_as_unhealthy_not_type_error() -
         )
 
 
+def test_stabilization_stop_event_has_typed_resumable_outcome() -> None:
+    stop_event = threading.Event()
+    stop_event.set()
+    stabilizer = Stabilizer(WorkflowExecutor(), stop_event)
+
+    with pytest.raises(StabilizationInterrupted, match="shutdown interrupted"):
+        stabilizer.wait(
+            vmid=106,
+            phase="rollback",
+            timeout_seconds=1,
+            policy=StabilizationPolicy(initial_grace_seconds=0),
+            emit=lambda **kwargs: None,
+        )
+
+
+def test_stabilization_transport_unavailable_is_resumable_not_negative_health() -> None:
+    class UnavailableInspectExecutor:
+        def run(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise ExecutorError("inspect transport unavailable")
+
+    clock = FakeClock()
+    stabilizer = Stabilizer(
+        UnavailableInspectExecutor(),  # type: ignore[arg-type]
+        threading.Event(),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    policy = StabilizationPolicy(
+        post_rollback_timeout_seconds=1,
+        poll_interval_seconds=1,
+        initial_grace_seconds=0,
+        required_consecutive_successes=1,
+    )
+
+    with pytest.raises(StabilizationInterrupted, match="could not be confirmed"):
+        stabilizer.wait(
+            vmid=106,
+            phase="rollback",
+            timeout_seconds=1,
+            policy=policy,
+            emit=lambda **kwargs: None,
+        )
+
+
 def test_refresh_preserves_failed_operation_state(tmp_path: Path) -> None:
     executor = WorkflowExecutor([docker_state(3)])
     service, _ = service_with(tmp_path, executor)
@@ -705,7 +831,7 @@ def test_repair_failure_invokes_rollback_and_waits_for_0_3_3(tmp_path: Path) -> 
     service._run_job(job)
     assert db.get_job(job["id"])["status"] == "rolled_back"
     assert "repair" in executor.actions
-    assert "rollback" in executor.actions
+    assert "rollback" not in executor.actions
     state = service.get_state(106)
     assert state["last_operation_result"] == "rolled_back"
     assert state["last_terminal_event"] == "job_rolled_back"
@@ -875,9 +1001,13 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
             return [
                 {
                     "name": snapshot,
+                    "kind": "pre-update",
+                    "vmid": 106,
                     "owned_by_hubinet_ops": True,
                     "rollback_eligible": True,
                     "delete_eligible": True,
+                    "source_job_id": "c" * 32,
+                    "pve_snaptime": 1785329640,
                 }
             ]
 
@@ -888,6 +1018,9 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
             request_id: str,
             *,
             snapshot_name: str | None = None,
+            snapshot_kind: str | None = None,
+            expected_source_job_id: str | None = None,
+            expected_pve_snaptime: int | None = None,
             release_fingerprint: str | None = None,
         ) -> dict[str, Any]:
             assert operation_type == "snapshot_rollback"
@@ -911,11 +1044,13 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
     _, source = db.approve_plan(plan["id"])
     db.update_job(
         source["id"],
-        status="failed",
-        stage="failed",
-        progress=100,
         snapshot_name=snapshot,
     )
+    db.record_pre_update_snapshot_proof(
+        source["id"], 106, snapshot, "c" * 32, 1785329640
+    )
+    db.update_job(source["id"], status="failed", stage="failed", progress=100)
+    db.update_plan_status(plan["id"], "failed")
     result = service.manual_rollback(106)
     assert result["status"] == "success"
     assert "rollback" not in executor.actions
@@ -980,7 +1115,7 @@ def test_post_update_verification_failure_triggers_rollback(tmp_path: Path) -> N
     job = approved_job(service, db)
     service._run_job(job)
     assert db.get_job(job["id"])["status"] == "rolled_back"
-    assert "rollback" in executor.actions
+    assert "rollback" not in executor.actions
     state = service.get_state(106)
     assert state["verification_status"] == "unknown"
     assert state["apt_check_ok"] is None
@@ -1239,7 +1374,7 @@ def test_integrity_or_docker_verification_failure_follows_rollback_policy(
     job = approved_job(service, db)
     service._run_job(job)
     assert db.get_job(job["id"])["status"] == "rolled_back"
-    assert "rollback" in executor.actions
+    assert "rollback" not in executor.actions
     state = service.get_state(106)
     assert state["verification_status"] == "unknown"
     assert state["packages_remaining_count"] is None

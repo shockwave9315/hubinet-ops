@@ -61,8 +61,13 @@ def validate(config_path: Path, policy_dir: Path) -> None:
     for capability, allowed in policies.items():
         if not allowed <= observation or not allowed <= host_control:
             raise ValueError(f"{capability} policy exceeds PVE host-control boundaries")
-        if any(resource_types.get(vmid) != "lxc" for vmid in allowed):
-            raise ValueError(f"{capability} policy contains a non-LXC VMID")
+        supported_types = (
+            {"lxc"} if capability == "snapshot_rollback" else {"lxc", "qemu"}
+        )
+        if any(resource_types.get(vmid) not in supported_types for vmid in allowed):
+            raise ValueError(
+                f"{capability} policy contains an unsupported resource type"
+            )
 
     configured: dict[str, set[int]] = {
         capability: set() for capability in ACTION_POLICIES
@@ -105,7 +110,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     validate(args.config, args.policy_dir)
-    print("PVE snapshot policy validation: CT101-CT110 consistent")
+    print("PVE snapshot policy validation: VM100 and CT101-CT110 consistent")
     return 0
 
 
