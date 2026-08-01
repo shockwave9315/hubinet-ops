@@ -2218,6 +2218,36 @@ class OpsService:
                 )
                 self._execute("snapshot", vmid, 600, emit, snapshot)
                 try:
+                    self._confirm_physical_pre_update_snapshot(vmid, snapshot)
+                except (ExecutorError, HostControlError, ValueError) as exc:
+                    warning = sanitize_text(
+                        f"Created snapshot {snapshot} could not be physically confirmed: {exc}",
+                        limit=2000,
+                    )
+                    state = self.get_state(vmid)
+                    state.update(
+                        {
+                            "snapshot_state_stale": True,
+                            "snapshot_refresh_required": True,
+                            "snapshot_refresh_warning": warning,
+                        }
+                    )
+                    self._save_state(vmid, state)
+                    event = self.db.insert_job_event(
+                        job_id=str(job["id"]),
+                        vmid=vmid,
+                        level="error",
+                        stage="snapshot",
+                        progress=int(
+                            self.db.get_job(str(job["id"])).get("progress") or 0
+                        ),
+                        event_type="snapshot_confirmation_failed",
+                        message=warning,
+                        details={"snapshot_name": snapshot, "kind": "pre-update"},
+                    )
+                    self.mqtt.publish_event(vmid, event)
+                    raise ExecutorError(warning) from exc
+                try:
                     self.db.record_pre_update_snapshot_proof(
                         str(job["id"]),
                         vmid,
@@ -2227,13 +2257,6 @@ class OpsService:
                     raise ExecutorError(
                         f"Failed to persist pre-update snapshot proof: {exc}"
                     ) from exc
-                emit(
-                    stage="snapshot",
-                    progress=24,
-                    event_type="snapshot_mutation_succeeded",
-                    message="Pre-update snapshot mutation completed",
-                    details={"snapshot_name": snapshot},
-                )
                 try:
                     self._refresh_snapshot_state(
                         vmid,
@@ -2243,6 +2266,13 @@ class OpsService:
                     )
                 except ValueError as exc:
                     raise ExecutorError(str(exc)) from exc
+                emit(
+                    stage="snapshot",
+                    progress=24,
+                    event_type="snapshot_mutation_succeeded",
+                    message="Pre-update snapshot mutation completed",
+                    details={"snapshot_name": snapshot},
+                )
                 emit(
                     stage="snapshot",
                     progress=25,
@@ -3124,6 +3154,55 @@ class OpsService:
                 self.executor.run("list-snapshots", vmid, timeout=60)
             ).get("snapshots", [])
         )
+
+    def _confirm_physical_pre_update_snapshot(
+        self,
+        vmid: int,
+        snapshot_name: str,
+    ) -> dict[str, Any]:
+        """Confirm an exact host-owned snapshot without consulting durable proof."""
+        try:
+            snapshots = self._raw_snapshot_list(vmid)
+        except (AttributeError, TypeError) as exc:
+            raise ValueError("Physical snapshot listing is malformed") from exc
+        if not isinstance(snapshots, list) or any(
+            not isinstance(item, dict) for item in snapshots
+        ):
+            raise ValueError("Physical snapshot listing is malformed")
+        matches = [
+            item
+            for item in snapshots
+            if isinstance(item.get("name"), str)
+            and item["name"] == snapshot_name
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "Physical snapshot listing must contain exactly one matching snapshot"
+            )
+        snapshot = dict(matches[0])
+        parsed = parse_owned_snapshot_name(snapshot_name, vmid=vmid)
+        if parsed is None or parsed.get("kind") != "pre-update":
+            raise ValueError("Physical snapshot name is not an exact pre-update name")
+        if snapshot.get("kind") != "pre-update":
+            raise ValueError("Physical snapshot kind is not pre-update")
+        if snapshot.get("owned_by_hubinet_ops") is not True:
+            raise ValueError("Physical snapshot is foreign or ownership is uncertain")
+        if (
+            "ownership_status" in snapshot
+            and snapshot.get("ownership_status") != "owned"
+        ):
+            raise ValueError("Physical snapshot ownership status is not owned")
+        if "vmid" in snapshot:
+            raw_vmid = snapshot.get("vmid")
+            if isinstance(raw_vmid, bool):
+                raise ValueError("Physical snapshot VMID is malformed")
+            try:
+                physical_vmid = int(raw_vmid)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Physical snapshot VMID is malformed") from exc
+            if physical_vmid != int(vmid):
+                raise ValueError("Physical snapshot VMID conflicts with the resource")
+        return snapshot
 
     def _validate_approved_plan(
         self,

@@ -49,12 +49,35 @@ def _approved_update(
 
 def test_pre_update_snapshot_is_refreshed_and_visible_before_apt_mutation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executor = SnapshotUpdateExecutor()
+    order: list[str] = []
+
+    class OrderedExecutor(SnapshotUpdateExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            if action in {"snapshot", "list-snapshots", "update"}:
+                order.append(action)
+            return super().run(action, vmid, argument, timeout, on_event)
+
+    executor = OrderedExecutor()
     service, db, job = _approved_update(tmp_path, executor)
+    record_proof = db.record_pre_update_snapshot_proof
+
+    def traced_record_proof(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        order.append("record-proof")
+        return record_proof(*args, **kwargs)
+
+    monkeypatch.setattr(db, "record_pre_update_snapshot_proof", traced_record_proof)
 
     service._run_job(db.get_job(job["id"]))
 
+    assert order == [
+        "snapshot",
+        "list-snapshots",
+        "record-proof",
+        "list-snapshots",
+        "update",
+    ]
     assert executor.actions.index("snapshot") < executor.actions.index("list-snapshots")
     assert executor.actions.index("list-snapshots") < executor.actions.index("update")
     state = service.get_state(106)
@@ -148,6 +171,111 @@ def test_snapshot_proof_persistence_failure_blocks_update_without_replaying_snap
     assert modeled["owned_by_hubinet_ops"] is False
     assert after_restart["owned_by_hubinet_ops"] is False
     assert after_restart["ownership_status"] == "uncertain"
+
+
+@pytest.mark.parametrize(
+    "physical_mutation",
+    [
+        {"owned_by_hubinet_ops": False},
+        {"kind": "manual"},
+        {"ownership_status": "uncertain"},
+        {"vmid": 999},
+        {"vmid": "malformed"},
+    ],
+    ids=["foreign", "wrong-kind", "uncertain", "conflicting-vmid", "malformed-vmid"],
+)
+def test_invalid_physical_snapshot_never_receives_proof_or_starts_update(
+    tmp_path: Path,
+    physical_mutation: dict[str, Any],
+) -> None:
+    class InvalidPhysicalSnapshotExecutor(SnapshotUpdateExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            result = super().run(action, vmid, argument, timeout, on_event)
+            if action == "snapshot":
+                self.snapshots[0].update(physical_mutation)
+            return result
+
+    executor = InvalidPhysicalSnapshotExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+
+    service._run_job(db.get_job(job["id"]))
+
+    terminal = db.get_job(job["id"])
+    assert terminal["status"] == "blocked"
+    assert "snapshot_proof" not in dict(terminal.get("result") or {})
+    assert "update" not in executor.actions
+
+
+def test_duplicate_physical_snapshot_payload_fails_closed_without_proof(
+    tmp_path: Path,
+) -> None:
+    class DuplicateSnapshotExecutor(SnapshotUpdateExecutor):
+        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
+            result = super().run(action, vmid, argument, timeout, on_event)
+            if action == "snapshot":
+                self.snapshots.append(dict(self.snapshots[0]))
+            return result
+
+    executor = DuplicateSnapshotExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+
+    service._run_job(db.get_job(job["id"]))
+
+    terminal = db.get_job(job["id"])
+    assert terminal["status"] == "blocked"
+    assert "snapshot_proof" not in dict(terminal.get("result") or {})
+    assert "update" not in executor.actions
+
+
+def test_final_managed_refresh_failure_preserves_confirmed_proof_for_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = SnapshotUpdateExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+    monkeypatch.setattr(
+        service,
+        "_refresh_snapshot_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("simulated managed refresh failure")
+        ),
+    )
+
+    service._run_job(db.get_job(job["id"]))
+
+    terminal = db.get_job(job["id"])
+    assert terminal["status"] == "blocked"
+    assert terminal["result"]["snapshot_proof"]["snapshot_name"] == terminal["snapshot_name"]
+    assert "update" not in executor.actions
+    restarted = OpsService(service.settings, db, executor)
+    modeled = restarted._refresh_snapshot_state(106)["snapshots"][0]
+    assert modeled["owned_by_hubinet_ops"] is True
+    assert modeled["source_job_id"] == job["id"]
+
+
+def test_crash_before_physical_confirmation_leaves_no_restart_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = SnapshotUpdateExecutor()
+    service, db, job = _approved_update(tmp_path, executor)
+    monkeypatch.setattr(
+        service,
+        "_confirm_physical_pre_update_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit("simulated crash")),
+    )
+
+    with pytest.raises(SystemExit, match="simulated crash"):
+        service._run_job(db.get_job(job["id"]))
+
+    crashed = db.get_job(job["id"])
+    assert "snapshot_proof" not in dict(crashed.get("result") or {})
+    assert executor.actions.count("snapshot") == 1
+    assert "update" not in executor.actions
+    restarted = OpsService(service.settings, db, executor)
+    modeled = restarted._refresh_snapshot_state(106)["snapshots"][0]
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["ownership_status"] == "uncertain"
 
 
 def test_executor_snapshot_result_cannot_create_or_overwrite_backend_proof(
@@ -279,8 +407,10 @@ def test_unconfirmed_pre_update_snapshot_blocks_before_apt_mutation(
     tmp_path: Path,
 ) -> None:
     class MissingFromListingExecutor(SnapshotUpdateExecutor):
+        expose_snapshot = False
+
         def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
-            if action == "list-snapshots":
+            if action == "list-snapshots" and not self.expose_snapshot:
                 self.actions.append(action)
                 return {"ok": True, "data": {"snapshots": []}}
             return super().run(action, vmid, argument, timeout, on_event)
@@ -291,7 +421,9 @@ def test_unconfirmed_pre_update_snapshot_blocks_before_apt_mutation(
     service._run_job(db.get_job(job["id"]))
 
     assert "update" not in executor.actions
-    assert db.get_job(job["id"])["status"] == "blocked"
+    terminal = db.get_job(job["id"])
+    assert terminal["status"] == "blocked"
+    assert "snapshot_proof" not in dict(terminal.get("result") or {})
     state = service.get_state(106)
     assert state["snapshot_state_stale"] is True
     assert state["snapshot_refresh_required"] is True
@@ -299,6 +431,26 @@ def test_unconfirmed_pre_update_snapshot_blocks_before_apt_mutation(
         event["event_type"] == "snapshot_confirmation_failed"
         for event in db.list_job_events(job["id"])
     )
+
+    executor.expose_snapshot = True
+    delayed = service._refresh_snapshot_state(106)["snapshots"][0]
+    assert delayed["owned_by_hubinet_ops"] is False
+    assert delayed["ownership_status"] == "uncertain"
+    assert delayed["rollback_eligible"] is False
+    assert delayed["delete_eligible"] is False
+
+    service.settings.raw["containers"][106]["operator_capabilities"].update(
+        {"snapshot_list": True, "snapshot_delete": True}
+    )
+    host = FakeHostControl("running")
+    host.snapshots = list(executor.snapshots)
+    service.host_control = host
+    with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
+        service.manual_rollback(106)
+    service.queue_snapshot_prune(106, "oldest", "delayed-unproven-prune-0001")
+    prune = run_queued(service, db)
+    assert prune["result"]["deleted"] == []
+    assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
 def test_manual_snapshot_create_and_delete_refresh_canonical_state(
