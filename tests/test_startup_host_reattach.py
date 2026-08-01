@@ -298,7 +298,7 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
     ("remote_status", "expected_local_status", "expected_operation_status"),
     [
         ("failed", "failed", "failed"),
-        ("interrupted", "interrupted", "unknown"),
+        ("interrupted", "running", "reconciliation_required"),
     ],
 )
 def test_startup_reattach_propagates_remote_terminal_error_and_result(
@@ -362,14 +362,14 @@ def test_startup_reattach_propagates_remote_terminal_error_and_result(
     assert terminal["error"] == remote_error
     state = service.get_state(110)
     assert state["snapshot_operation_status"] == (
-        "failed" if remote_status == "failed" else "unknown"
+        "failed" if remote_status == "failed" else "idle"
     )
     assert state["operation_status"] == expected_operation_status
     assert [request.method for request in requests] == ["GET"]
 
 
 @pytest.mark.parametrize("local_status", ["queued", "running"])
-def test_missing_remote_job_interrupts_without_replaying_submit(
+def test_missing_remote_job_preserves_unknown_and_only_prepared_may_submit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     local_status: str,
@@ -398,11 +398,13 @@ def test_missing_remote_job_interrupts_without_replaying_submit(
     service._reconcile_startup_jobs()
 
     terminal = db.get_job(local_job["id"])
-    assert terminal["status"] == "interrupted"
+    assert terminal["status"] == local_status
     assert terminal["result"] is None
-    assert "outcome is unknown" in terminal["error"]
-    assert service.get_state(110)["operation_status"] == "unknown"
-    assert [request.method for request in requests] == ["GET"]
+    assert terminal["error"]
+    assert service.get_state(110)["operation_status"] == "reconciliation_required"
+    assert [request.method for request in requests] == (
+        ["GET", "POST"] if local_status == "queued" else ["GET"]
+    )
 
 
 @pytest.mark.parametrize(

@@ -970,6 +970,28 @@ class Database:
                     )
                     else None
                 )
+                automatic_rollback = (
+                    existing.get("automatic_rollback")
+                    if existing is not None
+                    and _valid_automatic_rollback_contract(
+                        existing.get("automatic_rollback"),
+                        job_id=str(current["id"]),
+                        vmid=int(current["vmid"]),
+                        snapshot_name=str(current["snapshot_name"] or ""),
+                    )
+                    else None
+                )
+                pre_update_create = (
+                    existing.get("pre_update_snapshot_create")
+                    if existing is not None
+                    and _valid_pre_update_create_contract(
+                        existing.get("pre_update_snapshot_create"),
+                        job_id=str(current["id"]),
+                        vmid=int(current["vmid"]),
+                        snapshot_name=str(current["snapshot_name"] or ""),
+                    )
+                    else None
+                )
                 incoming = fields["result"]
                 if isinstance(incoming, dict):
                     merged = dict(incoming)
@@ -979,8 +1001,19 @@ class Database:
                     merged.pop("expected_snapshot_identity", None)
                     if expected_identity is not None:
                         merged["expected_snapshot_identity"] = expected_identity
+                    merged.pop("automatic_rollback", None)
+                    if automatic_rollback is not None:
+                        merged["automatic_rollback"] = automatic_rollback
+                    merged.pop("pre_update_snapshot_create", None)
+                    if pre_update_create is not None:
+                        merged["pre_update_snapshot_create"] = pre_update_create
                     fields["result"] = merged
-                elif proof is not None or expected_identity is not None:
+                elif (
+                    proof is not None
+                    or expected_identity is not None
+                    or automatic_rollback is not None
+                    or pre_update_create is not None
+                ):
                     fields["result"] = existing
             fields["updated_at"] = utc_now()
             assignments = ", ".join(f"{key}=?" for key in fields)
@@ -994,6 +1027,163 @@ class Database:
             values.append(job_id)
             conn.execute(f"UPDATE jobs SET {assignments} WHERE id=?", values)
         return self.get_job(job_id)
+
+    def persist_pre_update_create_contract(
+        self,
+        job_id: str,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (str(job_id),)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(job_id)
+            if (
+                str(row["operation_type"]) != "update"
+                or str(row["status"]) not in {"queued", "running"}
+                or not _valid_pre_update_create_contract(
+                    contract,
+                    job_id=str(row["id"]),
+                    vmid=int(row["vmid"]),
+                    snapshot_name=str(row["snapshot_name"] or ""),
+                )
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("Pre-update create contract is malformed")
+            result = _result_dict(row["result"])
+            if result is None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Update job result is malformed")
+            previous = result.get("pre_update_snapshot_create")
+            if previous is not None:
+                if not _valid_pre_update_create_contract(
+                    previous,
+                    job_id=str(row["id"]),
+                    vmid=int(row["vmid"]),
+                    snapshot_name=str(row["snapshot_name"] or ""),
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Stored pre-update create contract is malformed")
+                if any(
+                    previous.get(key) != contract.get(key)
+                    for key in ("version", "request_id", "snapshot_name")
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Pre-update create contract identity changed")
+                transitions = {
+                    "prepared": {"prepared", "submitting", "definitive_failed"},
+                    "submitting": {"submitting", "remote_observed", "outcome_unknown", "remote_succeeded", "definitive_failed"},
+                    "remote_observed": {"remote_observed", "outcome_unknown", "remote_succeeded", "definitive_failed"},
+                    "outcome_unknown": {"outcome_unknown", "remote_observed", "remote_succeeded", "definitive_failed"},
+                    "remote_succeeded": {"remote_succeeded", "confirming", "definitive_failed"},
+                    "confirming": {"confirming", "completed", "definitive_failed"},
+                    "completed": {"completed"},
+                    "definitive_failed": {"definitive_failed"},
+                }
+                if str(contract["phase"]) not in transitions[str(previous["phase"])]:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Invalid pre-update create phase transition")
+                if (
+                    previous.get("host_job_id") is not None
+                    and previous.get("host_job_id") != contract.get("host_job_id")
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Pre-update create host job ID changed")
+            result["pre_update_snapshot_create"] = dict(contract)
+            conn.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
+                (bounded_json(result), now, str(job_id)),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(str(job_id))
+
+    def persist_automatic_rollback_contract(
+        self,
+        job_id: str,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a backend-owned automatic rollback transition atomically."""
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM jobs WHERE id=?", (str(job_id),)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(job_id)
+            if (
+                str(row["operation_type"]) != "update"
+                or str(row["status"]) not in {"queued", "running"}
+                or not _valid_automatic_rollback_contract(
+                    contract,
+                    job_id=str(row["id"]),
+                    vmid=int(row["vmid"]),
+                    snapshot_name=str(row["snapshot_name"] or ""),
+                )
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("Automatic rollback contract is malformed")
+            result = _result_dict(row["result"])
+            if result is None:
+                conn.execute("ROLLBACK")
+                raise ValueError("Update job result is malformed")
+            previous = result.get("automatic_rollback")
+            if previous is not None:
+                if not _valid_automatic_rollback_contract(
+                    previous,
+                    job_id=str(row["id"]),
+                    vmid=int(row["vmid"]),
+                    snapshot_name=str(row["snapshot_name"] or ""),
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Stored automatic rollback contract is malformed")
+                immutable = (
+                    "version",
+                    "request_id",
+                    "snapshot_name",
+                    "expected_snapshot_identity",
+                )
+                if any(previous.get(key) != contract.get(key) for key in immutable):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Automatic rollback contract identity changed")
+                transitions = {
+                    "prepared": {"prepared", "submitting", "definitive_failed"},
+                    "submitting": {
+                        "submitting", "remote_observed", "outcome_unknown",
+                        "remote_succeeded", "definitive_failed",
+                    },
+                    "remote_observed": {
+                        "remote_observed", "outcome_unknown", "remote_succeeded",
+                        "definitive_failed",
+                    },
+                    "outcome_unknown": {
+                        "outcome_unknown", "remote_observed", "remote_succeeded",
+                        "definitive_failed",
+                    },
+                    "remote_succeeded": {"remote_succeeded", "stabilizing"},
+                    "stabilizing": {"stabilizing", "stabilized", "definitive_failed"},
+                    "stabilized": {"stabilized", "completed", "definitive_failed"},
+                    "completed": {"completed"},
+                    "definitive_failed": {"definitive_failed"},
+                }
+                if str(contract["phase"]) not in transitions[str(previous["phase"])]:
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Invalid automatic rollback phase transition")
+                previous_host_job_id = previous.get("host_job_id")
+                if (
+                    previous_host_job_id is not None
+                    and contract.get("host_job_id") != previous_host_job_id
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Automatic rollback host job ID changed")
+            result["automatic_rollback"] = dict(contract)
+            conn.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
+                (bounded_json(result), now, str(job_id)),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(str(job_id))
 
     def record_pre_update_snapshot_proof(
         self,
@@ -1571,6 +1761,73 @@ def _valid_expected_snapshot_identity(
         and isinstance(snaptime, int)
         and not isinstance(snaptime, bool)
         and snaptime > 0
+    )
+
+
+def _valid_automatic_rollback_contract(
+    value: Any,
+    *,
+    job_id: str,
+    vmid: int,
+    snapshot_name: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    phases = {
+        "prepared",
+        "submitting",
+        "remote_observed",
+        "outcome_unknown",
+        "remote_succeeded",
+        "stabilizing",
+        "stabilized",
+        "completed",
+        "definitive_failed",
+    }
+    host_job_id = value.get("host_job_id")
+    return (
+        value.get("version") == 1
+        and str(value.get("request_id") or "") == f"automatic-rollback-{job_id}"
+        and str(value.get("phase") or "") in phases
+        and str(value.get("snapshot_name") or "") == snapshot_name
+        and _valid_expected_snapshot_identity(
+            value.get("expected_snapshot_identity"),
+            vmid=vmid,
+            snapshot_name=snapshot_name,
+        )
+        and (host_job_id is None or re.fullmatch(r"[a-f0-9]{32}", str(host_job_id)))
+        and (value.get("last_error") is None or isinstance(value.get("last_error"), str))
+    )
+
+
+def _valid_pre_update_create_contract(
+    value: Any,
+    *,
+    job_id: str,
+    vmid: int,
+    snapshot_name: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    host_job_id = value.get("host_job_id")
+    identity = value.get("snapshot_identity")
+    return (
+        value.get("version") == 1
+        and value.get("request_id") == f"pre-update-snapshot-{job_id}"
+        and value.get("phase") in {
+            "prepared", "submitting", "remote_observed", "outcome_unknown",
+            "remote_succeeded", "completed", "definitive_failed",
+            "confirming",
+        }
+        and value.get("snapshot_name") == snapshot_name
+        and (host_job_id is None or re.fullmatch(r"[a-f0-9]{32}", str(host_job_id)))
+        and (
+            identity is None
+            or _valid_expected_snapshot_identity(
+                identity, vmid=vmid, snapshot_name=snapshot_name
+            )
+        )
+        and (value.get("last_error") is None or isinstance(value.get("last_error"), str))
     )
 
 

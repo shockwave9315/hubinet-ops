@@ -498,6 +498,20 @@ class HostJobStore:
         self._sync_recovery_event(persisted)
         return persisted
 
+    def mark_outcome_unknown(self, job_id: str, error: str) -> dict[str, Any]:
+        """Keep a possibly-mutated host job active so the global lock is retained."""
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE host_jobs SET status='running',stage='outcome_unknown',error=?,"
+                "updated_at=? WHERE id=? AND status='running'",
+                (str(error)[:4096], utc_now(), str(job_id)),
+            )
+        if cursor.rowcount != 1:
+            return self.get(job_id)
+        persisted = self.get(job_id)
+        self._sync_recovery_event(persisted)
+        return persisted
+
     def begin_self_update_launch(
         self,
         job_id: str,
@@ -570,6 +584,10 @@ class HostJobStore:
             return job
         if job["operation_type"] == "self_update":
             return self.refresh_self_update_result(job_id)
+        if job["status"] == "queued":
+            # begin_execution is the durable mutation boundary. A queued job has
+            # not crossed it and may be started exactly once by main() below.
+            return job
 
         result: dict[str, Any] | None = None
         terminal = "interrupted"
@@ -603,14 +621,16 @@ class HostJobStore:
                     )
             except Exception as exc:  # reconciliation must never repeat the operation
                 message = f"status reconciliation failed: {exc}"
-        return self.transition_from_active(
-            job["id"],
-            status=terminal,
-            stage="complete" if terminal == "succeeded" else "interrupted",
-            progress=100,
-            result=result,
-            error=message,
-        )
+        if terminal == "succeeded":
+            return self.transition_from_active(
+                job["id"],
+                status="succeeded",
+                stage="complete",
+                progress=100,
+                result=result,
+                error=None,
+            )
+        return self.mark_outcome_unknown(job["id"], str(message))
 
     def refresh_self_update_result(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
@@ -679,6 +699,10 @@ class HostJobStore:
             message = f"{exc}; rollout outcome is unknown"
             remove = True
 
+        if terminal == "interrupted":
+            # Missing/late supervisor evidence cannot prove that rollout did not
+            # start. Keep the host job active and retain the global lock.
+            return self.mark_outcome_unknown(job["id"], str(message))
         persisted = self.transition_from_active(
             job["id"],
             status=terminal,
@@ -1348,6 +1372,8 @@ def main() -> int:
         update_token,
         recovery_token,
     )
+    for queued_job in store.queued():
+        application.runner.start(str(queued_job["id"]))
     serve(config, application)
     return 0
 

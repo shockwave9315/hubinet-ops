@@ -1506,7 +1506,7 @@ def test_recovery_restart_distinguishes_queued_from_mutation_started(
         queued_database
     ).list_unacknowledged_recovery_events()[0]
     assert queued_event["host_job_id"] == queued["id"]
-    assert queued_event["status"] == "interrupted"
+    assert queued_event["status"] == "queued"
     assert queued_event["mutation_started_at"] is None
     assert queued_controller.calls == []
 
@@ -1526,7 +1526,7 @@ def test_recovery_restart_distinguishes_queued_from_mutation_started(
     interrupted = HostJobStore(
         started_database
     ).list_unacknowledged_recovery_events()[0]
-    assert interrupted["status"] == "interrupted"
+    assert interrupted["status"] == "running"
     assert interrupted["mutation_started_at"] == marked["mutation_started_at"]
     assert "outcome is unknown" in interrupted["error"]
     assert started_controller.calls == []
@@ -1754,6 +1754,7 @@ def test_startup_reconciliation_after_store_recreation_uses_runtime_without_repl
         operation_type=operation_type,
         request_id=f"request-{operation_type}-0004",
     )
+    store.begin_execution(job["id"])
 
     restarted = HostJobStore(tmp_path / "jobs.db")
     reconciled = restarted.reconcile_startup(controller)  # type: ignore[arg-type]
@@ -1786,7 +1787,7 @@ def test_startup_reconciliation_after_store_recreation_uses_runtime_without_repl
     "operation_type",
     ["snapshot_create", "snapshot_rollback", "snapshot_delete"],
 )
-def test_snapshot_job_at_real_startup_is_interrupted_without_replay(
+def test_snapshot_job_at_real_startup_stays_active_unknown_without_replay(
     tmp_path: Path,
     operation_type: str,
 ) -> None:
@@ -1803,9 +1804,16 @@ def test_snapshot_job_at_real_startup_is_interrupted_without_replay(
 
     reconciled = restarted.reconcile_startup(controller)  # type: ignore[arg-type]
 
-    assert reconciled[0]["status"] == "interrupted"
+    assert reconciled[0]["status"] == "running"
+    assert reconciled[0]["stage"] == "outcome_unknown"
     assert "outcome is unknown" in reconciled[0]["error"]
     assert controller.calls == []
+    with pytest.raises(HostControlError, match="another destructive host job is active"):
+        restarted.create(
+            vmid=110,
+            operation_type="lifecycle_force_stop",
+            request_id=f"blocked-after-{operation_type}",
+        )
 
 
 def test_reboot_reconciliation_is_unknown_even_when_lxc_is_running(
@@ -1819,13 +1827,15 @@ def test_reboot_reconciliation_is_unknown_even_when_lxc_is_running(
         operation_type="lifecycle_reboot",
         request_id="request-reboot-0004",
     )
+    store.begin_execution(job["id"])
 
     reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
-    assert reconciled[0]["status"] == "interrupted"
+    assert reconciled[0]["status"] == "running"
+    assert reconciled[0]["stage"] == "outcome_unknown"
     assert "cannot prove" in reconciled[0]["error"]
     assert controller.calls == []
-    assert store.get(job["id"])["status"] == "interrupted"
+    assert store.get(job["id"])["status"] == "running"
 
 
 def test_status_reconciliation_falls_back_to_runtime_status(
@@ -1838,11 +1848,12 @@ def test_status_reconciliation_falls_back_to_runtime_status(
         "runtime_status": "running",
         "lxc_status": "",
     }
-    store.create(
+    job, _ = store.create(
         vmid=110,
         operation_type="lifecycle_start",
         request_id="request-runtime-fallback-0004",
     )
+    store.begin_execution(job["id"])
 
     reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
@@ -1867,15 +1878,17 @@ def test_status_reconciliation_reports_controlled_unknown_for_invalid_payload_or
         controller.status_error = failure
     else:
         controller.status_payload = failure
-    store.create(
+    job, _ = store.create(
         vmid=110,
         operation_type="lifecycle_start",
         request_id="request-invalid-status-0004",
     )
+    store.begin_execution(job["id"])
 
     reconciled = store.reconcile_startup(controller)  # type: ignore[arg-type]
 
-    assert reconciled[0]["status"] == "interrupted"
+    assert reconciled[0]["status"] == "running"
+    assert reconciled[0]["stage"] == "outcome_unknown"
     assert reconciled[0]["error"].startswith("status reconciliation failed:")
 
 
@@ -1945,7 +1958,7 @@ def test_self_update_result_survives_hostd_store_recreation(
     assert not (results / f"{job['id']}.json").exists()
 
 
-def test_self_update_without_supervisor_marker_is_interrupted_unknown(
+def test_self_update_without_supervisor_marker_stays_active_unknown(
     tmp_path: Path,
 ) -> None:
     store = HostJobStore(tmp_path / "jobs.db", tmp_path / "results")
@@ -1966,7 +1979,8 @@ def test_self_update_without_supervisor_marker_is_interrupted_unknown(
         tmp_path / "results",
     ).reconcile_startup(DummyController())[0]  # type: ignore[arg-type]
 
-    assert terminal["status"] == "interrupted"
+    assert terminal["status"] == "running"
+    assert terminal["stage"] == "outcome_unknown"
     assert "outcome is unknown" in terminal["error"]
 
 

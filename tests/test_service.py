@@ -50,8 +50,17 @@ class UpdateSnapshotHost:
         expected_source_job_id: str | None = None,
         expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed=None,
     ) -> dict[str, Any]:
         self.calls.append((operation_type, vmid, request_id))
+        if on_observed is not None:
+            on_observed(
+                {
+                    "id": hashlib.sha256(
+                        f"host:{vmid}:{request_id}".encode("utf-8")
+                    ).hexdigest()[:32]
+                }
+            )
         if operation_type == "snapshot_rollback":
             assert snapshot_kind == "pre-update"
             assert expected_source_job_id

@@ -167,11 +167,16 @@ def test_host_control_unavailable_blocks_before_snapshot_mutation(
     )
 
 
-def test_host_control_failure_blocks_without_snapshot_or_update(
+def test_host_control_failure_after_submit_keeps_outcome_unknown(
     tmp_path: Path,
 ) -> None:
     class UnavailableHost(PreUpdateHost):
+        def __init__(self) -> None:
+            super().__init__()
+            self.submissions = 0
+
         def execute(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            self.submissions += 1
             raise HostControlError("hostd unavailable", status="unavailable")
 
     executor = SnapshotUpdateExecutor()
@@ -181,10 +186,17 @@ def test_host_control_failure_blocks_without_snapshot_or_update(
     service._run_job(db.get_job(job["id"]))
 
     terminal = db.get_job(job["id"])
-    assert terminal["status"] == "blocked"
+    assert terminal["status"] in {"queued", "running"}
     assert host.snapshots == []
     assert "snapshot_proof" not in dict(terminal.get("result") or {})
+    assert terminal["result"]["pre_update_snapshot_create"]["phase"] == "outcome_unknown"
+    assert db.get_plan(str(job["plan_id"]))["status"] == "approved"
     assert "update" not in executor.actions
+    restarted = OpsService(service.settings, db, executor, host_control=host)
+    restarted._reconcile_startup_jobs()
+    restarted._reconcile_startup_jobs()
+    assert host.submissions == 1
+    assert db.get_job(job["id"])["status"] in {"queued", "running"}
 
 
 def test_snapshot_proof_persistence_failure_blocks_update_without_replaying_snapshot(

@@ -336,7 +336,7 @@ def test_restart_before_submission_resubmits_stable_child_request(
 
     service._reconcile_startup_jobs()
 
-    assert host.reattach_calls[0][2:4] == (request_id, target["name"])
+    assert host.reattach_calls == []
     assert host.delete_submissions == [(request_id, target["name"])]
     assert db.get_job(job["id"])["status"] == "success"
 
@@ -534,7 +534,7 @@ def test_direct_http_500_child_error_stays_active_as_unknown(
 
 
 @pytest.mark.parametrize("target_present", [True, False])
-def test_missing_remote_job_is_resubmitted_only_when_target_still_exists(
+def test_missing_remote_job_after_submit_is_never_resubmitted(
     tmp_path: Path,
     target_present: bool,
 ) -> None:
@@ -563,10 +563,11 @@ def test_missing_remote_job_is_resubmitted_only_when_target_still_exists(
 
     service._reconcile_startup_jobs()
 
-    assert host.delete_submissions == (
-        [(request_id, target["name"])] if target_present else []
-    )
-    assert db.get_job(job["id"])["status"] == "success"
+    assert host.delete_submissions == []
+    active = db.get_job(job["id"])
+    assert active["status"] == "running"
+    assert active["result"]["phase"] == "unknown"
+    assert active["result"]["current"]["phase"] == "unknown"
 
 
 def test_ambiguous_remote_outcome_stays_active_and_fail_closed(

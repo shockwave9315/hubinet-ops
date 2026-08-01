@@ -123,6 +123,7 @@ class FakeHostControl:
         expected_source_job_id: str | None = None,
         expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed=None,
     ) -> dict[str, Any]:
         self.calls.append(
             (
@@ -133,6 +134,14 @@ class FakeHostControl:
                 release_fingerprint,
             )
         )
+        if on_observed is not None:
+            on_observed(
+                {
+                    "id": hashlib.sha256(
+                        f"host:{vmid}:{request_id}".encode("utf-8")
+                    ).hexdigest()[:32]
+                }
+            )
         if operation_type == "lifecycle_start":
             self.runtime = "running"
         elif operation_type in {"lifecycle_shutdown", "lifecycle_force_stop"}:
@@ -202,6 +211,7 @@ class FakeHostControl:
         expected_source_job_id: str | None = None,
         expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed=None,
     ) -> dict[str, Any]:
         self.reattach_calls.append(
             (
@@ -217,6 +227,14 @@ class FakeHostControl:
             raise HostControlError(
                 "Host control job was not found; operation outcome is unknown",
                 status="not_found",
+            )
+        if on_observed is not None:
+            on_observed(
+                {
+                    "id": str(existing.get("id") or hashlib.sha256(
+                        f"host:{vmid}:{request_id}".encode("utf-8")
+                    ).hexdigest()[:32])
+                }
             )
         status = str(existing.get("status") or "succeeded")
         result = dict(existing.get("result") or {})

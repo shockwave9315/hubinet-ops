@@ -124,6 +124,7 @@ class HostControlClient:
         expected_source_job_id: str | None = None,
         expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"request_id": request_id}
         if operation_type.startswith("lifecycle_"):
@@ -185,7 +186,23 @@ class HostControlClient:
         job_id = str(submitted.get("id") or "")
         if not job_id:
             raise HostControlError("Host control did not return a job ID")
-        result = self._wait_for_terminal(job_id, submitted)
+        def validate(remote: dict[str, Any]) -> None:
+            self._validate_existing_contract(
+                remote,
+                operation_type=operation_type,
+                vmid=vmid,
+                request_id=request_id,
+                snapshot_name=snapshot_name,
+                snapshot_kind=snapshot_kind,
+                expected_source_job_id=expected_source_job_id,
+                expected_pve_snaptime=expected_pve_snaptime,
+                release_fingerprint=release_fingerprint,
+            )
+
+        validate(submitted)
+        if on_observed is not None:
+            on_observed(dict(submitted))
+        result = self._wait_for_terminal(job_id, submitted, validate=validate)
         if operation_type in {"snapshot_create", "snapshot_create_ram"}:
             self._validate_snapshot_create_result(
                 result,
@@ -237,6 +254,7 @@ class HostControlClient:
         expected_source_job_id: str | None = None,
         expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         deadline = self.monotonic() + self.operation_timeout
         current = self._retry_read(
@@ -248,7 +266,6 @@ class HostControlClient:
                 "Host control job was not found; operation outcome is unknown",
                 status="not_found",
             )
-
         def validate(remote: dict[str, Any]) -> None:
             self._validate_existing_contract(
                 remote,
@@ -269,6 +286,8 @@ class HostControlClient:
                 "Host control lookup returned no job ID",
                 status="contract_mismatch",
             )
+        if on_observed is not None:
+            on_observed(dict(current))
         result = self._wait_for_terminal(
             job_id,
             current,

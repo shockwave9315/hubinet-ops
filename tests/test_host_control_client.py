@@ -8,6 +8,27 @@ import pytest
 from app.host_control import HostControlClient, HostControlError
 
 
+def _job(
+    job_id: str,
+    *,
+    vmid: int,
+    request_id: str,
+    operation_type: str,
+    argument: str | None = None,
+    status: str = "queued",
+    result: dict | None = None,
+) -> dict:
+    return {
+        "id": job_id,
+        "vmid": vmid,
+        "request_id": request_id,
+        "operation_type": operation_type,
+        "argument": argument,
+        "status": status,
+        "result": result,
+    }
+
+
 def test_host_control_client_uses_typed_paths_bearer_and_idempotent_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -15,12 +36,8 @@ def test_host_control_client_uses_typed_paths_bearer_and_idempotent_request(
     requests: list[httpx.Request] = []
     polls = iter(
         [
-            {"id": "job1", "status": "running"},
-            {
-                "id": "job1",
-                "status": "succeeded",
-                "result": {"lxc_status": "running"},
-            },
+            _job("job1", vmid=110, request_id="request-12345678", operation_type="lifecycle_start", status="running"),
+            _job("job1", vmid=110, request_id="request-12345678", operation_type="lifecycle_start", status="succeeded", result={"lxc_status": "running"}),
         ]
     )
 
@@ -29,7 +46,7 @@ def test_host_control_client_uses_typed_paths_bearer_and_idempotent_request(
         assert request.headers["Authorization"] == f"Bearer {'t' * 64}"
         if request.method == "POST":
             assert json.loads(request.content) == {"request_id": "request-12345678"}
-            return httpx.Response(202, json={"id": "job1", "status": "queued"})
+            return httpx.Response(202, json=_job("job1", vmid=110, request_id="request-12345678", operation_type="lifecycle_start"))
         return httpx.Response(200, json=next(polls))
 
     client = HostControlClient(
@@ -87,19 +104,15 @@ def test_host_control_client_sends_typed_qemu_include_ram(
                 "name": "hubinet-ops-100-manual-20260729T120000Z",
                 "include_ram": include_ram,
             }
-            return httpx.Response(202, json={"id": host_job_id, "status": "queued"})
+            return httpx.Response(202, json=_job(host_job_id, vmid=100, request_id="vm100-snapshot-request", operation_type=operation_type, argument="hubinet-ops-100-manual-20260729T120000Z"))
         return httpx.Response(
             200,
-            json={
-                "id": host_job_id,
-                "status": "succeeded",
-                "result": {
+            json=_job(host_job_id, vmid=100, request_id="vm100-snapshot-request", operation_type=operation_type, argument="hubinet-ops-100-manual-20260729T120000Z", status="succeeded", result={
                     "name": "hubinet-ops-100-manual-20260729T120000Z",
                     "kind": "manual",
                     "source_job_id": host_job_id,
                     "pve_snaptime": 1785329640,
-                },
-            },
+                }),
         )
 
     client = HostControlClient(
@@ -131,19 +144,15 @@ def test_host_control_client_rejects_snapshot_result_from_different_host_job(
         if request.method == "POST":
             return httpx.Response(
                 202,
-                json={"id": host_job_id, "status": "queued"},
+                json=_job(host_job_id, vmid=106, request_id="pre-update-snapshot-request-0001", operation_type="snapshot_create", argument="hubinet-ops-106-pre-20260729T120000Z"),
             )
         return httpx.Response(
             200,
-            json={
-                "id": host_job_id,
-                "status": "succeeded",
-                "result": {
+            json=_job(host_job_id, vmid=106, request_id="pre-update-snapshot-request-0001", operation_type="snapshot_create", argument="hubinet-ops-106-pre-20260729T120000Z", status="succeeded", result={
                     "name": "hubinet-ops-106-pre-20260729T120000Z",
                     "kind": "pre-update",
                     "source_job_id": "e" * 32,
-                },
-            },
+                }),
         )
 
     client = HostControlClient(
@@ -173,18 +182,14 @@ def test_host_control_client_rejects_create_result_without_pve_snaptime(
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
-            return httpx.Response(202, json={"id": host_job_id, "status": "queued"})
+            return httpx.Response(202, json=_job(host_job_id, vmid=106, request_id="missing-snaptime-create-result-0001", operation_type="snapshot_create", argument="hubinet-ops-106-pre-20260729T120000Z"))
         return httpx.Response(
             200,
-            json={
-                "id": host_job_id,
-                "status": "succeeded",
-                "result": {
+            json=_job(host_job_id, vmid=106, request_id="missing-snaptime-create-result-0001", operation_type="snapshot_create", argument="hubinet-ops-106-pre-20260729T120000Z", status="succeeded", result={
                     "name": "hubinet-ops-106-pre-20260729T120000Z",
                     "kind": "pre-update",
                     "source_job_id": host_job_id,
-                },
-            },
+                }),
         )
 
     client = HostControlClient(
@@ -276,17 +281,13 @@ def test_self_update_poll_survives_transient_hostd_restart_without_resubmission(
                 "request_id": "self-update-request-0001",
                 "fingerprint": fingerprint,
             }
-            return httpx.Response(202, json={"id": "job-self", "status": "running"})
+            return httpx.Response(202, json=_job("job-self", vmid=110, request_id="self-update-request-0001", operation_type="self_update", argument=fingerprint, status="running"))
         poll_count += 1
         if poll_count == 1:
             raise httpx.ConnectError("hostd restarting", request=request)
         return httpx.Response(
             200,
-            json={
-                "id": "job-self",
-                "status": "succeeded",
-                "result": {"fingerprint": fingerprint, "exit_code": 0},
-            },
+            json=_job("job-self", vmid=110, request_id="self-update-request-0001", operation_type="self_update", argument=fingerprint, status="succeeded", result={"fingerprint": fingerprint, "exit_code": 0}),
         )
 
     client = HostControlClient(
@@ -324,18 +325,14 @@ def test_normal_host_job_poll_retries_transient_get_without_resubmission(
         if request.method == "POST":
             return httpx.Response(
                 202,
-                json={"id": "job-start", "status": "running"},
+                json=_job("job-start", vmid=110, request_id="normal-transient-get-0001", operation_type="lifecycle_start", status="running"),
             )
         get_count += 1
         if get_count == 1:
             return httpx.Response(503, json={"error": "hostd temporarily unavailable"})
         return httpx.Response(
             200,
-            json={
-                "id": "job-start",
-                "status": "succeeded",
-                "result": {"lxc_status": "running"},
-            },
+            json=_job("job-start", vmid=110, request_id="normal-transient-get-0001", operation_type="lifecycle_start", status="succeeded", result={"lxc_status": "running"}),
         )
 
     client = HostControlClient(

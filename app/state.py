@@ -16,6 +16,7 @@ OPERATION_STATUSES = {
     "failed",
     "rolled_back",
     "manual_intervention",
+    "reconciliation_required",
     "unknown",
 }
 JOB_STAGES = {
@@ -44,6 +45,11 @@ JOB_STAGES = {
     "rollback_healthcheck",
     "completed",
     "failed",
+    "host_submitting",
+    "host_remote_observed",
+    "host_outcome_unknown",
+    "host_remote_succeeded",
+    "host_reconciliation",
 }
 OPERATION_RESULTS = {
     None,
@@ -291,7 +297,7 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
 
     # active_job_id describes a currently executable job, never historical work.
     # Terminal outcomes remain available through last_operation_result and job_stage.
-    if state["operation_status"] != "running":
+    if state["operation_status"] not in {"running", "reconciliation_required"}:
         state["active_job_id"] = None
 
     # Waiting for approval is a plan state, not a running or completed job. A stale
