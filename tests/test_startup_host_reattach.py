@@ -487,6 +487,7 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
         request_id,
         snapshot_name=snapshot,
     )
+    host_job_id = hashlib.sha256(operation_type.encode("utf-8")).hexdigest()[:32]
     remote_result = (
         {
             "lxc_status": (
@@ -499,7 +500,15 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
             )
         }
         if operation_type.startswith("lifecycle_")
-        else {"snapshot_name": snapshot, "operation": operation_type}
+        else {
+            "snapshot_name": snapshot,
+            "operation": operation_type,
+            **(
+                {"source_job_id": host_job_id}
+                if operation_type == "snapshot_create"
+                else {}
+            ),
+        }
     )
     requests: list[httpx.Request] = []
 
@@ -509,7 +518,7 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
             return httpx.Response(
                 200,
                 json={
-                    "id": f"host-{operation_type}",
+                    "id": host_job_id,
                     "vmid": 110,
                     "request_id": request_id,
                     "operation_type": operation_type,

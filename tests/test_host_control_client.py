@@ -77,6 +77,7 @@ def test_host_control_client_sends_typed_qemu_include_ram(
 ) -> None:
     monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
     requests: list[httpx.Request] = []
+    host_job_id = "d" * 32
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
@@ -86,10 +87,14 @@ def test_host_control_client_sends_typed_qemu_include_ram(
                 "name": "hubinet-ops-100-manual-20260729T120000Z",
                 "include_ram": include_ram,
             }
-            return httpx.Response(202, json={"id": "job1", "status": "queued"})
+            return httpx.Response(202, json={"id": host_job_id, "status": "queued"})
         return httpx.Response(
             200,
-            json={"id": "job1", "status": "succeeded", "result": {}},
+            json={
+                "id": host_job_id,
+                "status": "succeeded",
+                "result": {"source_job_id": host_job_id},
+            },
         )
 
     client = HostControlClient(
@@ -109,6 +114,46 @@ def test_host_control_client_sends_typed_qemu_include_ram(
         snapshot_name="hubinet-ops-100-manual-20260729T120000Z",
     )
     assert requests[0].url.path == "/api/v1/resources/100/snapshots"
+
+
+def test_host_control_client_rejects_snapshot_result_from_different_host_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
+    host_job_id = "d" * 32
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                202,
+                json={"id": host_job_id, "status": "queued"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": host_job_id,
+                "status": "succeeded",
+                "result": {"source_job_id": "e" * 32},
+            },
+        )
+
+    client = HostControlClient(
+        {
+            "base_url": "http://hostd.invalid",
+            "backend_token_env": "TEST_HOSTD_TOKEN",
+            "poll_interval_seconds": 0.001,
+        },
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _seconds: None,
+    )
+
+    with pytest.raises(HostControlError, match="does not match its host job"):
+        client.execute(
+            "snapshot_create",
+            106,
+            "pre-update-snapshot-request-0001",
+            snapshot_name="hubinet-ops-106-pre-20260729T120000Z",
+        )
 
 
 def test_host_control_health_is_the_only_unauthenticated_request(

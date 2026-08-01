@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from app.config import validate_config
 from app.database import Database
 from app.executor import ExecutorError
+from app.host_control import HostControlError
 from app.service import OpsService
 from app.stabilization import Stabilizer
 from tests.test_lifecycle_snapshots import (
@@ -22,6 +23,7 @@ from tests.test_lifecycle_snapshots import (
     settings,
 )
 from tests.test_v042_snapshot_consistency import (
+    PreUpdateHost,
     SnapshotUpdateExecutor,
     _approved_update,
 )
@@ -44,11 +46,7 @@ def _owned(
         "owned_by_hubinet_ops": True,
         "rollback_eligible": True,
         "delete_eligible": True,
-        "source_job_id": (
-            None
-            if kind == "pre-update"
-            else hashlib.sha256(name.encode("utf-8")).hexdigest()[:32]
-        ),
+        "source_job_id": hashlib.sha256(name.encode("utf-8")).hexdigest()[:32],
     }
 
 
@@ -104,6 +102,7 @@ def _record_snapshot_source(
             source_id,
             resolved_vmid,
             resolved_name,
+            str(snapshot["source_job_id"]),
         )
         db.update_job(source_id, status="success", stage="completed", progress=100)
     return db.get_job(source_id)
@@ -327,6 +326,7 @@ def test_backend_snapshot_proof_confirms_ownership_and_survives_result_update_an
         source["id"],
         106,
         snapshot["name"],
+        str(snapshot["source_job_id"]),
     )
     proof = dict(proven["result"]["snapshot_proof"])
 
@@ -356,6 +356,169 @@ def test_backend_snapshot_proof_confirms_ownership_and_survives_result_update_an
     assert terminal["result"]["verification"] == {"status": "passed"}
     assert after_restart["owned_by_hubinet_ops"] is True
     assert after_restart["source_job_id"] == source["id"]
+
+
+def test_version_one_snapshot_proof_is_preserved_but_never_authorizes_ownership(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = _owned(
+        106,
+        "20260729T125300Z",
+        kind="pre-update",
+        created_at="2026-07-29T12:53:00+00:00",
+    )
+    host.snapshots = [snapshot]
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="update",
+        request_id="legacy-version-one-proof-0001",
+        snapshot_name=snapshot["name"],
+    )
+    version_one = {
+        "version": 1,
+        "vmid": 106,
+        "snapshot_name": snapshot["name"],
+        "kind": "pre-update",
+    }
+    with db._lock, db._connect() as conn:
+        conn.execute(
+            "UPDATE jobs SET result=? WHERE id=?",
+            (json.dumps({"snapshot_proof": version_one}), source["id"]),
+        )
+    terminal = db.update_job(
+        source["id"],
+        status="blocked",
+        stage="failed",
+        progress=100,
+        result={"terminal_result": "failed"},
+    )
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+
+    modeled = service.list_snapshots(106)["snapshots"][0]
+
+    assert terminal["result"]["snapshot_proof"] == version_one
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["protected"] is True
+    assert modeled["rollback_eligible"] is False
+    assert modeled["delete_eligible"] is False
+    with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
+        service.manual_rollback(106)
+    service.queue_snapshot_prune(106, "oldest", "version-one-proof-prune-0001")
+    prune = run_queued(service, db)
+    assert prune["result"]["deleted"] == []
+    assert not any(call[0] == "snapshot_delete" for call in host.calls)
+
+
+def test_version_one_snapshot_proof_cannot_authorize_automatic_rollback(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = _owned(
+        106,
+        "20260729T125330Z",
+        kind="pre-update",
+        created_at="2026-07-29T12:53:30+00:00",
+    )
+    host.snapshots = [snapshot]
+    plan = db.create_plan(
+        vmid=106,
+        container_name="ct-106",
+        fingerprint="version-one-automatic-rollback",
+        risk="high",
+        payload={"pending_count": 1},
+        ttl_minutes=60,
+    )
+    _, source = db.approve_plan(plan["id"])
+    db.update_job(
+        source["id"],
+        status="running",
+        stage="updating",
+        snapshot_name=snapshot["name"],
+    )
+    version_one = {
+        "version": 1,
+        "vmid": 106,
+        "snapshot_name": snapshot["name"],
+        "kind": "pre-update",
+    }
+    with db._lock, db._connect() as conn:
+        conn.execute(
+            "UPDATE jobs SET result=? WHERE id=?",
+            (json.dumps({"snapshot_proof": version_one}), source["id"]),
+        )
+    executor = CompatibleExecutor()
+    service = OpsService(cfg, db, executor, host_control=host)
+
+    service._rollback(db.get_job(source["id"]), "simulated update failure")
+
+    terminal = db.get_job(source["id"])
+    assert terminal["status"] == "failed"
+    assert terminal["result"]["snapshot_proof"] == version_one
+    assert "rollback" not in executor.calls
+    assert not any(call[0] == "snapshot_rollback" for call in host.calls)
+
+
+@pytest.mark.parametrize(
+    "replacement_source_job_id",
+    ["b" * 32, ""],
+    ids=["different-source", "empty-source"],
+)
+def test_stale_pre_update_proof_never_authorizes_recreated_snapshot(
+    tmp_path: Path,
+    replacement_source_job_id: str,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    snapshot = _owned(
+        106,
+        "20260729T125400Z",
+        kind="pre-update",
+        created_at="2026-07-29T12:54:00+00:00",
+    )
+    original_source_job_id = "a" * 32
+    snapshot["source_job_id"] = original_source_job_id
+    host.snapshots = [snapshot]
+    source, _ = db.create_operation_job(
+        vmid=106,
+        container_name="ct-106",
+        operation_type="update",
+        request_id="stale-pre-update-proof-0001",
+        snapshot_name=snapshot["name"],
+    )
+    db.record_pre_update_snapshot_proof(
+        source["id"],
+        106,
+        snapshot["name"],
+        original_source_job_id,
+    )
+    db.update_job(source["id"], status="blocked", stage="failed", progress=100)
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+    assert service.list_snapshots(106)["snapshots"][0]["owned_by_hubinet_ops"] is True
+
+    replacement = dict(snapshot)
+    replacement["source_job_id"] = replacement_source_job_id
+    host.snapshots = [replacement]
+    modeled = service.list_snapshots(106)["snapshots"][0]
+
+    assert replacement_source_job_id != original_source_job_id
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["rollback_eligible"] is False
+    assert modeled["delete_eligible"] is False
+    with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
+        service.manual_rollback(106)
+    service.queue_snapshot_prune(106, "oldest", "stale-proof-prune-0001")
+    prune = run_queued(service, db)
+    assert prune["result"]["deleted"] == []
+    assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
 @pytest.mark.parametrize(
@@ -490,7 +653,12 @@ def test_malformed_active_update_result_blocks_proof_persistence_fail_closed(
     db.update_job(source["id"], result="{malformed-json")
 
     with pytest.raises(ValueError, match="result is malformed"):
-        db.record_pre_update_snapshot_proof(source["id"], 106, snapshot["name"])
+        db.record_pre_update_snapshot_proof(
+            source["id"],
+            106,
+            snapshot["name"],
+            str(snapshot["source_job_id"]),
+        )
 
     modeled = OpsService(
         cfg, db, CompatibleExecutor(), host_control=host
@@ -851,21 +1019,21 @@ def test_snapshot_api_returns_full_list_and_exposes_safe_bulk_operations(
 def test_pruning_failure_is_warning_and_does_not_change_successful_update(
     tmp_path: Path,
 ) -> None:
-    class PruningFailureExecutor(SnapshotUpdateExecutor):
-        def run(self, action: str, vmid: int, argument=None, timeout=None, on_event=None):
-            if action == "snapshot-delete":
-                self.actions.append(action)
-                raise ExecutorError("pruning delete failed")
-            return super().run(action, vmid, argument, timeout, on_event)
+    class PruningFailureHost(PreUpdateHost):
+        def execute(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            if args[0] == "snapshot_delete":
+                raise HostControlError("pruning delete failed", status="failed")
+            return super().execute(*args, **kwargs)
 
-    executor = PruningFailureExecutor()
-    executor.snapshots = [
+    executor = SnapshotUpdateExecutor()
+    host = PruningFailureHost()
+    host.snapshots = [
         _owned(106, "20260728T120000Z", created_at="2026-07-28T12:00:00+00:00"),
         _owned(106, "20260727T120000Z", created_at="2026-07-27T12:00:00+00:00"),
         _owned(106, "20260726T120000Z", created_at="2026-07-26T12:00:00+00:00"),
     ]
-    service, db, job = _approved_update(tmp_path, executor)
-    _record_snapshot_sources(db, executor.snapshots)
+    service, db, job = _approved_update(tmp_path, executor, host)
+    _record_snapshot_sources(db, host.snapshots)
     clock = FakeClock()
     service.stabilizer = Stabilizer(
         executor,

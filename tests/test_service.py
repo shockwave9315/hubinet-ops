@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,38 @@ class FakeClock:
 
     def sleep(self, seconds: float) -> None:
         self.now += seconds
+
+
+class UpdateSnapshotHost:
+    def __init__(self) -> None:
+        self.snapshots: list[dict[str, Any]] = []
+
+    def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
+        return [dict(item) for item in self.snapshots]
+
+    def execute(
+        self,
+        operation_type: str,
+        vmid: int,
+        request_id: str,
+        *,
+        snapshot_name: str | None = None,
+        release_fingerprint: str | None = None,
+    ) -> dict[str, Any]:
+        assert operation_type == "snapshot_create"
+        assert snapshot_name is not None
+        source_job_id = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:32]
+        snapshot = {
+            "name": snapshot_name,
+            "kind": "pre-update",
+            "owned_by_hubinet_ops": True,
+            "ownership_status": "owned",
+            "rollback_eligible": True,
+            "delete_eligible": True,
+            "source_job_id": source_job_id,
+        }
+        self.snapshots.insert(0, snapshot)
+        return dict(snapshot)
 
 
 def docker_state(healthy: int) -> dict[str, Any]:
@@ -493,6 +526,8 @@ def approved_job(service: OpsService, db: Database) -> dict[str, Any]:
         ttl_minutes=60,
     )
     service.approve(plan["id"])
+    if service.host_control is None:
+        service.host_control = UpdateSnapshotHost()  # type: ignore[assignment]
     job = db.next_queued_job()
     assert job is not None
     return job
@@ -901,6 +936,7 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
                     "owned_by_hubinet_ops": True,
                     "rollback_eligible": True,
                     "delete_eligible": True,
+                    "source_job_id": "c" * 32,
                 }
             ]
 
@@ -936,7 +972,7 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
         source["id"],
         snapshot_name=snapshot,
     )
-    db.record_pre_update_snapshot_proof(source["id"], 106, snapshot)
+    db.record_pre_update_snapshot_proof(source["id"], 106, snapshot, "c" * 32)
     db.update_job(source["id"], status="failed", stage="failed", progress=100)
     db.update_plan_status(plan["id"], "failed")
     result = service.manual_rollback(106)

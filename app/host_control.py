@@ -162,7 +162,10 @@ class HostControlClient:
         job_id = str(submitted.get("id") or "")
         if not job_id:
             raise HostControlError("Host control did not return a job ID")
-        return self._wait_for_terminal(job_id, submitted)
+        result = self._wait_for_terminal(job_id, submitted)
+        if operation_type in {"snapshot_create", "snapshot_create_ram"}:
+            self._validate_snapshot_source_job_id(result, job_id)
+        return result
 
     def find_job_by_request_id(
         self,
@@ -232,12 +235,31 @@ class HostControlClient:
                 "Host control lookup returned no job ID",
                 status="contract_mismatch",
             )
-        return self._wait_for_terminal(
+        result = self._wait_for_terminal(
             job_id,
             current,
             deadline=deadline,
             validate=validate,
         )
+        if operation_type in {"snapshot_create", "snapshot_create_ram"}:
+            self._validate_snapshot_source_job_id(result, job_id)
+        return result
+
+    @staticmethod
+    def _validate_snapshot_source_job_id(
+        result: dict[str, Any],
+        host_job_id: str,
+    ) -> None:
+        source_job_id = str(result.get("source_job_id") or "")
+        if (
+            len(host_job_id) != 32
+            or any(char not in "0123456789abcdef" for char in host_job_id)
+            or source_job_id != host_job_id
+        ):
+            raise HostControlError(
+                "Host snapshot result source job ID does not match its host job",
+                status="contract_mismatch",
+            )
 
     def _wait_for_terminal(
         self,

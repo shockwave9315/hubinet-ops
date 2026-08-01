@@ -929,7 +929,7 @@ class Database:
                 proof = (
                     existing.get("snapshot_proof")
                     if existing is not None
-                    and _snapshot_proof_matches(
+                    and _stored_snapshot_proof_matches_job(
                         existing.get("snapshot_proof"),
                         vmid=int(current["vmid"]),
                         snapshot_name=str(current["snapshot_name"] or ""),
@@ -963,10 +963,13 @@ class Database:
         job_id: str,
         vmid: int,
         snapshot_name: str,
+        host_source_job_id: str,
     ) -> dict[str, Any]:
         parsed = parse_owned_snapshot_name(snapshot_name, vmid=int(vmid))
         if parsed is None or parsed.get("kind") != "pre-update":
             raise ValueError("Snapshot proof requires an exact pre-update snapshot name")
+        if not re.fullmatch(r"[a-f0-9]{32}", str(host_source_job_id)):
+            raise ValueError("Snapshot proof requires an exact host source job ID")
         now = utc_now()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -990,10 +993,11 @@ class Database:
                 conn.execute("ROLLBACK")
                 raise ValueError("Active update job result is malformed")
             result["snapshot_proof"] = {
-                "version": 1,
+                "version": 2,
                 "vmid": int(vmid),
                 "snapshot_name": str(snapshot_name),
                 "kind": "pre-update",
+                "host_source_job_id": str(host_source_job_id),
             }
             conn.execute(
                 "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
@@ -1278,9 +1282,14 @@ class Database:
         job_id: str,
         vmid: int,
         snapshot_name: str,
+        host_source_job_id: str,
     ) -> bool:
         parsed = parse_owned_snapshot_name(snapshot_name, vmid=int(vmid))
-        if parsed is None or parsed.get("kind") != "pre-update":
+        if (
+            parsed is None
+            or parsed.get("kind") != "pre-update"
+            or not re.fullmatch(r"[a-f0-9]{32}", str(host_source_job_id))
+        ):
             return False
         with self._lock, self._connect() as conn:
             job = conn.execute(
@@ -1295,6 +1304,7 @@ class Database:
             result.get("snapshot_proof"),
             vmid=int(vmid),
             snapshot_name=str(snapshot_name),
+            host_source_job_id=str(host_source_job_id),
         )
 
     def list_container_events(self, vmid: int, limit: int = 50) -> list[dict[str, Any]]:
@@ -1417,6 +1427,7 @@ def _snapshot_proof_matches(
     *,
     vmid: int,
     snapshot_name: str,
+    host_source_job_id: str,
 ) -> bool:
     if not isinstance(value, dict):
         return False
@@ -1425,13 +1436,48 @@ def _snapshot_proof_matches(
     return (
         isinstance(version, int)
         and not isinstance(version, bool)
-        and version == 1
+        and version == 2
+        and isinstance(proof_vmid, int)
+        and not isinstance(proof_vmid, bool)
+        and proof_vmid == int(vmid)
+        and str(value.get("snapshot_name") or "") == str(snapshot_name)
+        and str(value.get("kind") or "") == "pre-update"
+        and re.fullmatch(
+            r"[a-f0-9]{32}",
+            str(value.get("host_source_job_id") or ""),
+        )
+        is not None
+        and str(value.get("host_source_job_id")) == str(host_source_job_id)
+    )
+
+
+def _stored_snapshot_proof_matches_job(
+    value: Any,
+    *,
+    vmid: int,
+    snapshot_name: str,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    version = value.get("version")
+    proof_vmid = value.get("vmid")
+    common = (
+        isinstance(version, int)
+        and not isinstance(version, bool)
         and isinstance(proof_vmid, int)
         and not isinstance(proof_vmid, bool)
         and proof_vmid == int(vmid)
         and str(value.get("snapshot_name") or "") == str(snapshot_name)
         and str(value.get("kind") or "") == "pre-update"
     )
+    if not common:
+        return False
+    if version == 1:
+        return True
+    return version == 2 and re.fullmatch(
+        r"[a-f0-9]{32}",
+        str(value.get("host_source_job_id") or ""),
+    ) is not None
 
 
 def _decode_plan(row: sqlite3.Row) -> dict[str, Any]:

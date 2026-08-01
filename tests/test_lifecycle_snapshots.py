@@ -151,7 +151,7 @@ class FakeHostControl:
                     "name": snapshot_name,
                     "description": description,
                     "created_at": created_at,
-                    "kind": "manual",
+                    "kind": parsed["kind"],
                     "owned_by_hubinet_ops": True,
                     "rollback_eligible": True,
                     "delete_eligible": True,
@@ -162,7 +162,7 @@ class FakeHostControl:
                 "name": snapshot_name,
                 "description": description,
                 "created_at": created_at,
-                "kind": "manual",
+                "kind": parsed["kind"],
                 "owned_by_hubinet_ops": True,
                 "source_job_id": host_source_job_id,
                 "include_ram": operation_type == "snapshot_create_ram",
@@ -391,6 +391,7 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
             "owned_by_hubinet_ops": True,
             "rollback_eligible": True,
             "delete_eligible": True,
+            "source_job_id": "a" * 32,
         }
     ]
     executor = MissingExecutor()
@@ -415,7 +416,7 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
         source["id"],
         snapshot_name=snapshot,
     )
-    db.record_pre_update_snapshot_proof(source["id"], 109, snapshot)
+    db.record_pre_update_snapshot_proof(source["id"], 109, snapshot, "a" * 32)
     db.update_job(source["id"], status="failed", stage="failed", progress=100)
     terminal = service.manual_rollback(109)
     state = service.get_state(109)
@@ -487,6 +488,7 @@ def test_legacy_manual_rollback_rejects_update_without_durable_snapshot_proof(
             "owned_by_hubinet_ops": True,
             "rollback_eligible": True,
             "delete_eligible": True,
+            "source_job_id": "b" * 32,
         }
     ]
     source, _ = db.create_operation_job(
@@ -523,6 +525,7 @@ def test_legacy_manual_rollback_requires_snapshot_owned_by_exact_source_update(
             "owned_by_hubinet_ops": True,
             "rollback_eligible": True,
             "delete_eligible": True,
+            "source_job_id": "b" * 32,
         }
     ]
     proven, _ = db.create_operation_job(
@@ -532,7 +535,7 @@ def test_legacy_manual_rollback_requires_snapshot_owned_by_exact_source_update(
         request_id="proven-older-update-source-0001",
         snapshot_name=snapshot,
     )
-    db.record_pre_update_snapshot_proof(proven["id"], 109, snapshot)
+    db.record_pre_update_snapshot_proof(proven["id"], 109, snapshot, "b" * 32)
     db.update_job(proven["id"], status="failed", stage="failed", progress=100)
     source, _ = db.create_operation_job(
         vmid=109,

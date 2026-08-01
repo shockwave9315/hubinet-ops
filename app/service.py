@@ -1178,6 +1178,7 @@ class OpsService:
                                 str(candidate["id"]),
                                 vmid,
                                 name,
+                                host_source_job_id,
                             )
                         ),
                         None,
@@ -2216,9 +2217,31 @@ class OpsService:
                     event_type="snapshot_started",
                     message="Creating rollback snapshot" if auto_rollback else "Creating pre-update safety snapshot",
                 )
-                self._execute("snapshot", vmid, 600, emit, snapshot)
                 try:
-                    self._confirm_physical_pre_update_snapshot(vmid, snapshot)
+                    host_control = self._require_host_control(
+                        "Pre-update snapshot creation"
+                    )
+                    host_result = host_control.execute(
+                        "snapshot_create",
+                        vmid,
+                        f"pre-update-snapshot-{job['id']}",
+                        snapshot_name=snapshot,
+                    )
+                    host_source_job_id = self._pre_update_host_source_job_id(
+                        host_result,
+                        vmid=vmid,
+                        snapshot_name=snapshot,
+                    )
+                except (HostControlError, ValueError) as exc:
+                    raise ExecutorError(
+                        f"Pre-update snapshot host operation failed: {exc}"
+                    ) from exc
+                try:
+                    self._confirm_physical_pre_update_snapshot(
+                        vmid,
+                        snapshot,
+                        host_source_job_id,
+                    )
                 except (ExecutorError, HostControlError, ValueError) as exc:
                     warning = sanitize_text(
                         f"Created snapshot {snapshot} could not be physically confirmed: {exc}",
@@ -2252,6 +2275,7 @@ class OpsService:
                         str(job["id"]),
                         vmid,
                         snapshot,
+                        host_source_job_id,
                     )
                 except Exception as exc:
                     raise ExecutorError(
@@ -3159,6 +3183,7 @@ class OpsService:
         self,
         vmid: int,
         snapshot_name: str,
+        host_source_job_id: str,
     ) -> dict[str, Any]:
         """Confirm an exact host-owned snapshot without consulting durable proof."""
         try:
@@ -3187,6 +3212,11 @@ class OpsService:
             raise ValueError("Physical snapshot kind is not pre-update")
         if snapshot.get("owned_by_hubinet_ops") is not True:
             raise ValueError("Physical snapshot is foreign or ownership is uncertain")
+        physical_source_job_id = str(snapshot.get("source_job_id") or "")
+        if not self._valid_host_source_job_id(physical_source_job_id):
+            raise ValueError("Physical snapshot source job ID is missing or malformed")
+        if physical_source_job_id != host_source_job_id:
+            raise ValueError("Physical snapshot source job ID does not match host result")
         if (
             "ownership_status" in snapshot
             and snapshot.get("ownership_status") != "owned"
@@ -3203,6 +3233,42 @@ class OpsService:
             if physical_vmid != int(vmid):
                 raise ValueError("Physical snapshot VMID conflicts with the resource")
         return snapshot
+
+    @staticmethod
+    def _valid_host_source_job_id(value: str) -> bool:
+        return (
+            len(value) == 32
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    @classmethod
+    def _pre_update_host_source_job_id(
+        cls,
+        result: dict[str, Any],
+        *,
+        vmid: int,
+        snapshot_name: str,
+    ) -> str:
+        if not isinstance(result, dict):
+            raise ValueError("Host snapshot result is malformed")
+        if str(result.get("name") or "") != snapshot_name:
+            raise ValueError("Host snapshot result name does not match the request")
+        if str(result.get("kind") or "") != "pre-update":
+            raise ValueError("Host snapshot result kind is not pre-update")
+        if "vmid" in result:
+            result_vmid = result.get("vmid")
+            if isinstance(result_vmid, bool):
+                raise ValueError("Host snapshot result VMID is malformed")
+            try:
+                parsed_vmid = int(result_vmid)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Host snapshot result VMID is malformed") from exc
+            if parsed_vmid != int(vmid):
+                raise ValueError("Host snapshot result VMID does not match the request")
+        source_job_id = str(result.get("source_job_id") or "")
+        if not cls._valid_host_source_job_id(source_job_id):
+            raise ValueError("Host snapshot result source job ID is missing or malformed")
+        return source_job_id
 
     def _validate_approved_plan(
         self,
@@ -3325,6 +3391,17 @@ class OpsService:
             return
         emit = self._emitter(job)
         try:
+            try:
+                self._refresh_snapshot_state(
+                    vmid,
+                    job=job,
+                    required_name=snapshot,
+                    required_kind="pre-update",
+                )
+            except (HostControlError, ValueError) as exc:
+                raise ExecutorError(
+                    f"Rollback snapshot ownership could not be confirmed: {exc}"
+                ) from exc
             emit(
                 stage="rollback",
                 progress=88,
