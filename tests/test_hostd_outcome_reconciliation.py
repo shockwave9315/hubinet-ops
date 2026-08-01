@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import threading
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ from app.database import Database
 from app.executor import ExecutorError
 from app.host_control import HostControlError
 from app.service import HostJobOutcome, OpsService, classify_host_job_error
+from app.stabilization import StabilizationInterrupted
 from tests.test_lifecycle_snapshots import (
     CompatibleExecutor,
     FakeHostControl,
@@ -307,7 +309,7 @@ def test_restart_after_remote_succeeded_before_stabilization_runs_it_once(
     assert db.get_job(job["id"])["status"] == "rolled_back"
 
 
-def test_restart_during_stabilization_does_not_run_stabilization_twice(
+def test_restart_during_stabilization_repeats_only_read_only_healthcheck(
     tmp_path: Path,
 ) -> None:
     service, db, host, job = _case(tmp_path, "accepted_success_lost")
@@ -333,8 +335,175 @@ def test_restart_during_stabilization_does_not_run_stabilization_twice(
     )
     restarted._reconcile_startup_jobs()
     assert crashing.calls == 1
-    assert replacement.calls == 0
-    assert db.get_job(job["id"])["status"] in {"queued", "running"}
+    assert replacement.calls == 1
+    assert host.rollback_posts == 1
+    assert db.get_job(job["id"])["status"] == "rolled_back"
+
+
+def test_graceful_service_stop_during_rollback_stabilization_stays_active(
+    tmp_path: Path,
+) -> None:
+    service, db, host, job = _case(tmp_path, "success")
+    entered = threading.Event()
+
+    class ShutdownStabilizer:
+        def wait(self, **_kwargs: Any) -> dict[str, Any]:
+            entered.set()
+            if not service._stop.wait(5):
+                raise AssertionError("service.stop() was not called")
+            raise StabilizationInterrupted("shutdown during rollback stabilization")
+
+    class DormantThread:
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return False
+
+    service.stabilizer = ShutdownStabilizer()  # type: ignore[assignment]
+    worker = threading.Thread(
+        target=service._run_job,
+        args=(db.get_job(job["id"]),),
+        daemon=True,
+    )
+    service._worker = worker
+    service._telemetry = DormantThread()  # type: ignore[assignment]
+    service._recovery_worker = DormantThread()  # type: ignore[assignment]
+    worker.start()
+    assert entered.wait(5)
+
+    service.stop()
+
+    active = db.get_job(job["id"])
+    assert active["status"] in {"queued", "running"}
+    assert active["result"]["automatic_rollback"]["phase"] == "stabilizing"
+    assert db.get_plan(str(job["plan_id"]))["status"] == "approved"
+    assert host.rollback_posts == 1
+    assert not any(
+        event.get("terminal") for event in db.list_job_events(job["id"])
+    )
+
+
+def test_stop_event_interruption_keeps_stabilization_resumable(
+    tmp_path: Path,
+) -> None:
+    service, db, host, job = _case(tmp_path, "success")
+
+    class StopEventStabilizer:
+        def wait(self, **_kwargs: Any) -> dict[str, Any]:
+            service._stop.set()
+            raise StabilizationInterrupted("stop event interrupted stabilization")
+
+    service.stabilizer = StopEventStabilizer()  # type: ignore[assignment]
+    service._run_job(db.get_job(job["id"]))
+
+    active = db.get_job(job["id"])
+    assert active["status"] in {"queued", "running"}
+    assert active["result"]["automatic_rollback"]["phase"] == "stabilizing"
+    assert db.get_plan(str(job["plan_id"]))["status"] == "approved"
+    assert host.rollback_posts == 1
+
+
+def test_full_rollback_stabilization_timeout_is_definitive_failure(
+    tmp_path: Path,
+) -> None:
+    service, db, host, job = _case(tmp_path, "success")
+
+    class TimedOutStabilizer:
+        def wait(self, **_kwargs: Any) -> dict[str, Any]:
+            raise ExecutorError("rollback stabilization timed out")
+
+    service.stabilizer = TimedOutStabilizer()  # type: ignore[assignment]
+    service._run_job(db.get_job(job["id"]))
+
+    terminal = db.get_job(job["id"])
+    assert terminal["status"] == "failed"
+    assert terminal["result"]["automatic_rollback"]["phase"] == "definitive_failed"
+    assert db.get_plan(str(job["plan_id"]))["status"] == "failed"
+    assert host.rollback_posts == 1
+
+
+def test_crash_after_stabilized_resumes_local_terminalization_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, db, host, job = _case(tmp_path, "success")
+    stabilizer = CountingStabilizer()
+    service.stabilizer = stabilizer  # type: ignore[assignment]
+    transition = service._transition_automatic_rollback
+
+    def crash_after_stabilized(
+        current_job: dict[str, Any],
+        contract: dict[str, Any],
+        phase: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        persisted = transition(current_job, contract, phase, **kwargs)
+        if phase == "stabilized":
+            raise SystemExit("crash after stabilized")
+        return persisted
+
+    monkeypatch.setattr(
+        service, "_transition_automatic_rollback", crash_after_stabilized
+    )
+    with pytest.raises(SystemExit, match="crash after stabilized"):
+        service._run_job(db.get_job(job["id"]))
+
+    crashed = db.get_job(job["id"])
+    assert crashed["result"]["automatic_rollback"]["phase"] == "stabilized"
+    assert crashed["status"] in {"queued", "running"}
+    assert stabilizer.calls == 1
+    assert host.rollback_posts == 1
+
+    restarted_stabilizer = CountingStabilizer()
+    restarted = OpsService(
+        service.settings,
+        db,
+        service.executor,
+        host_control=host,
+        stabilizer=restarted_stabilizer,  # type: ignore[arg-type]
+    )
+    restarted._reconcile_startup_jobs()
+    restarted._reconcile_startup_jobs()
+
+    assert db.get_job(job["id"])["status"] == "rolled_back"
+    assert restarted_stabilizer.calls == 0
+    assert host.rollback_posts == 1
+    terminal_events = [
+        event for event in db.list_job_events(job["id"])
+        if event.get("event_type") == "job_rolled_back"
+    ]
+    assert len(terminal_events) == 1
+
+
+def test_crash_after_completed_contract_terminalizes_once_on_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, db, host, job = _case(tmp_path, "success")
+    service.stabilizer = CountingStabilizer()  # type: ignore[assignment]
+
+    def crash_before_terminal(*_args: Any, **_kwargs: Any) -> None:
+        raise SystemExit("crash before terminalization")
+
+    monkeypatch.setattr(service, "_terminal", crash_before_terminal)
+    with pytest.raises(SystemExit, match="before terminalization"):
+        service._run_job(db.get_job(job["id"]))
+    assert db.get_job(job["id"])["result"]["automatic_rollback"]["phase"] == "completed"
+
+    restarted = OpsService(
+        service.settings, db, service.executor, host_control=host,
+        stabilizer=CountingStabilizer(),  # type: ignore[arg-type]
+    )
+    restarted._reconcile_startup_jobs()
+    restarted._reconcile_startup_jobs()
+
+    assert db.get_job(job["id"])["status"] == "rolled_back"
+    assert host.rollback_posts == 1
+    assert sum(
+        event.get("event_type") == "job_rolled_back"
+        for event in db.list_job_events(job["id"])
+    ) == 1
 
 
 @pytest.mark.parametrize(
@@ -448,7 +617,7 @@ def _matrix() -> list[FailureScenario]:
                 expected,
                 expected_state,
                 1 if submit_started else 0,
-                "test_failure_matrix_classifies_50_named_host_scenarios",
+                "test_host_error_classifier_matrix",
                 error,
                 submit_started,
             )
@@ -460,7 +629,7 @@ FAILURE_MATRIX = _matrix()
 
 
 @pytest.mark.parametrize("case", FAILURE_MATRIX, ids=lambda case: case.scenario)
-def test_failure_matrix_classifies_50_named_host_scenarios(case: FailureScenario) -> None:
+def test_host_error_classifier_matrix(case: FailureScenario) -> None:
     assert len(FAILURE_MATRIX) >= 50
     assert classify_host_job_error(
         case.error, submit_started=case.submit_started

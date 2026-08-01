@@ -63,6 +63,11 @@ class PreUpdateHost(FakeHostControl):
         return snapshots
 
 
+class HealthyStabilizer:
+    def wait(self, **_kwargs: Any) -> dict[str, Any]:
+        return docker_state(3)
+
+
 def _approved_update(
     tmp_path: Path,
     executor: SnapshotUpdateExecutor,
@@ -373,11 +378,13 @@ def test_crash_after_proof_preserves_exact_source_ownership_on_restart(
     ]
 
 
-def test_crash_before_physical_confirmation_leaves_no_restart_proof(
+def test_crash_before_physical_confirmation_resumes_without_duplicate_create(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executor = SnapshotUpdateExecutor()
+    executor = SnapshotUpdateExecutor(
+        [docker_state(3), docker_state(3), docker_state(3)]
+    )
     service, db, job = _approved_update(tmp_path, executor)
     monkeypatch.setattr(
         service,
@@ -390,16 +397,114 @@ def test_crash_before_physical_confirmation_leaves_no_restart_proof(
 
     crashed = db.get_job(job["id"])
     assert "snapshot_proof" not in dict(crashed.get("result") or {})
+    assert crashed["result"]["pre_update_snapshot_create"]["phase"] == "confirming"
     host = service.host_control
     assert isinstance(host, PreUpdateHost)
     assert len([call for call in host.calls if call[0] == "snapshot_create"]) == 1
     assert "update" not in executor.actions
-    restarted = OpsService(service.settings, db, executor, host_control=host)
+    restarted = OpsService(
+        service.settings,
+        db,
+        executor,
+        host_control=host,
+        stabilizer=HealthyStabilizer(),  # type: ignore[arg-type]
+    )
     restarted._reconcile_startup_jobs()
     assert len([call for call in host.calls if call[0] == "snapshot_create"]) == 1
+    resumed = db.get_job(job["id"])
+    assert resumed["status"] == "success"
+    assert resumed["result"]["pre_update_snapshot_create"]["phase"] == "completed"
+    assert resumed["result"]["snapshot_proof"]["version"] == 3
+    assert "update" in executor.actions
     modeled = restarted._refresh_snapshot_state(106)["snapshots"][0]
-    assert modeled["owned_by_hubinet_ops"] is False
-    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["owned_by_hubinet_ops"] is True
+    assert modeled["ownership_status"] == "owned"
+
+
+def test_restart_from_pre_update_remote_succeeded_confirms_without_duplicate_post(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = SnapshotUpdateExecutor(
+        [docker_state(3), docker_state(3), docker_state(3)]
+    )
+    host = PreUpdateHost()
+    service, db, job = _approved_update(tmp_path, executor, host)
+    persist = db.persist_pre_update_create_contract
+    crashed = False
+
+    def crash_after_remote_success(
+        job_id: str,
+        contract: dict[str, Any],
+    ) -> dict[str, Any]:
+        nonlocal crashed
+        saved = persist(job_id, contract)
+        if contract.get("phase") == "remote_succeeded" and not crashed:
+            crashed = True
+            raise SystemExit("crash after remote snapshot success")
+        return saved
+
+    monkeypatch.setattr(
+        db, "persist_pre_update_create_contract", crash_after_remote_success
+    )
+    with pytest.raises(SystemExit, match="remote snapshot success"):
+        service._run_job(db.get_job(job["id"]))
+
+    before_restart = db.get_job(job["id"])
+    assert before_restart["result"]["pre_update_snapshot_create"]["phase"] == "remote_succeeded"
+    assert "snapshot_proof" not in before_restart["result"]
+    assert "update" not in executor.actions
+    assert len([call for call in host.calls if call[0] == "snapshot_create"]) == 1
+
+    restarted = OpsService(
+        service.settings,
+        db,
+        executor,
+        host_control=host,
+        stabilizer=HealthyStabilizer(),  # type: ignore[arg-type]
+    )
+    restarted._reconcile_startup_jobs()
+
+    completed = db.get_job(job["id"])
+    assert completed["status"] == "success"
+    assert completed["result"]["pre_update_snapshot_create"]["phase"] == "completed"
+    assert completed["result"]["snapshot_proof"]["version"] == 3
+    assert len([call for call in host.calls if call[0] == "snapshot_create"]) == 1
+    assert "update" in executor.actions
+
+
+def test_pre_update_confirmation_mismatch_after_restart_blocks_without_recreate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = SnapshotUpdateExecutor(
+        [docker_state(3), docker_state(3), docker_state(3)]
+    )
+    host = PreUpdateHost()
+    service, db, job = _approved_update(tmp_path, executor, host)
+    monkeypatch.setattr(
+        service,
+        "_confirm_physical_pre_update_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            SystemExit("crash before confirmation")
+        ),
+    )
+    with pytest.raises(SystemExit, match="before confirmation"):
+        service._run_job(db.get_job(job["id"]))
+
+    assert db.get_job(job["id"])["result"]["pre_update_snapshot_create"]["phase"] == "confirming"
+    assert "snapshot_proof" not in db.get_job(job["id"])["result"]
+    assert len([call for call in host.calls if call[0] == "snapshot_create"]) == 1
+    host.listing_mutation["pve_snaptime"] = int(host.snapshots[0]["pve_snaptime"]) + 1
+
+    restarted = OpsService(service.settings, db, executor, host_control=host)
+    restarted._reconcile_startup_jobs()
+
+    blocked = db.get_job(job["id"])
+    assert blocked["status"] == "blocked"
+    assert "snapshot_proof" not in blocked["result"]
+    assert "update" not in executor.actions
+    assert len([call for call in host.calls if call[0] == "snapshot_create"]) == 1
 
 
 def test_executor_snapshot_result_cannot_create_or_overwrite_backend_proof(

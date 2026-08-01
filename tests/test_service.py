@@ -13,7 +13,11 @@ from app.contracts import REQUIRED_APT_ACTIONS
 from app.database import Database
 from app.executor import ExecutorError
 from app.service import OpsService
-from app.stabilization import StabilizationPolicy, Stabilizer
+from app.stabilization import (
+    StabilizationInterrupted,
+    StabilizationPolicy,
+    Stabilizer,
+)
 
 
 EXECUTOR_HASH = "a" * 64
@@ -707,6 +711,50 @@ def test_stabilization_treats_null_executor_data_as_unhealthy_not_type_error() -
         stabilizer.wait(
             vmid=106,
             phase="update",
+            timeout_seconds=1,
+            policy=policy,
+            emit=lambda **kwargs: None,
+        )
+
+
+def test_stabilization_stop_event_has_typed_resumable_outcome() -> None:
+    stop_event = threading.Event()
+    stop_event.set()
+    stabilizer = Stabilizer(WorkflowExecutor(), stop_event)
+
+    with pytest.raises(StabilizationInterrupted, match="shutdown interrupted"):
+        stabilizer.wait(
+            vmid=106,
+            phase="rollback",
+            timeout_seconds=1,
+            policy=StabilizationPolicy(initial_grace_seconds=0),
+            emit=lambda **kwargs: None,
+        )
+
+
+def test_stabilization_transport_unavailable_is_resumable_not_negative_health() -> None:
+    class UnavailableInspectExecutor:
+        def run(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise ExecutorError("inspect transport unavailable")
+
+    clock = FakeClock()
+    stabilizer = Stabilizer(
+        UnavailableInspectExecutor(),  # type: ignore[arg-type]
+        threading.Event(),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    policy = StabilizationPolicy(
+        post_rollback_timeout_seconds=1,
+        poll_interval_seconds=1,
+        initial_grace_seconds=0,
+        required_consecutive_successes=1,
+    )
+
+    with pytest.raises(StabilizationInterrupted, match="could not be confirmed"):
+        stabilizer.wait(
+            vmid=106,
+            phase="rollback",
             timeout_seconds=1,
             policy=policy,
             emit=lambda **kwargs: None,

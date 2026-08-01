@@ -27,7 +27,11 @@ from .executor import Executor, ExecutorError
 from .host_control import HostControlClient, HostControlError
 from .mqtt import MqttTelemetry, VERSION
 from .security import sanitize_data, sanitize_text
-from .stabilization import StabilizationPolicy, Stabilizer
+from .stabilization import (
+    StabilizationInterrupted,
+    StabilizationPolicy,
+    Stabilizer,
+)
 from .state import normalize_state
 from .time_utils import parse_utc_timestamp
 
@@ -2124,7 +2128,8 @@ class OpsService:
                 # The embedded create state machine decides whether prepared may
                 # submit or submitting+ may only perform read-only reconciliation.
                 if pre_update_create.get("phase") in {
-                    "prepared", "submitting", "remote_observed", "outcome_unknown"
+                    "prepared", "submitting", "remote_observed", "outcome_unknown",
+                    "remote_succeeded", "confirming",
                 }:
                     self._run_job(job)
                 else:
@@ -3544,7 +3549,7 @@ class OpsService:
                     str(contract["request_id"]),
                     snapshot_name=snapshot_name,
                 )
-            elif contract["phase"] == "remote_succeeded":
+            elif contract["phase"] in {"remote_succeeded", "confirming"}:
                 identity = contract.get("snapshot_identity")
                 if not isinstance(identity, dict):
                     raise ValueError("Pre-update create result identity is missing")
@@ -3964,19 +3969,23 @@ class OpsService:
                 durable = self._automatic_rollback_contract(job)
             except ValueError:
                 durable = None
-            if (
-                isinstance(durable, dict)
-                and durable.get("phase") == "stabilizing"
-                and isinstance(rollback_error, ExecutorError)
-            ):
-                self._transition_automatic_rollback(
-                    job,
-                    durable,
-                    "definitive_failed",
-                    last_error=str(rollback_error),
-                )
-                self._fail_automatic_rollback(job, cause, rollback_error)
-                return
+            if isinstance(durable, dict) and durable.get("phase") == "stabilizing":
+                if isinstance(rollback_error, StabilizationInterrupted) or (
+                    isinstance(rollback_error, ExecutorError) and self._stop.is_set()
+                ):
+                    self._hold_automatic_rollback_unknown(
+                        job, durable, str(rollback_error)
+                    )
+                    return
+                if isinstance(rollback_error, ExecutorError):
+                    self._transition_automatic_rollback(
+                        job,
+                        durable,
+                        "definitive_failed",
+                        last_error=str(rollback_error),
+                    )
+                    self._fail_automatic_rollback(job, cause, rollback_error)
+                    return
             if isinstance(durable, dict) and durable.get("phase") in {
                 "submitting", "remote_observed", "outcome_unknown",
                 "remote_succeeded", "stabilizing", "stabilized",
@@ -4058,9 +4067,9 @@ class OpsService:
         contract = self._automatic_rollback_contract(job)
         phase = str(contract["phase"])
         identity = dict(contract["expected_snapshot_identity"])
-        host = self._require_host_control("Automatic rollback")
         try:
             if phase == "prepared":
+                host = self._require_host_control("Automatic rollback")
                 contract = self._transition_automatic_rollback(
                     job, contract, "submitting"
                 )
@@ -4077,6 +4086,7 @@ class OpsService:
                     ),
                 )
             elif phase in {"submitting", "remote_observed", "outcome_unknown"}:
+                host = self._require_host_control("Automatic rollback")
                 result = host.wait_existing_job(
                     "snapshot_rollback",
                     int(job["vmid"]),
@@ -4089,19 +4099,16 @@ class OpsService:
                         job, remote
                     ),
                 )
-            elif phase in {"remote_succeeded", "stabilized"}:
+            elif phase in {
+                "remote_succeeded", "stabilizing", "stabilized", "completed"
+            }:
                 result = {}
-            elif phase == "stabilizing":
-                self._hold_automatic_rollback_unknown(
-                    job,
-                    contract,
-                    "Backend restarted while rollback stabilization was in progress",
-                )
-                return
             else:
                 return
             contract = self._automatic_rollback_contract(job)
-            if str(contract["phase"]) not in {"remote_succeeded", "stabilized"}:
+            if str(contract["phase"]) not in {
+                "remote_succeeded", "stabilizing", "stabilized", "completed"
+            }:
                 contract = self._transition_automatic_rollback(
                     job, contract, "remote_succeeded"
                 )
@@ -4186,7 +4193,7 @@ class OpsService:
         snapshot = str(self.db.get_job(job["id"]).get("snapshot_name") or "")
         try:
             contract = self._automatic_rollback_contract(job)
-            if str(contract["phase"]) == "remote_succeeded":
+            if str(contract["phase"]) in {"remote_succeeded", "stabilizing"}:
                 contract = self._transition_automatic_rollback(
                     job, contract, "stabilizing"
                 )
@@ -4213,6 +4220,10 @@ class OpsService:
                 health = dict(contract.get("stabilization_result") or {})
                 if not health:
                     raise ValueError("Automatic rollback stabilization result is missing")
+            elif str(contract["phase"]) == "completed":
+                self._terminal(job, "rolled_back", "rolled_back", cause)
+                self._notify_ha(self._notification("job_rolled_back", vmid))
+                return
             else:
                 return
             emit(
@@ -4324,6 +4335,21 @@ class OpsService:
                     job, "automatic_rollback_contract", str(exc)
                 )
                 return
+            if str(contract.get("phase")) == "stabilizing":
+                if isinstance(exc, StabilizationInterrupted) or (
+                    isinstance(exc, ExecutorError) and self._stop.is_set()
+                ):
+                    self._hold_automatic_rollback_unknown(job, contract, str(exc))
+                    return
+                if isinstance(exc, ExecutorError):
+                    self._transition_automatic_rollback(
+                        job,
+                        contract,
+                        "definitive_failed",
+                        last_error=str(exc),
+                    )
+                    self._fail_automatic_rollback(job, cause, exc)
+                    return
             self._hold_automatic_rollback_unknown(job, contract, str(exc))
 
     def _terminal(

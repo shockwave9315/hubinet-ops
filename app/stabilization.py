@@ -9,6 +9,10 @@ from typing import Any, Callable, Protocol
 from .executor import ExecutorError
 
 
+class StabilizationInterrupted(ExecutorError):
+    """Stabilization has no definitive health outcome and may be retried safely."""
+
+
 class HealthExecutor(Protocol):
     def run(
         self,
@@ -96,11 +100,12 @@ class Stabilizer:
 
         deadline = self.monotonic() + timeout_seconds
         consecutive = 0
+        completed_inspections = 0
         last_data: dict[str, Any] = {}
         last_error: str | None = None
         while self.monotonic() <= deadline:
             if self.stop_event.is_set():
-                raise ExecutorError(
+                raise StabilizationInterrupted(
                     "Agent shutdown interrupted stabilization",
                     data=last_data,
                 )
@@ -111,6 +116,7 @@ class Stabilizer:
                 raw_data = result.get("data") if isinstance(result, dict) else None
                 last_data = dict(raw_data) if isinstance(raw_data, dict) else {}
                 last_error = None
+                completed_inspections += 1
                 ok = self._is_stable(last_data)
             except ExecutorError as exc:
                 last_data = dict(exc.data)
@@ -162,11 +168,16 @@ class Stabilizer:
                 break
             self.sleep(min(policy.poll_interval_seconds, remaining))
 
+        if completed_inspections == 0 and last_error is not None:
+            raise StabilizationInterrupted(
+                f"{phase} stabilization could not be confirmed",
+                data=last_data,
+            )
         raise ExecutorError(f"{phase} stabilization timed out", data=last_data)
 
     def _interruptible_sleep(self, seconds: float) -> None:
         if self.stop_event.wait(seconds):
-            raise ExecutorError("Agent shutdown interrupted stabilization")
+            raise StabilizationInterrupted("Agent shutdown interrupted stabilization")
 
     @staticmethod
     def _is_stable(data: dict[str, Any]) -> bool:
