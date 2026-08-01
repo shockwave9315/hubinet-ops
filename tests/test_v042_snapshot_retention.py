@@ -5,6 +5,7 @@ import importlib
 import json
 from pathlib import Path
 import threading
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -47,6 +48,7 @@ def _owned(
         "rollback_eligible": True,
         "delete_eligible": True,
         "source_job_id": hashlib.sha256(name.encode("utf-8")).hexdigest()[:32],
+        "pve_snaptime": int(datetime.fromisoformat(created_at).timestamp()),
     }
 
 
@@ -68,7 +70,12 @@ def _record_snapshot_source(
     ).hexdigest()
     source_id = f"ownership{digest[:23]}"
     result = (
-        {"source_job_id": snapshot.get("source_job_id")}
+        {
+            "name": resolved_name,
+            "kind": snapshot.get("kind"),
+            "source_job_id": snapshot.get("source_job_id"),
+            "pve_snaptime": snapshot.get("pve_snaptime"),
+        }
         if resolved_operation in {"snapshot_create", "snapshot_create_ram"}
         else {"pre_update_snapshot": True}
     )
@@ -103,6 +110,7 @@ def _record_snapshot_source(
             resolved_vmid,
             resolved_name,
             str(snapshot["source_job_id"]),
+            int(snapshot["pve_snaptime"]),
         )
         db.update_job(source_id, status="success", stage="completed", progress=100)
     return db.get_job(source_id)
@@ -327,6 +335,7 @@ def test_backend_snapshot_proof_confirms_ownership_and_survives_result_update_an
         106,
         snapshot["name"],
         str(snapshot["source_job_id"]),
+        int(snapshot["pve_snaptime"]),
     )
     proof = dict(proven["result"]["snapshot_proof"])
 
@@ -358,8 +367,10 @@ def test_backend_snapshot_proof_confirms_ownership_and_survives_result_update_an
     assert after_restart["source_job_id"] == source["id"]
 
 
-def test_version_one_snapshot_proof_is_preserved_but_never_authorizes_ownership(
+@pytest.mark.parametrize("proof_version", [1, 2])
+def test_legacy_snapshot_proof_is_preserved_but_never_authorizes_ownership(
     tmp_path: Path,
+    proof_version: int,
 ) -> None:
     cfg = settings(tmp_path)
     db = Database(cfg.db_path)
@@ -375,19 +386,21 @@ def test_version_one_snapshot_proof_is_preserved_but_never_authorizes_ownership(
         vmid=106,
         container_name="ct-106",
         operation_type="update",
-        request_id="legacy-version-one-proof-0001",
+        request_id=f"legacy-version-{proof_version}-proof-0001",
         snapshot_name=snapshot["name"],
     )
-    version_one = {
-        "version": 1,
+    legacy_proof = {
+        "version": proof_version,
         "vmid": 106,
         "snapshot_name": snapshot["name"],
         "kind": "pre-update",
     }
+    if proof_version == 2:
+        legacy_proof["host_source_job_id"] = snapshot["source_job_id"]
     with db._lock, db._connect() as conn:
         conn.execute(
             "UPDATE jobs SET result=? WHERE id=?",
-            (json.dumps({"snapshot_proof": version_one}), source["id"]),
+            (json.dumps({"snapshot_proof": legacy_proof}), source["id"]),
         )
     terminal = db.update_job(
         source["id"],
@@ -400,7 +413,7 @@ def test_version_one_snapshot_proof_is_preserved_but_never_authorizes_ownership(
 
     modeled = service.list_snapshots(106)["snapshots"][0]
 
-    assert terminal["result"]["snapshot_proof"] == version_one
+    assert terminal["result"]["snapshot_proof"] == legacy_proof
     assert modeled["owned_by_hubinet_ops"] is False
     assert modeled["ownership_status"] == "uncertain"
     assert modeled["protected"] is True
@@ -408,7 +421,11 @@ def test_version_one_snapshot_proof_is_preserved_but_never_authorizes_ownership(
     assert modeled["delete_eligible"] is False
     with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
         service.manual_rollback(106)
-    service.queue_snapshot_prune(106, "oldest", "version-one-proof-prune-0001")
+    service.queue_snapshot_prune(
+        106,
+        "oldest",
+        f"version-{proof_version}-proof-prune-0001",
+    )
     prune = run_queued(service, db)
     assert prune["result"]["deleted"] == []
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
@@ -467,8 +484,8 @@ def test_version_one_snapshot_proof_cannot_authorize_automatic_rollback(
 
 @pytest.mark.parametrize(
     "replacement_source_job_id",
-    ["b" * 32, ""],
-    ids=["different-source", "empty-source"],
+    ["b" * 32, "", "a" * 32],
+    ids=["different-source", "empty-source", "same-source-different-snaptime"],
 )
 def test_stale_pre_update_proof_never_authorizes_recreated_snapshot(
     tmp_path: Path,
@@ -498,6 +515,7 @@ def test_stale_pre_update_proof_never_authorizes_recreated_snapshot(
         106,
         snapshot["name"],
         original_source_job_id,
+        int(snapshot["pve_snaptime"]),
     )
     db.update_job(source["id"], status="blocked", stage="failed", progress=100)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
@@ -505,10 +523,15 @@ def test_stale_pre_update_proof_never_authorizes_recreated_snapshot(
 
     replacement = dict(snapshot)
     replacement["source_job_id"] = replacement_source_job_id
+    if replacement_source_job_id == original_source_job_id:
+        replacement["pve_snaptime"] = int(snapshot["pve_snaptime"]) + 1
     host.snapshots = [replacement]
     modeled = service.list_snapshots(106)["snapshots"][0]
 
-    assert replacement_source_job_id != original_source_job_id
+    assert (
+        replacement_source_job_id != original_source_job_id
+        or replacement["pve_snaptime"] != snapshot["pve_snaptime"]
+    )
     assert modeled["owned_by_hubinet_ops"] is False
     assert modeled["ownership_status"] == "uncertain"
     assert modeled["rollback_eligible"] is False
@@ -516,6 +539,39 @@ def test_stale_pre_update_proof_never_authorizes_recreated_snapshot(
     with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
         service.manual_rollback(106)
     service.queue_snapshot_prune(106, "oldest", "stale-proof-prune-0001")
+    prune = run_queued(service, db)
+    assert prune["result"]["deleted"] == []
+    assert not any(call[0] == "snapshot_delete" for call in host.calls)
+
+
+def test_manual_snapshot_same_source_replay_with_new_snaptime_is_uncertain(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path)
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    original = _owned(
+        106,
+        "20260729T125500Z",
+        created_at="2026-07-29T12:55:00+00:00",
+    )
+    _record_snapshot_source(db, original)
+    host.snapshots = [original]
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
+    assert service.list_snapshots(106)["snapshots"][0]["owned_by_hubinet_ops"] is True
+
+    replacement = dict(original)
+    replacement["pve_snaptime"] = int(original["pve_snaptime"]) + 1
+    host.snapshots = [replacement]
+    modeled = service.list_snapshots(106)["snapshots"][0]
+
+    assert modeled["owned_by_hubinet_ops"] is False
+    assert modeled["protected"] is True
+    assert modeled["rollback_eligible"] is False
+    assert modeled["delete_eligible"] is False
+    with pytest.raises(ValueError, match="does not exist"):
+        service.queue_snapshot_action(106, "delete", original["name"], "manual-replay-delete-0001")
+    service.queue_snapshot_prune(106, "oldest", "manual-replay-prune-0001")
     prune = run_queued(service, db)
     assert prune["result"]["deleted"] == []
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
@@ -658,6 +714,7 @@ def test_malformed_active_update_result_blocks_proof_persistence_fail_closed(
             106,
             snapshot["name"],
             str(snapshot["source_job_id"]),
+            int(snapshot["pve_snaptime"]),
         )
 
     modeled = OpsService(
@@ -730,7 +787,12 @@ def test_malformed_newer_candidate_does_not_hide_valid_manual_source(
     db.update_job(
         valid["id"],
         status="success",
-        result={"source_job_id": snapshot["source_job_id"]},
+        result={
+            "name": snapshot["name"],
+            "kind": "manual",
+            "source_job_id": snapshot["source_job_id"],
+            "pve_snaptime": snapshot["pve_snaptime"],
+        },
     )
     malformed, _ = db.create_operation_job(
         vmid=106,

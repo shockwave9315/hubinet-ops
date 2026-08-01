@@ -93,7 +93,12 @@ def test_host_control_client_sends_typed_qemu_include_ram(
             json={
                 "id": host_job_id,
                 "status": "succeeded",
-                "result": {"source_job_id": host_job_id},
+                "result": {
+                    "name": "hubinet-ops-100-manual-20260729T120000Z",
+                    "kind": "manual",
+                    "source_job_id": host_job_id,
+                    "pve_snaptime": 1785329640,
+                },
             },
         )
 
@@ -133,7 +138,11 @@ def test_host_control_client_rejects_snapshot_result_from_different_host_job(
             json={
                 "id": host_job_id,
                 "status": "succeeded",
-                "result": {"source_job_id": "e" * 32},
+                "result": {
+                    "name": "hubinet-ops-106-pre-20260729T120000Z",
+                    "kind": "pre-update",
+                    "source_job_id": "e" * 32,
+                },
             },
         )
 
@@ -152,6 +161,46 @@ def test_host_control_client_rejects_snapshot_result_from_different_host_job(
             "snapshot_create",
             106,
             "pre-update-snapshot-request-0001",
+            snapshot_name="hubinet-ops-106-pre-20260729T120000Z",
+        )
+
+
+def test_host_control_client_rejects_create_result_without_pve_snaptime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_HOSTD_TOKEN", "t" * 64)
+    host_job_id = "d" * 32
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json={"id": host_job_id, "status": "queued"})
+        return httpx.Response(
+            200,
+            json={
+                "id": host_job_id,
+                "status": "succeeded",
+                "result": {
+                    "name": "hubinet-ops-106-pre-20260729T120000Z",
+                    "kind": "pre-update",
+                    "source_job_id": host_job_id,
+                },
+            },
+        )
+
+    client = HostControlClient(
+        {
+            "base_url": "http://hostd.invalid",
+            "backend_token_env": "TEST_HOSTD_TOKEN",
+            "poll_interval_seconds": 0.001,
+        },
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        sleep=lambda _seconds: None,
+    )
+    with pytest.raises(HostControlError, match="PVE snaptime"):
+        client.execute(
+            "snapshot_create",
+            106,
+            "missing-snaptime-create-result-0001",
             snapshot_name="hubinet-ops-106-pre-20260729T120000Z",
         )
 
@@ -328,6 +377,13 @@ def test_wait_existing_job_rejects_contract_mismatch_without_post(
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+        durable_argument = HostControlClient._snapshot_identity_argument(
+            vmid=110,
+            snapshot_name=remote_argument,
+            snapshot_kind="manual",
+            expected_source_job_id="a" * 32,
+            expected_pve_snaptime=1785329640,
+        )
         return httpx.Response(
             200,
             json={
@@ -335,7 +391,7 @@ def test_wait_existing_job_rejects_contract_mismatch_without_post(
                 "vmid": 110,
                 "request_id": request_id,
                 "operation_type": remote_operation,
-                "argument": remote_argument,
+                "argument": durable_argument,
                 "status": "running",
                 "stage": "executing",
                 "result": None,
@@ -355,6 +411,9 @@ def test_wait_existing_job_rejects_contract_mismatch_without_post(
             110,
             request_id,
             snapshot_name=expected_snapshot,
+            snapshot_kind="manual",
+            expected_source_job_id="a" * 32,
+            expected_pve_snaptime=1785329640,
         )
 
     assert captured.value.status == "contract_mismatch"

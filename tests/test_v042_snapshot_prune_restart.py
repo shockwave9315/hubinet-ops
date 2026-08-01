@@ -27,6 +27,17 @@ class SimulatedBackendRestart(BaseException):
     pass
 
 
+def expected_identity(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "vmid": int(str(snapshot["name"]).split("-")[2]),
+        "snapshot_name": snapshot["name"],
+        "kind": snapshot["kind"],
+        "host_source_job_id": snapshot["source_job_id"],
+        "pve_snaptime": snapshot["pve_snaptime"],
+    }
+
+
 class RestartablePruneHost(FakeHostControl):
     def __init__(self, db: Database) -> None:
         super().__init__()
@@ -45,6 +56,9 @@ class RestartablePruneHost(FakeHostControl):
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         if operation_type != "snapshot_delete":
@@ -53,16 +67,26 @@ class RestartablePruneHost(FakeHostControl):
                 vmid,
                 request_id,
                 snapshot_name=snapshot_name,
+                snapshot_kind=snapshot_kind,
+                expected_source_job_id=expected_source_job_id,
+                expected_pve_snaptime=expected_pve_snaptime,
                 release_fingerprint=release_fingerprint,
             )
         assert snapshot_name is not None
         active = self.db.active_jobs()
         assert len(active) == 1
         assert active[0]["operation_type"] == "snapshot_prune"
-        assert active[0]["result"]["current"] == {
+        current = active[0]["result"]["current"]
+        assert current["snapshot_name"] == snapshot_name
+        assert current["request_id"] == request_id
+        assert current["phase"] == "submitted"
+        assert current["expected_snapshot_identity"] == {
+            "version": 1,
+            "vmid": vmid,
             "snapshot_name": snapshot_name,
-            "request_id": request_id,
-            "phase": "submitted",
+            "kind": snapshot_kind,
+            "host_source_job_id": expected_source_job_id,
+            "pve_snaptime": expected_pve_snaptime,
         }
         self.calls.append(
             (operation_type, vmid, request_id, snapshot_name, release_fingerprint)
@@ -96,6 +120,9 @@ class RestartablePruneHost(FakeHostControl):
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         self.reattach_calls.append(
@@ -297,8 +324,9 @@ def test_restart_before_submission_resubmits_stable_child_request(
     state.update(
         {
             "phase": "child_prepared",
-            "current": {
-                "snapshot_name": target["name"],
+                "current": {
+                    "snapshot_name": target["name"],
+                    "expected_snapshot_identity": expected_identity(target),
                 "request_id": request_id,
                 "phase": "prepared",
             },
@@ -424,8 +452,9 @@ def test_failed_child_delete_fails_prune_but_preserves_durable_source(
     state.update(
         {
             "phase": "child_submitted",
-            "current": {
-                "snapshot_name": target["name"],
+                "current": {
+                    "snapshot_name": target["name"],
+                    "expected_snapshot_identity": expected_identity(target),
                 "request_id": request_id,
                 "phase": "submitted",
             },
@@ -522,8 +551,9 @@ def test_missing_remote_job_is_resubmitted_only_when_target_still_exists(
     state.update(
         {
             "phase": "child_submitted",
-            "current": {
-                "snapshot_name": target["name"],
+                "current": {
+                    "snapshot_name": target["name"],
+                    "expected_snapshot_identity": expected_identity(target),
                 "request_id": request_id,
                 "phase": "submitted",
             },
@@ -555,8 +585,9 @@ def test_ambiguous_remote_outcome_stays_active_and_fail_closed(
     state.update(
         {
             "phase": "child_submitted",
-            "current": {
-                "snapshot_name": target["name"],
+                "current": {
+                    "snapshot_name": target["name"],
+                    "expected_snapshot_identity": expected_identity(target),
                 "request_id": request_id,
                 "phase": "submitted",
             },
@@ -712,6 +743,9 @@ def test_prune_failure_does_not_rewrite_successful_create_source(
             request_id: str,
             *,
             snapshot_name: str | None = None,
+            snapshot_kind: str | None = None,
+            expected_source_job_id: str | None = None,
+            expected_pve_snaptime: int | None = None,
             release_fingerprint: str | None = None,
         ) -> dict[str, Any]:
             if operation_type == "snapshot_delete":
@@ -724,6 +758,9 @@ def test_prune_failure_does_not_rewrite_successful_create_source(
                 vmid,
                 request_id,
                 snapshot_name=snapshot_name,
+                snapshot_kind=snapshot_kind,
+                expected_source_job_id=expected_source_job_id,
+                expected_pve_snaptime=expected_pve_snaptime,
                 release_fingerprint=release_fingerprint,
             )
 

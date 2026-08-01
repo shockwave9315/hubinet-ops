@@ -24,7 +24,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from hubinet_ops_host_control import HostControlError, HostController
+from hubinet_ops_host_control import (
+    HostControlError,
+    HostController,
+    snapshot_identity_argument,
+)
 from hubinet_ops_release import ReleaseError, read_marker, remove_marker, write_marker
 
 VERSION = "0.4.2"
@@ -77,6 +81,16 @@ def _runtime_status(payload: Any) -> str:
     if status not in {"running", "stopped"}:
         raise HostControlError("status response has no valid LXC runtime state")
     return status
+
+
+def _snapshot_identity_name(argument: str | None) -> str | None:
+    try:
+        value = json.loads(str(argument or ""))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    return str(value.get("snapshot_name") or "") or None
 
 
 def _parse_timestamp(value: Any) -> datetime | None:
@@ -313,7 +327,11 @@ class HostJobStore:
                     job_id,
                     request_id,
                     vmid,
-                    argument if operation_type == "offline_snapshot_restore" else None,
+                    (
+                        _snapshot_identity_name(argument)
+                        if operation_type == "offline_snapshot_restore"
+                        else None
+                    ),
                     operation_type,
                     now,
                 ),
@@ -885,7 +903,6 @@ class HostdApplication:
             "offline_snapshot_restore": "snapshot-rollback",
             "offline_force_stop": "force-stop",
         }[operation_type]
-        self.runner.controller.policy.validate(action, vmid, argument)
         with self._submit_lock:
             try:
                 existing = self.store.get_by_request_id(vmid, request_id)
@@ -894,7 +911,14 @@ class HostdApplication:
             if existing is not None:
                 if (
                     existing["operation_type"] != operation_type
-                    or existing["argument"] != argument
+                    or (
+                        operation_type == "offline_snapshot_restore"
+                        and _snapshot_identity_name(existing.get("argument")) != argument
+                    )
+                    or (
+                        operation_type == "offline_force_stop"
+                        and existing["argument"] is not None
+                    )
                 ):
                     raise ValueError(
                         "request_id was already used for another operation"
@@ -926,6 +950,34 @@ class HostdApplication:
                     raise HostControlError(
                         "offline restore requires an owned rollback-eligible snapshot"
                     )
+                source_job_id = str(snapshot.get("source_job_id") or "")
+                try:
+                    source_job = self.store.get(source_job_id)
+                except KeyError as exc:
+                    raise HostControlError(
+                        "offline restore snapshot has no durable create job"
+                    ) from exc
+                result = source_job.get("result")
+                if (
+                    source_job.get("operation_type")
+                    not in {"snapshot_create", "snapshot_create_ram"}
+                    or source_job.get("status") != "succeeded"
+                    or not isinstance(result, dict)
+                    or result.get("name") != argument
+                    or result.get("source_job_id") != source_job_id
+                    or result.get("pve_snaptime") != snapshot.get("pve_snaptime")
+                ):
+                    raise HostControlError(
+                        "offline restore snapshot identity is not backed by its create job"
+                    )
+                argument = snapshot_identity_argument(
+                    vmid=vmid,
+                    snapshot_name=str(snapshot["name"]),
+                    kind=str(snapshot.get("kind") or ""),
+                    expected_source_job_id=source_job_id,
+                    expected_pve_snaptime=snapshot.get("pve_snaptime"),
+                )
+            self.runner.controller.policy.validate(action, vmid, argument)
             job, created = self.store.create_recovery(
                 vmid=vmid,
                 operation_type=operation_type,
@@ -1149,7 +1201,16 @@ class HostdHandler(BaseHTTPRequestHandler):
             }:
                 vmid = int(snapshot_match.group("vmid"))
                 operation_type = "snapshot_rollback"
-                argument = unquote(snapshot_match.group("name"))
+                snapshot_name = unquote(snapshot_match.group("name"))
+                argument = snapshot_identity_argument(
+                    vmid=vmid,
+                    snapshot_name=snapshot_name,
+                    kind=str(payload.get("kind") or ""),
+                    expected_source_job_id=str(
+                        payload.get("expected_source_job_id") or ""
+                    ),
+                    expected_pve_snaptime=payload.get("expected_pve_snaptime"),
+                )
                 job, created = self.app.submit(
                     vmid=vmid,
                     operation_type=operation_type,
@@ -1191,11 +1252,21 @@ class HostdHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._body()
+            vmid = int(match.group("vmid"))
+            snapshot_name = unquote(match.group("name"))
             job, created = self.app.submit(
-                vmid=int(match.group("vmid")),
+                vmid=vmid,
                 operation_type="snapshot_delete",
                 request_id=str(payload.get("request_id") or uuid.uuid4().hex),
-                argument=unquote(match.group("name")),
+                argument=snapshot_identity_argument(
+                    vmid=vmid,
+                    snapshot_name=snapshot_name,
+                    kind=str(payload.get("kind") or ""),
+                    expected_source_job_id=str(
+                        payload.get("expected_source_job_id") or ""
+                    ),
+                    expected_pve_snaptime=payload.get("expected_pve_snaptime"),
+                ),
             )
         except ValueError as exc:
             self._send(HTTPStatus.BAD_REQUEST, {"error": str(exc)})

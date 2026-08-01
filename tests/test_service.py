@@ -34,6 +34,7 @@ class FakeClock:
 class UpdateSnapshotHost:
     def __init__(self) -> None:
         self.snapshots: list[dict[str, Any]] = []
+        self.calls: list[tuple[str, int, str]] = []
 
     def list_snapshots(self, vmid: int) -> list[dict[str, Any]]:
         return [dict(item) for item in self.snapshots]
@@ -45,8 +46,17 @@ class UpdateSnapshotHost:
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
     ) -> dict[str, Any]:
+        self.calls.append((operation_type, vmid, request_id))
+        if operation_type == "snapshot_rollback":
+            assert snapshot_kind == "pre-update"
+            assert expected_source_job_id
+            assert expected_pve_snaptime
+            return {"lxc_status": "running", "runtime_status": "running"}
         assert operation_type == "snapshot_create"
         assert snapshot_name is not None
         source_job_id = hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:32]
@@ -58,6 +68,7 @@ class UpdateSnapshotHost:
             "rollback_eligible": True,
             "delete_eligible": True,
             "source_job_id": source_job_id,
+            "pve_snaptime": 1785329640,
         }
         self.snapshots.insert(0, snapshot)
         return dict(snapshot)
@@ -763,7 +774,7 @@ def test_repair_failure_invokes_rollback_and_waits_for_0_3_3(tmp_path: Path) -> 
     service._run_job(job)
     assert db.get_job(job["id"])["status"] == "rolled_back"
     assert "repair" in executor.actions
-    assert "rollback" in executor.actions
+    assert "rollback" not in executor.actions
     state = service.get_state(106)
     assert state["last_operation_result"] == "rolled_back"
     assert state["last_terminal_event"] == "job_rolled_back"
@@ -933,10 +944,13 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
             return [
                 {
                     "name": snapshot,
+                    "kind": "pre-update",
+                    "vmid": 106,
                     "owned_by_hubinet_ops": True,
                     "rollback_eligible": True,
                     "delete_eligible": True,
                     "source_job_id": "c" * 32,
+                    "pve_snaptime": 1785329640,
                 }
             ]
 
@@ -947,6 +961,9 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
             request_id: str,
             *,
             snapshot_name: str | None = None,
+            snapshot_kind: str | None = None,
+            expected_source_job_id: str | None = None,
+            expected_pve_snaptime: int | None = None,
             release_fingerprint: str | None = None,
         ) -> dict[str, Any]:
             assert operation_type == "snapshot_rollback"
@@ -972,7 +989,9 @@ def test_manual_rollback_requires_policy_and_failed_snapshot(tmp_path: Path) -> 
         source["id"],
         snapshot_name=snapshot,
     )
-    db.record_pre_update_snapshot_proof(source["id"], 106, snapshot, "c" * 32)
+    db.record_pre_update_snapshot_proof(
+        source["id"], 106, snapshot, "c" * 32, 1785329640
+    )
     db.update_job(source["id"], status="failed", stage="failed", progress=100)
     db.update_plan_status(plan["id"], "failed")
     result = service.manual_rollback(106)
@@ -1039,7 +1058,7 @@ def test_post_update_verification_failure_triggers_rollback(tmp_path: Path) -> N
     job = approved_job(service, db)
     service._run_job(job)
     assert db.get_job(job["id"])["status"] == "rolled_back"
-    assert "rollback" in executor.actions
+    assert "rollback" not in executor.actions
     state = service.get_state(106)
     assert state["verification_status"] == "unknown"
     assert state["apt_check_ok"] is None
@@ -1298,7 +1317,7 @@ def test_integrity_or_docker_verification_failure_follows_rollback_policy(
     job = approved_job(service, db)
     service._run_job(job)
     assert db.get_job(job["id"])["status"] == "rolled_back"
-    assert "rollback" in executor.actions
+    assert "rollback" not in executor.actions
     state = service.get_state(106)
     assert state["verification_status"] == "unknown"
     assert state["packages_remaining_count"] is None

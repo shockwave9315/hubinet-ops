@@ -929,7 +929,15 @@ class OpsService:
                 raise ValueError(
                     f"Cannot establish PVE runtime before rollback: {runtime}"
                 )
-            job = self.db.create_manual_rollback_job(source["id"])
+            job = self.db.create_manual_rollback_job(
+                source["id"],
+                expected_snapshot_identity=self._snapshot_identity(
+                    vmid,
+                    selected,
+                    expected_name=snapshot_name,
+                    expected_kind="pre-update",
+                ),
+            )
             self.db.update_job(job["id"], status="running", stage="rollback", progress=1)
             self._run_operation_job(job)
             return self.db.get_job(job["id"])
@@ -1147,8 +1155,15 @@ class OpsService:
             parsed = parse_owned_snapshot_name(name, vmid=vmid)
             snapshot_jobs = jobs_by_snapshot.get(name, [])
             host_source_job_id = str(item.get("source_job_id") or "") or None
+            pve_snaptime = item.get("pve_snaptime")
             durable_source: dict[str, Any] | None = None
-            if item.get("owned_by_hubinet_ops") is True and parsed is not None:
+            if (
+                item.get("owned_by_hubinet_ops") is True
+                and parsed is not None
+                and isinstance(pve_snaptime, int)
+                and not isinstance(pve_snaptime, bool)
+                and pve_snaptime > 0
+            ):
                 if parsed["kind"] == "manual" and host_source_job_id is not None:
                     durable_source = next(
                         (
@@ -1165,6 +1180,11 @@ class OpsService:
                                 or ""
                             )
                             == host_source_job_id
+                            and isinstance(candidate.get("result"), dict)
+                            and candidate["result"].get("pve_snaptime")
+                            == pve_snaptime
+                            and candidate["result"].get("name") == name
+                            and candidate["result"].get("kind") == "manual"
                         ),
                         None,
                     )
@@ -1179,6 +1199,7 @@ class OpsService:
                                 vmid,
                                 name,
                                 host_source_job_id,
+                                pve_snaptime,
                             )
                         ),
                         None,
@@ -1226,6 +1247,7 @@ class OpsService:
                         str(related_job["id"]) if related_job is not None else None
                     ),
                     "host_source_job_id": host_source_job_id,
+                    "pve_snaptime": pve_snaptime,
                     "source_plan_id": (
                         str(related_plan["id"])
                         if related_plan is not None
@@ -1402,6 +1424,13 @@ class OpsService:
             operation_type=operation_type,
             request_id=request_id or uuid.uuid4().hex,
             snapshot_name=str(selected["name"]),
+            result={
+                "expected_snapshot_identity": self._snapshot_identity(
+                    vmid,
+                    selected,
+                    expected_name=str(selected["name"]),
+                )
+            },
             require_no_active_plan=action == "rollback",
         )
         self._mark_job_queued(vmid, job)
@@ -1999,6 +2028,13 @@ class OpsService:
     def _reconcile_startup_jobs(self) -> None:
         for job in self.db.active_jobs():
             operation_type = str(job.get("operation_type") or "update")
+            if (
+                operation_type == "update"
+                and str(job.get("stage") or "")
+                in {"rollback", "rollback_wait", "rollback_healthcheck"}
+            ):
+                self._reattach_automatic_rollback(job)
+                continue
             if operation_type == "snapshot_prune":
                 self._reconcile_snapshot_prune(job)
                 continue
@@ -2126,11 +2162,23 @@ class OpsService:
             if operation_type == "self_update":
                 release = self._approved_self_update_release(job)
                 release_fingerprint = str(release["fingerprint"])
+            identity = (
+                self._expected_snapshot_identity_from_job(job)
+                if operation_type in {"snapshot_rollback", "snapshot_delete"}
+                else None
+            )
             result = self.host_control.wait_existing_job(
                 operation_type,
                 int(job["vmid"]),
                 str(job["request_id"]),
                 snapshot_name=snapshot_name,
+                snapshot_kind=(str(identity["kind"]) if identity else None),
+                expected_source_job_id=(
+                    str(identity["host_source_job_id"]) if identity else None
+                ),
+                expected_pve_snaptime=(
+                    int(identity["pve_snaptime"]) if identity else None
+                ),
                 release_fingerprint=release_fingerprint,
             )
             self._finalize_operation_success(
@@ -2227,7 +2275,7 @@ class OpsService:
                         f"pre-update-snapshot-{job['id']}",
                         snapshot_name=snapshot,
                     )
-                    host_source_job_id = self._pre_update_host_source_job_id(
+                    snapshot_identity = self._pre_update_snapshot_identity(
                         host_result,
                         vmid=vmid,
                         snapshot_name=snapshot,
@@ -2240,7 +2288,8 @@ class OpsService:
                     self._confirm_physical_pre_update_snapshot(
                         vmid,
                         snapshot,
-                        host_source_job_id,
+                        str(snapshot_identity["host_source_job_id"]),
+                        int(snapshot_identity["pve_snaptime"]),
                     )
                 except (ExecutorError, HostControlError, ValueError) as exc:
                     warning = sanitize_text(
@@ -2275,7 +2324,8 @@ class OpsService:
                         str(job["id"]),
                         vmid,
                         snapshot,
-                        host_source_job_id,
+                        str(snapshot_identity["host_source_job_id"]),
+                        int(snapshot_identity["pve_snaptime"]),
                     )
                 except Exception as exc:
                     raise ExecutorError(
@@ -2771,6 +2821,11 @@ class OpsService:
             name = str(candidate["name"])
             state["current"] = {
                 "snapshot_name": name,
+                "expected_snapshot_identity": self._snapshot_identity(
+                    vmid,
+                    candidate,
+                    expected_name=name,
+                ),
                 "request_id": self._snapshot_prune_child_request_id(job, name),
                 "phase": "prepared",
             }
@@ -2806,11 +2861,15 @@ class OpsService:
                 "Snapshot prune job has no persisted durable contract"
             )
         state = dict(raw)
-        if state.get("prune_version") == 1:
+        if state.get("prune_version") in {1, 2}:
             legacy_deleted = state.get("deleted")
             if not isinstance(legacy_deleted, list):
                 raise SnapshotPruneOutcomeUnknown(
                     "Legacy snapshot prune job has invalid deletion history"
+                )
+            if state.get("current") is not None:
+                raise SnapshotPruneOutcomeUnknown(
+                    "Legacy active snapshot prune has no durable physical identity"
                 )
             state["prune_version"] = SNAPSHOT_PRUNE_STATE_VERSION
             state["deleted_count"] = len(legacy_deleted)
@@ -2885,6 +2944,18 @@ class OpsService:
                 not in {"prepared", "submitted", "remote_succeeded", "unknown"}
             ):
                 raise ValueError("Snapshot pruning current child contract is invalid")
+            identity = current.get("expected_snapshot_identity")
+            if not isinstance(identity, dict):
+                raise SnapshotPruneOutcomeUnknown(
+                    "Snapshot pruning child has no durable expected identity"
+                )
+            self._expected_snapshot_identity_from_job(
+                {
+                    **job,
+                    "snapshot_name": name,
+                    "result": {"expected_snapshot_identity": identity},
+                }
+            )
         return state
 
     def _persist_snapshot_prune_state(
@@ -2944,6 +3015,17 @@ class OpsService:
         current = dict(state["current"])
         name = str(current["snapshot_name"])
         request_id = str(current["request_id"])
+        identity = self._expected_snapshot_identity_from_job(
+            {
+                **job,
+                "snapshot_name": name,
+                "result": {
+                    "expected_snapshot_identity": current.get(
+                        "expected_snapshot_identity"
+                    )
+                },
+            }
+        )
         host_control = self._require_host_control("Snapshot pruning")
         child_phase = str(current["phase"])
         remote_succeeded = child_phase == "remote_succeeded"
@@ -2955,6 +3037,9 @@ class OpsService:
                     vmid,
                     request_id,
                     snapshot_name=name,
+                    snapshot_kind=str(identity["kind"]),
+                    expected_source_job_id=str(identity["host_source_job_id"]),
+                    expected_pve_snaptime=int(identity["pve_snaptime"]),
                 )
                 remote_succeeded = True
             except HostControlError as exc:
@@ -2985,6 +3070,9 @@ class OpsService:
                         vmid,
                         request_id,
                         snapshot_name=name,
+                        snapshot_kind=str(identity["kind"]),
+                        expected_source_job_id=str(identity["host_source_job_id"]),
+                        expected_pve_snaptime=int(identity["pve_snaptime"]),
                     )
                     remote_succeeded = True
         elif not remote_succeeded:
@@ -3010,6 +3098,9 @@ class OpsService:
                     vmid,
                     request_id,
                     snapshot_name=name,
+                    snapshot_kind=str(identity["kind"]),
+                    expected_source_job_id=str(identity["host_source_job_id"]),
+                    expected_pve_snaptime=int(identity["pve_snaptime"]),
                 )
                 remote_succeeded = True
 
@@ -3149,11 +3240,26 @@ class OpsService:
                 str(job["request_id"]),
                 release_fingerprint=str(release["fingerprint"]),
             )
+        identity = (
+            self._expected_snapshot_identity_from_job(job)
+            if operation_type in {"snapshot_rollback", "snapshot_delete"}
+            else None
+        )
+        identity_kwargs = (
+            {
+                "snapshot_kind": str(identity["kind"]),
+                "expected_source_job_id": str(identity["host_source_job_id"]),
+                "expected_pve_snaptime": int(identity["pve_snaptime"]),
+            }
+            if identity
+            else {}
+        )
         return host_control.execute(
             operation_type,
             vmid,
             str(job["request_id"]),
             snapshot_name=str(snapshot_name) if snapshot_name else None,
+            **identity_kwargs,
         )
 
     def _approved_self_update_release(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -3184,6 +3290,7 @@ class OpsService:
         vmid: int,
         snapshot_name: str,
         host_source_job_id: str,
+        pve_snaptime: int,
     ) -> dict[str, Any]:
         """Confirm an exact host-owned snapshot without consulting durable proof."""
         try:
@@ -3217,6 +3324,8 @@ class OpsService:
             raise ValueError("Physical snapshot source job ID is missing or malformed")
         if physical_source_job_id != host_source_job_id:
             raise ValueError("Physical snapshot source job ID does not match host result")
+        if snapshot.get("pve_snaptime") != pve_snaptime:
+            raise ValueError("Physical snapshot PVE snaptime does not match host result")
         if (
             "ownership_status" in snapshot
             and snapshot.get("ownership_status") != "owned"
@@ -3234,6 +3343,70 @@ class OpsService:
                 raise ValueError("Physical snapshot VMID conflicts with the resource")
         return snapshot
 
+    @classmethod
+    def _snapshot_identity(
+        cls,
+        vmid: int,
+        snapshot: dict[str, Any],
+        *,
+        expected_name: str | None = None,
+        expected_kind: str | None = None,
+    ) -> dict[str, Any]:
+        name = str(snapshot.get("name") or "")
+        parsed = parse_owned_snapshot_name(name, vmid=vmid)
+        kind = str(snapshot.get("kind") or "")
+        source_job_id = str(snapshot.get("host_source_job_id") or snapshot.get("source_job_id") or "")
+        snaptime = snapshot.get("pve_snaptime")
+        if (
+            parsed is None
+            or kind != parsed.get("kind")
+            or (expected_name is not None and name != expected_name)
+            or (expected_kind is not None and kind != expected_kind)
+            or snapshot.get("owned_by_hubinet_ops") is not True
+            or not cls._valid_host_source_job_id(source_job_id)
+            or isinstance(snaptime, bool)
+            or not isinstance(snaptime, int)
+            or snaptime <= 0
+        ):
+            raise ValueError("Snapshot has no valid physical identity")
+        return {
+            "version": 1,
+            "vmid": int(vmid),
+            "snapshot_name": name,
+            "kind": kind,
+            "host_source_job_id": source_job_id,
+            "pve_snaptime": snaptime,
+        }
+
+    @classmethod
+    def _expected_snapshot_identity_from_job(
+        cls,
+        job: dict[str, Any],
+    ) -> dict[str, Any]:
+        result = job.get("result")
+        identity = (
+            result.get("expected_snapshot_identity")
+            if isinstance(result, dict)
+            else None
+        )
+        if not isinstance(identity, dict):
+            raise ValueError("Snapshot operation has no durable expected identity")
+        modeled = {
+            "name": identity.get("snapshot_name"),
+            "kind": identity.get("kind"),
+            "source_job_id": identity.get("host_source_job_id"),
+            "pve_snaptime": identity.get("pve_snaptime"),
+            "owned_by_hubinet_ops": True,
+        }
+        validated = cls._snapshot_identity(
+            int(job["vmid"]),
+            modeled,
+            expected_name=str(job.get("snapshot_name") or ""),
+        )
+        if identity.get("version") != 1 or identity.get("vmid") != int(job["vmid"]):
+            raise ValueError("Snapshot operation expected identity is malformed")
+        return validated
+
     @staticmethod
     def _valid_host_source_job_id(value: str) -> bool:
         return (
@@ -3242,13 +3415,13 @@ class OpsService:
         )
 
     @classmethod
-    def _pre_update_host_source_job_id(
+    def _pre_update_snapshot_identity(
         cls,
         result: dict[str, Any],
         *,
         vmid: int,
         snapshot_name: str,
-    ) -> str:
+    ) -> dict[str, Any]:
         if not isinstance(result, dict):
             raise ValueError("Host snapshot result is malformed")
         if str(result.get("name") or "") != snapshot_name:
@@ -3268,7 +3441,21 @@ class OpsService:
         source_job_id = str(result.get("source_job_id") or "")
         if not cls._valid_host_source_job_id(source_job_id):
             raise ValueError("Host snapshot result source job ID is missing or malformed")
-        return source_job_id
+        snaptime = result.get("pve_snaptime")
+        if (
+            isinstance(snaptime, bool)
+            or not isinstance(snaptime, int)
+            or snaptime <= 0
+        ):
+            raise ValueError("Host snapshot result PVE snaptime is missing or malformed")
+        return {
+            "version": 1,
+            "vmid": int(vmid),
+            "snapshot_name": snapshot_name,
+            "kind": "pre-update",
+            "host_source_job_id": source_job_id,
+            "pve_snaptime": snaptime,
+        }
 
     def _validate_approved_plan(
         self,
@@ -3409,7 +3596,58 @@ class OpsService:
                 event_type="rollback_started",
                 message="Rollback started",
             )
-            self._execute("rollback", vmid, 1200, emit, snapshot)
+            refreshed = self._refresh_snapshot_state(
+                vmid,
+                job=job,
+                required_name=snapshot,
+                required_kind="pre-update",
+            )
+            selected = next(
+                item
+                for item in refreshed["snapshots"]
+                if item.get("name") == snapshot
+            )
+            identity = self._snapshot_identity(
+                vmid,
+                selected,
+                expected_name=snapshot,
+                expected_kind="pre-update",
+            )
+            proof = self._pre_update_identity_from_job(job)
+            if identity != proof:
+                raise ExecutorError("Rollback snapshot physical identity changed")
+            self._require_host_control("Automatic rollback").execute(
+                "snapshot_rollback",
+                vmid,
+                f"automatic-rollback-{job['id']}",
+                snapshot_name=snapshot,
+                snapshot_kind="pre-update",
+                expected_source_job_id=str(identity["host_source_job_id"]),
+                expected_pve_snaptime=int(identity["pve_snaptime"]),
+            )
+            self._finish_automatic_rollback(job, cause, emit, policy)
+        except (ExecutorError, HostControlError, ValueError) as rollback_error:
+            error = f"Original failure: {cause}; rollback failure: {rollback_error}"
+            self.db.update_plan_status(job["plan_id"], "failed")
+            self._terminal(job, "failed", "manual_intervention", error)
+            self._notify_ha(
+                self._notification(
+                    "manual_intervention_required",
+                    vmid,
+                    error=error,
+                )
+            )
+
+    def _finish_automatic_rollback(
+        self,
+        job: dict[str, Any],
+        cause: str,
+        emit: Callable[..., None],
+        policy: StabilizationPolicy,
+    ) -> None:
+        vmid = int(job["vmid"])
+        snapshot = str(self.db.get_job(job["id"]).get("snapshot_name") or "")
+        try:
             emit(
                 stage="rollback_wait",
                 progress=90,
@@ -3467,16 +3705,69 @@ class OpsService:
                 )
             self._terminal(job, "rolled_back", "rolled_back", cause)
             self._notify_ha(self._notification("job_rolled_back", vmid))
-        except ExecutorError as rollback_error:
-            error = f"Original failure: {cause}; rollback failure: {rollback_error}"
+        except ExecutorError:
+            raise
+
+    def _pre_update_identity_from_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        current = self.db.get_job(str(job["id"]))
+        result = current.get("result")
+        proof = result.get("snapshot_proof") if isinstance(result, dict) else None
+        if not isinstance(proof, dict) or proof.get("version") != 3:
+            raise ValueError("Update job has no current snapshot proof")
+        identity = {
+            "version": 1,
+            "vmid": proof.get("vmid"),
+            "snapshot_name": proof.get("snapshot_name"),
+            "kind": proof.get("kind"),
+            "host_source_job_id": proof.get("host_source_job_id"),
+            "pve_snaptime": proof.get("pve_snaptime"),
+        }
+        validated = self._snapshot_identity(
+            int(current["vmid"]),
+            {
+                "name": identity["snapshot_name"],
+                "kind": identity["kind"],
+                "host_source_job_id": identity["host_source_job_id"],
+                "pve_snaptime": identity["pve_snaptime"],
+                "owned_by_hubinet_ops": True,
+            },
+            expected_name=str(current.get("snapshot_name") or ""),
+            expected_kind="pre-update",
+        )
+        if identity.get("vmid") != int(current["vmid"]):
+            raise ValueError("Update snapshot proof VMID changed")
+        return validated
+
+    def _reattach_automatic_rollback(self, job: dict[str, Any]) -> None:
+        vmid = int(job["vmid"])
+        cause = str(job.get("error") or "Update failed")
+        try:
+            identity = self._pre_update_identity_from_job(job)
+            self._require_host_control("Automatic rollback reattachment").wait_existing_job(
+                "snapshot_rollback",
+                vmid,
+                f"automatic-rollback-{job['id']}",
+                snapshot_name=str(identity["snapshot_name"]),
+                snapshot_kind="pre-update",
+                expected_source_job_id=str(identity["host_source_job_id"]),
+                expected_pve_snaptime=int(identity["pve_snaptime"]),
+            )
+            self._finish_automatic_rollback(
+                job,
+                cause,
+                self._emitter(job),
+                StabilizationPolicy.from_config(
+                    self._resource(vmid).get("stabilization")
+                ),
+            )
+        except (ExecutorError, HostControlError, ValueError) as exc:
             self.db.update_plan_status(job["plan_id"], "failed")
-            self._terminal(job, "failed", "manual_intervention", error)
-            self._notify_ha(
-                self._notification(
-                    "manual_intervention_required",
-                    vmid,
-                    error=error,
-                )
+            definitive = isinstance(exc, HostControlError) and exc.status == "failed"
+            self._terminal(
+                job,
+                "failed" if definitive else "interrupted",
+                "manual_intervention" if definitive else "interrupted",
+                f"Automatic rollback outcome could not be reattached: {exc}",
             )
 
     def _terminal(

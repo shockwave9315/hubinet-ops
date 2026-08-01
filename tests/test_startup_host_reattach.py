@@ -15,6 +15,35 @@ from app.service import OpsService
 from tests.test_v042_snapshot_retention import _record_snapshot_source
 
 
+PVE_SNAPTIME = 1_785_286_400
+
+
+def _expected_identity(snapshot_name: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "vmid": 110,
+        "snapshot_name": snapshot_name,
+        "kind": "manual",
+        "host_source_job_id": hashlib.sha256(
+            snapshot_name.encode("utf-8")
+        ).hexdigest()[:32],
+        "pve_snaptime": PVE_SNAPTIME,
+    }
+
+
+def _remote_argument(operation_type: str, snapshot_name: str | None) -> str | None:
+    if operation_type not in {"snapshot_rollback", "snapshot_delete"}:
+        return snapshot_name
+    identity = _expected_identity(str(snapshot_name))
+    return HostControlClient._snapshot_identity_argument(
+        vmid=110,
+        snapshot_name=str(snapshot_name),
+        snapshot_kind="manual",
+        expected_source_job_id=str(identity["host_source_job_id"]),
+        expected_pve_snaptime=int(identity["pve_snaptime"]),
+    )
+
+
 class NoopExecutor:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int, str | None]] = []
@@ -107,6 +136,12 @@ def _create_active_job(
         operation_type=operation_type,
         request_id=request_id,
         snapshot_name=snapshot_name,
+        result=(
+            {"expected_snapshot_identity": _expected_identity(snapshot_name)}
+            if snapshot_name is not None
+            and operation_type in {"snapshot_rollback", "snapshot_delete"}
+            else None
+        ),
     )
     if status == "running":
         return db.update_job(
@@ -139,6 +174,7 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
             "name": snapshot,
             "kind": "manual",
             "source_job_id": source_job_id,
+            "pve_snaptime": PVE_SNAPTIME,
         },
     )
     db.upsert_container_state(
@@ -162,7 +198,7 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
         "vmid": 110,
         "request_id": request_id,
         "operation_type": "snapshot_rollback",
-        "argument": snapshot,
+        "argument": _remote_argument("snapshot_rollback", snapshot),
         "status": "running",
         "stage": "executing",
         "result": None,
@@ -185,8 +221,10 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
                     "snapshots": [
                         {
                             "name": snapshot,
+                            "kind": "manual",
                             "owned_by_hubinet_ops": True,
                             "source_job_id": source_job_id,
+                            "pve_snaptime": PVE_SNAPTIME,
                             "rollback_eligible": True,
                             "delete_eligible": True,
                         }
@@ -234,10 +272,11 @@ def test_snapshot_rollback_startup_reattaches_running_job_and_finalizes_success(
     assert failures == []
     terminal = db.get_job(local_job["id"])
     assert terminal["status"] == "success"
-    assert terminal["result"] == {
-        "action": "rollback",
-        "snapshot_name": snapshot,
-    }
+    assert terminal["result"]["action"] == "rollback"
+    assert terminal["result"]["snapshot_name"] == snapshot
+    assert terminal["result"]["expected_snapshot_identity"] == _expected_identity(
+        snapshot
+    )
     state = service.get_state(110)
     assert state["snapshot_operation_status"] == "success"
     assert state["verification_status"] == "unknown"
@@ -296,7 +335,7 @@ def test_startup_reattach_propagates_remote_terminal_error_and_result(
                 "vmid": 110,
                 "request_id": request_id,
                 "operation_type": "snapshot_rollback",
-                "argument": snapshot,
+                "argument": _remote_argument("snapshot_rollback", snapshot),
                 "status": remote_status,
                 "stage": remote_status,
                 "result": remote_result,
@@ -314,7 +353,12 @@ def test_startup_reattach_propagates_remote_terminal_error_and_result(
 
     terminal = db.get_job(local_job["id"])
     assert terminal["status"] == expected_local_status
-    assert terminal["result"] == remote_result
+    assert {
+        key: terminal["result"][key] for key in remote_result
+    } == remote_result
+    assert terminal["result"]["expected_snapshot_identity"] == _expected_identity(
+        snapshot
+    )
     assert terminal["error"] == remote_error
     state = service.get_state(110)
     assert state["snapshot_operation_status"] == (
@@ -392,13 +436,14 @@ def test_successful_snapshot_create_reattach_applies_retention_once(
         "vmid": 110,
         "request_id": request_id,
         "operation_type": operation_type,
-        "argument": snapshot,
+        "argument": _remote_argument(operation_type, snapshot),
         "status": "succeeded",
         "stage": "complete",
         "result": {
             "name": snapshot,
             "kind": "manual",
             "source_job_id": host_source_job_id,
+            "pve_snaptime": PVE_SNAPTIME,
         },
         "error": None,
     }
@@ -416,6 +461,7 @@ def test_successful_snapshot_create_reattach_applies_retention_once(
         "rollback_eligible": True,
         "delete_eligible": True,
         "source_job_id": host_source_job_id,
+        "pve_snaptime": PVE_SNAPTIME,
     }
     requests: list[httpx.Request] = []
 
@@ -501,7 +547,9 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
         }
         if operation_type.startswith("lifecycle_")
         else {
-            "snapshot_name": snapshot,
+            "name": snapshot,
+            "kind": "manual",
+            "pve_snaptime": PVE_SNAPTIME,
             "operation": operation_type,
             **(
                 {"source_job_id": host_job_id}
@@ -522,7 +570,7 @@ def test_all_host_backed_lifecycle_and_snapshot_jobs_reattach_existing_job(
                     "vmid": 110,
                     "request_id": request_id,
                     "operation_type": operation_type,
-                    "argument": snapshot,
+                    "argument": _remote_argument(operation_type, snapshot),
                     "status": "succeeded",
                     "stage": "complete",
                     "result": remote_result,

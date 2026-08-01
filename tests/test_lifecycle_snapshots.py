@@ -27,6 +27,12 @@ def record_owned_snapshot_sources(
     from tests.test_v042_snapshot_retention import _record_snapshot_sources
 
     for snapshot in snapshots:
+        if snapshot.get("owned_by_hubinet_ops") is True and not snapshot.get(
+            "pve_snaptime"
+        ):
+            snapshot["pve_snaptime"] = int(
+                datetime.fromisoformat(str(snapshot["created_at"])).timestamp()
+            )
         if (
             snapshot.get("owned_by_hubinet_ops") is True
             and snapshot.get("kind") != "pre-update"
@@ -113,6 +119,9 @@ class FakeHostControl:
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         self.calls.append(
@@ -138,6 +147,7 @@ class FakeHostControl:
                 parsed["timestamp"],
                 "%Y%m%dT%H%M%SZ",
             ).replace(tzinfo=UTC).isoformat()
+            pve_snaptime = int(datetime.fromisoformat(created_at).timestamp())
             host_source_job_id = hashlib.sha256(
                 f"{vmid}:{request_id}:{snapshot_name}".encode("utf-8")
             ).hexdigest()[:32]
@@ -156,6 +166,7 @@ class FakeHostControl:
                     "rollback_eligible": True,
                     "delete_eligible": True,
                     "source_job_id": host_source_job_id,
+                    "pve_snaptime": pve_snaptime,
                 },
             )
             return {
@@ -165,6 +176,7 @@ class FakeHostControl:
                 "kind": parsed["kind"],
                 "owned_by_hubinet_ops": True,
                 "source_job_id": host_source_job_id,
+                "pve_snaptime": pve_snaptime,
                 "include_ram": operation_type == "snapshot_create_ram",
             }
         elif operation_type == "snapshot_delete":
@@ -186,6 +198,9 @@ class FakeHostControl:
         request_id: str,
         *,
         snapshot_name: str | None = None,
+        snapshot_kind: str | None = None,
+        expected_source_job_id: str | None = None,
+        expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
     ) -> dict[str, Any]:
         self.reattach_calls.append(
@@ -416,7 +431,11 @@ def test_successful_hostd_rollback_records_executor_drift_without_failing_restor
         source["id"],
         snapshot_name=snapshot,
     )
-    db.record_pre_update_snapshot_proof(source["id"], 109, snapshot, "a" * 32)
+    snaptime = int(datetime.fromisoformat("2026-07-24T18:02:27+00:00").timestamp())
+    host.snapshots[0]["pve_snaptime"] = snaptime
+    db.record_pre_update_snapshot_proof(
+        source["id"], 109, snapshot, "a" * 32, snaptime
+    )
     db.update_job(source["id"], status="failed", stage="failed", progress=100)
     terminal = service.manual_rollback(109)
     state = service.get_state(109)
@@ -535,7 +554,11 @@ def test_legacy_manual_rollback_requires_snapshot_owned_by_exact_source_update(
         request_id="proven-older-update-source-0001",
         snapshot_name=snapshot,
     )
-    db.record_pre_update_snapshot_proof(proven["id"], 109, snapshot, "b" * 32)
+    snaptime = int(datetime.fromisoformat("2026-07-24T18:30:00+00:00").timestamp())
+    host.snapshots[0]["pve_snaptime"] = snaptime
+    db.record_pre_update_snapshot_proof(
+        proven["id"], 109, snapshot, "b" * 32, snaptime
+    )
     db.update_job(proven["id"], status="failed", stage="failed", progress=100)
     source, _ = db.create_operation_job(
         vmid=109,

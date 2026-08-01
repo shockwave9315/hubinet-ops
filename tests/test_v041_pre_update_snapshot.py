@@ -203,7 +203,11 @@ def test_pre_update_snapshot_policy_auto_rollback(tmp_path: Path) -> None:
     assert "snapshot" not in executor.actions
     assert len(service.host_control.snapshots) == 1
     assert "update" in executor.actions
-    assert "rollback" in executor.actions  # Auto rollback!
+    assert "rollback" not in executor.actions
+    assert any(
+        call[0] == "snapshot_rollback"
+        for call in service.host_control.calls
+    )
     final_job = db.get_job(job_id)
     assert final_job["status"] == "rolled_back"
     state = service.get_state(106)
