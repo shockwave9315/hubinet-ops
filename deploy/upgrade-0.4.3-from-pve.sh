@@ -22,6 +22,9 @@ HOSTD_SERVICE="${HUBINET_OPS_HOSTD_SERVICE:-hubinet-ops-hostd}"
 HOSTD_DATABASE=""
 VALIDATION_NOT_BEFORE=""
 HOST_CONTROL_URL="${HUBINET_OPS_HOST_CONTROL_URL:-}"
+AGENT_API_PORT=""
+AGENT_HEALTH_URL=""
+CT110_PROFILE=""
 TOKEN_STAGE=""
 HOSTD_ENV_STAGE=""
 changes_started=false
@@ -105,6 +108,7 @@ required_source=(
   scripts/validate_pve_snapshot_policy.py
   scripts/migrate_config_0_4_0.py
   scripts/migrate_config_0_4_3.py
+  scripts/render_ct110_profile.py
   scripts/validate_rollout_state_0_4_3.py
 )
 for item in "${required_source[@]}"; do
@@ -152,7 +156,21 @@ print(f"http://{host}:{int(cfg.get('port',8741))}")
 PY
 )"
 fi
-installed_agent_health="$(pct exec "$AGENT_VMID" -- curl -fsS --max-time 5 http://127.0.0.1:8787/health)"
+AGENT_API_PORT="$(pct exec "$AGENT_VMID" -- /opt/hubinet-ops/.venv/bin/python - <<'PY'
+import yaml
+with open("/etc/hubinet-ops/config.yaml", encoding="utf-8") as stream:
+    config=yaml.safe_load(stream)
+api=config.get("api") if isinstance(config, dict) else None
+port=api.get("port") if isinstance(api, dict) else None
+if isinstance(port, bool): raise SystemExit("CT110 api.port must be an integer between 1 and 65535")
+try: parsed=int(port)
+except (TypeError, ValueError): raise SystemExit("CT110 api.port must be an integer between 1 and 65535")
+if not 1 <= parsed <= 65535 or str(port) != str(parsed): raise SystemExit("CT110 api.port must be an integer between 1 and 65535")
+print(parsed)
+PY
+)"
+AGENT_HEALTH_URL="http://127.0.0.1:${AGENT_API_PORT}/health"
+installed_agent_health="$(pct exec "$AGENT_VMID" -- curl -fsS --max-time 5 "$AGENT_HEALTH_URL")"
 python3 - "$installed_agent_health" <<'PY'
 import json, sys
 data=json.loads(sys.argv[1])
@@ -374,9 +392,23 @@ restore_managed_ct() {
   return "$layer_rc"
 }
 
+managed_profile() {
+  local vmid="$1"
+  if [[ "$vmid" == "$AGENT_VMID" ]]; then
+    [[ -s "$CT110_PROFILE" ]] || {
+      echo "Rendered CT110 managed profile is unavailable" >&2
+      return 1
+    }
+    printf '%s\n' "$CT110_PROFILE"
+  else
+    printf '%s\n' "$SOURCE_DIR/deploy/managed/profiles/ct${vmid}.json"
+  fi
+}
+
 validate_capabilities() {
-  local vmid="$1" payload="$2" profile="$SOURCE_DIR/deploy/managed/profiles/ct${vmid}.json"
+  local vmid="$1" payload="$2" profile
   local executor_hash profile_hash
+  profile="$(managed_profile "$vmid")"
   executor_hash="$(sha256sum "$SOURCE_DIR/deploy/managed/hubinet-maint" | awk '{print $1}')"
   profile_hash="$(sha256sum "$profile" | awk '{print $1}')"
   python3 - "$payload" "$executor_hash" "$profile_hash" <<'PY'
@@ -395,8 +427,9 @@ PY
 }
 
 install_managed_ct() {
-  local vmid="$1" status="$2" profile="$SOURCE_DIR/deploy/managed/profiles/ct${vmid}.json"
+  local vmid="$1" status="$2" profile
   local mountpoint payload
+  profile="$(managed_profile "$vmid")"
   if [[ "$status" == running ]]; then
     pct_retry_129 push "$vmid" "$SOURCE_DIR/deploy/managed/hubinet-maint" /usr/local/sbin/.hubinet-maint.new --perms 0755
     pct_retry_129 push "$vmid" "$profile" /etc/.hubinet-maint.new.json --perms 0644
@@ -545,6 +578,18 @@ pct pull "$AGENT_VMID" /etc/hubinet-ops/agent.env "$BACKUP/agent.env" >/dev/null
 python3 "$SOURCE_DIR/scripts/migrate_config_0_4_3.py" \
   "$BACKUP/agent-config.yaml" "$BACKUP/agent-config-0.4.3.yaml" \
   --host-control-url "$HOST_CONTROL_URL"
+CT110_PROFILE="$BACKUP/managed/ct110-profile-0.4.3.json"
+migrated_agent_api_port="$(python3 "$SOURCE_DIR/scripts/render_ct110_profile.py" \
+  --config "$BACKUP/agent-config-0.4.3.yaml" \
+  --profile-template "$SOURCE_DIR/deploy/managed/profiles/ct110.json" \
+  --output "$CT110_PROFILE" \
+  --print-api-port)"
+[[ "$migrated_agent_api_port" == "$AGENT_API_PORT" ]] || {
+  echo "CT110 api.port changed during configuration migration" >&2
+  exit 1
+}
+AGENT_API_PORT="$migrated_agent_api_port"
+AGENT_HEALTH_URL="http://127.0.0.1:${AGENT_API_PORT}/health"
 python3 "$SOURCE_DIR/scripts/validate_pve_snapshot_policy.py" \
   "$BACKUP/agent-config-0.4.3.yaml" \
   --policy-dir "$SOURCE_DIR/deploy/pve"
@@ -726,12 +771,13 @@ REMOTE_INSTALL_AGENT
 
 validation_ok=false
 for attempt in $(seq 1 "${HUBINET_OPS_VALIDATION_ATTEMPTS:-60}"); do
-  health="$(pct exec "$AGENT_VMID" -- curl -fsS --max-time 3 http://127.0.0.1:8787/health 2>/dev/null || true)"
+  health="$(pct exec "$AGENT_VMID" -- curl -fsS --max-time 3 "$AGENT_HEALTH_URL" 2>/dev/null || true)"
   if [[ "$health" == *'"version":"0.4.3"'* ]]; then
-    states="$(pct exec "$AGENT_VMID" -- bash -s <<'REMOTE_READ_STATE'
+    states="$(pct exec "$AGENT_VMID" -- bash -s -- "$AGENT_API_PORT" <<'REMOTE_READ_STATE'
 set -Eeuo pipefail
+api_port="$1"
 set -a; source /etc/hubinet-ops/agent.env; set +a
-curl -fsS --max-time 5 -H "Authorization: Bearer $HUBINET_OPS_API_TOKEN" http://127.0.0.1:8787/api/v1/state
+curl -fsS --max-time 5 -H "Authorization: Bearer $HUBINET_OPS_API_TOKEN" "http://127.0.0.1:${api_port}/api/v1/state"
 REMOTE_READ_STATE
 )" || states=""
     if printf '%s' "$states" | \
@@ -746,16 +792,47 @@ REMOTE_READ_STATE
 done
 [[ "$validation_ok" == true ]] || { echo "Fresh 0.4.3 telemetry validation failed after all attempts" >&2; rollback_all 1; }
 
+pct exec "$AGENT_VMID" -- systemctl is-active --quiet hubinet-ops.service
+pct exec "$AGENT_VMID" -- /opt/hubinet-ops/.venv/bin/python - <<'PY'
+import json, yaml
+with open("/etc/hubinet-ops/config.yaml", encoding="utf-8") as stream:
+    config=yaml.safe_load(stream)
+with open("/etc/hubinet-maint.json", encoding="utf-8") as stream:
+    profile=json.load(stream)
+api=config.get("api") if isinstance(config, dict) else None
+port=api.get("port") if isinstance(api, dict) else None
+if isinstance(port, bool): raise SystemExit("CT110 api.port must be an integer between 1 and 65535")
+try: parsed=int(port)
+except (TypeError, ValueError): raise SystemExit("CT110 api.port must be an integer between 1 and 65535")
+if not 1 <= parsed <= 65535 or str(port) != str(parsed): raise SystemExit("CT110 api.port must be an integer between 1 and 65535")
+expected=f"http://127.0.0.1:{parsed}/health"
+if profile.get("health_urls") != [expected]:
+    raise SystemExit("CT110 profile health URL does not match api.port")
+PY
+ct110_managed_health="$(pct exec "$AGENT_VMID" -- /usr/local/sbin/hubinet-maint healthcheck)"
+python3 - "$ct110_managed_health" "$AGENT_HEALTH_URL" <<'PY'
+import json, sys
+raw=json.loads(sys.argv[1])
+expected=sys.argv[2]
+data=raw.get("data") if raw.get("ok") is True else None
+if not isinstance(data, dict): raise SystemExit("CT110 hubinet-maint healthcheck failed")
+if data.get("services", {}).get("hubinet-ops.service") != "active":
+    raise SystemExit("CT110 hubinet-ops.service is not active")
+if data.get("urls", {}).get(expected, {}).get("ok") is not True:
+    raise SystemExit("CT110 hubinet-maint healthcheck did not reach the backend")
+PY
+
 pct exec "$AGENT_VMID" -- /opt/hubinet-ops/.venv/bin/python - /var/lib/hubinet-ops/ops.db <<'PY'
 import sqlite3, sys
 with sqlite3.connect(sys.argv[1]) as db:
     version=db.execute("PRAGMA user_version").fetchone()[0]
 if version != 400: raise SystemExit(f"unexpected database migration version {version}")
 PY
-snapshot_api="$(pct exec "$AGENT_VMID" -- bash -s <<'REMOTE_SNAPSHOT_LIST'
+snapshot_api="$(pct exec "$AGENT_VMID" -- bash -s -- "$AGENT_API_PORT" <<'REMOTE_SNAPSHOT_LIST'
 set -Eeuo pipefail
+api_port="$1"
 set -a; source /etc/hubinet-ops/agent.env; set +a
-curl -fsS --max-time 5 -H "Authorization: Bearer $HUBINET_OPS_API_TOKEN" http://127.0.0.1:8787/api/v1/resources/106/snapshots
+curl -fsS --max-time 5 -H "Authorization: Bearer $HUBINET_OPS_API_TOKEN" "http://127.0.0.1:${api_port}/api/v1/resources/106/snapshots"
 REMOTE_SNAPSHOT_LIST
 )"
 python3 - "$snapshot_api" <<'PY'
@@ -767,5 +844,5 @@ PY
 trap - ERR INT TERM EXIT
 rm -f "$ARCHIVE"
 echo "Hubinet Ops 0.4.3 installed transactionally. Backup: $BACKUP"
-echo "Validated hostd, /api/v1/state, fresh inventory 100-110, executor compatibility and read-only snapshot listing."
+echo "Validated hostd, /api/v1/state, fresh inventory 100-110, executor compatibility, CT110 managed health and read-only snapshot listing."
 echo "No LXC/VM lifecycle, snapshot mutation, update or maintenance action was executed."

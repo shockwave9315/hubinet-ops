@@ -125,6 +125,18 @@ def test_config_migration_preserves_operator_data_and_enables_split_ct110_flows(
     assert ct110["pre_update_snapshot"] is True
 
 
+def test_upgrade_installs_ct110_profile_rendered_from_migrated_configuration() -> None:
+    text = _upgrade_text()
+    migration = text.index('"$BACKUP/agent-config.yaml" "$BACKUP/agent-config-0.4.3.yaml"')
+    render = text.index('"$BACKUP/agent-config-0.4.3.yaml"', migration + 1)
+    managed_install = text.index('install_managed_ct "$vmid" "$status"', render)
+
+    assert 'CT110_PROFILE="$BACKUP/managed/ct110-profile-0.4.3.json"' in text
+    assert "render_ct110_profile.py" in text
+    assert migration < render < managed_install
+    assert 'profile="$(managed_profile "$vmid")"' in text
+
+
 def test_ha_installer_validates_secrets_backs_up_checks_and_rolls_back() -> None:
     text = HA_UPGRADE.read_text(encoding="utf-8")
     assert "validate_ha_secrets_0_4_3.py" in text

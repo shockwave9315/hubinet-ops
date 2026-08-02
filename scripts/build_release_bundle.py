@@ -53,6 +53,14 @@ def _candidate_files(source_root: Path, version: str) -> list[Path]:
     if scripts.is_dir():
         candidates.extend(scripts.glob("migrate_config_*.py"))
         candidates.extend(scripts.glob("validate_rollout_state_*.py"))
+        candidates.extend(
+            scripts / name
+            for name in (
+                "render_ct110_profile.py",
+                "validate_managed_profiles.py",
+                "validate_pve_snapshot_policy.py",
+            )
+        )
     return candidates
 
 

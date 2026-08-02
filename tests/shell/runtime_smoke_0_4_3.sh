@@ -50,15 +50,23 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$HOST_ONLY_BIN/$HOST_PATH_SENTINEL"
 chmod +x "$HOST_ONLY_BIN/$HOST_PATH_SENTINEL"
 
 make_fakes() {
-  local root="$1" bin safe_bin pve ct safe_tool hostd_bind
+  local root="$1" bin safe_bin pve ct safe_tool hostd_bind agent_api_port
   bin="$root/bin"; safe_bin="$root/safe-bin"; pve="$root/pve"; ct="$root/ct"
   hostd_bind="${HUBINET_OPS_FAKE_HOSTD_BIND:-192.0.2.10}"
+  agent_api_port="${HUBINET_OPS_FAKE_AGENT_API_PORT:-8787}"
   mkdir -p "$bin" "$safe_bin" "$root/pycompat" "$pve/etc/hubinet-ops" "$pve/usr/local/sbin" "$ct/ct110"
   for safe_tool in "${SAFE_TOOL_NAMES[@]}"; do
     ln -s "${SAFE_TOOL_PATHS[$safe_tool]}" "$safe_bin/$safe_tool"
   done
   printf 'LOCK_EX=2\nLOCK_NB=4\ndef flock(*args, **kwargs): return None\n' > "$root/pycompat/fcntl.py"
   cp "$ROOT/config/config.example.yaml" "$ct/ct110/etc-config.yaml"
+  "$REAL_PYTHON" - "$ct/ct110/etc-config.yaml" "$agent_api_port" <<'PY'
+import pathlib, sys, yaml
+path=pathlib.Path(sys.argv[1])
+config=yaml.safe_load(path.read_text(encoding="utf-8"))
+config["api"]["port"]=int(sys.argv[2])
+path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+PY
   printf 'HUBINET_OPS_API_TOKEN=%064d\n' 0 > "$ct/ct110/agent.env"
   printf '{"bind":"%s","port":8741,"database":"/var/lib/hubinet-ops-hostd/jobs.db","client_allowlist":[]}\n' "$hostd_bind" > "$pve/etc/hubinet-ops/hostd.json"
   printf 'HUBINET_OPS_HOSTD_TOKEN=%064d\n' 1 > "$pve/etc/hubinet-ops/hostd.env"
@@ -190,8 +198,33 @@ PY
       if [[ "${FAIL_CAPABILITIES_VMID:-}" == "$vmid" ]]; then echo '{"ok":false,"data":{}}'; else
         HUBINET_MAINT_CONFIG_PATH="$root/etc/hubinet-maint.json" "$REAL_PYTHON" "$root/usr/local/sbin/hubinet-maint" capabilities
       fi
-    elif [[ "$1" == systemctl && "$2" == start ]]; then
-      echo AGENT_STARTED >> "$TEST_LOG"
+    elif [[ "$1" == systemctl ]]; then
+      if [[ "$2" == start ]]; then
+        echo AGENT_STARTED >> "$TEST_LOG"
+      elif [[ "$2" == is-active && "$3" == --quiet && "$4" == hubinet-ops.service ]]; then
+        if [[ "${FAIL_MANAGED_SERVICE_ACTIVE:-0}" == 1 ]]; then
+          echo MANAGED_SERVICE_INACTIVE >> "$TEST_LOG"
+          exit 3
+        fi
+        echo MANAGED_SERVICE_ACTIVE >> "$TEST_LOG"
+      else
+        echo "unsupported fake CT systemctl: $*" >&2; exit 1
+      fi
+    elif [[ "$1" == /usr/local/sbin/hubinet-maint && "$2" == healthcheck ]]; then
+      if [[ "${FAIL_MANAGED_HEALTHCHECK:-0}" == 1 ]]; then
+        echo MANAGED_HEALTHCHECK_FAILED >> "$TEST_LOG"
+        exit 1
+      fi
+      "$REAL_PYTHON" - "$TEST_CT_ROOT/ct110/etc-config.yaml" "$root/etc/hubinet-maint.json" <<'PY'
+import json, sys, yaml
+config=yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+profile=json.load(open(sys.argv[2], encoding="utf-8"))
+expected=f"http://127.0.0.1:{int(config['api']['port'])}/health"
+if profile.get("health_urls") != [expected]:
+    raise SystemExit("fake managed healthcheck observed a profile/api.port mismatch")
+print(json.dumps({"ok":True,"data":{"services":{"hubinet-ops.service":"active"},"urls":{expected:{"status":200,"ok":True}}}}))
+PY
+      echo MANAGED_HEALTHCHECK_OK >> "$TEST_LOG"
     elif [[ "$1" == curl ]]; then
       if grep -Fq 'AGENT_INSTALLED' "$TEST_LOG"; then
         echo '{"status":"ok","version":"0.4.3"}'
@@ -199,7 +232,28 @@ PY
         echo '{"status":"ok","version":"0.4.2"}'
       fi
     elif [[ "$1" == /opt/hubinet-ops/.venv/bin/python ]]; then
-      cat >/dev/null
+      script="$(cat)"
+      if grep -Fq 'CT110 profile health URL does not match api.port' <<<"$script"; then
+        if [[ "${FAIL_PROFILE_PORT_MATCH:-0}" == 1 ]]; then
+          echo PROFILE_PORT_MISMATCH >> "$TEST_LOG"
+          exit 1
+        fi
+        "$REAL_PYTHON" - "$TEST_CT_ROOT/ct110/etc-config.yaml" "$root/etc/hubinet-maint.json" <<'PY'
+import json, sys, yaml
+config=yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+profile=json.load(open(sys.argv[2], encoding="utf-8"))
+expected=f"http://127.0.0.1:{int(config['api']['port'])}/health"
+if profile.get("health_urls") != [expected]:
+    raise SystemExit("CT110 profile health URL does not match api.port")
+PY
+        echo PROFILE_PORT_MATCHED >> "$TEST_LOG"
+      elif grep -Fq 'print(parsed)' <<<"$script"; then
+        "$REAL_PYTHON" - "$TEST_CT_ROOT/ct110/etc-config.yaml" <<'PY'
+import sys, yaml
+config=yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+print(int(config["api"]["port"]))
+PY
+      fi
     else
       echo "unsupported fake pct exec: $*" >&2; exit 1
     fi
@@ -439,6 +493,45 @@ if [[ "$(grep -Fc 'curl -fsS --max-time 5 http://192.0.2.10:8741/health' "$TMP/s
   echo "IPv4 host-control healthchecks did not reuse the canonical URL" >&2
   exit 1
 fi
+grep -Fq '"health_urls":["http://127.0.0.1:8787/health"]' \
+  "$TMP/success/ct/ct110/etc/hubinet-maint.json"
+grep -Fq 'MANAGED_SERVICE_ACTIVE' "$TMP/success/actions.log"
+grep -Fq 'PROFILE_PORT_MATCHED' "$TMP/success/actions.log"
+grep -Fq 'MANAGED_HEALTHCHECK_OK' "$TMP/success/actions.log"
+
+export HUBINET_OPS_FAKE_AGENT_API_PORT=8899
+custom_agent_port_rc="$(run_case custom_agent_port)"
+unset HUBINET_OPS_FAKE_AGENT_API_PORT
+if [[ "$custom_agent_port_rc" != 0 ]]; then
+  cat "$TMP/custom_agent_port/stderr" >&2
+  exit 1
+fi
+grep -Fq '"health_urls":["http://127.0.0.1:8899/health"]' \
+  "$TMP/custom_agent_port/ct/ct110/etc/hubinet-maint.json"
+grep -Fq 'pct exec 110 -- curl -fsS --max-time 5 http://127.0.0.1:8899/health' \
+  "$TMP/custom_agent_port/actions.log"
+if grep -Fq '127.0.0.1:8787' "$TMP/custom_agent_port/actions.log"; then
+  echo "CT110 installer reused the fixture port instead of preserved api.port" >&2
+  exit 1
+fi
+
+for validation_failure in profile_port_match managed_service_active managed_healthcheck; do
+  case "$validation_failure" in
+    profile_port_match) export FAIL_PROFILE_PORT_MATCH=1 ;;
+    managed_service_active) export FAIL_MANAGED_SERVICE_ACTIVE=1 ;;
+    managed_healthcheck) export FAIL_MANAGED_HEALTHCHECK=1 ;;
+  esac
+  validation_failure_rc="$(run_case "final_validation_${validation_failure}")"
+  unset FAIL_PROFILE_PORT_MATCH FAIL_MANAGED_SERVICE_ACTIVE FAIL_MANAGED_HEALTHCHECK
+  if [[ "$validation_failure_rc" == 0 ]]; then
+    echo "injected CT110 $validation_failure failure unexpectedly passed final validation" >&2
+    exit 1
+  fi
+  grep -Fq '0.4.3 upgrade failed; restoring all modified layers' \
+    "$TMP/final_validation_${validation_failure}/stderr"
+  grep -Fq 'old_profile' \
+    "$TMP/final_validation_${validation_failure}/ct/ct110/etc/hubinet-maint.json"
+done
 
 export HUBINET_OPS_FAKE_HOSTD_BIND="2001:db8::10"
 ipv6_rc="$(run_case ipv6)"

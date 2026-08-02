@@ -29,6 +29,9 @@ def _runtime_tree(root: Path, version: str = "0.4.4") -> None:
         "deploy/pve/hubinet-ops-host": "#!/usr/bin/env bash\n",
         f"deploy/upgrade-{version}-from-pve.sh": "#!/usr/bin/env bash\n",
         "scripts/migrate_config_0_4_2.py": "# migration\n",
+        "scripts/render_ct110_profile.py": "# profile renderer\n",
+        "scripts/validate_managed_profiles.py": "# profile validator\n",
+        "scripts/validate_pve_snapshot_policy.py": "# PVE policy validator\n",
         "home-assistant/packages/hubinet_ops.yaml": "template: []\n",
         "home-assistant/dashboards/hubinet_ops.yaml": "views: []\n",
     }
@@ -79,6 +82,9 @@ def test_release_bundle_is_versioned_immutable_and_manifest_verified(
         names = [member.name for member in members]
         assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)
         assert names.count("deploy/upgrade-0.4.4-from-pve.sh") == 1
+        assert names.count("scripts/render_ct110_profile.py") == 1
+        assert names.count("scripts/validate_managed_profiles.py") == 1
+        assert names.count("scripts/validate_pve_snapshot_policy.py") == 1
         assert not any(
             name.startswith("deploy/upgrade-")
             and name != "deploy/upgrade-0.4.4-from-pve.sh"

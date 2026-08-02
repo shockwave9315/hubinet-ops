@@ -22,6 +22,8 @@ sudo ./deploy/install-ha-0.4.3-from-pve.sh --restart-core HA_HOST
 
 The PVE installer accepts no arguments and verifies exactly 0.4.2 as the installed backend/hostd. Before its first mutation it creates `/root/hubinet-ops-backups/<UTC>-before-0.4.3/`, including PVE host files, configured hostd SQLite state, CT101–110 helpers/profiles, and CT110 application/config/database/key state. HA backups are stored at `/config/backups/hubinet-ops/<UTC>-before-0.4.3/`.
 
+The installer preserves `api.port` from the existing CT110 configuration and renders `/etc/hubinet-maint.json` from that migrated value. For the standard production configuration this produces `http://127.0.0.1:8787/health`. Final validation fails and rolls back if the installed profile disagrees with `api.port`, `hubinet-ops.service` is not active, or the real read-only `/usr/local/sbin/hubinet-maint healthcheck` cannot reach the backend.
+
 Any failure invokes reverse rollback: CT110 application/config/database, CT110–101 helpers/profiles, host files and hostd database, unit state, and service enabled/active state. An incomplete rollback is a manual-intervention condition; use the printed backup path and never retry an outcome-unknown mutation.
 
 ## Production acceptance after bootstrap

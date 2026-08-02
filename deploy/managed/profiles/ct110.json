@@ -1,1 +1,1 @@
-{"services":["hubinet-ops.service"],"health_urls":["http://127.0.0.1:8740/health"],"min_free_mb":2048,"ignore_failed_units":[],"repair_actions":[],"docker":{"enabled":false,"require_health":false,"required_containers":[]}}
+{"services":["hubinet-ops.service"],"health_urls":["http://127.0.0.1:{api_port}/health"],"min_free_mb":2048,"ignore_failed_units":[],"repair_actions":[],"docker":{"enabled":false,"require_health":false,"required_containers":[]}}
