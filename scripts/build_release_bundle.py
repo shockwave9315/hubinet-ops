@@ -42,7 +42,13 @@ def _candidate_files(source_root: Path, version: str) -> list[Path]:
         root = source_root / relative
         if not root.is_dir():
             raise BuildError(f"Required runtime directory is missing: {relative}")
-        candidates.extend(path for path in root.rglob("*") if not path.is_dir())
+        candidates.extend(
+            path
+            for path in root.rglob("*")
+            if not path.is_dir()
+            and "__pycache__" not in path.parts
+            and path.suffix.lower() not in {".pyc", ".pyo"}
+        )
     scripts = source_root / "scripts"
     if scripts.is_dir():
         candidates.extend(scripts.glob("migrate_config_*.py"))
