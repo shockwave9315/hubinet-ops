@@ -154,6 +154,7 @@ def _health_failure(error: Exception) -> bool:
         ("health" in message or "hubinet-ops.service" in message)
         and "apt-get check" not in message
         and "dpkg audit" not in message
+        and "final apt scan" not in message
     )
 
 
@@ -207,6 +208,18 @@ def run(
         marker = {
             **marker,
             "snapshot_proof": proof,
+            "apt_started_at": None,
+        }
+        write_marker(result_dir, job_id, marker)
+
+        post_snapshot = controller.execute("ct110-system-scan", VMID)
+        if post_snapshot.get("fingerprint") != fingerprint:
+            raise SystemUpdateError(
+                "CT110 system state changed during snapshot creation"
+            )
+
+        marker = {
+            **marker,
             "apt_started_at": utc_now(),
         }
         # This durable write is the one-shot APT mutation boundary.  A retry
@@ -232,14 +245,15 @@ def run(
                 ) from exc
             raise
         required = {
-            "apt_check_ok": verification.get("apt_check_ok"),
-            "dpkg_audit_ok": verification.get("dpkg_audit_ok"),
-            "service_active": verification.get("service_active", True),
-            "health_endpoint_ok": verification.get("health_endpoint_ok", True),
+            "apt_check_ok": verification.get("apt_check_ok") is True,
+            "dpkg_audit_ok": verification.get("dpkg_audit_ok") is True,
+            "service_active": verification.get("service_active") is True,
+            "health_endpoint_ok": verification.get("health_endpoint_ok") is True,
+            "final_apt_scan_ok": verification.get("final_apt_scan_ok") is True,
         }
-        if any(value is not True for value in required.values()):
+        if not all(required.values()):
             raise SystemUpdateError(
-                "CT110 final apt, dpkg, service, or health verification failed"
+                "CT110 final apt, dpkg, service, health, or scan verification failed"
             )
         terminal = {
             **marker,

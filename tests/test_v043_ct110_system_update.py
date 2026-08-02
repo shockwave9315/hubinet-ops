@@ -271,6 +271,7 @@ class SupervisorController:
             "dpkg_audit_ok": True,
             "service_active": True,
             "health_endpoint_ok": True,
+            "final_apt_scan_ok": True,
             "reboot_required": True,
             "updates": {
                 "pending_count": 0,
@@ -487,3 +488,50 @@ def test_health_failure_uses_policy_gated_exact_snapshot_rollback(
     assert identity["snapshot_name"].startswith("hubinet-ops-110-pre-")
     assert identity["expected_source_job_id"] == job["id"]
     assert identity["expected_pve_snaptime"] == 1785672000
+
+
+def test_pve_supervisor_persists_snapshot_proof_but_not_apt_if_fingerprint_changes(
+    tmp_path: Path,
+) -> None:
+    store, job, result_dir, controller = _prepared_host_supervisor(tmp_path)
+    
+    original_execute = controller.execute
+    scan_count = 0
+    def mock_execute(action: str, vmid: int, argument: str | None = None, *, source_job_id: str | None = None) -> dict[str, Any]:
+        nonlocal scan_count
+        if action == "ct110-system-scan":
+            scan_count += 1
+            if scan_count == 3:
+                return {"fingerprint": "changed" * 9}
+        return original_execute(action, vmid, argument, source_job_id=source_job_id)
+    controller.execute = mock_execute  # type: ignore
+
+    print(controller.calls)
+    exit_code = run_host_supervisor(
+        result_dir=result_dir,
+        database=store.path,
+        job_id=job["id"],
+        fingerprint=str(job["argument"]),
+        controller=controller,  # type: ignore[arg-type]
+    )
+    assert exit_code == 1
+
+    marker = read_marker(result_dir, job["id"])
+    assert marker is not None
+    assert "CT110 system state changed during snapshot creation" in marker["error"]
+    
+    assert any(call[0] == "snapshot-create" for call in controller.calls)
+    assert marker is not None
+    assert marker["snapshot_proof"] is not None
+    assert marker.get("apt_started_at") is None
+    assert not any(call[0] == "guest" and call[2] == "update" for call in controller.calls)
+
+    with pytest.raises(SystemUpdateError, match="CT110 supervisor is not at the one-shot pre-mutation boundary"):
+        run_host_supervisor(
+            result_dir=result_dir,
+            database=store.path,
+            job_id=job["id"],
+            fingerprint=str(job["argument"]),
+            controller=controller,  # type: ignore[arg-type]
+        )
+    assert not any(call[0] == "guest" and call[2] == "update" for call in controller.calls)
