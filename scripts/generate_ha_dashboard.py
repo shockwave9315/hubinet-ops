@@ -1481,27 +1481,68 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
         _controls_section(vmid, general_cfg),
         _ct110_break_glass_section(),
         _section(
+            _title("Zarządzanie planami"),
+            {
+                "type": "conditional",
+                "conditions": [
+                    _state_condition(_entity(vmid, cfg, "active_plan_status"), state="waiting_approval"),
+                    _state_condition(_entity(vmid, cfg, "capability_reject"), state="allowed"),
+                    _state_condition(_entity(vmid, cfg, "active_job_id"), state="none"),
+                ],
+                "card": _entity_grid(
+                    [
+                        {
+                            "type": "custom:mushroom-template-card",
+                            "primary": "{% if states('" + _entity(vmid, cfg, "system_active_plan_status") + "') == 'waiting_approval' %}Odrzuć plan aktualizacji systemu{% else %}Odrzuć plan wydania Hubinet Ops{% endif %}",
+                            "secondary": "Odrzuć i wyczyść bieżący plan",
+                            "multiline_secondary": True,
+                            "icon": "mdi:close-octagon-outline",
+                            "icon_color": "red",
+                            "tap_action": {
+                                "action": "perform-action",
+                                "perform_action": "script.hubinet_ops_reject_container",
+                                "confirmation": {
+                                    "title": "Odrzuć plan",
+                                    "text": "Odrzucić obecnie aktywny plan? Po odrzuceniu będzie można uruchomić nowy skan.",
+                                    "confirm_text": "Odrzuć",
+                                    "dismiss_text": "Anuluj",
+                                },
+                            },
+                        }
+                    ],
+                    columns=1,
+                ),
+            }
+        ),
+        _section(
             _title(
                 "System Debian CT110",
                 "Pakiety systemowe są niezależne od wydania aplikacji Hubinet Ops",
             ),
             _entity_grid(
                 [
-                    action_card(
-                        "Skanuj aktualizacje systemu CT110",
-                        "Read-only skan pakietów Debiana wykonywany przez PVE hostd",
-                        "script.hubinet_ops_scan_ct110_system",
-                        "mdi:package-down",
-                        "blue",
-                        "Odświeżyć listę pakietów systemowych CT110?",
-                    ),
+                    {
+                        "type": "conditional",
+                        "conditions": [
+                            _state_condition(_entity(vmid, cfg, "capability_scan"), state="allowed"),
+                        ],
+                        "card": action_card(
+                            "Skanuj aktualizacje systemu CT110",
+                            "Read-only skan pakietów Debiana wykonywany przez PVE hostd",
+                            "script.hubinet_ops_scan_ct110_system",
+                            "mdi:package-down",
+                            "blue",
+                            "Odświeżyć listę pakietów systemowych CT110?",
+                        ),
+                    },
                     {
                         "type": "conditional",
                         "conditions": [
                             _state_condition(
                                 _entity(vmid, cfg, "system_active_plan_status"),
                                 state="waiting_approval",
-                            )
+                            ),
+                            _state_condition(_entity(vmid, cfg, "capability_approve"), state="allowed"),
                         ],
                         "card": action_card(
                             "Zatwierdź aktualizację systemu",
@@ -1572,14 +1613,20 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
             ),
             _entity_grid(
                 [
-                    action_card(
-                        "Sprawdź nowe wydanie Hubinet Ops",
-                        "Sprawdź stabilne wydanie w skonfigurowanym repozytorium",
-                        "script.hubinet_ops_check_application_release",
-                        "mdi:cloud-search",
-                        "blue",
-                        "Sprawdzić najnowsze stabilne wydanie Hubinet Ops?",
-                    ),
+                    {
+                        "type": "conditional",
+                        "conditions": [
+                            _state_condition(_entity(vmid, cfg, "capability_self_update"), state="allowed"),
+                        ],
+                        "card": action_card(
+                            "Sprawdź nowe wydanie Hubinet Ops",
+                            "Sprawdź stabilne wydanie w skonfigurowanym repozytorium",
+                            "script.hubinet_ops_check_application_release",
+                            "mdi:cloud-search",
+                            "blue",
+                            "Sprawdzić najnowsze stabilne wydanie Hubinet Ops?",
+                        ),
+                    },
                     {
                         "type": "conditional",
                         "conditions": [
@@ -1591,6 +1638,8 @@ def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]
                                 _entity(vmid, cfg, "application_release_check_status"),
                                 state="update_available",
                             ),
+                            _state_condition(_entity(vmid, cfg, "capability_approve"), state="allowed"),
+                            _state_condition(_entity(vmid, cfg, "capability_self_update"), state="allowed"),
                         ],
                         "card": action_card(
                             "Zainstaluj wydanie Hubinet Ops",

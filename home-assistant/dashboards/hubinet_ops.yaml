@@ -17968,31 +17968,76 @@ views:
   - type: grid
     cards:
     - type: custom:mushroom-title-card
+      title: Zarządzanie planami
+      subtitle: ''
+    - type: conditional
+      conditions:
+      - condition: state
+        entity: sensor.hubinet_ops_ct110_active_plan_status
+        state: waiting_approval
+      - condition: state
+        entity: sensor.hubinet_ops_ct110_capability_reject
+        state: allowed
+      - condition: state
+        entity: sensor.hubinet_ops_ct110_active_job_id
+        state: none
+      card:
+        type: grid
+        columns: 1
+        square: false
+        cards:
+        - type: custom:mushroom-template-card
+          primary: '{% if states(''sensor.hubinet_ops_ct110_system_active_plan_status'') == ''waiting_approval'' %}Odrzuć
+            plan aktualizacji systemu{% else %}Odrzuć plan wydania Hubinet Ops{% endif %}'
+          secondary: Odrzuć i wyczyść bieżący plan
+          multiline_secondary: true
+          icon: mdi:close-octagon-outline
+          icon_color: red
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_reject_container
+            confirmation:
+              title: Odrzuć plan
+              text: Odrzucić obecnie aktywny plan? Po odrzuceniu będzie można uruchomić nowy skan.
+              confirm_text: Odrzuć
+              dismiss_text: Anuluj
+  - type: grid
+    cards:
+    - type: custom:mushroom-title-card
       title: System Debian CT110
       subtitle: Pakiety systemowe są niezależne od wydania aplikacji Hubinet Ops
     - type: grid
       columns: 2
       square: false
       cards:
-      - type: custom:mushroom-template-card
-        primary: Skanuj aktualizacje systemu CT110
-        secondary: Read-only skan pakietów Debiana wykonywany przez PVE hostd
-        multiline_secondary: true
-        icon: mdi:package-down
-        icon_color: blue
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_scan_ct110_system
-          confirmation:
-            title: Skanuj aktualizacje systemu CT110
-            text: Odświeżyć listę pakietów systemowych CT110?
-            confirm_text: Skanuj aktualizacje systemu CT110
-            dismiss_text: Anuluj
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct110_capability_scan
+          state: allowed
+        card:
+          type: custom:mushroom-template-card
+          primary: Skanuj aktualizacje systemu CT110
+          secondary: Read-only skan pakietów Debiana wykonywany przez PVE hostd
+          multiline_secondary: true
+          icon: mdi:package-down
+          icon_color: blue
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_scan_ct110_system
+            confirmation:
+              title: Skanuj aktualizacje systemu CT110
+              text: Odświeżyć listę pakietów systemowych CT110?
+              confirm_text: Skanuj aktualizacje systemu CT110
+              dismiss_text: Anuluj
       - type: conditional
         conditions:
         - condition: state
           entity: sensor.hubinet_ops_ct110_system_active_plan_status
           state: waiting_approval
+        - condition: state
+          entity: sensor.hubinet_ops_ct110_capability_approve
+          state: allowed
         card:
           type: custom:mushroom-template-card
           primary: Zatwierdź aktualizację systemu
@@ -18287,20 +18332,26 @@ views:
       columns: 2
       square: false
       cards:
-      - type: custom:mushroom-template-card
-        primary: Sprawdź nowe wydanie Hubinet Ops
-        secondary: Sprawdź stabilne wydanie w skonfigurowanym repozytorium
-        multiline_secondary: true
-        icon: mdi:cloud-search
-        icon_color: blue
-        tap_action:
-          action: perform-action
-          perform_action: script.hubinet_ops_check_application_release
-          confirmation:
-            title: Sprawdź nowe wydanie Hubinet Ops
-            text: Sprawdzić najnowsze stabilne wydanie Hubinet Ops?
-            confirm_text: Sprawdź nowe wydanie Hubinet Ops
-            dismiss_text: Anuluj
+      - type: conditional
+        conditions:
+        - condition: state
+          entity: sensor.hubinet_ops_ct110_capability_self_update
+          state: allowed
+        card:
+          type: custom:mushroom-template-card
+          primary: Sprawdź nowe wydanie Hubinet Ops
+          secondary: Sprawdź stabilne wydanie w skonfigurowanym repozytorium
+          multiline_secondary: true
+          icon: mdi:cloud-search
+          icon_color: blue
+          tap_action:
+            action: perform-action
+            perform_action: script.hubinet_ops_check_application_release
+            confirmation:
+              title: Sprawdź nowe wydanie Hubinet Ops
+              text: Sprawdzić najnowsze stabilne wydanie Hubinet Ops?
+              confirm_text: Sprawdź nowe wydanie Hubinet Ops
+              dismiss_text: Anuluj
       - type: conditional
         conditions:
         - condition: state
@@ -18309,6 +18360,12 @@ views:
         - condition: state
           entity: sensor.hubinet_ops_ct110_application_release_check_status
           state: update_available
+        - condition: state
+          entity: sensor.hubinet_ops_ct110_capability_approve
+          state: allowed
+        - condition: state
+          entity: sensor.hubinet_ops_ct110_capability_self_update
+          state: allowed
         card:
           type: custom:mushroom-template-card
           primary: Zainstaluj wydanie Hubinet Ops

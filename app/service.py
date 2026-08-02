@@ -715,6 +715,26 @@ class OpsService:
                 "data": data,
                 "source": source,
             }
+        if not self._capabilities(vmid)["approve"]:
+            active = self.db.find_active_plan(vmid)
+            if active is not None and self._plan_type(active) == "ct110_system_update":
+                self.db.update_plan_status(str(active["id"]), "superseded")
+            state.update(
+                {
+                    "system_active_plan_id": None,
+                    "system_active_plan_status": None,
+                    "operation_status": "idle",
+                    "job_stage": "idle",
+                }
+            )
+            self._save_state(vmid, state)
+            return {
+                "vmid": vmid,
+                "status": "updates_observed",
+                "plan_created": False,
+                "data": data,
+                "source": source,
+            }
 
         active = self.db.find_active_plan(vmid, fingerprint)
         if active is not None and self._plan_type(active) != "ct110_system_update":
@@ -886,16 +906,24 @@ class OpsService:
         plan = self.db.reject_plan(plan_id)
         vmid = int(plan["vmid"])
         state = self.get_state(vmid)
-        state.update(
-            {
-                "active_plan_id": None,
-                "active_plan_status": "rejected",
-                "risk": "none",
-                "operation_status": "idle",
-                "job_stage": "idle",
-                "job_progress": 0,
-            }
-        )
+
+        updates = {
+            "active_plan_id": None,
+            "active_plan_status": "rejected",
+            "risk": "none",
+            "operation_status": "idle",
+            "job_stage": "idle",
+            "job_progress": 0,
+        }
+
+        plan_type = self._plan_type(plan)
+        if plan_type == "ct110_system_update":
+            updates.update({
+                "system_active_plan_id": None,
+                "system_active_plan_status": None,
+            })
+
+        state.update(updates)
         self._save_state(vmid, state)
         return {"plan": plan}
 
@@ -909,7 +937,7 @@ class OpsService:
             if self.db.get_active_job(vmid) is not None:
                 raise ValueError("Another job is already active for this resource")
             plan = self._single_waiting_plan(vmid)
-            if self._plan_type(plan) != "self_update":
+            if self._plan_type(plan) not in {"self_update", "ct110_system_update"}:
                 self._require_compatible_executor(vmid)
             return self.reject(plan["id"])
         finally:
@@ -1984,6 +2012,31 @@ class OpsService:
             )
             self._save_state(vmid, state)
             return dict(release)
+        if not self._capabilities(vmid)["approve"]:
+            active = self.db.find_active_plan(vmid)
+            if active is not None and self._plan_type(active) == "self_update":
+                self.db.update_plan_status(str(active["id"]), "superseded")
+            state = self.get_state(vmid)
+            state.update(
+                {
+                    "active_plan_id": None,
+                    "active_plan_status": None,
+                    "operation_status": "idle",
+                    "job_stage": "idle",
+                    "job_progress": 0,
+                    "application_release_check_status": "update_available",
+                    "application_current_version": release.get("current_version", VERSION),
+                    "application_latest_version": release["version"],
+                    "application_release_tag": release.get("tag"),
+                    "application_release_commit": release.get("commit_sha"),
+                    "application_release_published_at": release.get("published_at"),
+                    "application_last_check": self._utc_second_timestamp(),
+                    "application_last_error": None,
+                }
+            )
+            self._save_state(vmid, state)
+            return dict(release, plan_created=False)
+
         fingerprint = str(release["fingerprint"])
         active = self.db.find_active_plan(vmid, fingerprint)
         if active is not None:
