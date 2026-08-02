@@ -55,7 +55,7 @@ def test_production_lifecycle_allowlist_contains_all_lxc() -> None:
 
 def test_managed_verify_is_fixed_and_checks_integrity_services_and_docker() -> None:
     text = (ROOT / "deploy" / "managed" / "hubinet-maint").read_text(encoding="utf-8")
-    assert 'VERSION = "0.4.1"' in text
+    assert 'VERSION = "0.4.3"' in text
     assert 'run(["apt-get", "check"]' in text
     assert 'run(["dpkg", "--audit"]' in text
     assert 'Path("/var/run/reboot-required").exists()' in text
