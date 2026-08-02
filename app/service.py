@@ -969,7 +969,7 @@ class OpsService:
         payload = dict(plan.get("payload") or {})
         if any(
             str(release.get(key) or "") != str(payload.get(key) or "")
-            for key in ("fingerprint", "release_id", "version")
+            for key in ("fingerprint", "release_id", "version", "bundle_sha256")
         ):
             self.db.update_plan_status(plan["id"], "superseded")
             raise ValueError(
@@ -2072,6 +2072,7 @@ class OpsService:
                 "commit_sha": release.get("commit_sha"),
                 "published_at": release.get("published_at"),
                 "artifact_verification": release.get("artifact_verification"),
+                "bundle_sha256": release.get("bundle_sha256"),
             }
             active = self.db.create_plan(
                 vmid=vmid,

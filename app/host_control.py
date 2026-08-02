@@ -109,7 +109,7 @@ class HostControlClient:
         if status == "update_available":
             required = (
                 "latest_version", "tag", "commit_sha", "published_at",
-                "fingerprint", "artifact_verification",
+                "fingerprint", "artifact_verification", "bundle_sha256",
             )
             if not all(result.get(key) not in {None, ""} for key in required):
                 raise HostControlError("Host control returned an incomplete release identity")
