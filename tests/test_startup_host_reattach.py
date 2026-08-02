@@ -619,6 +619,8 @@ def test_self_update_startup_reattaches_by_request_without_execute_post(
             "fingerprint": fingerprint,
             "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
             "version": "0.4.0",
+            "tag": "v0.4.0",
+            "commit_sha": "1" * 40,
         },
         ttl_minutes=60,
     )
@@ -638,6 +640,9 @@ def test_self_update_startup_reattaches_by_request_without_execute_post(
         "fingerprint": fingerprint,
         "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
         "version": "0.4.0",
+        "tag": "v0.4.0",
+        "commit_sha": "1" * 40,
+        "artifact_verification": "verified",
         "exit_code": 0,
     }
 

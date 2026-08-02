@@ -271,13 +271,14 @@ def validate_config(raw: dict[str, Any]) -> None:
         if adapter == "agent_self":
             forbidden = {
                 name
-                for name in ("scan", "retry_healthcheck", "rollback")
+                for name in ("retry_healthcheck", "rollback")
                 if bool(capabilities.get(name, False))
             }
             if forbidden:
                 raise RuntimeError(
-                    "Resource 110 agent_self supports only plan approval, host lifecycle, "
-                    "snapshot, refresh, and self-update capabilities"
+                    "Resource 110 agent_self supports only supervised system-update, "
+                    "plan approval, host lifecycle, snapshot, refresh, and application "
+                    "release capabilities"
                 )
 
         actions_raw = value.get("repair_actions") or []

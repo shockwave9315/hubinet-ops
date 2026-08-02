@@ -39,7 +39,7 @@ def main() -> int:
     parser.add_argument("--profiles", type=Path, default=DEFAULT_PROFILES)
     args = parser.parse_args()
     executor = load_executor(args.executor)
-    expected = {f"ct{vmid}.json" for vmid in range(101, 110)}
+    expected = {f"ct{vmid}.json" for vmid in range(101, 111)}
     actual = {path.name for path in args.profiles.glob("ct*.json")}
     if actual != expected:
         missing = sorted(expected - actual)

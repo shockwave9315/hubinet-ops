@@ -54,7 +54,7 @@ def test_managed_executor_capabilities_are_hashed_and_complete(
 
     payload = namespace["capabilities"]()
 
-    assert payload["version"] == "0.4.1"
+    assert payload["version"] == "0.4.3"
     assert payload["protocol_version"] == 1
     assert set(payload["supported_actions"]) == REQUIRED_APT_ACTIONS
     assert payload["executor_sha256"] == hashlib.sha256(EXECUTOR.read_bytes()).hexdigest()
@@ -124,7 +124,7 @@ def test_complete_executor_contract_is_compatible() -> None:
 def test_executor_state_and_snapshot_name_models_are_bounded() -> None:
     state = normalize_state(
         {
-            "executor_version": "0.4.1",
+            "executor_version": "0.4.3",
             "executor_protocol_version": 1,
             "executor_compatible": True,
             "executor_missing_actions": ["verify", "x" * 100],

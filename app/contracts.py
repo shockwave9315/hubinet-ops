@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-EXECUTOR_VERSION = "0.4.1"
+EXECUTOR_VERSION = "0.4.3"
 EXECUTOR_PROTOCOL_VERSION = 1
 REQUIRED_APT_ACTIONS = frozenset(
     {
@@ -33,6 +33,7 @@ JOB_OPERATION_TYPES = frozenset(
         "snapshot_prune",
         "retry_healthcheck",
         "self_update",
+        "ct110_system_update",
     }
 )
 SNAPSHOT_KINDS = frozenset({"pre-update", "manual"})

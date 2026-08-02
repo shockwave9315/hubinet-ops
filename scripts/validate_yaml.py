@@ -49,6 +49,7 @@ def yaml_paths(root: Path) -> list[Path]:
             if not any(
                 part.lower() in IGNORED_DIRECTORIES
                 or part.lower().startswith(".pytest-")
+                or part.lower().startswith(".tmp-pytest-")
                 for part in path.relative_to(root).parts
             )
         ),

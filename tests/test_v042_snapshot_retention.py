@@ -125,6 +125,21 @@ def _record_snapshot_sources(
             _record_snapshot_source(db, snapshot)
 
 
+def _assert_prune_is_read_only_noop(
+    service: OpsService,
+    db: Database,
+    request_id: str,
+) -> None:
+    before = [job["id"] for job in db.list_jobs()]
+    result = service.queue_snapshot_prune(106, "oldest", request_id)
+    assert result == {
+        "status": "nothing_to_delete",
+        "mode": "oldest",
+        "deleted_count": 0,
+    }
+    assert [job["id"] for job in db.list_jobs()] == before
+
+
 def test_name_only_and_unrecorded_snapshot_candidates_remain_uncertain(
     tmp_path: Path,
 ) -> None:
@@ -150,9 +165,12 @@ def test_name_only_and_unrecorded_snapshot_candidates_remain_uncertain(
 
     listing = service.list_snapshots(106)
 
+    assert [snapshot["ownership_status"] for snapshot in listing["snapshots"]] == [
+        "uncertain",
+        "host_owned_unproven",
+    ]
     assert all(
         snapshot["owned_by_hubinet_ops"] is False
-        and snapshot["ownership_status"] == "uncertain"
         and snapshot["delete_eligible"] is False
         and snapshot["protected"] is True
         for snapshot in listing["snapshots"]
@@ -164,9 +182,9 @@ def test_name_only_and_unrecorded_snapshot_candidates_remain_uncertain(
             name_only["name"],
             "reject-name-only-delete-0001",
         )
-    service.queue_snapshot_prune(106, "oldest", "skip-uncertain-oldest-0001")
-    terminal = run_queued(service, db)
-    assert terminal["result"]["deleted"] == []
+    _assert_prune_is_read_only_noop(
+        service, db, "skip-uncertain-oldest-0001"
+    )
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
@@ -208,7 +226,7 @@ def test_snapshot_candidate_requires_exact_durable_source_contract(
     modeled = service.list_snapshots(106)["snapshots"][0]
 
     assert modeled["owned_by_hubinet_ops"] is False
-    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["ownership_status"] == "host_owned_unproven"
     assert modeled["delete_eligible"] is False
 
 
@@ -238,7 +256,7 @@ def test_manual_snapshot_requires_matching_host_and_backend_job(
     modeled = service.list_snapshots(106)["snapshots"][0]
 
     assert modeled["owned_by_hubinet_ops"] is True
-    assert modeled["ownership_status"] == "owned"
+    assert modeled["ownership_status"] == "managed"
     assert modeled["source_job_id"] == source["id"]
     assert modeled["host_source_job_id"] == snapshot["source_job_id"]
     assert modeled["delete_eligible"] is True
@@ -300,13 +318,13 @@ def test_pre_update_snapshot_requires_durable_mutation_event_and_prune_skips_it(
     modeled = service.list_snapshots(106)["snapshots"][0]
 
     assert modeled["owned_by_hubinet_ops"] is False
-    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["ownership_status"] == "host_owned_unproven"
     assert modeled["protected"] is True
     assert modeled["delete_eligible"] is False
     assert modeled["rollback_eligible"] is False
-    service.queue_snapshot_prune(106, "oldest", "skip-unproven-pre-update-0001")
-    terminal = run_queued(service, db)
-    assert terminal["result"]["deleted"] == []
+    _assert_prune_is_read_only_noop(
+        service, db, "skip-unproven-pre-update-0001"
+    )
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
@@ -415,19 +433,15 @@ def test_legacy_snapshot_proof_is_preserved_but_never_authorizes_ownership(
 
     assert terminal["result"]["snapshot_proof"] == legacy_proof
     assert modeled["owned_by_hubinet_ops"] is False
-    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["ownership_status"] == "host_owned_unproven"
     assert modeled["protected"] is True
     assert modeled["rollback_eligible"] is False
     assert modeled["delete_eligible"] is False
     with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
         service.manual_rollback(106)
-    service.queue_snapshot_prune(
-        106,
-        "oldest",
-        f"version-{proof_version}-proof-prune-0001",
+    _assert_prune_is_read_only_noop(
+        service, db, f"version-{proof_version}-proof-prune-0001"
     )
-    prune = run_queued(service, db)
-    assert prune["result"]["deleted"] == []
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
@@ -533,14 +547,14 @@ def test_stale_pre_update_proof_never_authorizes_recreated_snapshot(
         or replacement["pve_snaptime"] != snapshot["pve_snaptime"]
     )
     assert modeled["owned_by_hubinet_ops"] is False
-    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["ownership_status"] == (
+        "host_owned_unproven" if replacement_source_job_id else "uncertain"
+    )
     assert modeled["rollback_eligible"] is False
     assert modeled["delete_eligible"] is False
     with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
         service.manual_rollback(106)
-    service.queue_snapshot_prune(106, "oldest", "stale-proof-prune-0001")
-    prune = run_queued(service, db)
-    assert prune["result"]["deleted"] == []
+    _assert_prune_is_read_only_noop(service, db, "stale-proof-prune-0001")
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
@@ -571,9 +585,7 @@ def test_manual_snapshot_same_source_replay_with_new_snaptime_is_uncertain(
     assert modeled["delete_eligible"] is False
     with pytest.raises(ValueError, match="does not exist"):
         service.queue_snapshot_action(106, "delete", original["name"], "manual-replay-delete-0001")
-    service.queue_snapshot_prune(106, "oldest", "manual-replay-prune-0001")
-    prune = run_queued(service, db)
-    assert prune["result"]["deleted"] == []
+    _assert_prune_is_read_only_noop(service, db, "manual-replay-prune-0001")
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
@@ -631,16 +643,16 @@ def test_historical_snapshot_events_never_authorize_legacy_snapshot(
     modeled = service.list_snapshots(106)["snapshots"][0]
 
     assert modeled["owned_by_hubinet_ops"] is False
-    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["ownership_status"] == "host_owned_unproven"
     assert modeled["protected"] is True
     assert modeled["delete_eligible"] is False
     assert modeled["rollback_eligible"] is False
     with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
         service.manual_rollback(106)
     assert db.get_job(source["id"]) == before
-    service.queue_snapshot_prune(106, "oldest", "skip-historical-event-0001")
-    prune = run_queued(service, db)
-    assert prune["result"]["deleted"] == []
+    _assert_prune_is_read_only_noop(
+        service, db, "skip-historical-event-0001"
+    )
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 
@@ -683,7 +695,7 @@ def test_generic_job_result_cannot_create_snapshot_proof(
 
     assert updated["result"] == {"executor_data": "untrusted"}
     assert modeled["owned_by_hubinet_ops"] is False
-    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["ownership_status"] == "host_owned_unproven"
 
 
 def test_malformed_active_update_result_blocks_proof_persistence_fail_closed(
@@ -755,13 +767,13 @@ def test_malformed_manual_snapshot_result_is_uncertain_and_never_pruned(
     modeled = service.list_snapshots(106)["snapshots"][0]
 
     assert modeled["owned_by_hubinet_ops"] is False
-    assert modeled["ownership_status"] == "uncertain"
+    assert modeled["ownership_status"] == "host_owned_unproven"
     assert modeled["protected"] is True
     assert modeled["delete_eligible"] is False
     assert modeled["rollback_eligible"] is False
-    service.queue_snapshot_prune(106, "oldest", "skip-malformed-manual-0001")
-    terminal = run_queued(service, db)
-    assert terminal["result"]["deleted"] == []
+    _assert_prune_is_read_only_noop(
+        service, db, "skip-malformed-manual-0001"
+    )
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 

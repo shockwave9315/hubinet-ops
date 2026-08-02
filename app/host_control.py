@@ -94,6 +94,38 @@ class HostControlClient:
             raise HostControlError("Host control returned an invalid release fingerprint")
         return result
 
+    def check_application_release(self, vmid: int) -> dict[str, Any]:
+        if int(vmid) != 110:
+            raise HostControlError("Application release checks are restricted to CT110")
+        result = self._request(
+            "GET",
+            "/api/v1/resources/110/application-release",
+        )
+        status = str(result.get("status") or "")
+        if status not in {
+            "up_to_date", "update_available", "no_release_published"
+        }:
+            raise HostControlError("Host control returned an invalid release status")
+        if status == "update_available":
+            required = (
+                "latest_version", "tag", "commit_sha", "published_at",
+                "fingerprint", "artifact_verification",
+            )
+            if not all(result.get(key) not in {None, ""} for key in required):
+                raise HostControlError("Host control returned an incomplete release identity")
+        return result
+
+    def scan_ct110_system(self, vmid: int) -> dict[str, Any]:
+        if int(vmid) != 110:
+            raise HostControlError("System update scan is restricted to CT110")
+        result = self._request(
+            "GET",
+            "/api/v1/resources/110/system-update/scan",
+        )
+        if not isinstance(result.get("packages"), list):
+            raise HostControlError("Host control returned an invalid CT110 system scan")
+        return result
+
     def list_recovery_events(self) -> list[dict[str, Any]]:
         result = self._retry_read(
             lambda: self._request("GET", "/api/v1/recovery-events"),
@@ -124,6 +156,7 @@ class HostControlClient:
         expected_source_job_id: str | None = None,
         expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        system_update_fingerprint: str | None = None,
         on_observed: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"request_id": request_id}
@@ -141,6 +174,18 @@ class HostControlClient:
                     f"Self-update bearer token is missing from {self.update_token_env}"
                 )
             body["fingerprint"] = release_fingerprint
+        elif operation_type == "ct110_system_update":
+            if int(vmid) != 110:
+                raise HostControlError("System update is restricted to CT110")
+            method = "POST"
+            path = "/api/v1/resources/110/system-update"
+            if not system_update_fingerprint:
+                raise HostControlError("CT110 system update requires a plan fingerprint")
+            if len(self.update_token) < 32:
+                raise HostControlError(
+                    f"Update bearer token is missing from {self.update_token_env}"
+                )
+            body["fingerprint"] = system_update_fingerprint
         elif operation_type in {"snapshot_create", "snapshot_create_ram"}:
             method = "POST"
             path = f"/api/v1/resources/{int(vmid)}/snapshots"
@@ -180,7 +225,9 @@ class HostControlClient:
             path,
             json=body,
             bearer_token=(
-                self.update_token if operation_type == "self_update" else None
+                self.update_token
+                if operation_type in {"self_update", "ct110_system_update"}
+                else None
             ),
         )
         job_id = str(submitted.get("id") or "")
@@ -197,6 +244,7 @@ class HostControlClient:
                 expected_source_job_id=expected_source_job_id,
                 expected_pve_snaptime=expected_pve_snaptime,
                 release_fingerprint=release_fingerprint,
+                system_update_fingerprint=system_update_fingerprint,
             )
 
         validate(submitted)
@@ -254,6 +302,7 @@ class HostControlClient:
         expected_source_job_id: str | None = None,
         expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        system_update_fingerprint: str | None = None,
         on_observed: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         deadline = self.monotonic() + self.operation_timeout
@@ -277,6 +326,7 @@ class HostControlClient:
                 expected_source_job_id=expected_source_job_id,
                 expected_pve_snaptime=expected_pve_snaptime,
                 release_fingerprint=release_fingerprint,
+                system_update_fingerprint=system_update_fingerprint,
             )
 
         validate(current)
@@ -430,6 +480,7 @@ class HostControlClient:
         expected_source_job_id: str | None,
         expected_pve_snaptime: int | None,
         release_fingerprint: str | None,
+        system_update_fingerprint: str | None,
     ) -> None:
         try:
             remote_vmid = int(current.get("vmid"))
@@ -441,6 +492,8 @@ class HostControlClient:
         expected_argument: str | None = None
         if operation_type == "self_update":
             expected_argument = release_fingerprint
+        elif operation_type == "ct110_system_update":
+            expected_argument = system_update_fingerprint
         elif operation_type in {"snapshot_create", "snapshot_create_ram"}:
             expected_argument = snapshot_name
         elif operation_type in {"snapshot_rollback", "snapshot_delete"}:
@@ -452,7 +505,9 @@ class HostControlClient:
                 expected_pve_snaptime=expected_pve_snaptime,
             )
         remote_argument = current.get("argument")
-        if remote_argument is None and operation_type == "self_update":
+        if remote_argument is None and operation_type in {
+            "self_update", "ct110_system_update"
+        }:
             remote_argument = current.get("fingerprint")
         if remote_argument is None and operation_type.startswith("snapshot_"):
             remote_argument = current.get("snapshot_name")
@@ -464,7 +519,7 @@ class HostControlClient:
         if str(current.get("operation_type") or "") != operation_type:
             mismatches.append("operation_type")
         if remote_argument != expected_argument:
-            if operation_type == "self_update":
+            if operation_type in {"self_update", "ct110_system_update"}:
                 mismatches.append("fingerprint")
             elif operation_type.startswith("snapshot_"):
                 mismatches.append("snapshot_name")

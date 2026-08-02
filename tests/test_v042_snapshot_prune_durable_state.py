@@ -47,6 +47,11 @@ def _queue_all(
     )
 
 
+def _seed_prune_candidate(db: Database, host: RestartablePruneHost) -> None:
+    host.snapshots = _managed_snapshots(106, 1)
+    _record_snapshot_sources(db, host.snapshots)
+
+
 def test_snapshot_prune_insert_contains_complete_state_atomically(
     tmp_path: Path,
 ) -> None:
@@ -179,6 +184,7 @@ def test_request_retry_preserves_active_child_contract(
     cfg = settings(tmp_path)
     db = Database(cfg.db_path)
     host = RestartablePruneHost(db)
+    _seed_prune_candidate(db, host)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     job = service.queue_snapshot_prune(
         106,
@@ -217,6 +223,7 @@ def test_retry_before_execution_and_after_progress_never_resets_state(
     cfg = settings(tmp_path)
     db = Database(cfg.db_path)
     host = RestartablePruneHost(db)
+    _seed_prune_candidate(db, host)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     job = _queue_all(service, "retry-progress-prune-0001")
 
@@ -255,6 +262,7 @@ def test_retry_preserves_pre_durable_manual_prune_job(
     cfg = settings(tmp_path)
     db = Database(cfg.db_path)
     host = RestartablePruneHost(db)
+    _seed_prune_candidate(db, host)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     job, _ = db.create_operation_job(
         vmid=106,
@@ -283,6 +291,7 @@ def test_retry_preserves_v1_manual_prune_state_without_migration(
     cfg = settings(tmp_path)
     db = Database(cfg.db_path)
     host = RestartablePruneHost(db)
+    _seed_prune_candidate(db, host)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     job = _queue_all(service, "legacy-v1-manual-retry-0001")
     legacy_state = dict(job["result"])

@@ -60,6 +60,7 @@ class RestartablePruneHost(FakeHostControl):
         expected_source_job_id: str | None = None,
         expected_pve_snaptime: int | None = None,
         release_fingerprint: str | None = None,
+        on_observed=None,
     ) -> dict[str, Any]:
         if operation_type != "snapshot_delete":
             return super().execute(
@@ -71,6 +72,7 @@ class RestartablePruneHost(FakeHostControl):
                 expected_source_job_id=expected_source_job_id,
                 expected_pve_snaptime=expected_pve_snaptime,
                 release_fingerprint=release_fingerprint,
+                on_observed=on_observed,
             )
         assert snapshot_name is not None
         active = self.db.active_jobs()
@@ -92,6 +94,8 @@ class RestartablePruneHost(FakeHostControl):
             (operation_type, vmid, request_id, snapshot_name, release_fingerprint)
         )
         self.delete_submissions.append((request_id, snapshot_name))
+        if on_observed is not None:
+            on_observed({"id": request_id[:32]})
         if self.execute_error is not None:
             raise self.execute_error
         if snapshot_name == self.interrupt_name:
@@ -164,6 +168,13 @@ def _service(
     cfg = settings(tmp_path)
     db = Database(cfg.db_path)
     host = RestartablePruneHost(db)
+    initial = _owned(
+        106,
+        "20260727T120000Z",
+        created_at="2026-07-27T12:00:00+00:00",
+    )
+    host.snapshots = [initial]
+    _record_snapshot_sources(db, host.snapshots)
     service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)
     job = service.queue_snapshot_prune(
         106,

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_PATH = Path(os.environ.get("HUBINET_MAINT_CONFIG_PATH", "/etc/hubinet-maint.json"))
-VERSION = "0.4.1"
+VERSION = "0.4.3"
 PROTOCOL_VERSION = 1
 SUPPORTED_ACTIONS = (
     "capabilities",
@@ -202,6 +202,16 @@ def apt_scan() -> dict[str, Any]:
             f"apt simulation failed: {(sim.stderr or sim.stdout)[-1000:]}"
         )
 
+    security_by_name: dict[str, bool] = {}
+    listing = run(["apt", "list", "--upgradable"], timeout=300)
+    if listing.returncode == 0:
+        for line in listing.stdout.splitlines():
+            match = re.match(r"^(\S+?)/([^\s]+)\s+", line)
+            if match:
+                security_by_name[match.group(1)] = (
+                    "security" in match.group(2).lower()
+                )
+
     packages: list[dict[str, Any]] = []
     pattern = re.compile(r"^Inst\s+(\S+)(?:\s+\[([^\]]+)\])?\s+\(([^ )]+)")
     for line in sim.stdout.splitlines():
@@ -212,6 +222,7 @@ def apt_scan() -> dict[str, Any]:
                     "name": match.group(1),
                     "current": match.group(2),
                     "target": match.group(3),
+                    "security": security_by_name.get(match.group(1)),
                 }
             )
     fingerprint = hashlib.sha256(
@@ -222,6 +233,10 @@ def apt_scan() -> dict[str, Any]:
         "packages": packages,
         "fingerprint": fingerprint,
         "scanned_at": int(time.time()),
+        "security_updates_count": sum(
+            item["security"] is True for item in packages
+        ),
+        "reboot_required": Path("/var/run/reboot-required").exists(),
     }
 
 

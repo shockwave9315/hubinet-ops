@@ -20,7 +20,7 @@ class ContractExecutor:
         self,
         *,
         fingerprint: str = "approved-fingerprint",
-        version: str = "0.4.1",
+        version: str = "0.4.3",
         actions: set[str] | None = None,
     ) -> None:
         self.fingerprint = fingerprint
@@ -165,7 +165,7 @@ def test_incompatible_executor_blocks_before_snapshot_or_update(tmp_path: Path) 
     )
     service = OpsService(cfg, db, executor)  # type: ignore[arg-type]
 
-    with pytest.raises(ValueError, match=r"required 0\.4\.1/protocol 1/verify"):
+    with pytest.raises(ValueError, match=r"required 0\.4\.3/protocol 1/verify"):
         service.approve_active(106)
 
     assert executor.calls == ["capabilities"]

@@ -119,7 +119,7 @@ resources:
       snapshot_delete: true
       self_update: false
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: e101a103edf2622208fa8207a37ef58c35568f8b0b3a821fe9dda9d8c05ea205
     snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
@@ -145,7 +145,7 @@ resources:
     monitoring: {inspect: true, update_scan: true}
     operator_capabilities: *full_lxc_control
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: 43eb03016572e1282624e9a1560223c517705009f2bd938be4a50ef0ddd711f4
     snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
@@ -171,7 +171,7 @@ resources:
     monitoring: {inspect: true, update_scan: true}
     operator_capabilities: *full_lxc_control
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: 8f8c58d96d72996c08c42262341e9b84f9fcc6932576dcc0453dc70340bea8f1
     snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
@@ -197,7 +197,7 @@ resources:
     monitoring: {inspect: true, update_scan: true}
     operator_capabilities: *full_lxc_control
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: 29a19ed2935970a7e88516acec792062b1bdc4849596b16e7f448179ce350e62
     snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
@@ -227,7 +227,7 @@ resources:
     monitoring: {inspect: true, update_scan: true}
     operator_capabilities: *full_lxc_control
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: c1c0ee212c5318cac5be6d6a912baf33665a77d77efc0af0dfa66a443c59451a
     snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
@@ -253,7 +253,7 @@ resources:
     monitoring: {inspect: true, update_scan: true}
     operator_capabilities: *full_lxc_control
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: 110df87fefe1d99ab8d39b1b96ab2d32f7ebf0ffd38c6fe783d51def2620d82c
     snapshot_retention_count: 3
     recovery_scan: {enabled: true, delay_seconds: 90, cooldown_seconds: 900}
@@ -292,7 +292,7 @@ resources:
     monitoring: {inspect: true, update_scan: true}
     operator_capabilities: *full_lxc_control
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: 87ea05776807a81eb9760118b645b40ce7940b9dabefed5683518e17c8fc27d6
     snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
@@ -318,7 +318,7 @@ resources:
     monitoring: {inspect: true, update_scan: true}
     operator_capabilities: *full_lxc_control
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: 53c881c47e88f6c589df0341097f09ebb9b703ae662c15987175bb6c3d82de3a
     snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
@@ -344,7 +344,7 @@ resources:
     monitoring: {inspect: true, update_scan: true}
     operator_capabilities: *full_lxc_control
     executor_contract:
-      executor_sha256: ae3092947543113d92047de30a877f9c85802e4e2a2aab20f4832b4572177b12
+      executor_sha256: 2a5cf128356bb7545485567d50a64ee7d3cabf372d4ddc7cdb7a39ba3fccf78c
       profile_sha256: 7be7c63d5b3e49b762788b2786592cd138ad37ba5948220e4c1753ae34ee6c32
     snapshot_retention_count: 3
     recovery_scan: {enabled: false, delay_seconds: 90, cooldown_seconds: 900}
@@ -367,10 +367,10 @@ resources:
     criticality: high
     ip_address: 192.168.4.200
     os: Debian 13
-    monitoring: {inspect: true, update_scan: false}
+    monitoring: {inspect: true, update_scan: true}
     operator_capabilities:
       refresh: true
-      scan: false
+      scan: true
       approve: true
       reject: true
       retry_healthcheck: false
@@ -389,7 +389,7 @@ resources:
     repair_actions: []
     required_services: [hubinet-ops.service]
     docker: {enabled: false, require_health: false, required: []}
-    pre_update_snapshot: false
+    pre_update_snapshot: true
     automatic_rollback: false
     manual_rollback_allowed: false
     manual_snapshot_restore_allowed: true

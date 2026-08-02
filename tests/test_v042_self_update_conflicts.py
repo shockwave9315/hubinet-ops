@@ -4,7 +4,6 @@ import importlib
 from pathlib import Path
 from typing import Any
 
-import pytest
 import yaml
 from fastapi.testclient import TestClient
 
@@ -19,12 +18,17 @@ from tests.test_lifecycle_snapshots import (
 
 
 class MissingReleaseHost(FakeHostControl):
-    def inspect_self_update_release(self, vmid: int) -> dict[str, Any]:
-        raise HostControlError(
-            "No approved Hubinet Ops release is staged",
-            http_status=409,
-            code="staged_release_missing",
-        )
+    def check_application_release(self, vmid: int) -> dict[str, Any]:
+        return {
+            "status": "no_release_published",
+            "current_version": "0.4.3",
+            "latest_version": None,
+        }
+
+
+class UnavailableReleaseHost(FakeHostControl):
+    def check_application_release(self, vmid: int) -> dict[str, Any]:
+        raise HostControlError("GitHub release discovery timed out", http_status=502)
 
 
 def _import_main(tmp_path: Path, monkeypatch):
@@ -39,7 +43,7 @@ def _import_main(tmp_path: Path, monkeypatch):
     return importlib.import_module("app.main")
 
 
-def test_missing_staged_release_returns_structured_nonempty_409(
+def test_no_published_release_returns_structured_http_200_without_a_plan(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -59,18 +63,34 @@ def test_missing_staged_release_returns_structured_nonempty_409(
         headers={"Authorization": f"Bearer {cfg.api_token}"},
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 200
     assert response.json() == {
-        "detail": {
-            "code": "staged_release_missing",
-            "message": "No approved Hubinet Ops release is staged",
-            "required_action": (
-                "Stage and validate the signed Hubinet Ops release on PVE, "
-                "then refresh CT110."
-            ),
-        }
+        "status": "no_release_published",
+        "current_version": "0.4.3",
+        "latest_version": None,
     }
-    assert response.json() != {}
+
+
+def test_release_transport_failure_is_a_gateway_error_not_a_business_conflict(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    main = _import_main(tmp_path, monkeypatch)
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    response = TestClient(
+        main.create_app(
+            cfg,
+            database=Database(cfg.db_path),
+            executor=CompatibleExecutor(),
+            host_control=UnavailableReleaseHost(),
+        )
+    ).post(
+        "/api/v1/resources/110/self-update",
+        headers={"Authorization": f"Bearer {cfg.api_token}"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "application_release_unavailable"
 
 
 def test_real_self_update_plan_conflict_has_stable_error_code(
@@ -115,45 +135,34 @@ def _ha_self_update_script() -> dict[str, Any]:
     return package["script"]["hubinet_ops_self_update"]
 
 
-@pytest.mark.parametrize("release_state", ["none", "unknown", "unavailable"])
-def test_ha_self_update_requests_backend_when_release_sensor_is_missing(
-    release_state: str,
-) -> None:
+def test_ha_application_check_always_requests_configured_backend_discovery() -> None:
     script = _ha_self_update_script()
-    branch = script["sequence"][0]["choose"][0]
-
-    assert release_state in {"none", "unknown", "unavailable"}
-    assert branch["conditions"] == "{{ vmid | int == 110 }}"
-    assert branch["sequence"][0]["action"] == "rest_command.hubinet_ops_self_update_plan"
-    assert "self_update_release_version" not in str(script)
+    assert script["sequence"] == [
+        {"action": "script.hubinet_ops_check_application_release"}
+    ]
 
 
-def test_ha_self_update_does_not_request_backend_for_other_vmids() -> None:
-    script = _ha_self_update_script()
-    choose_step = script["sequence"][0]
-    choose = choose_step["choose"]
-
-    assert len(choose) == 1
-    assert choose[0]["conditions"] == "{{ vmid | int == 110 }}"
-    assert choose[0]["sequence"][0]["action"] == (
-        "rest_command.hubinet_ops_self_update_plan"
+def test_ha_has_separate_system_and_application_actions() -> None:
+    package = yaml.load(
+        Path("home-assistant/packages/hubinet_ops.yaml").read_text(encoding="utf-8"),
+        Loader=HomeAssistantLoader,
     )
-    assert choose_step["default"][0]["variables"]["response"]["status"] == 403
+    scripts = package["script"]
+    for name in (
+        "hubinet_ops_scan_ct110_system",
+        "hubinet_ops_approve_ct110_system",
+        "hubinet_ops_check_application_release",
+        "hubinet_ops_install_application_release",
+    ):
+        assert name in scripts
+    assert "staged_release_missing" not in str(scripts)
 
 
-def test_ha_self_update_presents_structured_backend_conflicts() -> None:
-    script = str(_ha_self_update_script())
-
-    assert "detail.get('code', '')" in script
-    assert "detail.get('message'," in script
-    assert "staged_release_missing" in script
-    assert "Brak przygotowanego wydania" in script
-    assert "error_message" in script
-    assert "Backend odrzucił przygotowanie planu aktualizacji" in script
-
-
-def test_hostd_labels_missing_staged_release_with_stable_code() -> None:
+def test_hostd_exposes_release_discovery_without_a_user_supplied_repository() -> None:
     hostd = Path("deploy/pve/hubinet_ops_hostd.py").read_text(encoding="utf-8")
 
-    assert '"staged_release_missing"' in hostd
-    assert 'message == "No approved Hubinet Ops release is staged"' in hostd
+    assert "application-release" in hostd
+    assert "application-release-check" in hostd
+    assert "repo" not in Path("app/main.py").read_text(encoding="utf-8").split(
+        'def self_update_resource', 1
+    )[1].split('def retry_healthcheck', 1)[0]

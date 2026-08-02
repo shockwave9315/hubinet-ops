@@ -54,7 +54,7 @@ class CompatibleExecutor:
             return {
                 "ok": True,
                 "data": {
-                    "version": "0.4.1",
+                    "version": "0.4.3",
                     "protocol_version": 1,
                     "supported_actions": sorted(REQUIRED_APT_ACTIONS),
                     "executor_sha256": EXECUTOR_HASH,
@@ -88,11 +88,18 @@ class FakeHostControl:
         self.acknowledged_recovery_ids: list[str] = []
         self.snapshots: list[dict[str, Any]] = []
         self.release = {
-            "version": "0.4.0",
-            "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
+            "status": "update_available",
+            "current_version": "0.4.2",
+            "latest_version": "0.4.3",
+            "version": "0.4.3",
+            "tag": "v0.4.3",
+            "commit_sha": "1" * 40,
+            "published_at": "2026-08-02T12:00:00+00:00",
+            "release_id": "hubinet-ops-0.4.3-aaaaaaaaaaaaaaaa",
             "fingerprint": "a" * 64,
             "file_count": 136,
             "total_bytes": 1000,
+            "artifact_verification": "not_downloaded",
         }
 
     def status(self, vmid: int) -> dict[str, Any]:
@@ -102,6 +109,10 @@ class FakeHostControl:
         return [dict(item) for item in self.snapshots]
 
     def inspect_self_update_release(self, vmid: int) -> dict[str, Any]:
+        assert vmid == 110
+        return dict(self.release)
+
+    def check_application_release(self, vmid: int) -> dict[str, Any]:
         assert vmid == 110
         return dict(self.release)
 
@@ -196,6 +207,9 @@ class FakeHostControl:
                 "version": self.release["version"],
                 "release_id": self.release["release_id"],
                 "fingerprint": release_fingerprint,
+                "tag": self.release["tag"],
+                "commit_sha": self.release["commit_sha"],
+                "artifact_verification": "verified",
                 "exit_code": 0,
             }
         return {"runtime_status": self.runtime, "lxc_status": self.runtime}
@@ -1182,10 +1196,21 @@ def test_ct110_self_update_requires_plan_approval_and_rechecks_before_rollout(
     assert same["job"]["id"] == approved["job"]["id"]
     assert same["job"]["operation_type"] == "self_update"
     assert approved["job"]["request_id"] == "approve-self-update-0001"
+    queued_state = service.get_state(110)
+    assert queued_state["application_download_status"] == "pending"
+    assert queued_state["application_validation_status"] == "pending"
+    assert queued_state["application_deployment_status"] == "queued"
 
     terminal = run_queued(service, db)
     assert terminal["status"] == "success"
     assert terminal["result"]["exit_code"] == 0
+    assert db.get_plan(planned["plan"]["id"])["status"] == "completed"
+    state = service.get_state(110)
+    assert state["application_current_version"] == "0.4.3"
+    assert state["application_release_tag"] == "v0.4.3"
+    assert state["application_release_commit"] == "1" * 40
+    assert state["application_validation_status"] == "verified"
+    assert state["application_deployment_status"] == "success"
     assert host.calls == [
         (
             "self_update",
@@ -1195,6 +1220,41 @@ def test_ct110_self_update_requires_plan_approval_and_rechecks_before_rollout(
             "a" * 64,
         )
     ]
+    host.release = {
+        "status": "up_to_date",
+        "current_version": "0.4.3",
+        "latest_version": "0.4.3",
+    }
+    assert service.create_self_update_plan(110)["status"] == "up_to_date"
+    assert len(host.calls) == 1
+
+
+def test_ct110_application_release_up_to_date_is_http_style_business_result(
+    tmp_path: Path,
+) -> None:
+    cfg = settings(tmp_path, vmid=110, adapter="agent_self")
+    db = Database(cfg.db_path)
+    host = FakeHostControl("running")
+    host.release = {
+        "status": "up_to_date",
+        "current_version": "0.4.3",
+        "latest_version": "0.4.3",
+    }
+    service = OpsService(cfg, db, CompatibleExecutor(), host_control=host)  # type: ignore[arg-type]
+
+    result = service.create_self_update_plan(110)
+
+    assert result == {
+        "status": "up_to_date",
+        "current_version": "0.4.3",
+        "latest_version": "0.4.3",
+    }
+    assert db.list_jobs() == []
+    assert db.waiting_plans(110) == []
+    state = service.get_state(110)
+    assert state["application_release_check_status"] == "up_to_date"
+    assert state["application_current_version"] == "0.4.3"
+    assert state["operation_status"] == "idle"
 
 
 def test_ct110_self_update_fingerprint_change_blocks_before_host_mutation(

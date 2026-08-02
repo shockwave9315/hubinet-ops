@@ -330,7 +330,15 @@ def create_app(
             raise HTTPException(status_code=404, detail="Resource not found") from exc
         except ConflictError as exc:
             raise HTTPException(status_code=409, detail=exc.detail()) from exc
-        except (ValueError, ExecutorError, HostControlError) as exc:
+        except HostControlError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "application_release_unavailable",
+                    "message": str(exc),
+                },
+            ) from exc
+        except (ValueError, ExecutorError) as exc:
             raise HTTPException(
                 status_code=409,
                 detail={

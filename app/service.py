@@ -71,6 +71,7 @@ HOST_CONTROL_OPERATION_TYPES = {
     "snapshot_rollback",
     "snapshot_delete",
     "self_update",
+    "ct110_system_update",
 }
 BACKEND_ONLY_EVENT_TYPES = {
     "snapshot_created",
@@ -191,6 +192,7 @@ class OpsService:
     def start(self) -> None:
         self._consume_offline_recovery_events()
         self._reconcile_startup_jobs()
+        self.reconcile_snapshot_proofs()
         self._ensure_initial_states()
         self.mqtt.start()
         self._worker.start()
@@ -340,6 +342,13 @@ class OpsService:
             # stale operation/plan/job fields captured before that transition.
             state = self.get_state(vmid)
             state.update(inspected)
+            if vmid == 110 and cfg.get("adapter") == "agent_self":
+                installed_version = str(
+                    inspected.get("agent_version") or VERSION
+                )
+                state["application_current_version"] = installed_version
+                if state.get("application_latest_version") == installed_version:
+                    state["application_release_check_status"] = "up_to_date"
             if str(cfg.get("resource_type") or "lxc") == "lxc":
                 state["lxc_status"] = host_runtime
                 state["runtime_status"] = host_runtime
@@ -386,6 +395,19 @@ class OpsService:
                 )
         saved = self._save_state(vmid, state)
         self._observe_health(vmid, str(saved.get("health_status", "unknown")))
+        if operator and self._capabilities(vmid).get("snapshot_list", False):
+            try:
+                self._refresh_snapshot_state(vmid)
+            except (ExecutorError, HostControlError, ValueError) as exc:
+                # The primary resource observation is still useful.  The
+                # snapshot helper preserves the previous canonical snapshot
+                # model and marks it stale instead of inventing a deletion.
+                LOGGER.warning(
+                    "Snapshot refresh failed during operator refresh for %s: %s",
+                    vmid,
+                    exc,
+                )
+            saved = self.get_state(vmid)
         return saved
 
     @staticmethod
@@ -488,6 +510,12 @@ class OpsService:
     ) -> dict[str, Any]:
         if not bool(cfg.get("enabled", False)):
             return {"vmid": vmid, "status": "disabled"}
+        if (
+            vmid == 110
+            and cfg.get("adapter") == "agent_self"
+            and cfg.get("resource_type", "lxc") == "lxc"
+        ):
+            return self._scan_ct110_system_locked(vmid, cfg, source=source)
         if cfg.get("adapter", "apt") != "apt" or cfg.get("resource_type", "lxc") != "lxc":
             return {
                 "vmid": vmid,
@@ -611,6 +639,182 @@ class OpsService:
         self._save_state(vmid, state)
         return {"vmid": vmid, "status": status, "plan": active, "source": source}
 
+    def _scan_ct110_system_locked(
+        self,
+        vmid: int,
+        cfg: dict[str, Any],
+        *,
+        source: str,
+    ) -> dict[str, Any]:
+        host = self._require_host_control("CT110 system update scan")
+        state = self.get_state(vmid)
+        prior_operation = state["operation_status"]
+        prior_stage = state["job_stage"]
+        state.update(
+            {
+                "system_update_status": "scanning",
+                "job_stage": "system_scanning",
+            }
+        )
+        self._save_state(vmid, state)
+        try:
+            data = self._validate_ct110_system_scan(host.scan_ct110_system(vmid))
+        except (HostControlError, ValueError) as exc:
+            state = self.get_state(vmid)
+            state.update(
+                {
+                    "system_update_status": "unknown",
+                    "system_last_scan": self._utc_second_timestamp(),
+                    "system_last_error": sanitize_text(exc, limit=2000),
+                    "job_stage": prior_stage,
+                    "operation_status": prior_operation,
+                }
+            )
+            self._save_state(vmid, state)
+            return {
+                "vmid": vmid,
+                "status": "error",
+                "error": sanitize_text(exc, limit=2000),
+            }
+
+        count = int(data["pending_count"])
+        fingerprint = str(data["fingerprint"])
+        payload = {**data, "plan_type": "ct110_system_update"}
+        state = self.get_state(vmid)
+        state.update(
+            {
+                "system_updates": data,
+                "system_pending_updates": count,
+                "system_security_updates": data["security_updates_count"],
+                "system_package_names": ", ".join(
+                    item["name"] for item in data["packages"]
+                )[:255] or None,
+                "system_update_status": (
+                    "update_available" if count else "up_to_date"
+                ),
+                "system_last_scan": data["scanned_at"],
+                "system_last_error": None,
+                "job_stage": prior_stage,
+                "operation_status": prior_operation,
+            }
+        )
+        if count == 0:
+            active = self.db.find_active_plan(vmid)
+            if active is not None and self._plan_type(active) == "ct110_system_update":
+                self.db.update_plan_status(str(active["id"]), "superseded")
+            state.update(
+                {
+                    "system_active_plan_id": None,
+                    "system_active_plan_status": None,
+                }
+            )
+            self._save_state(vmid, state)
+            return {
+                "vmid": vmid,
+                "status": "up_to_date",
+                "data": data,
+                "source": source,
+            }
+
+        active = self.db.find_active_plan(vmid, fingerprint)
+        if active is not None and self._plan_type(active) != "ct110_system_update":
+            raise ValueError("Resolve the active application release plan first")
+        if active is None:
+            other = self.db.find_active_plan(vmid)
+            if other is not None:
+                raise ValueError("Resolve the active CT110 plan before system scan")
+            active = self.db.create_plan(
+                vmid=vmid,
+                container_name=str(cfg.get("name", "hubinet-ops")),
+                fingerprint=fingerprint,
+                risk=_risk_for(cfg, data),
+                payload=payload,
+                ttl_minutes=int(
+                    self.settings.scheduler.get("approval_ttl_minutes", 1440)
+                ),
+            )
+            status = "plan_created"
+        else:
+            status = "existing_plan"
+        state.update(
+            {
+                "system_active_plan_id": active["id"],
+                "system_active_plan_status": active["status"],
+                "operation_status": "waiting_approval",
+            }
+        )
+        self._save_state(vmid, state)
+        return {
+            "vmid": vmid,
+            "status": status,
+            "plan": active,
+            "source": source,
+        }
+
+    @staticmethod
+    def _validate_ct110_system_scan(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValueError("CT110 system scan result must be an object")
+        packages = raw.get("packages")
+        if not isinstance(packages, list) or len(packages) > 2000:
+            raise ValueError("CT110 system scan package list is invalid")
+        normalized: list[dict[str, Any]] = []
+        for item in packages:
+            if not isinstance(item, dict) or set(item) - {
+                "name", "current", "target", "security"
+            }:
+                raise ValueError("CT110 system scan package entry is invalid")
+            name = str(item.get("name") or "")
+            current = str(item.get("current") or "")
+            target = str(item.get("target") or "")
+            security = item.get("security")
+            if (
+                not name
+                or len(name) > 255
+                or not current
+                or len(current) > 255
+                or not target
+                or len(target) > 255
+                or security not in {True, False, None}
+            ):
+                raise ValueError("CT110 system scan package identity is invalid")
+            normalized.append(
+                {
+                    "name": name,
+                    "current": current,
+                    "target": target,
+                    "security": security,
+                }
+            )
+        if len({item["name"] for item in normalized}) != len(normalized):
+            raise ValueError("CT110 system scan contains duplicate packages")
+        pending = raw.get("pending_count")
+        if isinstance(pending, bool) or pending != len(normalized):
+            raise ValueError("CT110 system scan package count is invalid")
+        stable = json.dumps(
+            normalized, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        fingerprint = hashlib.sha256(stable).hexdigest()
+        if raw.get("fingerprint") != fingerprint:
+            raise ValueError("CT110 system scan fingerprint is invalid")
+        scanned_at = parse_utc_timestamp(raw.get("scanned_at"))
+        if scanned_at is None:
+            raise ValueError("CT110 system scan timestamp is invalid")
+        security_count = sum(item["security"] is True for item in normalized)
+        if raw.get("security_updates_count") != security_count:
+            raise ValueError("CT110 security update count is invalid")
+        reboot = raw.get("reboot_required")
+        if reboot not in {True, False, None}:
+            raise ValueError("CT110 reboot-required state is invalid")
+        return {
+            "pending_count": len(normalized),
+            "packages": normalized,
+            "fingerprint": fingerprint,
+            "scanned_at": scanned_at.isoformat(),
+            "security_updates_count": security_count,
+            "reboot_required": reboot,
+        }
+
     def approve(self, plan_id: str) -> dict[str, Any]:
         candidate = self.db.get_plan(plan_id)
         vmid = int(candidate["vmid"])
@@ -623,6 +827,8 @@ class OpsService:
         try:
             if self._plan_type(candidate) == "self_update":
                 return self._approve_self_update_plan(candidate)
+            if self._plan_type(candidate) == "ct110_system_update":
+                return self._approve_ct110_system_plan(candidate)
             plan, job = self.db.approve_plan(plan_id)
             return self._publish_approved_plan(plan, job)
         finally:
@@ -640,7 +846,8 @@ class OpsService:
                 if existing is not None:
                     if (
                         existing.get("plan_id")
-                        and existing.get("operation_type") in {"update", "self_update"}
+                        and existing.get("operation_type")
+                        in {"update", "self_update", "ct110_system_update"}
                     ):
                         return {
                             "plan": self.db.get_plan(str(existing["plan_id"])),
@@ -652,6 +859,8 @@ class OpsService:
             plan = self._single_waiting_plan(vmid)
             if self._plan_type(plan) == "self_update":
                 return self._approve_self_update_plan(plan, request_id)
+            if self._plan_type(plan) == "ct110_system_update":
+                return self._approve_ct110_system_plan(plan, request_id)
             self._require_compatible_executor(vmid)
             scan = _executor_data(self.executor.run("scan", vmid, timeout=700))
             pending = max(0, int(scan.get("pending_count", 0) or 0))
@@ -743,6 +952,50 @@ class OpsService:
             request_id=request_id or uuid.uuid4().hex,
             operation_type="self_update",
         )
+        published = self._publish_approved_plan(plan, job)
+        state = self.get_state(110)
+        state.update(
+            {
+                "application_download_status": "pending",
+                "application_validation_status": "pending",
+                "application_deployment_status": "queued",
+                "application_last_error": None,
+            }
+        )
+        self._save_state(110, state)
+        return published
+
+    def _approve_ct110_system_plan(
+        self,
+        plan: dict[str, Any],
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        if int(plan["vmid"]) != 110 or self._plan_type(plan) != "ct110_system_update":
+            raise ValueError("Plan is not a CT110 system-update plan")
+        host = self._require_host_control("CT110 system update approval")
+        current = self._validate_ct110_system_scan(host.scan_ct110_system(110))
+        if (
+            int(current["pending_count"]) <= 0
+            or str(current["fingerprint"]) != str(plan["fingerprint"])
+        ):
+            self.db.update_plan_status(str(plan["id"]), "superseded")
+            raise ValueError(
+                "CT110 system update fingerprint changed; run a new system scan"
+            )
+        plan, job = self.db.approve_plan(
+            str(plan["id"]),
+            request_id=request_id or uuid.uuid4().hex,
+            operation_type="ct110_system_update",
+        )
+        state = self.get_state(110)
+        state.update(
+            {
+                "system_active_plan_id": plan["id"],
+                "system_active_plan_status": "approved",
+                "system_update_status": "queued",
+            }
+        )
+        self._save_state(110, state)
         return self._publish_approved_plan(plan, job)
 
     def _publish_approved_plan(
@@ -1040,6 +1293,156 @@ class OpsService:
         self._require_capability(vmid, "snapshot_list")
         return self._refresh_snapshot_state(vmid)
 
+    def reconcile_snapshot_proofs(self) -> list[dict[str, Any]]:
+        """Recover only proofs backed by an exact backend→hostd→PVE chain.
+
+        The method performs read-only host operations.  It never creates,
+        deletes, restores, retains, or otherwise mutates a physical snapshot.
+        """
+        host = self.host_control
+        if host is None or not hasattr(host, "find_job_by_request_id"):
+            return []
+        reconciled: list[dict[str, Any]] = []
+        for vmid, cfg in sorted(self.settings.resources.items()):
+            if (
+                not bool(cfg.get("enabled", False))
+                or not self._capabilities(vmid).get("snapshot_list", False)
+            ):
+                continue
+            try:
+                snapshots = self._raw_snapshot_list(vmid)
+            except (ExecutorError, HostControlError, ValueError) as exc:
+                LOGGER.warning(
+                    "Snapshot proof reconciliation list failed for %s: %s",
+                    vmid,
+                    exc,
+                )
+                continue
+            for raw in snapshots:
+                if not isinstance(raw, dict):
+                    continue
+                name = str(raw.get("name") or "")
+                parsed = parse_owned_snapshot_name(name, vmid=vmid)
+                host_job_id = str(raw.get("source_job_id") or "")
+                pve_snaptime = raw.get("pve_snaptime")
+                if (
+                    raw.get("owned_by_hubinet_ops") is not True
+                    or parsed is None
+                    or parsed.get("kind") != "pre-update"
+                    or not self._valid_host_source_job_id(host_job_id)
+                    or isinstance(pve_snaptime, bool)
+                    or not isinstance(pve_snaptime, int)
+                    or pve_snaptime <= 0
+                ):
+                    continue
+                candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                for candidate in self.db.find_snapshot_jobs(vmid, name):
+                    result = candidate.get("result")
+                    contract = (
+                        result.get("pre_update_snapshot_create")
+                        if isinstance(result, dict)
+                        else None
+                    )
+                    if (
+                        candidate.get("operation_type") == "update"
+                        and candidate.get("status")
+                        in {"failed", "blocked", "interrupted"}
+                        and isinstance(contract, dict)
+                        and contract.get("version") == 1
+                        and contract.get("request_id")
+                        == f"pre-update-snapshot-{candidate['id']}"
+                        and contract.get("snapshot_name") == name
+                        and contract.get("phase")
+                        in {"definitive_failed", "outcome_unknown"}
+                        and contract.get("host_job_id") in {None, host_job_id}
+                        and not self.db.has_snapshot_proof(
+                            str(candidate["id"]),
+                            vmid,
+                            name,
+                            host_job_id,
+                            pve_snaptime,
+                        )
+                    ):
+                        candidates.append((candidate, contract))
+                if len(candidates) != 1:
+                    continue
+                candidate, contract = candidates[0]
+                request_id = str(contract["request_id"])
+                try:
+                    remote = host.find_job_by_request_id(vmid, request_id)
+                except (HostControlError, ValueError):
+                    continue
+                if not isinstance(remote, dict):
+                    continue
+                remote_vmid = remote.get("vmid")
+                if (
+                    remote.get("id") != host_job_id
+                    or remote.get("request_id") != request_id
+                    or isinstance(remote_vmid, bool)
+                    or remote_vmid != vmid
+                    or remote.get("operation_type") != "snapshot_create"
+                    or remote.get("argument") != name
+                    or remote.get("status") not in {"succeeded", "failed"}
+                ):
+                    continue
+                if remote.get("status") == "succeeded":
+                    remote_result = remote.get("result")
+                    if (
+                        not isinstance(remote_result, dict)
+                        or remote_result.get("name") != name
+                        or remote_result.get("kind") != "pre-update"
+                        or remote_result.get("source_job_id") != host_job_id
+                        or remote_result.get("pve_snaptime") != pve_snaptime
+                    ):
+                        continue
+                try:
+                    self.db.reconcile_pre_update_snapshot_proof(
+                        str(candidate["id"]),
+                        vmid,
+                        name,
+                        host_job_id,
+                        pve_snaptime,
+                        request_id,
+                    )
+                except (KeyError, ValueError):
+                    continue
+                existing_events = self.db.list_job_events(
+                    str(candidate["id"]),
+                    limit=200,
+                )
+                if not any(
+                    event.get("event_type") == "snapshot_proof_reconciled"
+                    for event in existing_events
+                ):
+                    self.db.insert_job_event(
+                        job_id=str(candidate["id"]),
+                        vmid=vmid,
+                        level="warning",
+                        stage="failed",
+                        progress=100,
+                        event_type="snapshot_proof_reconciled",
+                        message=(
+                            "Recovered snapshot proof from the exact durable host job; "
+                            "the failed update outcome was preserved"
+                        ),
+                        details={
+                            "snapshot_name": name,
+                            "host_job_id": host_job_id,
+                            "request_id": request_id,
+                            "pve_snaptime": pve_snaptime,
+                        },
+                    )
+                reconciled.append(
+                    {
+                        "vmid": vmid,
+                        "snapshot_name": name,
+                        "backend_job_id": str(candidate["id"]),
+                        "host_job_id": host_job_id,
+                        "status": "reconciled",
+                    }
+                )
+        return reconciled
+
     def _refresh_snapshot_state(
         self,
         vmid: int,
@@ -1059,7 +1462,7 @@ class OpsService:
                 last_error = exc
         else:
             warning = sanitize_text(
-                f"Snapshot refresh failed after mutation: {last_error}",
+                f"Snapshot refresh failed: {last_error}",
                 limit=2000,
             )
             state = self.get_state(vmid)
@@ -1090,11 +1493,20 @@ class OpsService:
         )
         snapshots.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         owned = [item for item in snapshots if item.get("owned_by_hubinet_ops") is True]
+        unproven = [
+            item
+            for item in snapshots
+            if item.get("ownership_status") == "host_owned_unproven"
+        ]
         latest = owned[0] if owned else {}
         state = self.get_state(vmid)
         state.update(
             {
                 "snapshot_count": len(owned),
+                "snapshot_unproven_count": len(unproven),
+                "latest_unproven_snapshot_name": (
+                    unproven[0].get("name") if unproven else None
+                ),
                 "latest_snapshot_name": latest.get("name"),
                 "latest_snapshot_at": latest.get("created_at"),
                 "latest_snapshot_kind": latest.get("kind"),
@@ -1103,6 +1515,7 @@ class OpsService:
                 "snapshot_refresh_warning": None,
                 "snapshot_refreshed_at": self._utc_second_timestamp(),
                 "managed_snapshots": owned,
+                "unproven_snapshots": unproven,
             }
         )
         self._save_state(vmid, state)
@@ -1194,14 +1607,17 @@ class OpsService:
             snapshot_jobs = jobs_by_snapshot.get(name, [])
             host_source_job_id = str(item.get("source_job_id") or "") or None
             pve_snaptime = item.get("pve_snaptime")
-            durable_source: dict[str, Any] | None = None
-            if (
+            host_owned = (
                 item.get("owned_by_hubinet_ops") is True
                 and parsed is not None
                 and isinstance(pve_snaptime, int)
                 and not isinstance(pve_snaptime, bool)
                 and pve_snaptime > 0
-            ):
+                and host_source_job_id is not None
+                and self._valid_host_source_job_id(host_source_job_id)
+            )
+            durable_source: dict[str, Any] | None = None
+            if host_owned:
                 if parsed["kind"] == "manual" and host_source_job_id is not None:
                     durable_source = next(
                         (
@@ -1258,7 +1674,11 @@ class OpsService:
                 reasons.append("manual_rollback_source")
             if not owned:
                 reasons.append(
-                    "foreign_snapshot" if parsed is None else "ownership_uncertain"
+                    "foreign_snapshot"
+                    if parsed is None
+                    else "backend_proof_missing"
+                    if host_owned
+                    else "ownership_uncertain"
                 )
             created = parse_utc_timestamp(item.get("created_at"))
             age_seconds = (
@@ -1286,6 +1706,8 @@ class OpsService:
                     ),
                     "host_source_job_id": host_source_job_id,
                     "pve_snaptime": pve_snaptime,
+                    "host_owned": host_owned,
+                    "backend_proven": owned,
                     "source_plan_id": (
                         str(related_plan["id"])
                         if related_plan is not None
@@ -1301,7 +1723,13 @@ class OpsService:
                         owned and item.get("delete_eligible") is True
                     ),
                     "ownership_status": (
-                        "owned" if owned else "foreign" if parsed is None else "uncertain"
+                        "managed"
+                        if owned
+                        else "host_owned_unproven"
+                        if host_owned
+                        else "foreign"
+                        if parsed is None
+                        else "uncertain"
                     ),
                 }
             )
@@ -1404,13 +1832,49 @@ class OpsService:
         self._require_capability(vmid, "snapshot_delete")
         self._require_capability(vmid, "snapshot_list")
         self._require_host_control("Snapshot pruning")
+        resolved_request_id = request_id or uuid.uuid4().hex
+        existing = self.db.get_job_by_request_id(vmid, resolved_request_id)
+        if existing is not None:
+            result = existing.get("result")
+            if (
+                existing.get("operation_type") != "snapshot_prune"
+                or existing.get("snapshot_name") != mode
+                or (
+                    isinstance(result, dict)
+                    and result.get("mode") not in {None, mode}
+                )
+            ):
+                raise ValueError("request_id was already used for another operation")
+            return existing
+        if self.db.active_job_count() > 0:
+            raise ValueError("Another destructive maintenance job is active")
+        listing = self._refresh_snapshot_state(vmid)
+        precheck_state = {
+            "mode": mode,
+            "retention_target": None,
+            "deleted_count": 0,
+        }
+        candidate = self._select_snapshot_prune_candidate(precheck_state, listing)
+        if candidate is None:
+            return {
+                "status": "nothing_to_delete",
+                "mode": mode,
+                "deleted_count": 0,
+            }
+        candidate_name = str(candidate.get("name") or "")
+        initial_identity = self._snapshot_identity(
+            vmid,
+            candidate,
+            expected_name=candidate_name,
+        )
         job, created = self.db.create_snapshot_prune_job(
             vmid=vmid,
             container_name=str(cfg.get("name", f"resource-{vmid}")),
-            request_id=request_id or uuid.uuid4().hex,
+            request_id=resolved_request_id,
             mode=mode,
             retention_target=None,
             source_job_id=None,
+            initial_snapshot_identity=initial_identity,
         )
         if created:
             self._mark_job_queued(vmid, job)
@@ -1504,6 +1968,22 @@ class OpsService:
                 required_action="Wait for the active job to finish.",
             )
         release = self._read_self_update_release(vmid)
+        if release["status"] in {"up_to_date", "no_release_published"}:
+            state = self.get_state(vmid)
+            state.update(
+                {
+                    "application_release_check_status": release["status"],
+                    "application_current_version": release.get(
+                        "current_version", VERSION
+                    ),
+                    "application_latest_version": release.get("latest_version"),
+                    "application_last_check": self._utc_second_timestamp(),
+                    "application_last_error": None,
+                    "operation_status": "idle",
+                }
+            )
+            self._save_state(vmid, state)
+            return dict(release)
         fingerprint = str(release["fingerprint"])
         active = self.db.find_active_plan(vmid, fingerprint)
         if active is not None:
@@ -1534,7 +2014,11 @@ class OpsService:
                 "release_id": str(release["release_id"]),
                 "fingerprint": fingerprint,
                 "file_count": release.get("file_count"),
-                "total_bytes": release.get("total_bytes"),
+                "total_bytes": release.get("total_bytes", release.get("size")),
+                "tag": release.get("tag"),
+                "commit_sha": release.get("commit_sha"),
+                "published_at": release.get("published_at"),
+                "artifact_verification": release.get("artifact_verification"),
             }
             active = self.db.create_plan(
                 vmid=vmid,
@@ -1568,6 +2052,20 @@ class OpsService:
                 "self_update_release_id": release["release_id"],
                 "self_update_release_version": release["version"],
                 "self_update_release_fingerprint": fingerprint,
+                "application_release_check_status": "update_available",
+                "application_current_version": release.get(
+                    "current_version", VERSION
+                ),
+                "application_latest_version": release["version"],
+                "application_release_tag": release.get("tag"),
+                "application_release_commit": release.get("commit_sha"),
+                "application_release_published_at": release.get("published_at"),
+                "application_download_status": "not_started",
+                "application_validation_status": release.get(
+                    "artifact_verification", "not_downloaded"
+                ),
+                "application_last_check": self._utc_second_timestamp(),
+                "application_last_error": None,
             }
         )
         self._save_state(vmid, state)
@@ -1581,32 +2079,23 @@ class OpsService:
     def _read_self_update_release(self, vmid: int) -> dict[str, Any]:
         if self.host_control is None:
             raise ValueError("CT110 self-update requires independent PVE host control")
-        try:
-            release = self.host_control.inspect_self_update_release(vmid)
-        except HostControlError as exc:
-            if (
-                exc.code == "staged_release_missing"
-                or str(exc) == "No approved Hubinet Ops release is staged"
-            ):
-                raise ConflictError(
-                    "staged_release_missing",
-                    "No approved Hubinet Ops release is staged",
-                    required_action=(
-                        "Stage and validate the signed Hubinet Ops release on PVE, "
-                        "then refresh CT110."
-                    ),
-                ) from exc
+        release = self.host_control.check_application_release(vmid)
+        status = str(release.get("status") or "")
+        if status in {"up_to_date", "no_release_published"}:
+            return dict(release)
+        if status != "update_available":
             raise ConflictError(
-                (
-                    "staged_release_invalid"
-                    if exc.http_status == 409
-                    else "staged_release_unavailable"
-                ),
-                f"Cannot inspect staged self-update release: {exc}",
-                required_action=(
-                    "Validate the staged release and PVE host control health."
-                ),
-            ) from exc
+                "application_release_status_invalid",
+                "Application release check returned an invalid status",
+            )
+        release = {
+            **release,
+            "version": str(release.get("latest_version") or ""),
+            "release_id": (
+                f"hubinet-ops-{release.get('latest_version')}-"
+                f"{str(release.get('fingerprint') or '')[:16]}"
+            ),
+        }
         required = ("version", "release_id", "fingerprint")
         if not all(isinstance(release.get(key), str) and release[key] for key in required):
             raise ConflictError(
@@ -2291,6 +2780,7 @@ class OpsService:
             else None
         )
         release_fingerprint: str | None = None
+        system_update_fingerprint: str | None = None
         try:
             if str(job.get("stage") or "") == "host_remote_succeeded":
                 result = job.get("result")
@@ -2304,27 +2794,35 @@ class OpsService:
             if operation_type == "self_update":
                 release = self._approved_self_update_release(job)
                 release_fingerprint = str(release["fingerprint"])
+            elif operation_type == "ct110_system_update":
+                plan = self._approved_ct110_system_plan(job)
+                system_update_fingerprint = str(plan["fingerprint"])
             identity = (
                 self._expected_snapshot_identity_from_job(job)
                 if operation_type in {"snapshot_rollback", "snapshot_delete"}
                 else None
             )
+            wait_kwargs: dict[str, Any] = {
+                "snapshot_name": snapshot_name,
+                "snapshot_kind": (str(identity["kind"]) if identity else None),
+                "expected_source_job_id": (
+                    str(identity["host_source_job_id"]) if identity else None
+                ),
+                "expected_pve_snaptime": (
+                    int(identity["pve_snaptime"]) if identity else None
+                ),
+                "release_fingerprint": release_fingerprint,
+                "on_observed": lambda remote: self.db.update_job(
+                    str(job["id"]), stage="host_remote_observed"
+                ),
+            }
+            if system_update_fingerprint is not None:
+                wait_kwargs["system_update_fingerprint"] = system_update_fingerprint
             result = self.host_control.wait_existing_job(
                 operation_type,
                 int(job["vmid"]),
                 str(job["request_id"]),
-                snapshot_name=snapshot_name,
-                snapshot_kind=(str(identity["kind"]) if identity else None),
-                expected_source_job_id=(
-                    str(identity["host_source_job_id"]) if identity else None
-                ),
-                expected_pve_snaptime=(
-                    int(identity["pve_snaptime"]) if identity else None
-                ),
-                release_fingerprint=release_fingerprint,
-                on_observed=lambda remote: self.db.update_job(
-                    str(job["id"]), stage="host_remote_observed"
-                ),
+                **wait_kwargs,
             )
             self.db.update_job(
                 str(job["id"]), result=result, stage="host_remote_succeeded"
@@ -2739,6 +3237,7 @@ class OpsService:
             "snapshot_prune": "snapshot_pruning",
             "retry_healthcheck": "healthcheck",
             "self_update": "self_updating",
+            "ct110_system_update": "system_updating",
         }.get(operation_type, "executing")
         emit(
             stage=stage,
@@ -2830,6 +3329,10 @@ class OpsService:
     ) -> None:
         vmid = int(job["vmid"])
         operation_type = str(job["operation_type"])
+        if operation_type == "ct110_system_update":
+            result = self._validate_ct110_system_result(job, result)
+        elif operation_type == "self_update":
+            result = self._validate_self_update_result(job, result)
         self.db.update_job(job["id"], result=result)
         state = self.get_state(vmid)
         snapshot_refreshed = False
@@ -2905,6 +3408,64 @@ class OpsService:
                         vmid,
                         exc,
                     )
+        elif operation_type == "ct110_system_update":
+            verification = dict(result["verification"])
+            updates = dict(verification["updates"])
+            state.update(
+                {
+                    "system_update_status": (
+                        "update_available"
+                        if int(updates["pending_count"]) > 0
+                        else "up_to_date"
+                    ),
+                    "system_updates": updates,
+                    "system_pending_updates": int(updates["pending_count"]),
+                    "system_security_updates": sum(
+                        item.get("security") is True
+                        for item in updates.get("packages", [])
+                        if isinstance(item, dict)
+                    ),
+                    "system_package_names": ", ".join(
+                        str(item.get("name") or "")
+                        for item in updates.get("packages", [])
+                        if isinstance(item, dict) and item.get("name")
+                    )[:255] or None,
+                    "system_active_plan_id": None,
+                    "system_active_plan_status": "completed",
+                    "system_last_update": self._utc_second_timestamp(),
+                    "system_last_verification": self._utc_second_timestamp(),
+                    "system_apt_check_ok": True,
+                    "system_dpkg_audit_ok": True,
+                    "system_service_active": True,
+                    "system_health_endpoint_ok": True,
+                    "system_reboot_required": verification["reboot_required"],
+                    "system_last_error": None,
+                    "snapshot_name": result["snapshot_proof"]["snapshot_name"],
+                }
+            )
+            if job.get("plan_id"):
+                self.db.update_plan_status(str(job["plan_id"]), "completed")
+            self._save_state(vmid, state)
+        elif operation_type == "self_update":
+            state.update(
+                {
+                    "application_release_check_status": "up_to_date",
+                    "application_current_version": result["version"],
+                    "application_latest_version": result["version"],
+                    "application_release_tag": result["tag"],
+                    "application_release_commit": result["commit_sha"],
+                    "application_download_status": "downloaded",
+                    "application_validation_status": "verified",
+                    "application_deployment_status": "success",
+                    "application_last_deployment": self._utc_second_timestamp(),
+                    "application_last_result": "success",
+                    "application_last_error": None,
+                    "active_plan_status": "completed",
+                }
+            )
+            if job.get("plan_id"):
+                self.db.update_plan_status(str(job["plan_id"]), "completed")
+            self._save_state(vmid, state)
         elif operation_type == "retry_healthcheck":
             state.update(result)
             state["health_status"] = result.get(
@@ -2961,8 +3522,146 @@ class OpsService:
             state["snapshot_operation_status"] = (
                 "unknown" if job_status == "interrupted" else "failed"
             )
+        if operation_type == "ct110_system_update":
+            state.update(
+                {
+                    "system_update_status": (
+                        "outcome_unknown"
+                        if job_status == "interrupted"
+                        else "manual_intervention"
+                    ),
+                    "system_active_plan_status": (
+                        "interrupted" if job_status == "interrupted" else "failed"
+                    ),
+                    "system_last_error": sanitize_text(error, limit=2000),
+                }
+            )
+            if job.get("plan_id"):
+                current_plan = self.db.get_plan(str(job["plan_id"]))
+                if current_plan.get("status") == "approved":
+                    self.db.update_plan_status(
+                        str(job["plan_id"]),
+                        "interrupted" if job_status == "interrupted" else "failed",
+                    )
+        if operation_type == "self_update":
+            state.update(
+                {
+                    "application_deployment_status": (
+                        "outcome_unknown"
+                        if job_status == "interrupted"
+                        else "failed"
+                    ),
+                    "application_last_result": terminal_result,
+                    "application_last_error": sanitize_text(error, limit=2000),
+                    "active_plan_status": (
+                        "interrupted" if job_status == "interrupted" else "failed"
+                    ),
+                }
+            )
+            if job.get("plan_id"):
+                current_plan = self.db.get_plan(str(job["plan_id"]))
+                if current_plan.get("status") == "approved":
+                    self.db.update_plan_status(
+                        str(job["plan_id"]),
+                        "interrupted" if job_status == "interrupted" else "failed",
+                    )
         self._save_state(vmid, state)
         self._terminal(job, job_status, terminal_result, str(error))
+
+    def _validate_self_update_result(
+        self,
+        job: dict[str, Any],
+        raw: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValueError("Application rollout result must be an object")
+        plan = self._approved_self_update_release(job)
+        required = {
+            "version": str(plan.get("version") or ""),
+            "release_id": str(plan.get("release_id") or ""),
+            "fingerprint": str(plan.get("fingerprint") or ""),
+            "tag": str(plan.get("tag") or ""),
+            "commit_sha": str(plan.get("commit_sha") or ""),
+        }
+        if any(str(raw.get(key) or "") != value for key, value in required.items()):
+            raise ValueError("Application rollout result identity mismatch")
+        exit_code = raw.get("exit_code")
+        if isinstance(exit_code, bool) or exit_code != 0:
+            raise ValueError("Application rollout did not report a successful exit code")
+        if raw.get("artifact_verification") != "verified":
+            raise ValueError("Application rollout artifact was not verified")
+        validated = dict(raw)
+        for key, value in required.items():
+            validated.setdefault(key, value)
+        return validated
+
+    def _validate_ct110_system_result(
+        self,
+        job: dict[str, Any],
+        raw: Any,
+    ) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValueError("CT110 system update result must be an object")
+        plan = self._approved_ct110_system_plan(job)
+        if raw.get("plan_fingerprint") != plan["fingerprint"]:
+            raise ValueError("CT110 system update result fingerprint mismatch")
+        proof = raw.get("snapshot_proof")
+        if not isinstance(proof, dict):
+            raise ValueError("CT110 system update has no physical snapshot proof")
+        name = str(proof.get("snapshot_name") or "")
+        parsed = parse_owned_snapshot_name(name, vmid=110)
+        source = str(proof.get("host_source_job_id") or "")
+        snaptime = proof.get("pve_snaptime")
+        if (
+            proof.get("version") != 3
+            or proof.get("vmid") != 110
+            or parsed is None
+            or parsed.get("kind") != "pre-update"
+            or proof.get("kind") != "pre-update"
+            or len(source) != 32
+            or any(character not in "0123456789abcdef" for character in source)
+            or isinstance(snaptime, bool)
+            or not isinstance(snaptime, int)
+            or snaptime <= 0
+            or proof.get("physically_confirmed") is not True
+        ):
+            raise ValueError("CT110 system update snapshot proof is invalid")
+        verification = raw.get("verification")
+        if not isinstance(verification, dict):
+            raise ValueError("CT110 system update verification is missing")
+        for key in (
+            "apt_check_ok",
+            "dpkg_audit_ok",
+            "service_active",
+            "health_endpoint_ok",
+        ):
+            if verification.get(key) is not True:
+                raise ValueError(f"CT110 system update verification failed: {key}")
+        reboot = verification.get("reboot_required")
+        if reboot not in {True, False}:
+            raise ValueError("CT110 system reboot-required result is invalid")
+        updates = self._validate_ct110_system_scan(
+            {
+                **dict(verification.get("updates") or {}),
+                "scanned_at": self._utc_second_timestamp(),
+                "security_updates_count": sum(
+                    item.get("security") is True
+                    for item in dict(verification.get("updates") or {}).get(
+                        "packages", []
+                    )
+                    if isinstance(item, dict)
+                ),
+                "reboot_required": reboot,
+            }
+        )
+        normalized = dict(raw)
+        normalized["snapshot_proof"] = dict(proof)
+        normalized["verification"] = {
+            **verification,
+            "updates": updates,
+            "reboot_required": reboot,
+        }
+        return normalized
 
     def _execute_retry_healthcheck(
         self,
@@ -3260,7 +3959,14 @@ class OpsService:
                 None,
             )
             if target is None:
-                remote_succeeded = True
+                # The exact prechecked target disappeared before this worker
+                # crossed the host submission boundary.  Complete as an
+                # explicit no-op; never select or delete a replacement.
+                state["current"] = None
+                state["phase"] = "completed"
+                state["status"] = "target_disappeared"
+                self._persist_snapshot_prune_state(job, state)
+                return
             else:
                 self._validate_snapshot_prune_target(vmid, name, target)
                 current["phase"] = "submitted"
@@ -3420,6 +4126,19 @@ class OpsService:
                 str(job["request_id"]),
                 **kwargs,
             )
+        if operation_type == "ct110_system_update":
+            plan = self._approved_ct110_system_plan(job)
+            kwargs = {
+                "system_update_fingerprint": str(plan["fingerprint"]),
+            }
+            if on_observed is not None:
+                kwargs["on_observed"] = on_observed
+            return host_control.execute(
+                operation_type,
+                vmid,
+                str(job["request_id"]),
+                **kwargs,
+            )
         identity = (
             self._expected_snapshot_identity_from_job(job)
             if operation_type in {"snapshot_rollback", "snapshot_delete"}
@@ -3457,6 +4176,24 @@ class OpsService:
         if len(fingerprint) != 64:
             raise ValueError("Approved self-update plan has an invalid fingerprint")
         return payload
+
+    def _approved_ct110_system_plan(self, job: dict[str, Any]) -> dict[str, Any]:
+        if int(job.get("vmid") or 0) != 110 or not job.get("plan_id"):
+            raise ValueError("CT110 system update job has no approved plan")
+        plan = self.db.get_plan(str(job["plan_id"]))
+        if (
+            plan.get("status") != "approved"
+            or self._plan_type(plan) != "ct110_system_update"
+        ):
+            raise ValueError(
+                f"CT110 system update plan status is {plan.get('status')}, not approved"
+            )
+        fingerprint = str(plan.get("fingerprint") or "")
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint
+        ):
+            raise ValueError("Approved CT110 system plan has an invalid fingerprint")
+        return plan
 
     def _raw_snapshot_list(self, vmid: int) -> list[dict[str, Any]]:
         if self.host_control is not None:
@@ -3541,6 +4278,10 @@ class OpsService:
                     vmid,
                     str(contract["request_id"]),
                     snapshot_name=snapshot_name,
+                    on_observed=lambda remote: self._observe_pre_update_create(
+                        job,
+                        remote,
+                    ),
                 )
             elif contract["phase"] in {"submitting", "remote_observed", "outcome_unknown"}:
                 host_result = host.wait_existing_job(
@@ -3548,6 +4289,10 @@ class OpsService:
                     vmid,
                     str(contract["request_id"]),
                     snapshot_name=snapshot_name,
+                    on_observed=lambda remote: self._observe_pre_update_create(
+                        job,
+                        remote,
+                    ),
                 )
             elif contract["phase"] in {"remote_succeeded", "confirming"}:
                 identity = contract.get("snapshot_identity")

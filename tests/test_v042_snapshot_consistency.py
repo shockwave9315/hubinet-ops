@@ -232,7 +232,7 @@ def test_snapshot_proof_persistence_failure_blocks_update_without_replaying_snap
     assert "snapshot_proof" not in dict(after_failure.get("result") or {})
     assert modeled["owned_by_hubinet_ops"] is False
     assert after_restart["owned_by_hubinet_ops"] is False
-    assert after_restart["ownership_status"] == "uncertain"
+    assert after_restart["ownership_status"] == "host_owned_unproven"
 
 
 @pytest.mark.parametrize(
@@ -418,7 +418,7 @@ def test_crash_before_physical_confirmation_resumes_without_duplicate_create(
     assert "update" in executor.actions
     modeled = restarted._refresh_snapshot_state(106)["snapshots"][0]
     assert modeled["owned_by_hubinet_ops"] is True
-    assert modeled["ownership_status"] == "owned"
+    assert modeled["ownership_status"] == "managed"
 
 
 def test_restart_from_pre_update_remote_succeeded_confirms_without_duplicate_post(
@@ -636,7 +636,7 @@ def test_unconfirmed_pre_update_snapshot_blocks_before_apt_mutation(
     host.hide_listing = False
     delayed = service._refresh_snapshot_state(106)["snapshots"][0]
     assert delayed["owned_by_hubinet_ops"] is False
-    assert delayed["ownership_status"] == "uncertain"
+    assert delayed["ownership_status"] == "host_owned_unproven"
     assert delayed["rollback_eligible"] is False
     assert delayed["delete_eligible"] is False
 
@@ -645,9 +645,16 @@ def test_unconfirmed_pre_update_snapshot_blocks_before_apt_mutation(
     )
     with pytest.raises(ValueError, match="missing, foreign, or ineligible"):
         service.manual_rollback(106)
-    service.queue_snapshot_prune(106, "oldest", "delayed-unproven-prune-0001")
-    prune = run_queued(service, db)
-    assert prune["result"]["deleted"] == []
+    before_jobs = [item["id"] for item in db.list_jobs()]
+    prune = service.queue_snapshot_prune(
+        106, "oldest", "delayed-unproven-prune-0001"
+    )
+    assert prune == {
+        "status": "nothing_to_delete",
+        "mode": "oldest",
+        "deleted_count": 0,
+    }
+    assert [item["id"] for item in db.list_jobs()] == before_jobs
     assert not any(call[0] == "snapshot_delete" for call in host.calls)
 
 

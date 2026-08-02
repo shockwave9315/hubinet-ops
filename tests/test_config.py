@@ -286,7 +286,8 @@ def test_production_monitoring_scheduler_is_enabled_for_observation_scans() -> N
         assert raw["resources"][vmid]["monitoring"]["update_scan"] is True
         assert raw["resources"][vmid]["operator_capabilities"]["scan"] is True
     assert raw["resources"][100]["monitoring"]["update_scan"] is False
-    assert raw["resources"][110]["monitoring"]["update_scan"] is False
+    assert raw["resources"][110]["monitoring"]["update_scan"] is True
+    assert raw["resources"][110]["operator_capabilities"]["scan"] is True
 
 
 def test_resources_and_containers_conflict_fails_closed() -> None:

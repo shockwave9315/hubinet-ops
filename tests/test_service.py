@@ -137,7 +137,7 @@ class WorkflowExecutor:
             return {
                 "ok": True,
                 "data": {
-                    "version": "0.4.1",
+                    "version": "0.4.3",
                     "protocol_version": 1,
                     "supported_actions": sorted(REQUIRED_APT_ACTIONS),
                     "executor_sha256": EXECUTOR_HASH,
@@ -358,7 +358,7 @@ def test_observation_scan_reports_updates_without_creating_unapprovable_plan(
     assert db.find_active_plan(101) is None
 
 
-def test_production_periodic_scan_targets_only_apt_lxc_resources(
+def test_production_periodic_scan_includes_supervised_ct110_read_only_scan(
     tmp_path: Path,
 ) -> None:
     import yaml
@@ -382,13 +382,30 @@ def test_production_periodic_scan_targets_only_apt_lxc_resources(
             return super().run(action, vmid, **kwargs)
 
     executor = InventoryExecutor()
-    service = OpsService(cfg, Database(cfg.db_path), executor)
+    class InventoryHost:
+        def scan_ct110_system(self, vmid: int) -> dict[str, Any]:
+            assert vmid == 110
+            return {
+                "pending_count": 0,
+                "packages": [],
+                "fingerprint": hashlib.sha256(b"[]").hexdigest(),
+                "scanned_at": "2026-08-02T12:00:00+00:00",
+                "security_updates_count": 0,
+                "reboot_required": False,
+            }
+
+    service = OpsService(
+        cfg,
+        Database(cfg.db_path),
+        executor,
+        host_control=InventoryHost(),  # type: ignore[arg-type]
+    )
 
     results = service.scan_all(operator=False)
 
     assert cfg.monitoring_scheduler["enabled"] is True
     assert executor.vmids == list(range(101, 110))
-    assert len(results) == 9
+    assert len(results) == 10
     assert all(item["status"] == "up_to_date" for item in results)
     assert 100 not in executor.vmids
     assert 110 not in executor.vmids
@@ -501,7 +518,7 @@ def test_refresh_probes_and_persists_compatible_executor_contract(
 
     assert executor.actions[:3] == ["status", "capabilities", "inspect"]
     assert state["executor_compatible"] is True
-    assert state["executor_version"] == "0.4.1"
+    assert state["executor_version"] == "0.4.3"
     assert state["executor_protocol_version"] == 1
     assert state["executor_sha256"] == EXECUTOR_HASH
     assert state["executor_profile_sha256"] == PROFILE_HASH
@@ -512,7 +529,7 @@ def test_refresh_probes_and_persists_compatible_executor_contract(
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("version", "0.4.0", "version 0.4.0 != 0.4.1"),
+        ("version", "0.4.0", "version 0.4.0 != 0.4.3"),
         ("executor_sha256", "c" * 64, "executor sha256 mismatch"),
     ],
 )

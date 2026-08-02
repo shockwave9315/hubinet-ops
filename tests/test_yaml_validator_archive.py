@@ -46,6 +46,7 @@ def test_yaml_discovery_is_deterministic_and_ignores_generated_directories(
         ".venv",
         "venv",
         ".pytest_tmp",
+        ".tmp-pytest-case",
         ".tmp",
         "build",
         "runtime",

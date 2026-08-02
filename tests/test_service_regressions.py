@@ -74,7 +74,7 @@ class Executor:
             return {
                 "ok": True,
                 "data": {
-                    "version": "0.4.1",
+                    "version": "0.4.3",
                     "protocol_version": 1,
                     "supported_actions": sorted(REQUIRED_APT_ACTIONS),
                     "executor_sha256": "a" * 64,

@@ -77,7 +77,7 @@ def test_pre_update_snapshot_policy_no_auto_rollback(tmp_path: Path) -> None:
         if action == "capabilities":
             from app.contracts import REQUIRED_APT_ACTIONS
             return {"ok": True, "data": {
-                "version": "0.4.1", "protocol_version": 1, "supported_actions": list(REQUIRED_APT_ACTIONS),
+                "version": "0.4.3", "protocol_version": 1, "supported_actions": list(REQUIRED_APT_ACTIONS),
                 "executor_sha256": "a" * 64, "profile_sha256": "b" * 64,
                 "profile_validation_status": "insufficient_health_contract"
             }}
@@ -305,4 +305,4 @@ def test_all_managed_lxc_have_pre_update_snapshot() -> None:
         assert cfg['resources'][100].get('pre_update_snapshot') is False, "VM100 must have pre_update_snapshot=false"
         
     if 110 in cfg['resources']:
-        assert cfg['resources'][110].get('pre_update_snapshot') is False, "CT110 must have pre_update_snapshot=false"
+        assert cfg['resources'][110].get('pre_update_snapshot') is True, "CT110 system updates must require a pre-update snapshot"

@@ -92,10 +92,10 @@ def test_wrapper_routes_fixed_qemu_reads_and_blocks_managed_qemu_actions() -> No
     assert "pct console" not in text
 
 
-def test_managed_profiles_exist_only_for_apt_lxc_inventory() -> None:
+def test_managed_profiles_exist_for_apt_and_supervised_ct110_inventory() -> None:
     profiles = ROOT / "deploy" / "managed" / "profiles"
     names = sorted(path.name for path in profiles.glob("ct*.json"))
-    assert names == [f"ct{vmid}.json" for vmid in range(101, 110)]
+    assert names == [f"ct{vmid}.json" for vmid in range(101, 111)]
     for path in profiles.glob("*.json"):
         data = json.loads(path.read_text(encoding="utf-8"))
         assert isinstance(data["services"], list)

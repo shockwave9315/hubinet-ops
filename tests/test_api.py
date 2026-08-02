@@ -17,11 +17,26 @@ class FakeExecutor:
 
 
 class FakeSelfUpdateHost:
+    def check_application_release(self, vmid: int) -> dict[str, Any]:
+        assert vmid == 110
+        return {
+            "status": "update_available",
+            "current_version": "0.4.2",
+            "latest_version": "0.4.3",
+            "tag": "v0.4.3",
+            "commit_sha": "1" * 40,
+            "published_at": "2026-08-02T12:00:00+00:00",
+            "fingerprint": "a" * 64,
+            "file_count": 136,
+            "total_bytes": 1000,
+            "artifact_verification": "not_downloaded",
+        }
+
     def inspect_self_update_release(self, vmid: int) -> dict[str, Any]:
         assert vmid == 110
         return {
-            "version": "0.4.0",
-            "release_id": "hubinet-ops-0.4.0-aaaaaaaaaaaaaaaa",
+            "version": "0.4.3",
+            "release_id": "hubinet-ops-0.4.3-aaaaaaaaaaaaaaaa",
             "fingerprint": "a" * 64,
             "file_count": 136,
             "total_bytes": 1000,

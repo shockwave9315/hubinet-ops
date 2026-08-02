@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import threading
@@ -324,7 +325,7 @@ class Database:
         request_id: str | None = None,
         operation_type: str = "update",
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        if operation_type not in {"update", "self_update"}:
+        if operation_type not in {"update", "self_update", "ct110_system_update"}:
             raise ValueError("Invalid approved plan operation")
         now = datetime.now(UTC)
         with self._lock, self._connect() as conn:
@@ -614,6 +615,7 @@ class Database:
         mode: str,
         retention_target: int | None,
         source_job_id: str | None,
+        initial_snapshot_identity: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Atomically create a queued prune job with its complete durable state."""
         initial_result = _initial_snapshot_prune_result(
@@ -623,7 +625,6 @@ class Database:
         )
         if not REQUEST_ID_RE.fullmatch(str(request_id)):
             raise ValueError("Invalid request_id")
-        raw_result = bounded_json(initial_result)
         now = utc_now()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -652,6 +653,34 @@ class Database:
                 conn.execute("ROLLBACK")
                 raise ValueError("Another destructive maintenance job is active")
             job_id = uuid.uuid4().hex
+            if initial_snapshot_identity is not None:
+                snapshot_name = str(
+                    initial_snapshot_identity.get("snapshot_name") or ""
+                )
+                if mode not in {"oldest", "all_unprotected"} or not (
+                    _valid_expected_snapshot_identity(
+                        initial_snapshot_identity,
+                        vmid=int(vmid),
+                        snapshot_name=snapshot_name,
+                    )
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ValueError("Invalid initial snapshot prune identity")
+                digest = hashlib.sha256(snapshot_name.encode("utf-8")).hexdigest()[:20]
+                initial_result.update(
+                    {
+                        "current": {
+                            "snapshot_name": snapshot_name,
+                            "expected_snapshot_identity": dict(
+                                initial_snapshot_identity
+                            ),
+                            "request_id": f"prune-{job_id[:32]}-{digest}",
+                            "phase": "prepared",
+                        },
+                        "phase": "child_prepared",
+                    }
+                )
+            raw_result = bounded_json(initial_result)
             conn.execute(
                 "INSERT INTO jobs "
                 "(id,request_id,operation_type,plan_id,vmid,container_name,status,"
@@ -950,6 +979,7 @@ class Database:
                 raise KeyError(job_id)
             if "result" in fields:
                 existing = _result_dict(current["result"])
+                incoming_result = fields["result"]
                 proof = (
                     existing.get("snapshot_proof")
                     if existing is not None
@@ -960,6 +990,15 @@ class Database:
                     )
                     else None
                 )
+                if (
+                    str(current["operation_type"]) == "ct110_system_update"
+                    and isinstance(incoming_result, dict)
+                    and _valid_ct110_system_snapshot_proof(
+                        incoming_result.get("snapshot_proof")
+                    )
+                ):
+                    proof = dict(incoming_result["snapshot_proof"])
+                    fields.setdefault("snapshot_name", str(proof["snapshot_name"]))
                 expected_identity = (
                     existing.get("expected_snapshot_identity")
                     if existing is not None
@@ -992,7 +1031,7 @@ class Database:
                     )
                     else None
                 )
-                incoming = fields["result"]
+                incoming = incoming_result
                 if isinstance(incoming, dict):
                     merged = dict(incoming)
                     merged.pop("snapshot_proof", None)
@@ -1233,6 +1272,111 @@ class Database:
                 "kind": "pre-update",
                 "host_source_job_id": str(host_source_job_id),
                 "pve_snaptime": pve_snaptime,
+            }
+            conn.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
+                (bounded_json(result), now, str(job_id)),
+            )
+            conn.execute("COMMIT")
+        return self.get_job(str(job_id))
+
+    def reconcile_pre_update_snapshot_proof(
+        self,
+        job_id: str,
+        vmid: int,
+        snapshot_name: str,
+        host_source_job_id: str,
+        pve_snaptime: int,
+        host_request_id: str,
+    ) -> dict[str, Any]:
+        """Persist proof for a terminal 0.4.2 create-confirmation failure.
+
+        This never changes the terminal backend job outcome.  It only promotes
+        the exact physical snapshot after the caller has matched the backend
+        create contract to the durable hostd job and its PVE metadata.
+        """
+        parsed = parse_owned_snapshot_name(snapshot_name, vmid=int(vmid))
+        if parsed is None or parsed.get("kind") != "pre-update":
+            raise ValueError("Reconciled proof requires an exact pre-update name")
+        if not re.fullmatch(r"[a-f0-9]{32}", str(host_source_job_id)):
+            raise ValueError("Reconciled proof requires an exact host job ID")
+        if not REQUEST_ID_RE.fullmatch(str(host_request_id)):
+            raise ValueError("Reconciled proof requires an exact host request ID")
+        if (
+            isinstance(pve_snaptime, bool)
+            or not isinstance(pve_snaptime, int)
+            or pve_snaptime <= 0
+        ):
+            raise ValueError("Reconciled proof requires an exact PVE snaptime")
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE id=?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise KeyError(job_id)
+            if (
+                int(row["vmid"]) != int(vmid)
+                or str(row["operation_type"]) != "update"
+                or str(row["snapshot_name"] or "") != str(snapshot_name)
+                or str(row["status"])
+                not in {"failed", "blocked", "interrupted"}
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError(
+                    "Reconciled proof does not match a terminal failed update job"
+                )
+            result = _result_dict(row["result"])
+            contract = (
+                result.get("pre_update_snapshot_create")
+                if isinstance(result, dict)
+                else None
+            )
+            if result is None or not _valid_pre_update_create_contract(
+                contract,
+                job_id=str(job_id),
+                vmid=int(vmid),
+                snapshot_name=str(snapshot_name),
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("Terminal update create contract is malformed")
+            assert isinstance(contract, dict)
+            if (
+                contract.get("request_id") != str(host_request_id)
+                or contract.get("host_job_id") not in {
+                    None,
+                    str(host_source_job_id),
+                }
+                or contract.get("phase")
+                not in {"definitive_failed", "outcome_unknown"}
+            ):
+                conn.execute("ROLLBACK")
+                raise ValueError("Terminal update create contract identity does not match")
+            proof = {
+                "version": 3,
+                "vmid": int(vmid),
+                "snapshot_name": str(snapshot_name),
+                "kind": "pre-update",
+                "host_source_job_id": str(host_source_job_id),
+                "pve_snaptime": pve_snaptime,
+            }
+            existing = result.get("snapshot_proof")
+            if existing is not None and existing != proof:
+                conn.execute("ROLLBACK")
+                raise ValueError("A different snapshot proof is already stored")
+            contract = dict(contract)
+            contract["host_job_id"] = str(host_source_job_id)
+            result["pre_update_snapshot_create"] = contract
+            result["snapshot_proof"] = proof
+            result["snapshot_proof_reconciliation"] = {
+                "version": 1,
+                "status": "reconciled",
+                "host_request_id": str(host_request_id),
+                "host_job_id": str(host_source_job_id),
+                "reconciled_at": now,
             }
             conn.execute(
                 "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
@@ -1734,6 +1878,33 @@ def _stored_snapshot_proof_matches_job(
         and isinstance(pve_snaptime, int)
         and not isinstance(pve_snaptime, bool)
         and pve_snaptime > 0
+    )
+
+
+def _valid_ct110_system_snapshot_proof(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    snaptime = value.get("pve_snaptime")
+    return (
+        value.get("version") == 3
+        and value.get("vmid") == 110
+        and isinstance(value.get("vmid"), int)
+        and not isinstance(value.get("vmid"), bool)
+        and re.fullmatch(
+            r"hubinet-ops-110-(?:pre-update|pre)-[0-9]{8}T[0-9]{6}Z",
+            str(value.get("snapshot_name") or ""),
+        )
+        is not None
+        and value.get("kind") == "pre-update"
+        and re.fullmatch(
+            r"[a-f0-9]{32}",
+            str(value.get("host_source_job_id") or ""),
+        )
+        is not None
+        and isinstance(snaptime, int)
+        and not isinstance(snaptime, bool)
+        and snaptime > 0
+        and value.get("physically_confirmed") is True
     )
 
 

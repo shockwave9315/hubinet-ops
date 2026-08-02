@@ -38,6 +38,8 @@ JOB_STAGES = {
     "snapshot_deleting",
     "snapshot_pruning",
     "self_updating",
+    "system_scanning",
+    "system_updating",
     "executing",
     "repair",
     "rollback",
@@ -154,6 +156,35 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("self_update_release_id", None)
     state.setdefault("self_update_release_version", None)
     state.setdefault("self_update_release_fingerprint", None)
+    state.setdefault("application_release_check_status", "unknown")
+    state.setdefault("application_current_version", None)
+    state.setdefault("application_latest_version", None)
+    state.setdefault("application_release_tag", None)
+    state.setdefault("application_release_commit", None)
+    state.setdefault("application_release_published_at", None)
+    state.setdefault("application_download_status", "not_started")
+    state.setdefault("application_validation_status", "unknown")
+    state.setdefault("application_deployment_status", "idle")
+    state.setdefault("application_last_check", None)
+    state.setdefault("application_last_deployment", None)
+    state.setdefault("application_last_result", None)
+    state.setdefault("application_last_error", None)
+    state.setdefault("system_update_status", "unknown")
+    state.setdefault("system_updates", {"pending_count": None, "packages": []})
+    state.setdefault("system_pending_updates", None)
+    state.setdefault("system_security_updates", None)
+    state.setdefault("system_package_names", None)
+    state.setdefault("system_active_plan_id", None)
+    state.setdefault("system_active_plan_status", None)
+    state.setdefault("system_last_scan", None)
+    state.setdefault("system_last_update", None)
+    state.setdefault("system_last_verification", None)
+    state.setdefault("system_apt_check_ok", None)
+    state.setdefault("system_dpkg_audit_ok", None)
+    state.setdefault("system_service_active", None)
+    state.setdefault("system_health_endpoint_ok", None)
+    state.setdefault("system_reboot_required", None)
+    state.setdefault("system_last_error", None)
     state.setdefault("active_job_id", None)
     state.setdefault("last_job_id", None)
     state.setdefault("operation_type", None)
@@ -275,6 +306,10 @@ def normalize_state(payload: dict[str, Any]) -> dict[str, Any]:
     state.setdefault("executor_last_checked_at", None)
     state.setdefault("executor_contract_error", None)
     state["snapshot_count"] = max(0, _safe_int(state.get("snapshot_count"), 0))
+    state["snapshot_unproven_count"] = max(
+        0, _safe_int(state.get("snapshot_unproven_count"), 0)
+    )
+    state.setdefault("latest_unproven_snapshot_name", None)
     state.setdefault("latest_snapshot_name", None)
     state.setdefault("latest_snapshot_at", None)
     state.setdefault("latest_snapshot_kind", None)
