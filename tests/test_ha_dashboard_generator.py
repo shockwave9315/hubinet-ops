@@ -54,83 +54,18 @@ def test_dashboard_generator_is_deterministic_and_checked_in() -> None:
     assert DEFAULT_OUTPUT.read_text(encoding="utf-8") == first
 
 
-def test_ct110_self_update_control_does_not_depend_on_staged_release() -> None:
+def test_ct110_application_release_control_does_not_depend_on_manual_staging() -> None:
     data = _dashboard()
     ct110 = _text(_view(data, "ct-110"))
 
-    assert "Brak przygotowanego wydania" in ct110
-    assert "Przygotuj plan aktualizacji" in ct110
-    assert "backend odczyta" in ct110
-    assert "release" in ct110
+    assert "Brak przygotowanego wydania" not in ct110
+    assert "approved-release" not in ct110
+    assert "Sprawdź nowe wydanie Hubinet Ops" in ct110
+    assert "Zainstaluj wydanie Hubinet Ops" in ct110
+    assert "skonfigurowanym repozytorium" in ct110
     assert "PVE" in ct110
-    conditions = _control_conditions(110, load_resources(DEFAULT_CONFIG)[110], "self_update")
-    rendered = _text(conditions)
-    assert "sensor.hubinet_ops_ct110_self_update_release_version" not in rendered
-    for required in (
-        "sensor.hubinet_ops_ct110_runtime_status",
-        "sensor.hubinet_ops_ct110_capability_self_update",
-        "sensor.hubinet_ops_ct110_operation_status",
-        "sensor.hubinet_ops_ct110_active_job_id",
-        "sensor.hubinet_ops_ct110_lifecycle_status",
-    ):
-        assert required in rendered
-
-
-def test_ct110_missing_release_warning_is_three_complete_conditional_sections() -> None:
-    sections = _view(_dashboard(), "ct-110")["sections"]
-    warnings = [
-        section
-        for section in sections
-        if any(
-            card.get("title") == "Brak przygotowanego wydania"
-            for card in section["cards"]
-        )
-    ]
-
-    assert len(warnings) == 3
-    states = []
-    for section in warnings:
-        assert section["type"] == "grid"
-        assert len(section["visibility"]) == 1
-        condition = section["visibility"][0]
-        assert condition["entity"] == (
-            "sensor.hubinet_ops_ct110_self_update_release_version"
-        )
-        states.append(condition["state"])
-        assert section["cards"][0]["type"] == "custom:mushroom-title-card"
-        assert section["cards"][0]["subtitle"]
-        assert section["cards"][1]["primary"] == "Brak przygotowanego wydania"
-    assert states == ["none", "unknown", "unavailable"]
-
-
-@pytest.mark.parametrize(
-    ("release_state", "expected_visible"),
-    [
-        ("none", 1),
-        ("unknown", 1),
-        ("unavailable", 1),
-        ("0.4.2", 0),
-    ],
-)
-def test_ct110_missing_release_warning_visibility_is_logical_or(
-    release_state: str,
-    expected_visible: int,
-) -> None:
-    sections = _view(_dashboard(), "ct-110")["sections"]
-    warnings = [
-        section
-        for section in sections
-        if section.get("visibility")
-        and section["visibility"][0]["entity"]
-        == "sensor.hubinet_ops_ct110_self_update_release_version"
-    ]
-
-    visible = [
-        section
-        for section in warnings
-        if section["visibility"][0]["state"] == release_state
-    ]
-    assert len(visible) == expected_visible
+    assert "script.hubinet_ops_check_application_release" in ct110
+    assert "script.hubinet_ops_install_application_release" in ct110
 
 
 def test_dashboard_contains_full_inventory_and_legacy_paths() -> None:
@@ -267,17 +202,23 @@ def test_ct110_has_only_supported_self_metrics() -> None:
         "service_status", "api_health", "agent_version", "cpu_load_1m",
         "cpu_cores", "memory_used", "memory_total", "memory_available",
         "disk_used", "disk_total", "disk_free", "recent_warnings",
-        "active_plan_id", "active_plan_status", "self_update_release_id",
-        "self_update_release_version", "self_update_release_fingerprint",
+        "system_update_status", "system_pending_updates", "system_security_updates",
+        "system_package_names", "system_active_plan_status", "system_reboot_required",
+        "system_apt_check_ok", "system_dpkg_audit_ok", "system_last_scan",
+        "application_current_version", "application_latest_version",
+        "application_release_tag", "application_release_commit",
+        "application_release_check_status", "application_download_status",
+        "application_validation_status", "application_deployment_status",
+        "application_last_result",
     ):
         assert f"sensor.hubinet_ops_ct110_{suffix}" in text
     for unsupported in ("cpu_usage", "network_received", "network_sent"):
         assert f"sensor.hubinet_ops_ct110_{unsupported}" not in text
     assert "pending_update_count" not in text
-    assert text.count("perform-action") == 15
-    assert "script.hubinet_ops_self_update" in text
-    assert "script.hubinet_ops_approve_container" in text
-    assert "script.hubinet_ops_reject_container" in text
+    assert "script.hubinet_ops_scan_ct110_system" in text
+    assert "script.hubinet_ops_approve_ct110_system" in text
+    assert "script.hubinet_ops_check_application_release" in text
+    assert "script.hubinet_ops_install_application_release" in text
     assert "script.hubinet_ops_scan_container" not in text
 
 

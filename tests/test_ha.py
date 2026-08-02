@@ -184,7 +184,7 @@ def test_dashboard_actions_exist_and_active_plan_decisions_use_only_vmid() -> No
     assert "/resources/{{ vmid }}/self-update" in secrets_text
     self_update = package["script"]["hubinet_ops_self_update"]
     self_update_text = str(self_update)
-    assert "rest_command.hubinet_ops_self_update_plan" in self_update_text
+    assert "script.hubinet_ops_check_application_release" in self_update_text
     assert "rest_command.hubinet_ops_host_start" not in self_update_text
     restore = package["script"]["hubinet_ops_snapshot_restore_latest"]
     restore_text = str(restore)

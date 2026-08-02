@@ -1,4 +1,4 @@
-# Hubinet Ops 0.4.2: typed resource actions; backend and hostd enforce policy.
+# Hubinet Ops 0.4.3: typed resource actions; backend and hostd enforce policy.
 
 recorder:
   exclude:
@@ -203,8 +203,34 @@ script:
           title: "Hubinet Ops — {{ action_name }} CT{{ vmid | int }}"
           message: >-
             {% set result = response | default({}, true) %}
-            {{ 'Żądanie przyjęte.' if result.get('status', 0) in [200, 202]
-               else 'Błąd: ' ~ result.get('content', {}).get('detail', result.get('content', {}).get('error', 'usługa niedostępna')) }}
+            {% set transport_status = result.get('status', 0) | int(0) %}
+            {% set content = result.get('content', {}) %}
+            {% set content = content if content is mapping else {} %}
+            {% set business_status = content.get('status', '') %}
+            {% set detail = content.get('detail', content.get('error', '')) %}
+            {% if business_status == 'nothing_to_delete' %}
+              Brak niechronionych snapshotów do usunięcia.
+            {% elif business_status == 'nothing_to_do' %}
+              Brak pracy do wykonania.
+            {% elif business_status == 'up_to_date' %}
+              Hubinet Ops jest w aktualnej wersji {{ content.get('current_version', '') }}.
+            {% elif business_status == 'update_available' %}
+              Dostępne jest wydanie {{ content.get('latest_version', content.get('version', 'Hubinet Ops')) }}.
+            {% elif business_status == 'no_release_published' %}
+              Nie opublikowano jeszcze stabilnego wydania Hubinet Ops.
+            {% elif transport_status == 202 %}
+              Zadanie zostało przyjęte i będzie wykonane trwale.
+            {% elif transport_status == 200 %}
+              Operacja zakończyła się powodzeniem.
+            {% elif transport_status == 409 %}
+              Konflikt: {{ detail.get('message', detail.get('code', 'operacja jest obecnie niedostępna')) if detail is mapping else detail | default('operacja jest obecnie niedostępna', true) }}
+            {% elif transport_status >= 400 %}
+              Błąd backendu: {{ detail.get('message', detail.get('code', 'nieznany błąd')) if detail is mapping else detail | default('nieznany błąd', true) }}
+            {% elif result %}
+              Błąd sieci: backend nie zwrócił poprawnej odpowiedzi HTTP.
+            {% else %}
+              Usługa Hubinet Ops jest niedostępna.
+            {% endif %}
 
   hubinet_ops_start_container:
     alias: "Hubinet Ops — uruchom kontener"
@@ -401,52 +427,56 @@ script:
           action_name: "AWARYJNE wymuszenie zatrzymania CT110"
           response: "{{ response | default({}) }}"
 
+  hubinet_ops_scan_ct110_system:
+    alias: "Hubinet Ops — skanuj aktualizacje systemu CT110"
+    mode: single
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_scan_container
+        data: {vmid: 110}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: 110, action_name: "skan systemu Debian CT110", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_approve_ct110_system:
+    alias: "Hubinet Ops — zatwierdź aktualizację systemu CT110"
+    mode: single
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_approve
+        data: {vmid: 110}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: 110, action_name: "aktualizacja systemu Debian CT110", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_check_application_release:
+    alias: "Hubinet Ops — sprawdź nowe wydanie aplikacji"
+    mode: single
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_self_update_plan
+        data: {vmid: 110}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: 110, action_name: "sprawdzenie wydania Hubinet Ops", response: "{{ response | default({}) }}"}
+
+  hubinet_ops_install_application_release:
+    alias: "Hubinet Ops — zainstaluj wydanie aplikacji"
+    mode: single
+    sequence:
+      - continue_on_error: true
+        action: rest_command.hubinet_ops_approve
+        data: {vmid: 110}
+        response_variable: response
+      - action: script.hubinet_ops_report_action
+        data: {vmid: 110, action_name: "instalacja wydania Hubinet Ops", response: "{{ response | default({}) }}"}
+
   hubinet_ops_self_update:
-    alias: "Hubinet Ops — przygotuj plan aktualizacji control plane"
+    alias: "Hubinet Ops — sprawdź nowe wydanie aplikacji"
     mode: single
     fields: *lifecycle_vmid_field
     sequence:
-      - choose:
-          - conditions: "{{ vmid | int == 110 }}"
-            sequence:
-              - continue_on_error: true
-                action: rest_command.hubinet_ops_self_update_plan
-                data: {vmid: 110}
-                response_variable: response
-              - variables:
-                  result: "{{ response | default({}, true) }}"
-                  content: "{{ result.get('content', {}) }}"
-                  detail: "{{ content.get('detail', {}) }}"
-                  error_code: "{{ detail.get('code', '') if detail is mapping else '' }}"
-                  error_message: >-
-                    {% if detail is mapping %}
-                      {{ detail.get('message', 'Backend odrzucił przygotowanie planu aktualizacji.') }}
-                    {% else %}
-                      {{ detail | default('Backend odrzucił przygotowanie planu aktualizacji.', true) }}
-                    {% endif %}
-              - choose:
-                  - conditions: "{{ result.get('status', 0) not in [200, 202] }}"
-                    sequence:
-                      - action: persistent_notification.create
-                        data:
-                          notification_id: hubinet_ops_self_update_conflict
-                          title: "Hubinet Ops — nie można przygotować planu"
-                          message: >-
-                            {% if error_code == 'staged_release_missing' %}
-                              Brak przygotowanego wydania: {{ error_message }}
-                            {% else %}
-                              {{ error_message }}
-                            {% endif %}
-        default:
-          - variables:
-              response:
-                status: 403
-                content:
-                  detail:
-                    code: self_update_not_supported
-                    message: "Aktualizacja Hubinet Ops jest dozwolona wyłącznie dla CT110"
-      - action: script.hubinet_ops_report_action
-        data: {vmid: 110, action_name: "plan aktualizacji control plane", response: "{{ response | default({}) }}"}
+      - action: script.hubinet_ops_check_application_release
 
   hubinet_ops_scan_container:
     alias: "Hubinet Ops — skanuj kontener"
@@ -516,13 +546,8 @@ script:
         data:
           vmid: "{{ vmid | int }}"
         response_variable: response
-      - action: persistent_notification.create
-        data:
-          notification_id: "hubinet_ops_action_ct{{ vmid | int }}"
-          title: "Hubinet Ops — zatwierdzenie planu CT{{ vmid | int }}"
-          message: >-
-            {{ 'Żądanie przyjęte.' if (response | default({})).get('status', 0) in [200, 202]
-               else 'Błąd: ' ~ ((response | default({})).get('content', {}).get('detail', 'backend niedostępny lub brak aktywnego planu')) }}
+      - action: script.hubinet_ops_report_action
+        data: {vmid: "{{ vmid | int }}", action_name: "zatwierdzenie planu", response: "{{ response | default({}) }}"}
 
   hubinet_ops_reject_container:
     alias: "Hubinet Ops — odrzuć plan"

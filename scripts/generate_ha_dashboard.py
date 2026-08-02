@@ -114,7 +114,7 @@ def _state_label(entity_expression: str = "entity") -> str:
         f"{{% set labels = {labels} %}}"
         f"{{% set value = states({entity_expression}) %}}"
         f"{{{{ 'Brak danych' if value in {missing} "
-        "else labels.get(value, value | replace('_', ' ')) }}}}"
+        "else labels.get(value, value | replace('_', ' ')) }}"
     )
 
 
@@ -980,6 +980,18 @@ def _snapshot_section(vmid: int, cfg: dict[str, Any]) -> dict[str, Any]:
                     "mdi:camera-burst",
                 ),
                 _entity_card(
+                    _entity(vmid, cfg, "snapshot_unproven_count"),
+                    "Host-owned bez proof",
+                    "mdi:shield-alert-outline",
+                    "orange",
+                ),
+                _entity_card(
+                    _entity(vmid, cfg, "latest_unproven_snapshot_name"),
+                    "Ostatni bez proof",
+                    "mdi:alert-outline",
+                    "orange",
+                ),
+                _entity_card(
                     _entity(vmid, cfg, "latest_snapshot_name"),
                     "Ostatni snapshot",
                     "mdi:camera-outline",
@@ -1165,14 +1177,14 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
             + f" · pakiety pozostałe: {{{{ states('{remaining}') "
             "if states('"
             + remaining
-            + "') not in ['unknown', 'unavailable', 'none', ''] else 'Brak danych' }}}}"
+            + "') not in ['unknown', 'unavailable', 'none', ''] else 'Brak danych' }}"
             + " · ostatni wynik: "
             + _state_label(repr(last_result))
             + f"\nOstatnia weryfikacja: {{{{ as_timestamp(states('{last_verification}'), none) "
             "| timestamp_custom('%d.%m.%Y %H:%M', true) "
             "if as_timestamp(states('"
             + last_verification
-            + "'), none) is not none else 'Brak danych' }}}}"
+            + "'), none) is not none else 'Brak danych' }}"
         ),
         "multiline_secondary": True,
         "icon": _semantic_icon("mdi:check-decagram"),
@@ -1263,7 +1275,7 @@ def _apt_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 f"{{{{ states('{_entity(vmid, cfg, 'executor_contract_error')}') "
                 f"if states('{_entity(vmid, cfg, 'executor_contract_error')}') "
                 "not in ['none', 'unknown', 'unavailable', ''] "
-                "else 'test zdrowia aplikacji' }}}}"
+                "else 'test zdrowia aplikacji' }}"
             ),
             "multiline_secondary": True,
             "icon": "mdi:alert-outline",
@@ -1427,71 +1439,182 @@ def _qemu_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _agent_self_sections(vmid: int, cfg: dict[str, Any]) -> list[dict[str, Any]]:
     health = _entity(vmid, cfg, "health_status")
-    release_version = _entity(vmid, cfg, "self_update_release_version")
-    missing_release = [
-        _conditional_section(
-            _state_condition(release_version, state=state),
-            _title(
-                "Brak przygotowanego wydania",
-                "Najpierw przygotuj i zweryfikuj wydanie Hubinet Ops na PVE, "
-                "następnie odśwież stan CT110.",
-            ),
-            {
-                "type": "custom:mushroom-template-card",
-                "primary": "Brak przygotowanego wydania",
-                "secondary": (
-                    "Kliknij „Przygotuj plan aktualizacji”; backend odczyta "
-                    "i zweryfikuje staged release na PVE."
-                ),
-                "multiline_secondary": True,
-                "icon": "mdi:package-variant-remove",
-                "icon_color": "grey",
-                "tap_action": {"action": "none"},
+    general_cfg = dict(cfg)
+    general_cfg["operator_capabilities"] = {
+        key: value
+        for key, value in cfg["operator_capabilities"].items()
+        if key not in {"scan", "approve", "reject", "self_update"}
+    }
+
+    def action_card(
+        primary: str,
+        secondary: str,
+        service: str,
+        icon: str,
+        color: str,
+        confirmation: str,
+    ) -> dict[str, Any]:
+        return {
+            "type": "custom:mushroom-template-card",
+            "primary": primary,
+            "secondary": secondary,
+            "multiline_secondary": True,
+            "icon": icon,
+            "icon_color": color,
+            "tap_action": {
+                "action": "perform-action",
+                "perform_action": service,
+                "confirmation": {
+                    "title": primary,
+                    "text": confirmation,
+                    "confirm_text": primary,
+                    "dismiss_text": "Anuluj",
+                },
             },
-        )
-        for state in ("none", "unknown", "unavailable")
-    ]
+        }
     return [
         _section(
             _title(_label(vmid, cfg), "Stan własny agenta"),
             _resource_status(vmid, cfg),
             _resource_chips(vmid, cfg),
         ),
-        _controls_section(vmid, cfg),
-        *missing_release,
+        _controls_section(vmid, general_cfg),
         _ct110_break_glass_section(),
         _section(
             _title(
-                "Plan aktualizacji Hubinet Ops",
-                "Wersja i fingerprint staged release zatwierdzane ręcznie",
+                "System Debian CT110",
+                "Pakiety systemowe są niezależne od wydania aplikacji Hubinet Ops",
+            ),
+            _entity_grid(
+                [
+                    action_card(
+                        "Skanuj aktualizacje systemu CT110",
+                        "Read-only skan pakietów Debiana wykonywany przez PVE hostd",
+                        "script.hubinet_ops_scan_ct110_system",
+                        "mdi:package-down",
+                        "blue",
+                        "Odświeżyć listę pakietów systemowych CT110?",
+                    ),
+                    {
+                        "type": "conditional",
+                        "conditions": [
+                            _state_condition(
+                                _entity(vmid, cfg, "system_active_plan_status"),
+                                state="waiting_approval",
+                            )
+                        ],
+                        "card": action_card(
+                            "Zatwierdź aktualizację systemu",
+                            "Snapshot i APT są nadzorowane trwale przez PVE",
+                            "script.hubinet_ops_approve_ct110_system",
+                            "mdi:shield-check",
+                            "green",
+                            "Zatwierdzić dokładny plan pakietów systemowych CT110?",
+                        ),
+                    },
+                ],
+                columns=2,
             ),
             _entity_grid(
                 [
                     _entity_card(
-                        _entity(vmid, cfg, "active_plan_status"),
+                        _entity(vmid, cfg, "system_update_status"),
+                        "Status systemu",
+                        "mdi:debian",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "system_pending_updates"),
+                        "Pakiety",
+                        "mdi:package-variant",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "system_security_updates"),
+                        "Aktualizacje bezpieczeństwa",
+                        "mdi:security",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "system_package_names"),
+                        "Lista pakietów",
+                        "mdi:format-list-bulleted",
+                    ),
+                    _entity_card(
+                        _entity(vmid, cfg, "system_active_plan_status"),
                         "Status planu",
                         "mdi:clipboard-check-outline",
                     ),
                     _entity_card(
-                        _entity(vmid, cfg, "active_plan_id"),
-                        "ID planu",
-                        "mdi:identifier",
+                        _entity(vmid, cfg, "system_reboot_required"),
+                        "Wymagany restart",
+                        "mdi:restart-alert",
                     ),
                     _entity_card(
-                        _entity(vmid, cfg, "self_update_release_version"),
-                        "Wersja release",
-                        "mdi:tag-outline",
+                        _entity(vmid, cfg, "system_apt_check_ok"),
+                        "APT check",
+                        "mdi:check-network-outline",
                     ),
                     _entity_card(
-                        _entity(vmid, cfg, "self_update_release_id"),
-                        "ID wydania",
-                        "mdi:package-variant-closed",
+                        _entity(vmid, cfg, "system_dpkg_audit_ok"),
+                        "DPKG audit",
+                        "mdi:check-decagram-outline",
                     ),
-                    _entity_card(
-                        _entity(vmid, cfg, "self_update_release_fingerprint"),
-                        "Odcisk wydania",
-                        "mdi:fingerprint",
+                    _timestamp_card(
+                        _entity(vmid, cfg, "system_last_scan"),
+                        "Ostatni skan",
+                        "mdi:clock-search",
                     ),
+                ]
+            ),
+        ),
+        _section(
+            _title(
+                "Aplikacja Hubinet Ops",
+                "Niezmienne wydania GitHub; rollout jest nadzorowany przez PVE",
+            ),
+            _entity_grid(
+                [
+                    action_card(
+                        "Sprawdź nowe wydanie Hubinet Ops",
+                        "Sprawdź stabilne wydanie w skonfigurowanym repozytorium",
+                        "script.hubinet_ops_check_application_release",
+                        "mdi:cloud-search",
+                        "blue",
+                        "Sprawdzić najnowsze stabilne wydanie Hubinet Ops?",
+                    ),
+                    {
+                        "type": "conditional",
+                        "conditions": [
+                            _state_condition(
+                                _entity(vmid, cfg, "active_plan_status"),
+                                state="waiting_approval",
+                            ),
+                            _state_condition(
+                                _entity(vmid, cfg, "application_release_check_status"),
+                                state="update_available",
+                            ),
+                        ],
+                        "card": action_card(
+                            "Zainstaluj wydanie Hubinet Ops",
+                            "PVE pobierze i zweryfikuje zatwierdzony artefakt",
+                            "script.hubinet_ops_install_application_release",
+                            "mdi:application-import",
+                            "amber",
+                            "Zainstalować dokładnie wskazane wydanie Hubinet Ops?",
+                        ),
+                    },
+                ],
+                columns=2,
+            ),
+            _entity_grid(
+                [
+                    _entity_card(_entity(vmid, cfg, "application_current_version"), "Wersja zainstalowana", "mdi:application-cog"),
+                    _entity_card(_entity(vmid, cfg, "application_latest_version"), "Wersja najnowsza", "mdi:tag-arrow-up-outline"),
+                    _entity_card(_entity(vmid, cfg, "application_release_tag"), "Tag", "mdi:tag-outline"),
+                    _entity_card(_entity(vmid, cfg, "application_release_commit"), "Commit", "mdi:source-commit"),
+                    _entity_card(_entity(vmid, cfg, "application_release_check_status"), "Status sprawdzenia", "mdi:cloud-check-outline"),
+                    _entity_card(_entity(vmid, cfg, "application_download_status"), "Status pobrania", "mdi:download-circle-outline"),
+                    _entity_card(_entity(vmid, cfg, "application_validation_status"), "Status walidacji", "mdi:shield-check-outline"),
+                    _entity_card(_entity(vmid, cfg, "application_deployment_status"), "Status wdrożenia", "mdi:progress-check"),
+                    _entity_card(_entity(vmid, cfg, "application_last_result"), "Ostatni wynik", "mdi:history"),
                 ]
             ),
         ),
