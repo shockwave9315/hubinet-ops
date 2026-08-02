@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
+import tarfile
+import tempfile
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 FINGERPRINT_RE = re.compile(r"^[a-f0-9]{64}$")
 JOB_ID_RE = re.compile(r"^[a-f0-9]{8,64}$")
@@ -22,10 +29,510 @@ TERMINAL_MARKER_STATUSES = {"succeeded", "failed"}
 MAX_RELEASE_FILES = 20_000
 MAX_RELEASE_BYTES = 2 * 1024 * 1024 * 1024
 SUPERVISOR_TIMEOUT_SECONDS = 7200
+GITHUB_REPOSITORY = "shockwave9315/hubinet-ops"
+GITHUB_API_URL = (
+    f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
+)
+ALLOWED_GITHUB_HOSTS = frozenset(
+    {
+        "api.github.com",
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    }
+)
+SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+COMMIT_RE = re.compile(r"^[a-f0-9]{40}$")
+MANIFEST_NAME = "release-manifest.json"
+STAGED_METADATA_NAME = "release-staging.json"
+DEFAULT_BUNDLE_BYTES = 128 * 1024 * 1024
+DEFAULT_UNPACKED_BYTES = 512 * 1024 * 1024
+DEFAULT_RELEASE_FILES = 20_000
+MAX_REDIRECTS = 3
 
 
 class ReleaseError(RuntimeError):
     pass
+
+
+class ReleaseHttpError(ReleaseError):
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class ReleaseTransport(Protocol):
+    def get_json(self, url: str, *, max_bytes: int) -> dict[str, Any]: ...
+
+    def get_bytes(self, url: str, *, max_bytes: int) -> bytes: ...
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def validate_redirect_chain(urls: list[str]) -> None:
+    if not urls or len(urls) - 1 > MAX_REDIRECTS:
+        raise ReleaseError("GitHub download redirect limit exceeded")
+    for value in urls:
+        parsed = urlsplit(value)
+        if parsed.scheme != "https":
+            raise ReleaseError("GitHub release downloads require HTTPS")
+        if parsed.hostname not in ALLOWED_GITHUB_HOSTS:
+            raise ReleaseError("GitHub release redirect host is not allowed")
+        if parsed.username is not None or parsed.password is not None:
+            raise ReleaseError("GitHub release URL must not contain credentials")
+
+
+class GitHubHttpTransport:
+    def __init__(self, *, timeout_seconds: int = 30) -> None:
+        self.timeout_seconds = max(1, min(int(timeout_seconds), 120))
+        self._opener = build_opener(_NoRedirect())
+
+    def get_json(self, url: str, *, max_bytes: int) -> dict[str, Any]:
+        raw = self.get_bytes(url, max_bytes=max_bytes)
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReleaseError("GitHub API returned invalid JSON") from exc
+        if not isinstance(value, dict):
+            raise ReleaseError("GitHub API response must be an object")
+        return value
+
+    def get_bytes(self, url: str, *, max_bytes: int) -> bytes:
+        current = url
+        chain = [current]
+        validate_redirect_chain(chain)
+        for _attempt in range(MAX_REDIRECTS + 1):
+            request = Request(
+                current,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "hubinet-ops-hostd/0.4.3",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                method="GET",
+            )
+            try:
+                response = self._opener.open(
+                    request, timeout=self.timeout_seconds
+                )
+            except HTTPError as exc:
+                if exc.code in {301, 302, 303, 307, 308}:
+                    location = exc.headers.get("Location")
+                    if not location:
+                        raise ReleaseError("GitHub redirect has no destination") from exc
+                    current = urljoin(current, location)
+                    chain.append(current)
+                    validate_redirect_chain(chain)
+                    continue
+                if exc.code == 429 or (
+                    exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0"
+                ):
+                    raise ReleaseHttpError(
+                        "GitHub API rate limit exceeded", status=exc.code
+                    ) from exc
+                raise ReleaseHttpError(
+                    f"GitHub request failed with HTTP {exc.code}", status=exc.code
+                ) from exc
+            except TimeoutError as exc:
+                raise ReleaseError("GitHub release request timed out") from exc
+            except URLError as exc:
+                if isinstance(exc.reason, TimeoutError):
+                    raise ReleaseError("GitHub release request timed out") from exc
+                raise ReleaseError("GitHub release service is unavailable") from exc
+            with response:
+                declared = response.headers.get("Content-Length")
+                if declared and int(declared) > max_bytes:
+                    raise ReleaseError("Download exceeds configured size limit")
+                payload = response.read(max_bytes + 1)
+                if len(payload) > max_bytes:
+                    raise ReleaseError("Download exceeds configured size limit")
+                return payload
+        raise ReleaseError("GitHub download redirect limit exceeded")
+
+
+def _version(value: Any, *, field: str = "version") -> tuple[int, int, int]:
+    match = SEMVER_RE.fullmatch(str(value or ""))
+    if match is None:
+        raise ReleaseError(f"Invalid {field}")
+    return tuple(int(match.group(index)) for index in (1, 2, 3))
+
+
+class GitHubReleaseDiscovery:
+    def __init__(self, *, transport: ReleaseTransport | None = None) -> None:
+        self.transport = transport or GitHubHttpTransport()
+
+    def check(self, current_version: str) -> dict[str, Any]:
+        current = _version(current_version, field="current version")
+        try:
+            metadata = self.transport.get_json(GITHUB_API_URL, max_bytes=1024 * 1024)
+        except ReleaseHttpError as exc:
+            if exc.status == 404:
+                return {
+                    "status": "no_release_published",
+                    "current_version": current_version,
+                }
+            raise
+        if metadata.get("draft") is not False or metadata.get("prerelease") is not False:
+            raise ReleaseError("Latest GitHub release is not stable")
+        tag = str(metadata.get("tag_name") or "")
+        if not tag.startswith("v"):
+            raise ReleaseError("Invalid release tag")
+        latest_text = tag[1:]
+        latest = _version(latest_text, field="release version")
+        if tag != f"v{latest_text}":
+            raise ReleaseError("Invalid release tag")
+        if latest < current:
+            raise ReleaseError("Hubinet Ops release downgrade is blocked")
+        if latest == current:
+            return {
+                "status": "up_to_date",
+                "current_version": current_version,
+                "latest_version": latest_text,
+            }
+        commit = str(metadata.get("target_commitish") or "").lower()
+        if COMMIT_RE.fullmatch(commit) is None:
+            raise ReleaseError("Release commit SHA is invalid")
+        try:
+            published = datetime.fromisoformat(
+                str(metadata.get("published_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ReleaseError("Release published timestamp is invalid") from exc
+        if published.tzinfo is None:
+            raise ReleaseError("Release published timestamp is invalid")
+        bundle_name = f"hubinet-ops-{latest_text}.tar.gz"
+        checksum_name = f"{bundle_name}.sha256"
+        assets = metadata.get("assets")
+        if not isinstance(assets, list):
+            raise ReleaseError("Release asset list is invalid")
+        by_name: dict[str, dict[str, Any]] = {}
+        for item in assets:
+            if isinstance(item, dict) and isinstance(item.get("name"), str):
+                if item["name"] in by_name:
+                    raise ReleaseError("Release contains duplicate assets")
+                by_name[item["name"]] = item
+        if set(by_name) & {bundle_name, checksum_name} != {bundle_name, checksum_name}:
+            raise ReleaseError("Required release asset is missing")
+        bundle = by_name[bundle_name]
+        checksum = by_name[checksum_name]
+        bundle_url = str(bundle.get("browser_download_url") or "")
+        checksum_url = str(checksum.get("browser_download_url") or "")
+        validate_redirect_chain([bundle_url])
+        validate_redirect_chain([checksum_url])
+        raw_size = bundle.get("size")
+        if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size <= 0:
+            raise ReleaseError("Release asset size is invalid")
+        identity = {
+            "version": latest_text,
+            "tag": tag,
+            "commit_sha": commit,
+            "published_at": published.astimezone(UTC).replace(microsecond=0).isoformat(),
+            "asset_name": bundle_name,
+            "checksum_asset_name": checksum_name,
+            "size": raw_size,
+        }
+        fingerprint = _release_identity_fingerprint(identity)
+        return {
+            "status": "update_available",
+            "current_version": current_version,
+            "latest_version": latest_text,
+            **identity,
+            "fingerprint": fingerprint,
+            "artifact_verification": "not_downloaded",
+            "_bundle_url": bundle_url,
+            "_checksum_url": checksum_url,
+        }
+
+
+class ReleaseStager:
+    def __init__(
+        self,
+        *,
+        transport: ReleaseTransport | None = None,
+        max_bundle_bytes: int = DEFAULT_BUNDLE_BYTES,
+        max_unpacked_bytes: int = DEFAULT_UNPACKED_BYTES,
+        max_files: int = DEFAULT_RELEASE_FILES,
+    ) -> None:
+        self.transport = transport or GitHubHttpTransport()
+        self.max_bundle_bytes = max(1, int(max_bundle_bytes))
+        self.max_unpacked_bytes = max(1, int(max_unpacked_bytes))
+        self.max_files = max(1, int(max_files))
+
+    def stage(
+        self,
+        release: dict[str, Any],
+        *,
+        current_version: str,
+        destination: Path,
+    ) -> dict[str, Any]:
+        if release.get("status") != "update_available":
+            raise ReleaseError("Release has nothing to stage")
+        expected_fingerprint = str(release.get("fingerprint") or "")
+        if FINGERPRINT_RE.fullmatch(expected_fingerprint) is None:
+            raise ReleaseError("Release identity fingerprint is invalid")
+        bundle_url = str(release.get("_bundle_url") or "")
+        checksum_url = str(release.get("_checksum_url") or "")
+        validate_redirect_chain([bundle_url])
+        validate_redirect_chain([checksum_url])
+        checksum_raw = self.transport.get_bytes(checksum_url, max_bytes=4096)
+        try:
+            checksum_text = checksum_raw.decode("ascii")
+        except UnicodeDecodeError as exc:
+            raise ReleaseError("Release SHA-256 file is invalid") from exc
+        expected_name = str(release["asset_name"])
+        match = re.fullmatch(
+            rf"([a-f0-9]{{64}})  {re.escape(expected_name)}\n?",
+            checksum_text,
+        )
+        if match is None:
+            raise ReleaseError("Release SHA-256 file is invalid")
+        bundle = self.transport.get_bytes(
+            bundle_url, max_bytes=self.max_bundle_bytes
+        )
+        bundle_sha = hashlib.sha256(bundle).hexdigest()
+        if bundle_sha != match.group(1):
+            raise ReleaseError("Release bundle SHA-256 mismatch")
+
+        parent = destination.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if (
+            os.name == "posix"
+            and hasattr(os, "geteuid")
+            and os.geteuid() == 0
+        ):
+            parent_stat = parent.stat()
+            if parent_stat.st_uid != 0 or parent_stat.st_mode & 0o022:
+                raise ReleaseError(
+                    "Release staging parent must be root-owned and not writable"
+                )
+        temporary = Path(tempfile.mkdtemp(prefix=".release-", dir=parent))
+        try:
+            manifest = self._extract_and_verify(
+                bundle,
+                temporary,
+                release=release,
+                current_version=current_version,
+            )
+            staging_record = {
+                "schema_version": 1,
+                "version": manifest["version"],
+                "tag": manifest["tag"],
+                "commit_sha": manifest["commit_sha"],
+                "published_at": release["published_at"],
+                "asset_name": release["asset_name"],
+                "size": release["size"],
+                "fingerprint": expected_fingerprint,
+                "bundle_sha256": bundle_sha,
+                "artifact_verification": "verified",
+            }
+            staging_target = temporary / STAGED_METADATA_NAME
+            descriptor = os.open(
+                staging_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(
+                    staging_record,
+                    output,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            previous = destination.with_name(destination.name + ".previous")
+            moved_previous = False
+            if destination.exists():
+                if destination.is_symlink():
+                    raise ReleaseError("Staging destination must not be a symbolic link")
+                if previous.exists():
+                    if previous.is_symlink() or not previous.is_dir():
+                        raise ReleaseError("Previous staging destination is unsafe")
+                    shutil.rmtree(previous)
+                os.replace(destination, previous)
+                moved_previous = True
+            try:
+                os.replace(temporary, destination)
+            except Exception:
+                if moved_previous and not destination.exists():
+                    os.replace(previous, destination)
+                raise
+            return {
+                "status": "staged",
+                "version": manifest["version"],
+                "tag": manifest["tag"],
+                "commit_sha": manifest["commit_sha"],
+                "minimum_source_version": manifest["minimum_source_version"],
+                "release_id": (
+                    f"hubinet-ops-{manifest['version']}-{bundle_sha[:16]}"
+                ),
+                "fingerprint": expected_fingerprint,
+                "bundle_sha256": bundle_sha,
+                "file_count": len(manifest["files"]),
+                "total_bytes": sum(item["size"] for item in manifest["files"]),
+                "artifact_verification": "verified",
+            }
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
+    def _extract_and_verify(
+        self,
+        bundle: bytes,
+        root: Path,
+        *,
+        release: dict[str, Any],
+        current_version: str,
+    ) -> dict[str, Any]:
+        try:
+            archive = tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
+        except (tarfile.TarError, OSError) as exc:
+            raise ReleaseError("Release bundle archive is invalid") from exc
+        with archive:
+            members = archive.getmembers()
+            names: set[str] = set()
+            files: dict[str, tarfile.TarInfo] = {}
+            total = 0
+            for member in members:
+                name = member.name
+                path = PurePosixPath(name)
+                if (
+                    not name
+                    or "\\" in name
+                    or path.is_absolute()
+                    or any(part in {"", ".", ".."} for part in path.parts)
+                ):
+                    raise ReleaseError("Release archive path is unsafe")
+                if name in names:
+                    raise ReleaseError("Release archive contains duplicate paths")
+                names.add(name)
+                if member.isdir():
+                    continue
+                if not member.isreg():
+                    raise ReleaseError("Release archive link or special file is forbidden")
+                files[name] = member
+                total += member.size
+                if len(files) > self.max_files:
+                    raise ReleaseError("Release archive file count limit exceeded")
+                if total > self.max_unpacked_bytes:
+                    raise ReleaseError("Release archive unpacked size limit exceeded")
+            manifest_member = files.get(MANIFEST_NAME)
+            if manifest_member is None or manifest_member.size > 1024 * 1024:
+                raise ReleaseError("Release manifest is missing or too large")
+            handle = archive.extractfile(manifest_member)
+            if handle is None:
+                raise ReleaseError("Release manifest is unreadable")
+            try:
+                manifest = json.loads(handle.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ReleaseError("Release manifest is invalid") from exc
+            self._validate_manifest(
+                manifest,
+                release=release,
+                current_version=current_version,
+                archive_files=set(files) - {MANIFEST_NAME},
+            )
+            manifest_by_path = {item["path"]: item for item in manifest["files"]}
+            for name, member in files.items():
+                if name == MANIFEST_NAME:
+                    continue
+                item = manifest_by_path[name]
+                source = archive.extractfile(member)
+                if source is None:
+                    raise ReleaseError("Release archive file is unreadable")
+                data = source.read(member.size + 1)
+                if len(data) != member.size or len(data) != item["size"]:
+                    raise ReleaseError("Release file size does not match manifest")
+                if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                    raise ReleaseError("Release file SHA-256 does not match manifest")
+                target = root.joinpath(*PurePosixPath(name).parts)
+                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                descriptor = os.open(
+                    target, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o755 if name == manifest["entrypoint"] else 0o644,
+                )
+                with os.fdopen(descriptor, "wb") as output:
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+            manifest_target = root / MANIFEST_NAME
+            descriptor = os.open(
+                manifest_target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                json.dump(manifest, output, sort_keys=True, separators=(",", ":"))
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            return manifest
+
+    @staticmethod
+    def _validate_manifest(
+        manifest: Any,
+        *,
+        release: dict[str, Any],
+        current_version: str,
+        archive_files: set[str],
+    ) -> None:
+        required = {
+            "schema_version", "version", "tag", "commit_sha",
+            "minimum_source_version", "entrypoint", "files",
+        }
+        if not isinstance(manifest, dict) or set(manifest) != required:
+            raise ReleaseError("Release manifest fields are invalid")
+        if manifest["schema_version"] != 1:
+            raise ReleaseError("Release manifest schema is invalid")
+        version = str(manifest["version"])
+        current = _version(current_version, field="current version")
+        target = _version(version, field="manifest version")
+        minimum = _version(
+            manifest["minimum_source_version"], field="minimum source version"
+        )
+        if current < minimum:
+            raise ReleaseError("Current version is below the supported source version")
+        if target <= current:
+            raise ReleaseError("Release reinstall or downgrade is blocked")
+        if version != release.get("latest_version") or manifest["tag"] != release.get("tag"):
+            raise ReleaseError("Release manifest version or tag mismatch")
+        if manifest["tag"] != f"v{version}":
+            raise ReleaseError("Release manifest tag is invalid")
+        if (
+            COMMIT_RE.fullmatch(str(manifest["commit_sha"])) is None
+            or manifest["commit_sha"] != release.get("commit_sha")
+        ):
+            raise ReleaseError("Release manifest commit mismatch")
+        entrypoint = str(manifest["entrypoint"])
+        if entrypoint != f"deploy/upgrade-{version}-from-pve.sh":
+            raise ReleaseError("Release manifest entrypoint is invalid")
+        values = manifest["files"]
+        if not isinstance(values, list):
+            raise ReleaseError("Release manifest file list is invalid")
+        paths: set[str] = set()
+        for item in values:
+            if not isinstance(item, dict) or set(item) != {"path", "sha256", "size"}:
+                raise ReleaseError("Release manifest file entry is invalid")
+            path = str(item["path"])
+            parsed = PurePosixPath(path)
+            if (
+                not path
+                or "\\" in path
+                or parsed.is_absolute()
+                or any(part in {"", ".", ".."} for part in parsed.parts)
+                or path in paths
+            ):
+                raise ReleaseError("Release manifest file path is invalid")
+            paths.add(path)
+            if FINGERPRINT_RE.fullmatch(str(item["sha256"])) is None:
+                raise ReleaseError("Release manifest file SHA-256 is invalid")
+            if isinstance(item["size"], bool) or not isinstance(item["size"], int) or item["size"] < 0:
+                raise ReleaseError("Release manifest file size is invalid")
+        if paths != archive_files or entrypoint not in paths:
+            raise ReleaseError("Release manifest does not match archive files")
+        upgrades = [path for path in paths if UPGRADE_RE.fullmatch(path)]
+        if upgrades != [entrypoint]:
+            raise ReleaseError("Release must contain exactly one versioned entrypoint")
 
 
 def utc_now() -> str:
@@ -33,7 +540,7 @@ def utc_now() -> str:
 
 
 def inspect_staged_release(root: Path) -> dict[str, Any]:
-    """Return a stable identity for a root-owned staged release without mutation."""
+    """Re-verify and return a root-owned immutable staged release identity."""
     if root.is_symlink():
         raise ReleaseError("Approved release root must not be a symbolic link")
     root = root.resolve()
@@ -70,42 +577,142 @@ def inspect_staged_release(root: Path) -> dict[str, Any]:
         files.append((relative, path))
 
     files.sort(key=lambda item: item[0])
-    upgrades = [
-        (match, path)
-        for relative, path in files
-        if (match := UPGRADE_RE.fullmatch(relative)) is not None
-    ]
-    if len(upgrades) != 1:
-        raise ReleaseError("Staged release must contain exactly one versioned upgrade entrypoint")
-
-    digest = hashlib.sha256()
-    digest.update(b"hubinet-ops-release-v1\0")
-    for relative, path in files:
-        encoded = relative.encode("utf-8")
-        digest.update(len(encoded).to_bytes(4, "big"))
-        digest.update(encoded)
-        digest.update(path.stat().st_size.to_bytes(8, "big"))
+    by_name = {relative: path for relative, path in files}
+    try:
+        manifest = json.loads(by_name[MANIFEST_NAME].read_text(encoding="utf-8"))
+        staging = json.loads(
+            by_name[STAGED_METADATA_NAME].read_text(encoding="utf-8")
+        )
+    except KeyError as exc:
+        raise ReleaseError("Staged release manifest or verification record is missing") from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseError("Staged release metadata is invalid") from exc
+    required_manifest = {
+        "schema_version", "version", "tag", "commit_sha",
+        "minimum_source_version", "entrypoint", "files",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != required_manifest:
+        raise ReleaseError("Staged release manifest is invalid")
+    required_staging = {
+        "schema_version", "version", "tag", "commit_sha", "published_at",
+        "asset_name", "size", "fingerprint", "bundle_sha256",
+        "artifact_verification",
+    }
+    if not isinstance(staging, dict) or set(staging) != required_staging:
+        raise ReleaseError("Staged release verification record is invalid")
+    version = str(manifest.get("version") or "")
+    expected_asset_name = f"hubinet-ops-{version}.tar.gz"
+    try:
+        published_at = datetime.fromisoformat(
+            str(staging.get("published_at") or "").replace("Z", "+00:00")
+        )
+        minimum_source = _version(
+            str(manifest.get("minimum_source_version") or ""),
+            field="minimum source version",
+        )
+    except (ValueError, TypeError) as exc:
+        raise ReleaseError("Staged release identity is invalid") from exc
+    if (
+        manifest.get("schema_version") != 1
+        or _version(version, field="staged version") < (0, 0, 1)
+        or manifest.get("tag") != f"v{version}"
+        or COMMIT_RE.fullmatch(str(manifest.get("commit_sha") or "")) is None
+        or manifest.get("entrypoint") != f"deploy/upgrade-{version}-from-pve.sh"
+        or staging.get("schema_version") != 1
+        or staging.get("version") != version
+        or staging.get("tag") != manifest.get("tag")
+        or staging.get("commit_sha") != manifest.get("commit_sha")
+        or staging.get("artifact_verification") != "verified"
+        or published_at.tzinfo is None
+        or staging.get("asset_name") != expected_asset_name
+        or isinstance(staging.get("size"), bool)
+        or not isinstance(staging.get("size"), int)
+        or int(staging["size"]) <= 0
+        or minimum_source > _version(version, field="staged version")
+        or FINGERPRINT_RE.fullmatch(str(staging.get("fingerprint") or "")) is None
+        or FINGERPRINT_RE.fullmatch(str(staging.get("bundle_sha256") or "")) is None
+    ):
+        raise ReleaseError("Staged release identity is invalid")
+    identity = {
+        "version": version,
+        "tag": manifest["tag"],
+        "commit_sha": manifest["commit_sha"],
+        "published_at": staging["published_at"],
+        "asset_name": staging["asset_name"],
+        "checksum_asset_name": f"{staging['asset_name']}.sha256",
+        "size": staging["size"],
+    }
+    if _release_identity_fingerprint(identity) != staging["fingerprint"]:
+        raise ReleaseError("Staged release fingerprint does not match its identity")
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        raise ReleaseError("Staged release file manifest is invalid")
+    expected: dict[str, dict[str, Any]] = {}
+    for item in entries:
+        if not isinstance(item, dict) or set(item) != {"path", "sha256", "size"}:
+            raise ReleaseError("Staged release file manifest is invalid")
+        relative = str(item.get("path") or "")
+        path = PurePosixPath(relative)
+        if (
+            not relative
+            or "\\" in relative
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or relative in expected
+            or FINGERPRINT_RE.fullmatch(str(item.get("sha256") or "")) is None
+            or isinstance(item.get("size"), bool)
+            or not isinstance(item.get("size"), int)
+            or int(item["size"]) < 0
+        ):
+            raise ReleaseError("Staged release file manifest is invalid")
+        expected[relative] = item
+    actual = set(by_name) - {MANIFEST_NAME, STAGED_METADATA_NAME}
+    if actual != set(expected):
+        raise ReleaseError("Staged release files do not match the manifest")
+    for relative, item in expected.items():
+        path = by_name[relative]
+        if path.stat().st_size != item["size"]:
+            raise ReleaseError("Staged release file size mismatch")
+        digest = hashlib.sha256()
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
-
-    fingerprint = digest.hexdigest()
-    version = upgrades[0][0].group("version")
+        if digest.hexdigest() != item["sha256"]:
+            raise ReleaseError("Staged release file checksum mismatch")
+    upgrades = [relative for relative in expected if UPGRADE_RE.fullmatch(relative)]
+    if upgrades != [manifest["entrypoint"]]:
+        raise ReleaseError("Staged release must contain exactly one versioned upgrade entrypoint")
     return {
         "version": version,
-        "release_id": f"hubinet-ops-{version}-{fingerprint[:16]}",
-        "fingerprint": fingerprint,
-        "file_count": len(files),
-        "total_bytes": total_bytes,
-        "upgrade_path": str(upgrades[0][1]),
+        "tag": manifest["tag"],
+        "commit_sha": manifest["commit_sha"],
+        "published_at": staging["published_at"],
+        "minimum_source_version": manifest["minimum_source_version"],
+        "release_id": f"hubinet-ops-{version}-{str(staging['fingerprint'])[:16]}",
+        "fingerprint": staging["fingerprint"],
+        "bundle_sha256": staging["bundle_sha256"],
+        "artifact_verification": "verified",
+        "file_count": len(expected),
+        "total_bytes": sum(int(item["size"]) for item in expected.values()),
+        "upgrade_path": str(root / manifest["entrypoint"]),
     }
 
 
 def public_release(release: dict[str, Any]) -> dict[str, Any]:
     return {
         key: release[key]
-        for key in ("version", "release_id", "fingerprint", "file_count", "total_bytes")
+        for key in (
+            "version", "tag", "commit_sha", "published_at",
+            "minimum_source_version", "release_id", "fingerprint",
+            "bundle_sha256", "artifact_verification", "file_count", "total_bytes",
+        )
     }
+
+
+def _release_identity_fingerprint(identity: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def marker_path(result_dir: Path, job_id: str) -> Path:
@@ -439,7 +1046,11 @@ def _safe_output_tail(value: Any) -> str:
     text = text[-8192:]
     lines = []
     for line in text.splitlines():
-        if re.search(r"authorization|bearer|token|password|webhook", line, re.IGNORECASE):
+        if re.search(
+            r"authorization|bearer|token|password|webhook|private[-_ ]?key|mqtt",
+            line,
+            re.IGNORECASE,
+        ):
             lines.append("[redacted sensitive output]")
         else:
             lines.append(line)

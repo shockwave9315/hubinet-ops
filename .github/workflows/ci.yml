@@ -10,7 +10,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +20,13 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Compile agent
-        run: python -m compileall app
+        run: python -m compileall app scripts deploy/pve
+      - name: Validate generated and managed contracts
+        run: |
+          python scripts/validate_managed_profiles.py
+          python scripts/validate_pve_snapshot_policy.py config/config.example.yaml --policy-dir deploy/pve
+          python scripts/generate_ha_dashboard.py --check
+          python scripts/validate_hermetic_shell_boundary.py deploy/upgrade-0.4.3-from-pve.sh
       - name: Verify deployment smoke sandbox support
         run: |
           docker version
@@ -48,5 +54,17 @@ jobs:
         run: python -m py_compile deploy/managed/hubinet-maint
       - name: Parse YAML
         run: python scripts/validate_yaml.py
+      - name: Validate immutable release bundle
+        run: |
+          release_version="$(python -c 'from pathlib import Path; from scripts.release_version import read_application_version; print(read_application_version(Path.cwd()))')"
+          minimum_source=0.4.3
+          if [[ "$release_version" == 0.4.3 ]]; then minimum_source=0.4.2; fi
+          python scripts/build_release_bundle.py \
+            --version "$release_version" \
+            --commit "$GITHUB_SHA" \
+            --minimum-source-version "$minimum_source" \
+            --output "/tmp/hubinet-ops-$release_version.tar.gz"
+          cd /tmp
+          sha256sum --check "hubinet-ops-$release_version.tar.gz.sha256"
       - name: Reject tracked runtime files
         run: python scripts/check_tracked_files.py

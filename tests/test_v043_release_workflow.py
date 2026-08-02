@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import tarfile
+
+import pytest
+
+from scripts.build_release_bundle import BuildError, build_release_bundle
+from scripts.release_version import ReleaseDecisionError, decide_release
+
+
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _runtime_tree(root: Path, version: str = "0.4.4") -> None:
+    files = {
+        "app/mqtt.py": f'VERSION = "{version}"\n',
+        "app/main.py": "# runtime\n",
+        "requirements.txt": "fastapi==1\n",
+        "config/config.example.yaml": "resources: {}\n",
+        "deploy/hubinet-ops.service": "[Service]\n",
+        "deploy/install-agent.sh": "#!/usr/bin/env bash\n",
+        "deploy/managed/hubinet-maint": "#!/usr/bin/env python3\n",
+        "deploy/managed/profiles/ct110.json": "{}\n",
+        "deploy/pve/hubinet_ops_hostd.py": "VERSION = '0.4.4'\n",
+        "deploy/pve/hubinet-ops-host": "#!/usr/bin/env bash\n",
+        f"deploy/upgrade-{version}-from-pve.sh": "#!/usr/bin/env bash\n",
+        "scripts/migrate_config_0_4_2.py": "# migration\n",
+        "home-assistant/packages/hubinet_ops.yaml": "template: []\n",
+        "home-assistant/dashboards/hubinet_ops.yaml": "views: []\n",
+    }
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8", newline="\n")
+
+
+def test_release_decision_requires_a_strict_version_bump_and_absent_tag() -> None:
+    assert decide_release("0.4.4", ["v0.4.3"]) == {
+        "status": "release",
+        "version": "0.4.4",
+        "tag": "v0.4.4",
+        "previous_version": "0.4.3",
+    }
+    assert decide_release("0.4.3", ["v0.4.3"])["status"] == "no_version_bump"
+    assert decide_release("0.4.2", ["v0.4.3"])["status"] == "downgrade_blocked"
+    with pytest.raises(ReleaseDecisionError, match="stable semantic"):
+        decide_release("main", ["v0.4.3"])
+
+
+def test_release_bundle_is_versioned_immutable_and_manifest_verified(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    _runtime_tree(source)
+    output = tmp_path / "dist" / "hubinet-ops-0.4.4.tar.gz"
+
+    built = build_release_bundle(
+        source_root=source,
+        output=output,
+        version="0.4.4",
+        commit_sha=COMMIT,
+        minimum_source_version="0.4.3",
+    )
+
+    assert built["version"] == "0.4.4"
+    assert built["tag"] == "v0.4.4"
+    assert built["commit_sha"] == COMMIT
+    assert built["bundle_sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert output.with_suffix(output.suffix + ".sha256").read_text(
+        encoding="ascii"
+    ) == f"{built['bundle_sha256']}  hubinet-ops-0.4.4.tar.gz\n"
+    with tarfile.open(output, "r:gz") as archive:
+        members = archive.getmembers()
+        assert not any(member.issym() or member.islnk() for member in members)
+        names = [member.name for member in members]
+        assert names.count("deploy/upgrade-0.4.4-from-pve.sh") == 1
+        assert not any(
+            name.startswith("deploy/upgrade-")
+            and name != "deploy/upgrade-0.4.4-from-pve.sh"
+            for name in names
+        )
+        manifest = json.load(archive.extractfile("release-manifest.json"))
+    assert manifest["entrypoint"] == "deploy/upgrade-0.4.4-from-pve.sh"
+    assert manifest["minimum_source_version"] == "0.4.3"
+    assert manifest["commit_sha"] == COMMIT
+    assert all(set(item) == {"path", "sha256", "size"} for item in manifest["files"])
+
+
+def test_release_bundle_rejects_wrong_source_version_and_symlink(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    _runtime_tree(source, version="0.4.3")
+    with pytest.raises(BuildError, match="does not match"):
+        build_release_bundle(
+            source_root=source,
+            output=tmp_path / "bundle.tar.gz",
+            version="0.4.4",
+            commit_sha=COMMIT,
+            minimum_source_version="0.4.3",
+        )
+    source = tmp_path / "linked"
+    _runtime_tree(source)
+    link = source / "app" / "linked.py"
+    try:
+        link.symlink_to(source / "app" / "main.py")
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+    with pytest.raises(BuildError, match="symlink"):
+        build_release_bundle(
+            source_root=source,
+            output=tmp_path / "linked.tar.gz",
+            version="0.4.4",
+            commit_sha=COMMIT,
+            minimum_source_version="0.4.3",
+        )
+
+
+def test_release_workflow_runs_only_after_successful_main_push_ci() -> None:
+    workflow = (
+        Path(__file__).parents[1] / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    assert "workflow_run:" in workflow
+    assert 'workflows: ["CI"]' in workflow
+    assert "github.event.workflow_run.conclusion == 'success'" in workflow
+    assert "github.event.workflow_run.event == 'push'" in workflow
+    assert "github.event.workflow_run.head_branch == 'main'" in workflow
+    assert "github.event.workflow_run.head_sha" in workflow
+    assert "scripts/release_version.py" in workflow
+    assert "scripts/build_release_bundle.py" in workflow
+    assert "softprops/action-gh-release" not in workflow
+    assert "gh release create" in workflow
+
+
+def test_ci_bundle_validation_follows_the_version_in_source() -> None:
+    workflow = (
+        Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
+    assert "read_application_version" in workflow
+    assert '--version "$release_version"' in workflow
+    assert 'hubinet-ops-$release_version.tar.gz' in workflow
