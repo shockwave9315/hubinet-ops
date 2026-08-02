@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -12,7 +13,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from hubinet_ops_release import FINGERPRINT_RE, inspect_staged_release, public_release
+from hubinet_ops_release import (
+    FINGERPRINT_RE,
+    GitHubReleaseDiscovery,
+    ReleaseError,
+    ReleaseStager,
+    inspect_staged_release,
+    public_release,
+)
 
 SNAPSHOT_RE = re.compile(
     r"^hubinet-ops-(?P<vmid>[1-9][0-9]{1,5})-"
@@ -27,6 +35,8 @@ READ_ONLY_ACTIONS = {
     "capabilities",
     "list-snapshots",
     "self-update-release",
+    "application-release-check",
+    "ct110-system-scan",
 }
 LIFECYCLE_ACTIONS = {"start", "shutdown", "reboot", "force-stop"}
 MANAGED_ACTIONS = {
@@ -54,7 +64,7 @@ ALLOWED_ACTIONS = (
     | set(MANAGED_ACTIONS)
     | SNAPSHOT_ACTIONS
     | set(ALIASES)
-    | {"self-update"}
+    | {"self-update", "ct110-system-update"}
 )
 
 
@@ -77,6 +87,12 @@ class HostPaths:
     pve_nodes: Path = Path("/etc/pve/nodes")
     self_update: Path = Path("/usr/local/sbin/hubinet-ops-self-update")
     self_update_release: Path = Path("/var/lib/hubinet-ops-hostd/approved-release")
+    ct110_system_update: Path = Path(
+        "/usr/local/sbin/hubinet-ops-ct110-system-update"
+    )
+    ct110_system_update_vmids: Path = Path(
+        "/etc/hubinet-ops/ct110-system-update-vmids"
+    )
 
 
 class HostPolicy:
@@ -90,6 +106,7 @@ class HostPolicy:
         self.snapshot_create = _read_vmids(paths.snapshot_create)
         self.snapshot_restore = _read_vmids(paths.snapshot_restore)
         self.snapshot_delete = _read_vmids(paths.snapshot_delete)
+        self.ct110_system_update = _read_vmids(paths.ct110_system_update_vmids)
         self.resource_types = _read_resource_types(paths.resource_types)
 
     def validate(
@@ -132,17 +149,25 @@ class HostPolicy:
                 raise HostControlError("RAM snapshot is allowed only for QEMU")
             if normalized == "snapshot-rollback" and resource_type != "lxc":
                 raise HostControlError("Snapshot restore is allowed only for LXC")
-        if normalized in {"self-update", "self-update-release"} and vmid != 110:
+        if normalized in {
+            "self-update", "self-update-release", "application-release-check",
+            "ct110-system-scan",
+            "ct110-system-update",
+        } and vmid != 110:
             raise HostControlError("Self-update is allowed only for CT110")
+        if normalized in {"ct110-system-scan", "ct110-system-update"} and (
+            resource_type != "lxc" or vmid not in self.ct110_system_update
+        ):
+            raise HostControlError("CT110 system update is not allowed by PVE policy")
         if normalized in SNAPSHOT_ACTIONS:
             if normalized in {"snapshot-create", "snapshot-create-ram"}:
                 if not argument or not owned_snapshot(argument, vmid):
                     raise HostControlError("Snapshot is not owned by Hubinet Ops")
             else:
                 _parse_snapshot_identity(argument, vmid=vmid)
-        elif normalized == "self-update":
+        elif normalized in {"self-update", "ct110-system-update"}:
             if not argument or not FINGERPRINT_RE.fullmatch(argument):
-                raise HostControlError("Self-update requires an approved release fingerprint")
+                raise HostControlError("Update requires an approved plan fingerprint")
         elif argument is not None:
             raise HostControlError("Action does not accept an argument")
         return normalized, vmid, argument, resource_type
@@ -157,9 +182,17 @@ class HostController:
         policy: HostPolicy | None = None,
         *,
         runner: Runner = subprocess.run,
+        release_discovery: GitHubReleaseDiscovery | None = None,
+        release_stager: ReleaseStager | None = None,
+        current_version: str = "0.4.3",
     ) -> None:
         self.policy = policy or HostPolicy()
         self.runner = runner
+        self.release_discovery = release_discovery or GitHubReleaseDiscovery()
+        self.release_stager = release_stager or ReleaseStager(
+            transport=self.release_discovery.transport
+        )
+        self.current_version = str(current_version)
 
     def execute(
         self,
@@ -185,6 +218,21 @@ class HostController:
                 )
             except RuntimeError as exc:
                 raise HostControlError(str(exc)) from exc
+        if action == "application-release-check":
+            try:
+                result = self.release_discovery.check(self.current_version)
+            except ReleaseError as exc:
+                raise HostControlError(str(exc)) from exc
+            return {
+                key: value
+                for key, value in result.items()
+                if not str(key).startswith("_")
+            }
+        if action == "ct110-system-scan":
+            self._require_running(vmid)
+            return _normalize_ct110_system_scan(
+                self._managed(vmid, "check-updates", timeout=700)
+            )
         if action == "capabilities":
             self._require_running(vmid)
             return self._managed(vmid, "capabilities", timeout=60)
@@ -258,6 +306,41 @@ class HostController:
                 "expected_pve_snaptime": identity["expected_pve_snaptime"],
             }
         if action == "self-update":
+            staged: dict[str, Any] | None = None
+            try:
+                inspected = inspect_staged_release(
+                    self.policy.paths.self_update_release
+                )
+                if inspected.get("fingerprint") == argument:
+                    staged = inspected
+            except ReleaseError:
+                staged = None
+            if staged is None:
+                try:
+                    latest = self.release_discovery.check(self.current_version)
+                    if (
+                        latest.get("status") != "update_available"
+                        or latest.get("fingerprint") != argument
+                    ):
+                        raise ReleaseError(
+                            "Approved application release changed before download"
+                        )
+                    self.release_stager.stage(
+                        latest,
+                        current_version=self.current_version,
+                        destination=self.policy.paths.self_update_release,
+                    )
+                    staged = inspect_staged_release(
+                        self.policy.paths.self_update_release
+                    )
+                except ReleaseError as exc:
+                    raise HostControlError(
+                        f"Application release download or verification failed: {exc}"
+                    ) from exc
+            if staged.get("fingerprint") != argument:
+                raise HostControlError(
+                    "Staged application release fingerprint changed before rollout"
+                )
             script = self.policy.paths.self_update
             if not script.is_file():
                 raise HostControlError("CT110 self-update supervisor is not installed")
@@ -275,6 +358,28 @@ class HostController:
             )
             return {
                 "action": "self-update",
+                "vmid": 110,
+                "fingerprint": argument,
+                "supervisor_started": True,
+            }
+        if action == "ct110-system-update":
+            script = self.policy.paths.ct110_system_update
+            if not script.is_file():
+                raise HostControlError("CT110 system update supervisor is not installed")
+            if source_job_id is None:
+                raise HostControlError("CT110 system update requires a durable source job ID")
+            self._run(
+                [
+                    str(script),
+                    "--job-id",
+                    source_job_id,
+                    "--fingerprint",
+                    str(argument),
+                ],
+                timeout=60,
+            )
+            return {
+                "action": "ct110-system-update",
                 "vmid": 110,
                 "fingerprint": argument,
                 "supervisor_started": True,
@@ -682,6 +787,71 @@ def _json_list(raw: str) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
+def _normalize_ct110_system_scan(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise HostControlError("CT110 system scan must return an object")
+    values = raw.get("packages")
+    if not isinstance(values, list) or len(values) > 2000:
+        raise HostControlError("CT110 system scan package list is invalid")
+    packages: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise HostControlError("CT110 system scan package entry is invalid")
+        name = str(value.get("name") or "")
+        current = str(value.get("current") or "")
+        target = str(value.get("target") or "")
+        security = value.get("security")
+        if (
+            not name
+            or len(name) > 255
+            or not current
+            or len(current) > 255
+            or not target
+            or len(target) > 255
+            or security not in {True, False, None}
+        ):
+            raise HostControlError("CT110 system scan package identity is invalid")
+        packages.append(
+            {
+                "name": name,
+                "current": current,
+                "target": target,
+                "security": security,
+            }
+        )
+    if len({item["name"] for item in packages}) != len(packages):
+        raise HostControlError("CT110 system scan contains duplicate packages")
+    fingerprint = hashlib.sha256(
+        json.dumps(packages, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    scanned = raw.get("scanned_at")
+    if isinstance(scanned, bool):
+        raise HostControlError("CT110 system scan timestamp is invalid")
+    if isinstance(scanned, (int, float)):
+        scanned_at = datetime.fromtimestamp(float(scanned), UTC).replace(
+            microsecond=0
+        ).isoformat()
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(scanned))
+        except (TypeError, ValueError) as exc:
+            raise HostControlError("CT110 system scan timestamp is invalid") from exc
+        if parsed.tzinfo is None:
+            raise HostControlError("CT110 system scan timestamp is invalid")
+        scanned_at = parsed.astimezone(UTC).replace(microsecond=0).isoformat()
+    reboot = raw.get("reboot_required")
+    return {
+        "pending_count": len(packages),
+        "packages": packages,
+        "fingerprint": fingerprint,
+        "scanned_at": scanned_at,
+        "security_updates_count": sum(
+            item["security"] is True for item in packages
+        ),
+        "reboot_required": reboot if reboot in {True, False} else None,
+    }
+
+
 def _same_vmid(value: Any, vmid: int) -> bool:
     try:
         return int(value) == int(vmid)
@@ -786,7 +956,15 @@ def _snapshot_description_metadata(
 ) -> dict[str, str | None] | None:
     if parsed is None:
         return None
-    parts = str(value or "").split(";")
+    description = str(value or "")
+    # PVE serializes a description field with one trailing line ending.  Remove
+    # exactly that transport artifact, not arbitrary whitespace or repeated
+    # newlines, so malformed metadata remains fail-closed.
+    if description.endswith("\r\n"):
+        description = description[:-2]
+    elif description.endswith("\n"):
+        description = description[:-1]
+    parts = description.split(";")
     if not parts or parts[0] != "hubinet-ops":
         return None
     fields: dict[str, str] = {}

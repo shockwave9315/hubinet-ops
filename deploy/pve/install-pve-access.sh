@@ -18,27 +18,33 @@ AGENT_IP="${HUBINET_OPS_AGENT_IP:-}"
 
 for required in observation-vmids managed-vmids maintenance-vmids lifecycle-vmids \
   host-control-vmids snapshot-create-vmids snapshot-restore-vmids \
-  snapshot-delete-vmids resource-types hubinet_ops_host_control.py; do
+  snapshot-delete-vmids resource-types ct110-system-update-vmids \
+  ct110-system-automatic-rollback-vmids hubinet_ops_host_control.py \
+  hubinet_ops_hostd.py hubinet_ops_release.py hubinet_ops_ct110_system.py \
+  hubinet-ops-self-update hubinet-ops-ct110-system-update; do
   [[ -f "$SOURCE_DIR/$required" ]] || {
     echo "Missing $required in the installation package" >&2
     exit 1
   }
 done
 cmp -s "$SOURCE_DIR/managed-vmids" "$SOURCE_DIR/maintenance-vmids" || {
-  echo "Managed and maintenance allowlists must match for 0.4.2" >&2
+  echo "Managed and maintenance allowlists must match for 0.4.3" >&2
   exit 1
 }
 cmp -s "$SOURCE_DIR/lifecycle-vmids" "$SOURCE_DIR/snapshot-restore-vmids" || {
-  echo "Lifecycle and snapshot restore allowlists must match for 0.4.2" >&2
+  echo "Lifecycle and snapshot restore allowlists must match for 0.4.3" >&2
   exit 1
 }
 for policy in snapshot-create-vmids snapshot-delete-vmids; do
   cmp -s "$SOURCE_DIR/host-control-vmids" "$SOURCE_DIR/$policy" || {
-    echo "$policy must match host-control-vmids for 0.4.2" >&2
+    echo "$policy must match host-control-vmids for 0.4.3" >&2
     exit 1
   }
 done
 python3 -m py_compile "$SOURCE_DIR/hubinet_ops_host_control.py"
+python3 -m py_compile "$SOURCE_DIR/hubinet_ops_hostd.py" \
+  "$SOURCE_DIR/hubinet_ops_release.py" \
+  "$SOURCE_DIR/hubinet_ops_ct110_system.py"
 
 [[ "$PUBLIC_KEY" != *$'\n'* && "$PUBLIC_KEY" != *$'\r'* ]] || {
   echo "Klucz publiczny nie może zawierać nowych linii" >&2
@@ -77,6 +83,11 @@ install -d -m 0750 /etc/hubinet-ops
 install -d -m 0755 /usr/local/lib/hubinet-ops
 install -m 0755 "$SOURCE_DIR/hubinet_ops_host_control.py" /usr/local/lib/hubinet-ops/hubinet_ops_host_control.py
 install -m 0755 "$SOURCE_DIR/hubinet-ops-host" /usr/local/sbin/hubinet-ops-host
+install -m 0755 "$SOURCE_DIR/hubinet-ops-self-update" /usr/local/sbin/hubinet-ops-self-update
+install -m 0755 "$SOURCE_DIR/hubinet-ops-ct110-system-update" /usr/local/sbin/hubinet-ops-ct110-system-update
+install -m 0644 "$SOURCE_DIR/hubinet_ops_hostd.py" /usr/local/lib/hubinet-ops/hubinet_ops_hostd.py
+install -m 0644 "$SOURCE_DIR/hubinet_ops_release.py" /usr/local/lib/hubinet-ops/hubinet_ops_release.py
+install -m 0644 "$SOURCE_DIR/hubinet_ops_ct110_system.py" /usr/local/lib/hubinet-ops/hubinet_ops_ct110_system.py
 # Deprecated rollback copy for 0.2.x; the wrapper uses observation-vmids.
 install -m 0640 "$TMP_ALLOWLIST" /etc/hubinet-ops/allowed-vmids
 install -m 0640 "$SOURCE_DIR/observation-vmids" /etc/hubinet-ops/observation-vmids
@@ -88,6 +99,8 @@ install -m 0640 "$SOURCE_DIR/snapshot-create-vmids" /etc/hubinet-ops/snapshot-cr
 install -m 0640 "$SOURCE_DIR/snapshot-restore-vmids" /etc/hubinet-ops/snapshot-restore-vmids
 install -m 0640 "$SOURCE_DIR/snapshot-delete-vmids" /etc/hubinet-ops/snapshot-delete-vmids
 install -m 0640 "$SOURCE_DIR/resource-types" /etc/hubinet-ops/resource-types
+install -m 0640 "$SOURCE_DIR/ct110-system-update-vmids" /etc/hubinet-ops/ct110-system-update-vmids
+install -m 0640 "$SOURCE_DIR/ct110-system-automatic-rollback-vmids" /etc/hubinet-ops/ct110-system-automatic-rollback-vmids
 
 AUTHORIZED_KEYS=/root/.ssh/authorized_keys
 touch "$AUTHORIZED_KEYS"

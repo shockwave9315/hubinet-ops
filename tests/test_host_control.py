@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import http.client
 import json
 import sqlite3
@@ -54,6 +55,65 @@ def _write(path: Path, value: str) -> Path:
     return path
 
 
+def _write_staged_release(
+    root: Path,
+    *,
+    version: str = "0.4.4",
+    commit_sha: str = "1" * 40,
+) -> dict[str, Any]:
+    entrypoint = f"deploy/upgrade-{version}-from-pve.sh"
+    content = b"#!/usr/bin/env bash\nexit 0\n"
+    target = root / entrypoint
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    manifest = {
+        "schema_version": 1,
+        "version": version,
+        "tag": f"v{version}",
+        "commit_sha": commit_sha,
+        "minimum_source_version": "0.4.3",
+        "entrypoint": entrypoint,
+        "files": [{
+            "path": entrypoint,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size": len(content),
+        }],
+    }
+    asset_name = f"hubinet-ops-{version}.tar.gz"
+    identity = {
+        "version": version,
+        "tag": f"v{version}",
+        "commit_sha": commit_sha,
+        "published_at": "2026-08-02T12:00:00+00:00",
+        "asset_name": asset_name,
+        "checksum_asset_name": f"{asset_name}.sha256",
+        "size": 1234,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    (root / "release-manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    (root / "release-staging.json").write_text(
+        json.dumps({
+            "schema_version": 1,
+            "version": version,
+            "tag": f"v{version}",
+            "commit_sha": commit_sha,
+            "published_at": identity["published_at"],
+            "asset_name": asset_name,
+            "size": 1234,
+            "fingerprint": fingerprint,
+            "bundle_sha256": "2" * 64,
+            "artifact_verification": "verified",
+        }, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return inspect_staged_release(root)
+
+
 def policy(
     tmp_path: Path,
     *,
@@ -67,12 +127,9 @@ def policy(
     except OSError:
         local = node
     release = tmp_path / "approved-release"
-    (release / "deploy").mkdir(parents=True)
-    _write(
-        release / "deploy" / "upgrade-0.4.0-from-pve.sh",
-        "#!/usr/bin/env bash\nexit 0\n",
-    )
+    _write_staged_release(release)
     _write(tmp_path / "self-update", "#!/usr/bin/env bash\nexit 0\n")
+    _write(tmp_path / "ct110-system-update", "#!/usr/bin/env bash\nexit 0\n")
     return HostPolicy(
         HostPaths(
             observation=_write(tmp_path / "observation", "100\n101\n106\n110\n"),
@@ -100,6 +157,10 @@ def policy(
             pve_nodes=node.parent,
             self_update=tmp_path / "self-update",
             self_update_release=release,
+            ct110_system_update=tmp_path / "ct110-system-update",
+            ct110_system_update_vmids=_write(
+                tmp_path / "ct110-system-update-vmids", "110\n"
+            ),
         )
     )
 
@@ -228,8 +289,8 @@ def test_controller_inspects_and_launches_only_the_approved_release_fingerprint(
         source_job_id="abcd1234",
     )
 
-    assert release["version"] == "0.4.0"
-    assert release["release_id"].startswith("hubinet-ops-0.4.0-")
+    assert release["version"] == "0.4.4"
+    assert release["release_id"].startswith("hubinet-ops-0.4.4-")
     assert result["supervisor_started"] is True
     assert runner.calls[-1][0] == [
         str(tmp_path / "self-update"),
@@ -238,15 +299,70 @@ def test_controller_inspects_and_launches_only_the_approved_release_fingerprint(
         "--fingerprint",
         release["fingerprint"],
     ]
-    _write(
-        tmp_path / "approved-release" / "CHANGELOG.md",
-        "changed staged content\n",
-    )
-    changed = controller.execute("self-update-release", 110)
-    assert changed["fingerprint"] != release["fingerprint"]
-    assert changed["release_id"] != release["release_id"]
+    target = tmp_path / "approved-release" / "deploy" / "upgrade-0.4.4-from-pve.sh"
+    _write(target, "#!/usr/bin/env bash\nexit 1\n")
+    with pytest.raises(HostControlError, match="checksum|size"):
+        controller.execute("self-update-release", 110)
     with pytest.raises(HostControlError, match="fingerprint"):
         controller.execute("self-update", 110, "bad", source_job_id="abcd1234")
+
+
+def test_ct110_system_scan_and_supervisor_use_only_fixed_typed_argv(
+    tmp_path: Path,
+) -> None:
+    class SystemRunner(FakeRunner):
+        def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            if argv == [
+                "pct", "exec", "110", "--", "/usr/local/sbin/hubinet-maint",
+                "check-updates",
+            ]:
+                self.calls.append((list(argv), dict(kwargs)))
+                payload = {
+                    "ok": True,
+                    "data": {
+                        "pending_count": 1,
+                        "packages": [{
+                            "name": "libexpat1",
+                            "current": "2.8.1-1",
+                            "target": "2.8.2-1~deb13u1",
+                            "security": True,
+                        }],
+                        "scanned_at": 1785672000,
+                        "reboot_required": False,
+                    },
+                }
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps(payload) + "\n", ""
+                )
+            return super().__call__(argv, **kwargs)
+
+    runner = SystemRunner()
+    controller = HostController(policy(tmp_path), runner=runner)
+
+    scan = controller.execute("ct110-system-scan", 110)
+    result = controller.execute(
+        "ct110-system-update",
+        110,
+        scan["fingerprint"],
+        source_job_id="abcd1234",
+    )
+
+    assert scan["pending_count"] == 1
+    assert scan["security_updates_count"] == 1
+    assert result["supervisor_started"] is True
+    assert runner.calls[-1][0] == [
+        str(tmp_path / "ct110-system-update"),
+        "--job-id",
+        "abcd1234",
+        "--fingerprint",
+        scan["fingerprint"],
+    ]
+    assert all(call[1]["shell"] is False for call in runner.calls)
+    with pytest.raises(HostControlError, match="approved plan fingerprint"):
+        controller.execute(
+            "ct110-system-update", 110, "not-a-fingerprint",
+            source_job_id="abcd1234",
+        )
 
 
 def test_snapshot_list_marks_only_project_snapshots_as_eligible(tmp_path: Path) -> None:
@@ -2121,12 +2237,7 @@ def test_prepare_does_not_publish_running_marker_after_job_terminalization(
     database = tmp_path / "jobs.db"
     results = tmp_path / "results"
     release_root = tmp_path / "release"
-    (release_root / "deploy").mkdir(parents=True)
-    _write(
-        release_root / "deploy" / "upgrade-0.4.0-from-pve.sh",
-        "#!/usr/bin/env bash\nexit 0\n",
-    )
-    release = inspect_staged_release(release_root)
+    release = _write_staged_release(release_root)
     store = HostJobStore(database, results)
     job, _ = store.create(
         vmid=110,
@@ -2171,12 +2282,7 @@ def test_supervisor_rechecks_terminal_job_after_release_scan_before_rollout(
     database = tmp_path / "jobs.db"
     results = tmp_path / "results"
     release_root = tmp_path / "release"
-    (release_root / "deploy").mkdir(parents=True)
-    _write(
-        release_root / "deploy" / "upgrade-0.4.0-from-pve.sh",
-        "#!/usr/bin/env bash\nexit 0\n",
-    )
-    release = inspect_staged_release(release_root)
+    release = _write_staged_release(release_root)
     store = HostJobStore(database, results)
     job, _ = store.create(
         vmid=110,

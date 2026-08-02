@@ -31,7 +31,7 @@ from hubinet_ops_host_control import (
 )
 from hubinet_ops_release import ReleaseError, read_marker, remove_marker, write_marker
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 MAX_REQUEST_BYTES = 16 * 1024
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 SNAPSHOT_PATH_RE = re.compile(
@@ -40,7 +40,10 @@ SNAPSHOT_PATH_RE = re.compile(
 )
 ACTION_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/"
-    r"(?P<action>start|shutdown|reboot|force-stop|self-update)$"
+    r"(?P<action>start|shutdown|reboot|force-stop|self-update|system-update)$"
+)
+CT110_SYSTEM_SCAN_PATH_RE = re.compile(
+    r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/system-update/scan$"
 )
 OFFLINE_RESTORE_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/snapshots/"
@@ -60,6 +63,9 @@ JOB_BY_REQUEST_PATH_RE = re.compile(
 )
 SELF_UPDATE_RELEASE_PATH_RE = re.compile(
     r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/self-update/release$"
+)
+APPLICATION_RELEASE_PATH_RE = re.compile(
+    r"^/api/v1/resources/(?P<vmid>[1-9][0-9]{1,5})/application-release$"
 )
 TERMINAL_STATUSES = {"succeeded", "failed", "interrupted"}
 SELF_UPDATE_LAUNCH_TIMEOUT_SECONDS = 600
@@ -520,8 +526,10 @@ class HostJobStore:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         current = self.get(job_id)
-        if current["operation_type"] != "self_update" or current["status"] != "queued":
-            raise HostControlError("self-update job is not queued for launch")
+        if current["operation_type"] not in {
+            "self_update", "ct110_system_update"
+        } or current["status"] != "queued":
+            raise HostControlError("supervised update job is not queued for launch")
         started = (now or datetime.now(UTC)).replace(microsecond=0)
         deadline = started + timedelta(seconds=timeout_seconds)
         started_at = started.isoformat()
@@ -530,7 +538,8 @@ class HostJobStore:
             cursor = connection.execute(
                 "UPDATE host_jobs SET status='running', stage='launching', progress=5, "
                 "launching_started_at=?, launch_deadline_at=?, updated_at=? "
-                "WHERE id=? AND status='queued' AND operation_type='self_update'",
+                "WHERE id=? AND status='queued' "
+                "AND operation_type IN ('self_update','ct110_system_update')",
                 (started_at, deadline_at, utc_now(), job_id),
             )
             if cursor.rowcount != 1:
@@ -582,7 +591,7 @@ class HostJobStore:
         job = self.get(job_id)
         if job["status"] in TERMINAL_STATUSES:
             return job
-        if job["operation_type"] == "self_update":
+        if job["operation_type"] in {"self_update", "ct110_system_update"}:
             return self.refresh_self_update_result(job_id)
         if job["status"] == "queued":
             # begin_execution is the durable mutation boundary. A queued job has
@@ -634,9 +643,9 @@ class HostJobStore:
 
     def refresh_self_update_result(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
-        if job["operation_type"] != "self_update":
+        if job["operation_type"] not in {"self_update", "ct110_system_update"}:
             raise HostControlError(
-                "supervisor marker refresh is supported only for self-update jobs"
+                "supervisor marker refresh is supported only for supervised update jobs"
             )
         if job["status"] in TERMINAL_STATUSES:
             return job
@@ -750,7 +759,7 @@ class HostJobRunner:
     def run(self, job_id: str) -> dict[str, Any]:
         with self._lock:
             job = self.store.get(job_id)
-            if job["operation_type"] == "self_update":
+            if job["operation_type"] in {"self_update", "ct110_system_update"}:
                 if job["status"] != "running" or job["stage"] != "launching":
                     return job
             elif job["status"] != "queued":
@@ -769,6 +778,7 @@ class HostJobRunner:
                 "snapshot_rollback": "snapshot-rollback",
                 "snapshot_delete": "snapshot-delete",
                 "self_update": "self-update",
+                "ct110_system_update": "ct110-system-update",
                 "offline_snapshot_restore": "snapshot-rollback",
                 "offline_force_stop": "force-stop",
             }[job["operation_type"]]
@@ -793,7 +803,7 @@ class HostJobRunner:
                 )
             except Exception as exc:
                 LOG.error("host job failed id=%s vmid=%s operation=%s", job_id, job["vmid"], job["operation_type"])
-                if job["operation_type"] == "self_update":
+                if job["operation_type"] in {"self_update", "ct110_system_update"}:
                     current = self.store.get(job_id)
                     if current["status"] in TERMINAL_STATUSES:
                         return current
@@ -815,7 +825,7 @@ class HostJobRunner:
                     progress=100,
                     error=str(exc)[:1024],
                 )
-                if job["operation_type"] == "self_update":
+                if job["operation_type"] in {"self_update", "ct110_system_update"}:
                     try:
                         remove_marker(self.store.self_update_results, str(job_id))
                     except OSError as cleanup_error:
@@ -825,7 +835,7 @@ class HostJobRunner:
                             cleanup_error,
                         )
                 return failed
-            if job["operation_type"] == "self_update":
+            if job["operation_type"] in {"self_update", "ct110_system_update"}:
                 return self.store.refresh_self_update_result(job_id)
             LOG.info("host job succeeded id=%s vmid=%s operation=%s", job_id, job["vmid"], job["operation_type"])
             return self.store.transition_from_active(
@@ -898,6 +908,7 @@ class HostdApplication:
             "snapshot_rollback": "snapshot-rollback",
             "snapshot_delete": "snapshot-delete",
             "self_update": "self-update",
+            "ct110_system_update": "ct110-system-update",
         }[operation_type]
         self.runner.controller.policy.validate(action, vmid, argument)
         with self._submit_lock:
@@ -908,7 +919,7 @@ class HostdApplication:
                 argument=argument,
             )
             if created:
-                if operation_type == "self_update":
+                if operation_type in {"self_update", "ct110_system_update"}:
                     job = self.store.begin_self_update_launch(job["id"])
                 self.runner.start(job["id"])
         return job, created
@@ -1015,7 +1026,7 @@ class HostdApplication:
     def get_job(self, job_id: str) -> dict[str, Any]:
         job = self.store.get(job_id)
         if (
-            job["operation_type"] == "self_update"
+            job["operation_type"] in {"self_update", "ct110_system_update"}
             and job["status"] not in TERMINAL_STATUSES
         ):
             return self.store.refresh_self_update_result(job_id)
@@ -1028,7 +1039,7 @@ class HostdApplication:
     ) -> dict[str, Any]:
         job = self.store.get_by_request_id(vmid, request_id)
         if (
-            job["operation_type"] == "self_update"
+            job["operation_type"] in {"self_update", "ct110_system_update"}
             and job["status"] not in TERMINAL_STATUSES
         ):
             return self.store.refresh_self_update_result(str(job["id"]))
@@ -1127,6 +1138,33 @@ class HostdHandler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, result)
             return
+        application_release_match = APPLICATION_RELEASE_PATH_RE.fullmatch(path)
+        if application_release_match:
+            if not self._authorized({"backend", "self_update"}):
+                return
+            try:
+                result = self.app.runner.controller.execute(
+                    "application-release-check",
+                    int(application_release_match.group("vmid")),
+                )
+            except (HostControlError, ValueError) as exc:
+                self._send(HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+                return
+            self._send(HTTPStatus.OK, result)
+            return
+        system_scan_match = CT110_SYSTEM_SCAN_PATH_RE.fullmatch(path)
+        if system_scan_match:
+            if not self._authorized({"backend"}):
+                return
+            try:
+                result = self.app.runner.controller.execute(
+                    "ct110-system-scan", int(system_scan_match.group("vmid"))
+                )
+            except (HostControlError, ValueError) as exc:
+                self._send(HTTPStatus.CONFLICT, {"error": str(exc)})
+                return
+            self._send(HTTPStatus.OK, result)
+            return
         match = SNAPSHOT_PATH_RE.fullmatch(path)
         if match and match.group("name") is None:
             if not self._authorized({"general", "backend"}):
@@ -1167,7 +1205,8 @@ class HostdHandler(BaseHTTPRequestHandler):
             offline_restore_match or offline_force_stop_match
         ) else (
             {"self_update"}
-            if action_match and action_match.group("action") == "self-update"
+            if action_match
+            and action_match.group("action") in {"self-update", "system-update"}
             else {"general", "backend"}
             if action_match and action_match.group("action") == "start"
             else {"backend"}
@@ -1207,10 +1246,11 @@ class HostdHandler(BaseHTTPRequestHandler):
                     "reboot": "lifecycle_reboot",
                     "force-stop": "lifecycle_force_stop",
                     "self-update": "self_update",
+                    "system-update": "ct110_system_update",
                 }[action_match.group("action")]
                 argument = (
                     str(payload.get("fingerprint") or "")
-                    if operation_type == "self_update"
+                    if operation_type in {"self_update", "ct110_system_update"}
                     else None
                 )
                 job, created = self.app.submit(
@@ -1359,7 +1399,7 @@ def main() -> int:
     recovery_token = os.environ.get("HUBINET_OPS_HOSTD_RECOVERY_TOKEN", "")
     config = HostdConfig.load(args.config)
     os.environ["HUBINET_OPS_HOSTD_DATABASE"] = str(config.database)
-    controller = HostController()
+    controller = HostController(current_version=VERSION)
     store = HostJobStore(config.database)
     os.environ["HUBINET_OPS_SELF_UPDATE_RESULTS"] = str(store.self_update_results)
     store.reconcile_startup(controller)
