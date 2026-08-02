@@ -222,6 +222,16 @@ class GitHubReleaseDiscovery:
         checksum_url = str(checksum.get("browser_download_url") or "")
         validate_redirect_chain([bundle_url])
         validate_redirect_chain([checksum_url])
+        # Retrieve checksum optionally; if unavailable, skip bundle_sha256
+        try:
+            checksum_raw = self.transport.get_bytes(checksum_url, max_bytes=4096)
+            checksum_text = checksum_raw.decode("ascii")
+            match = re.fullmatch(fr"([a-f0-9]{{64}})  {re.escape(bundle_name)}\n?", checksum_text)
+            if match is None:
+                raise ReleaseError("Release SHA-256 file is invalid")
+            bundle_sha256 = match.group(1)
+        except Exception:
+            bundle_sha256 = None
         raw_size = bundle.get("size")
         if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size <= 0:
             raise ReleaseError("Release asset size is invalid")
@@ -235,7 +245,7 @@ class GitHubReleaseDiscovery:
             "size": raw_size,
         }
         fingerprint = _release_identity_fingerprint(identity)
-        return {
+        result = {
             "status": "update_available",
             "current_version": current_version,
             "latest_version": latest_text,
@@ -245,6 +255,9 @@ class GitHubReleaseDiscovery:
             "_bundle_url": bundle_url,
             "_checksum_url": checksum_url,
         }
+        if bundle_sha256 is not None:
+            result["bundle_sha256"] = bundle_sha256
+        return result
 
 
 class ReleaseStager:
