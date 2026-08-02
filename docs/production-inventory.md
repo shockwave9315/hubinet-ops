@@ -15,3 +15,6 @@
 | 110 | Hubinet Ops | LXC / agent_self | high | backend-gated hostd lifecycle/snapshot, dedicated self-update, scoped offline recovery |
 
 Exact IP addresses, services, Docker requirements, monitoring flags, and dashboard paths are versioned in `config/config.example.yaml`. The repository never treats any production resource as a live test target; rollout validation is read-only.
+# 0.4.3 CT110 policy
+
+CT110 remains VMID 110 with `agent_self`, but its `monitoring.update_scan` and typed `scan` capability are enabled for PVE-supervised Debian package discovery. This does not authorize the backend to run APT directly. Application release discovery is a separate `self_update` capability fixed to the configured Hubinet Ops repository.

@@ -26,3 +26,6 @@ Only the health sensor receives rich JSON attributes, from the dedicated retaine
 The dashboard still reads `updates`, `recent_job_events`, and `recent_warnings` from that dedicated attributes projection. Active plan/job IDs and progress are separate sensors, so a telemetry-only metric refresh cannot churn `health_status` attributes in Recorder.
 
 In 0.4.2 CPU state is rounded to one decimal place. Changes below 0.5 percentage point are suppressed until the five-minute heartbeat. The first state after start and availability, runtime, health, error, or operation transitions publish immediately. Canonical API refresh remains independent and is never throttled.
+# 0.4.3 CT110 telemetry
+
+The retained CT110 state exposes separate `system_*` fields (package/security counts, bounded package names, scan/update/verification times, apt/dpkg results and reboot requirement) and `application_*` fields (installed/latest version, tag, commit, check/download/validation/deployment status and last result). MQTT remains telemetry and Discovery only; it has no command topic.

@@ -35,3 +35,6 @@ Offline CT110 restore and emergency force-stop are distinct break-glass endpoint
 - `container_states` remains the SQLite table name; canonical database methods are aliases over it.
 - old states without type normalize to `resource_type=lxc`, `adapter=apt`.
 - CT101/CT106 MQTT entity IDs and legacy `hubinet/ops/ct/...` topics remain.
+# 0.4.3 supervised update split
+
+CT110 Debian maintenance and Hubinet Ops application rollout are independent state machines. Both cross a durable PVE boundary before mutation, persist request identity outside CT110, and reconcile terminal supervisor evidence after backend/hostd restart. Debian APT never starts without exact snapshot proof; application code never executes before immutable release verification.

@@ -21,3 +21,8 @@ General HA credentials cannot submit online shutdown/reboot/force-stop or snapsh
 Tokens, MQTT passwords, webhook IDs, SSH keys, authorization headers, hostd bearer values, and full commands are never logged or published. Updates still require manual approval. Automatic rollback additionally requires a real pre-update snapshot, a compatible executor/profile with a meaningful health contract, and the per-resource policy.
 
 The CT110 agent runs as `hubinetops`. Its SSH directory is `0750 root:hubinetops`, the private Proxmox key is `0600 hubinetops:hubinetops`, and `ssh_known_hosts` is `0640 root:hubinetops`. Provisioning, upgrade, and rollback normalize these metadata before the service starts; the private key is never group-readable or replaced during an ordinary upgrade.
+# 0.4.3 recovery and release boundaries
+
+PVE snapshot descriptions normalize exactly one trailing LF or CRLF and no other whitespace. A valid description proves only host ownership. Delete/restore eligibility additionally requires durable backend proof; name patterns never adopt an orphan. Read-only reconciliation requires exact matching backend update job, durable request/contract, hostd database job, VMID, name, kind, source job ID, and PVE timestamp.
+
+Application discovery is restricted in root-owned code to `shockwave9315/hubinet-ops`, HTTPS GitHub hosts, bounded redirects/time/size/files/unpacked size, canonical relative regular files, exact manifest/checksums/tag/full commit, one versioned entrypoint, source compatibility, and no same-version install/downgrade. HA supplies none of URL/repository/tag/path/command/argv.

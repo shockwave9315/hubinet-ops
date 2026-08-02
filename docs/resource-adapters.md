@@ -2,7 +2,7 @@
 
 ## `apt` / LXC
 
-Uses PVE `pct status`, the fixed `hubinet-maint` 0.4.1/protocol 1 actions, Hubinet-owned LXC snapshots, stabilization, configured services, optional Docker requirements, verification, repair policy, and rollback policy. PVE runtime is probed independently before guest inspection. Scan, preflight, update, repair, verify, and guest healthcheck require the complete executor contract—not only a version string. Hostd-only lifecycle and snapshot operations retain backend/PVE policy gates but deliberately do not depend on files inside the guest. It is valid only for `resource_type: lxc`.
+Uses PVE `pct status`, the fixed `hubinet-maint` 0.4.3/protocol 1 actions, Hubinet-owned LXC snapshots, stabilization, configured services, optional Docker requirements, verification, repair policy, and rollback policy. PVE runtime is probed independently before guest inspection. Scan, preflight, update, repair, verify, and guest healthcheck require the complete executor contract—not only a version string. Hostd-only lifecycle and snapshot operations retain backend/PVE policy gates but deliberately do not depend on files inside the guest. It is valid only for `resource_type: lxc`.
 
 Profiles for CT101–CT109 are versioned in `deploy/managed/profiles`. A schema-valid but insufficient health contract is reported as `insufficient_health_contract`; it blocks automatic health-based rollback but does not invent services. Manual lifecycle/snapshot remains subject to the ordinary backend/PVE guards.
 
@@ -15,3 +15,6 @@ Read-only in 0.4.0. The PVE wrapper uses `qm status`, `pvesh .../status/current`
 Combines read-only PVE LXC status with fixed local observations: `hubinet-ops.service`, in-process API health/version, inventory/job counts, MQTT availability, `/proc`/disk resource usage, and at most 20 sanitized journal warning/error lines. It never SSHes to itself and never runs `hubinet-maint` in CT110. Normal lifecycle, snapshot, and self-update requests are gated and persisted by the backend before delegation to independent PVE hostd. Direct hostd access while CT110 is stopped is limited to start and separately scoped break-glass recovery.
 
 Invalid adapter/type combinations fail configuration validation. Adding another resource is configuration-driven; backend logic is not copied per VMID.
+# CT110 in 0.4.3
+
+`agent_self` keeps local inspect/status but now routes Debian scan and update through typed PVE hostd contracts. `ct110_system_update` has its own package fingerprint, pre-update physical snapshot proof and PVE supervisor. `self_update` is reserved for immutable Hubinet Ops application releases. These plan types cannot be combined or silently substituted.

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.3
+
+- normalize exactly one trailing PVE LF/CRLF in snapshot descriptions while retaining strict metadata and physical identity checks;
+- distinguish foreign, host-owned/backend-unproven, and fully managed/proven snapshots, with read-only recovery only from an exact backend/hostd durable contract;
+- refresh physical snapshot state during operator refresh and return `nothing_to_delete` without creating empty destructive jobs;
+- remove leaked literal Jinja braces and validate every generated VM100/CT101–110 template with Jinja parsing;
+- split CT110 Debian system updates from immutable Hubinet Ops application releases in the API, state model, MQTT Discovery, and Home Assistant dashboard;
+- supervise CT110 APT update, verification, restart reconciliation, and policy-gated rollback durably on PVE;
+- discover only stable releases from `shockwave9315/hubinet-ops`, verify bounded immutable bundles, and atomically stage them without replacing a prior valid staging on failure;
+- add release-on-version-bump GitHub Actions and deterministic manifests/checksums with one versioned upgrade entrypoint;
+- add transactional 0.4.2 → 0.4.3 PVE/CT110 and Home Assistant installers; 0.4.3 is the final manually bootstrapped release.
+
 ## 0.4.2
 
 - refresh and confirm canonical snapshot state after every mutation, blocking package changes when a pre-update snapshot cannot be confirmed;

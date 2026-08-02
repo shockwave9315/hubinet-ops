@@ -1,4 +1,4 @@
-# REST API 0.4.2
+# REST API 0.4.3
 
 Every `/api/v1` route requires `Authorization: Bearer …`. Unknown resources return 404. Policy, compatibility, state, ownership, idempotency, or concurrency conflicts return an explicit 409; no endpoint accepts command text.
 
@@ -45,3 +45,10 @@ At backend startup, lifecycle, snapshot, and self-update jobs backed by hostd ar
 Hostd uses explicit bearer scopes. General HA scope can read and start CT110, backend scope can submit ordinary lifecycle/snapshot jobs and read/ACK recovery events, self-update scope can submit only the fingerprinted self-update job, and recovery scope can submit only typed break-glass operations. A recognized token presented to the wrong scope receives 403 without creating a job.
 
 Break-glass hostd routes are `POST /api/v1/resources/110/snapshots/{name}/offline-restore` with `confirm: RESTORE_CT110_OFFLINE`, and `POST /api/v1/resources/110/offline-force-stop` with `confirm: FORCE_STOP_CT110_RECOVERY`. The former requires CT110 stopped and an eligible owned snapshot. `GET /api/v1/recovery-events` returns the durable event contract, including nullable `mutation_started_at`, and `POST /api/v1/recovery-events/{recovery_id}/ack` acknowledges it; both are backend-scope routes. Hostd sets `mutation_started_at` atomically immediately before calling the destructive PVE controller. ACK is rejected until the event is terminal.
+# 0.4.3 update and no-op outcomes
+
+`POST /api/v1/resources/110/scan` is the CT110 Debian system scan. It creates only a `ct110_system_update` waiting plan and never installs packages. Approval remains `POST /api/v1/resources/110/plans/approve-active`; the approved job is supervised on PVE.
+
+`POST /api/v1/resources/110/self-update` now checks the fixed GitHub repository and returns HTTP 200 with `up_to_date`, `no_release_published`, or `update_available`/a waiting application plan. It no longer requires a manually copied `approved-release`. Transport/discovery failure is a gateway error; HTTP 409 is reserved for active-plan/job and changed-approved-release conflicts.
+
+Manual prune endpoints return HTTP 200 `{status: nothing_to_delete, mode, deleted_count: 0}` before a durable destructive job exists when there is no exact candidate.

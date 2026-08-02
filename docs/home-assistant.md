@@ -13,7 +13,7 @@ MQTT discovery preserves stable `unique_id` values and declares production-compa
 Install the HA patch separately from the agent patch:
 
 ```bash
-bash deploy/install-ha-0.4.2-from-pve.sh HA_HOST 22
+bash deploy/install-ha-0.4.3-from-pve.sh HA_HOST 22
 ```
 
 The required keys are `hubinet_ops_scan_url`, `hubinet_ops_refresh_url`, `hubinet_ops_retry_healthcheck_url`, `hubinet_ops_rollback_url`, `hubinet_ops_approve_url`, `hubinet_ops_reject_url`, `hubinet_ops_self_update_plan_url`, `hubinet_ops_start_url`, `hubinet_ops_shutdown_url`, `hubinet_ops_reboot_url`, `hubinet_ops_force_stop_url`, `hubinet_ops_snapshot_create_url`, `hubinet_ops_snapshot_restore_url`, `hubinet_ops_snapshot_delete_url`, `hubinet_ops_authorization`, `hubinet_ops_host_start_url`, `hubinet_ops_host_authorization`, `hubinet_ops_host_offline_snapshot_restore_url`, `hubinet_ops_host_offline_force_stop_url`, `hubinet_ops_host_recovery_authorization`, `hubinet_ops_webhook_id`, and `hubinet_ops_notify_service`. Values remain private and are never printed.
@@ -21,7 +21,7 @@ The required keys are `hubinet_ops_scan_url`, `hubinet_ops_refresh_url`, `hubine
 The installer backs up configuration/package/dashboard/secrets, runs `ha core check`, and rolls files back on error. Without a restart, newly installed package scripts do not exist in Home Assistant's service registry yet; the installer prints the exact `ha core restart` command. To make that reviewed restart part of the transaction, use:
 
 ```bash
-bash deploy/install-ha-0.4.2-from-pve.sh --restart-core HA_HOST 22
+bash deploy/install-ha-0.4.3-from-pve.sh --restart-core HA_HOST 22
 ```
 
 This restarts Home Assistant Core only after a successful check and waits for `running`; it never restarts or stops VM100 through Proxmox and never edits the entity registry.
@@ -29,3 +29,6 @@ This restarts Home Assistant Core only after a successful check and waits for `r
 The package excludes the 12 agent/resource `last_refresh` sensors and ephemeral job-progress sensors from Recorder. It does not change `db_url`, `purge_keep_days`, or other user Recorder settings. Historical rows recorded before installation are not deleted immediately; they disappear according to the existing Recorder purge configuration.
 
 All displayed timestamps use Home Assistant local time (`dd.mm.yyyy HH:MM`); live logs show local `HH:MM` without microseconds. Invalid/unknown values render a readable fallback. Plan and job cards show at most the first eight ID characters rather than full UUIDs.
+# 0.4.3 CT110 controls
+
+CT110 has separate “System Debian CT110” and “Aplikacja Hubinet Ops” sections. Their four actions are: system scan, system-plan approval, application-release check, and exact application-release installation. They do not share an “update” button or status. Normal `up_to_date`, `no_release_published`, and `nothing_to_delete` responses use HTTP 200 and produce business messages rather than red `rest_command` errors. Mapping-shaped backend details are rendered by selected fields, never as a Python dictionary.

@@ -136,7 +136,6 @@ ssh "${SSH_ARGS[@]}" '
 if [[ "$restart_core" == true ]]; then
   restart_core_and_wait
 fi
-
 trap - ERR INT TERM EXIT
 echo "Hubinet Ops 0.4.3 HA files validated. Backup: $HA_HOST:$BACKUP_DIR"
 if [[ "$restart_core" == true ]]; then
@@ -146,4 +145,3 @@ else
   echo "The package is valid, but new scripts are unavailable until Core is restarted."
   echo "Restart command: ssh -p $HA_PORT -i $SSH_KEY root@$HA_HOST 'ha core restart'"
 fi
-

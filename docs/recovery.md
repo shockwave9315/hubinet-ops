@@ -40,3 +40,6 @@ The upgrade does not replace `agent.env` or SSH keys and does not enable MQTT, o
 ## Read-only diagnosis without changing a resource
 
 Use a non-production copy of runtime config and keep `scheduler.enabled: false`. Call only authenticated `refresh`, wrapper `inspect`, executor `capabilities`, or snapshot list. These are read-only. A deliberate scan may refresh APT metadata and create a waiting plan, so it is not part of installer validation. Never test update, lifecycle, snapshot mutation, or rollback against production as a smoke check.
+# Interrupted 0.4.2 snapshot confirmation
+
+After 0.4.3, a physical snapshot with valid PVE metadata may appear as `host_owned_unproven`. It remains ineligible for automatic/manual delete or restore. The backend may recover proof read-only only when the failed/blocked/interrupted backend update, request ID, durable `pre_update_snapshot_create` contract, hostd job record, physical name/VMID/kind/source job ID and PVE timestamp all match uniquely. Otherwise preserve the snapshot and job and require an operator decision; do not infer ownership from its name.

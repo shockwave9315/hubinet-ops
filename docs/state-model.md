@@ -11,3 +11,6 @@ After rollback, `verification_status` returns to unknown and `last_verification`
 SQLite remains `/var/lib/hubinet-ops/ops.db`. Migration to `user_version=400` is additive and idempotent; existing plans/jobs/events/state survive. Historical `container_states` remains on disk with canonical resource methods layered over it. Hostd uses a separate PVE SQLite database so CT110 host job results survive the guest being offline.
 
 Retained MQTT state/attributes are bounded projections, not authority. Home Assistant never writes resource state back to SQLite.
+# 0.4.3 ownership and CT110 state
+
+Snapshot ownership is tri-state: `foreign`, `host_owned_unproven`, or `managed`. Only `managed` has durable backend proof and can become policy-eligible for mutation. CT110 state additionally separates `system_*` package/update/verification fields from `application_*` release/download/validation/deployment fields; a plan is explicitly typed as `ct110_system_update` or `self_update`.

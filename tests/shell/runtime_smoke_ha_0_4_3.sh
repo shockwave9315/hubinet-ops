@@ -669,4 +669,3 @@ fi
 [[ "$(grep -c '^REJECTED_SCP$' "$probe_root/events.log")" == 1 ]]
 
 echo "0.4.3 HA installer runtime smoke: passed"
-
