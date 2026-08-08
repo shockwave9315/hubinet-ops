@@ -90,23 +90,31 @@ Minimalny projektowany custom role:
 
 - `VM.Audit` na `/vms` z propagation — widoczność QEMU/LXC i ich konfiguracji;
 - `Sys.Audit` na `/nodes` z propagation — node status/config;
+- `Sys.Audit` na `/access` — wymagane tylko dla authoritative ACL topology
+  verification przez `GET /access/acl`;
 - `Sys.Audit` na `/` tylko jeśli wymagane są `/cluster/status` lub pełna
   cluster/task evidence; jest to szersze niż sam inventory i musi być
   uzasadnione kontraktem implementacji;
 - dodatkowe `Pool.Audit`, `Datastore.Audit`, `SDN.Audit` nie są wymagane dla
   minimalnego workload inventory, jeśli tych facts nie pobieramy.
 
+`Sys.Audit` na `/access` jest read-only, ale zwiększa zakres widocznych
+security-relevant ACL metadata. To jawny tradeoff konieczny dla authoritative
+source-wide completeness; provider bez niego może dostarczać tylko
+non-authoritative partial view.
+
 Wbudowany `PVEAuditor` jest read-only i prosty operacyjnie, lecz jego zakres jest
-szerszy niż minimalne `VM.Audit` + `Sys.Audit`. Nie przyjmujemy go automatycznie.
-Przed implementacją powstanie dokładna macierz endpoint → ACL path → privilege,
-sprawdzona negatywnymi testami. Żadna rola discovery nie może zawierać
+szerszy niż projektowany discovery contract. Nie przyjmujemy go automatycznie.
+Powyższa lista nie jest jeszcze finalną minimal permission matrix. Przed
+implementacją powstanie dokładna macierz endpoint → ACL path → privilege,
+sprawdzona contract i negatywnymi testami. Żadna rola discovery nie może zawierać
 `VM.Allocate`, `VM.PowerMgmt`, `VM.Backup`, `VM.Clone`, `Sys.PowerMgmt` ani
 pozostałych uprawnień mutacyjnych.
 
 Token nigdy nie jest logowany ani zwracany przez Hubinet Ops API/diagnostics.
 Authorization header powstaje wyłącznie w adapterze transportowym.
 
-### Independent effective-permission proof
+### ACL topology i effective-permission proof
 
 **FACT-SOURCE:** `GET /access/permissions` pozwala userowi/tokenowi odczytać
 własne effective permissions i zwraca mapę `path → privilege → propagate`.
@@ -114,27 +122,46 @@ własne effective permissions i zwraca mapę `path → privilege → propagate`.
 niewidoczne VM/LXC, więc ACL-filtered response może wyglądać dokładnie jak
 kompletny, mniejszy inventory.
 
+Effective permissions nie wystarczają samodzielnie. **FACT-DOC:** ACL na deeper
+path zastępuje inherited permissions, a `NoAccess` cancels all other roles na
+ścieżce. **FACT-SOURCE:** `get_effective_permissions()` pomija paths, których
+effective permission map jest pusta. Przykładowe `/vms → VM.Audit propagate`
+oraz `/vms/103 → NoAccess` może więc ukryć VM103 zarówno w resources, jak i w
+effective permission dump.
+
+**FACT-SOURCE:** `GET /access/acl` zwraca pełną konfigurację ACL, gdy caller ma
+`Sys.Audit` na `/access`. Bez tego privilege wynik jest ograniczony do obiektów,
+dla których caller może modyfikować permissions, więc nie jest topology proof.
+
 Authoritative source-wide run musi używać tego samego tokenu i wykonać:
 
 ```text
-permission snapshot/hash BEFORE
+ACL topology snapshot/hash BEFORE
++ effective permission snapshot/hash BEFORE
 → fetch cluster-wide baseline and required facts
-→ permission snapshot/hash AFTER
+→ ACL topology snapshot/hash AFTER
++ effective permission snapshot/hash AFTER
 ```
 
 Permission evaluator musi fail-closed potwierdzić:
 
+- identyczną canonical security-relevant ACL topology przed i po discovery
+  window;
+- identyczny effective permission snapshot przed i po discovery window;
 - effective `VM.Audit` z propagation dla całego `/vms` guest tree;
 - wymagane przez kontrakt node permissions dla całego `/nodes` tree oraz
   `Sys.Audit` na `/`, jeśli używane endpointy tego wymagają;
-- brak descendant/restrictive/niejednoznacznych ACL scopes, które mogłyby ukryć
+- topology proof potwierdzający brak security-relevant descendant override,
+  `NoAccess` lub innej restriction dla discovery identity, które mogłyby ukryć
   dowolny guest albo wymagany node;
-- identyczny canonical permission snapshot/hash przed i po discovery window.
+- brak pool/per-VM limited scope użytego jako substitute dla source-wide
+  visibility.
 
 Token widzący wyłącznie per-VM albo per-pool scope nie może utworzyć
 authoritative `complete` inventory. Brak możliwości pobrania lub jednoznacznej
-interpretacji własnych effective permissions jest configuration error, nie
-domniemaniem pełnego dostępu.
+interpretacji własnych effective permissions albo pełnej ACL topology jest
+`configuration_error`/`partial`, nie domniemaniem pełnego dostępu. Nie wolno
+wtedy wykonywać absence/removal transitions.
 
 ## Normalized discovery snapshot
 
@@ -148,6 +175,8 @@ DiscoverySnapshot
   source_facts
   source_availability
   completeness
+  acl_topology_hash_before
+  acl_topology_hash_after
   permission_snapshot_hash_before
   permission_snapshot_hash_after
   permission_coverage
@@ -185,8 +214,8 @@ przed transaction boundary. Shallow read-only wrapper nie wystarcza.
 Każdy run ma jedną z klasyfikacji:
 
 - `complete` — autorytatywny source-wide baseline zakończył się sukcesem,
-  independent permission proof potwierdza pełne wymagane guest/node coverage
-  oraz permission hashes przed/po są identyczne;
+  ACL topology i effective-permission proof potwierdzają pełne wymagane
+  guest/node coverage, a oba topology/permission hashes przed/po są identyczne;
 - `partial` — source odpowiedział, lecz brakuje node'a, strony, zakresu albo
   wystąpił per-resource read error;
 - `configuration_error` — token/effective ACL lub provider configuration nie
@@ -200,10 +229,12 @@ locatorów z błędem config read pozwala zachować `present`, ale ustawia
 jest traktowana jak dowód nieobecności.
 
 `covered_nodes` i `failed_scopes` opisują jawnie zauważone błędy transportu lub
-subrequestów, ale nie dowodzą pełnego ACL coverage. Tylko niezależny effective-
-permission proof może wykluczyć ciche filtrowanie. Brak pełnego coverage daje
-`partial`/`configuration_error`; różne permission hashes przed/po dają `invalid`.
-W obu przypadkach nie wolno wykonywać absence/removal transitions.
+subrequestów, ale nie dowodzą pełnego ACL coverage. Effective-permission proof
+bez topology proof również nie może wykluczyć cichego `NoAccess`. Brak pełnej,
+jednoznacznie ocenionej topology lub coverage daje `partial`/
+`configuration_error`; różne topology albo permission hashes przed/po dają
+`invalid`. We wszystkich tych przypadkach nie wolno wykonywać absence/removal
+transitions.
 
 ## Reconciliation state machine
 
@@ -311,11 +342,11 @@ maintenance permission ani aktywnych destructive approvals/jobs.
 Każdy run wykonuje:
 
 ```text
-fetch permission snapshot BEFORE
+fetch ACL topology + effective permission snapshots BEFORE
 → fetch baseline/facts
-→ fetch permission snapshot AFTER
+→ fetch ACL topology + effective permission snapshots AFTER
 → normalize
-→ validate permission stability/coverage, source, schema, time and completeness
+→ validate topology/permission stability and coverage, source, schema, time and completeness
 → reconcile in one DB transaction
 → derive presence, continuity and capabilities
 → commit
@@ -338,7 +369,10 @@ pamięć procesu nie jest source of truth.
 | osiągalny endpoint innego klastra | `invalid` | odrzuć run; security alert |
 | brak jednego node'a | `partial` lub `node_unavailable` | resources node'a zachowane |
 | baseline pełny, config read jednego guest fail | baseline complete + per-resource error | locator `present`, facts unavailable |
-| permission proof nie pokrywa całego `/vms`/`/nodes` contract | `partial`/`configuration_error` | bez absence/removal transitions |
+| `GET /access/acl` niedostępne, ograniczone lub niejednoznaczne | `partial`/`configuration_error` | bez absence/removal transitions |
+| topology wykazuje descendant override/`NoAccess` ukrywający scope | `configuration_error` | bez absence/removal transitions |
+| topology hash BEFORE ≠ AFTER | `invalid` | odrzuć run; bez absence/removal transitions |
+| effective permission proof nie pokrywa całego `/vms`/`/nodes` contract | `partial`/`configuration_error` | bez absence/removal transitions |
 | permission hash BEFORE ≠ AFTER | `invalid` | odrzuć run; bez absence/removal transitions |
 | token ma tylko per-VM/per-pool visibility | `configuration_error` | read-only partial view może być diagnostyczny, ale nie authoritative inventory |
 | pełny baseline bez locatora | `complete` | `missing`, nie `confirmed_removed` |
@@ -392,19 +426,25 @@ Oficjalne źródła Proxmox, odczytane 2026-08-08:
 - [pveum — API tokens, privilege separation, role i ACL](https://github.com/proxmox/pve-docs/blob/master/pveum.adoc)
 - [pve-manager `Cluster.pm` — cluster-wide resources/status/tasks i permission filters](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Cluster.pm)
 - [pve-access-control `AccessControl.pm` — `GET /access/permissions` i effective permission map](https://github.com/proxmox/pve-access-control/blob/master/src/PVE/API2/AccessControl.pm)
+- [pve-access-control `ACL.pm` — `GET /access/acl` i warunek pełnego odczytu ACL](https://github.com/proxmox/pve-access-control/blob/master/src/PVE/API2/ACL.pm)
+- [pve-access-control `RPCEnvironment.pm` — obliczanie i filtrowanie effective permissions](https://github.com/proxmox/pve-access-control/blob/master/src/PVE/RPCEnvironment.pm)
 - [Proxmox VE API Viewer](https://pve.proxmox.com/pve-docs/api-viewer/)
 - [pvecm — multi-master, node remove/reinstall/rejoin i certificate refresh](https://github.com/proxmox/pve-docs/blob/master/pvecm.adoc)
 
 **FACT-DOC:** `pveproxy` forwarduje requests do innych node'ów; token z
 separated privileges ma effective ACL jako przecięcie user/token; `VM.Audit`
-pozwala czytać VM config, `Sys.Audit` node/cluster status/config.
+pozwala czytać VM config, `Sys.Audit` node/cluster status/config. ACL na deeper
+path zastępuje inherited permissions, a `NoAccess` anuluje pozostałe role na
+danej ścieżce.
 
 **FACT-SOURCE:** `/cluster/resources` filtruje guest entries przez `VM.Audit` na
 `/vms/{vmid}`, node facts przez `Sys.Audit` na `/nodes/{node}`, a
 `/cluster/status` wymaga `Sys.Audit` na `/`. Brak `VM.Audit` powoduje pominięcie
 guest entry bez markeru brakującego scope. `GET /access/permissions` pozwala
 userowi/tokenowi odczytać własne effective permissions jako mapę path/privilege/
-propagation.
+propagation, ale `get_effective_permissions()` pomija paths z pustą effective
+permission map. `GET /access/acl` ujawnia pełną konfigurację ACL tylko callerowi
+z `Sys.Audit` na `/access`; bez tego zwraca ograniczony widok.
 
 Pozostałe reguły completeness, reconciliation i failover są decyzjami
 architektonicznymi Hubinet Ops, nie obietnicami Proxmox API.
