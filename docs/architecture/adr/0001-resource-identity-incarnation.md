@@ -476,13 +476,17 @@ degraded, w `configuration_error` albo ma nowszy applicable invalid
 current-context outcome podważający confidence. Future destructive/maintenance
 eligibility wymaga committed inventory utworzonego pod bieżącym
 `source_config_revision`, exact endpoint/canonicalization contract i
-`transport_trust_revision`, bez nowszego source health outcome podważającego
+`transport_trust_revision`, przed fixed freshness deadline należącym do exact
+committed run/contextu, bez nowszego source health outcome podważającego
 current-state assumptions, oraz jawnie spełnionego operation freshness limit.
 Freshness wynika wyłącznie z authoritative successful applicable commit i trwa
-do pierwszego nowszego applicable outcome, który ją unieważnia; nie zależy od
-przypadkowej nazwy health enumu.
-Zmiana source configuration albo transport trust pozostawia poprzedni inventory
-jako last-known presentation data, lecz nie jako mutation-fresh evidence.
+do najwcześniejszego z deadline, controlled context transition albo nowszego
+applicable outcome, który ją unieważnia; nie zależy od przypadkowej nazwy health
+enumu. Mutation eligibility sprawdza deadline fail-closed niezależnie od
+pollera/timera/API read, a expiry jest revisioned transition opisaną w ADR 0002.
+Zmiana source configuration, transport trust albo time expiry pozostawia
+poprzedni inventory jako last-known presentation data, lecz nie jako
+mutation-fresh evidence.
 
 Wyjątek oparty na silniejszej, niezależnej live host/source attestation wymaga
 przyszłego, osobno zaakceptowanego operation-specific security contract. Bez
@@ -577,6 +581,8 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   tego samego VMID, current occupant resolution przez active binding oraz
   retained node references bez dangling `via_device`;
 - source health/freshness/origin fields, initial non-fresh semantics,
+  fixed last-success/deadline provenance, controlled `time_expiry` oraz
+  scheduler-independent deadline enforcement,
   globalny `published_state_revision` dla każdej zmiany publikowanego pola,
   consistent-read snapshot contract oraz HA tests odróżniające osiągalny backend
   ze świeżym inventory od osiągalnego backendu ze

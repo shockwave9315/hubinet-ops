@@ -851,7 +851,8 @@ atomic transaction:
     → reconcile inventory
     (w tym optional atomic direct old-binding → successor-binding handoff)
     → update committed-inventory and source-health tokens
-    → update last-successful health/freshness provenance
+    → persist fixed last-successful timestamp + freshness deadline
+      bound to exact committed run/context
     → increment inventory revision + published-state revision
     → derive presence, continuity, freshness and capabilities
     → release active discovery ownership
@@ -876,7 +877,8 @@ Nie publikujemy surowego albo częściowo reconciled snapshotu. Monotonic
 source identity. Inkrementuje się przy każdej zmianie provider/discovery
 settings, credential material/version lub secret reference, discovery-relevant
 lifecycle/config state, active discovery-route transition albo wymaganych
-provider contract parameters. Controlled canonicalization migration active
+provider contract parameters, w tym configured freshness duration. Controlled
+canonicalization migration active
 endpointu również zwiększa revision. Pure display-label change, inert candidate
 metadata i nowe observed facts nie zmieniają znaczenia bieżącego runu, więc nie
 zwiększają revision.
@@ -1055,7 +1057,7 @@ Backend utrzymuje dwa niezależne durable outcomes:
    reconciliation i może być zachowany do read-only presentation;
 2. **current source observation health/freshness** — bieżący presentation i
    security state wraz z origin/reason; może pochodzić z najnowszego applicable
-   completed runu, controlled context transition albo initial state.
+   completed runu, controlled context transition, time expiry albo initial state.
 
 Canonical durable ownership jest pojedyncze:
 
@@ -1063,7 +1065,7 @@ Canonical durable ownership jest pojedyncze:
   `last_issued_run_sequence`, `last_committed_run_sequence` i durable active-run
   ownership;
 - `source_runtime_health` posiada completion/health provenance, current
-  health/freshness/origin/reason i last-successful/context metadata;
+  health/freshness/origin/reason i last-successful/deadline/context metadata;
 - published source view agreguje oba recordy, ale nie tworzy drugiej
   authoritative kopii żadnego monotonic tokenu.
 
@@ -1078,12 +1080,14 @@ Conceptual source state publikuje co najmniej:
   nie musi być current contextem;
 - `last_committed_run_sequence`;
 - `last_successful_observed_at`;
+- fixed `freshness_valid_until`/`fresh_until` oraz exact committed run/context
+  provenance, do których deadline należy;
 - current health/freshness, np. `healthy/fresh`, `stale`,
   `source_unavailable`, `partial/degraded`, `configuration_error`, invalid
   current-context observation albo `not_yet_observed`;
 - `current_health_origin` i `current_health_reason`, gdzie origin rozróżnia co
-  najmniej `discovery_run(sequence)`, `controlled_context_transition` oraz
-  `initial/not_yet_observed`;
+  najmniej `discovery_run(sequence)`, `controlled_context_transition`,
+  `time_expiry` oraz `initial/not_yet_observed`;
 - exact `source_config_revision`, endpoint/canonical locator/version i
   `transport_trust_revision`, pod którymi last inventory został committed, oraz
   bieżący source/transport context do porównania.
@@ -1104,8 +1108,9 @@ Successful authoritative inventory run wykonuje jedną atomic transaction, któr
 sprawdza nonterminal run i exact active ownership, ponownie waliduje exact
 current context, one-time finalizuje run i completion provenance, reconciliuje
 resources, aktualizuje `last_committed_run_sequence`, successful
-observation/freshness i `last_health_run_sequence`, zwiększa `inventory_revision`
-i `published_state_revision`, zwalnia ownership, po czym commit/publikuje wszystko
+observation/freshness, fixed freshness deadline należący do exact run/contextu i
+`last_health_run_sequence`, zwiększa `inventory_revision` i
+`published_state_revision`, zwalnia ownership, po czym commit/publikuje wszystko
 albo nic.
 
 Failed, partial, unavailable albo invalid **newest applicable** run wykonuje
@@ -1175,7 +1180,8 @@ mutation-fresh do nowego udanego commitu; po nim current origin staje się
 Initial source creation atomowo tworzy source, dokładnie jeden initial active
 endpoint oraz wymagany `source_runtime_health` record z
 `current_health_origin=initial/not_yet_observed`, jawnie non-fresh health i
-`last_successful_observed_at=null`, a active discovery ownership jest unset;
+`last_successful_observed_at=null`, unset freshness deadline provenance, a active
+discovery ownership jest unset;
 `last_committed_run_sequence` pozostaje null
 albo używa jednoznacznego initial sentinel. Ta sama transaction zwiększa
 `published_state_revision`, ponieważ source pojawia się w API. Nie ma effective
@@ -1205,8 +1211,110 @@ jako not mutation-fresh. Obejmuje to `source_unavailable`, partial/degraded,
 duplicate locator/node lub boundary mismatch. Audit-only invalid run ze starym
 contextem nie jest applicable i nie nadpisuje current health. Freshness nie jest
 wiązane z przypadkową nazwą enumu: istnieje tylko po authoritative successful
-applicable commit i do pierwszego nowszego applicable health outcome
-unieważniającego confidence.
+applicable commit i do najwcześniejszego z fixed deadline, controlled context
+transition albo nowszego applicable health outcome unieważniającego confidence.
+
+### Freshness deadline i revisioned expiry
+
+Authoritative successful applicable commit wylicza według jawnego
+freshness-duration contract i atomowo utrwala fixed
+`last_successful_observed_at`, `freshness_valid_until` oraz exact committed
+run/source/endpoint/canonicalization/transport-trust provenance. Deadline należy
+do tej revision i nie przesuwa się przy API read. Nowy successful applicable run
+może ustanowić nowy deadline. Exact duration/TTL pozostaje późniejszym explicit
+configuration/operation contract, ale Phase 1 nie może reprezentować fresh jako
+bezterminowego. Zmiana configured duration jest controlled discovery-relevant
+configuration transition zwiększającą `source_config_revision`; nie interpretuje
+ponownie ani nie wydłuża deadline istniejącego commitu.
+
+Po przekroczeniu current deadline backend wykonuje controlled transition:
+
+```text
+current health: healthy/fresh → stale/non-fresh
+current_health_origin = time_expiry
+current_health_reason = freshness_deadline_elapsed
+mutation freshness = false
+freshness-dependent destructive/maintenance effective capabilities = none/ineligible
+resource inventory/presence/identity unchanged
+inventory_revision unchanged
+published_state_revision = next globally allocated revision
+```
+
+Od chwili deadline poprzednia revision jest wyłącznie historycznym committed
+view z fixed facts; nie może być traktowana ani zwrócona jako authoritative
+current fresh state. Jeżeli timer nie zmaterializował jeszcze expiry, pierwsza
+granica publikacji lub użycia musi wykonać transition przed zwróceniem/oceną
+state.
+
+Expiry transaction nie wykonuje reconciliation, missing, removal ani replacement
+transition i nie zmienia retained policy/history. Ponownie wyprowadza effective
+capabilities i zapisuje health, reason/origin, capability result oraz globalny
+published token atomowo. Powrót stale → fresh jest dozwolony wyłącznie przez nowy
+authoritative successful applicable inventory commit z nowym deadline i nową
+published revision. Ponowny read, retry timera ani cofnięcie zegara nie odwracają
+committed expiry.
+
+Expiry jest CAS/fenced względem exact current freshness provenance. W tej samej
+transaction backend sprawdza co najmniej:
+
+```text
+expected last_committed_run_sequence == current last_committed_run_sequence
+expected freshness_valid_until == current freshness_valid_until
+expected committed source_config_revision == current/committed source_config_revision
+expected committed endpoint/canonical locator/version == current/committed route contract
+expected committed transport_trust_revision == current/committed transport trust
+current health is still fresh for that exact provenance
+current time is at or beyond the fixed deadline
+```
+
+Jeżeli run N+1 ustanowił już nowy deadline albo context się zmienił, spóźniony
+timer runu N jest no-op. Expiry serializuje się z successful/failed run
+finalization, single-flight ownership transitions i controlled source/transport
+context transitions. Nie jest discovery runem i nie tworzy fake run sequence ani
+observation.
+
+Timer/expiry worker może przyspieszać notification, ale nie jest correctness
+boundary. Przed zwróceniem authoritative published source freshness lub effective
+capabilities backend sprawdza deadline; jeśli już minął, najpierw atomowo commit
+expiry, a dopiero potem składa consistent published view. Każda przyszła
+destructive/maintenance eligibility decision wykonuje niezależnie ten sam
+deadline check we własnej fail-closed decision boundary — nie polega na tym, że
+poller, timer albo wcześniejszy HA/API read wykonał transition. Jeśli expiry
+commit nie może zostać wykonany, API nie zwraca state jako authoritative fresh,
+a mutation eligibility odmawia operacji.
+
+Przykład:
+
+```text
+22:00 successful commit, fresh_until=22:05
+poller i timer zatrzymują się
+22:30 API read albo mutation eligibility check
+→ najpierw atomic stale/time_expiry transition + published_state_revision++
+→ dopiero potem zwróć/wykorzystaj non-fresh state
+```
+
+Wall-clock-derived display age nie jest security authority. Gdy anomalia czasu
+uniemożliwia bezpieczną ocenę deadline, backend nie może przedłużyć mutation
+freshness: stosuje fail-closed non-fresh transition/decision według późniejszego
+clock implementation contract. Raz committed expiry nie jest cofane przez
+backward clock change.
+
+Wymagane freshness/expiry contract tests:
+
+```text
+successful run → fixed last_successful_observed_at + fresh_until → fresh
+deadline passes without a new run → atomic stale/time_expiry transition
+  → published_state_revision increases; inventory_revision unchanged
+poller/timer stalls → later API read commits expiry before returning authoritative view
+poller/timer stalls → direct mutation eligibility check independently enforces expiry
+run10 timer fires after run11 successful/new deadline → run10 expiry CAS is no-op
+time expiry → no missing/replacement/removal; identity unchanged
+  → freshness-dependent capabilities become none/ineligible
+read published_state_revision N twice → identical fixed timestamps/deadline
+  → no canonical backend age changes within N
+new successful applicable run after expiry → fresh only with new deadline
+  + new published_state_revision
+```
 
 Każda committed zmiana dowolnego API-visible pola ma monotoniczny
 published-state change token. Inventory reconciliation zwiększa
@@ -1214,8 +1322,9 @@ published-state change token. Inventory reconciliation zwiększa
 albo controlled context transition zwiększa `published_state_revision` bez
 wymuszania nowego `inventory_revision`. Dotyczy to m.in. zmian
 `latest_completed_run_sequence/outcome`, `last_health_run_sequence/outcome`,
-last-success timestamp, health reason/origin, current/committed source context,
-initial source state, resource/node/policy i derived capabilities.
+fixed last-success/deadline timestamps, health reason/origin,
+current/committed source context, initial/time-expiry/context-transition state,
+resource/node/policy i derived capabilities.
 
 Samo porównanie health enum jest niewystarczające: `seq11 source_unavailable →
 seq12 source_unavailable` zmienia published provenance i musi zwiększyć
@@ -1227,11 +1336,22 @@ nie mogą otrzymać tego samego resulting published revision. Revision update i
 publikowane dane należą zawsze do tej samej atomic transaction.
 
 Dzięki temu HA/cache/push-refresh widzi `healthy → source_unavailable/stale`
-mimo identycznego `resources[]`. Globalny published timestamp nie zastępuje
-per-source `last_successful_observed_at`, run sequence ani committed context
-provenance.
+mimo identycznego `resources[]`, także przy time expiry bez nowego discovery
+runu. Globalny published timestamp nie zastępuje per-source
+`last_successful_observed_at`, fixed `freshness_valid_until`, run sequence ani
+committed context provenance.
 Canonical global ownerem obu published-view tokens jest `backend_instance`;
 source i health records nie przechowują niezależnych authoritative kopii.
+
+Revisioned published source view zawiera fixed timestamps/deadline i committed
+freshness state/origin/reason. Nie zawiera canonical wall-clock-mutating
+`inventory_freshness/age`. HA/UI może wyliczyć display-only age jako
+`now - last_successful_observed_at`, lecz ta wartość nie należy do equality/
+immutability contract `published_state_revision=N`, nie jest security authority
+i nie uczestniczy w mutation/capability decision. Dwa odczyty revision N zwracają
+identyczne fixed freshness facts. Opcjonalny dynamiczny age z backendu musiałby
+być jawnie non-revisioned presentation metadata poza tym snapshot contract;
+preferowany kontrakt to fixed timestamps i client-side age.
 
 `published_state_revision=N` identyfikuje dokładnie jeden logicznie spójny
 committed backend view. API assembly musi używać consistent DB read snapshot/
@@ -1243,7 +1363,7 @@ HTTP caching protocol.
 
 Published API rozróżnia osiągalność Hubinet backendu od freshness każdego
 Proxmox source. Przy `source_unavailable`/degraded/configuration error albo
-applicable invalid current-context observation:
+applicable invalid current-context observation, a także po `time_expiry`:
 
 - HA nie usuwa devices ani nie wyprowadza false resource `missing`;
 - last-known read-only facts mogą pozostać jako stale/historyczne;
@@ -1297,6 +1417,9 @@ source unavailable != resource missing
 | context zmienia się przy active A | wait albo controlled fence A | B nowego contextu nie zaczyna I/O przed terminal release A; late fenced A nie może apply state |
 | context zmienia się między pre-check a failed-run transaction | old-context run nieapplicable | finalizacja/completion audit i release dozwolone tylko dla exact active ownera; transaction revalidation blokuje current health overwrite |
 | controlled source/transport context transition po healthy seq10 | current health stale, origin `controlled_context_transition` | jedna transaction zmienia context, freshness i published revision; last run outcome/sequence pozostają provenance seq10 |
+| fixed freshness deadline mija bez nowego runu | `stale`, origin `time_expiry` | CAS-fenced health/capability transition; bez resource reconciliation, `inventory_revision` bez zmian, `published_state_revision++` |
+| timer starego run10 odpala po successful run11 | stale expiry provenance mismatch | no-op; nie starzeje nowego deadline ani capabilities |
+| poller/timer zatrzymany, późniejszy API read lub mutation check | deadline guard | najpierw commit expiry, potem zwróć/użyj non-fresh state; brak optimistic fallback |
 | seq11 i seq12 oba `source_unavailable` | ten sam health enum, inne provenance | oba applicable published updates zwiększają unique `published_state_revision` |
 | old-context run podnosi tylko `latest_completed_run_sequence` | current health bez zmian | published completion field zmienia się, więc ta sama transaction zwiększa `published_state_revision` |
 | concurrent source A/B published commits | dwie globalne revisions | resulting `published_state_revision` muszą być różne i strictly ordered |
@@ -1324,19 +1447,23 @@ capabilities wymagają sufficiently fresh committed inventory:
 - committed pod bieżącym `source_config_revision`;
 - związany z nadal exact active endpointem, canonicalization contract i
   `transport_trust_revision`;
+- current time jest bezpiecznie oceniony jako wcześniejszy niż fixed
+  `freshness_valid_until` exact committed run/contextu;
 - bez nowszego applicable non-authoritative outcome podważającego current-state
   assumptions, w tym `source_unavailable`, partial/degraded,
   `configuration_error` albo invalid current-context run;
-- mieszczący się w jawnym, operation-specific freshness requirement.
+- mieszczący się także w jawnym, operation-specific freshness requirement.
 
-Zmiana source configuration/transport trust lub każdy nowszy applicable current
-source outcome podważający confidence zachowuje last-known presentation
-inventory, ale odbiera mu status
-mutation-fresh. Nie ma optimistic fallback. Dokładny TTL pozostaje przyszłym
-implementation/operation contract, lecz musi być explicit i fail-closed przed
-włączeniem destructive operations. Użycie silniejszej niezależnej live
-host/source-side attestation podczas stale discovery wymaga osobnego accepted
-operation-specific security contract.
+Zmiana source configuration/transport trust, expiry deadline lub każdy nowszy
+applicable current source outcome podważający confidence zachowuje last-known
+presentation inventory, ale odbiera mu status mutation-fresh. Mutation path
+sprawdza deadline samodzielnie i w razie expiry najpierw wykonuje fenced stale
+transition; nie może polegać na pollerze, timerze ani wcześniejszym API read. Nie
+ma optimistic fallback. Dokładna source freshness duration i dodatkowy
+operation-specific TTL pozostają przyszłym implementation/operation contract,
+lecz muszą być explicit i fail-closed przed włączeniem destructive operations.
+Użycie silniejszej niezależnej live host/source-side attestation podczas stale
+discovery wymaga osobnego accepted operation-specific security contract.
 
 ### Node routing jest osobną granicą
 
