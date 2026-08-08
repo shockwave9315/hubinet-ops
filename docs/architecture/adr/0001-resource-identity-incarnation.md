@@ -472,11 +472,15 @@ wyliczonym dopiero po tych kontrolach.
 
 Stary trusted `resource_id`, applicable stored policy i osiągalny Hubinet backend
 nie wystarczają do mutacji, jeśli inventory source jest stale, unavailable,
-degraded albo w `configuration_error`. Future destructive/maintenance
+degraded, w `configuration_error` albo ma nowszy applicable invalid
+current-context outcome podważający confidence. Future destructive/maintenance
 eligibility wymaga committed inventory utworzonego pod bieżącym
 `source_config_revision`, exact endpoint/canonicalization contract i
 `transport_trust_revision`, bez nowszego source health outcome podważającego
 current-state assumptions, oraz jawnie spełnionego operation freshness limit.
+Freshness wynika wyłącznie z authoritative successful applicable commit i trwa
+do pierwszego nowszego applicable outcome, który ją unieważnia; nie zależy od
+przypadkowej nazwy health enumu.
 Zmiana source configuration albo transport trust pozostawia poprzedni inventory
 jako last-known presentation data, lecz nie jako mutation-fresh evidence.
 
@@ -572,8 +576,10 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
 - testy published identity keyed by `resource_id`, kilku retained generations
   tego samego VMID, current occupant resolution przez active binding oraz
   retained node references bez dangling `via_device`;
-- source health/freshness fields i HA tests odróżniające osiągalny backend ze
-  świeżym inventory od osiągalnego backendu ze stale/degraded Proxmox source;
+- source health/freshness/origin fields, initial non-fresh semantics,
+  `published_state_revision` dla health-only transitions i HA tests
+  odróżniające osiągalny backend ze świeżym inventory od osiągalnego backendu ze
+  stale/degraded/invalid-current-context Proxmox source;
 - validator/contract tests wymagające `detail_status=not_applicable` dla
   `missing`, `confirmed_removed` i `not_current` oraz zabraniające tej wartości
   w normalized provider entry obecnym w current baseline.
