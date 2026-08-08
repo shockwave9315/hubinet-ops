@@ -253,19 +253,24 @@ Każda oś ma jednego właściciela znaczenia i zamknięty vocabulary:
 - `observational_continuity`: `consistent`, `uncertain`, `replaced`;
 - `security_continuity`: `unverified`, `trusted`, `revoked`;
 - `detail_status` i `node_availability` pozostają osobnymi osiami opisanymi w
-  ADR 0002.
+  ADR 0002. Reconciled/published `detail_status` ma wartości `ok`,
+  `temporarily_unavailable`, `error` i `not_applicable`.
 
 `retired` należy wyłącznie do lifecycle i nigdy nie jest wartością
 `observational_continuity`. Kanoniczna macierz dozwolonych przypadków:
 
-| Przypadek | `presence` | `lifecycle` | `observational_continuity` | `security_continuity` |
-| --- | --- | --- | --- | --- |
-| normal current resource | `present` | `active` | `consistent` | `unverified` albo `trusted` |
-| ambiguous current resource | `present` | `quarantined` | `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` |
-| ambiguous missing resource | `missing` | `quarantined` | `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` |
-| confirmed removed resource | `confirmed_removed` | `retired` | zachowaj ostatnie znaczące `consistent` albo `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` |
-| replaced old resource | `not_current` | `retired` | `replaced` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` |
-| new successor | `present` | `active` | `consistent` | `unverified` |
+| Przypadek | `presence` | `lifecycle` | `observational_continuity` | `security_continuity` | reconciled `detail_status` |
+| --- | --- | --- | --- | --- | --- |
+| normal current resource | `present` | `active` | `consistent` | `unverified` albo `trusted` | `ok`, `temporarily_unavailable` albo `error` |
+| ambiguous current resource | `present` | `quarantined` | `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` | `ok`, `temporarily_unavailable` albo `error` |
+| ambiguous missing resource | `missing` | `quarantined` | `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` | `not_applicable` |
+| confirmed removed resource | `confirmed_removed` | `retired` | zachowaj ostatnie znaczące `consistent` albo `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` | `not_applicable` |
+| replaced old resource | `not_current` | `retired` | `replaced` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` | `not_applicable` |
+| new successor | `present` | `active` | `consistent` | `unverified` | `ok`, `temporarily_unavailable` albo `error` |
+
+`not_applicable` oznacza brak current detail read dla bieżącego absence/terminal
+state, nie błąd, timeout ani brak retained last-known facts. Provider observation
+dla locatora obecnego w current baseline nigdy nie używa `not_applicable`.
 
 Common terminal invariant dla każdego accepted terminal transition starego
 resource:
@@ -415,7 +420,7 @@ podnosi `unverified` do `trusted`.
 | 10 | delete/recreate między dwoma identycznymi pollingami | Zdarzenie może być observationally indistinguishable. Backend może zachować `resource_id` i read-only HA identity ze stanami `consistent`/`unverified`; nie oznacza to physical continuity. Retained policy może pozostać historycznie, ale effective destructive policy, maintenance permission i nowe destructive approvals/jobs są niedostępne. |
 | 11 | backend offline podczas delete/recreate | Znana przerwa w observation jest rzeczywistym gap. Jeśli po powrocie nie ma positive replacement ani confirmed-removal proof, backend zachowuje ten sam read-only `resource_id` i active binding, ustawia `presence=present`, observational `uncertain`, lifecycle `quarantined`, security `revoked`/`unverified` i wyłącza effective policy/capabilities. |
 | 12 | node chwilowo offline | Jeśli locator nadal występuje w baseline, presence pozostaje `present`, a `node_availability=unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o mutation trust, nie o samym read-only presentation bindingu. |
-| 13 | cały source/API niedostępny | Zachowanie last-known inventory, freshness maleje; żadnych missing/removal transitions. |
+| 13 | cały source/API niedostępny | Newest applicable run aktualizuje osobny source health na `source_unavailable`/stale; last committed resource inventory i identity pozostają bez missing/removal transitions, ale nie są mutation-fresh. |
 | 14 | resource missing przez kilka polli i wraca | Liczba polli nie potwierdza removal. Bez positive replacement i bez wcześniejszego `confirmed_removed` powrót zachowuje ten sam `resource_id`, active binding i generation dla read-only UX; `presence=present`, continuity `uncertain`, lifecycle `quarantined`, bez destructive authority. |
 | 15 | `confirmed_removed`, potem locator wraca | Zawsze nowy `resource_id`/generation. Nawet jawny restore tworzy nową incarnation; lineage może wskazać poprzednika. |
 | 16 | destructive policy na zastąpionym resource | Policy zostaje przy starym `resource_id`; nowy startuje `discovered`, bez capabilities/maintenance. |
@@ -436,6 +441,7 @@ stored policy allows operation
 ∩ trusted security continuity
 ∩ backend capability
 ∩ exact resource_id/active binding_id/locator_generation/resource_continuity_revision
+∩ sufficiently fresh committed inventory under current source/transport contract
 ∩ operation-specific preconditions
 = operation eligible
 ```
@@ -463,6 +469,21 @@ incarnation. Każda przyszła mutacja musi ponownie sprawdzić `resource_id`, ak
 `binding_id`, `locator_generation`, exact `resource_continuity_revision`,
 `trusted`, policy i runtime preconditions. Locator jest parametrem wykonawczym
 wyliczonym dopiero po tych kontrolach.
+
+Stary trusted `resource_id`, applicable stored policy i osiągalny Hubinet backend
+nie wystarczają do mutacji, jeśli inventory source jest stale, unavailable,
+degraded albo w `configuration_error`. Future destructive/maintenance
+eligibility wymaga committed inventory utworzonego pod bieżącym
+`source_config_revision`, exact endpoint/canonicalization contract i
+`transport_trust_revision`, bez nowszego source health outcome podważającego
+current-state assumptions, oraz jawnie spełnionego operation freshness limit.
+Zmiana source configuration albo transport trust pozostawia poprzedni inventory
+jako last-known presentation data, lecz nie jako mutation-fresh evidence.
+
+Wyjątek oparty na silniejszej, niezależnej live host/source attestation wymaga
+przyszłego, osobno zaakceptowanego operation-specific security contract. Bez
+niego nie ma optimistic fallback; dokładny TTL może zostać ustalony później, ale
+musi być jawny i fail-closed przed uruchomieniem destructive capabilities.
 
 Resource ze stanem security continuity `unverified` lub `revoked` może posiadać
 wyłącznie historycznie retained policy record; nie może mieć effective
@@ -523,8 +544,10 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   `backend_instance_id`, `inventory_source_id` i backendowy `resource_id`;
 - oddzielenie locator/resource presence (`present`, `missing`,
   `confirmed_removed` oraz terminalne `not_current` dla zastąpionej starej
-  incarnation) od per-resource `detail_status` (`ok`,
-  `temporarily_unavailable`, `error`) oraz `node_availability`;
+  incarnation) od reconciled/published per-resource `detail_status` (`ok`,
+  `temporarily_unavailable`, `error`, `not_applicable`) oraz
+  `node_availability`; provider observations dla present locatorów nadal używają
+  wyłącznie pierwszych trzech wartości;
 - wdrożenie kanonicznych osi i valid-state matrix: lifecycle
   `active`/`quarantined`/`retired`, observational continuity bez wartości
   `retired` oraz security continuity `unverified`/`trusted`/`revoked`;
@@ -537,7 +560,9 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
 - wdrożenie jednej semantyki `current_node_id`/`last_known_node_id` i HA
   `via_device` opisanej w [ADR 0002](0002-proxmox-discovery-reconciliation.md#node-relation-i-ha-availability);
 - dostosowanie mapowania availability w Coordinator/entities tak, aby błąd
-  detail lub node availability nie oznaczał automatycznie physical absence;
+  detail lub node availability nie oznaczał automatycznie physical absence,
+  absence/terminal resource używał `detail_status=not_applicable`, a source-level
+  stale/degraded/unavailable state pozostawał niezależny od resource presence;
 - zmianę validatorów snapshotu i testów Device Registry/node relation dla
   rozdzielonych osi, rename, migracji i atomowego direct replacement bez
   pośredniego pustego slotu ani dwóch active bindings;
@@ -546,7 +571,12 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   fail-closed policy/capabilities;
 - testy published identity keyed by `resource_id`, kilku retained generations
   tego samego VMID, current occupant resolution przez active binding oraz
-  retained node references bez dangling `via_device`.
+  retained node references bez dangling `via_device`;
+- source health/freshness fields i HA tests odróżniające osiągalny backend ze
+  świeżym inventory od osiągalnego backendu ze stale/degraded Proxmox source;
+- validator/contract tests wymagające `detail_status=not_applicable` dla
+  `missing`, `confirmed_removed` i `not_current` oraz zabraniające tej wartości
+  w normalized provider entry obecnym w current baseline.
 
 Obecny `docs/architecture/0.5-foundation.md` dokumentuje faktyczny kontrakt
 Phase 0 i nie jest w tym PR przepisywany tak, jakby amendment już wdrożono.

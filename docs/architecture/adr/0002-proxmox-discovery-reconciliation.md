@@ -384,6 +384,10 @@ continuity decision są wynikiem persistent reconciliation, nie surowym faktem
 Proxmox. Provider może przekazać candidate evidence (`vmgenid`, `digest`,
 `meta.ctime`, task records), wyraźnie opisane typem i provenance.
 
+Snapshotowe `source_availability` jest outcome/faktem jednej próby provider read,
+nie trwałym current source health. Dopiero backend stosuje sequence/CAS i
+wyprowadza durable/published health bez zmiany retained resource presence.
+
 Przed reconciliation normalized snapshot przechodzi fail-closed validation:
 
 - snapshot `inventory_source_id` musi być exact expected source runu;
@@ -453,7 +457,8 @@ z niego `confirmed_removed`.
 
 ### B. Per-resource detail/fact read status
 
-Każdy locator obecny w baseline ma niezależny `detail_status`:
+Każdy locator obecny w normalized provider baseline ma niezależny
+`detail_status`:
 
 - `ok` — wymagane dla widoku detail facts zostały odczytane i zwalidowane;
 - `temporarily_unavailable` — timeout, przejściowy transport/source error albo
@@ -466,6 +471,23 @@ continuity hints, o ile provider contract nie oznaczył konkretnego odczytu jako
 baseline prerequisite. Detail failures są zapisywane per observation oraz
 agregowane w run jako `detail_error_count`/`failed_detail_scopes`; nie zmieniają
 automatycznie `baseline_completeness`.
+
+Po reconciliation published `detail_status` ma dodatkową wartość
+`not_applicable`:
+
+```text
+presence=present
+  → detail_status ∈ {ok, temporarily_unavailable, error}
+
+presence∈{missing, confirmed_removed, not_current}
+  → detail_status=not_applicable
+```
+
+`not_applicable` oznacza, że dla bieżącego published absence/terminal state nie
+istnieje current detail read. Nie oznacza error, timeout ani braku retained
+last-known facts. Normalized provider entry obecny w current baseline nigdy nie
+używa tej wartości. Validator/contract tests muszą odrzucać niezgodne kombinacje
+presence/detail status w obu kierunkach.
 
 Przykład kontraktowy:
 
@@ -494,6 +516,10 @@ State machine używa bez wyjątków taxonomy i valid-state matrix z
 - `observational_continuity`: `consistent`, `uncertain`, `replaced`;
 - `security_continuity`: `unverified`, `trusted`, `revoked`;
 - `detail_status` i `node_availability` są niezależnymi osiami.
+
+Reconciled `detail_status` używa `ok|temporarily_unavailable|error` wyłącznie dla
+`presence=present`, a dla `missing|confirmed_removed|not_current` zawsze
+`not_applicable`.
 
 `retired` jest wyłącznie lifecycle; nigdy nie jest observational continuity.
 Locator presence i availability/detail status są niezależne:
@@ -629,14 +655,14 @@ To jest docelowy kontrakt wymagany przez Phase 0 Amendment. `detail_status`
 pozostaje niezależny; dla absence albo terminal state nie ma bieżącego detail
 read, a retained facts są stale/historyczne.
 
-| Przypadek | `presence` | `node_availability` | `current_node_id` | `last_known_node_id` | HA `via_device` | HA availability |
-| --- | --- | --- | --- | --- | --- | --- |
-| A. Locator present, current assignment znany, node dostępny | `present` | `available` | wymagany, node istnieje w tym samym snapshotcie | `null` | current node | Presence i facts dostępne zależnie od `detail_status`; detail error wyłącza tylko zależne encje. |
-| B. Locator present, current assignment znany, node niedostępny | `present` | `unavailable` | wymagany, node istnieje w tym samym snapshotcie | `null` | current node | Presence może pozostać dostępne; node/runtime/detail-dependent entities są unavailable lub jawnie stale. |
-| C. Locator present, current relation nierozstrzygnięta | `present` | `unresolved` | `null` | poprzedni node, jeśli był znany | last-known node dla presentation, jeśli istnieje; inaczej brak relacji | Presence może pozostać dostępne; location/node-dependent entities są unavailable do resolution. |
-| D. Locator missing | `missing` | `not_applicable` | `null` | ostatni znany node, jeśli istniał | zachowaj last-known presentation relation | Resource entities unavailable; brak purge. |
-| E. Confirmed removed | `confirmed_removed` | `not_applicable` | `null` | ostatni znany node, jeśli istniał | zachowaj last-known presentation relation/history | Resource entities unavailable; brak automatycznego delete/purge. |
-| F. Stara incarnation po direct replacement | `not_current` | `not_applicable` | `null` | ostatni znany node starej incarnation, jeśli istniał | zachowaj last-known presentation relation/history | Stare entities unavailable i retained; successor ma osobne device/entities oraz własną current node relation. |
+| Przypadek | `presence` | `detail_status` | `node_availability` | `current_node_id` | `last_known_node_id` | HA `via_device` | HA availability |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A. Locator present, current assignment znany, node dostępny | `present` | `ok`, `temporarily_unavailable` albo `error` | `available` | wymagany, node istnieje w tym samym snapshotcie | `null` | current node | Presence i facts dostępne zależnie od `detail_status`; detail error wyłącza tylko zależne encje. |
+| B. Locator present, current assignment znany, node niedostępny | `present` | `ok`, `temporarily_unavailable` albo `error` | `unavailable` | wymagany, node istnieje w tym samym snapshotcie | `null` | current node | Presence może pozostać dostępne; node/runtime/detail-dependent entities są unavailable lub jawnie stale. |
+| C. Locator present, current relation nierozstrzygnięta | `present` | `ok`, `temporarily_unavailable` albo `error` | `unresolved` | `null` | poprzedni node, jeśli był znany | last-known node dla presentation, jeśli istnieje; inaczej brak relacji | Presence może pozostać dostępne; location/node-dependent entities są unavailable do resolution. |
+| D. Locator missing | `missing` | `not_applicable` | `not_applicable` | `null` | ostatni znany node, jeśli istniał | zachowaj last-known presentation relation | Resource entities unavailable; retained facts są stale/historyczne; brak purge. |
+| E. Confirmed removed | `confirmed_removed` | `not_applicable` | `not_applicable` | `null` | ostatni znany node, jeśli istniał | zachowaj last-known presentation relation/history | Resource entities unavailable; retained facts są historyczne; brak automatycznego delete/purge. |
+| F. Stara incarnation po direct replacement | `not_current` | `not_applicable` | `not_applicable` | `null` | ostatni znany node starej incarnation, jeśli istniał | zachowaj last-known presentation relation/history | Stare entities unavailable i retained; successor ma osobne device/entities oraz własną current node relation. |
 
 `current_node_id` oznacza wyłącznie aktualną, wiarygodnie resolved relację
 inventory. `last_known_node_id` jest presentation/history hint i nigdy security
@@ -751,8 +777,12 @@ ACL-filtered listing, timeout, source outage ani sam upływ czasu nie należą d
 
 - bez observable gap/conflict zgodne, kompletne obserwacje mogą zachować
   read-only `resource_id`; to observational consistency, nie security proof;
-- po rzeczywistym gap (np. `missing`, source outage) mocny continuity proof może
-  przywrócić istniejący trusted binding;
+- po rzeczywistym gap (np. `missing`, source outage) accepted continuity
+  resolution/re-enrollment zachowuje ten sam `resource_id` i active locator
+  binding, jeśli nadal są ważne, aktualizuje lifecycle/observational state,
+  może ustawić `security_continuity=trusted`, zwiększa
+  `resource_continuity_revision` i ponownie wyprowadza effective policy oraz
+  capabilities; locator binding sam nie posiada trust state;
 - jeśli evidence pozytywnie potwierdza innego current occupanta, atomowy direct
   replacement zamyka stary binding jako `replaced`, zachowuje terminal history,
   a successor dostaje nowe ID/generation bez `confirmed_removed`;
@@ -787,8 +817,11 @@ approvals/jobs.
 Każdy run wykonuje:
 
 ```text
-allocate per-source discovery_run_sequence
-→ capture expected source_config_revision + exact endpoint/canonicalization/TLS revisions
+atomic transaction:
+  increment durable source.last_issued_run_sequence
+  → capture expected source_config_revision + exact endpoint/canonicalization/TLS revisions
+  → persist run with returned discovery_run_sequence and expected context
+→ commit issuance/context
 → fetch ACL topology + per-path effective permission snapshots BEFORE
 → fetch locator baseline and declared baseline prerequisites
 → fetch per-resource optional detail/facts
@@ -798,11 +831,18 @@ allocate per-source discovery_run_sequence
 → validate exact source/endpoint/canonicalization/transport-trust revisions
 → validate boundary topology/permission equality and baseline completeness
 → record independent per-resource detail statuses
-→ reconcile in one DB transaction
-  (w tym optional atomic direct old-binding → successor-binding handoff)
-→ derive presence, continuity and capabilities
-→ commit
-→ publish committed snapshot to Hubinet Ops API/HA
+→ classify outcome
+→ if authoritative inventory success:
+    reconcile in one DB transaction
+    (w tym optional atomic direct old-binding → successor-binding handoff)
+    → update committed-inventory and source-health tokens
+    → derive presence, continuity, freshness and capabilities
+    → commit
+    → publish committed inventory + source state to Hubinet Ops API/HA
+→ else failed/partial/unavailable/invalid:
+    no resource reconciliation
+    → CAS-update newest applicable source health/outcome
+    → publish source state with retained last committed inventory
 ```
 
 Nie publikujemy surowego albo częściowo reconciled snapshotu. Monotonic
@@ -824,6 +864,7 @@ exact active endpoint_id == expected endpoint_id
 stored canonical locator/version == expected canonical locator/version
 current transport_trust_revision == expected transport_trust_revision
 discovery_run_sequence > last_committed_run_sequence
+discovery_run_sequence > last_health_run_sequence
 ```
 
 Każdy mismatch klasyfikuje run jako invalid/stale: bez reconciliation, inventory
@@ -843,50 +884,164 @@ runs, nie source identity ani czasem; może mieć luki po failed/crashed runs i 
 zwiększa `source_config_revision`. Wall-clock timestamps służą wyłącznie do
 observability/audit i nigdy nie są concurrency authority.
 
+Każdy source ma durable monotonic issuance state
+`last_issued_run_sequence` albo równoważny DB sequence. Allocation wykonuje w
+jednej transaction:
+
+```text
+atomic increment source.last_issued_run_sequence
+→ capture exact expected source/endpoint/canonicalization/TLS context
+→ persist run with the returned sequence and expected context
+→ commit issuance/context
+→ dopiero potem rozpocznij fetch
+```
+
+Issuance/context transaction serializuje się z controlled source configuration,
+endpoint i transport-trust transitions, więc persisted expected context nie może
+łączyć pól z różnych revisions.
+
+Wartość jest unique per source, strictly increasing, never reused i trwała przez
+restart/crash. Nie wolno wyliczać jej jako `last_committed_run_sequence + 1`,
+opierać na timestampie ani ponownie użyć po nieudanym runie. Luki są prawidłowe.
+Unique constraint obejmuje `(inventory_source_id, discovery_run_sequence)`.
+
 Każdy `discovery_runs` record zapisuje przydzielony sequence. Reconciliation
 commit wymaga:
 
 ```text
 run.discovery_run_sequence > source.last_committed_run_sequence
+run.discovery_run_sequence > source.last_health_run_sequence
 ```
 
 W tej samej transaction/CAS boundary backend reconciliuje inventory i ustawia
-`last_committed_run_sequence=run.discovery_run_sequence`. Jeżeli nowszy run już
-został committed, starszy jest `invalid`/stale bez reconciliation ani publish,
+`last_committed_run_sequence=last_health_run_sequence=run.discovery_run_sequence`
+oraz successful outcome. Jeżeli nowszy run został committed albo zapisał nowszy
+health outcome, starszy jest `invalid`/stale bez reconciliation ani publish,
 nawet gdy ma zgodny `source_config_revision`. Source config revision chroni
 znaczenie konfiguracji, a run sequence niezależnie chroni ordering konkurencyjnych
-observations. Implementacja może serializować runs per source, ale nie może
-pozwolić stale overwrite.
+observations i health. Implementacja może serializować runs per source, ale nie
+może pozwolić stale overwrite.
 
 Wymagane concurrency contract tests:
 
 ```text
+concurrent A/B allocation → A.sequence != B.sequence
+allocate N → crash before reconciliation → next allocation > N
 run A start → run B start → B commit → A commit attempt = rejected
 run A start → A commit → run B start → B commit = allowed
 ```
 
 Cursor jest sprawdzany tylko wtedy, gdy provider jawnie deklaruje wspierany
 trusted cursor contract albo używana jest klasa proof B. Snapshot starszy od
-ostatniego committed run sequence jest odrzucany. Restart backendu ładuje
-ostatni committed inventory, `last_committed_run_sequence`, tombstones oraz
+ostatniego committed albo health run sequence jest odrzucany. Restart backendu ładuje
+ostatni committed inventory, `last_issued_run_sequence`,
+`last_health_run_sequence`, `last_committed_run_sequence`, tombstones oraz
 wszystkie dostępne provider cursors; pamięć procesu nie jest source of truth.
+
+### Last committed inventory a current source health/freshness
+
+Backend utrzymuje dwa niezależne durable outcomes:
+
+1. **last committed inventory** — ostatni authoritative snapshot, który przeszedł
+   reconciliation i może być zachowany do read-only presentation;
+2. **current source observation health/freshness** — wynik najnowszego
+   applicable completed runu według sequence, nawet gdy run nie mógł zmienić
+   inventory.
+
+Conceptual source state publikuje co najmniej:
+
+- `last_issued_run_sequence`;
+- `latest_completed_run_sequence` i redacted outcome, wybierane przez najwyższy
+  completed sequence niezależnie od wall-clock finish order;
+- `last_health_run_sequence` i health outcome najnowszego completed runu
+  applicable do bieżącego source/transport context;
+- `last_committed_run_sequence`;
+- `last_successful_observed_at`;
+- current health/freshness, np. `healthy/fresh`, `stale`,
+  `source_unavailable`, `partial/degraded` albo `configuration_error`;
+- exact `source_config_revision`, endpoint/canonical locator/version i
+  `transport_trust_revision`, pod którymi last inventory został committed, oraz
+  bieżący source/transport context do porównania.
+
+Nazwy finalnych API/DB enumów pozostają implementation contract, lecz
+rozdzielenie tych danych jest obowiązkowe.
+
+Każdy zakończony run może atomowo podnieść completion-audit token, jeśli jego
+sequence jest większy od `latest_completed_run_sequence`; to nie nadaje mu prawa
+do inventory reconciliation ani current-health update.
+
+Successful authoritative inventory run wykonuje jedną transaction, która może
+reconcile resources, aktualizuje `last_committed_run_sequence`, successful
+observation/freshness i `last_health_run_sequence`, po czym publikuje nowy
+inventory. Failed, partial, unavailable albo invalid **applicable** run:
+
+- nie wykonuje resource reconciliation;
+- nie tworzy `missing`, removal ani replacement transition;
+- nie zmienia resource identity/presence;
+- może zachować redacted run audit;
+- musi zaktualizować health/outcome, jeśli jego sequence jest większy od
+  `last_health_run_sequence`;
+- publikuje/wyprowadza stale/degraded source state razem z zachowanym last
+  committed inventory.
+
+Health update używa CAS:
+
+```text
+run.discovery_run_sequence > source.last_health_run_sequence
+```
+
+Run ze starym source/endpoint/transport context jest auditowalny, ale nie jest
+applicable do bieżącego health; sama controlled config/trust transition oznacza
+atomowo current health jako stale pod nowym contextem, bez udawania completed
+runu ani cofania sequence, a poprzedni inventory jako not mutation-fresh do
+nowego udanego commitu.
+
+Dla prostych fail-closed semantics successful inventory commit także wymaga, aby
+nie istniał wyższy `last_health_run_sequence`. Przykład:
+
+```text
+A seq10 start
+B seq11 start
+B completes source_unavailable
+→ source health=source_unavailable, last_health_run_sequence=11
+A completes later
+→ A nie nadpisuje health ani nie commit/publikuje starszego inventory
+```
+
+Normalny `A commit → B commit` pozostaje dozwolony. Completion time ani wall
+clock nie mają pierwszeństwa przed sequence.
+
+Published API rozróżnia osiągalność Hubinet backendu od freshness każdego
+Proxmox source. Przy `source_unavailable`/degraded/configuration error:
+
+- HA nie usuwa devices ani nie wyprowadza false resource `missing`;
+- last-known read-only facts mogą pozostać jako stale/historyczne;
+- encje zależne od current facts są unavailable lub jawnie stale zgodnie z
+  source-health overlay;
+- resource presence i identity pozostają stanem last committed inventory.
+
+```text
+Hubinet backend reachable != Proxmox source inventory fresh
+source unavailable != resource missing
+```
 
 ## Failure modes
 
 | Zdarzenie | Klasyfikacja | Wpływ na poprzedni inventory |
 | --- | --- | --- |
-| active endpoint timeout/unavailable | `source_unavailable` | zachowaj, oznacz stale; nie próbuj candidate endpointu; bez missing/removal |
+| active endpoint timeout/unavailable | `source_unavailable` | zachowaj inventory, bez missing/removal; jeśli newest applicable sequence, CAS-update source health/freshness; nie próbuj candidate endpointu |
 | candidate endpoint osiągalny | nie uczestniczy w run | brak automatic failover do czasu accepted source-binding contract |
 | operator żąda nowego URL dla existing source | utwórz inert `candidate` z nowym `endpoint_id` | active record/URL bez zmian; activation disabled bez source-binding proof |
 | active endpoint retired albo source disable/re-enable | discovery disabled/last-known zachowane | gate nie resetuje się; brak direct replacement |
 | TLS trust/pinning zmienione | audytowana transport-security revalidation | nie ustanawia source continuity ani nie aktywuje innego peer/source |
-| `transport_trust_revision` zmienione podczas runu | `invalid` | nie commituj snapshotu odczytanego pod starym trust contract |
-| `source_config_revision` zmienione podczas runu | `invalid`/stale | bez reconciliation/commit; następny run używa nowej configuration revision |
+| `transport_trust_revision` zmienione podczas runu | `invalid` | nie commituj snapshotu odczytanego pod starym trust contract; old inventory pozostaje last-known, nie mutation-fresh |
+| `source_config_revision` zmienione podczas runu | `invalid`/stale | bez reconciliation/commit; old inventory pozostaje last-known, nie mutation-fresh; następny run używa nowej revision |
 | canonicalization version migration nieukończona, ambiguous lub collision | `configuration_error`/blocked | bez create/reactivation aliasu i bez commit runu o niezweryfikowanym endpoint provenance |
 | wrong snapshot source ID, unsupported resource type albo duplicate locator/node | `invalid` | bez reconciliation/publish; LXC101+QEMU101 w jednym snapshotcie nie jest replacement evidence |
 | brak node scope wymaganego do locator baseline | `baseline_completeness=partial` | bez `missing` transitions |
 | locator obecny, optional node/detail facts niedostępne | baseline bez zmian + `node_availability=unavailable`/detail error | locator zachowany jako `present` |
 | baseline pełny, config read jednego guest fail | `baseline_completeness=complete`; per-resource `detail_status=temporarily_unavailable/error` | locator `present`; facts unavailable; inne locatory reconciled normalnie |
+| reconciled resource jest `missing`, `confirmed_removed` albo `not_current` | `detail_status=not_applicable` | brak current detail read; retained facts mogą pozostać stale/historyczne, nie jest to error |
 | `GET /access/acl` niedostępne, ograniczone lub niejednoznaczne | `baseline_completeness=partial`/`configuration_error` | bez `missing`/removal transitions |
 | upstream per-path effective evaluation dla path z topology nie spełnia discovery contract | `configuration_error` | bez absence/removal transitions |
 | topology hash BEFORE ≠ AFTER | `invalid` | odrzuć run; bez absence/removal transitions |
@@ -899,6 +1054,10 @@ wszystkie dostępne provider cursors; pamięć procesu nie jest source of truth.
 | proof klasy A, B albo C + accepted authoritative absence evidence | zgodnie z kontraktem proof | `confirmed_removed`, tombstone |
 | nonterminal old active binding + bieżący successor + positive replacement evidence | direct replacement | atomowo `not_current`/`retired`/`replaced` old, nowy `resource_id` i generation; old może wcześniej być present albo missing/quarantined |
 | run A start, run B start, B commit, A commit attempt | `invalid`/stale A | `discovery_run_sequence <= last_committed_run_sequence`; bez zmian/publish |
+| concurrent A/B sequence allocation | dwa run records | atomic issuance gwarantuje różne strictly-increasing sequence dla source |
+| allocate N, crash przed fetch/reconciliation | failed/crashed run, luka dozwolona | następny issued sequence jest `> N`; brak reuse |
+| B seq11 kończy `source_unavailable`, następnie A seq10 kończy success | newest health pozostaje z B | A nie nadpisuje health ani nie commit/publikuje starszego inventory |
+| newest applicable partial/unavailable/invalid run | degraded source health | CAS-update health/outcome, bez resource reconciliation/identity/presence transitions; retained inventory pozostaje last-known |
 
 ## Trust boundary
 
@@ -911,6 +1070,27 @@ mutacje nadal przechodzą:
 HA → Hubinet Ops API → backend policy → plans/jobs/locks/audit
    → typed host-control → hostd/forced-command → Proxmox
 ```
+
+### Source freshness jest przyszłym mutation gate
+
+Retained trusted `resource_id`, applicable policy i osiągalność samego Hubinet
+backendu nie wystarczają do destructive/maintenance operation. Effective
+capabilities wymagają sufficiently fresh committed inventory:
+
+- committed pod bieżącym `source_config_revision`;
+- związany z nadal exact active endpointem, canonicalization contract i
+  `transport_trust_revision`;
+- bez nowszego `source_unavailable`, partial/degraded albo
+  `configuration_error` outcome podważającego current-state assumptions;
+- mieszczący się w jawnym, operation-specific freshness requirement.
+
+Zmiana source configuration/transport trust lub failed/degraded current source
+health zachowuje last-known presentation inventory, ale odbiera mu status
+mutation-fresh. Nie ma optimistic fallback. Dokładny TTL pozostaje przyszłym
+implementation/operation contract, lecz musi być explicit i fail-closed przed
+włączeniem destructive operations. Użycie silniejszej niezależnej live
+host/source-side attestation podczas stale discovery wymaga osobnego accepted
+operation-specific security contract.
 
 ### Node routing jest osobną granicą
 
