@@ -1,6 +1,6 @@
 # ADR 0001: identity zasobu i incarnation
 
-Status: **PROPOSED**
+Status: **ACCEPTED**
 
 Data: 2026-08-08
 

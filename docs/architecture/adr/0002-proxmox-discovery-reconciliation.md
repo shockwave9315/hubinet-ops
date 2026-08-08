@@ -1,6 +1,6 @@
 # ADR 0002: read-only discovery Proxmox i reconciliation
 
-Status: **PROPOSED**
+Status: **ACCEPTED**
 
 Data: 2026-08-08
 
