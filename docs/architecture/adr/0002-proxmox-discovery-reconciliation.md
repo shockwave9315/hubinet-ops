@@ -226,7 +226,7 @@ DiscoverySnapshot
   observed_at
   source_facts
   source_availability
-  completeness
+  baseline_completeness
   acl_topology_hash_before
   acl_topology_hash_after
   permission_snapshot_hash_before
@@ -235,7 +235,9 @@ DiscoverySnapshot
   boundary_consistency
   interval_consistency_evidence (optional; UNKNOWN for stock polling)
   covered_nodes
-  failed_scopes
+  failed_baseline_scopes
+  detail_summary {ok_count, temporarily_unavailable_count, error_count}
+  failed_detail_scopes[]
   event_cursor_before / event_cursor_after (optional evidence)
   nodes[]
     external_node_name
@@ -250,7 +252,8 @@ DiscoverySnapshot
     source facts
     observed config metadata
     observed_at
-    per-resource read_result
+    detail_status {ok | temporarily_unavailable | error}
+    detail_read_result
     continuity evidence[]
 ```
 
@@ -263,48 +266,88 @@ Proxmox. Provider może przekazać candidate evidence (`vmgenid`, `digest`,
 Zagnieżdżone dane snapshotu muszą być rzeczywiście immutable albo deep-copied
 przed transaction boundary. Shallow read-only wrapper nie wystarcza.
 
-## Completeness model
+## Dwie niezależne osie wyniku discovery
 
-Każdy run ma jedną z klasyfikacji:
+### A. Locator/baseline completeness
+
+Każdy run ma dokładnie jedną klasyfikację `baseline_completeness`:
 
 - `complete` — observational source-wide baseline zakończył się sukcesem,
   boundary ACL topology i effective-permission checks potwierdzają wymagane
   guest/node coverage, a oba topology/permission hashes przed/po są identyczne;
-- `partial` — source odpowiedział, lecz brakuje node'a, strony, zakresu albo
-  wystąpił per-resource read error;
+- `partial` — source odpowiedział, lecz sama enumeracja locatorów lub wymagany
+  dla niej page, scope, node coverage albo baseline prerequisite jest niepełny;
 - `configuration_error` — token/effective ACL lub provider configuration nie
   pozwala udowodnić boundary source-wide coverage;
 - `source_unavailable` — nie uzyskano wiarygodnego baseline;
 - `invalid` — odpowiedź narusza schema, source binding lub monotonicity.
 
-Kompletność baseline i kompletność szczegółowych facts są osobne. Pełna lista
-locatorów z błędem config read pozwala zachować `present`, ale ustawia
-`temporarily_unavailable` dla szczegółów. Częściowa lista locatorów nigdy nie
-jest traktowana jak dowód nieobecności.
+Ta oś jako jedyna decyduje, czy wolno wyprowadzać observational `present` oraz
+`missing`. `complete` baseline pozostaje `complete`, gdy późniejszy opcjonalny
+config/runtime/metadata read jednego resource kończy się błędem. Częściowa
+lista locatorów nigdy nie jest traktowana jak dowód nieobecności.
 
-`covered_nodes` i `failed_scopes` opisują jawnie zauważone błędy transportu lub
-subrequestów, ale nie dowodzą pełnego ACL coverage. Effective-permission proof
-bez topology proof również nie może wykluczyć cichego `NoAccess`. Brak pełnej,
-jednoznacznie ocenionej topology lub coverage daje `partial`/
-`configuration_error`; różne topology albo permission hashes przed/po dają
-`invalid`. We wszystkich tych przypadkach nie wolno wykonywać absence/removal
-transitions.
+Endpoint/subrequest jest `baseline prerequisite` tylko wtedy, gdy jego wynik
+jest z góry jawnie wymagany do enumeracji locatorów albo walidacji source-wide
+scope, ACL boundary, source binding, schema lub monotonicity. Taki status musi
+być częścią wersjonowanego provider contract; nie wolno po błędzie zwykłego
+detail read przeklasyfikować go retroaktywnie na baseline prerequisite.
+
+`covered_nodes` i `failed_baseline_scopes` opisują jawnie zauważone błędy
+baseline/prerequisites, ale nie dowodzą pełnego ACL coverage.
+Effective-permission proof bez topology proof również nie może wykluczyć
+cichego `NoAccess`. Brak pełnej, jednoznacznie ocenionej topology lub coverage
+daje `partial`/`configuration_error`; różne topology albo permission hashes
+przed/po dają `invalid`. We wszystkich tych przypadkach nie wolno wykonywać
+`missing`/removal transitions.
 
 `complete` oznacza boundary/snapshot completeness dla read-only inventory. Nie
 oznacza interval-wide ACL consistency ani authoritative negative/absence
 evidence. Bez osobno zaakceptowanego interval-wide proof nie wolno wyprowadzać
 z niego `confirmed_removed`.
 
+### B. Per-resource detail/fact read status
+
+Każdy locator obecny w baseline ma niezależny `detail_status`:
+
+- `ok` — wymagane dla widoku detail facts zostały odczytane i zwalidowane;
+- `temporarily_unavailable` — timeout, przejściowy transport/source error albo
+  chwilowa niedostępność config/runtime facts;
+- `error` — trwały/nieklasyfikowany błąd lub niepoprawny detail payload, który
+  wymaga diagnostyki, ale nie podważa samej zaobserwowanej obecności locatora.
+
+Status obejmuje guest config, dodatkowe runtime facts, opcjonalne metadata i
+continuity hints, o ile provider contract nie oznaczył konkretnego odczytu jako
+baseline prerequisite. Detail failures są zapisywane per observation oraz
+agregowane w run jako `detail_error_count`/`failed_detail_scopes`; nie zmieniają
+automatycznie `baseline_completeness`.
+
+Przykład kontraktowy:
+
+```text
+boundary-complete baseline: VM100, VM101, VM102
+VM101 detail/config read: timeout
+
+VM101.presence = present
+VM101.detail_status = temporarily_unavailable
+baseline_completeness = complete
+```
+
+Pozostałe locatory są normalnie reconciled względem pełnego baseline. Jeżeli
+wcześniej znany VM103 nie występuje na liście, może przejść do observational
+`missing` mimo błędu detail VM101. Nadal obowiązuje ACL ABA: takie `missing` nie
+jest authoritative absence proof i nie umożliwia polling-only
+`confirmed_removed`.
+
 ## Reconciliation state machine
 
-Presence states:
+Locator presence i availability/detail status są niezależne:
 
 - `present` — locator występuje w boundary-complete, bieżącym baseline; current
-  node musi występować w tym samym normalized snapshot;
-- `temporarily_unavailable` — locator jest obecny, lecz wymagane status/config
-  facts nie zostały odczytane;
+  node musi występować w tym samym normalized snapshot; detail status może być
+  `ok`, `temporarily_unavailable` albo `error`;
 - `node_unavailable` — source odpowiada, ale przypisany node jest niedostępny;
-  zachowujemy last-known node i resource;
+  jest availability overlay, zachowujemy locator, last-known node i resource;
 - `missing` — locator nie występuje w udanym, boundary-complete baseline, ale
   brak pozytywnego dowodu trwałego removal/replacement; jest to observational
   negative, które może wynikać także z niewykrytego ACL ABA;
@@ -314,13 +357,13 @@ Presence states:
 Dozwolone przejścia (skrót):
 
 ```text
-present → temporarily_unavailable → present
-present → node_unavailable        → present
-present → missing                 → present/uncertain
+present + detail_status ok ↔ temporarily_unavailable/error
+present + node_unavailable overlay → present + node available
+present → missing                  → present/uncertain
 missing → confirmed_removed       tylko z positive removal authority
                                   + accepted authoritative absence evidence
 confirmed_removed → (new resource_id), nigdy z powrotem do starej incarnation
-source unavailable/partial        → brak removal transition
+baseline source_unavailable/partial → brak `missing`/removal transition
 ```
 
 `missing przez N polli` nie wystarcza do `confirmed_removed`, niezależnie od N.
@@ -423,10 +466,12 @@ Każdy run wykonuje:
 
 ```text
 fetch ACL topology + per-path effective permission snapshots BEFORE
-→ fetch baseline/facts
+→ fetch locator baseline and declared baseline prerequisites
+→ fetch per-resource optional detail/facts
 → fetch ACL topology + per-path effective permission snapshots AFTER
 → normalize
-→ validate boundary topology/permission equality and coverage, source, schema, time and completeness
+→ validate boundary topology/permission equality and baseline completeness
+→ record independent per-resource detail statuses
 → reconcile in one DB transaction
 → derive presence, continuity and capabilities
 → commit
@@ -447,16 +492,17 @@ pamięć procesu nie jest source of truth.
 | --- | --- | --- |
 | active endpoint timeout/unavailable | `source_unavailable` | zachowaj, oznacz stale; nie próbuj candidate endpointu; bez missing/removal |
 | candidate endpoint osiągalny | nie uczestniczy w run | brak automatic failover do czasu accepted source-binding contract |
-| brak jednego node'a | `partial` lub `node_unavailable` | resources node'a zachowane |
-| baseline pełny, config read jednego guest fail | baseline complete + per-resource error | locator `present`, facts unavailable |
-| `GET /access/acl` niedostępne, ograniczone lub niejednoznaczne | `partial`/`configuration_error` | bez absence/removal transitions |
+| brak node scope wymaganego do locator baseline | `baseline_completeness=partial` | bez `missing` transitions |
+| locator obecny, optional node/detail facts niedostępne | baseline bez zmian + `node_unavailable`/detail error | locator zachowany jako `present` |
+| baseline pełny, config read jednego guest fail | `baseline_completeness=complete`; per-resource `detail_status=temporarily_unavailable/error` | locator `present`; facts unavailable; inne locatory reconciled normalnie |
+| `GET /access/acl` niedostępne, ograniczone lub niejednoznaczne | `baseline_completeness=partial`/`configuration_error` | bez `missing`/removal transitions |
 | upstream per-path effective evaluation dla path z topology nie spełnia discovery contract | `configuration_error` | bez absence/removal transitions |
 | topology hash BEFORE ≠ AFTER | `invalid` | odrzuć run; bez absence/removal transitions |
-| effective permission proof nie pokrywa całego `/vms`/`/nodes` contract | `partial`/`configuration_error` | bez absence/removal transitions |
+| effective permission proof nie pokrywa całego `/vms`/`/nodes` contract | `baseline_completeness=partial`/`configuration_error` | bez `missing`/removal transitions |
 | permission hash BEFORE ≠ AFTER | `invalid` | odrzuć run; bez absence/removal transitions |
 | token ma tylko per-VM/per-pool visibility | `configuration_error` | read-only partial view może być diagnostyczny, ale nie authoritative inventory |
-| pełny baseline bez locatora | `complete` | `missing`, nie `confirmed_removed` |
-| boundary-complete baseline + proof klasy A, B albo C, bez authoritative absence evidence | `complete` | najwyżej `missing`/`uncertain`; bez zamknięcia incarnation |
+| pełny baseline bez locatora | `baseline_completeness=complete` | `missing`, nie `confirmed_removed` |
+| boundary-complete baseline + proof klasy A, B albo C, bez authoritative absence evidence | `baseline_completeness=complete` | najwyżej `missing`/`uncertain`; bez zamknięcia incarnation |
 | proof klasy A, B albo C + accepted authoritative absence evidence | zgodnie z kontraktem proof | `confirmed_removed`, tombstone |
 | out-of-order/stary run | `invalid` | bez zmian |
 
