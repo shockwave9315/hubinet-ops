@@ -61,7 +61,7 @@ RESOURCE_SENSORS = (
         key="node",
         translation_key="resource_node",
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda resource: resource.node_id,
+        value_fn=lambda resource: resource.relation_node_id,
     ),
 )
 

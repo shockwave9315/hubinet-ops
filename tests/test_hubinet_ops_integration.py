@@ -38,6 +38,7 @@ from custom_components.hubinet_ops.const import (
     DATA_API_FACTORY,
     DOMAIN,
 )
+from custom_components.hubinet_ops.coordinator import resource_device_info
 from custom_components.hubinet_ops.diagnostics import (
     async_get_config_entry_diagnostics,
 )
@@ -99,14 +100,17 @@ def snapshot(
 ) -> HubinetOpsSnapshot:
     return HubinetOpsSnapshot(
         backend=backend_information(),
-        nodes=nodes
-        or (
-            NodeSnapshot(
-                instance_id=INSTANCE_ID,
-                node_id="pve-a",
-                name="pve-a",
-                status="online",
-            ),
+        nodes=(
+            nodes
+            if nodes is not None
+            else (
+                NodeSnapshot(
+                    instance_id=INSTANCE_ID,
+                    node_id="pve-a",
+                    name="pve-a",
+                    status="online",
+                ),
+            )
         ),
         resources=tuple(resources),
         generated_at="2026-08-08T12:00:00+00:00",
@@ -347,6 +351,24 @@ async def test_vm_lxc_devices_use_node_via_device(hass: HomeAssistant) -> None:
 
 
 @pytest.mark.asyncio
+async def test_device_info_uses_2026_8_1_via_device_id_contract(
+    hass: HomeAssistant,
+) -> None:
+    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    registry = dr.async_get(hass)
+    parent = registry.async_get_device({(DOMAIN, f"{INSTANCE_ID}:node:pve-a")})
+    assert parent is not None
+
+    device_info = resource_device_info(
+        hass,
+        entry.entry_id,
+        INITIAL_RESOURCES[0],
+    )
+    assert "via_device" not in device_info
+    assert device_info["via_device_id"] == parent.id
+
+
+@pytest.mark.asyncio
 async def test_resource_is_added_after_refresh_without_reload(
     hass: HomeAssistant,
 ) -> None:
@@ -448,9 +470,123 @@ async def test_one_missing_refresh_retains_unavailable_resource(
     retained = entry.runtime_data.data.resources_by_identity[identity]
     assert retained.presence is PresenceState.MISSING
     assert retained.available is False
+    assert retained.node_id is None
+    assert retained.last_known_node_id == "pve-a"
+    assert retained.relation_node_id == "pve-a"
     assert dr.async_get(hass).async_get_device(
         {(DOMAIN, identity.registry_key)}
     ) is not None
+
+
+def test_present_resource_requires_node_in_same_snapshot() -> None:
+    with pytest.raises(
+        ValueError,
+        match="present resource references a node absent from the same snapshot",
+    ):
+        snapshot((resource(ResourceType.LXC, 777, "Wrong Node", node_id="pve-b"),))
+
+
+@pytest.mark.parametrize(
+    "presence",
+    [
+        PresenceState.TEMPORARILY_UNAVAILABLE,
+        PresenceState.NODE_UNAVAILABLE,
+        PresenceState.MISSING,
+        PresenceState.CONFIRMED_REMOVED,
+    ],
+)
+def test_non_present_resource_uses_explicit_last_known_node(
+    presence: PresenceState,
+) -> None:
+    unavailable = ResourceSnapshot(
+        identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 777),
+        name="Unavailable Container",
+        node_id=None,
+        last_known_node_id="pve-a",
+        status="unknown",
+        presence=presence,
+    )
+    result = snapshot((unavailable,), nodes=())
+    stored = result.resources[0]
+    assert stored.node_id is None
+    assert stored.last_known_node_id == "pve-a"
+    assert stored.relation_node_id == "pve-a"
+    assert stored.available is False
+
+
+def test_non_present_resource_rejects_current_node_id() -> None:
+    with pytest.raises(ValueError, match="must use last_known_node_id"):
+        ResourceSnapshot(
+            identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 777),
+            name="Missing Container",
+            node_id="pve-a",
+            last_known_node_id="pve-a",
+            status="unknown",
+            presence=PresenceState.MISSING,
+        )
+
+
+@pytest.mark.asyncio
+async def test_last_known_node_absent_on_initial_snapshot_is_not_invented(
+    hass: HomeAssistant,
+) -> None:
+    missing = ResourceSnapshot(
+        identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 777),
+        name="Missing Container",
+        node_id=None,
+        last_known_node_id="retired-node",
+        status="unknown",
+        presence=PresenceState.MISSING,
+    )
+    await setup_entry(hass, FakeTransport([snapshot((missing,), nodes=())]))
+    device = dr.async_get(hass).async_get_device(
+        {(DOMAIN, missing.identity.registry_key)}
+    )
+    assert device is not None
+    assert device.via_device_id is None
+
+
+def test_confirmed_removed_is_not_downgraded_when_later_absent() -> None:
+    removed = ResourceSnapshot(
+        identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 777),
+        name="Removed Container",
+        node_id=None,
+        last_known_node_id="pve-a",
+        status="removed",
+        presence=PresenceState.CONFIRMED_REMOVED,
+    )
+    previous = snapshot((removed,))
+    current = snapshot(())
+
+    reconciled = current.preserving_unconfirmed_missing(previous)
+    retained = reconciled.resources_by_identity[removed.identity]
+    assert retained.presence is PresenceState.CONFIRMED_REMOVED
+    assert retained.last_known_node_id == "pve-a"
+
+
+def test_snapshot_mappings_are_deeply_immutable() -> None:
+    mutable_state = {
+        "nested": {"values": [1, {"flag": True}]},
+    }
+    frozen = resource(
+        ResourceType.LXC,
+        777,
+        "Immutable Container",
+        state=mutable_state,
+    )
+    mutable_state["nested"]["values"].append(2)
+
+    nested = frozen.state["nested"]
+    assert nested["values"] == (1, {"flag": True})
+    with pytest.raises(TypeError):
+        nested["new"] = "mutation"  # type: ignore[index]
+    with pytest.raises(TypeError, match="JSON-like"):
+        resource(
+            ResourceType.LXC,
+            778,
+            "Mutable Payload",
+            state={"payload": bytearray(b"mutable")},
+        )
 
 
 @pytest.mark.asyncio
@@ -462,6 +598,7 @@ async def test_diagnostics_redact_credentials(hass: HomeAssistant) -> None:
         state={
             "authorization": "Bearer deeply-secret",
             "headers": {"Authorization": "Bearer nested-secret"},
+            "events": [{"authorization": "Bearer sequence-secret"}],
         },
     )
     entry = await setup_entry(hass, FakeTransport([snapshot((sensitive_resource,))]))
@@ -472,9 +609,11 @@ async def test_diagnostics_redact_credentials(hass: HomeAssistant) -> None:
     state = diagnostics["snapshot"]["resources"][0]["state"]
     assert state["authorization"] == REDACTED
     assert state["headers"] == REDACTED
+    assert state["events"][0]["authorization"] == REDACTED
     assert API_TOKEN not in repr(diagnostics)
     assert "deeply-secret" not in repr(diagnostics)
     assert "nested-secret" not in repr(diagnostics)
+    assert "sequence-secret" not in repr(diagnostics)
 
 
 def integration_python_sources() -> list[Path]:
@@ -488,6 +627,7 @@ def test_client_has_no_direct_proxmox_dependency_or_mutation() -> None:
     assert "proxmoxer" not in combined
     assert "proxmoxapi" not in combined
     assert "press_action" not in combined
+    assert "via_device=" not in combined
     assert ".status.start" not in combined
     assert ".snapshot.post" not in combined
     assert "app.mqtt" not in combined

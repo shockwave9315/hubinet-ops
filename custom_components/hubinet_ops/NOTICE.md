@@ -5,7 +5,8 @@ adapted and substantially modified from the Home Assistant Core `proxmoxve`
 integration:
 
 - repository: `home-assistant/core`
-- commit: `2d754bc290f644d2e0416d1616634471949f112e`
+- tag: `2026.8.1`
+- commit: `53998d7710b4ac280658511c24a2a3e2651f9873`
 - upstream path: `homeassistant/components/proxmoxve/`
 - license: Apache License 2.0
 

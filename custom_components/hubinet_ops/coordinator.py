@@ -70,22 +70,42 @@ def resource_device_name(resource: ResourceSnapshot) -> str:
     return f"{prefix}{resource.identity.vmid} {resource.name}"
 
 
-def resource_device_info(resource: ResourceSnapshot) -> dr.DeviceInfo:
-    """Build Device Registry information using current node as a relation only."""
+def resource_device_info(
+    hass: HomeAssistant,
+    config_entry_id: str,
+    resource: ResourceSnapshot,
+) -> dr.DeviceInfo:
+    """Build DeviceInfo with the HA 2026.8.1 parent-device contract."""
 
-    node_key = f"{resource.identity.instance_id}:node:{resource.node_id}"
+    node_key = (
+        f"{resource.identity.instance_id}:node:{resource.relation_node_id}"
+    )
+    try:
+        via_device_id = dr.async_get_device_id_by_identifier(
+            hass,
+            (DOMAIN, node_key),
+            config_entry_id=config_entry_id,
+        )
+    except ValueError:
+        if resource.node_id is not None:
+            # Present resources are guaranteed to reference a node in the same
+            # snapshot, and the coordinator registers all nodes first.
+            raise
+        via_device_id = None
     model = (
         MODEL_QEMU
         if resource.identity.resource_type is ResourceType.QEMU
         else MODEL_LXC
     )
-    return dr.DeviceInfo(
+    device_info = dr.DeviceInfo(
         identifiers={resource_identifier(resource.identity)},
         manufacturer=MANUFACTURER,
         model=model,
         name=resource_device_name(resource),
-        via_device=(DOMAIN, node_key),
     )
+    if via_device_id is not None:
+        device_info["via_device_id"] = via_device_id
+    return device_info
 
 
 class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
@@ -147,7 +167,11 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
         for resource in data.resources:
             device_registry.async_get_or_create(
                 config_entry_id=self.config_entry.entry_id,
-                **resource_device_info(resource),
+                **resource_device_info(
+                    self.hass,
+                    self.config_entry.entry_id,
+                    resource,
+                ),
             )
 
         current_nodes = {(node.instance_id, node.node_id) for node in data.nodes}

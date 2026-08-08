@@ -62,7 +62,11 @@ class HubinetOpsResourceEntity(HubinetOpsCoordinatorEntity):
         self.entity_description = entity_description
         identity: ResourceIdentity = resource.identity
         self.identity = identity
-        self._attr_device_info = resource_device_info(resource)
+        self._attr_device_info = resource_device_info(
+            coordinator.hass,
+            coordinator.config_entry.entry_id,
+            resource,
+        )
         self._attr_unique_id = f"{identity.registry_key}:{entity_description.key}"
 
     @property

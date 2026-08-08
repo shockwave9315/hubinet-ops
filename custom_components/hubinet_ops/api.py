@@ -56,10 +56,30 @@ class PresenceState(StrEnum):
     CONFIRMED_REMOVED = "confirmed_removed"
 
 
-def _immutable_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    """Return a shallow immutable copy suitable for a frozen snapshot model."""
+def _deep_freeze(value: Any) -> Any:
+    """Recursively freeze one JSON-like backend snapshot value."""
 
-    return MappingProxyType(dict(value or {}))
+    if value is None or type(value) in {str, int, float, bool}:
+        return value
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("snapshot mapping keys must be strings")
+        return MappingProxyType(
+            {key: _deep_freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    raise TypeError(
+        f"snapshot values must be JSON-like, got {type(value).__name__}"
+    )
+
+
+def _immutable_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    """Return a recursively immutable copy of a JSON-like mapping."""
+
+    frozen = _deep_freeze(value or {})
+    assert isinstance(frozen, Mapping)
+    return frozen
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,8 +146,9 @@ class ResourceSnapshot:
 
     identity: ResourceIdentity
     name: str
-    node_id: str
+    node_id: str | None
     status: str
+    last_known_node_id: str | None = None
     state_level: ResourceStateLevel = ResourceStateLevel.DISCOVERED
     policy: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     capabilities: frozenset[str] = field(default_factory=frozenset)
@@ -136,19 +157,50 @@ class ResourceSnapshot:
     state: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
-        if not self.node_id.strip():
-            raise ValueError("node_id must not be empty")
+        if self.presence is PresenceState.PRESENT:
+            if not isinstance(self.node_id, str) or not self.node_id.strip():
+                raise ValueError("present resource must have a current node_id")
+            if self.last_known_node_id is not None:
+                raise ValueError(
+                    "present resource must not also define last_known_node_id"
+                )
+        else:
+            if self.node_id is not None:
+                raise ValueError(
+                    "non-present resource must use last_known_node_id, not node_id"
+                )
+            if (
+                not isinstance(self.last_known_node_id, str)
+                or not self.last_known_node_id.strip()
+            ):
+                raise ValueError(
+                    "non-present resource must have a last_known_node_id"
+                )
         object.__setattr__(self, "policy", _immutable_mapping(self.policy))
         object.__setattr__(self, "state", _immutable_mapping(self.state))
         object.__setattr__(self, "capabilities", frozenset(self.capabilities))
         if self.presence is not PresenceState.PRESENT:
             object.__setattr__(self, "available", False)
 
+    @property
+    def relation_node_id(self) -> str:
+        """Return the current or explicit last-known node for HA topology."""
+
+        if self.presence is PresenceState.PRESENT:
+            assert self.node_id is not None
+            return self.node_id
+        assert self.last_known_node_id is not None
+        return self.last_known_node_id
+
     def as_missing(self) -> Self:
         """Preserve identity and last observation after an unexplained absence."""
 
+        if self.presence is PresenceState.CONFIRMED_REMOVED:
+            return self
         return replace(
             self,
+            node_id=None,
+            last_known_node_id=self.relation_node_id,
             available=False,
             presence=PresenceState.MISSING,
         )
@@ -177,6 +229,16 @@ class HubinetOpsSnapshot:
             for resource in self.resources
         ):
             raise ValueError("resource belongs to a different backend instance")
+        invalid_present_nodes = [
+            resource.identity
+            for resource in self.resources
+            if resource.presence is PresenceState.PRESENT
+            and (resource.identity.instance_id, resource.node_id) not in node_keys
+        ]
+        if invalid_present_nodes:
+            raise ValueError(
+                "present resource references a node absent from the same snapshot"
+            )
 
     @property
     def nodes_by_id(self) -> dict[str, NodeSnapshot]:

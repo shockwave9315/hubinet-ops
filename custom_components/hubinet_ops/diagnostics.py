@@ -6,6 +6,7 @@ diagnostics and is expanded for bearer/header safety.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
@@ -28,6 +29,16 @@ TO_REDACT = {
 }
 
 
+def _diagnostic_value(value: Any) -> Any:
+    """Convert frozen snapshot values to redaction-friendly JSON containers."""
+
+    if isinstance(value, Mapping):
+        return {key: _diagnostic_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_diagnostic_value(item) for item in value]
+    return value
+
+
 def _snapshot_diagnostics(snapshot: HubinetOpsSnapshot) -> dict[str, Any]:
     return {
         "backend": {
@@ -43,7 +54,7 @@ def _snapshot_diagnostics(snapshot: HubinetOpsSnapshot) -> dict[str, Any]:
                 "name": node.name,
                 "status": node.status,
                 "available": node.available,
-                "facts": dict(node.facts),
+                "facts": _diagnostic_value(node.facts),
             }
             for node in snapshot.nodes
         ],
@@ -56,13 +67,14 @@ def _snapshot_diagnostics(snapshot: HubinetOpsSnapshot) -> dict[str, Any]:
                 },
                 "name": resource.name,
                 "node_id": resource.node_id,
+                "last_known_node_id": resource.last_known_node_id,
                 "status": resource.status,
                 "state_level": resource.state_level.value,
-                "policy": dict(resource.policy),
+                "policy": _diagnostic_value(resource.policy),
                 "capabilities": sorted(resource.capabilities),
                 "available": resource.available,
                 "presence": resource.presence.value,
-                "state": dict(resource.state),
+                "state": _diagnostic_value(resource.state),
             }
             for resource in snapshot.resources
         ],
