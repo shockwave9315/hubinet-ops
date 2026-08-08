@@ -47,7 +47,10 @@ documented phase gates and prerequisites before starting later-phase work.
 
 ## Mutation and security boundaries
 
-Every mutation must retain the complete path:
+### Normal 0.5 mutation path
+
+Every normal Hubinet Ops 0.5 mutation must retain the complete authoritative
+path:
 
 ```text
 Home Assistant
@@ -81,9 +84,31 @@ Home Assistant
   Explicit snapshot restore additionally requires
   `manual_snapshot_restore_allowed`, the required backend capability, explicit
   confirmation, no conflicting plan or destructive job, and independent host
-  policy. All rollback, restore, and break-glass paths must also validate exact
+  policy. All normal rollback and restore paths must also validate exact
   identity/binding/revision/trust, evidence, freshness, locking, and audit gates;
   none is an automatic fallback.
+
+### Transitional legacy 0.4 break-glass exception
+
+- The existing offline recovery path for the backend-hosting CT110 is a narrow,
+  transitional legacy 0.4 exception because the backend itself may be stopped or
+  damaged. It may bypass the normal backend path, including while the backend is
+  unavailable, only through its dedicated recovery credential and only for the
+  existing typed, allowlisted direct hostd offline force-stop and snapshot-restore
+  operations. It never accepts arbitrary command text and is not an automatic
+  fallback or a path to extend normal mutations.
+- A successful offline recovery must leave a durable recovery event on PVE and
+  require post-start backend reconciliation before acknowledgement. The restored
+  backend deliberately supersedes waiting plans, marks approved plans recovered,
+  and interrupts restored queued or running jobs according to the existing
+  recovery contract.
+- CT110 and VMID 110 name the current legacy deployment target only. They are not
+  normative identity or permanent constants in the Hubinet Ops 0.5 architecture.
+  Future 0.5 self-host/offline recovery requires a separately designed durable
+  recovery-target binding whose identity is not based on a hardcoded VMID. A
+  current VMID may be only an execution locator/context after that target has
+  been independently bound. The final break-glass contract requires a separate
+  later architecture decision; do not design or implement it opportunistically.
 
 ## Test boundaries
 
