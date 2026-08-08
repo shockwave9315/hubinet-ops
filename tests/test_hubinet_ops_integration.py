@@ -689,29 +689,162 @@ def test_snapshot_mappings_are_deeply_immutable() -> None:
 
 @pytest.mark.asyncio
 async def test_diagnostics_redact_credentials(hass: HomeAssistant) -> None:
-    sensitive_resource = resource(
-        ResourceType.LXC,
-        666,
-        "Test Container",
-        state={
-            "authorization": "Bearer deeply-secret",
-            "headers": {"Authorization": "Bearer nested-secret"},
-            "events": [{"authorization": "Bearer sequence-secret"}],
+    raw_secrets = {
+        "authorization": "Bearer lower-authorization-value",
+        "Authorization": "Bearer upper-authorization-value",
+        "authorization_header": "Bearer header-authorization-value",
+        "bearer_token": "bearer-token-value",
+        "mqtt_password": "mqtt-password-value",
+        "private_key": "private-key-value",
+        "webhook_id": "webhook-id-value",
+        "client_secret": "client-secret-value",
+        "api_key": "api-key-value",
+        "ssh_key": "ssh-key-value",
+        "some-service-token": "service-token-value",
+        "backend_token": "backend-token-value",
+        "update_token": "update-token-value",
+        "recovery_token": "recovery-token-value",
+        "token_value": "token-value-value",
+        "passphrase": "passphrase-value",
+        "host_authorization": "Bearer host-authorization-value",
+        "ha_ssh_key": "ha-ssh-key-value",
+        "webhook_url": "https://hooks.example.test/api/webhook/private-id",
+        "credential_object": "credential-object-value",
+        "hubinet_ops_scan_url": "https://private.example.test/api/v1/scan",
+    }
+    sensitive_node = NodeSnapshot(
+        INSTANCE_ID,
+        "pve-a",
+        "pve-a",
+        "online",
+        facts={
+            "MQTT_PASSWORD": raw_secrets["mqtt_password"],
+            "nested": {
+                "private_key": raw_secrets["private_key"],
+                "memory": 4096,
+            },
+            "events": (
+                {
+                    "webhook_id": raw_secrets["webhook_id"],
+                    "display": "visible-event",
+                },
+            ),
+            "cpu": 0.25,
+            "status": "online",
         },
     )
-    entry = await setup_entry(hass, FakeTransport([snapshot((sensitive_resource,))]))
+    sensitive_resource = ResourceSnapshot(
+        identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 666),
+        name="Test Container",
+        node_id="pve-a",
+        status="running",
+        policy={
+            "authorization": raw_secrets["authorization"],
+            "client_secret": raw_secrets["client_secret"],
+            "repository_secrets": {
+                "backend_token": raw_secrets["backend_token"],
+                "update_token": raw_secrets["update_token"],
+                "recovery_token": raw_secrets["recovery_token"],
+                "token_value": raw_secrets["token_value"],
+                "passphrase": raw_secrets["passphrase"],
+                "hubinet_ops_host_recovery_authorization": raw_secrets[
+                    "host_authorization"
+                ],
+                "HUBINET_OPS_HA_SSH_KEY": raw_secrets["ha_ssh_key"],
+                "webhook_url": raw_secrets["webhook_url"],
+                "credentials": {
+                    "value": raw_secrets["credential_object"],
+                },
+            },
+            "managed": False,
+        },
+        state={
+            "Authorization": raw_secrets["Authorization"],
+            "headers": {
+                "Authorization": raw_secrets["authorization_header"],
+                "Content-Type": "application/json",
+            },
+            "bearer_token": raw_secrets["bearer_token"],
+            "api_key": raw_secrets["api_key"],
+            "ssh_key": raw_secrets["ssh_key"],
+            "events": [
+                {
+                    "some-service-token": raw_secrets["some-service-token"],
+                    "availability": "online",
+                }
+            ],
+            "hubinet_ops_scan_url": raw_secrets["hubinet_ops_scan_url"],
+            "documentation_url": "https://docs.example.test/resource",
+            "device_id": "visible-device-id",
+            "registry_key": "visible-registry-key",
+            "token_id": "visible-token-id",
+            "backend_token_env": "VISIBLE_BACKEND_TOKEN_ENV",
+            "ssh_key_dir": "/visible/key-directory",
+            "secrets_file": "/visible/secrets-file-path",
+            "resource_type": "lxc",
+            "vmid": 666,
+        },
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [snapshot((sensitive_resource,), nodes=(sensitive_node,))]
+        ),
+    )
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
     config_data = diagnostics["config_entry"]["data"]
     assert config_data[CONF_API_TOKEN] == REDACTED
     assert config_data[CONF_BASE_URL] == REDACTED
-    state = diagnostics["snapshot"]["resources"][0]["state"]
-    assert state["authorization"] == REDACTED
+    snapshot_data = diagnostics["snapshot"]
+    facts = snapshot_data["nodes"][0]["facts"]
+    policy = snapshot_data["resources"][0]["policy"]
+    state = snapshot_data["resources"][0]["state"]
+
+    assert facts["MQTT_PASSWORD"] == REDACTED
+    assert facts["nested"]["private_key"] == REDACTED
+    assert facts["events"][0]["webhook_id"] == REDACTED
+    assert policy["authorization"] == REDACTED
+    assert policy["client_secret"] == REDACTED
+    repository_secrets = policy["repository_secrets"]
+    assert repository_secrets["backend_token"] == REDACTED
+    assert repository_secrets["update_token"] == REDACTED
+    assert repository_secrets["recovery_token"] == REDACTED
+    assert repository_secrets["token_value"] == REDACTED
+    assert repository_secrets["passphrase"] == REDACTED
+    assert (
+        repository_secrets["hubinet_ops_host_recovery_authorization"]
+        == REDACTED
+    )
+    assert repository_secrets["HUBINET_OPS_HA_SSH_KEY"] == REDACTED
+    assert repository_secrets["webhook_url"] == REDACTED
+    assert repository_secrets["credentials"] == REDACTED
+    assert state["Authorization"] == REDACTED
     assert state["headers"] == REDACTED
-    assert state["events"][0]["authorization"] == REDACTED
-    assert API_TOKEN not in repr(diagnostics)
-    assert "deeply-secret" not in repr(diagnostics)
-    assert "nested-secret" not in repr(diagnostics)
-    assert "sequence-secret" not in repr(diagnostics)
+    assert state["bearer_token"] == REDACTED
+    assert state["api_key"] == REDACTED
+    assert state["ssh_key"] == REDACTED
+    assert state["events"][0]["some-service-token"] == REDACTED
+    assert state["hubinet_ops_scan_url"] == REDACTED
+
+    assert facts["nested"]["memory"] == 4096
+    assert facts["events"][0]["display"] == "visible-event"
+    assert facts["cpu"] == 0.25
+    assert facts["status"] == "online"
+    assert policy["managed"] is False
+    assert state["events"][0]["availability"] == "online"
+    assert state["documentation_url"] == "https://docs.example.test/resource"
+    assert state["device_id"] == "visible-device-id"
+    assert state["registry_key"] == "visible-registry-key"
+    assert state["token_id"] == "visible-token-id"
+    assert state["backend_token_env"] == "VISIBLE_BACKEND_TOKEN_ENV"
+    assert state["ssh_key_dir"] == "/visible/key-directory"
+    assert state["secrets_file"] == "/visible/secrets-file-path"
+    assert state["resource_type"] == "lxc"
+    assert state["vmid"] == 666
+
+    diagnostics_repr = repr(diagnostics)
+    assert API_TOKEN not in diagnostics_repr
+    assert all(value not in diagnostics_repr for value in raw_secrets.values())
 
 
 def integration_python_sources() -> list[Path]:

@@ -7,26 +7,90 @@ diagnostics and is expanded for bearer/header safety.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import re
 from typing import Any
 
-from homeassistant.components.diagnostics import async_redact_data
+from homeassistant.components.diagnostics import REDACTED
 from homeassistant.core import HomeAssistant
 
 from .api import HubinetOpsSnapshot
 from .const import CONF_API_TOKEN, CONF_BASE_URL
 from .coordinator import HubinetOpsConfigEntry
 
-TO_REDACT = {
-    CONF_API_TOKEN,
-    CONF_BASE_URL,
-    "authorization",
-    "Authorization",
-    "bearer_token",
-    "credentials",
-    "headers",
-    "password",
-    "token",
-}
+_KEY_SEPARATOR = re.compile(r"[^a-z0-9]+")
+
+_REPOSITORY_SECRET_KEYS = frozenset(
+    {
+        CONF_API_TOKEN,
+        CONF_BASE_URL,
+        "api_key",
+        "authorization",
+        "authorization_header",
+        "credential",
+        "credentials",
+        "headers",
+        "hubinet_ops_ha_ssh_key",
+        "passphrase",
+        "password",
+        "private_key",
+        "secret",
+        "ssh_key",
+        "ssh_private_key",
+        "token",
+        "token_value",
+        "webhook_id",
+        "webhook_url",
+    }
+)
+
+_REPOSITORY_SECRET_SUFFIXES = (
+    "_api_key",
+    "_authorization",
+    "_credentials",
+    "_passphrase",
+    "_password",
+    "_private_key",
+    "_secret",
+    "_token",
+    "_webhook_id",
+)
+
+
+def _normalize_diagnostic_key(key: Any) -> str:
+    """Normalize case and separators without changing the published key."""
+
+    return _KEY_SEPARATOR.sub("_", str(key).casefold()).strip("_")
+
+
+def _is_repository_secret_key(key: Any) -> bool:
+    """Return whether a normalized key carries repository-sensitive data."""
+
+    normalized = _normalize_diagnostic_key(key)
+    return (
+        normalized in _REPOSITORY_SECRET_KEYS
+        or normalized.endswith(_REPOSITORY_SECRET_SUFFIXES)
+        or (
+            normalized.startswith("hubinet_ops_")
+            and normalized.endswith("_url")
+        )
+    )
+
+
+def _redact_repository_secrets(value: Any) -> Any:
+    """Recursively redact secret fields while retaining diagnostic structure."""
+
+    if isinstance(value, Mapping):
+        return {
+            key: (
+                REDACTED
+                if _is_repository_secret_key(key)
+                else _redact_repository_secrets(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_repository_secrets(item) for item in value]
+    return value
 
 
 def _diagnostic_value(value: Any) -> Any:
@@ -90,4 +154,4 @@ async def async_get_config_entry_diagnostics(
         "config_entry": config_entry.as_dict(),
         "snapshot": _snapshot_diagnostics(config_entry.runtime_data.data),
     }
-    return async_redact_data(diagnostics, TO_REDACT)
+    return _redact_repository_secrets(diagnostics)
