@@ -17,7 +17,7 @@ Proponujemy model D, będący uszczegółowieniem modelu C:
 ```text
 backend_instance_id             instalacja Hubinet Ops
 inventory_source_id             jawnie skonfigurowane środowisko Proxmox
-resource_id                     trwała backendowa inventory/candidate identity
+resource_id                     trwała backendowa inventory identity
 slot locator                    (inventory_source_id, vmid)
 resource_type                   immutable property occupant incarnation
 locator_generation              kolejny backendowy binding tego samego slotu
@@ -25,7 +25,7 @@ continuity_state + evidence     ocena, czy obserwacja należy do incarnation
 ```
 
 `resource_id` jest losowym, nieprzezroczystym UUID nadanym przez backend. Jest
-trwałą identity rekordu inventory/candidate incarnation, a nie „logicznej
+trwałą identity rekordu inventory incarnation, a nie „logicznej
 usługi”, i nie zależy od nazwy, VMID ani node'a. Dla resource `unverified` nie
 jest jednak dowodem, że fizyczna incarnation nie została niewidocznie
 zastąpiona między pollingami. `locator_generation` porządkuje historię
@@ -42,7 +42,8 @@ zaakceptowanego security continuity proof.
 - **occupant type** — immutable dla incarnation `resource_type` (`qemu` albo
   `lxc`), ale nie namespace slotu;
 - **resource/incarnation** — jeden workload od utworzenia lub jawnego uznania
-  ciągłości do potwierdzonego replacement;
+  ciągłości do accepted terminal transition, co najmniej `confirmed_removed`
+  albo `replaced`;
 - **observation** — read-only fakty z jednego discovery run;
 - **continuity** — backendowa ocena, czy bieżące fakty odnoszą się do tej samej
   incarnation;
@@ -158,11 +159,12 @@ zmiana zamyka albo zwiększa revision bindingu i zeruje mutation trust.
 | discovery endpoint failover | Dotyczy source transport, nie node identity. | Endpoint musi zostać związany z tym samym source; nie może sam wybrać host mutation route. |
 | migracja resource do untrusted node | `via_device` może wskazać bieżący discovered node. | Effective destructive capabilities dla resource stają się `none`; żadna mutacja nie jest routowana. |
 
-Przyszły job zapisuje expected `resource_id`, resource binding/revision,
-`node_binding_id`, node binding revision i `attestation_id`. Bezpośrednio przed
-wywołaniem typed host-control backend ponownie sprawdza wszystkie wartości,
-bieżącą lokalizację workloadu oraz `node_trust_state=trusted`. HA nie podaje node
-route. Routing wyłącznie po external node name jest zabroniony.
+Przyszły job zapisuje expected `resource_id`, active `binding_id`,
+`locator_generation`, `resource_continuity_revision`, `node_binding_id`, node
+`binding_revision` i `attestation_id`. Bezpośrednio przed wywołaniem typed
+host-control backend ponownie sprawdza wszystkie wartości, bieżącą lokalizację
+workloadu oraz `node_trust_state=trusted`. HA nie podaje node route. Routing
+wyłącznie po external node name jest zabroniony.
 
 ## Porównanie modeli
 
@@ -242,19 +244,85 @@ backend, a przypisanie nowego endpointu do istniejącego source wymaga później
 procedury weryfikacji/confirmation. Endpointów z dwóch sources nie wolno scalać
 na podstawie podobnych nazw lub VMID.
 
-## Model continuity
+## Kanoniczny model stanu i continuity
 
-Presence, observational continuity i security continuity są niezależnymi
-osiami.
+Każda oś ma jednego właściciela znaczenia i zamknięty vocabulary:
 
-Observational/read-only continuity:
+- `presence`: `present`, `missing`, `confirmed_removed`, `not_current`;
+- `lifecycle`: `active`, `quarantined`, `retired`;
+- `observational_continuity`: `consistent`, `uncertain`, `replaced`;
+- `security_continuity`: `unverified`, `trusted`, `revoked`;
+- `detail_status` i `node_availability` pozostają osobnymi osiami opisanymi w
+  ADR 0002.
 
-- `consistent` — kolejne kompletne obserwacje są zgodne i nie wystąpił
-  observable gap/conflict; nie jest to dowód fizycznej ciągłości;
+`retired` należy wyłącznie do lifecycle i nigdy nie jest wartością
+`observational_continuity`. Kanoniczna macierz dozwolonych przypadków:
+
+| Przypadek | `presence` | `lifecycle` | `observational_continuity` | `security_continuity` |
+| --- | --- | --- | --- | --- |
+| normal current resource | `present` | `active` | `consistent` | `unverified` albo `trusted` |
+| ambiguous current resource | `present` | `quarantined` | `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` |
+| ambiguous missing resource | `missing` | `quarantined` | `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` |
+| confirmed removed resource | `confirmed_removed` | `retired` | zachowaj ostatnie znaczące `consistent` albo `uncertain` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` |
+| replaced old resource | `not_current` | `retired` | `replaced` | `revoked` po wcześniejszym `trusted`, inaczej `unverified` |
+| new successor | `present` | `active` | `consistent` | `unverified` |
+
+Common terminal invariant dla każdego accepted terminal transition starego
+resource:
+
+- zamknij exact active binding;
+- ustaw `lifecycle=retired`;
+- ustaw policy applicability=false, destructive capabilities=none i maintenance
+  permission=none;
+- fail-closed zablokuj/przerwij active destructive execution;
+- zachowaj audit/history;
+- jeśli resource był `trusted`, ustaw `security_continuity=revoked`; jeśli nigdy
+  nie był trusted, zachowaj historyczne `unverified`.
+
+Direct replacement dodatkowo ustawia `presence=not_current` oraz
+`observational_continuity=replaced`. Confirmed removal ustawia
+`presence=confirmed_removed`, lecz zachowuje ostatnie znaczące observational
+`consistent` albo `uncertain`; nie tworzy sztucznego continuity `retired`.
+
+### `resource_continuity_revision`
+
+Każdy `resource_id` ma monotoniczny `resource_continuity_revision`. Jest to
+concurrency/security token konkretnego resource, nie identity,
+`locator_generation`, policy revision ani node `binding_revision`. Nowy resource
+zaczyna od jawnej initial revision.
+
+Revision zwiększa się przy każdej decyzji continuity/security wpływającej na
+mutation eligibility albo ważność approvals/jobs, w szczególności:
+
+- `consistent → uncertain`;
+- wejście lub wyjście z `quarantined` po accepted continuity resolution;
+- każda zmiana `security_continuity` między `unverified`, `trusted` i `revoked`;
+- enrollment/continuity proof revision albo anchor replacement;
+- trust revocation;
+- accepted terminal transition;
+- przyszła security-relevant continuity decision.
+
+Jedna atomowa decyzja zmieniająca kilka powyższych pól nadaje jedną kolejną
+revision; nie inkrementuje tokenu osobno za każde pole. Każda kolejna odrębna
+decyzja security-relevant musi nadać następną revision.
+
+Rename, runtime facts, detail refresh, display metadata ani zwykła config change
+bez continuity decision nie zwiększają revision. Każdy destructive
+plan/approval/job zapisuje expected `resource_id`, active `binding_id`,
+`locator_generation` i `resource_continuity_revision` oraz niezależne node
+binding/attestation revisions. Przed mutacją backend wymaga exact match bieżącej
+revision; mismatch oznacza fail closed, brak execution i konieczność ponownego
+planowania/autoryzacji. Zamknięcie bindingu jest niezależnie wykrywane przez exact
+binding identity i active state.
+
+Observational/read-only continuity ma następującą semantykę:
+
+- `consistent` — kompletne obserwacje są zgodne albo nowa incarnation została
+  utworzona na accepted identity boundary i nie ma observable conflict; nie jest
+  to dowód fizycznej ciągłości;
 - `uncertain` — istnieje rzeczywista obserwowalna luka, konflikt albo evidence,
   przez które continuity nie da się rozstrzygnąć;
-- `replaced` — istnieje pozytywny dowód, że slot wskazuje innego occupant;
-- `retired` — rekord został zakończony i zachowany historycznie.
+- `replaced` — istnieje pozytywny dowód, że slot wskazuje innego occupant.
 
 Security continuity:
 
@@ -281,7 +349,7 @@ Positive replacement evidence jest osobną klasą od removal/absence proof. Moż
 nią być wyłącznie evidence wystarczające do stwierdzenia, że bieżący occupant
 nie może być starą incarnation:
 
-- boundary-complete/current observation zmiany immutable occupant `resource_type`
+- boundary-valid/current observation zmiany immutable occupant `resource_type`
   dla tego samego slotu, czyli `lxc → qemu` albo `qemu → lxc`;
 - mismatch future accepted continuity anchor, jeżeli zaakceptowany contract
   jednoznacznie dowodzi innej incarnation;
@@ -289,14 +357,22 @@ nie może być starą incarnation:
   contiguous event/cursor semantics; taki stock-PVE contract jest obecnie
   **UNKNOWN**;
 - jawna, audytowana decyzja operatora związana z exact starym `resource_id`,
-  locator binding i revision; sama nie nadaje successorowi trusted continuity
-  ani destructive authority.
+  active `binding_id`, `locator_generation` i `resource_continuity_revision`;
+  sama nie nadaje successorowi trusted continuity ani destructive authority.
 
 Rename, name change, zwykła zmiana config `digest`, runtime/config/detail
 mismatch, pojedynczy HTTP error ani upływ czasu nie są positive replacement
 evidence. Task log i config fingerprints są wyłącznie evidence pomocniczym.
 Retencja i kompletność task history nie są potwierdzone jako niezawodny,
 wieczny event stream, więc nie mogą być jedyną granicą bezpieczeństwa.
+
+Direct replacement może rozpocząć się od dowolnego nonterminal old resource z
+exact active bindingiem: `present/active`, `present/quarantined` albo
+`missing/quarantined`. Nie wymaga, aby old published presence było `present`, ale
+zawsze wymaga expected `resource_id`, active `binding_id`,
+`locator_generation`, current `resource_continuity_revision`, positive
+replacement evidence i jednego boundary-valid current successor occupanta.
+Ambiguity sama nie jest taką granicą identity.
 
 Jeżeli wystąpi observable gap/conflict/evidence i continuity nie da się
 rozstrzygnąć bez positive replacement proof ani wcześniejszego
@@ -308,8 +384,9 @@ presence może wrócić do `present`, ale observational continuity pozostaje
 Policy applicability jest `false`, destructive capabilities i maintenance
 permission są `none`, a aktywne destructive operations fail closed. Stored
 policy/history pozostają przy tym samym `resource_id`; monotonic continuity/
-security revision zwiększa się, aby unieważnić wcześniejsze approvals/jobs,
-podczas gdy `binding_id` i `locator_generation` pozostają bez zmian.
+security token `resource_continuity_revision` zwiększa się, aby unieważnić
+wcześniejsze approvals/jobs, podczas gdy `binding_id` i `locator_generation`
+pozostają bez zmian.
 
 Ambiguity sama nie zamyka bindingu, nie zwiększa `locator_generation` i nie
 tworzy nowego active ani provisional `resource_id`. `quarantined` jest stanem
@@ -332,9 +409,9 @@ podnosi `unverified` do `trusted`.
 | 4 | config edit | Ten sam `resource_id`; nowy `digest`/fingerprint jest faktem, nie identity. |
 | 5 | snapshot rollback tego samego workloadu | Intencjonalnie ten sam logical workload, ale QEMU `vmgenid` się zmienia. Rewalidacja continuity proof; przy ambiguity ten sam `resource_id`/binding przechodzi do `uncertain`/`quarantined`, bez effective destructive policy. |
 | 6 | clone do nowego VMID | Nowy locator, nowy `resource_id`, `unverified`; żadna policy nie jest kopiowana. |
-| 7 | destroy CT101 | Najpierw `missing`; po pozytywnym potwierdzeniu `confirmed_removed`, `retired` i tombstone. |
+| 7 | destroy CT101 | Najpierw `missing`. `confirmed_removed`, `lifecycle=retired` i tombstone są dozwolone dopiero po positive removal authority **oraz** accepted authoritative absence evidence, z exact active binding i `resource_continuity_revision` validation. |
 | 8 | później nowy CT101 | Nowy `resource_id` i `locator_generation`; stary rekord pozostaje. |
-| 9 | LXC101 → delete → QEMU101 | Boundary-complete type change jest positive replacement evidence przy nadal zajętym slocie. Jedna direct-replacement transaction zamyka binding LXC z `closure_reason=replaced`, publikuje starą incarnation jako `presence=not_current`, `observational_continuity=replaced`, `lifecycle=retired`, tworzy terminal history, a QEMU dostaje nowy `resource_id`, immutable `resource_type=qemu`, nową `locator_generation` i `presence=present`. Nie wymaga pośredniego `missing`, `confirmed_removed` ani dowodu pustego slotu. |
+| 9 | LXC101 → delete → QEMU101 | Porównanie persisted old LXC z dokładnie jednym current QEMU occupantem w boundary-valid snapshot jest positive replacement evidence przy nadal zajętym slocie. Jeden snapshot zawierający jednocześnie LXC101 i QEMU101 jest invalid, nie evidence. Jedna direct-replacement transaction zamyka binding LXC z `closure_reason=replaced`, publikuje starą incarnation jako `presence=not_current`, `observational_continuity=replaced`, `lifecycle=retired`, tworzy terminal history, a QEMU dostaje nowy `resource_id`, immutable `resource_type=qemu`, nową `locator_generation` i `presence=present`. Nie wymaga pośredniego `missing`, `confirmed_removed` ani dowodu pustego slotu. |
 | 10 | delete/recreate między dwoma identycznymi pollingami | Zdarzenie może być observationally indistinguishable. Backend może zachować `resource_id` i read-only HA identity ze stanami `consistent`/`unverified`; nie oznacza to physical continuity. Retained policy może pozostać historycznie, ale effective destructive policy, maintenance permission i nowe destructive approvals/jobs są niedostępne. |
 | 11 | backend offline podczas delete/recreate | Znana przerwa w observation jest rzeczywistym gap. Jeśli po powrocie nie ma positive replacement ani confirmed-removal proof, backend zachowuje ten sam read-only `resource_id` i active binding, ustawia `presence=present`, observational `uncertain`, lifecycle `quarantined`, security `revoked`/`unverified` i wyłącza effective policy/capabilities. |
 | 12 | node chwilowo offline | Jeśli locator nadal występuje w baseline, presence pozostaje `present`, a `node_availability=unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o mutation trust, nie o samym read-only presentation bindingu. |
@@ -358,7 +435,7 @@ stored policy allows operation
 ∩ policy applicability
 ∩ trusted security continuity
 ∩ backend capability
-∩ exact resource/binding/revision
+∩ exact resource_id/active binding_id/locator_generation/resource_continuity_revision
 ∩ operation-specific preconditions
 = operation eligible
 ```
@@ -367,8 +444,9 @@ Stored/retained policy oraz jej revisions pozostają przy starym `resource_id`
 po `uncertain`, utracie trust, replacement, retirement i utworzeniu tombstone.
 Jest to wymagane dla audytu i nie oznacza, że policy jest effective/applicable.
 Policy może być applicable wyłącznie dla dokładnego enrollment/continuity
-context, aktualnego expected resource/binding revision, eligible lifecycle oraz
-wszystkich operation-specific gates.
+context, aktualnego active `binding_id`, `locator_generation`,
+`resource_continuity_revision`, eligible lifecycle oraz wszystkich
+operation-specific gates.
 
 Nowy resource nie ma stored policy. Istniejący `unverified`/`revoked` resource
 zachowuje wcześniejszą stored policy wyłącznie jako historię. W obu przypadkach:
@@ -382,9 +460,9 @@ maintenance permission = none
 
 Discovery nigdy nie kopiuje policy, approval, planów, jobs ani locks ze starej
 incarnation. Każda przyszła mutacja musi ponownie sprawdzić `resource_id`, aktywny
-locator binding, expected continuity revision, `trusted`, policy i runtime
-preconditions. Locator jest parametrem wykonawczym wyliczonym dopiero po tych
-kontrolach.
+`binding_id`, `locator_generation`, exact `resource_continuity_revision`,
+`trusted`, policy i runtime preconditions. Locator jest parametrem wykonawczym
+wyliczonym dopiero po tych kontrolach.
 
 Resource ze stanem security continuity `unverified` lub `revoked` może posiadać
 wyłącznie historycznie retained policy record; nie może mieć effective
@@ -396,7 +474,8 @@ obecność policy record nie jest podstawą wyjątku.
 Granularne flagi `automatic_rollback`, `manual_rollback_allowed` i
 `manual_snapshot_restore_allowed` zachowują swoje znaczenie, ale każda jest
 tylko jednym wymaganym gate. Na przykład `automatic_rollback=true` bez trusted
-continuity, exact binding/revision, backend capability i wymaganych snapshot/job
+continuity, exact active `binding_id`/`locator_generation`/
+`resource_continuity_revision`, backend capability i wymaganych snapshot/job
 preconditions nie autoryzuje rollbacku.
 
 Successor po replacement dostaje nowy `resource_id` i nie dziedziczy stored
@@ -446,6 +525,11 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   `confirmed_removed` oraz terminalne `not_current` dla zastąpionej starej
   incarnation) od per-resource `detail_status` (`ok`,
   `temporarily_unavailable`, `error`) oraz `node_availability`;
+- wdrożenie kanonicznych osi i valid-state matrix: lifecycle
+  `active`/`quarantined`/`retired`, observational continuity bez wartości
+  `retired` oraz security continuity `unverified`/`trusted`/`revoked`;
+- dodanie monotonic `resource_continuity_revision`, jego exact checks w
+  plan/approval/job oraz fail-closed invalidation tests;
 - usunięcie mutually-exclusive modelu, w którym `temporarily_unavailable` albo
   `node_unavailable` zastępuje presence: jeśli locator nadal istnieje,
   `temporarily_unavailable` jest detail status, a niedostępny node jest overlay
@@ -459,7 +543,10 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   pośredniego pustego slotu ani dwóch active bindings;
 - testy ambiguity/gap potwierdzające zachowanie istniejącego `resource_id`,
   bindingu i `locator_generation`, brak provisional split/tombstone oraz
-  fail-closed policy/capabilities.
+  fail-closed policy/capabilities;
+- testy published identity keyed by `resource_id`, kilku retained generations
+  tego samego VMID, current occupant resolution przez active binding oraz
+  retained node references bez dangling `via_device`.
 
 Obecny `docs/architecture/0.5-foundation.md` dokumentuje faktyczny kontrakt
 Phase 0 i nie jest w tym PR przepisywany tak, jakby amendment już wdrożono.

@@ -324,8 +324,11 @@ Dodatnia obserwacja locatora w poprawnym snapshotcie wystarcza do observational
 zgodnie z reconciliation, obniżyć observational continuity do `uncertain`.
 Sampled snapshot nie dowodzi jednak physical removal, nie zamyka
 security-sensitive starej incarnation i nie może nadać ani przenieść
-destructive authority. False read-only `missing` albo conservative identity
-split są dopuszczalne; false security continuity/removal authority nie jest.
+destructive authority. False read-only presence/continuity state wskutek ACL ABA
+jest dopuszczalne; identity split bez accepted identity boundary nie jest.
+`missing`, source outage, ACL ABA, observable gap, ambiguity ani upływ czasu nie
+tworzą nowego/provisional `resource_id`, nie zamykają active bindingu i nie
+zwiększają `locator_generation`.
 
 ## Normalized discovery snapshot
 
@@ -334,6 +337,7 @@ Snapshot jest value object niezależnym od SDK i powinien zawierać:
 ```text
 DiscoverySnapshot
   run_id
+  discovery_run_sequence
   inventory_source_id
   expected_source_config_revision
   endpoint_id
@@ -364,7 +368,7 @@ DiscoverySnapshot
   resources[]
     slot_locator {inventory_source_id, vmid}
     resource_type {qemu | lxc}
-    current_node_name (optional only when relation is unresolved)
+    current_node_name (optional; absent when current relation is unresolved)
     runtime presence/status
     source facts
     observed config metadata
@@ -380,11 +384,29 @@ continuity decision są wynikiem persistent reconciliation, nie surowym faktem
 Proxmox. Provider może przekazać candidate evidence (`vmgenid`, `digest`,
 `meta.ctime`, task records), wyraźnie opisane typem i provenance.
 
+Przed reconciliation normalized snapshot przechodzi fail-closed validation:
+
+- snapshot `inventory_source_id` musi być exact expected source runu;
+- każdy slot `(inventory_source_id, vmid)` może wystąpić najwyżej raz w current
+  locator baseline;
+- `resource_type` musi być dokładnie `qemu` albo `lxc`;
+- równoczesne current entries LXC101 i QEMU101 dla jednego slotu czynią cały run
+  `invalid`; nie są positive direct-replacement evidence;
+- direct replacement porównuje persisted old occupant z dokładnie jednym current
+  occupantem z nowego valid snapshotu;
+- external current node names muszą być jednoznaczne w node baseline;
+- malformed duplicate locator/node payload oznacza `invalid`, bez reconciliation
+  ani publish.
+
+Wymagane są negative contract tests dla duplicate locator, cross-type duplicate,
+duplicate node name, wrong source ID oraz unsupported `resource_type`.
+
 Zagnieżdżone dane snapshotu muszą być rzeczywiście immutable albo deep-copied
 przed transaction boundary. Shallow read-only wrapper nie wystarcza.
 
-Persistent `discovery_runs` zapisuje dla audit provenance expected oraz
-commit-observed `source_config_revision`, exact `endpoint_id`, canonical
+Persistent `discovery_runs` zapisuje `discovery_run_sequence` oraz dla audit
+provenance expected i commit-observed `source_config_revision`, exact
+`endpoint_id`, canonical
 transport locator, `canonicalization_contract_version` i expected/observed
 `transport_trust_revision`. Provider snapshot niesie expected values; wartości
 commit-observed powstają w fail-closed reconciliation transaction.
@@ -464,6 +486,16 @@ jest authoritative absence proof i nie umożliwia polling-only
 
 ## Reconciliation state machine
 
+State machine używa bez wyjątków taxonomy i valid-state matrix z
+[ADR 0001](0001-resource-identity-incarnation.md#kanoniczny-model-stanu-i-continuity):
+
+- `presence`: `present`, `missing`, `confirmed_removed`, `not_current`;
+- `lifecycle`: `active`, `quarantined`, `retired`;
+- `observational_continuity`: `consistent`, `uncertain`, `replaced`;
+- `security_continuity`: `unverified`, `trusted`, `revoked`;
+- `detail_status` i `node_availability` są niezależnymi osiami.
+
+`retired` jest wyłącznie lifecycle; nigdy nie jest observational continuity.
 Locator presence i availability/detail status są niezależne:
 
 - `present` — locator występuje w boundary-complete, bieżącym baseline; detail
@@ -489,8 +521,9 @@ missing → confirmed_removed       tylko z positive removal authority
                                   + accepted authoritative absence evidence
 confirmed_removed + późniejszy powrót locatora → new resource_id,
                                              nigdy stara incarnation
-present old + positive replacement evidence + present successor observation
-  → atomic old not_current/replaced/retired + new resource_id/generation/present
+nonterminal old + active binding + expected resource_continuity_revision
+  + positive replacement evidence + boundary-valid current successor observation
+  → atomic old not_current/retired/replaced + new resource_id/generation/present
 baseline source_unavailable/partial → brak `missing`/removal transition
 ```
 
@@ -515,7 +548,7 @@ confirmed_removed != replaced
 
 Positive direct replacement evidence może pochodzić wyłącznie z:
 
-1. boundary-complete/current observation pokazującej zmianę immutable occupant
+1. boundary-valid/current observation pokazującej zmianę immutable occupant
    `resource_type` dla tego samego `(inventory_source_id, vmid)`, czyli
    `lxc → qemu` albo `qemu → lxc`;
 2. future accepted continuity-anchor contract, którego mismatch jednoznacznie
@@ -535,19 +568,35 @@ evidence. Gdy evidence jest niejednoznaczne, obowiązuje
 wykonywać direct handoff, tworzyć provisional identity ani inkrementować
 generation tylko z powodu config change lub ambiguity.
 
+Input direct replacement to dowolny istniejący **nonterminal** old resource z
+exact active locator bindingiem, nie tylko resource aktualnie publikowany jako
+`presence=present`. Dopuszczalne old states obejmują co najmniej:
+
+- `presence=present`, `lifecycle=active`;
+- `presence=present`, `lifecycle=quarantined`;
+- `presence=missing`, `lifecycle=quarantined`.
+
+We wszystkich przypadkach wymagane są expected `resource_id`, active
+`binding_id`, `locator_generation`, `resource_continuity_revision`, positive
+replacement evidence i dokładnie jeden successor occupant w boundary-valid
+current snapshot. Ambiguity sama nie spełnia tego warunku.
+
 Direct replacement jest jedną reconciliation transaction. W tej samej granicy
 backend:
 
 1. weryfikuje expected old `resource_id`;
 2. weryfikuje exact active locator binding;
-3. weryfikuje expected binding/continuity revision;
-4. weryfikuje positive replacement evidence oraz bieżącą, boundary-complete
+3. weryfikuje expected `locator_generation` i current
+   `resource_continuity_revision`;
+4. weryfikuje positive replacement evidence oraz bieżącą, boundary-valid
    obserwację successor occupanta;
 5. zamyka stary binding przez `valid_to` i `closure_reason=replaced`;
 6. ustawia starej incarnation `presence=not_current`,
    `observational_continuity=replaced` i `lifecycle=retired`;
-7. revokuje wcześniejszy trust, jeżeli istniał, suspenduje policy applicability
-   i ustawia effective destructive authorization na `none`;
+7. zwiększa old `resource_continuity_revision`, revokuje wcześniejszy trust,
+   jeżeli istniał (wcześniejsze `unverified` pozostaje historycznie
+   `unverified`), suspenduje policy applicability i ustawia effective destructive
+   authorization/maintenance permission na `none`;
 8. zapisuje retained terminal/tombstone history;
 9. inkrementuje `locator_generation` i tworzy nowy `resource_id`;
 10. tworzy dokładnie jeden nowy active binding dla tego samego slotu;
@@ -564,6 +613,15 @@ replacement natychmiast suspenduje jej effective policy, ustawia destructive
 capabilities i maintenance permission na `none`, a aktywne destructive
 operations są fail-closed blokowane/przerywane według późniejszego audytowanego
 operation contract.
+
+Published `resources[]` jest identity-keyed przez `resource_id`, nie przez VMID.
+Po handoff widok może równocześnie zachować old
+`resource_id=A`/generation 4/`not_current`/`retired` i opublikować successor
+`resource_id=B`/generation 5/`present`/`active` dla tego samego VMID. Jest to
+historia dwóch occupants, nie dwa current bindings. API, Coordinator i HA nie
+mogą budować identity map przez `resources_by_vmid[vmid]`; current occupant jest
+rozwiązywany przez exact active locator binding. Contract tests muszą obejmować
+old i successor z tym samym VMID oraz ich różne Device Registry/entity identity.
 
 ### Node relation i HA availability
 
@@ -589,6 +647,12 @@ Każde non-null `current_node_id` i `last_known_node_id` musi wskazywać node re
 obecny w tym samym published snapshot; last-known może wskazywać retained/offline
 node. Validator nie może akceptować dangling `via_device` relation.
 
+Phase 1 nie purguje node recordu, dopóki jakikolwiek published current albo
+last-known resource go referencjonuje. Offline/history node pozostaje retained w
+published nodes, jeśli jest potrzebny do zachowania tej relacji. Future node
+purge wymaga osobnego atomowego reference/HA lifecycle contract; nie jest
+projektowany w tym ADR.
+
 ```text
 node availability failure != resource physical absence
 last_known_node_id != security mutation route
@@ -603,20 +667,31 @@ replacement transition i nigdy nie jest zapisywany jako `confirmed_removed`.
 Każda klasa proof wymaga wspólnych warunków:
 
 1. proof odnosi się do dokładnego `inventory_source_id`, `resource_id`, active
-   slot binding i expected binding/continuity revision;
+   `binding_id`, `locator_generation` i expected
+   `resource_continuity_revision`;
 2. istnieje osobno zaakceptowane authoritative absence evidence, które dowodzi,
    że slot `(inventory_source_id, vmid)` jest absent z klasą bezpieczeństwa
    wystarczającą do zamknięcia incarnation; boundary-complete fresh baseline
    jest wymaganym consistency check, lecz sam nie spełnia tego warunku;
-3. reconciliation transaction nadal widzi ten sam expected binding/revision i
-   atomowo zamyka binding, tworzy tombstone oraz ustawia `confirmed_removed`.
+3. reconciliation transaction nadal widzi ten sam expected active binding,
+   generation i resource continuity revision, a następnie atomowo zamyka binding,
+   zwiększa `resource_continuity_revision`, tworzy tombstone, ustawia
+   `presence=confirmed_removed` i `lifecycle=retired`.
+
+Confirmed removal zachowuje ostatnie znaczące
+`observational_continuity=consistent|uncertain`; nie ustawia wartości `retired`
+na tej osi. Policy applicability, destructive capabilities i maintenance
+permission są `none`, active destructive execution fail closed, a audit/history
+pozostają. Wcześniejsze `security_continuity=trusted` przechodzi do `revoked`;
+resource, który nigdy nie był trusted, może zachować historyczne `unverified`.
 
 Poza nimi rozróżniamy trzy klasy positive removal authority:
 
 #### A. Backend-mediated removal
 
 - zakończona sukcesem typed backend operation, wcześniej związana z expected
-  `resource_id`, slot binding i revision;
+  `resource_id`, active `binding_id`, `locator_generation` i
+  `resource_continuity_revision`;
 - późniejszy boundary-complete fresh baseline pokazujący pusty slot;
 - osobno zaakceptowane authoritative absence evidence.
 
@@ -645,7 +720,7 @@ tasks nie spełnia tego wymagania.
 #### C. Explicit operator confirmation
 
 - jawne, audytowane potwierdzenie operatora wskazujące dokładny `resource_id`,
-  current slot binding i revision;
+  current `binding_id`, `locator_generation` i `resource_continuity_revision`;
 - boundary-complete fresh baseline pokazujący pusty slot;
 - osobno zaakceptowane authoritative absence evidence lub attestation.
 
@@ -689,7 +764,7 @@ ACL-filtered listing, timeout, source outage ani sam upływ czasu nie należą d
   `unverified`. Policy applicability=false, destructive capabilities i
   maintenance permission są `none`; aktywne destructive operations fail closed.
   Stored policy/history pozostają przy istniejącym `resource_id`, a monotonic
-  continuity/security revision zwiększa się, aby unieważnić wcześniejsze
+  `resource_continuity_revision` zwiększa się, aby unieważnić wcześniejsze
   approvals/jobs bez zmiany `binding_id` ani `locator_generation`.
 
 Quarantine nie jest terminal history ani tombstone. Nie zamyka bindingu i nie
@@ -712,12 +787,14 @@ approvals/jobs.
 Każdy run wykonuje:
 
 ```text
-capture expected source_config_revision + exact endpoint/canonicalization/TLS revisions
+allocate per-source discovery_run_sequence
+→ capture expected source_config_revision + exact endpoint/canonicalization/TLS revisions
 → fetch ACL topology + per-path effective permission snapshots BEFORE
 → fetch locator baseline and declared baseline prerequisites
 → fetch per-resource optional detail/facts
 → fetch ACL topology + per-path effective permission snapshots AFTER
 → normalize
+→ validate exact source + locator/node uniqueness + schema
 → validate exact source/endpoint/canonicalization/transport-trust revisions
 → validate boundary topology/permission equality and baseline completeness
 → record independent per-resource detail statuses
@@ -746,6 +823,7 @@ current source_config_revision == expected source_config_revision
 exact active endpoint_id == expected endpoint_id
 stored canonical locator/version == expected canonical locator/version
 current transport_trust_revision == expected transport_trust_revision
+discovery_run_sequence > last_committed_run_sequence
 ```
 
 Każdy mismatch klasyfikuje run jako invalid/stale: bez reconciliation, inventory
@@ -756,11 +834,42 @@ configuration `A → B → A` podczas runu pozostawia inny numer. Exact endpoint
 canonicalization oraz TLS checks są oddzielne i nie mogą zostać zastąpione przez
 source revision. Mismatch odrzuca run także wtedy, gdy zmiana nastąpiła po
 odczytach AFTER, lecz przed transaction commit.
+
+### `discovery_run_sequence`
+
+Backend nadaje przed fetch monotoniczny `discovery_run_sequence` osobno dla
+każdego `inventory_source_id`. Sequence jest trwałym ordering tokenem observation
+runs, nie source identity ani czasem; może mieć luki po failed/crashed runs i nie
+zwiększa `source_config_revision`. Wall-clock timestamps służą wyłącznie do
+observability/audit i nigdy nie są concurrency authority.
+
+Każdy `discovery_runs` record zapisuje przydzielony sequence. Reconciliation
+commit wymaga:
+
+```text
+run.discovery_run_sequence > source.last_committed_run_sequence
+```
+
+W tej samej transaction/CAS boundary backend reconciliuje inventory i ustawia
+`last_committed_run_sequence=run.discovery_run_sequence`. Jeżeli nowszy run już
+został committed, starszy jest `invalid`/stale bez reconciliation ani publish,
+nawet gdy ma zgodny `source_config_revision`. Source config revision chroni
+znaczenie konfiguracji, a run sequence niezależnie chroni ordering konkurencyjnych
+observations. Implementacja może serializować runs per source, ale nie może
+pozwolić stale overwrite.
+
+Wymagane concurrency contract tests:
+
+```text
+run A start → run B start → B commit → A commit attempt = rejected
+run A start → A commit → run B start → B commit = allowed
+```
+
 Cursor jest sprawdzany tylko wtedy, gdy provider jawnie deklaruje wspierany
 trusted cursor contract albo używana jest klasa proof B. Snapshot starszy od
-ostatniego committed run jest odrzucany. Restart backendu ładuje ostatni
-committed inventory, tombstones oraz wszystkie dostępne provider cursors;
-pamięć procesu nie jest source of truth.
+ostatniego committed run sequence jest odrzucany. Restart backendu ładuje
+ostatni committed inventory, `last_committed_run_sequence`, tombstones oraz
+wszystkie dostępne provider cursors; pamięć procesu nie jest source of truth.
 
 ## Failure modes
 
@@ -774,6 +883,7 @@ pamięć procesu nie jest source of truth.
 | `transport_trust_revision` zmienione podczas runu | `invalid` | nie commituj snapshotu odczytanego pod starym trust contract |
 | `source_config_revision` zmienione podczas runu | `invalid`/stale | bez reconciliation/commit; następny run używa nowej configuration revision |
 | canonicalization version migration nieukończona, ambiguous lub collision | `configuration_error`/blocked | bez create/reactivation aliasu i bez commit runu o niezweryfikowanym endpoint provenance |
+| wrong snapshot source ID, unsupported resource type albo duplicate locator/node | `invalid` | bez reconciliation/publish; LXC101+QEMU101 w jednym snapshotcie nie jest replacement evidence |
 | brak node scope wymaganego do locator baseline | `baseline_completeness=partial` | bez `missing` transitions |
 | locator obecny, optional node/detail facts niedostępne | baseline bez zmian + `node_availability=unavailable`/detail error | locator zachowany jako `present` |
 | baseline pełny, config read jednego guest fail | `baseline_completeness=complete`; per-resource `detail_status=temporarily_unavailable/error` | locator `present`; facts unavailable; inne locatory reconciled normalnie |
@@ -783,12 +893,12 @@ pamięć procesu nie jest source of truth.
 | effective permission proof nie pokrywa całego `/vms`/`/nodes` contract | `baseline_completeness=partial`/`configuration_error` | bez `missing`/removal transitions |
 | permission hash BEFORE ≠ AFTER | `invalid` | odrzuć run; bez absence/removal transitions |
 | token ma tylko per-VM/per-pool visibility | `configuration_error` | read-only partial view może być diagnostyczny, ale nie authoritative inventory |
-| pełny baseline bez locatora | `baseline_completeness=complete` | `missing`, nie `confirmed_removed` |
+| boundary-complete baseline bez locatora, także potencjalne ACL ABA | observational `missing`/`uncertain` | zachowaj existing `resource_id`, active binding i generation; nie `confirmed_removed`, nie identity split |
 | locator wraca po `missing`/outage, continuity ambiguous, bez replacement/removal proof | `present` + `uncertain`/`quarantined` | zachowaj existing `resource_id`, active binding i generation; fail-closed authority; bez provisional ID/tombstone |
 | boundary-complete baseline + proof klasy A, B albo C, bez authoritative absence evidence | `baseline_completeness=complete` | najwyżej `missing`/`uncertain`; bez zamknięcia incarnation |
 | proof klasy A, B albo C + accepted authoritative absence evidence | zgodnie z kontraktem proof | `confirmed_removed`, tombstone |
-| bieżący slot zajęty przez successor + positive replacement evidence | direct replacement | atomowo `not_current`/`replaced`/`retired` old, nowy `resource_id` i generation; bez `missing`/`confirmed_removed` |
-| out-of-order/stary run | `invalid` | bez zmian |
+| nonterminal old active binding + bieżący successor + positive replacement evidence | direct replacement | atomowo `not_current`/`retired`/`replaced` old, nowy `resource_id` i generation; old może wcześniej być present albo missing/quarantined |
+| run A start, run B start, B commit, A commit attempt | `invalid`/stale A | `discovery_run_sequence <= last_committed_run_sequence`; bez zmian/publish |
 
 ## Trust boundary
 
