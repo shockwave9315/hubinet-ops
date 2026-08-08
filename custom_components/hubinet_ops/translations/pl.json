@@ -1,0 +1,54 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "Ten backend Hubinet Ops jest już skonfigurowany.",
+      "reauth_successful": "Ponowne uwierzytelnienie zakończyło się powodzeniem.",
+      "reconfigure_successful": "Zmiana konfiguracji zakończyła się powodzeniem."
+    },
+    "error": {
+      "cannot_connect": "Nie można połączyć się z backendem Hubinet Ops.",
+      "invalid_auth": "Token API Hubinet Ops jest nieprawidłowy.",
+      "invalid_url": "Podaj prawidłowy bazowy URL HTTP lub HTTPS bez credentials, query i fragmentu.",
+      "unknown": "Wystąpił nieoczekiwany błąd backendu Hubinet Ops.",
+      "wrong_instance": "Połączenie wskazuje inną instancję backendu Hubinet Ops."
+    },
+    "step": {
+      "reauth_confirm": {
+        "data": {"api_token": "Token API"},
+        "description": "Podaj nowy bearer token dla tego backendu Hubinet Ops.",
+        "title": "Ponownie uwierzytelnij Hubinet Ops"
+      },
+      "reconfigure": {
+        "data": {
+          "api_token": "Token API",
+          "base_url": "Bazowy URL Hubinet Ops",
+          "verify_tls": "Weryfikuj certyfikat TLS"
+        },
+        "description": "Zmień połączenie z tą samą instancją backendu Hubinet Ops.",
+        "title": "Zmień konfigurację Hubinet Ops"
+      },
+      "user": {
+        "data": {
+          "api_token": "Token API",
+          "base_url": "Bazowy URL Hubinet Ops",
+          "verify_tls": "Weryfikuj certyfikat TLS"
+        },
+        "data_description": {
+          "api_token": "Bearer token wydany przez Hubinet Ops. Nigdy nie jest wysyłany do Proxmoxa.",
+          "base_url": "Bazowy URL backendu Hubinet Ops, nie hosta Proxmox.",
+          "verify_tls": "Weryfikuj certyfikat TLS backendu."
+        },
+        "description": "Połącz Home Assistant z backendem Hubinet Ops.",
+        "title": "Połącz z Hubinet Ops"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "node_status": {"name": "Stan"},
+      "resource_node": {"name": "Node"},
+      "resource_status": {"name": "Stan"},
+      "resource_type": {"name": "Typ"}
+    }
+  }
+}

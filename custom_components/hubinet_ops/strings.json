@@ -1,0 +1,72 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "This Hubinet Ops backend is already configured.",
+      "reauth_successful": "Re-authentication was successful.",
+      "reconfigure_successful": "Reconfiguration was successful."
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the Hubinet Ops backend.",
+      "invalid_auth": "The Hubinet Ops API token is invalid.",
+      "invalid_url": "Enter a valid HTTP or HTTPS Hubinet Ops base URL without credentials, query, or fragment.",
+      "unknown": "An unexpected Hubinet Ops backend error occurred.",
+      "wrong_instance": "The connection points to a different Hubinet Ops backend instance."
+    },
+    "step": {
+      "reauth_confirm": {
+        "data": {
+          "api_token": "API token"
+        },
+        "description": "Enter a new bearer token for this Hubinet Ops backend.",
+        "title": "Re-authenticate Hubinet Ops"
+      },
+      "reconfigure": {
+        "data": {
+          "api_token": "API token",
+          "base_url": "Hubinet Ops base URL",
+          "verify_tls": "Verify TLS certificate"
+        },
+        "description": "Update the connection to the same Hubinet Ops backend instance.",
+        "title": "Reconfigure Hubinet Ops"
+      },
+      "user": {
+        "data": {
+          "api_token": "API token",
+          "base_url": "Hubinet Ops base URL",
+          "verify_tls": "Verify TLS certificate"
+        },
+        "data_description": {
+          "api_token": "Bearer token issued by Hubinet Ops. It is never sent to Proxmox.",
+          "base_url": "Base URL of the Hubinet Ops backend, not the Proxmox host.",
+          "verify_tls": "Verify the backend TLS certificate."
+        },
+        "description": "Connect Home Assistant to a Hubinet Ops backend.",
+        "title": "Connect to Hubinet Ops"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "node_status": {
+        "name": "Status"
+      },
+      "resource_node": {
+        "name": "Node"
+      },
+      "resource_status": {
+        "name": "Status"
+      },
+      "resource_type": {
+        "name": "Type"
+      }
+    }
+  },
+  "exceptions": {
+    "cannot_connect": {
+      "message": "Cannot connect to the Hubinet Ops backend."
+    },
+    "invalid_auth": {
+      "message": "The Hubinet Ops API token is invalid."
+    }
+  }
+}
