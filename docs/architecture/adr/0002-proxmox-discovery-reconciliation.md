@@ -43,10 +43,12 @@ failover. Gdy active endpoint jest niedostępny, wynik to `source_unavailable`;
 provider nie próbuje kolejnego endpointu.
 
 Canonical HTTPS URL/transport locator jest immutable dla jednego endpoint
-record. Zmiana URL zawsze tworzy nowy `endpoint_id` ze statusem `candidate`;
-nie istnieje operacja `existing_endpoint.url = new_url`. Relacja endpointu do
-`inventory_source_id` również jest immutable, więc record nie może zostać
-przeniesiony między sources.
+record w zwykłym lifecycle. Jedynym wyjątkiem jest controlled migration wersji
+canonicalization opisana niżej, która zachowuje endpoint identity i pełną
+historię pary przed/po. Zmiana URL zawsze tworzy nowy `endpoint_id` ze statusem
+`candidate`; nie istnieje operacja `existing_endpoint.url = new_url`. Relacja
+endpointu do `inventory_source_id` również jest immutable, więc record nie może
+zostać przeniesiony między sources.
 
 Raw user URL nie uczestniczy bezpośrednio w uniqueness, equality, retained
 history lookup ani decyzji replacement. Przed utworzeniem recordu jedna
@@ -71,6 +73,27 @@ implementacji.
 Przykładowo `https://PVE.EXAMPLE/` i `https://pve.example:443` są jednym
 locatorem, natomiast `https://pve.example:8006/` jest innym, jawnie
 non-default locatorem. Tekstowa różnica nie resetuje retained history.
+
+Każdy endpoint record przechowuje canonical locator razem z
+`canonicalization_contract_version`, która go wytworzyła. Backend upgrade nie
+może reinterpretować istniejącej wartości pod nowym algorytmem. Zmiana wersji
+wymaga explicit, audytowanej schema/data migration albo równoważnej controlled
+procedure, która zachowuje `endpoint_id`, `inventory_source_id`, source-binding
+i retained-history gates, deterministycznie przelicza cały retained namespace i
+zapisuje provenance starej/nowej canonical pair.
+
+Migration wykrywa cross-version aliases i collisions przed commit. Ambiguity lub
+collision zatrzymuje ją fail-closed: bez automatycznego merge historii, drugiej
+endpoint identity albo activation. Canonicalization version nie jest osobnym
+namespace pozwalającym ominąć uniqueness. Dopóki retained namespace nie został
+jednoznacznie zmigrowany lub objęty osobno zaakceptowanym cross-version lookup
+contractem, create/reactivation endpointu pod nową wersją jest blocked. Contract
+tests muszą obejmować version upgrade, alias do retained locatora i collision.
+
+Nieudana migration jest atomowa i pozostawia stare stored pairs bez zmian.
+Istniejący discovery może działać dalej wyłącznie, jeśli backend nadal potrafi
+honorować i weryfikować zapisany stary contract; inaczej source przechodzi w
+`configuration_error`. Nowa wersja nie jest furtką do utworzenia aliasu.
 
 Status `active` nie jest zwykłym mutable flag. Jest wynikiem kontrolowanej,
 atomowej state transition. Dla istniejącego source zabronione są bez accepted
@@ -312,9 +335,11 @@ Snapshot jest value object niezależnym od SDK i powinien zawierać:
 DiscoverySnapshot
   run_id
   inventory_source_id
+  expected_source_config_revision
   endpoint_id
   canonical_transport_locator
-  transport_trust_revision
+  canonicalization_contract_version
+  expected_transport_trust_revision
   observed_at
   source_facts
   source_availability
@@ -357,6 +382,12 @@ Proxmox. Provider może przekazać candidate evidence (`vmgenid`, `digest`,
 
 Zagnieżdżone dane snapshotu muszą być rzeczywiście immutable albo deep-copied
 przed transaction boundary. Shallow read-only wrapper nie wystarcza.
+
+Persistent `discovery_runs` zapisuje dla audit provenance expected oraz
+commit-observed `source_config_revision`, exact `endpoint_id`, canonical
+transport locator, `canonicalization_contract_version` i expected/observed
+`transport_trust_revision`. Provider snapshot niesie expected values; wartości
+commit-observed powstają w fail-closed reconciliation transaction.
 
 ## Dwie niezależne osie wyniku discovery
 
@@ -586,12 +617,13 @@ approvals/jobs.
 Każdy run wykonuje:
 
 ```text
-fetch ACL topology + per-path effective permission snapshots BEFORE
+capture expected source_config_revision + exact endpoint/canonicalization/TLS revisions
+→ fetch ACL topology + per-path effective permission snapshots BEFORE
 → fetch locator baseline and declared baseline prerequisites
 → fetch per-resource optional detail/facts
 → fetch ACL topology + per-path effective permission snapshots AFTER
 → normalize
-→ validate exact endpoint/canonical locator/transport-trust revision
+→ validate exact source/endpoint/canonicalization/transport-trust revisions
 → validate boundary topology/permission equality and baseline completeness
 → record independent per-resource detail statuses
 → reconcile in one DB transaction
@@ -600,11 +632,33 @@ fetch ACL topology + per-path effective permission snapshots BEFORE
 → publish committed snapshot to Hubinet Ops API/HA
 ```
 
-Nie publikujemy surowego albo częściowo reconciled snapshotu. Transaction
-sprawdza expected source revision, exact active `endpoint_id`, canonical
-transport locator, bieżący `transport_trust_revision`, active locator bindings i
-monotoniczny czas. Transition TLS trust revision musi serializować się z tym
-commitem; mismatch fail-closed odrzuca run, także gdy zmiana nastąpiła po
+Nie publikujemy surowego albo częściowo reconciled snapshotu. Monotonic
+`source_config_revision` jest concurrency tokenem source configuration, nie
+source identity. Inkrementuje się przy każdej zmianie provider/discovery
+settings, credential material/version lub secret reference, discovery-relevant
+lifecycle/config state, active discovery-route transition albo wymaganych
+provider contract parameters. Controlled canonicalization migration active
+endpointu również zwiększa revision. Pure display-label change, inert candidate
+metadata i nowe observed facts nie zmieniają znaczenia bieżącego runu, więc nie
+zwiększają revision.
+
+Run zapisuje expected `source_config_revision` przed fetch. Reconciliation
+transaction sprawdza fail-closed:
+
+```text
+current source_config_revision == expected source_config_revision
+exact active endpoint_id == expected endpoint_id
+stored canonical locator/version == expected canonical locator/version
+current transport_trust_revision == expected transport_trust_revision
+```
+
+Każdy mismatch klasyfikuje run jako invalid/stale: bez reconciliation, inventory
+commit ani publikacji snapshotu. Source configuration mutation, endpoint/TLS
+transition i reconciliation commit serializują się w tej samej backendowej
+transaction/lock/CAS boundary. Dzięki monotonic revision także zmiana source
+configuration `A → B → A` podczas runu pozostawia inny numer. Exact endpoint,
+canonicalization oraz TLS checks są oddzielne i nie mogą zostać zastąpione przez
+source revision. Mismatch odrzuca run także wtedy, gdy zmiana nastąpiła po
 odczytach AFTER, lecz przed transaction commit.
 Cursor jest sprawdzany tylko wtedy, gdy provider jawnie deklaruje wspierany
 trusted cursor contract albo używana jest klasa proof B. Snapshot starszy od
@@ -622,6 +676,8 @@ pamięć procesu nie jest source of truth.
 | active endpoint retired albo source disable/re-enable | discovery disabled/last-known zachowane | gate nie resetuje się; brak direct replacement |
 | TLS trust/pinning zmienione | audytowana transport-security revalidation | nie ustanawia source continuity ani nie aktywuje innego peer/source |
 | `transport_trust_revision` zmienione podczas runu | `invalid` | nie commituj snapshotu odczytanego pod starym trust contract |
+| `source_config_revision` zmienione podczas runu | `invalid`/stale | bez reconciliation/commit; następny run używa nowej configuration revision |
+| canonicalization version migration nieukończona, ambiguous lub collision | `configuration_error`/blocked | bez create/reactivation aliasu i bez commit runu o niezweryfikowanym endpoint provenance |
 | brak node scope wymaganego do locator baseline | `baseline_completeness=partial` | bez `missing` transitions |
 | locator obecny, optional node/detail facts niedostępne | baseline bez zmian + `node_availability=unavailable`/detail error | locator zachowany jako `present` |
 | baseline pełny, config read jednego guest fail | `baseline_completeness=complete`; per-resource `detail_status=temporarily_unavailable/error` | locator `present`; facts unavailable; inne locatory reconciled normalnie |
