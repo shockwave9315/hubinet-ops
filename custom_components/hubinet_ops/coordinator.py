@@ -150,6 +150,12 @@ class HubinetOpsCoordinator(DataUpdateCoordinator[HubinetOpsSnapshot]):
                 translation_key="cannot_connect",
             ) from err
 
+        if incoming.backend.instance_id != self.config_entry.unique_id:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="wrong_instance",
+            )
+
         previous = self.data
         data = incoming.preserving_unconfirmed_missing(previous)
         self._async_publish_inventory(data)

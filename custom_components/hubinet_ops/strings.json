@@ -67,6 +67,9 @@
     },
     "invalid_auth": {
       "message": "The Hubinet Ops API token is invalid."
+    },
+    "wrong_instance": {
+      "message": "The connection points to a different Hubinet Ops backend instance."
     }
   }
 }

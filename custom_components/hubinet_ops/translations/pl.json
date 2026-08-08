@@ -50,5 +50,16 @@
       "resource_status": {"name": "Stan"},
       "resource_type": {"name": "Typ"}
     }
+  },
+  "exceptions": {
+    "cannot_connect": {
+      "message": "Nie można połączyć się z backendem Hubinet Ops."
+    },
+    "invalid_auth": {
+      "message": "Token API Hubinet Ops jest nieprawidłowy."
+    },
+    "wrong_instance": {
+      "message": "Połączenie wskazuje inną instancję backendu Hubinet Ops."
+    }
   }
 }

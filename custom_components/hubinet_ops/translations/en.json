@@ -50,5 +50,16 @@
       "resource_status": {"name": "Status"},
       "resource_type": {"name": "Type"}
     }
+  },
+  "exceptions": {
+    "cannot_connect": {
+      "message": "Cannot connect to the Hubinet Ops backend."
+    },
+    "invalid_auth": {
+      "message": "The Hubinet Ops API token is invalid."
+    },
+    "wrong_instance": {
+      "message": "The connection points to a different Hubinet Ops backend instance."
+    }
   }
 }

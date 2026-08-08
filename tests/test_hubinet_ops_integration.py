@@ -10,7 +10,11 @@ import pytest
 pytest.importorskip("homeassistant", reason="isolated HA test dependencies not installed")
 
 from homeassistant.components.diagnostics import REDACTED
-from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigEntryState,
+)
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr, entity_registry as er
@@ -55,6 +59,7 @@ def auto_enable_custom_integrations(enable_custom_integrations, socket_enabled):
     yield
 
 INSTANCE_ID = "6a172b5d-d820-4cac-904f-dfb17d42163e"
+OTHER_INSTANCE_ID = "2b5d3b3b-e4b9-412a-851a-11bc4e839aa7"
 BASE_URL = "https://ops.example.test"
 API_TOKEN = "phase-zero-test-token-not-a-secret"
 ENTRY_DATA = {
@@ -64,9 +69,9 @@ ENTRY_DATA = {
 }
 
 
-def backend_information() -> BackendInformation:
+def backend_information(*, instance_id: str = INSTANCE_ID) -> BackendInformation:
     return BackendInformation(
-        instance_id=INSTANCE_ID,
+        instance_id=instance_id,
         name="Hubinet Ops Test",
         version="0.5.0.dev0",
         api_version="0.5-draft",
@@ -80,9 +85,10 @@ def resource(
     *,
     node_id: str = "pve-a",
     state: dict[str, Any] | None = None,
+    instance_id: str = INSTANCE_ID,
 ) -> ResourceSnapshot:
     return ResourceSnapshot(
-        identity=ResourceIdentity(INSTANCE_ID, resource_type, vmid),
+        identity=ResourceIdentity(instance_id, resource_type, vmid),
         name=name,
         node_id=node_id,
         status="running",
@@ -97,15 +103,16 @@ def snapshot(
     resources: Iterable[ResourceSnapshot],
     *,
     nodes: tuple[NodeSnapshot, ...] | None = None,
+    instance_id: str = INSTANCE_ID,
 ) -> HubinetOpsSnapshot:
     return HubinetOpsSnapshot(
-        backend=backend_information(),
+        backend=backend_information(instance_id=instance_id),
         nodes=(
             nodes
             if nodes is not None
             else (
                 NodeSnapshot(
-                    instance_id=INSTANCE_ID,
+                    instance_id=instance_id,
                     node_id="pve-a",
                     name="pve-a",
                     status="online",
@@ -300,6 +307,97 @@ async def test_coordinator_fetches_one_logical_snapshot(hass: HomeAssistant) -> 
     assert transport.snapshot_calls == 1
     assert len(coordinator.data.nodes) == 1
     assert len(coordinator.data.resources) == 3
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_snapshot_from_different_backend_instance(
+    hass: HomeAssistant,
+) -> None:
+    foreign_resource = resource(
+        ResourceType.LXC,
+        901,
+        "Foreign Container",
+        node_id="pve-b",
+        instance_id=OTHER_INSTANCE_ID,
+    )
+    foreign_snapshot = snapshot(
+        (foreign_resource,),
+        nodes=(
+            NodeSnapshot(
+                OTHER_INSTANCE_ID,
+                "pve-b",
+                "pve-b",
+                "online",
+            ),
+        ),
+        instance_id=OTHER_INSTANCE_ID,
+    )
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES), foreign_snapshot]
+    )
+    entry = await setup_entry(hass, transport)
+    coordinator = entry.runtime_data
+    previous = coordinator.data
+    known_nodes = coordinator.known_nodes.copy()
+    known_resources = coordinator.known_resources.copy()
+    callback_nodes: list[NodeSnapshot] = []
+    callback_resources: list[ResourceSnapshot] = []
+    coordinator.new_nodes_callbacks.append(callback_nodes.extend)
+    coordinator.new_resources_callbacks.append(callback_resources.extend)
+
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.last_update_success is False
+    assert isinstance(coordinator.last_exception, UpdateFailed)
+    assert coordinator.last_exception.translation_key == "wrong_instance"
+    assert coordinator.data is previous
+    assert coordinator.data.backend.instance_id == INSTANCE_ID
+    assert coordinator.known_nodes == known_nodes
+    assert coordinator.known_resources == known_resources
+    assert callback_nodes == []
+    assert callback_resources == []
+    registry = dr.async_get(hass)
+    assert registry.async_get_device(
+        {(DOMAIN, f"{OTHER_INSTANCE_ID}:node:pve-b")}
+    ) is None
+    assert registry.async_get_device(
+        {(DOMAIN, foreign_resource.identity.registry_key)}
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_first_refresh_rejects_snapshot_from_different_backend_instance(
+    hass: HomeAssistant,
+) -> None:
+    foreign_resource = resource(
+        ResourceType.QEMU,
+        902,
+        "Foreign VM",
+        instance_id=OTHER_INSTANCE_ID,
+    )
+    transport = FakeTransport(
+        [snapshot((foreign_resource,), instance_id=OTHER_INSTANCE_ID)]
+    )
+    install_factory(hass, transport)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=INSTANCE_ID,
+        version=1,
+        minor_version=1,
+    )
+    entry.add_to_hass(hass)
+
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert entry.state is ConfigEntryState.SETUP_RETRY
+    assert transport.snapshot_calls == 1
+    assert dr.async_entries_for_config_entry(
+        dr.async_get(hass), entry.entry_id
+    ) == []
 
 
 @pytest.mark.asyncio
