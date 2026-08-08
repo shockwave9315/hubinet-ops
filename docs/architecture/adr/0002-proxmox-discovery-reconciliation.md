@@ -48,6 +48,30 @@ nie istnieje operacja `existing_endpoint.url = new_url`. Relacja endpointu do
 `inventory_source_id` również jest immutable, więc record nie może zostać
 przeniesiony między sources.
 
+Raw user URL nie uczestniczy bezpośrednio w uniqueness, equality, retained
+history lookup ani decyzji replacement. Przed utworzeniem recordu jedna
+deterministyczna, wersjonowana canonicalization function musi:
+
+- przyjmować wyłącznie wspierany HTTPS contract i normalizować scheme;
+- normalizować casing DNS hostname oraz canonical representation/brackets IPv6;
+- traktować brak portu i jawny standardowy port HTTPS `443` jako ten sam
+  locator, zachowując każdy jawny non-default port;
+- normalizować pustą/root path i trailing slash;
+- fail-closed odrzucać userinfo, query, fragment oraz ambiguous/invalid URL;
+- nie dodawać magicznie portu PVE `8006`: direct PVE wymaga jawnego `:8006`,
+  dopóki późniejszy contract nie zdefiniuje inaczej;
+- nie zakładać wsparcia reverse-proxy subpaths bez osobnego evidence/contract.
+
+Dwa raw URLs canonicalizujące się do tego samego transport locatora nie mogą
+tworzyć niezależnych endpoint identities ani historii. Ponowne użycie tekstowego
+aliasu retained locatora uruchamia ten sam reactivation/source-binding gate.
+Versioned contract oraz positive/negative canonicalization tests są warunkiem
+implementacji.
+
+Przykładowo `https://PVE.EXAMPLE/` i `https://pve.example:443` są jednym
+locatorem, natomiast `https://pve.example:8006/` jest innym, jawnie
+non-default locatorem. Tekstowa różnica nie resetuje retained history.
+
 Status `active` nie jest zwykłym mutable flag. Jest wynikiem kontrolowanej,
 atomowej state transition. Dla istniejącego source zabronione są bez accepted
 source-binding procedure:
@@ -105,14 +129,21 @@ multi-endpoint failover wymagają osobnego, zaakceptowanego ADR/contract dla
 source binding/attestation. Do tego czasu odpowiedzi z różnych endpointów nie
 są scalane ani porównywane jako inventory jednego source.
 
-Zmiany TLS trust/pinning configuration są security-sensitive, jawnie audytowane
-i przechodzą późniejszy transport-security/revalidation contract. Nie ustanawiają
-source identity. Zmiana CA trust roots, pin/fingerprint albo trybu verification,
-która pozwala zaufać innemu peerowi, nie może sama zachować ani ustanowić
-source-binding trust i nie omija endpoint activation gate. Normalne odnowienie
-CA-valid certificate jest dozwolone, jeśli canonical endpoint URL i logiczna
-trust policy pozostają te same. Szczegółowy certificate/pin rotation contract
-pozostaje przedmiotem późniejszego implementation/security review.
+Security-sensitive TLS trust configuration ma monotonic
+`transport_trust_revision` albo równoważną wersję contractu. Zmiany są explicit,
+jawnie audytowane i przechodzą kontrolowaną revalidation transition, nie luźny
+setter. Każdy discovery run wiąże się z exact `endpoint_id`, canonical transport
+locator oraz expected transport-trust revision. Zmiana revision podczas runu
+unieważnia commit wyniku pod starym contractem.
+
+Broadening/replacement CA roots, pin/fingerprint albo verification policy,
+które może zaufać innemu peerowi, wymaga jawnej revalidation. Nie ustanawia to
+source identity, nie dowodzi source binding i nie omija activation gate.
+Normalne odnowienie CA-valid certificate przy niezmienionym locatorze i
+configured trust policy jest zmianą peer observation, a nie source identity ani
+trust-policy revision. Rotation exact pinned certificate/fingerprint jest
+security-sensitive controlled transition. Szczegółowy certificate rotation i
+source-attestation protocol pozostaje do późniejszego security review.
 
 `/cluster/resources?type=vm` jest preferowanym cluster-wide baseline dla QEMU i
 LXC. Source pokazuje, że endpoint filtruje guests przez `VM.Audit`. Node facts
@@ -281,6 +312,9 @@ Snapshot jest value object niezależnym od SDK i powinien zawierać:
 DiscoverySnapshot
   run_id
   inventory_source_id
+  endpoint_id
+  canonical_transport_locator
+  transport_trust_revision
   observed_at
   source_facts
   source_availability
@@ -305,7 +339,7 @@ DiscoverySnapshot
   resources[]
     slot_locator {inventory_source_id, vmid}
     resource_type {qemu | lxc}
-    current_node_name
+    current_node_name (optional only when relation is unresolved)
     runtime presence/status
     source facts
     observed config metadata
@@ -401,11 +435,10 @@ jest authoritative absence proof i nie umożliwia polling-only
 
 Locator presence i availability/detail status są niezależne:
 
-- `present` — locator występuje w boundary-complete, bieżącym baseline; current
-  node musi występować w tym samym normalized snapshot; detail status może być
-  `ok`, `temporarily_unavailable` albo `error`;
-- `node_unavailable` — source odpowiada, ale przypisany node jest niedostępny;
-  jest availability overlay, zachowujemy locator, last-known node i resource;
+- `present` — locator występuje w boundary-complete, bieżącym baseline; detail
+  status może być `ok`, `temporarily_unavailable` albo `error`;
+- `node_availability` — osobna oś `available`, `unavailable`, `unresolved` albo
+  `not_applicable`; niedostępny node jest overlay i nie zmienia `present`;
 - `missing` — locator nie występuje w udanym, boundary-complete baseline, ale
   brak pozytywnego dowodu trwałego removal/replacement; jest to observational
   negative, które może wynikać także z niewykrytego ACL ABA;
@@ -416,7 +449,7 @@ Dozwolone przejścia (skrót):
 
 ```text
 present + detail_status ok ↔ temporarily_unavailable/error
-present + node_unavailable overlay → present + node available
+present + node_availability unavailable → present + node_availability available
 present → missing                  → present/uncertain
 missing → confirmed_removed       tylko z positive removal authority
                                   + accepted authoritative absence evidence
@@ -426,6 +459,34 @@ baseline source_unavailable/partial → brak `missing`/removal transition
 
 `missing przez N polli` nie wystarcza do `confirmed_removed`, niezależnie od N.
 Długi czas również nie zamienia braku dowodu w dowód.
+
+### Node relation i HA availability
+
+To jest docelowy kontrakt wymagany przez Phase 0 Amendment. `detail_status`
+pozostaje niezależny; dla absence state nie ma bieżącego detail read, a retained
+facts są stale/historyczne.
+
+| Przypadek | `presence` | `node_availability` | `current_node_id` | `last_known_node_id` | HA `via_device` | HA availability |
+| --- | --- | --- | --- | --- | --- | --- |
+| A. Locator present, current assignment znany, node dostępny | `present` | `available` | wymagany, node istnieje w tym samym snapshotcie | `null` | current node | Presence i facts dostępne zależnie od `detail_status`; detail error wyłącza tylko zależne encje. |
+| B. Locator present, current assignment znany, node niedostępny | `present` | `unavailable` | wymagany, node istnieje w tym samym snapshotcie | `null` | current node | Presence może pozostać dostępne; node/runtime/detail-dependent entities są unavailable lub jawnie stale. |
+| C. Locator present, current relation nierozstrzygnięta | `present` | `unresolved` | `null` | poprzedni node, jeśli był znany | last-known node dla presentation, jeśli istnieje; inaczej brak relacji | Presence może pozostać dostępne; location/node-dependent entities są unavailable do resolution. |
+| D. Locator missing | `missing` | `not_applicable` | `null` | ostatni znany node, jeśli istniał | zachowaj last-known presentation relation | Resource entities unavailable; brak purge. |
+| E. Confirmed removed | `confirmed_removed` | `not_applicable` | `null` | ostatni znany node, jeśli istniał | zachowaj last-known presentation relation/history | Resource entities unavailable; brak automatycznego delete/purge. |
+
+`current_node_id` oznacza wyłącznie aktualną, wiarygodnie resolved relację
+inventory. `last_known_node_id` jest presentation/history hint i nigdy security
+mutation route. Mutacja używa wyłącznie current location ponownie związanej z
+trusted `node_binding_id`, exact revision i ważną attestation. W szczególności:
+
+Każde non-null `current_node_id` i `last_known_node_id` musi wskazywać node record
+obecny w tym samym published snapshot; last-known może wskazywać retained/offline
+node. Validator nie może akceptować dangling `via_device` relation.
+
+```text
+node availability failure != resource physical absence
+last_known_node_id != security mutation route
+```
 
 ### Kiedy dokładnie wolno ustawić `confirmed_removed`
 
@@ -515,8 +576,10 @@ ACL-filtered listing, timeout, source outage ani sam upływ czasu nie należą d
 
 Delete/recreate całkowicie pomiędzy dwoma identycznymi pollingami może być
 nierozróżnialne i zachować read-only HA identity. Resource bez zaakceptowanego
-continuity anchor pozostaje `unverified` i nie może posiadać destructive policy,
-maintenance permission ani aktywnych destructive approvals/jobs.
+continuity anchor pozostaje `unverified`. Może zachować historycznie stored
+policy record, lecz effective destructive policy, maintenance permission i
+destructive capabilities są `none`; nie wolno tworzyć nowych destructive
+approvals/jobs.
 
 ## Transaction boundary i publikacja
 
@@ -528,6 +591,7 @@ fetch ACL topology + per-path effective permission snapshots BEFORE
 → fetch per-resource optional detail/facts
 → fetch ACL topology + per-path effective permission snapshots AFTER
 → normalize
+→ validate exact endpoint/canonical locator/transport-trust revision
 → validate boundary topology/permission equality and baseline completeness
 → record independent per-resource detail statuses
 → reconcile in one DB transaction
@@ -537,7 +601,11 @@ fetch ACL topology + per-path effective permission snapshots BEFORE
 ```
 
 Nie publikujemy surowego albo częściowo reconciled snapshotu. Transaction
-sprawdza expected source revision, active locator bindings i monotoniczny czas.
+sprawdza expected source revision, exact active `endpoint_id`, canonical
+transport locator, bieżący `transport_trust_revision`, active locator bindings i
+monotoniczny czas. Transition TLS trust revision musi serializować się z tym
+commitem; mismatch fail-closed odrzuca run, także gdy zmiana nastąpiła po
+odczytach AFTER, lecz przed transaction commit.
 Cursor jest sprawdzany tylko wtedy, gdy provider jawnie deklaruje wspierany
 trusted cursor contract albo używana jest klasa proof B. Snapshot starszy od
 ostatniego committed run jest odrzucany. Restart backendu ładuje ostatni
@@ -553,8 +621,9 @@ pamięć procesu nie jest source of truth.
 | operator żąda nowego URL dla existing source | utwórz inert `candidate` z nowym `endpoint_id` | active record/URL bez zmian; activation disabled bez source-binding proof |
 | active endpoint retired albo source disable/re-enable | discovery disabled/last-known zachowane | gate nie resetuje się; brak direct replacement |
 | TLS trust/pinning zmienione | audytowana transport-security revalidation | nie ustanawia source continuity ani nie aktywuje innego peer/source |
+| `transport_trust_revision` zmienione podczas runu | `invalid` | nie commituj snapshotu odczytanego pod starym trust contract |
 | brak node scope wymaganego do locator baseline | `baseline_completeness=partial` | bez `missing` transitions |
-| locator obecny, optional node/detail facts niedostępne | baseline bez zmian + `node_unavailable`/detail error | locator zachowany jako `present` |
+| locator obecny, optional node/detail facts niedostępne | baseline bez zmian + `node_availability=unavailable`/detail error | locator zachowany jako `present` |
 | baseline pełny, config read jednego guest fail | `baseline_completeness=complete`; per-resource `detail_status=temporarily_unavailable/error` | locator `present`; facts unavailable; inne locatory reconciled normalnie |
 | `GET /access/acl` niedostępne, ograniczone lub niejednoznaczne | `baseline_completeness=partial`/`configuration_error` | bez `missing`/removal transitions |
 | upstream per-path effective evaluation dla path z topology nie spełnia discovery contract | `configuration_error` | bez absence/removal transitions |
@@ -593,6 +662,11 @@ workloadu do takiego node'a może być pokazana read-only, ale jego effective
 destructive capabilities spadają do `none`. Przyszły, jawnie zaakceptowany
 endpoint failover discovery nie może przenosić hostd attestation ani przywracać
 mutation trust.
+
+Semantyka presentation node relation i availability jest zdefiniowana w
+[macierzy wyżej](#node-relation-i-ha-availability). W szczególności
+`node_availability=unavailable` nie zmienia locator presence, a
+`last_known_node_id` nie może zostać przekazane jako host route.
 
 ## Nierozstrzygnięte kwestie
 

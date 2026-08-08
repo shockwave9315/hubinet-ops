@@ -46,7 +46,8 @@ zaakceptowanego security continuity proof.
 - **observation** — read-only fakty z jednego discovery run;
 - **continuity** — backendowa ocena, czy bieżące fakty odnoszą się do tej samej
   incarnation;
-- **presence** — osobny stan dostępności/obecności; nie jest poziomem policy.
+- **presence** — osobny stan obecności locatora; nie jest detail status,
+  node availability ani poziomem policy.
 
 Node nie jest częścią locatora workloadu. Migracja zmienia bieżącą relację z
 node'em, nie identity workloadu.
@@ -305,9 +306,9 @@ podnosi `unverified` do `trusted`.
 | 7 | destroy CT101 | Najpierw `missing`; po pozytywnym potwierdzeniu `confirmed_removed`, `retired` i tombstone. |
 | 8 | później nowy CT101 | Nowy `resource_id` i `locator_generation`; stary rekord pozostaje. |
 | 9 | LXC101 → delete → QEMU101 | Ten sam slot `(source, 101)` zostaje zajęty ponownie. LXC incarnation jest retired/tombstoned; QEMU dostaje nowy `resource_id`, immutable `resource_type=qemu` i nową `locator_generation`. |
-| 10 | delete/recreate między dwoma identycznymi pollingami | Zdarzenie może być observationally indistinguishable. Backend może zachować `resource_id` i read-only HA identity ze stanami `consistent`/`unverified`; nie oznacza to physical continuity. Resource nie ma destructive policy, maintenance permission ani aktywnych destructive approvals/jobs. |
+| 10 | delete/recreate między dwoma identycznymi pollingami | Zdarzenie może być observationally indistinguishable. Backend może zachować `resource_id` i read-only HA identity ze stanami `consistent`/`unverified`; nie oznacza to physical continuity. Retained policy może pozostać historycznie, ale effective destructive policy, maintenance permission i nowe destructive approvals/jobs są niedostępne. |
 | 11 | backend offline podczas delete/recreate | Znana przerwa w observation jest rzeczywistym gap: observational `uncertain`, security trust revoked/unavailable i fail-closed revalidation. |
-| 12 | node chwilowo offline | Presence `node_unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o ponownym bindingu. |
+| 12 | node chwilowo offline | Jeśli locator nadal występuje w baseline, presence pozostaje `present`, a `node_availability=unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o mutation trust, nie o samym read-only presentation bindingu. |
 | 13 | cały source/API niedostępny | Zachowanie last-known inventory, freshness maleje; żadnych missing/removal transitions. |
 | 14 | resource missing przez kilka polli i wraca | Liczba polli nie potwierdza removal. Powrót wymaga continuity evidence; przy braku dowodu provisional ID. |
 | 15 | `confirmed_removed`, potem locator wraca | Zawsze nowy `resource_id`/generation. Nawet jawny restore tworzy nową incarnation; lineage może wskazać poprzednika. |
@@ -317,17 +318,35 @@ podnosi `unverified` do `trusted`.
 
 ## Konsekwencje bezpieczeństwa
 
-Fundamentalny invariant:
+Fundamentalny invariant rozdziela trwały zapis intencji operatora od bieżącej
+autoryzacji:
 
 ```text
-destructive policy attaches to a trusted resource identity and continuity proof,
-never merely to resource_id or Proxmox locator
+stored policy attaches durably to resource_id and its enrollment/history context,
+never merely to a Proxmox locator
+
+stored policy allows operation
+∩ policy applicability
+∩ trusted security continuity
+∩ backend capability
+∩ exact resource/binding/revision
+∩ operation-specific preconditions
+= operation eligible
 ```
 
-Nowy, `unverified` albo observationally `uncertain` resource zaczyna/pozostaje na
-poziomie `discovered`:
+Stored/retained policy oraz jej revisions pozostają przy starym `resource_id`
+po `uncertain`, utracie trust, replacement, retirement i utworzeniu tombstone.
+Jest to wymagane dla audytu i nie oznacza, że policy jest effective/applicable.
+Policy może być applicable wyłącznie dla dokładnego enrollment/continuity
+context, aktualnego expected resource/binding revision, eligible lifecycle oraz
+wszystkich operation-specific gates.
+
+Nowy resource nie ma stored policy. Istniejący `unverified`/`revoked` resource
+zachowuje wcześniejszą stored policy wyłącznie jako historię. W obu przypadkach:
 
 ```text
+stored policy = retained, jeśli wcześniej istniała
+effective/applicable destructive policy = false
 destructive capabilities = none
 maintenance permission = none
 ```
@@ -338,9 +357,25 @@ locator binding, expected continuity revision, `trusted`, policy i runtime
 preconditions. Locator jest parametrem wykonawczym wyliczonym dopiero po tych
 kontrolach.
 
-Resource ze stanem security continuity `unverified` nie może posiadać
-destructive policy, maintenance permission ani aktywnych destructive
-approvals/jobs. Stabilny `resource_id` sam nie jest podstawą wyjątku. Invariant:
+Resource ze stanem security continuity `unverified` lub `revoked` może posiadać
+wyłącznie historycznie retained policy record; nie może mieć effective
+destructive/maintenance policy ani nowych aktywnych destructive approvals/jobs.
+Utrata trust blokuje/przerywa istniejące aktywne destructive operations zgodnie
+z późniejszym jawnie audytowanym contract. Stabilny `resource_id` ani sama
+obecność policy record nie jest podstawą wyjątku.
+
+Granularne flagi `automatic_rollback`, `manual_rollback_allowed` i
+`manual_snapshot_restore_allowed` zachowują swoje znaczenie, ale każda jest
+tylko jednym wymaganym gate. Na przykład `automatic_rollback=true` bez trusted
+continuity, exact binding/revision, backend capability i wymaganych snapshot/job
+preconditions nie autoryzuje rollbacku.
+
+Successor po replacement dostaje nowy `resource_id` i nie dziedziczy stored
+policy, approvals ani jobs. Ewentualne przyszłe „copy settings” tworzy nową,
+jawną i audytowaną policy dla successor resource; nie reaktywuje historycznej
+policy poprzednika.
+
+Invariant:
 
 ```text
 false continuity must never transfer destructive authority
@@ -362,14 +397,35 @@ false continuity must never transfer destructive authority
 - niewidoczny delete/recreate pomiędzy identycznymi pollingami może zachować
   read-only HA identity, ponieważ stockowe discovery nie potrafi go rozróżnić;
   nie przenosi to żadnej destructive authority.
+- API/HA może prezentować retained policy i historię, lecz backend publikuje
+  osobno derived policy applicability/effective capabilities oraz suspended
+  reason; frontend nigdy nie wylicza capability z samej obecności policy.
 
 ## PHASE 0 AMENDMENT REQUIRED
 
-Obecne `ResourceIdentity(instance_id, resource_type, vmid)` w Phase 0 musi zostać
-zmienione **przed implementacją Phase 1**. `instance_id` trzeba rozdzielić na
-`backend_instance_id` i `inventory_source_id`, a HA resource identity oprzeć na
-backendowym `resource_id` inventory/candidate record. Trusted operations muszą
-osobno wymagać security continuity proof. Niniejsza faza nie modyfikuje kodu.
+Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Phase
+1**. Wymagany amendment obejmuje łącznie:
+
+- zastąpienie `ResourceIdentity(instance_id, resource_type, vmid)` przez jawne
+  `backend_instance_id`, `inventory_source_id` i backendowy `resource_id`;
+- oddzielenie locator presence (`present`, `missing`, `confirmed_removed`) od
+  per-resource `detail_status` (`ok`, `temporarily_unavailable`, `error`) oraz
+  `node_availability`;
+- usunięcie mutually-exclusive modelu, w którym `temporarily_unavailable` albo
+  `node_unavailable` zastępuje presence: jeśli locator nadal istnieje,
+  `temporarily_unavailable` jest detail status, a niedostępny node jest overlay
+  przy `presence=present`;
+- wdrożenie jednej semantyki `current_node_id`/`last_known_node_id` i HA
+  `via_device` opisanej w [ADR 0002](0002-proxmox-discovery-reconciliation.md#node-relation-i-ha-availability);
+- dostosowanie mapowania availability w Coordinator/entities tak, aby błąd
+  detail lub node availability nie oznaczał automatycznie physical absence;
+- zmianę validatorów snapshotu i testów Device Registry/node relation dla
+  rozdzielonych osi, rename oraz migracji.
+
+Obecny `docs/architecture/0.5-foundation.md` dokumentuje faktyczny kontrakt
+Phase 0 i nie jest w tym PR przepisywany tak, jakby amendment już wdrożono.
+Trusted operations muszą osobno wymagać zaakceptowanego security continuity
+proof. Niniejsza faza nie modyfikuje kodu ani testów.
 
 ## Nierozstrzygnięte kwestie
 
