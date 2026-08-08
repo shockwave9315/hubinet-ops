@@ -81,12 +81,27 @@ Home Assistant
   `automatic_rollback` policy for the exact resource incarnation.
 - Manual update rollback requires `manual_rollback_allowed` plus a failed,
   blocked, or interrupted update operation and its recorded eligible snapshot.
-  Explicit snapshot restore additionally requires
-  `manual_snapshot_restore_allowed`, the required backend capability, explicit
-  confirmation, no conflicting plan or destructive job, and independent host
-  policy. All normal rollback and restore paths must also validate exact
-  identity/binding/revision/trust, evidence, freshness, locking, and audit gates;
-  none is an automatic fallback.
+- Normal explicit snapshot restore remains backend-authoritative and requires all
+  of these fail-closed gates:
+  - `manual_snapshot_restore_allowed`;
+  - the exact backend capability `snapshot_rollback`;
+  - an existing snapshot that is both rollback-eligible and Hubinet-owned;
+  - explicit Home Assistant/operator confirmation;
+  - no waiting backend plan of any kind and no approved backend plan of any kind;
+  - no active global destructive job;
+  - an atomic backend recheck of `manual_snapshot_restore_allowed`,
+    `snapshot_rollback`, snapshot existence, rollback eligibility, Hubinet
+    ownership, explicit confirmation, absence of every waiting backend plan,
+    absence of every approved backend plan, and absence of any active global
+    destructive job while inserting the local restore job, before the first
+    hostd POST;
+  - independent PVE/host snapshot-restore policy enforcement; and
+  - where applicable under 0.5, exact `resource_id`/incarnation, active binding,
+    identity/binding revisions, trust, and freshness checks in addition to every
+    gate above. A current VMID may be only the validated execution locator/context
+    for the host policy and operation, never durable identity.
+  None of these gates is optional, and normal restore is never an automatic
+  fallback.
 
 ### Transitional legacy 0.4 break-glass exception
 
