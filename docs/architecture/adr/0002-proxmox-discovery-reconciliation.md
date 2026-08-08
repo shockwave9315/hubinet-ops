@@ -42,6 +42,44 @@ Source może przechowywać dodatkowe endpoint records wyłącznie jako
 failover. Gdy active endpoint jest niedostępny, wynik to `source_unavailable`;
 provider nie próbuje kolejnego endpointu.
 
+Canonical HTTPS URL/transport locator jest immutable dla jednego endpoint
+record. Zmiana URL zawsze tworzy nowy `endpoint_id` ze statusem `candidate`;
+nie istnieje operacja `existing_endpoint.url = new_url`. Relacja endpointu do
+`inventory_source_id` również jest immutable, więc record nie może zostać
+przeniesiony między sources.
+
+Status `active` nie jest zwykłym mutable flag. Jest wynikiem kontrolowanej,
+atomowej state transition. Dla istniejącego source zabronione są bez accepted
+source-binding procedure:
+
+- `candidate → active` i `inactive → active`;
+- direct replacement active endpoint record;
+- usunięcie/retire active record i utworzenie innego bezpośrednio jako active;
+- zachowanie `endpoint_id` przy zmianie URL/transport targetu;
+- przepięcie endpoint record do innego `inventory_source_id`;
+- disable/re-enable source użyte do zresetowania activation gate.
+
+Historyczne endpoint records i provenance są retencjonowane, więc delete/recreate
+nie zeruje gate. Retire active endpointu musi atomowo wyłączyć discovery dla
+source; nie pozwala utworzyć zastępstwa jako active. Wyłączenie i ponowne
+włączenie source nie przywraca wyjątku initial creation, a awaria active
+endpointu nie upoważnia providera do wyboru zastępstwa.
+
+### Initial source creation a existing source
+
+Jedyny wyjątek Phase 1 dotyczy atomowego initial source creation. Nowy
+`inventory_source_id`, który niczego historycznego nie dziedziczy, może zostać
+utworzony w jednej transaction razem z dokładnie jednym initial active endpoint
+record. To ustanawia nową backendową source identity; nie kontynuuje wcześniejszego
+source ani inventory.
+
+Po commit initial creation source jest `existing`, nawet zanim wykona pierwszy
+udany polling. Każde późniejsze żądanie innego transport locatora tworzy inert
+candidate. Dopóki source-binding contract pozostaje unresolved, candidate
+activation i active endpoint replacement są disabled. Operator, który nie może
+przedstawić source-binding proof, musi utworzyć nowy `inventory_source_id` z
+własnym initial active endpointem.
+
 Proxmox `pveproxy` udostępnia API na TCP 8006 i może forwardować żądania do
 innych node'ów, więc jeden osiągalny endpoint może obsłużyć cluster-wide
 discovery. Nie dowodzi to jednak, że dwa niezależnie osiągalne endpointy
@@ -49,12 +87,32 @@ reprezentują ten sam `inventory_source_id`. Cluster name, node membership,
 VMIDs, hostname, TLS certificate ani endpoint URL nie są samodzielnie
 wystarczającym source-binding proof.
 
+```text
+stable/unchanged endpoint URL != proven physical source continuity
+```
+
+Ten sam URL może po rebuildzie, zmianie DNS, reverse proxy albo infrastruktury
+wskazywać inny Proxmox environment. Phase 1 nie rozwiązuje niewidocznego
+same-URL repoint. Dla podstawowego read-only inventory jest to świadomie
+zaakceptowana observational limitation; stabilny locator, TLS state ani
+pozytywny odczyt nie mogą na tej podstawie nadać security continuity lub
+destructive trust.
+
 Active endpoint musi być jawnie skonfigurowany i używać TLS weryfikowanego przez
 zaufane CA albo jawnie przypięty fingerprint; `verify=false` nie jest
 rekomendowanym production mode. Aktywacja candidate endpointu oraz przyszły
 multi-endpoint failover wymagają osobnego, zaakceptowanego ADR/contract dla
 source binding/attestation. Do tego czasu odpowiedzi z różnych endpointów nie
 są scalane ani porównywane jako inventory jednego source.
+
+Zmiany TLS trust/pinning configuration są security-sensitive, jawnie audytowane
+i przechodzą późniejszy transport-security/revalidation contract. Nie ustanawiają
+source identity. Zmiana CA trust roots, pin/fingerprint albo trybu verification,
+która pozwala zaufać innemu peerowi, nie może sama zachować ani ustanowić
+source-binding trust i nie omija endpoint activation gate. Normalne odnowienie
+CA-valid certificate jest dozwolone, jeśli canonical endpoint URL i logiczna
+trust policy pozostają te same. Szczegółowy certificate/pin rotation contract
+pozostaje przedmiotem późniejszego implementation/security review.
 
 `/cluster/resources?type=vm` jest preferowanym cluster-wide baseline dla QEMU i
 LXC. Source pokazuje, że endpoint filtruje guests przez `VM.Audit`. Node facts
@@ -492,6 +550,9 @@ pamięć procesu nie jest source of truth.
 | --- | --- | --- |
 | active endpoint timeout/unavailable | `source_unavailable` | zachowaj, oznacz stale; nie próbuj candidate endpointu; bez missing/removal |
 | candidate endpoint osiągalny | nie uczestniczy w run | brak automatic failover do czasu accepted source-binding contract |
+| operator żąda nowego URL dla existing source | utwórz inert `candidate` z nowym `endpoint_id` | active record/URL bez zmian; activation disabled bez source-binding proof |
+| active endpoint retired albo source disable/re-enable | discovery disabled/last-known zachowane | gate nie resetuje się; brak direct replacement |
+| TLS trust/pinning zmienione | audytowana transport-security revalidation | nie ustanawia source continuity ani nie aktywuje innego peer/source |
 | brak node scope wymaganego do locator baseline | `baseline_completeness=partial` | bez `missing` transitions |
 | locator obecny, optional node/detail facts niedostępne | baseline bez zmian + `node_unavailable`/detail error | locator zachowany jako `present` |
 | baseline pełny, config read jednego guest fail | `baseline_completeness=complete`; per-resource `detail_status=temporarily_unavailable/error` | locator `present`; facts unavailable; inne locatory reconciled normalnie |
@@ -543,8 +604,9 @@ mutation trust.
 5. Monotonic ACL/config revision, transactional snapshot lub inny interval-wide
    consistency/absence proof — **UNKNOWN** dla stockowego polling API.
 6. Mechanizm source binding/attestation bez natywnego immutable cluster UUID.
-   Dopóki nie zostanie zaakceptowany, dokładnie jeden endpoint jest active, a
-   automatic failover pozostaje wyłączony.
+   Dopóki nie zostanie zaakceptowany, tylko initial source creation może nadać
+   status active; późniejsza aktywacja/replacement pozostają wyłączone, dokładnie
+   jeden endpoint jest active, a automatic failover pozostaje wyłączony.
 7. Finalny workload continuity proof/enrollment anchor. Dopóki nie zostanie
    zaakceptowany, trusted destructive capabilities są globalnie niedostępne;
    nie blokuje to przyszłego read-only discovery/inventory.
