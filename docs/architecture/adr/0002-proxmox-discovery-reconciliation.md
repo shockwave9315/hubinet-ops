@@ -117,8 +117,10 @@ endpointu nie upoważnia providera do wyboru zastępstwa.
 Jedyny wyjątek Phase 1 dotyczy atomowego initial source creation. Nowy
 `inventory_source_id`, który niczego historycznego nie dziedziczy, może zostać
 utworzony w jednej transaction razem z dokładnie jednym initial active endpoint
-record. To ustanawia nową backendową source identity; nie kontynuuje wcześniejszego
-source ani inventory.
+record, wymaganym `source_runtime_health` w stanie
+`initial/not_yet_observed`/non-fresh z unset last-success provenance oraz
+zwiększeniem globalnego `published_state_revision`. To ustanawia nową backendową
+source identity; nie kontynuuje wcześniejszego source ani inventory.
 
 Po commit initial creation source jest `existing`, nawet zanim wykona pierwszy
 udany polling. Każde późniejsze żądanie innego transport locatora tworzy inert
@@ -826,6 +828,7 @@ atomic transaction:
     + provider contract/version
   → persist issued run with returned discovery_run_sequence, expected context
     and no required completion fields
+  → increment global published_state_revision because last_issued_run_sequence is exposed
 → commit issuance/context
 → fetch ACL topology + per-path effective permission snapshots BEFORE
 → fetch locator baseline and declared baseline prerequisites
@@ -838,17 +841,26 @@ atomic transaction:
 → record independent per-resource detail statuses
 → classify outcome
 → if authoritative inventory success:
-    finalize run exactly once and reconcile in one DB transaction
+    one atomic DB transaction:
+    → revalidate exact current source/endpoint/canonicalization/TLS context
+    → finalize run exactly once + update completion provenance
+    → reconcile inventory
     (w tym optional atomic direct old-binding → successor-binding handoff)
     → update committed-inventory and source-health tokens
-    → increment inventory revision and published-state revision
+    → update last-successful health/freshness provenance
+    → increment inventory revision + published-state revision
     → derive presence, continuity, freshness and capabilities
-    → commit
+    → commit everything or nothing
     → publish committed inventory + source state to Hubinet Ops API/HA
 → else failed/partial/unavailable/invalid:
-    finalize run exactly once; no resource reconciliation
-    → CAS-update newest applicable source health/outcome
-    → increment published-state revision if API-visible health changed
+    one atomic DB transaction:
+    → finalize run exactly once + max-update completion provenance
+    → revalidate exact applicability/current source/endpoint/canonicalization/TLS context
+    → if newest applicable: CAS-update run-health provenance,
+      current health/freshness/origin/reason and invalidate mutation freshness
+    → increment published-state revision for every published-field change
+    → no resource reconciliation
+    → commit everything or nothing
     → publish source state with retained last committed inventory
 ```
 
@@ -863,7 +875,8 @@ metadata i nowe observed facts nie zmieniają znaczenia bieżącego runu, więc 
 zwiększają revision.
 
 Run zapisuje expected `source_config_revision` przed fetch. Reconciliation
-transaction sprawdza fail-closed:
+transaction oraz failed-run transaction, która miałaby zastosować health,
+sprawdzają fail-closed wewnątrz swojej atomic boundary:
 
 ```text
 current source_config_revision == expected source_config_revision
@@ -874,14 +887,19 @@ discovery_run_sequence > inventory_sources.last_committed_run_sequence
 discovery_run_sequence > source_runtime_health.last_health_run_sequence
 ```
 
-Każdy mismatch klasyfikuje run jako invalid/stale: bez reconciliation, inventory
-commit ani publikacji snapshotu. Source configuration mutation, endpoint/TLS
-transition i reconciliation commit serializują się w tej samej backendowej
-transaction/lock/CAS boundary. Dzięki monotonic revision także zmiana source
+Każdy mismatch klasyfikuje run jako invalid/stale: bez reconciliation ani
+inventory commit oraz bez zmiany current health nowego contextu. Run może zostać
+one-time finalized/audytowany i podnieść completion provenance; jeśli jest ono
+publikowane, ta sama transaction zwiększa `published_state_revision`. Source
+configuration mutation, active route/canonicalization/TLS transition, issuance,
+successful reconciliation oraz failed-run health application serializują się w
+tej samej backendowej transaction/lock/CAS boundary. Dzięki monotonic revision
+także zmiana source
 configuration `A → B → A` podczas runu pozostawia inny numer. Exact endpoint,
 canonicalization oraz TLS checks są oddzielne i nie mogą zostać zastąpione przez
-source revision. Mismatch odrzuca run także wtedy, gdy zmiana nastąpiła po
-odczytach AFTER, lecz przed transaction commit.
+source revision. Applicability check wykonany przed transaction nie jest
+security boundary. Mismatch odrzuca health/reconciliation application także
+wtedy, gdy zmiana nastąpiła po odczytach AFTER, lecz przed transaction commit.
 
 ### `discovery_run_sequence`
 
@@ -900,6 +918,7 @@ atomic increment source.last_issued_run_sequence
 → capture exact expected source/endpoint/canonicalization/TLS context
   + provider contract/version
 → persist issued run with the returned sequence and expected context only
+→ increment global published_state_revision because last_issued_run_sequence is exposed
 → commit issuance/context
 → dopiero potem rozpocznij fetch
 ```
@@ -958,6 +977,10 @@ issue run → completion fields may remain unset
 successful completion → finalizes exactly once
 failed completion → finalizes exactly once
 second conflicting finalization → rejected
+newest applicable failed finalization + health/published update → atomic all-or-nothing
+context changes before failed-run transaction → finalize audit, reject health application
+source A/B concurrent published commits → distinct global published_state_revision
+API read during N→N+1 commit → complete N or complete N+1, never torn view
 run A start → run B start → B commit → A commit attempt = rejected
 run A start → A commit → run B start → B commit = allowed
 ```
@@ -994,8 +1017,10 @@ Conceptual source state publikuje co najmniej:
 - `last_issued_run_sequence`;
 - `latest_completed_run_sequence` i redacted outcome, wybierane przez najwyższy
   completed sequence niezależnie od wall-clock finish order;
-- `last_health_run_sequence` i `last_run_health_outcome` najnowszego completed
-  runu applicable do bieżącego source/transport context;
+- `last_health_run_sequence` jako najwyższy sequence, którego run-derived health
+  outcome został kiedykolwiek skutecznie zastosowany, oraz odpowiadający
+  `last_run_health_outcome`; exact context znajduje się w powiązanym run record i
+  nie musi być current contextem;
 - `last_committed_run_sequence`;
 - `last_successful_observed_at`;
 - current health/freshness, np. `healthy/fresh`, `stale`,
@@ -1016,21 +1041,33 @@ pochodzą z canonical `inventory_sources`; nie należą do
 `source_runtime_health`. Każdy zakończony run może atomowo podnieść
 completion-audit token, jeśli jego
 sequence jest większy od `latest_completed_run_sequence`; to nie nadaje mu prawa
-do inventory reconciliation ani current-health update.
+do inventory reconciliation ani current-health update. Jeśli completion token/
+outcome jest publikowany, jego zmiana zwiększa w tej samej transaction
+`published_state_revision`, nawet dla old-context runu bez zmiany current health.
 
-Successful authoritative inventory run wykonuje jedną transaction, która może
-reconcile resources, aktualizuje `last_committed_run_sequence`, successful
-observation/freshness i `last_health_run_sequence`, po czym publikuje nowy
-inventory. Failed, partial, unavailable albo invalid **applicable** run:
+Successful authoritative inventory run wykonuje jedną atomic transaction, która
+ponownie waliduje exact current context, one-time finalizuje run i completion
+provenance, reconciliuje resources, aktualizuje `last_committed_run_sequence`,
+successful observation/freshness i `last_health_run_sequence`, zwiększa
+`inventory_revision` i `published_state_revision`, po czym commit/publikuje
+wszystko albo nic.
+
+Failed, partial, unavailable albo invalid **newest applicable** run wykonuje
+jedną atomic transaction obejmującą one-time finalization, completion-audit max,
+exact applicability validation, health CAS, `last_run_health_outcome`, current
+health/freshness/origin/reason, mutation-freshness invalidation i
+`published_state_revision`. W tej transaction:
 
 - nie wykonuje resource reconciliation;
 - nie tworzy `missing`, removal ani replacement transition;
 - nie zmienia resource identity/presence;
-- może zachować redacted run audit;
-- musi zaktualizować health/outcome, jeśli jego sequence jest większy od
+- zachowuje redacted run audit i completion provenance;
+- aktualizuje health/outcome, jeśli jego sequence jest większy od
   `last_health_run_sequence`;
 - publikuje/wyprowadza stale/degraded source state razem z zachowanym last
-  committed inventory.
+  committed inventory;
+- wszystko commit albo nic commit — crash nie może pozostawić finalized failed
+  runu przy nadal fresh source health.
 
 Health update używa CAS:
 
@@ -1038,23 +1075,42 @@ Health update używa CAS:
 run.discovery_run_sequence > source_runtime_health.last_health_run_sequence
 ```
 
-Run ze starym source/endpoint/transport context jest auditowalny, ale nie jest
-applicable do bieżącego health. Controlled source config/active route/
-canonicalization/TLS trust transition oznacza atomowo current health jako stale
-pod nowym contextem i ustawia origin
-`controlled_context_transition` z jawnym reason. Nie zmienia przy tym
+W tej samej transaction backend ponownie sprawdza:
+
+```text
+run.expected_source_config_revision == current source_config_revision
+run.expected_endpoint_id == exact current active endpoint_id
+run.expected_canonical_locator/version == current canonical locator/version
+run.expected_transport_trust_revision == current transport_trust_revision
+```
+
+To jest applicability check; wcześniejszy check przed transaction nie wystarcza
+i nie może tworzyć TOCTOU window. Run ze starym contextem jest auditowalny: może
+zostać finalized i podnieść completion-audit provenance, lecz nie może zmienić
+current health nowego contextu.
+
+Controlled source config/active route/canonicalization/TLS trust transition
+wykonuje jedną atomic transaction, która zmienia odpowiedni context/revision,
+ustawia current health jako stale, origin `controlled_context_transition` i
+jawny reason, ustawia mutation freshness na false oraz zwiększa
+`published_state_revision`. Transaction serializuje się z issuance, successful
+reconciliation oraz failed-run health application. Nie zmienia
 `last_run_health_outcome`, `last_health_run_sequence` ani
 `latest_completed_run_sequence`, nie tworzy fake runu i nie cofa żadnej
-sequence. Poprzedni inventory jest not mutation-fresh do nowego udanego commitu;
-po nim current origin staje się `discovery_run(sequence)`.
+sequence. Te run-derived pola zachowują provenance ostatniego zastosowanego runu
+również wtedy, gdy należał do poprzedniego contextu. Current source of truth to
+current health/origin/reason wraz z current context. Poprzedni inventory jest not
+mutation-fresh do nowego udanego commitu; po nim current origin staje się
+`discovery_run(sequence)`.
 
-Initial source przed pierwszym successful inventory commit ma
-`current_health_origin=initial/not_yet_observed`, jawnie non-fresh health,
-`last_successful_observed_at=null` oraz
-`inventory_sources.last_committed_run_sequence=null` albo jednoznaczny initial
-sentinel zgodny z allocator contract. Nie ma effective destructive capabilities.
-Initial health ani późniejsza controlled context transition nie resetują
-monotonic sequences.
+Initial source creation atomowo tworzy source, dokładnie jeden initial active
+endpoint oraz wymagany `source_runtime_health` record z
+`current_health_origin=initial/not_yet_observed`, jawnie non-fresh health i
+`last_successful_observed_at=null`; `last_committed_run_sequence` pozostaje null
+albo używa jednoznacznego initial sentinel. Ta sama transaction zwiększa
+`published_state_revision`, ponieważ source pojawia się w API. Nie ma effective
+destructive capabilities. Initial health ani późniejsza controlled context
+transition nie resetują monotonic sequences.
 
 Dla prostych fail-closed semantics successful inventory commit także wymaga, aby
 nie istniał wyższy `last_health_run_sequence`. Przykład:
@@ -1081,16 +1137,38 @@ wiązane z przypadkową nazwą enumu: istnieje tylko po authoritative successful
 applicable commit i do pierwszego nowszego applicable health outcome
 unieważniającego confidence.
 
-Każda API-visible zmiana ma monotoniczny published-state change token.
-Inventory reconciliation zwiększa `inventory_revision` i
-`published_state_revision`; health-only CAS update albo controlled context
-transition zwiększa `published_state_revision` bez wymuszania nowego
-`inventory_revision`. Dzięki temu HA/cache/push-refresh widzi
-`healthy → source_unavailable/stale` mimo identycznego `resources[]`. Globalny
-published timestamp nie zastępuje per-source `last_successful_observed_at`, run
-sequence ani committed context provenance.
+Każda committed zmiana dowolnego API-visible pola ma monotoniczny
+published-state change token. Inventory reconciliation zwiększa
+`inventory_revision` i `published_state_revision`; health/completion-only CAS
+albo controlled context transition zwiększa `published_state_revision` bez
+wymuszania nowego `inventory_revision`. Dotyczy to m.in. zmian
+`latest_completed_run_sequence/outcome`, `last_health_run_sequence/outcome`,
+last-success timestamp, health reason/origin, current/committed source context,
+initial source state, resource/node/policy i derived capabilities.
+
+Samo porównanie health enum jest niewystarczające: `seq11 source_unavailable →
+seq12 source_unavailable` zmienia published provenance i musi zwiększyć
+`published_state_revision`. Old-context run podnoszący tylko publikowany
+completion-audit max również zwiększa token. `inventory_revision` i
+`published_state_revision` są durable, atomic, strictly increasing i never
+reused; globalna alokacja jest serializowana, więc concurrent source A/B commits
+nie mogą otrzymać tego samego resulting published revision. Revision update i
+publikowane dane należą zawsze do tej samej atomic transaction.
+
+Dzięki temu HA/cache/push-refresh widzi `healthy → source_unavailable/stale`
+mimo identycznego `resources[]`. Globalny published timestamp nie zastępuje
+per-source `last_successful_observed_at`, run sequence ani committed context
+provenance.
 Canonical global ownerem obu published-view tokens jest `backend_instance`;
 source i health records nie przechowują niezależnych authoritative kopii.
+
+`published_state_revision=N` identyfikuje dokładnie jeden logicznie spójny
+committed backend view. API assembly musi używać consistent DB read snapshot/
+transaction albo równoważnej granicy i zwracać revision N wraz ze wszystkimi
+`sources[]`, `nodes[]`, `resources[]`, policy i derived capabilities ze stanu N.
+Torn view — revision N, część danych N i część po concurrent commit N+1 — jest
+zabroniony. Consumer dostaje kompletne N albo kompletne N+1. To nie definiuje
+HTTP caching protocol.
 
 Published API rozróżnia osiągalność Hubinet backendu od freshness każdego
 Proxmox source. Przy `source_unavailable`/degraded/configuration error albo
@@ -1138,13 +1216,19 @@ source unavailable != resource missing
 | run A start, run B start, B commit, A commit attempt | `invalid`/stale A | `discovery_run_sequence <= last_committed_run_sequence`; bez zmian/publish |
 | concurrent A/B sequence allocation | dwa run records | atomic issuance gwarantuje różne strictly-increasing sequence dla source |
 | issue run, przed fetch | `issued` record | completion fields pozostają unset; issuance nie wymaga fake outcome/timestamps/hash |
-| successful albo failed completion | controlled terminal finalization | completion fields zapisane dokładnie raz; conflicting second finalization odrzucona |
+| successful completion | jedna atomic transaction | finalization + completion provenance + reconciliation + commit/health provenance + oba global revisions; wszystko albo nic |
+| newest applicable failed completion | jedna atomic transaction bez resource reconciliation | finalization + completion max + exact applicability + health CAS/outcome/state + freshness invalidation + published revision; wszystko albo nic |
+| second conflicting finalization | rejected | immutable completion audit i brak jakiejkolwiek health/publish mutation |
 | allocate N, crash przed fetch/reconciliation | incomplete issued run, luka dozwolona | następny issued sequence jest `> N`; brak reuse; optional późniejsze `abandoned` nie wymyśla observation data |
 | B seq11 kończy `source_unavailable`, następnie A seq10 kończy success | newest health pozostaje z B | A nie nadpisuje health ani nie commit/publikuje starszego inventory |
 | newest applicable partial/unavailable/invalid run | degraded source health | CAS-update health/outcome, bez resource reconciliation/identity/presence transitions; retained inventory pozostaje last-known |
-| controlled source/transport context transition po healthy seq10 | current health stale, origin `controlled_context_transition` | last run outcome/sequence pozostają provenance seq10; nie powstaje fake run ani completion |
-| health-only CAS/context transition | resource inventory bez zmian | zwiększ `published_state_revision`, nie `inventory_revision`; HA/cache musi zobaczyć nowy state |
-| initial source przed pierwszym successful commit | `not_yet_observed`/non-fresh | null/unset last-success fields i commit token sentinel; destructive capabilities `none` |
+| context zmienia się między pre-check a failed-run transaction | old-context run nieapplicable | finalizacja/completion audit dozwolone; transaction revalidation blokuje current health overwrite |
+| controlled source/transport context transition po healthy seq10 | current health stale, origin `controlled_context_transition` | jedna transaction zmienia context, freshness i published revision; last run outcome/sequence pozostają provenance seq10 |
+| seq11 i seq12 oba `source_unavailable` | ten sam health enum, inne provenance | oba applicable published updates zwiększają unique `published_state_revision` |
+| old-context run podnosi tylko `latest_completed_run_sequence` | current health bez zmian | published completion field zmienia się, więc ta sama transaction zwiększa `published_state_revision` |
+| concurrent source A/B published commits | dwie globalne revisions | resulting `published_state_revision` muszą być różne i strictly ordered |
+| API read przecina concurrent N→N+1 commit | consistent read snapshot | zwróć kompletne N albo kompletne N+1; torn view odrzucony |
+| initial source creation | `not_yet_observed`/non-fresh | atomowo source + initial active endpoint + health record + published revision; destructive capabilities `none` |
 
 ## Trust boundary
 

@@ -577,8 +577,9 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   tego samego VMID, current occupant resolution przez active binding oraz
   retained node references bez dangling `via_device`;
 - source health/freshness/origin fields, initial non-fresh semantics,
-  `published_state_revision` dla health-only transitions i HA tests
-  odróżniające osiągalny backend ze świeżym inventory od osiągalnego backendu ze
+  globalny `published_state_revision` dla każdej zmiany publikowanego pola,
+  consistent-read snapshot contract oraz HA tests odróżniające osiągalny backend
+  ze świeżym inventory od osiągalnego backendu ze
   stale/degraded/invalid-current-context Proxmox source;
 - validator/contract tests wymagające `detail_status=not_applicable` dla
   `missing`, `confirmed_removed` i `not_current` oraz zabraniające tej wartości
