@@ -1,0 +1,304 @@
+# ADR 0001: identity zasobu i incarnation
+
+Status: **PROPOSED**
+
+Data: 2026-08-08
+
+## Kontekst i decyzja w skrócie
+
+Proxmox VE nie udostępnia jednego, oficjalnie udokumentowanego, niezmiennego
+identyfikatora workloadu wspólnego dla QEMU i LXC. `vmid` identyfikuje zajęty
+slot w obrębie klastra, lecz może zostać użyty ponownie. Nazwa i node są
+zmienne. `digest`, `vmgenid`, znaczniki czasu i pozostałe pola konfiguracyjne nie
+spełniają wymagań trwałej identity.
+
+Proponujemy model D, będący uszczegółowieniem modelu C:
+
+```text
+backend_instance_id             instalacja Hubinet Ops
+inventory_source_id             jawnie skonfigurowane środowisko Proxmox
+resource_id                     jedna trwała incarnation workloadu
+external locator                (inventory_source_id, resource_type, vmid)
+locator_generation              kolejny backendowy binding tego samego slotu
+continuity_state + evidence     ocena, czy obserwacja należy do incarnation
+```
+
+`resource_id` jest losowym, nieprzezroczystym UUID nadanym przez backend. Jest
+identity konkretnej incarnation, a nie „logicznej usługi” i nie zależy od
+nazwy, VMID ani node'a. `locator_generation` porządkuje historię wykorzystania
+slotu, ale sam nie dowodzi replacement. Policy, plany, jobs, locks oraz HA
+identity wiążą się z `resource_id`, nigdy wyłącznie z locatorem.
+
+## Terminologia i granice
+
+- **backend** — konkretna instalacja Hubinet Ops 0.5 i jej nowa baza danych;
+- **source** — jeden operatorowo skonfigurowany cluster Proxmox VE albo jeden
+  standalone node;
+- **locator** — adres aktualnego slotu: source, typ `qemu`/`lxc` i `vmid`;
+- **resource/incarnation** — jeden workload od utworzenia lub jawnego uznania
+  ciągłości do potwierdzonego replacement;
+- **observation** — read-only fakty z jednego discovery run;
+- **continuity** — backendowa ocena, czy bieżące fakty odnoszą się do tej samej
+  incarnation;
+- **presence** — osobny stan dostępności/obecności; nie jest poziomem policy.
+
+Node nie jest częścią locatora workloadu. Migracja zmienia bieżącą relację z
+node'em, nie identity workloadu.
+
+## Audyt kandydatów Proxmox
+
+Legenda:
+
+- **FACT-DOC** — udokumentowane przez Proxmox;
+- **FACT-SOURCE** — zachowanie widoczne w oficjalnym source Proxmox;
+- **INFERENCE** — wniosek architektoniczny z faktów;
+- **UNKNOWN** — właściwości nie potwierdzono oficjalnym kontraktem.
+
+| Kandydat | QEMU | LXC | Ocena właściwości |
+| --- | --- | --- | --- |
+| `vmid` / CTID | tak | tak | **FACT-DOC:** unikalny cluster-wide numer bieżącego guest. Przeżywa rename i migrację, lecz slot może zostać zwolniony i użyty ponownie. Clone otrzymuje nowy VMID. Nie jest immutable workload ID. |
+| nazwa | tak | tak | Konfiguracja edytowalna; rename nie może zmieniać identity. Nie jest identity. |
+| bieżący node | tak | tak | **FACT-DOC:** workloady mogą migrować między node'ami. To lokalizacja/relacja, nie identity. |
+| `vmgenid` | tak | nie | **FACT-SOURCE:** wartość jest konfigurowalna (`1` generuje, `0` wyłącza), regenerowana przy clone, snapshot rollback i restore. Nie jest immutable ani cross-type. |
+| config `digest` | tak | tak | **FACT-SOURCE/FACT-DOC:** hash bieżącej konfiguracji wykorzystywany do ochrony przed równoczesną zmianą. Zmienia się przy config edit, może wrócić do poprzedniej wartości, nie dowodzi stworzenia workloadu. |
+| QEMU `meta.ctime` | tak | niepotwierdzone/nie | **FACT-SOURCE:** QEMU zapisuje creation metadata. Aktualny kod clone kopiuje konfigurację i jawnie regeneruje `smbios1.uuid`/`vmgenid`, ale nie pokazuje równoważnej gwarancji nowego `meta.ctime`. LXC config nie eksponuje odpowiednika. Nie jest bezpiecznym cross-type ID. Dokładne zachowanie wszystkich ścieżek restore: **UNKNOWN**. |
+| `smbios1.uuid` | tak | nie | **FACT-SOURCE:** QEMU clone regeneruje UUID, ale pole jest elementem konfiguracji i nie istnieje dla LXC. Zachowanie wszystkich restore/config edit jest **UNKNOWN** jako kontrakt identity. Nie używamy. |
+| cluster resource `id` | tak | tak | **FACT-SOURCE:** `/cluster/resources` zwraca syntetyczny resource ID oraz `type`, `vmid`, `node`; source buduje dane z listy VM. Brak dokumentowanej gwarancji immutable incarnation. To reprezentacja locatora. |
+| tag, description, MAC, disk identity | zależnie | zależnie | Dane konfiguracyjne, kopiowalne lub edytowalne. Mogą być evidence/hint, nigdy samodzielnym identity. |
+| snapshot timestamp (`snaptime`) | tak | tak | Dotyczy snapshotu, nie utworzenia workloadu. Nie jest identity. |
+
+### Macierz wymaganych właściwości
+
+| Pole | Immutable | Rename | Migrate | Config edit | Snapshot restore | Clone | Destroy/recreate | Ręczna zmiana | Oficjalny kontrakt identity |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `vmid` | nie | przeżywa | przeżywa | przeżywa | zwykle przeżywa; restore może wybrać ID | nowe ID | może zostać użyty ponownie | operator może zmienić przez migrację/restore do innego ID | nie |
+| `vmgenid` | nie | **UNKNOWN** | **UNKNOWN** | możliwa | zmienia się | zmienia się | zwykle nowy, lecz wartość jest konfigurowalna | tak/disable | nie |
+| `digest` | nie | zmienia się, jeśli nazwa jest w config | zwykle zależy od treści config; pełny kontrakt **UNKNOWN** | zmienia się | może odtworzyć starą wartość | może być podobny | może być identyczny | pośrednio przez config | nie |
+| `meta.ctime` | nieudowodnione | prawdopodobnie przeżywa; **UNKNOWN** jako gwarancja | prawdopodobnie przeżywa; **UNKNOWN** | read-only w API, lecz semantyka wszystkich ścieżek **UNKNOWN** | **UNKNOWN** | brak gwarancji nowej wartości w przeanalizowanej ścieżce | zwykle nowe, ale bez cross-type gwarancji | **UNKNOWN** | nie |
+
+Wniosek architektoniczny: żadne pole nie daje pozytywnego dowodu ciągłości dla
+obu typów. Dopasowanie nazwy, `digest` albo fingerprintu konfiguracji oznacza
+co najwyżej podobieństwo.
+
+### Node i source identity
+
+`/cluster/status` zwraca dla klastra `id="cluster"`, a dla node'a syntetyczne
+`id="node/<name>"`; `nodeid` jest numerem z konfiguracji Corosync. Dla standalone
+source ten sam oficjalny kod tworzy lokalny wpis z `nodeid=0`. Są to pola statusu
+i locator facts, nie globalne immutable UUID.
+
+Proxmox dokumentuje, że hostname powinien być finalny przed utworzeniem klastra
+i że cluster name nie może być później zmieniony. Jednocześnie wymaga unikalnej
+nazwy klastra tylko dla wielu klastrów w tym samym physical/logical network, a
+standalone nie ma Corosync cluster identity. Nie znaleziono oficjalnego
+kontraktu globalnie unikalnego, immutable source UUID ani node UUID.
+
+| Obiekt | Kandydat Proxmox | Ocena |
+| --- | --- | --- |
+| node w cluster | name, Corosync `nodeid`, `node/<name>` | stabilne operational locators w obrębie bieżącej konfiguracji; globalna unikalność, reinstall i remove/rejoin continuity: **UNKNOWN**; nie używamy jako internal identity |
+| standalone node | hostname, `node/<name>`, `nodeid=0` | brak odrębnego immutable ID; hostname/certyfikat mogą zmienić się przy reinstall; backend nadaje `node_id` |
+| cluster | cluster name, stałe API `id="cluster"`, membership/config version | nazwa jest lokalnie stabilna, lecz nie globalnym UUID; `id` jest stałym literalem, version jest zmienna |
+| standalone environment | endpoint, hostname, TLS certificate | wszystkie są zmiennymi transport/facts; brak udokumentowanego environment UUID |
+
+## Porównanie modeli
+
+### A. `(instance_id, resource_type, vmid)`
+
+- bezpieczeństwo: nieakceptowalne; VMID reuse daje false continuity;
+- HA: proste i stabilne przy migracji, lecz nowy workload odziedziczy Device
+  Registry identifier i entity `unique_id`;
+- policy: niebezpiecznie wiąże pozwolenie ze slotem;
+- multi-node: działa, jeśli node nie jest w identity;
+- wiele Proxmoxów: możliwe tylko wtedy, gdy niejednoznaczne `instance_id`
+  faktycznie oznacza source;
+- reinstall i utrata obserwacji: brak jawnej semantyki;
+- DB: najprostsza, ale prostota ukrywa krytyczne ryzyko.
+
+### B. `(instance_id, resource_type, vmid, generation)`
+
+- bezpieczeństwo: lepsze po wykrytym replacement;
+- VMID reuse: bezpieczne tylko wtedy, gdy system wie, kiedy zwiększyć
+  `generation`;
+- delete/recreate między pollingami lub podczas outage: nadal może dać false
+  continuity, więc licznik nie rozwiązuje problemu dowodu;
+- HA/policy: bezpieczne po poprawnym inkrementowaniu; niebezpieczne przy
+  pominiętym replacement;
+- DB: umiarkowanie prosta;
+- reinstall: utrata licznika bez trwałej bazy może zderzyć identity.
+
+### C. backendowy `resource_id`, osobny locator i incarnation
+
+- bezpieczeństwo: pozwala fail-closed oddzielić identity od adresu;
+- VMID reuse: nowa incarnation otrzymuje nowy `resource_id`;
+- HA/policy: mogą wiązać się bezpośrednio z incarnation;
+- migracja/multi-node: node pozostaje relacją;
+- wiele Proxmoxów: locator jest namespaced przez source;
+- DB: wymaga historii bindingów, observations i tombstones;
+- outage: nadal wymaga jawnej oceny continuity, ale nie wymusza dziedziczenia.
+
+### D. wybrany model: C plus rozdzielenie backend/source i evidence
+
+Model C uzupełniamy o `backend_instance_id`, `inventory_source_id`, historię
+`locator_generation`, osobny `continuity_state` oraz trwałe evidence. Dzięki
+temu brak natywnego PVE UUID jest jawny, a nie ukryty za heurystyką.
+
+Koszt to bardziej rozbudowany schema i możliwość bezpiecznego false split
+(utworzenia nowej provisional incarnation, choć operator później potwierdzi, że
+był to ten sam workload). Ten koszt jest preferowany względem false continuity,
+które mogłoby przenieść destructive policy na inny workload.
+
+## Backend installation a Proxmox source
+
+`backend_instance_id` identyfikuje nową instalację Hubinet Ops oraz jej trwałą
+bazę. HA ConfigEntry wiąże się z tym ID. Zmiana URL/IP backendu nie zmienia ID.
+Clean reinstall bez przywrócenia dokładnie tej samej bazy tworzy nowe ID i nowe
+HA identity; 0.5 nie importuje identity z 0.4.
+
+`inventory_source_id` jest backendowym UUID jednego operatorowo dodanego
+środowiska Proxmox. Nazwa klastra, lista endpointów, ich IP/DNS i certyfikaty są
+atrybutami/evidence source, nie jego identity. Dwa niezależne Proxmoxy z VMID
+101 mają różne `inventory_source_id`.
+
+Proxmox dokumentuje niezmienność nazwy utworzonego klastra oraz stabilność nazw
+node'ów po jego utworzeniu, ale nie deklaruje globalnie unikalnego UUID klastra
+ani uniwersalnego ID standalone environment. Nazwa klastra jest wymagana jako
+unikalna tylko w tym samym fizycznym/logical network. Dlatego source ID nadaje
+backend, a przypisanie nowego endpointu do istniejącego source wymaga późniejszej
+procedury weryfikacji/confirmation. Endpointów z dwóch sources nie wolno scalać
+na podstawie podobnych nazw lub VMID.
+
+## Model continuity
+
+Presence i continuity są niezależnymi osiami. Proponowane continuity states:
+
+- `unverified` — nowa incarnation odkryta, ale jeszcze nie enrolled;
+- `trusted` — operator wykonał enrollment, a wymagany continuity proof pozostaje
+  ważny i nie ma luki w evidence;
+- `uncertain` — replacement jest możliwy, ale nie można ani potwierdzić
+  ciągłości, ani replacement;
+- `replaced` — istnieje pozytywny dowód, że locator wskazuje inną incarnation;
+- `retired` — stara incarnation została zakończona i zachowana historycznie.
+
+Pozytywny dowód continuity nie może opierać się tylko na nieprzerwanym VMID,
+nazwie, `digest` ani podobieństwie config. Stockowe API PVE nie dostarcza
+wspólnego immutable anchor. Przyszły enrollment musi zdefiniować continuity
+proof (oraz sposób jego odczytu i ochrony) przed nadaniem `trusted`. ADR nie
+przesądza jeszcze mechanizmu enrollment.
+
+Pozytywnym dowodem replacement może być:
+
+- obserwowany type change na tym samym numerze;
+- potwierdzona operacja destroy oraz pełny, późniejszy snapshot bez zasobu;
+- jawny mismatch przyszłego continuity anchor;
+- wiarygodny, nieprzerwany event/task cursor pokazujący destroy/create;
+- jawna, audytowana decyzja operatora.
+
+Task log i config fingerprints są evidence pomocniczym. Retencja i kompletność
+task history nie są potwierdzone jako niezawodny, wieczny event stream, więc nie
+mogą być jedyną granicą bezpieczeństwa.
+
+Jeżeli continuity nie da się udowodnić, system ustawia `uncertain`, wycofuje
+destructive capabilities i maintenance permission, a po ponownym pojawieniu
+locatora tworzy nową provisional `resource_id`. Poprzednia incarnation pozostaje
+w quarantine/tombstone. Późniejsze jawne resolution może zapisać lineage, ale
+nie kopiuje automatycznie policy. Bezpieczny false split jest dopuszczalny;
+false continuity nie jest.
+
+## Scenariusze lifecycle i zagrożeń
+
+| # | Scenariusz | Wymagane zachowanie |
+| --- | --- | --- |
+| 1 | rename VM/LXC | Ten sam `resource_id`; zmienia się display name. |
+| 2 | migrate `pve-a` → `pve-b` | Ten sam `resource_id` i locator; aktualizacja node relation. |
+| 3 | normal reboot | Ten sam `resource_id`; runtime status jest obserwacją. |
+| 4 | config edit | Ten sam `resource_id`; nowy `digest`/fingerprint jest faktem, nie identity. |
+| 5 | snapshot rollback tego samego workloadu | Intencjonalnie ten sam logical workload, ale QEMU `vmgenid` się zmienia. Rewalidacja continuity proof; przy ambiguity `uncertain`, bez automatycznej policy. |
+| 6 | clone do nowego VMID | Nowy locator, nowy `resource_id`, `unverified`; żadna policy nie jest kopiowana. |
+| 7 | destroy CT101 | Najpierw `missing`; po pozytywnym potwierdzeniu `confirmed_removed`, `retired` i tombstone. |
+| 8 | później nowy CT101 | Nowy `resource_id` i `locator_generation`; stary rekord pozostaje. |
+| 9 | LXC101 → QEMU101 | Typ jest częścią locatora; stara LXC incarnation jest retired, QEMU dostaje nowe ID. |
+| 10 | delete/recreate między dwoma pollingami | Stockowy snapshot nie dowodzi zdarzenia. `uncertain`, nowa provisional incarnation, zero odziedziczonych uprawnień. |
+| 11 | backend offline podczas delete/recreate | Jak wyżej; luka evidence wymusza fail-closed revalidation. |
+| 12 | node chwilowo offline | Presence `node_unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o ponownym bindingu. |
+| 13 | cały source/API niedostępny | Zachowanie last-known inventory, freshness maleje; żadnych missing/removal transitions. |
+| 14 | resource missing przez kilka polli i wraca | Liczba polli nie potwierdza removal. Powrót wymaga continuity evidence; przy braku dowodu provisional ID. |
+| 15 | `confirmed_removed`, potem locator wraca | Zawsze nowy `resource_id`/generation. Nawet jawny restore tworzy nową incarnation; lineage może wskazać poprzednika. |
+| 16 | destructive policy na zastąpionym resource | Policy zostaje przy starym `resource_id`; nowy startuje `discovered`, bez capabilities/maintenance. |
+| 17 | backup restore pod starym VMID | Nowa incarnation, chyba że przyszła, jawna semantyka restore z mocnym continuity proof zostanie osobno zaakceptowana. Obecne hints nie wystarczają. |
+| 18 | dwa Proxmoxy z VMID 101 | Różne `inventory_source_id`, locators i `resource_id`; brak kolizji. |
+
+## Konsekwencje bezpieczeństwa
+
+Fundamentalny invariant:
+
+```text
+policy attaches to durable resource incarnation,
+not merely to Proxmox locator
+```
+
+Nowy albo niepewny resource zaczyna na poziomie `discovered`:
+
+```text
+destructive capabilities = none
+maintenance permission = none
+```
+
+Discovery nigdy nie kopiuje policy, approval, planów, jobs ani locks ze starej
+incarnation. Każda przyszła mutacja musi ponownie sprawdzić `resource_id`, aktywny
+locator binding, expected continuity revision, `trusted`, policy i runtime
+preconditions. Locator jest parametrem wykonawczym wyliczonym dopiero po tych
+kontrolach.
+
+## Konsekwencje dla Home Assistant
+
+- ConfigEntry identifier: `backend_instance_id`, nie URL;
+- device identifier source/node: namespaced przez `backend_instance_id` i
+  backendowe `inventory_source_id`/`node_id`;
+- device identifier workloadu: `resource_id`;
+- entity `unique_id`: `resource_id` plus typ encji;
+- rename: tylko nazwa;
+- migrate: `via_device_id` wskazuje nowy node device, identity bez zmian;
+- `confirmed_removed`: stare device/entities pozostają unavailable; brak purge w
+  tej fazie;
+- VMID reuse/replacement/ambiguity: nowe device/entities; stare HA identity nie
+  przechodzi na nowy workload.
+
+## PHASE 0 AMENDMENT REQUIRED
+
+Obecne `ResourceIdentity(instance_id, resource_type, vmid)` w Phase 0 musi zostać
+zmienione **przed implementacją Phase 1**. `instance_id` trzeba rozdzielić na
+`backend_instance_id` i `inventory_source_id`, a HA resource identity oprzeć na
+backendowym `resource_id` incarnation. Niniejsza faza nie modyfikuje kodu.
+
+## Nierozstrzygnięte kwestie
+
+1. Konkretny, odporny na kopiowanie/rollback mechanizm continuity proof dla
+   późniejszego enrollment; bez niego resources nie mogą uzyskać destructive
+   capabilities.
+2. Semantyka QEMU `meta.ctime` we wszystkich wersjach i ścieżkach backup/restore
+   pozostaje **UNKNOWN**, ale niezależnie nie rozwiązuje LXC.
+3. Gwarancje retencji i kompletności task/event history są **UNKNOWN**; traktujemy
+   ją tylko jako evidence.
+4. Procedura bezpiecznego przypięcia alternatywnego endpointu do istniejącego
+   source wymaga osobnego design review.
+5. Czy operator będzie mógł jawnie scalić false split w HA bez utraty historii;
+   automatycznego merge nie projektujemy.
+
+## Sources / Evidence
+
+Oficjalne źródła Proxmox, odczytane 2026-08-08:
+
+- [pvecm — cluster, migracja, nazwy node/cluster](https://github.com/proxmox/pve-docs/blob/master/pvecm.adoc)
+- [pmxcfs — cluster-wide guest configuration i VMID](https://github.com/proxmox/pve-docs/blob/master/pmxcfs.adoc)
+- [pve-manager `Cluster.pm` — `/cluster/resources`, pola i ACL](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Cluster.pm)
+- [qemu-server `QemuServer.pm` — schema `vmgenid`, `meta`, restore](https://github.com/proxmox/qemu-server/blob/master/src/PVE/QemuServer.pm)
+- [qemu-server `QemuConfig.pm` — snapshot rollback i `vmgenid`](https://github.com/proxmox/qemu-server/blob/master/src/PVE/QemuConfig.pm)
+- [qemu-server `API2/Qemu.pm` — create/clone oraz regeneracja UUID/`vmgenid`](https://github.com/proxmox/qemu-server/blob/master/src/PVE/API2/Qemu.pm)
+- [pve-container `LXC/Config.pm` — config digest i brak odpowiednika `vmgenid`](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Config.pm)
+- [pct(1) — CTID, clone, migrate i digest](https://pve.proxmox.com/pve-docs/pct.1.html)
+- [qm(1) — VMID i QEMU config contract](https://pve.proxmox.com/pve-docs/qm.1.html)
+
+Repozytoria GitHub są oficjalnymi read-only mirrors; źródłem nadrzędnym jest
+również [git.proxmox.com](https://git.proxmox.com/). Wnioski o braku przydatności
+danego pola jako identity są inference architektonicznym opartym na wskazanym
+kontrakcie i source, a nie deklaracją dodatkowych gwarancji API Proxmox.
