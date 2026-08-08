@@ -18,7 +18,8 @@ Proponujemy model D, będący uszczegółowieniem modelu C:
 backend_instance_id             instalacja Hubinet Ops
 inventory_source_id             jawnie skonfigurowane środowisko Proxmox
 resource_id                     jedna trwała incarnation workloadu
-external locator                (inventory_source_id, resource_type, vmid)
+slot locator                    (inventory_source_id, vmid)
+resource_type                   immutable property occupant incarnation
 locator_generation              kolejny backendowy binding tego samego slotu
 continuity_state + evidence     ocena, czy obserwacja należy do incarnation
 ```
@@ -34,7 +35,9 @@ identity wiążą się z `resource_id`, nigdy wyłącznie z locatorem.
 - **backend** — konkretna instalacja Hubinet Ops 0.5 i jej nowa baza danych;
 - **source** — jeden operatorowo skonfigurowany cluster Proxmox VE albo jeden
   standalone node;
-- **locator** — adres aktualnego slotu: source, typ `qemu`/`lxc` i `vmid`;
+- **slot locator** — cluster-wide slot `(inventory_source_id, vmid)`;
+- **occupant type** — immutable dla incarnation `resource_type` (`qemu` albo
+  `lxc`), ale nie namespace slotu;
 - **resource/incarnation** — jeden workload od utworzenia lub jawnego uznania
   ciągłości do potwierdzonego replacement;
 - **observation** — read-only fakty z jednego discovery run;
@@ -56,7 +59,7 @@ Legenda:
 
 | Kandydat | QEMU | LXC | Ocena właściwości |
 | --- | --- | --- | --- |
-| `vmid` / CTID | tak | tak | **FACT-DOC:** unikalny cluster-wide numer bieżącego guest. Przeżywa rename i migrację, lecz slot może zostać zwolniony i użyty ponownie. Clone otrzymuje nowy VMID. Nie jest immutable workload ID. |
+| `vmid` / CTID | tak | tak | **FACT-DOC:** wspólny, unikalny cluster-wide numer bieżącego guest. Przeżywa rename i migrację, lecz slot może zostać zwolniony i użyty ponownie. Clone otrzymuje nowy VMID. Nie jest immutable workload ID. |
 | nazwa | tak | tak | Konfiguracja edytowalna; rename nie może zmieniać identity. Nie jest identity. |
 | bieżący node | tak | tak | **FACT-DOC:** workloady mogą migrować między node'ami. To lokalizacja/relacja, nie identity. |
 | `vmgenid` | tak | nie | **FACT-SOURCE:** wartość jest konfigurowalna (`1` generuje, `0` wyłącza), regenerowana przy clone, snapshot rollback i restore. Nie jest immutable ani cross-type. |
@@ -80,6 +83,23 @@ Wniosek architektoniczny: żadne pole nie daje pozytywnego dowodu ciągłości d
 obu typów. Dopasowanie nazwy, `digest` albo fingerprintu konfiguracji oznacza
 co najwyżej podobieństwo.
 
+### VMID jest wspólnym slotem QEMU/LXC
+
+**FACT-DOC:** dokumentacja Proxmox nazywa VM i LXC łącznie virtual guests i
+stwierdza, że identyfikuje je unikalny numeryczny VMID. Dokumentacja `pct`
+dodaje, że CTID musi być unique cluster wide. `pmxcfs` utrzymuje konfiguracje
+QEMU i LXC w osobnych katalogach typu, ale jego consistency checks gwarantują
+unikalność VMID, nie pary `(type, vmid)`.
+
+**FACT-SOURCE:** `/cluster/nextid` pobiera jedną wspólną `get_vmlist()` i uznaje
+numer za zajęty, jeśli występuje w `ids`, niezależnie od `qemu`/`lxc`.
+`/cluster/resources` iteruje tę samą listę, a typ opisuje occupant.
+
+Dlatego slot locator to wyłącznie `(inventory_source_id, vmid)`. Schema nie może
+mieć równocześnie aktywnych bindingów LXC101 i QEMU101 w jednym source. Zmiana
+typu pod tym samym numerem oznacza replacement occupant tego samego slotu,
+nowy `resource_id` i nową `locator_generation`.
+
 ### Node i source identity
 
 `/cluster/status` zwraca dla klastra `id="cluster"`, a dla node'a syntetyczne
@@ -100,6 +120,44 @@ kontraktu globalnie unikalnego, immutable source UUID ani node UUID.
 | cluster | cluster name, stałe API `id="cluster"`, membership/config version | nazwa jest lokalnie stabilna, lecz nie globalnym UUID; `id` jest stałym literalem, version jest zmienna |
 | standalone environment | endpoint, hostname, TLS certificate | wszystkie są zmiennymi transport/facts; brak udokumentowanego environment UUID |
 
+### Node presentation identity a mutation trust
+
+Oficjalna dokumentacja wymaga finalnego hostname przed utworzeniem klastra i
+nie wspiera zwykłego rename po jego utworzeniu. Jednocześnie opisuje remove,
+reinstall i rejoin node'a pod tym samym hostname/IP oraz aktualizację starego SSH
+fingerprintu. Jest to pozytywny dowód, że sama nazwa nie może zachowywać mutation
+trust przez taki lifecycle.
+
+Minimalny fail-closed model rozdziela:
+
+- `node_id` — backendową presentation identity używaną w inventory i HA;
+- `node_binding_id` + monotonic `binding_revision` — jedną wersję związania
+  `node_id` z obserwowaną nazwą/member record;
+- `node_attestation` — jawnie zweryfikowane security evidence dokładnego hosta i
+  hostd/forced-command endpointu;
+- `node_trust_state` — `unverified`, `trusted` albo `revoked`.
+
+Nie przesądzamy pełnego resource-style node incarnation. `node_id` może pozostać
+ten sam dla presentation po jawnej decyzji operatora, ale każda security-relevant
+zmiana zamyka albo zwiększa revision bindingu i zeruje mutation trust.
+
+| Scenariusz | Presentation | Mutation trust |
+| --- | --- | --- |
+| rename node | W cluster nie jest normalnie wspierany; standalone/wyjątek traktowany jako nowy candidate binding. | Brak automatycznej continuity; wymagane ponowne binding/attestation. |
+| remove/rejoin | Stary `node_id` może pozostać historyczny; rejoin może być pokazany jako candidate tego samego lub nowego node'a. | Stary binding revoked; nowy `node_binding_id`/revision zaczyna `unverified`. |
+| reinstall pod tą samą nazwą | Nazwa może być taka sama, ale nie dowodzi host continuity. | Nigdy nie dziedziczy trust; ponowna attestation obowiązkowa. |
+| nowy fizyczny node ze starą nazwą | Osobna lub nierozstrzygnięta presentation identity do decyzji operatora. | Nowy untrusted binding; stara attestation nie pasuje. |
+| TLS certificate/key rotation | Endpoint facts aktualizują się dopiero po poprawnej weryfikacji TLS policy. | Nie przenosi ani nie nadaje hostd trust; nieoczekiwany fingerprint fail-closed. |
+| hostd reinstall/key change | HA presentation może pozostać. | Attestation mismatch/revocation; binding traci `trusted` do re-enrollment. |
+| discovery endpoint failover | Dotyczy source transport, nie node identity. | Endpoint musi zostać związany z tym samym source; nie może sam wybrać host mutation route. |
+| migracja resource do untrusted node | `via_device` może wskazać bieżący discovered node. | Effective destructive capabilities dla resource stają się `none`; żadna mutacja nie jest routowana. |
+
+Przyszły job zapisuje expected `resource_id`, resource binding/revision,
+`node_binding_id`, node binding revision i `attestation_id`. Bezpośrednio przed
+wywołaniem typed host-control backend ponownie sprawdza wszystkie wartości,
+bieżącą lokalizację workloadu oraz `node_trust_state=trusted`. HA nie podaje node
+route. Routing wyłącznie po external node name jest zabroniony.
+
 ## Porównanie modeli
 
 ### A. `(instance_id, resource_type, vmid)`
@@ -113,6 +171,8 @@ kontraktu globalnie unikalnego, immutable source UUID ani node UUID.
   faktycznie oznacza source;
 - reinstall i utrata obserwacji: brak jawnej semantyki;
 - DB: najprostsza, ale prostota ukrywa krytyczne ryzyko.
+- dodatkowo błędnie modeluje `resource_type` jako namespace, mimo że Proxmox
+  traktuje VMID jako wspólny slot QEMU/LXC.
 
 ### B. `(instance_id, resource_type, vmid, generation)`
 
@@ -125,6 +185,8 @@ kontraktu globalnie unikalnego, immutable source UUID ani node UUID.
   pominiętym replacement;
 - DB: umiarkowanie prosta;
 - reinstall: utrata licznika bez trwałej bazy może zderzyć identity.
+- podobnie jak A pozwala schema wyrazić dwa aktywne occupants jednego slotu,
+  jeśli uniqueness obejmuje typ.
 
 ### C. backendowy `resource_id`, osobny locator i incarnation
 
@@ -135,6 +197,9 @@ kontraktu globalnie unikalnego, immutable source UUID ani node UUID.
 - wiele Proxmoxów: locator jest namespaced przez source;
 - DB: wymaga historii bindingów, observations i tombstones;
 - outage: nadal wymaga jawnej oceny continuity, ale nie wymusza dziedziczenia.
+
+W tym modelu locator C/D to `(inventory_source_id, vmid)`, a `resource_type`
+jest immutable property związanej incarnation.
 
 ### D. wybrany model: C plus rozdzielenie backend/source i evidence
 
@@ -187,7 +252,7 @@ przesądza jeszcze mechanizmu enrollment.
 
 Pozytywnym dowodem replacement może być:
 
-- obserwowany type change na tym samym numerze;
+- obserwowany type change occupant tego samego slotu;
 - potwierdzona operacja destroy oraz pełny, późniejszy snapshot bez zasobu;
 - jawny mismatch przyszłego continuity anchor;
 - wiarygodny, nieprzerwany event/task cursor pokazujący destroy/create;
@@ -216,7 +281,7 @@ false continuity nie jest.
 | 6 | clone do nowego VMID | Nowy locator, nowy `resource_id`, `unverified`; żadna policy nie jest kopiowana. |
 | 7 | destroy CT101 | Najpierw `missing`; po pozytywnym potwierdzeniu `confirmed_removed`, `retired` i tombstone. |
 | 8 | później nowy CT101 | Nowy `resource_id` i `locator_generation`; stary rekord pozostaje. |
-| 9 | LXC101 → QEMU101 | Typ jest częścią locatora; stara LXC incarnation jest retired, QEMU dostaje nowe ID. |
+| 9 | LXC101 → delete → QEMU101 | Ten sam slot `(source, 101)` zostaje zajęty ponownie. LXC incarnation jest retired/tombstoned; QEMU dostaje nowy `resource_id`, immutable `resource_type=qemu` i nową `locator_generation`. |
 | 10 | delete/recreate między dwoma pollingami | Stockowy snapshot nie dowodzi zdarzenia. `uncertain`, nowa provisional incarnation, zero odziedziczonych uprawnień. |
 | 11 | backend offline podczas delete/recreate | Jak wyżej; luka evidence wymusza fail-closed revalidation. |
 | 12 | node chwilowo offline | Presence `node_unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o ponownym bindingu. |
@@ -273,8 +338,9 @@ backendowym `resource_id` incarnation. Niniejsza faza nie modyfikuje kodu.
 ## Nierozstrzygnięte kwestie
 
 1. Konkretny, odporny na kopiowanie/rollback mechanizm continuity proof dla
-   późniejszego enrollment; bez niego resources nie mogą uzyskać destructive
-   capabilities.
+   późniejszego enrollment. Dopóki nie zostanie zaakceptowany, trusted
+   destructive capabilities są globalnie niedostępne; read-only
+   discovery/inventory może powstać niezależnie.
 2. Semantyka QEMU `meta.ctime` we wszystkich wersjach i ścieżkach backup/restore
    pozostaje **UNKNOWN**, ale niezależnie nie rozwiązuje LXC.
 3. Gwarancje retencji i kompletności task/event history są **UNKNOWN**; traktujemy
@@ -283,6 +349,8 @@ backendowym `resource_id` incarnation. Niniejsza faza nie modyfikuje kodu.
    source wymaga osobnego design review.
 5. Czy operator będzie mógł jawnie scalić false split w HA bez utraty historii;
    automatycznego merge nie projektujemy.
+6. Konkretny node/hostd attestation protocol, key rotation i operatorowa
+   procedura ponownego nadania `trusted` pozostają do osobnego review.
 
 ## Sources / Evidence
 
@@ -290,13 +358,14 @@ Oficjalne źródła Proxmox, odczytane 2026-08-08:
 
 - [pvecm — cluster, migracja, nazwy node/cluster](https://github.com/proxmox/pve-docs/blob/master/pvecm.adoc)
 - [pmxcfs — cluster-wide guest configuration i VMID](https://github.com/proxmox/pve-docs/blob/master/pmxcfs.adoc)
-- [pve-manager `Cluster.pm` — `/cluster/resources`, pola i ACL](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Cluster.pm)
+- [pve-manager `Cluster.pm` — wspólne `/cluster/resources` i `/cluster/nextid`](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Cluster.pm)
 - [qemu-server `QemuServer.pm` — schema `vmgenid`, `meta`, restore](https://github.com/proxmox/qemu-server/blob/master/src/PVE/QemuServer.pm)
 - [qemu-server `QemuConfig.pm` — snapshot rollback i `vmgenid`](https://github.com/proxmox/qemu-server/blob/master/src/PVE/QemuConfig.pm)
 - [qemu-server `API2/Qemu.pm` — create/clone oraz regeneracja UUID/`vmgenid`](https://github.com/proxmox/qemu-server/blob/master/src/PVE/API2/Qemu.pm)
 - [pve-container `LXC/Config.pm` — config digest i brak odpowiednika `vmgenid`](https://github.com/proxmox/pve-container/blob/master/src/PVE/LXC/Config.pm)
 - [pct(1) — CTID, clone, migrate i digest](https://pve.proxmox.com/pve-docs/pct.1.html)
 - [qm(1) — VMID i QEMU config contract](https://pve.proxmox.com/pve-docs/qm.1.html)
+- [Migrate to Proxmox VE — wspólna identity virtual guests przez VMID](https://pve.proxmox.com/wiki/Migrate_to_Proxmox_VE)
 
 Repozytoria GitHub są oficjalnymi read-only mirrors; źródłem nadrzędnym jest
 również [git.proxmox.com](https://git.proxmox.com/). Wnioski o braku przydatności

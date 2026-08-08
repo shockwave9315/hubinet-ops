@@ -127,7 +127,8 @@ DiscoverySnapshot
     observed_at
     read_result
   resources[]
-    locator {inventory_source_id, resource_type, vmid}
+    slot_locator {inventory_source_id, vmid}
+    resource_type {qemu | lxc}
     current_node_name
     runtime presence/status
     source facts
@@ -197,18 +198,58 @@ Długi czas również nie zamienia braku dowodu w dowód.
 
 ### Kiedy dokładnie wolno ustawić `confirmed_removed`
 
-Wymagane są łącznie:
+Każda klasa proof wymaga wspólnych warunków:
 
-1. pozytywny, przypisany do właściwego source i locatora dowód destroy/removal
-   (np. kompletna task/event evidence, przyszła audytowana operacja backendu lub
-   jawne operator confirmation);
-2. kompletny, świeży baseline source po zdarzeniu, w którym locator jest absent;
-3. brak gaps/out-of-order cursor pomiędzy evidence i baseline;
-4. transaction nadal widzi ten sam expected active binding/continuity revision.
+1. proof odnosi się do dokładnego `inventory_source_id`, `resource_id`, active
+   slot binding i expected binding/continuity revision;
+2. późniejszy, kompletny i świeży source baseline potwierdza, że slot
+   `(inventory_source_id, vmid)` jest absent;
+3. reconciliation transaction nadal widzi ten sam expected binding/revision i
+   atomowo zamyka binding, tworzy tombstone oraz ustawia `confirmed_removed`.
+
+Poza nimi akceptowane są trzy rozłączne klasy authoritative removal proof:
+
+#### A. Backend-mediated removal
+
+- zakończona sukcesem typed backend operation, wcześniej związana z expected
+  `resource_id`, slot binding i revision;
+- późniejszy complete fresh baseline potwierdzający pusty slot.
+
+Durable job/audit backendu jest w tej klasie pozytywnym proof. Nie wymaga
+ciągłości zewnętrznego PVE event cursor, ponieważ operacja przeszła własną
+autorytatywną ścieżkę backendu. Wymaga natomiast zgodności revision i snapshotu
+po operacji.
+
+#### B. Reliable event/task proof
+
+- pozytywnie zidentyfikowany destroy/removal event dla dokładnego slotu i
+  occupant;
+- ciągły, zaufany cursor/evidence chain obejmujący zdarzenie;
+- późniejszy complete fresh baseline potwierdzający pusty slot.
+
+Tylko ta klasa wymaga cursor continuity. Ponieważ oficjalny kontrakt kompletnego,
+trwale retencjonowanego PVE event stream pozostaje **UNKNOWN**, klasa B jest
+niedostępna, dopóki implementacja nie udowodni takiego kontraktu dla wspieranej
+wersji/provider. Zwykła lista recent tasks nie spełnia tego wymagania.
+
+#### C. Explicit operator confirmation
+
+- jawne, audytowane potwierdzenie operatora wskazujące dokładny `resource_id`,
+  current slot binding i revision;
+- complete fresh baseline potwierdzający pusty slot.
+
+Klasa C nie zależy od event cursor. Potwierdzenie nie zastępuje fresh baseline i
+nie może wskazywać jedynie VMID bez resource/binding context.
+
+| Proof class | Positive authority | Complete fresh baseline | Cursor continuity |
+| --- | --- | --- | --- |
+| A: backend-mediated | durable successful typed backend job | wymagany | nie; obowiązuje backend job/binding revision |
+| B: event/task | trusted destroy/removal event | wymagany | tak, obowiązkowo |
+| C: operator confirmation | explicit audited operator decision | wymagany | nie |
 
 HTTP 404 z pojedynczego config endpointu, niedostępny node, partial listing,
-ACL-filtered listing, timeout, source outage ani sam upływ czasu nie spełniają
-tych warunków.
+ACL-filtered listing, timeout, source outage ani sam upływ czasu nie należą do
+żadnej klasy proof.
 
 ### Powrót po braku lub outage
 
@@ -238,10 +279,12 @@ fetch
 ```
 
 Nie publikujemy surowego albo częściowo reconciled snapshotu. Transaction
-sprawdza expected source revision, active locator bindings i monotoniczny czas/
-cursor. Snapshot starszy od ostatniego committed run jest odrzucany. Restart
-backendu ładuje ostatni committed inventory, tombstones oraz cursors; pamięć
-procesu nie jest source of truth.
+sprawdza expected source revision, active locator bindings i monotoniczny czas.
+Cursor jest sprawdzany tylko wtedy, gdy provider jawnie deklaruje wspierany
+trusted cursor contract albo używana jest klasa proof B. Snapshot starszy od
+ostatniego committed run jest odrzucany. Restart backendu ładuje ostatni
+committed inventory, tombstones oraz wszystkie dostępne provider cursors;
+pamięć procesu nie jest source of truth.
 
 ## Failure modes
 
@@ -253,7 +296,7 @@ procesu nie jest source of truth.
 | baseline pełny, config read jednego guest fail | baseline complete + per-resource error | locator `present`, facts unavailable |
 | ACL ukrywa część inventory | `partial`/configuration error | bez removal transitions |
 | pełny baseline bez locatora | `complete` | `missing`, nie `confirmed_removed` |
-| pełny baseline + pozytywny destroy proof | `complete` | `confirmed_removed`, tombstone |
+| pełny baseline + proof klasy A, B albo C | `complete` | `confirmed_removed`, tombstone |
 | out-of-order/stary run | `invalid` | bez zmian |
 
 ## Trust boundary
@@ -268,6 +311,20 @@ HA → Hubinet Ops API → backend policy → plans/jobs/locks/audit
    → typed host-control → hostd/forced-command → Proxmox
 ```
 
+### Node routing jest osobną granicą
+
+Discovery może ustalić current node i HA `via_device`, ale nie ustanawia mutation
+route. Przed typed host-control backend musi rozwiązać current node do aktywnego
+`node_binding_id`, sprawdzić expected binding revision, ważną attestation,
+`node_trust_state=trusted` oraz executor/host policy readiness. Node name jest
+wyłącznie external locator i nie może być samodzielnym routing credential.
+
+Po remove/rejoin, reinstall, nieoczekiwanej zmianie hostd identity lub nowym
+hoście pod starą nazwą binding staje się `unverified`/`revoked`. Migracja
+workloadu do takiego node'a może być pokazana read-only, ale jego effective
+destructive capabilities spadają do `none`. Endpoint failover discovery nie
+przenosi hostd attestation i nie przywraca mutation trust.
+
 ## Nierozstrzygnięte kwestie
 
 1. Exact supported PVE versions i contract test standalone `/cluster/resources`.
@@ -276,6 +333,10 @@ HA → Hubinet Ops API → backend policy → plans/jobs/locks/audit
 4. Dostępność, pagination i retencja task/event history jako evidence —
    **UNKNOWN** jako niezawodny stream.
 5. Mechanizm source binding/failover bez natywnego immutable cluster UUID.
+6. Finalny workload continuity proof/enrollment anchor. Dopóki nie zostanie
+   zaakceptowany, trusted destructive capabilities są globalnie niedostępne;
+   nie blokuje to przyszłego read-only discovery/inventory.
+7. Finalny node/hostd attestation protocol i procedura jawnej key rotation.
 
 ## Sources / Evidence
 
@@ -285,7 +346,7 @@ Oficjalne źródła Proxmox, odczytane 2026-08-08:
 - [pveum — API tokens, privilege separation, role i ACL](https://github.com/proxmox/pve-docs/blob/master/pveum.adoc)
 - [pve-manager `Cluster.pm` — cluster-wide resources/status/tasks i permission filters](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Cluster.pm)
 - [Proxmox VE API Viewer](https://pve.proxmox.com/pve-docs/api-viewer/)
-- [pvecm — multi-master cluster i migracja](https://github.com/proxmox/pve-docs/blob/master/pvecm.adoc)
+- [pvecm — multi-master, node remove/reinstall/rejoin i certificate refresh](https://github.com/proxmox/pve-docs/blob/master/pvecm.adoc)
 
 **FACT-DOC:** `pveproxy` forwarduje requests do innych node'ów; token z
 separated privileges ma effective ACL jako przecięcie user/token; `VM.Audit`
