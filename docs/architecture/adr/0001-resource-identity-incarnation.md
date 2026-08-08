@@ -197,7 +197,8 @@ route. Routing wyłącznie po external node name jest zabroniony.
 ### C. backendowy `resource_id`, osobny locator i incarnation
 
 - bezpieczeństwo: pozwala fail-closed oddzielić identity od adresu;
-- wykryty VMID reuse: nowa candidate incarnation otrzymuje nowy `resource_id`;
+- VMID reuse potwierdzone positive replacement evidence albo powrót po
+  `confirmed_removed`: nowa incarnation otrzymuje nowy `resource_id`;
 - HA: może wiązać się z `resource_id` dla read-only continuity; destructive
   policy wymaga dodatkowo `security_continuity=trusted`;
 - migracja/multi-node: node pozostaje relacją;
@@ -216,9 +217,10 @@ trwałe evidence. Dzięki temu brak natywnego PVE UUID jest jawny, a nie ukryty 
 heurystyką.
 
 Koszt to bardziej rozbudowany schema oraz jawne rozróżnienie dwóch ryzyk:
-observable gap może spowodować bezpieczny false split, natomiast niewidoczny
-replacement może zachować read-only identity. Security continuity powoduje, że
-żaden z tych przypadków nie przenosi destructive authority.
+observable gap bez rozstrzygającego evidence może zachować false read-only
+continuity na istniejącej identity, natomiast niewidoczny replacement również
+może zachować tę read-only identity. Security continuity powoduje, że żaden z
+tych przypadków nie przenosi destructive authority.
 
 ## Backend installation a Proxmox source
 
@@ -297,10 +299,26 @@ Retencja i kompletność task history nie są potwierdzone jako niezawodny,
 wieczny event stream, więc nie mogą być jedyną granicą bezpieczeństwa.
 
 Jeżeli wystąpi observable gap/conflict/evidence i continuity nie da się
-rozstrzygnąć, system ustawia observational `uncertain`, wycofuje security trust
-i może utworzyć nową provisional `resource_id` po ponownym pojawieniu locatora.
-Poprzednia candidate incarnation pozostaje w quarantine/tombstone. Późniejsze
-jawne resolution może zapisać lineage, ale nie kopiuje automatycznie policy.
+rozstrzygnąć bez positive replacement proof ani wcześniejszego
+`confirmed_removed`, system zachowuje istniejący `resource_id` i jego active
+locator binding dla read-only reconciliation. Po ponownym pojawieniu locatora
+presence może wrócić do `present`, ale observational continuity pozostaje
+`uncertain`, lifecycle przechodzi do `quarantined`, a security continuity jest
+`revoked`, jeśli istniał wcześniejszy trust, albo pozostaje `unverified`.
+Policy applicability jest `false`, destructive capabilities i maintenance
+permission są `none`, a aktywne destructive operations fail closed. Stored
+policy/history pozostają przy tym samym `resource_id`; monotonic continuity/
+security revision zwiększa się, aby unieważnić wcześniejsze approvals/jobs,
+podczas gdy `binding_id` i `locator_generation` pozostają bez zmian.
+
+Ambiguity sama nie zamyka bindingu, nie zwiększa `locator_generation` i nie
+tworzy nowego active ani provisional `resource_id`. `quarantined` jest stanem
+nieterminalnym: zachowuje identity, binding i historię do późniejszego accepted
+continuity resolution. Nie tworzy tombstone/termination. Nowy current
+`resource_id` dla tego samego slotu powstaje wyłącznie przez atomic direct
+replacement z positive replacement evidence albo po prawidłowym
+`confirmed_removed`, gdy locator pojawi się później ponownie.
+
 Brak observable konfliktu pozwala zachować read-only identity, lecz nigdy nie
 podnosi `unverified` do `trusted`.
 
@@ -312,19 +330,19 @@ podnosi `unverified` do `trusted`.
 | 2 | migrate `pve-a` → `pve-b` | Ten sam `resource_id` i locator; aktualizacja node relation. |
 | 3 | normal reboot | Ten sam `resource_id`; runtime status jest obserwacją. |
 | 4 | config edit | Ten sam `resource_id`; nowy `digest`/fingerprint jest faktem, nie identity. |
-| 5 | snapshot rollback tego samego workloadu | Intencjonalnie ten sam logical workload, ale QEMU `vmgenid` się zmienia. Rewalidacja continuity proof; przy ambiguity `uncertain`, bez automatycznej policy. |
+| 5 | snapshot rollback tego samego workloadu | Intencjonalnie ten sam logical workload, ale QEMU `vmgenid` się zmienia. Rewalidacja continuity proof; przy ambiguity ten sam `resource_id`/binding przechodzi do `uncertain`/`quarantined`, bez effective destructive policy. |
 | 6 | clone do nowego VMID | Nowy locator, nowy `resource_id`, `unverified`; żadna policy nie jest kopiowana. |
 | 7 | destroy CT101 | Najpierw `missing`; po pozytywnym potwierdzeniu `confirmed_removed`, `retired` i tombstone. |
 | 8 | później nowy CT101 | Nowy `resource_id` i `locator_generation`; stary rekord pozostaje. |
 | 9 | LXC101 → delete → QEMU101 | Boundary-complete type change jest positive replacement evidence przy nadal zajętym slocie. Jedna direct-replacement transaction zamyka binding LXC z `closure_reason=replaced`, publikuje starą incarnation jako `presence=not_current`, `observational_continuity=replaced`, `lifecycle=retired`, tworzy terminal history, a QEMU dostaje nowy `resource_id`, immutable `resource_type=qemu`, nową `locator_generation` i `presence=present`. Nie wymaga pośredniego `missing`, `confirmed_removed` ani dowodu pustego slotu. |
 | 10 | delete/recreate między dwoma identycznymi pollingami | Zdarzenie może być observationally indistinguishable. Backend może zachować `resource_id` i read-only HA identity ze stanami `consistent`/`unverified`; nie oznacza to physical continuity. Retained policy może pozostać historycznie, ale effective destructive policy, maintenance permission i nowe destructive approvals/jobs są niedostępne. |
-| 11 | backend offline podczas delete/recreate | Znana przerwa w observation jest rzeczywistym gap: observational `uncertain`, security trust revoked/unavailable i fail-closed revalidation. |
+| 11 | backend offline podczas delete/recreate | Znana przerwa w observation jest rzeczywistym gap. Jeśli po powrocie nie ma positive replacement ani confirmed-removal proof, backend zachowuje ten sam read-only `resource_id` i active binding, ustawia `presence=present`, observational `uncertain`, lifecycle `quarantined`, security `revoked`/`unverified` i wyłącza effective policy/capabilities. |
 | 12 | node chwilowo offline | Jeśli locator nadal występuje w baseline, presence pozostaje `present`, a `node_availability=unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o mutation trust, nie o samym read-only presentation bindingu. |
 | 13 | cały source/API niedostępny | Zachowanie last-known inventory, freshness maleje; żadnych missing/removal transitions. |
-| 14 | resource missing przez kilka polli i wraca | Liczba polli nie potwierdza removal. Powrót wymaga continuity evidence; przy braku dowodu provisional ID. |
+| 14 | resource missing przez kilka polli i wraca | Liczba polli nie potwierdza removal. Bez positive replacement i bez wcześniejszego `confirmed_removed` powrót zachowuje ten sam `resource_id`, active binding i generation dla read-only UX; `presence=present`, continuity `uncertain`, lifecycle `quarantined`, bez destructive authority. |
 | 15 | `confirmed_removed`, potem locator wraca | Zawsze nowy `resource_id`/generation. Nawet jawny restore tworzy nową incarnation; lineage może wskazać poprzednika. |
 | 16 | destructive policy na zastąpionym resource | Policy zostaje przy starym `resource_id`; nowy startuje `discovered`, bez capabilities/maintenance. |
-| 17 | backup restore pod starym VMID | Wykryty restore/replacement tworzy nową candidate incarnation, chyba że przyszła jawna semantyka z mocnym proof zostanie zaakceptowana. Restore niewidoczny pomiędzy identycznymi pollingami może zachować read-only `resource_id` jako `unverified`; obecne hints nie wystarczają do destructive trust. |
+| 17 | backup restore pod starym VMID | Accepted continuity-anchor mismatch lub inne positive replacement evidence uruchamia atomic direct replacement i nowy `resource_id`. Bez takiego proof restore po gap zachowuje istniejący read-only ID/binding jako `uncertain`/`quarantined`/`unverified` lub `revoked`; restore niewidoczny między identycznymi pollingami również może zachować read-only identity. Obecne hints nie wystarczają do destructive trust. |
 | 18 | dwa Proxmoxy z VMID 101 | Różne `inventory_source_id`, locators i `resource_id`; brak kolizji. |
 
 ## Konsekwencje bezpieczeństwa
@@ -407,8 +425,9 @@ false continuity must never transfer destructive authority
   presentation relation, mają terminalne `presence=not_current`, pozostają
   unavailable i nie są automatycznie purge; successor dostaje nowe
   `resource_id`, nowe device/entity identity i bieżący presentation state;
-- observable gap z nierozstrzygniętą continuity: nowe/provisional device
-  identity zgodnie z reconciliation;
+- observable gap z nierozstrzygniętą continuity: istniejące device/entity
+  identity i active binding pozostają dla read-only UX, resource jest
+  `uncertain`/`quarantined` i nie ma effective destructive capabilities;
 - niewidoczny delete/recreate pomiędzy identycznymi pollingami może zachować
   read-only HA identity, ponieważ stockowe discovery nie potrafi go rozróżnić;
   nie przenosi to żadnej destructive authority.
@@ -437,7 +456,10 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   detail lub node availability nie oznaczał automatycznie physical absence;
 - zmianę validatorów snapshotu i testów Device Registry/node relation dla
   rozdzielonych osi, rename, migracji i atomowego direct replacement bez
-  pośredniego pustego slotu ani dwóch active bindings.
+  pośredniego pustego slotu ani dwóch active bindings;
+- testy ambiguity/gap potwierdzające zachowanie istniejącego `resource_id`,
+  bindingu i `locator_generation`, brak provisional split/tombstone oraz
+  fail-closed policy/capabilities.
 
 Obecny `docs/architecture/0.5-foundation.md` dokumentuje faktyczny kontrakt
 Phase 0 i nie jest w tym PR przepisywany tak, jakby amendment już wdrożono.
@@ -456,8 +478,9 @@ proof. Niniejsza faza nie modyfikuje kodu ani testów.
    ją tylko jako evidence.
 4. Procedura bezpiecznego przypięcia alternatywnego endpointu do istniejącego
    source wymaga osobnego design review.
-5. Czy operator będzie mógł jawnie scalić false split w HA bez utraty historii;
-   automatycznego merge nie projektujemy.
+5. Procedura jawnego rozstrzygnięcia quarantined continuity i ewentualnego
+   ponownego enrollment pozostaje do osobnego review; ambiguity nie tworzy
+   automatycznego split/merge identity.
 6. Konkretny node/hostd attestation protocol, key rotation i operatorowa
    procedura ponownego nadania `trusted` pozostają do osobnego review.
 

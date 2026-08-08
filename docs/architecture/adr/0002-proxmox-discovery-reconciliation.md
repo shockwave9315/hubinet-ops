@@ -484,7 +484,7 @@ Dozwolone przejścia (skrót):
 ```text
 present + detail_status ok ↔ temporarily_unavailable/error
 present + node_availability unavailable → present + node_availability available
-present → missing                  → present/uncertain
+present → missing                  → same resource_id/binding + present/uncertain/quarantined
 missing → confirmed_removed       tylko z positive removal authority
                                   + accepted authoritative absence evidence
 confirmed_removed + późniejszy powrót locatora → new resource_id,
@@ -496,6 +496,11 @@ baseline source_unavailable/partial → brak `missing`/removal transition
 
 `missing przez N polli` nie wystarcza do `confirmed_removed`, niezależnie od N.
 Długi czas również nie zamienia braku dowodu w dowód.
+
+Powrót locatora po ambiguity sam nie jest granicą identity. Bez positive
+replacement evidence i bez wcześniejszego `confirmed_removed` reconciler nie
+zamyka active bindingu, nie zwiększa `locator_generation` i nie tworzy nowego
+active/provisional `resource_id`.
 
 ### Direct replacement bez pustego slotu
 
@@ -526,8 +531,9 @@ Positive direct replacement evidence może pochodzić wyłącznie z:
 Rename, name change, zwykła zmiana config `digest`, runtime/config/detail
 mismatch, pojedynczy HTTP error ani upływ czasu nie są positive replacement
 evidence. Gdy evidence jest niejednoznaczne, obowiązuje
-`uncertain`/quarantine/provisional path; nie wolno wykonywać direct handoff ani
-inkrementować generation tylko z powodu config change.
+`uncertain`/quarantine na istniejącym `resource_id` i bindingu; nie wolno
+wykonywać direct handoff, tworzyć provisional identity ani inkrementować
+generation tylko z powodu config change lub ambiguity.
 
 Direct replacement jest jedną reconciliation transaction. W tej samej granicy
 backend:
@@ -675,9 +681,24 @@ ACL-filtered listing, timeout, source outage ani sam upływ czasu nie należą d
 - jeśli evidence pozytywnie potwierdza innego current occupanta, atomowy direct
   replacement zamyka stary binding jako `replaced`, zachowuje terminal history,
   a successor dostaje nowe ID/generation bez `confirmed_removed`;
-- jeśli po observable gap oba wyjaśnienia są możliwe, stary binding trafia do
-  quarantine, a bieżący locator może dostać provisional `resource_id` ze stanem
-  security `unverified`; żadna policy nie jest kopiowana.
+- jeśli po observable gap oba wyjaśnienia są możliwe, istniejący `resource_id`,
+  active locator binding i `locator_generation` pozostają dla read-only
+  reconciliation. Gdy locator jest ponownie widoczny, `presence=present`,
+  observational continuity=`uncertain`, lifecycle=`quarantined`, a security
+  continuity jest `revoked` po utracie wcześniejszego trust albo pozostaje
+  `unverified`. Policy applicability=false, destructive capabilities i
+  maintenance permission są `none`; aktywne destructive operations fail closed.
+  Stored policy/history pozostają przy istniejącym `resource_id`, a monotonic
+  continuity/security revision zwiększa się, aby unieważnić wcześniejsze
+  approvals/jobs bez zmiany `binding_id` ani `locator_generation`.
+
+Quarantine nie jest terminal history ani tombstone. Nie zamyka bindingu i nie
+tworzy successor lineage. Tombstone/termination powstaje dopiero po accepted
+terminal transition: `confirmed_removed` z authoritative absence proof albo
+direct replacement z positive replacement evidence. Nowy current `resource_id`
+dla tego samego slotu powstaje tylko na jednej z tych dwóch granic: jako
+successor direct replacement albo przy powrocie locatora po wcześniejszym
+`confirmed_removed`.
 
 Delete/recreate całkowicie pomiędzy dwoma identycznymi pollingami może być
 nierozróżnialne i zachować read-only HA identity. Resource bez zaakceptowanego
@@ -763,6 +784,7 @@ pamięć procesu nie jest source of truth.
 | permission hash BEFORE ≠ AFTER | `invalid` | odrzuć run; bez absence/removal transitions |
 | token ma tylko per-VM/per-pool visibility | `configuration_error` | read-only partial view może być diagnostyczny, ale nie authoritative inventory |
 | pełny baseline bez locatora | `baseline_completeness=complete` | `missing`, nie `confirmed_removed` |
+| locator wraca po `missing`/outage, continuity ambiguous, bez replacement/removal proof | `present` + `uncertain`/`quarantined` | zachowaj existing `resource_id`, active binding i generation; fail-closed authority; bez provisional ID/tombstone |
 | boundary-complete baseline + proof klasy A, B albo C, bez authoritative absence evidence | `baseline_completeness=complete` | najwyżej `missing`/`uncertain`; bez zamknięcia incarnation |
 | proof klasy A, B albo C + accepted authoritative absence evidence | zgodnie z kontraktem proof | `confirmed_removed`, tombstone |
 | bieżący slot zajęty przez successor + positive replacement evidence | direct replacement | atomowo `not_current`/`replaced`/`retired` old, nowy `resource_id` i generation; bez `missing`/`confirmed_removed` |
