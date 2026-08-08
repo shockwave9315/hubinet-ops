@@ -17,7 +17,7 @@ Proponujemy model D, będący uszczegółowieniem modelu C:
 ```text
 backend_instance_id             instalacja Hubinet Ops
 inventory_source_id             jawnie skonfigurowane środowisko Proxmox
-resource_id                     jedna trwała incarnation workloadu
+resource_id                     trwała backendowa inventory/candidate identity
 slot locator                    (inventory_source_id, vmid)
 resource_type                   immutable property occupant incarnation
 locator_generation              kolejny backendowy binding tego samego slotu
@@ -25,10 +25,13 @@ continuity_state + evidence     ocena, czy obserwacja należy do incarnation
 ```
 
 `resource_id` jest losowym, nieprzezroczystym UUID nadanym przez backend. Jest
-identity konkretnej incarnation, a nie „logicznej usługi” i nie zależy od
-nazwy, VMID ani node'a. `locator_generation` porządkuje historię wykorzystania
-slotu, ale sam nie dowodzi replacement. Policy, plany, jobs, locks oraz HA
-identity wiążą się z `resource_id`, nigdy wyłącznie z locatorem.
+trwałą identity rekordu inventory/candidate incarnation, a nie „logicznej
+usługi”, i nie zależy od nazwy, VMID ani node'a. Dla resource `unverified` nie
+jest jednak dowodem, że fizyczna incarnation nie została niewidocznie
+zastąpiona między pollingami. `locator_generation` porządkuje historię
+wykorzystania slotu, ale sam nie dowodzi replacement. HA może używać
+`resource_id` do read-only continuity; destructive authority wymaga dodatkowo
+zaakceptowanego security continuity proof.
 
 ## Terminologia i granice
 
@@ -191,8 +194,9 @@ route. Routing wyłącznie po external node name jest zabroniony.
 ### C. backendowy `resource_id`, osobny locator i incarnation
 
 - bezpieczeństwo: pozwala fail-closed oddzielić identity od adresu;
-- VMID reuse: nowa incarnation otrzymuje nowy `resource_id`;
-- HA/policy: mogą wiązać się bezpośrednio z incarnation;
+- wykryty VMID reuse: nowa candidate incarnation otrzymuje nowy `resource_id`;
+- HA: może wiązać się z `resource_id` dla read-only continuity; destructive
+  policy wymaga dodatkowo `security_continuity=trusted`;
 - migracja/multi-node: node pozostaje relacją;
 - wiele Proxmoxów: locator jest namespaced przez source;
 - DB: wymaga historii bindingów, observations i tombstones;
@@ -204,13 +208,14 @@ jest immutable property związanej incarnation.
 ### D. wybrany model: C plus rozdzielenie backend/source i evidence
 
 Model C uzupełniamy o `backend_instance_id`, `inventory_source_id`, historię
-`locator_generation`, osobny `continuity_state` oraz trwałe evidence. Dzięki
-temu brak natywnego PVE UUID jest jawny, a nie ukryty za heurystyką.
+`locator_generation`, osobne observational/security continuity states oraz
+trwałe evidence. Dzięki temu brak natywnego PVE UUID jest jawny, a nie ukryty za
+heurystyką.
 
-Koszt to bardziej rozbudowany schema i możliwość bezpiecznego false split
-(utworzenia nowej provisional incarnation, choć operator później potwierdzi, że
-był to ten sam workload). Ten koszt jest preferowany względem false continuity,
-które mogłoby przenieść destructive policy na inny workload.
+Koszt to bardziej rozbudowany schema oraz jawne rozróżnienie dwóch ryzyk:
+observable gap może spowodować bezpieczny false split, natomiast niewidoczny
+replacement może zachować read-only identity. Security continuity powoduje, że
+żaden z tych przypadków nie przenosi destructive authority.
 
 ## Backend installation a Proxmox source
 
@@ -234,21 +239,38 @@ na podstawie podobnych nazw lub VMID.
 
 ## Model continuity
 
-Presence i continuity są niezależnymi osiami. Proponowane continuity states:
+Presence, observational continuity i security continuity są niezależnymi
+osiami.
 
-- `unverified` — nowa incarnation odkryta, ale jeszcze nie enrolled;
-- `trusted` — operator wykonał enrollment, a wymagany continuity proof pozostaje
-  ważny i nie ma luki w evidence;
-- `uncertain` — replacement jest możliwy, ale nie można ani potwierdzić
-  ciągłości, ani replacement;
-- `replaced` — istnieje pozytywny dowód, że locator wskazuje inną incarnation;
-- `retired` — stara incarnation została zakończona i zachowana historycznie.
+Observational/read-only continuity:
+
+- `consistent` — kolejne kompletne obserwacje są zgodne i nie wystąpił
+  observable gap/conflict; nie jest to dowód fizycznej ciągłości;
+- `uncertain` — istnieje rzeczywista obserwowalna luka, konflikt albo evidence,
+  przez które continuity nie da się rozstrzygnąć;
+- `replaced` — istnieje pozytywny dowód, że slot wskazuje innego occupant;
+- `retired` — rekord został zakończony i zachowany historycznie.
+
+Security continuity:
+
+- `unverified` — resource nie ma zaakceptowanego continuity anchor/proof;
+- `trusted` — operator wykonał enrollment, wymagany proof pozostaje ważny i nie
+  ma dyskwalifikującej luki/evidence;
+- `revoked` — wcześniejszy trust został jawnie wycofany lub proof przestał być
+  ważny.
 
 Pozytywny dowód continuity nie może opierać się tylko na nieprzerwanym VMID,
 nazwie, `digest` ani podobieństwie config. Stockowe API PVE nie dostarcza
 wspólnego immutable anchor. Przyszły enrollment musi zdefiniować continuity
 proof (oraz sposób jego odczytu i ochrony) przed nadaniem `trusted`. ADR nie
 przesądza jeszcze mechanizmu enrollment.
+
+Dla `unverified` backend może zachować ten sam `resource_id` pomiędzy zgodnymi,
+kompletnymi obserwacjami dla inventory, UX i HA. Sam odstęp czasu między
+pollingami nie jest observable gap i nie ustawia automatycznie `uncertain`.
+Stockowy polling nie potrafi wykluczyć, że delete/recreate zaszło całkowicie
+między dwoma identycznymi obserwacjami. Taka niewidoczna replacement może więc
+zachować read-only HA identity; nie może zachować destructive authority.
 
 Pozytywnym dowodem replacement może być:
 
@@ -262,12 +284,13 @@ Task log i config fingerprints są evidence pomocniczym. Retencja i kompletnoś�
 task history nie są potwierdzone jako niezawodny, wieczny event stream, więc nie
 mogą być jedyną granicą bezpieczeństwa.
 
-Jeżeli continuity nie da się udowodnić, system ustawia `uncertain`, wycofuje
-destructive capabilities i maintenance permission, a po ponownym pojawieniu
-locatora tworzy nową provisional `resource_id`. Poprzednia incarnation pozostaje
-w quarantine/tombstone. Późniejsze jawne resolution może zapisać lineage, ale
-nie kopiuje automatycznie policy. Bezpieczny false split jest dopuszczalny;
-false continuity nie jest.
+Jeżeli wystąpi observable gap/conflict/evidence i continuity nie da się
+rozstrzygnąć, system ustawia observational `uncertain`, wycofuje security trust
+i może utworzyć nową provisional `resource_id` po ponownym pojawieniu locatora.
+Poprzednia candidate incarnation pozostaje w quarantine/tombstone. Późniejsze
+jawne resolution może zapisać lineage, ale nie kopiuje automatycznie policy.
+Brak observable konfliktu pozwala zachować read-only identity, lecz nigdy nie
+podnosi `unverified` do `trusted`.
 
 ## Scenariusze lifecycle i zagrożeń
 
@@ -282,14 +305,14 @@ false continuity nie jest.
 | 7 | destroy CT101 | Najpierw `missing`; po pozytywnym potwierdzeniu `confirmed_removed`, `retired` i tombstone. |
 | 8 | później nowy CT101 | Nowy `resource_id` i `locator_generation`; stary rekord pozostaje. |
 | 9 | LXC101 → delete → QEMU101 | Ten sam slot `(source, 101)` zostaje zajęty ponownie. LXC incarnation jest retired/tombstoned; QEMU dostaje nowy `resource_id`, immutable `resource_type=qemu` i nową `locator_generation`. |
-| 10 | delete/recreate między dwoma pollingami | Stockowy snapshot nie dowodzi zdarzenia. `uncertain`, nowa provisional incarnation, zero odziedziczonych uprawnień. |
-| 11 | backend offline podczas delete/recreate | Jak wyżej; luka evidence wymusza fail-closed revalidation. |
+| 10 | delete/recreate między dwoma identycznymi pollingami | Zdarzenie może być observationally indistinguishable. Backend może zachować `resource_id` i read-only HA identity ze stanami `consistent`/`unverified`; nie oznacza to physical continuity. Resource nie ma destructive policy, maintenance permission ani aktywnych destructive approvals/jobs. |
+| 11 | backend offline podczas delete/recreate | Znana przerwa w observation jest rzeczywistym gap: observational `uncertain`, security trust revoked/unavailable i fail-closed revalidation. |
 | 12 | node chwilowo offline | Presence `node_unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o ponownym bindingu. |
 | 13 | cały source/API niedostępny | Zachowanie last-known inventory, freshness maleje; żadnych missing/removal transitions. |
 | 14 | resource missing przez kilka polli i wraca | Liczba polli nie potwierdza removal. Powrót wymaga continuity evidence; przy braku dowodu provisional ID. |
 | 15 | `confirmed_removed`, potem locator wraca | Zawsze nowy `resource_id`/generation. Nawet jawny restore tworzy nową incarnation; lineage może wskazać poprzednika. |
 | 16 | destructive policy na zastąpionym resource | Policy zostaje przy starym `resource_id`; nowy startuje `discovered`, bez capabilities/maintenance. |
-| 17 | backup restore pod starym VMID | Nowa incarnation, chyba że przyszła, jawna semantyka restore z mocnym continuity proof zostanie osobno zaakceptowana. Obecne hints nie wystarczają. |
+| 17 | backup restore pod starym VMID | Wykryty restore/replacement tworzy nową candidate incarnation, chyba że przyszła jawna semantyka z mocnym proof zostanie zaakceptowana. Restore niewidoczny pomiędzy identycznymi pollingami może zachować read-only `resource_id` jako `unverified`; obecne hints nie wystarczają do destructive trust. |
 | 18 | dwa Proxmoxy z VMID 101 | Różne `inventory_source_id`, locators i `resource_id`; brak kolizji. |
 
 ## Konsekwencje bezpieczeństwa
@@ -297,11 +320,12 @@ false continuity nie jest.
 Fundamentalny invariant:
 
 ```text
-policy attaches to durable resource incarnation,
-not merely to Proxmox locator
+destructive policy attaches to a trusted resource identity and continuity proof,
+never merely to resource_id or Proxmox locator
 ```
 
-Nowy albo niepewny resource zaczyna na poziomie `discovered`:
+Nowy, `unverified` albo observationally `uncertain` resource zaczyna/pozostaje na
+poziomie `discovered`:
 
 ```text
 destructive capabilities = none
@@ -314,6 +338,14 @@ locator binding, expected continuity revision, `trusted`, policy i runtime
 preconditions. Locator jest parametrem wykonawczym wyliczonym dopiero po tych
 kontrolach.
 
+Resource ze stanem security continuity `unverified` nie może posiadać
+destructive policy, maintenance permission ani aktywnych destructive
+approvals/jobs. Stabilny `resource_id` sam nie jest podstawą wyjątku. Invariant:
+
+```text
+false continuity must never transfer destructive authority
+```
+
 ## Konsekwencje dla Home Assistant
 
 - ConfigEntry identifier: `backend_instance_id`, nie URL;
@@ -325,15 +357,19 @@ kontrolach.
 - migrate: `via_device_id` wskazuje nowy node device, identity bez zmian;
 - `confirmed_removed`: stare device/entities pozostają unavailable; brak purge w
   tej fazie;
-- VMID reuse/replacement/ambiguity: nowe device/entities; stare HA identity nie
-  przechodzi na nowy workload.
+- wykryte VMID reuse/replacement albo observable gap z nierozstrzygniętą
+  continuity: nowe/provisional device identity zgodnie z reconciliation;
+- niewidoczny delete/recreate pomiędzy identycznymi pollingami może zachować
+  read-only HA identity, ponieważ stockowe discovery nie potrafi go rozróżnić;
+  nie przenosi to żadnej destructive authority.
 
 ## PHASE 0 AMENDMENT REQUIRED
 
 Obecne `ResourceIdentity(instance_id, resource_type, vmid)` w Phase 0 musi zostać
 zmienione **przed implementacją Phase 1**. `instance_id` trzeba rozdzielić na
 `backend_instance_id` i `inventory_source_id`, a HA resource identity oprzeć na
-backendowym `resource_id` incarnation. Niniejsza faza nie modyfikuje kodu.
+backendowym `resource_id` inventory/candidate record. Trusted operations muszą
+osobno wymagać security continuity proof. Niniejsza faza nie modyfikuje kodu.
 
 ## Nierozstrzygnięte kwestie
 

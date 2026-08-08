@@ -106,6 +106,36 @@ pozostałych uprawnień mutacyjnych.
 Token nigdy nie jest logowany ani zwracany przez Hubinet Ops API/diagnostics.
 Authorization header powstaje wyłącznie w adapterze transportowym.
 
+### Independent effective-permission proof
+
+**FACT-SOURCE:** `GET /access/permissions` pozwala userowi/tokenowi odczytać
+własne effective permissions i zwraca mapę `path → privilege → propagate`.
+**FACT-SOURCE:** `/cluster/resources` nie zgłasza brakującego `VM.Audit`; pomija
+niewidoczne VM/LXC, więc ACL-filtered response może wyglądać dokładnie jak
+kompletny, mniejszy inventory.
+
+Authoritative source-wide run musi używać tego samego tokenu i wykonać:
+
+```text
+permission snapshot/hash BEFORE
+→ fetch cluster-wide baseline and required facts
+→ permission snapshot/hash AFTER
+```
+
+Permission evaluator musi fail-closed potwierdzić:
+
+- effective `VM.Audit` z propagation dla całego `/vms` guest tree;
+- wymagane przez kontrakt node permissions dla całego `/nodes` tree oraz
+  `Sys.Audit` na `/`, jeśli używane endpointy tego wymagają;
+- brak descendant/restrictive/niejednoznacznych ACL scopes, które mogłyby ukryć
+  dowolny guest albo wymagany node;
+- identyczny canonical permission snapshot/hash przed i po discovery window.
+
+Token widzący wyłącznie per-VM albo per-pool scope nie może utworzyć
+authoritative `complete` inventory. Brak możliwości pobrania lub jednoznacznej
+interpretacji własnych effective permissions jest configuration error, nie
+domniemaniem pełnego dostępu.
+
 ## Normalized discovery snapshot
 
 Snapshot jest value object niezależnym od SDK i powinien zawierać:
@@ -118,6 +148,9 @@ DiscoverySnapshot
   source_facts
   source_availability
   completeness
+  permission_snapshot_hash_before
+  permission_snapshot_hash_after
+  permission_coverage
   covered_nodes
   failed_scopes
   event_cursor_before / event_cursor_after (optional evidence)
@@ -151,10 +184,13 @@ przed transaction boundary. Shallow read-only wrapper nie wystarcza.
 
 Każdy run ma jedną z klasyfikacji:
 
-- `complete` — autorytatywny source-wide baseline zakończył się sukcesem, a
-  wszystkie zakresy wymagane do oceny presence są pokryte;
+- `complete` — autorytatywny source-wide baseline zakończył się sukcesem,
+  independent permission proof potwierdza pełne wymagane guest/node coverage
+  oraz permission hashes przed/po są identyczne;
 - `partial` — source odpowiedział, lecz brakuje node'a, strony, zakresu albo
   wystąpił per-resource read error;
+- `configuration_error` — token/effective ACL lub provider configuration nie
+  pozwala udowodnić authoritative source-wide coverage;
 - `source_unavailable` — nie uzyskano wiarygodnego baseline;
 - `invalid` — odpowiedź narusza schema, source binding lub monotonicity.
 
@@ -163,9 +199,11 @@ locatorów z błędem config read pozwala zachować `present`, ale ustawia
 `temporarily_unavailable` dla szczegółów. Częściowa lista locatorów nigdy nie
 jest traktowana jak dowód nieobecności.
 
-Run zawiera `covered_nodes` i `failed_scopes`, aby brak node'a lub ACL filtering
-nie wyglądał jak empty inventory. Odpowiedź widoczna tylko częściowo z powodu
-ACL jest configuration error, nie kompletnym snapshotem source.
+`covered_nodes` i `failed_scopes` opisują jawnie zauważone błędy transportu lub
+subrequestów, ale nie dowodzą pełnego ACL coverage. Tylko niezależny effective-
+permission proof może wykluczyć ciche filtrowanie. Brak pełnego coverage daje
+`partial`/`configuration_error`; różne permission hashes przed/po dają `invalid`.
+W obu przypadkach nie wolno wykonywać absence/removal transitions.
 
 ## Reconciliation state machine
 
@@ -253,25 +291,31 @@ ACL-filtered listing, timeout, source outage ani sam upływ czasu nie należą d
 
 ### Powrót po braku lub outage
 
-- jeśli mocny continuity proof potwierdza tę samą incarnation, wraca istniejący
-  `resource_id`;
+- bez observable gap/conflict zgodne, kompletne obserwacje mogą zachować
+  read-only `resource_id`; to observational consistency, nie security proof;
+- po rzeczywistym gap (np. `missing`, source outage) mocny continuity proof może
+  przywrócić istniejący trusted binding;
 - jeśli evidence potwierdza replacement, stary record jest retired/tombstoned,
   a nowy dostaje nowe ID;
-- jeśli oba wyjaśnienia są możliwe, stary binding trafia do quarantine, a
-  bieżący locator dostaje provisional `resource_id` ze stanem `unverified`;
-  żadna policy nie jest kopiowana.
+- jeśli po observable gap oba wyjaśnienia są możliwe, stary binding trafia do
+  quarantine, a bieżący locator może dostać provisional `resource_id` ze stanem
+  security `unverified`; żadna policy nie jest kopiowana.
 
-To samo dotyczy delete/recreate między pollingami i długiej przerwy backendu.
-Brak obserwowanego `absent` nie oznacza continuity.
+Delete/recreate całkowicie pomiędzy dwoma identycznymi pollingami może być
+nierozróżnialne i zachować read-only HA identity. Resource bez zaakceptowanego
+continuity anchor pozostaje `unverified` i nie może posiadać destructive policy,
+maintenance permission ani aktywnych destructive approvals/jobs.
 
 ## Transaction boundary i publikacja
 
 Każdy run wykonuje:
 
 ```text
-fetch
+fetch permission snapshot BEFORE
+→ fetch baseline/facts
+→ fetch permission snapshot AFTER
 → normalize
-→ validate snapshot source, schema, time and completeness
+→ validate permission stability/coverage, source, schema, time and completeness
 → reconcile in one DB transaction
 → derive presence, continuity and capabilities
 → commit
@@ -294,7 +338,9 @@ pamięć procesu nie jest source of truth.
 | osiągalny endpoint innego klastra | `invalid` | odrzuć run; security alert |
 | brak jednego node'a | `partial` lub `node_unavailable` | resources node'a zachowane |
 | baseline pełny, config read jednego guest fail | baseline complete + per-resource error | locator `present`, facts unavailable |
-| ACL ukrywa część inventory | `partial`/configuration error | bez removal transitions |
+| permission proof nie pokrywa całego `/vms`/`/nodes` contract | `partial`/`configuration_error` | bez absence/removal transitions |
+| permission hash BEFORE ≠ AFTER | `invalid` | odrzuć run; bez absence/removal transitions |
+| token ma tylko per-VM/per-pool visibility | `configuration_error` | read-only partial view może być diagnostyczny, ale nie authoritative inventory |
 | pełny baseline bez locatora | `complete` | `missing`, nie `confirmed_removed` |
 | pełny baseline + proof klasy A, B albo C | `complete` | `confirmed_removed`, tombstone |
 | out-of-order/stary run | `invalid` | bez zmian |
@@ -345,6 +391,7 @@ Oficjalne źródła Proxmox, odczytane 2026-08-08:
 - [pveproxy — HTTPS 8006 i forwarding do innych node'ów](https://github.com/proxmox/pve-docs/blob/master/pveproxy.adoc)
 - [pveum — API tokens, privilege separation, role i ACL](https://github.com/proxmox/pve-docs/blob/master/pveum.adoc)
 - [pve-manager `Cluster.pm` — cluster-wide resources/status/tasks i permission filters](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Cluster.pm)
+- [pve-access-control `AccessControl.pm` — `GET /access/permissions` i effective permission map](https://github.com/proxmox/pve-access-control/blob/master/src/PVE/API2/AccessControl.pm)
 - [Proxmox VE API Viewer](https://pve.proxmox.com/pve-docs/api-viewer/)
 - [pvecm — multi-master, node remove/reinstall/rejoin i certificate refresh](https://github.com/proxmox/pve-docs/blob/master/pvecm.adoc)
 
@@ -354,7 +401,10 @@ pozwala czytać VM config, `Sys.Audit` node/cluster status/config.
 
 **FACT-SOURCE:** `/cluster/resources` filtruje guest entries przez `VM.Audit` na
 `/vms/{vmid}`, node facts przez `Sys.Audit` na `/nodes/{node}`, a
-`/cluster/status` wymaga `Sys.Audit` na `/`.
+`/cluster/status` wymaga `Sys.Audit` na `/`. Brak `VM.Audit` powoduje pominięcie
+guest entry bez markeru brakującego scope. `GET /access/permissions` pozwala
+userowi/tokenowi odczytać własne effective permissions jako mapę path/privilege/
+propagation.
 
 Pozostałe reguły completeness, reconciliation i failover są decyzjami
 architektonicznymi Hubinet Ops, nie obietnicami Proxmox API.
