@@ -46,8 +46,10 @@ zaakceptowanego security continuity proof.
 - **observation** — read-only fakty z jednego discovery run;
 - **continuity** — backendowa ocena, czy bieżące fakty odnoszą się do tej samej
   incarnation;
-- **presence** — osobny stan obecności locatora; nie jest detail status,
-  node availability ani poziomem policy.
+- **presence** — osobny stan relacji incarnation do slotu; `present`/`missing`/
+  `confirmed_removed` opisują obserwację lub dowód dotyczący slotu, a terminalne
+  `not_current` mówi wyłącznie, że inny occupant przejął slot. Presence nie jest
+  detail status, node availability ani poziomem policy.
 
 Node nie jest częścią locatora workloadu. Migracja zmienia bieżącą relację z
 node'em, nie identity workloadu.
@@ -273,17 +275,26 @@ Stockowy polling nie potrafi wykluczyć, że delete/recreate zaszło całkowicie
 między dwoma identycznymi obserwacjami. Taka niewidoczna replacement może więc
 zachować read-only HA identity; nie może zachować destructive authority.
 
-Pozytywnym dowodem replacement może być:
+Positive replacement evidence jest osobną klasą od removal/absence proof. Może
+nią być wyłącznie evidence wystarczające do stwierdzenia, że bieżący occupant
+nie może być starą incarnation:
 
-- obserwowany type change occupant tego samego slotu;
-- potwierdzona operacja destroy oraz pełny, późniejszy snapshot bez zasobu;
-- jawny mismatch przyszłego continuity anchor;
-- wiarygodny, nieprzerwany event/task cursor pokazujący destroy/create;
-- jawna, audytowana decyzja operatora.
+- boundary-complete/current observation zmiany immutable occupant `resource_type`
+  dla tego samego slotu, czyli `lxc → qemu` albo `qemu → lxc`;
+- mismatch future accepted continuity anchor, jeżeli zaakceptowany contract
+  jednoznacznie dowodzi innej incarnation;
+- trusted destroy/create event chain, ale tylko po późniejszym udowodnieniu
+  contiguous event/cursor semantics; taki stock-PVE contract jest obecnie
+  **UNKNOWN**;
+- jawna, audytowana decyzja operatora związana z exact starym `resource_id`,
+  locator binding i revision; sama nie nadaje successorowi trusted continuity
+  ani destructive authority.
 
-Task log i config fingerprints są evidence pomocniczym. Retencja i kompletność
-task history nie są potwierdzone jako niezawodny, wieczny event stream, więc nie
-mogą być jedyną granicą bezpieczeństwa.
+Rename, name change, zwykła zmiana config `digest`, runtime/config/detail
+mismatch, pojedynczy HTTP error ani upływ czasu nie są positive replacement
+evidence. Task log i config fingerprints są wyłącznie evidence pomocniczym.
+Retencja i kompletność task history nie są potwierdzone jako niezawodny,
+wieczny event stream, więc nie mogą być jedyną granicą bezpieczeństwa.
 
 Jeżeli wystąpi observable gap/conflict/evidence i continuity nie da się
 rozstrzygnąć, system ustawia observational `uncertain`, wycofuje security trust
@@ -305,7 +316,7 @@ podnosi `unverified` do `trusted`.
 | 6 | clone do nowego VMID | Nowy locator, nowy `resource_id`, `unverified`; żadna policy nie jest kopiowana. |
 | 7 | destroy CT101 | Najpierw `missing`; po pozytywnym potwierdzeniu `confirmed_removed`, `retired` i tombstone. |
 | 8 | później nowy CT101 | Nowy `resource_id` i `locator_generation`; stary rekord pozostaje. |
-| 9 | LXC101 → delete → QEMU101 | Ten sam slot `(source, 101)` zostaje zajęty ponownie. LXC incarnation jest retired/tombstoned; QEMU dostaje nowy `resource_id`, immutable `resource_type=qemu` i nową `locator_generation`. |
+| 9 | LXC101 → delete → QEMU101 | Boundary-complete type change jest positive replacement evidence przy nadal zajętym slocie. Jedna direct-replacement transaction zamyka binding LXC z `closure_reason=replaced`, publikuje starą incarnation jako `presence=not_current`, `observational_continuity=replaced`, `lifecycle=retired`, tworzy terminal history, a QEMU dostaje nowy `resource_id`, immutable `resource_type=qemu`, nową `locator_generation` i `presence=present`. Nie wymaga pośredniego `missing`, `confirmed_removed` ani dowodu pustego slotu. |
 | 10 | delete/recreate między dwoma identycznymi pollingami | Zdarzenie może być observationally indistinguishable. Backend może zachować `resource_id` i read-only HA identity ze stanami `consistent`/`unverified`; nie oznacza to physical continuity. Retained policy może pozostać historycznie, ale effective destructive policy, maintenance permission i nowe destructive approvals/jobs są niedostępne. |
 | 11 | backend offline podczas delete/recreate | Znana przerwa w observation jest rzeczywistym gap: observational `uncertain`, security trust revoked/unavailable i fail-closed revalidation. |
 | 12 | node chwilowo offline | Jeśli locator nadal występuje w baseline, presence pozostaje `present`, a `node_availability=unavailable`; bez usunięcia i bez zmiany identity. Po powrocie continuity proof decyduje o mutation trust, nie o samym read-only presentation bindingu. |
@@ -371,9 +382,9 @@ continuity, exact binding/revision, backend capability i wymaganych snapshot/job
 preconditions nie autoryzuje rollbacku.
 
 Successor po replacement dostaje nowy `resource_id` i nie dziedziczy stored
-policy, approvals ani jobs. Ewentualne przyszłe „copy settings” tworzy nową,
-jawną i audytowaną policy dla successor resource; nie reaktywuje historycznej
-policy poprzednika.
+policy, approvals, jobs ani locks. Ewentualne przyszłe „copy settings” tworzy
+nową, jawną i audytowaną policy dla successor resource; nie reaktywuje
+historycznej policy poprzednika.
 
 Invariant:
 
@@ -392,8 +403,12 @@ false continuity must never transfer destructive authority
 - migrate: `via_device_id` wskazuje nowy node device, identity bez zmian;
 - `confirmed_removed`: stare device/entities pozostają unavailable; brak purge w
   tej fazie;
-- wykryte VMID reuse/replacement albo observable gap z nierozstrzygniętą
-  continuity: nowe/provisional device identity zgodnie z reconciliation;
+- direct replacement: stare device/entities zachowują historię i last-known
+  presentation relation, mają terminalne `presence=not_current`, pozostają
+  unavailable i nie są automatycznie purge; successor dostaje nowe
+  `resource_id`, nowe device/entity identity i bieżący presentation state;
+- observable gap z nierozstrzygniętą continuity: nowe/provisional device
+  identity zgodnie z reconciliation;
 - niewidoczny delete/recreate pomiędzy identycznymi pollingami może zachować
   read-only HA identity, ponieważ stockowe discovery nie potrafi go rozróżnić;
   nie przenosi to żadnej destructive authority.
@@ -408,9 +423,10 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
 
 - zastąpienie `ResourceIdentity(instance_id, resource_type, vmid)` przez jawne
   `backend_instance_id`, `inventory_source_id` i backendowy `resource_id`;
-- oddzielenie locator presence (`present`, `missing`, `confirmed_removed`) od
-  per-resource `detail_status` (`ok`, `temporarily_unavailable`, `error`) oraz
-  `node_availability`;
+- oddzielenie locator/resource presence (`present`, `missing`,
+  `confirmed_removed` oraz terminalne `not_current` dla zastąpionej starej
+  incarnation) od per-resource `detail_status` (`ok`,
+  `temporarily_unavailable`, `error`) oraz `node_availability`;
 - usunięcie mutually-exclusive modelu, w którym `temporarily_unavailable` albo
   `node_unavailable` zastępuje presence: jeśli locator nadal istnieje,
   `temporarily_unavailable` jest detail status, a niedostępny node jest overlay
@@ -420,7 +436,8 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
 - dostosowanie mapowania availability w Coordinator/entities tak, aby błąd
   detail lub node availability nie oznaczał automatycznie physical absence;
 - zmianę validatorów snapshotu i testów Device Registry/node relation dla
-  rozdzielonych osi, rename oraz migracji.
+  rozdzielonych osi, rename, migracji i atomowego direct replacement bez
+  pośredniego pustego slotu ani dwóch active bindings.
 
 Obecny `docs/architecture/0.5-foundation.md` dokumentuje faktyczny kontrakt
 Phase 0 i nie jest w tym PR przepisywany tak, jakby amendment już wdrożono.

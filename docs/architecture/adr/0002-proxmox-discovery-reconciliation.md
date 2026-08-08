@@ -474,7 +474,10 @@ Locator presence i availability/detail status są niezależne:
   brak pozytywnego dowodu trwałego removal/replacement; jest to observational
   negative, które może wynikać także z niewykrytego ACL ABA;
 - `confirmed_removed` — istnieje pozytywny removal proof i autorytatywna
-  nieobecność została zatwierdzona w reconciliation.
+  nieobecność slotu została zatwierdzona w reconciliation;
+- `not_current` — terminalna reprezentacja starej incarnation po positive direct
+  replacement; nie twierdzi, że slot jest absent, ponieważ current occupantem
+  jest successor.
 
 Dozwolone przejścia (skrót):
 
@@ -484,18 +487,83 @@ present + node_availability unavailable → present + node_availability availabl
 present → missing                  → present/uncertain
 missing → confirmed_removed       tylko z positive removal authority
                                   + accepted authoritative absence evidence
-confirmed_removed → (new resource_id), nigdy z powrotem do starej incarnation
+confirmed_removed + późniejszy powrót locatora → new resource_id,
+                                             nigdy stara incarnation
+present old + positive replacement evidence + present successor observation
+  → atomic old not_current/replaced/retired + new resource_id/generation/present
 baseline source_unavailable/partial → brak `missing`/removal transition
 ```
 
 `missing przez N polli` nie wystarcza do `confirmed_removed`, niezależnie od N.
 Długi czas również nie zamienia braku dowodu w dowód.
 
+### Direct replacement bez pustego slotu
+
+Direct replacement jest osobnym przejściem od removal/absence. Dowodzi, że
+stary resource nie zajmuje już slotu, ale nie dowodzi, że slot był albo jest
+pusty:
+
+```text
+replacement proof != absence proof
+confirmed_removed != replaced
+```
+
+Positive direct replacement evidence może pochodzić wyłącznie z:
+
+1. boundary-complete/current observation pokazującej zmianę immutable occupant
+   `resource_type` dla tego samego `(inventory_source_id, vmid)`, czyli
+   `lxc → qemu` albo `qemu → lxc`;
+2. future accepted continuity-anchor contract, którego mismatch jednoznacznie
+   wyklucza starą incarnation;
+3. trusted destroy/create event chain, ale dopiero po zaakceptowaniu contractu
+   gwarantującego contiguous event/cursor semantics; dla stockowego PVE taki
+   kontrakt pozostaje **UNKNOWN**;
+4. explicit audited operator replacement decision związana z exact starym
+   `resource_id`, active locator binding i expected revision. Taka decyzja
+   klasyfikuje replacement, ale nie nadaje successorowi trusted continuity ani
+   destructive authority.
+
+Rename, name change, zwykła zmiana config `digest`, runtime/config/detail
+mismatch, pojedynczy HTTP error ani upływ czasu nie są positive replacement
+evidence. Gdy evidence jest niejednoznaczne, obowiązuje
+`uncertain`/quarantine/provisional path; nie wolno wykonywać direct handoff ani
+inkrementować generation tylko z powodu config change.
+
+Direct replacement jest jedną reconciliation transaction. W tej samej granicy
+backend:
+
+1. weryfikuje expected old `resource_id`;
+2. weryfikuje exact active locator binding;
+3. weryfikuje expected binding/continuity revision;
+4. weryfikuje positive replacement evidence oraz bieżącą, boundary-complete
+   obserwację successor occupanta;
+5. zamyka stary binding przez `valid_to` i `closure_reason=replaced`;
+6. ustawia starej incarnation `presence=not_current`,
+   `observational_continuity=replaced` i `lifecycle=retired`;
+7. revokuje wcześniejszy trust, jeżeli istniał, suspenduje policy applicability
+   i ustawia effective destructive authorization na `none`;
+8. zapisuje retained terminal/tombstone history;
+9. inkrementuje `locator_generation` i tworzy nowy `resource_id`;
+10. tworzy dokładnie jeden nowy active binding dla tego samego slotu;
+11. inicjalizuje successor jako `presence=present`,
+   `security_continuity=unverified`, level `discovered`, bez inherited stored
+   policy, approvals, jobs ani locks;
+12. zapisuje optional lineage old → successor oraz evidence/provenance/audit;
+13. wykonuje commit i dopiero potem publikuje oba stany.
+
+Nie istnieje committed ani published moment z dwoma active bindings dla slotu.
+Nie jest wymagany pośredni `missing`, `confirmed_removed` ani authoritative
+proof, że slot stał się pusty. Jeśli stara incarnation była `trusted`, positive
+replacement natychmiast suspenduje jej effective policy, ustawia destructive
+capabilities i maintenance permission na `none`, a aktywne destructive
+operations są fail-closed blokowane/przerywane według późniejszego audytowanego
+operation contract.
+
 ### Node relation i HA availability
 
 To jest docelowy kontrakt wymagany przez Phase 0 Amendment. `detail_status`
-pozostaje niezależny; dla absence state nie ma bieżącego detail read, a retained
-facts są stale/historyczne.
+pozostaje niezależny; dla absence albo terminal state nie ma bieżącego detail
+read, a retained facts są stale/historyczne.
 
 | Przypadek | `presence` | `node_availability` | `current_node_id` | `last_known_node_id` | HA `via_device` | HA availability |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -504,6 +572,7 @@ facts są stale/historyczne.
 | C. Locator present, current relation nierozstrzygnięta | `present` | `unresolved` | `null` | poprzedni node, jeśli był znany | last-known node dla presentation, jeśli istnieje; inaczej brak relacji | Presence może pozostać dostępne; location/node-dependent entities są unavailable do resolution. |
 | D. Locator missing | `missing` | `not_applicable` | `null` | ostatni znany node, jeśli istniał | zachowaj last-known presentation relation | Resource entities unavailable; brak purge. |
 | E. Confirmed removed | `confirmed_removed` | `not_applicable` | `null` | ostatni znany node, jeśli istniał | zachowaj last-known presentation relation/history | Resource entities unavailable; brak automatycznego delete/purge. |
+| F. Stara incarnation po direct replacement | `not_current` | `not_applicable` | `null` | ostatni znany node starej incarnation, jeśli istniał | zachowaj last-known presentation relation/history | Stare entities unavailable i retained; successor ma osobne device/entities oraz własną current node relation. |
 
 `current_node_id` oznacza wyłącznie aktualną, wiarygodnie resolved relację
 inventory. `last_known_node_id` jest presentation/history hint i nigdy security
@@ -520,6 +589,10 @@ last_known_node_id != security mutation route
 ```
 
 ### Kiedy dokładnie wolno ustawić `confirmed_removed`
+
+Ta ścieżka dotyczy wyłącznie autorytatywnego potwierdzenia pustego slotu.
+Positive replacement przy slocie zajętym przez successor używa osobnego direct
+replacement transition i nigdy nie jest zapisywany jako `confirmed_removed`.
 
 Każda klasa proof wymaga wspólnych warunków:
 
@@ -599,8 +672,9 @@ ACL-filtered listing, timeout, source outage ani sam upływ czasu nie należą d
   read-only `resource_id`; to observational consistency, nie security proof;
 - po rzeczywistym gap (np. `missing`, source outage) mocny continuity proof może
   przywrócić istniejący trusted binding;
-- jeśli evidence potwierdza replacement, stary record jest retired/tombstoned,
-  a nowy dostaje nowe ID;
+- jeśli evidence pozytywnie potwierdza innego current occupanta, atomowy direct
+  replacement zamyka stary binding jako `replaced`, zachowuje terminal history,
+  a successor dostaje nowe ID/generation bez `confirmed_removed`;
 - jeśli po observable gap oba wyjaśnienia są możliwe, stary binding trafia do
   quarantine, a bieżący locator może dostać provisional `resource_id` ze stanem
   security `unverified`; żadna policy nie jest kopiowana.
@@ -627,6 +701,7 @@ capture expected source_config_revision + exact endpoint/canonicalization/TLS re
 → validate boundary topology/permission equality and baseline completeness
 → record independent per-resource detail statuses
 → reconcile in one DB transaction
+  (w tym optional atomic direct old-binding → successor-binding handoff)
 → derive presence, continuity and capabilities
 → commit
 → publish committed snapshot to Hubinet Ops API/HA
@@ -690,6 +765,7 @@ pamięć procesu nie jest source of truth.
 | pełny baseline bez locatora | `baseline_completeness=complete` | `missing`, nie `confirmed_removed` |
 | boundary-complete baseline + proof klasy A, B albo C, bez authoritative absence evidence | `baseline_completeness=complete` | najwyżej `missing`/`uncertain`; bez zamknięcia incarnation |
 | proof klasy A, B albo C + accepted authoritative absence evidence | zgodnie z kontraktem proof | `confirmed_removed`, tombstone |
+| bieżący slot zajęty przez successor + positive replacement evidence | direct replacement | atomowo `not_current`/`replaced`/`retired` old, nowy `resource_id` i generation; bez `missing`/`confirmed_removed` |
 | out-of-order/stary run | `invalid` | bez zmian |
 
 ## Trust boundary
