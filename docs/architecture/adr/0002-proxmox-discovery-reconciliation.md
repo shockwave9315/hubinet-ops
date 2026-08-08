@@ -851,8 +851,8 @@ atomic transaction:
     → reconcile inventory
     (w tym optional atomic direct old-binding → successor-binding handoff)
     → update committed-inventory and source-health tokens
-    → persist fixed last-successful timestamp + freshness deadline
-      bound to exact committed run/context
+    → persist fixed last-successful timestamp + observation-derived
+      freshness reference/deadline bound to exact committed run/context
     → increment inventory revision + published-state revision
     → derive presence, continuity, freshness and capabilities
     → release active discovery ownership
@@ -1080,8 +1080,9 @@ Conceptual source state publikuje co najmniej:
   nie musi być current contextem;
 - `last_committed_run_sequence`;
 - `last_successful_observed_at`;
+- fixed, observation-derived `freshness_reference_at`;
 - fixed `freshness_valid_until`/`fresh_until` oraz exact committed run/context
-  provenance, do których deadline należy;
+  provenance, do których anchor i deadline należą;
 - current health/freshness, np. `healthy/fresh`, `stale`,
   `source_unavailable`, `partial/degraded`, `configuration_error`, invalid
   current-context observation albo `not_yet_observed`;
@@ -1108,8 +1109,9 @@ Successful authoritative inventory run wykonuje jedną atomic transaction, któr
 sprawdza nonterminal run i exact active ownership, ponownie waliduje exact
 current context, one-time finalizuje run i completion provenance, reconciliuje
 resources, aktualizuje `last_committed_run_sequence`, successful
-observation/freshness, fixed freshness deadline należący do exact run/contextu i
-`last_health_run_sequence`, zwiększa `inventory_revision` i
+observation/freshness, fixed observation-derived freshness reference/deadline
+należące do exact run/contextu i `last_health_run_sequence`, zwiększa
+`inventory_revision` i
 `published_state_revision`, zwalnia ownership, po czym commit/publikuje wszystko
 albo nic.
 
@@ -1180,7 +1182,8 @@ mutation-fresh do nowego udanego commitu; po nim current origin staje się
 Initial source creation atomowo tworzy source, dokładnie jeden initial active
 endpoint oraz wymagany `source_runtime_health` record z
 `current_health_origin=initial/not_yet_observed`, jawnie non-fresh health i
-`last_successful_observed_at=null`, unset freshness deadline provenance, a active
+`last_successful_observed_at=null`, unset freshness reference/deadline
+provenance, a active
 discovery ownership jest unset;
 `last_committed_run_sequence` pozostaje null
 albo używa jednoznacznego initial sentinel. Ta sama transaction zwiększa
@@ -1216,16 +1219,40 @@ transition albo nowszego applicable health outcome unieważniającego confidence
 
 ### Freshness deadline i revisioned expiry
 
+Wersjonowany provider contract wyznacza fixed `freshness_reference_at` z
+faktycznie accepted observation window/provider observation. Anchor musi być
+konserwatywny względem wszystkich required baseline, permission i fact reads
+tworzących authoritative inventory snapshot: nie może być późniejszy niż
+najstarsza freshness-relevant obserwacja, chyba że oficjalnie zweryfikowany
+provider contract dowodzi wspólnego authoritative snapshot time. Jeżeli provider
+nie daje takiego timestampu, contract wybiera równoważny, nie mniej
+konserwatywny boundary z observation window. Reconciliation commit time, API
+read time ani timer execution time nie mogą być użyte jako anchor.
+
 Authoritative successful applicable commit wylicza według jawnego
-freshness-duration contract i atomowo utrwala fixed
-`last_successful_observed_at`, `freshness_valid_until` oraz exact committed
-run/source/endpoint/canonicalization/transport-trust provenance. Deadline należy
-do tej revision i nie przesuwa się przy API read. Nowy successful applicable run
-może ustanowić nowy deadline. Exact duration/TTL pozostaje późniejszym explicit
-configuration/operation contract, ale Phase 1 nie może reprezentować fresh jako
-bezterminowego. Zmiana configured duration jest controlled discovery-relevant
-configuration transition zwiększającą `source_config_revision`; nie interpretuje
-ponownie ani nie wydłuża deadline istniejącego commitu.
+freshness-duration contract
+`freshness_valid_until = freshness_reference_at + configured duration` albo
+wcześniejszy, bardziej konserwatywny deadline i atomowo utrwala fixed
+`last_successful_observed_at`, `freshness_reference_at`, deadline oraz exact
+committed run/source/endpoint/canonicalization/transport-trust provenance.
+Deadline należy do tej revision, a opóźnienie fetch/reconciliation/DB commit nie
+odmładza danych. Nie przesuwa się przy API read. Nowy successful applicable run
+może ustanowić nowy observation-derived anchor/deadline. Exact duration/TTL
+pozostaje późniejszym explicit configuration/operation contract, ale Phase 1 nie
+może reprezentować fresh jako bezterminowego. Zmiana configured duration jest
+controlled discovery-relevant configuration transition zwiększającą
+`source_config_revision`; nie interpretuje ponownie ani nie wydłuża deadline
+istniejącego commitu.
+
+Successful reconciliation ocenia deadline wewnątrz tej samej atomic commit
+boundary. Jeżeli `current time >= freshness_valid_until`, może trwale zapisać
+inventory jako nowy last-known successful commit i zwiększyć
+`inventory_revision`, ale current health jest od razu non-fresh/stale z origin
+`time_expiry`, reason `freshness_deadline_elapsed_before_commit` (albo
+równoważnym jawnym reason) i freshness-dependent capabilities `none/ineligible`.
+Ta sama transaction tworzy jeden nowy `published_state_revision`; nie publikuje
+nawet przejściowo `fresh` i nie planuje osobnej expiry transition dla już
+przeterminowanego commitu.
 
 Po przekroczeniu current deadline backend wykonuje controlled transition:
 
@@ -1303,6 +1330,11 @@ Wymagane freshness/expiry contract tests:
 
 ```text
 successful run → fixed last_successful_observed_at + fresh_until → fresh
+observation at T0 + delayed reconciliation commit → freshness reference/deadline remain based on T0 observation, not commit time
+deadline elapsed before successful reconciliation commit → last-known inventory commit allowed
+  → immediately non-fresh; no transient fresh published state
+normal fast run → fresh until its fixed observation-derived deadline
+next successful run → new observation-derived reference and deadline
 deadline passes without a new run → atomic stale/time_expiry transition
   → published_state_revision increases; inventory_revision unchanged
 poller/timer stalls → later API read commits expiry before returning authoritative view
@@ -1322,7 +1354,7 @@ published-state change token. Inventory reconciliation zwiększa
 albo controlled context transition zwiększa `published_state_revision` bez
 wymuszania nowego `inventory_revision`. Dotyczy to m.in. zmian
 `latest_completed_run_sequence/outcome`, `last_health_run_sequence/outcome`,
-fixed last-success/deadline timestamps, health reason/origin,
+fixed last-success/reference/deadline timestamps, health reason/origin,
 current/committed source context, initial/time-expiry/context-transition state,
 resource/node/policy i derived capabilities.
 

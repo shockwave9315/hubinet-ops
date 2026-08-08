@@ -476,9 +476,10 @@ degraded, w `configuration_error` albo ma nowszy applicable invalid
 current-context outcome podważający confidence. Future destructive/maintenance
 eligibility wymaga committed inventory utworzonego pod bieżącym
 `source_config_revision`, exact endpoint/canonicalization contract i
-`transport_trust_revision`, przed fixed freshness deadline należącym do exact
-committed run/contextu, bez nowszego source health outcome podważającego
-current-state assumptions, oraz jawnie spełnionego operation freshness limit.
+`transport_trust_revision`, przed fixed, observation-derived freshness deadline
+należącym do exact committed run/contextu, bez nowszego source health outcome
+podważającego current-state assumptions, oraz jawnie spełnionego operation
+freshness limit.
 Freshness wynika wyłącznie z authoritative successful applicable commit i trwa
 do najwcześniejszego z deadline, controlled context transition albo nowszego
 applicable outcome, który ją unieważnia; nie zależy od przypadkowej nazwy health
@@ -581,8 +582,8 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   tego samego VMID, current occupant resolution przez active binding oraz
   retained node references bez dangling `via_device`;
 - source health/freshness/origin fields, initial non-fresh semantics,
-  fixed last-success/deadline provenance, controlled `time_expiry` oraz
-  scheduler-independent deadline enforcement,
+  fixed last-success/observation-reference/deadline provenance, controlled
+  `time_expiry` oraz scheduler-independent deadline enforcement,
   globalny `published_state_revision` dla każdej zmiany publikowanego pola,
   consistent-read snapshot contract oraz HA tests odróżniające osiągalny backend
   ze świeżym inventory od osiągalnego backendu ze
