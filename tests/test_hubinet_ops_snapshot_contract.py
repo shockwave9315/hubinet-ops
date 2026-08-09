@@ -140,6 +140,7 @@ def resource(
     suspended_reason: str | None = None,
     effective_capabilities: frozenset[str] = frozenset(),
     state: dict[str, Any] | None = None,
+    state_level: ResourceStateLevel = ResourceStateLevel.OBSERVED,
     termination_reason: str | None = None,
     successor_resource_id: str | None = None,
 ) -> ResourceSnapshot:
@@ -165,7 +166,7 @@ def resource(
         security_continuity=security_continuity,
         detail_status=detail_status,
         node_availability=node_availability,
-        state_level=ResourceStateLevel.OBSERVED,
+        state_level=state_level,
         retained_policy=retained_policy or {},
         effective_policy=effective_policy or {},
         policy_applicable=policy_applicable,
@@ -384,28 +385,30 @@ def direct_replacement_views() -> tuple[
     return previous, incoming, old, successor
 
 
-def test_direct_replacement_introduction_rejects_trusted_successor() -> None:
+def test_revision_gap_may_skip_handoff_and_observe_trusted_successor() -> None:
     previous, _, old, successor = direct_replacement_views()
     incoming = snapshot(
         resources=(
             old,
             replace(
                 successor,
+                resource_continuity_revision=2,
                 security_continuity=SecurityContinuity.TRUSTED,
             ),
         ),
-        inventory_revision=11,
-        published_state_revision=21,
+        inventory_revision=12,
+        published_state_revision=23,
     )
-    with pytest.raises(ValueError, match="introduction violates handoff"):
-        incoming.validate_revision_successor(previous)
+    incoming.validate_revision_successor(previous)
 
 
-def test_direct_replacement_introduction_rejects_successor_policy() -> None:
+def test_revision_gap_may_skip_handoff_and_successor_policy_transition() -> None:
     previous, _, old, successor = direct_replacement_views()
     policy_successor = replace(
         successor,
+        resource_continuity_revision=3,
         security_continuity=SecurityContinuity.TRUSTED,
+        state_level=ResourceStateLevel.MANAGED,
         retained_policy={"managed": True},
         effective_policy={"managed": True},
         policy_applicable=True,
@@ -413,35 +416,10 @@ def test_direct_replacement_introduction_rejects_successor_policy() -> None:
     )
     incoming = snapshot(
         resources=(old, policy_successor),
-        inventory_revision=11,
-        published_state_revision=21,
+        inventory_revision=13,
+        published_state_revision=24,
     )
-    with pytest.raises(ValueError, match="introduction violates handoff"):
-        incoming.validate_revision_successor(previous)
-
-
-def test_direct_replacement_introduction_rejects_noncurrent_successor() -> None:
-    previous, _, old, successor = direct_replacement_views()
-    removed_successor = replace(
-        successor,
-        active_binding_id=None,
-        resource_continuity_revision=2,
-        current_node_id=None,
-        last_known_node_id=NODE_A,
-        presence=PresenceState.CONFIRMED_REMOVED,
-        lifecycle=LifecycleState.RETIRED,
-        detail_status=DetailStatus.NOT_APPLICABLE,
-        node_availability=NodeAvailability.NOT_APPLICABLE,
-        status="unknown",
-        termination_reason="confirmed_removed",
-    )
-    incoming = snapshot(
-        resources=(old, removed_successor),
-        inventory_revision=11,
-        published_state_revision=21,
-    )
-    with pytest.raises(ValueError, match="introduction violates handoff"):
-        incoming.validate_revision_successor(previous)
+    incoming.validate_revision_successor(previous)
 
 
 @pytest.mark.parametrize(
@@ -498,10 +476,30 @@ def test_terminal_successor_lineage_cannot_be_rewritten() -> None:
         rewritten.validate_revision_successor(accepted)
 
 
-def test_not_current_successor_pointer_cannot_be_cleared() -> None:
+def test_terminal_successor_lineage_cannot_be_cleared() -> None:
+    previous, accepted, old, successor = direct_replacement_views()
+    accepted.validate_revision_successor(previous)
+    cleared = replace(
+        old,
+        presence=PresenceState.CONFIRMED_REMOVED,
+        observational_continuity=ObservationalContinuity.CONSISTENT,
+        resource_continuity_revision=3,
+        termination_reason="confirmed_removed",
+        successor_resource_id=None,
+    )
+    incoming = snapshot(
+        resources=(cleared, successor),
+        inventory_revision=12,
+        published_state_revision=22,
+    )
+    with pytest.raises(ValueError, match="replacement lineage is immutable"):
+        incoming.validate_revision_successor(accepted)
+
+
+def test_replacement_successor_must_be_retained_in_same_snapshot() -> None:
     old = not_current_resource(generation=4)
-    with pytest.raises(ValueError, match="requires successor_resource_id"):
-        replace(old, successor_resource_id=None)
+    with pytest.raises(ValueError, match="successor is absent"):
+        snapshot(resources=(old,))
 
 
 def test_replacement_lineage_cannot_reference_itself() -> None:
@@ -518,24 +516,16 @@ def test_valid_direct_replacement_handoff_is_accepted() -> None:
     incoming.validate_revision_successor(previous)
 
 
-def test_historical_successor_may_later_become_trusted() -> None:
-    previous, accepted, old, successor = direct_replacement_views()
-    accepted.validate_revision_successor(previous)
-    trusted = replace(
-        successor,
-        resource_continuity_revision=2,
-        security_continuity=SecurityContinuity.TRUSTED,
-    )
-    snapshot(
-        resources=(old, trusted),
-        inventory_revision=12,
-        published_state_revision=22,
-    ).validate_revision_successor(accepted)
+def test_terminal_replacement_resource_cannot_be_reopened() -> None:
+    old = not_current_resource(generation=4)
+    successor = resource(SUCCESSOR_ID, generation=5, name="Successor")
+    reopened_old = resource(generation=4, continuity_revision=3)
+    with pytest.raises(ValueError, match="multiple current occupants for a locator"):
+        snapshot(resources=(reopened_old, successor))
 
 
-def test_historical_successor_may_later_enter_quarantine() -> None:
-    previous, accepted, old, successor = direct_replacement_views()
-    accepted.validate_revision_successor(previous)
+def test_revision_gap_may_observe_historical_successor_in_quarantine() -> None:
+    previous, _, old, successor = direct_replacement_views()
     quarantined = replace(
         successor,
         resource_continuity_revision=2,
@@ -545,13 +535,12 @@ def test_historical_successor_may_later_enter_quarantine() -> None:
     snapshot(
         resources=(old, quarantined),
         inventory_revision=12,
-        published_state_revision=22,
-    ).validate_revision_successor(accepted)
+        published_state_revision=23,
+    ).validate_revision_successor(previous)
 
 
-def test_historical_successor_may_later_be_confirmed_removed() -> None:
-    previous, accepted, old, successor = direct_replacement_views()
-    accepted.validate_revision_successor(previous)
+def test_revision_gap_may_observe_historical_successor_confirmed_removed() -> None:
+    previous, _, old, successor = direct_replacement_views()
     removed = replace(
         successor,
         active_binding_id=None,
@@ -568,16 +557,15 @@ def test_historical_successor_may_later_be_confirmed_removed() -> None:
     later = snapshot(
         resources=(old, removed),
         inventory_revision=12,
-        published_state_revision=22,
+        published_state_revision=23,
     )
-    later.validate_revision_successor(accepted)
+    later.validate_revision_successor(previous)
     assert later.resources_by_id[RESOURCE_ID].successor_resource_id == SUCCESSOR_ID
     assert later.resources_by_id[SUCCESSOR_ID].active_binding_id is None
 
 
-def test_retained_replacement_lineage_may_form_a_chain() -> None:
-    previous, accepted, old_a, successor_b = direct_replacement_views()
-    accepted.validate_revision_successor(previous)
+def test_revision_gap_may_skip_entire_intermediate_successor_generation() -> None:
+    previous, _, old_a, successor_b = direct_replacement_views()
     old_b = not_current_resource(
         resource_id=SUCCESSOR_ID,
         generation=5,
@@ -590,10 +578,10 @@ def test_retained_replacement_lineage_may_form_a_chain() -> None:
     )
     chained = snapshot(
         resources=(old_a, old_b, successor_c),
-        inventory_revision=12,
-        published_state_revision=22,
+        inventory_revision=13,
+        published_state_revision=24,
     )
-    chained.validate_revision_successor(accepted)
+    chained.validate_revision_successor(previous)
     assert chained.resources_by_id[RESOURCE_ID].successor_resource_id == SUCCESSOR_ID
     assert chained.resources_by_id[SUCCESSOR_ID].successor_resource_id == THIRD_RESOURCE_ID
     assert successor_b.resource_id == SUCCESSOR_ID

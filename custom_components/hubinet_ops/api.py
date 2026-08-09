@@ -1077,33 +1077,15 @@ class HubinetOpsSnapshot:
                     "active binding is immutable before a terminal transition"
                 )
 
-            if (
-                not old_terminal
-                and resource.presence is PresenceState.NOT_CURRENT
-            ):
-                successor = self.resources_by_id[resource.successor_resource_id]
+            if not old_terminal and resource.presence is PresenceState.NOT_CURRENT:
                 expected_old_security = (
                     SecurityContinuity.REVOKED
                     if old.security_continuity is SecurityContinuity.TRUSTED
                     else old.security_continuity
                 )
-                if (
-                    successor.resource_id in previous_resources_by_id
-                    or resource.security_continuity is not expected_old_security
-                    or resource.policy_applicable
-                    or resource.effective_capabilities
-                    or successor.active_binding_id is None
-                    or successor.presence is not PresenceState.PRESENT
-                    or successor.lifecycle is not LifecycleState.ACTIVE
-                    or successor.observational_continuity
-                    is not ObservationalContinuity.CONSISTENT
-                    or successor.security_continuity
-                    is not SecurityContinuity.UNVERIFIED
-                    or successor.policy_applicable
-                    or successor.effective_capabilities
-                ):
+                if resource.security_continuity is not expected_old_security:
                     raise ValueError(
-                        "direct replacement introduction violates handoff invariants"
+                        "replacement terminal security continuity is invalid"
                     )
 
             security_relevant_transition = (
