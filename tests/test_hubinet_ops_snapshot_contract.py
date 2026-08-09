@@ -402,6 +402,94 @@ def test_revision_gap_may_skip_handoff_and_observe_trusted_successor() -> None:
     incoming.validate_revision_successor(previous)
 
 
+def test_revision_gap_allows_skipped_enrollment_before_replacement() -> None:
+    previous, _, old, successor = direct_replacement_views()
+    revoked_old = replace(
+        old,
+        resource_continuity_revision=3,
+        security_continuity=SecurityContinuity.REVOKED,
+    )
+    incoming = snapshot(
+        resources=(revoked_old, successor),
+        inventory_revision=12,
+        published_state_revision=23,
+    )
+    incoming.validate_revision_successor(previous)
+
+
+def test_trusted_predecessor_may_be_revoked_by_replacement() -> None:
+    previous = snapshot(
+        resources=(
+            resource(
+                generation=4,
+                continuity_revision=2,
+                security_continuity=SecurityContinuity.TRUSTED,
+            ),
+        )
+    )
+    revoked_old = replace(
+        not_current_resource(generation=4),
+        resource_continuity_revision=3,
+        security_continuity=SecurityContinuity.REVOKED,
+    )
+    incoming = snapshot(
+        resources=(revoked_old, resource(SUCCESSOR_ID, generation=5)),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+
+
+def test_revision_gap_does_not_reconstruct_predecessor_security_path() -> None:
+    previous, _, old, successor = direct_replacement_views()
+    after_multiple_security_transitions = replace(
+        old,
+        resource_continuity_revision=5,
+        security_continuity=SecurityContinuity.REVOKED,
+    )
+    incoming = snapshot(
+        resources=(after_multiple_security_transitions, successor),
+        inventory_revision=15,
+        published_state_revision=27,
+    )
+    incoming.validate_revision_successor(previous)
+
+
+def test_terminal_replacement_cannot_remain_trusted() -> None:
+    with pytest.raises(ValueError, match="canonical state matrix"):
+        replace(
+            not_current_resource(generation=4),
+            security_continuity=SecurityContinuity.TRUSTED,
+        )
+
+
+def test_terminal_replacement_requires_newer_continuity_revision() -> None:
+    previous, _, old, successor = direct_replacement_views()
+    unchanged_revision = replace(
+        old,
+        resource_continuity_revision=1,
+        security_continuity=SecurityContinuity.REVOKED,
+    )
+    incoming = snapshot(
+        resources=(unchanged_revision, successor),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="requires a newer resource_continuity_revision",
+    ):
+        incoming.validate_revision_successor(previous)
+
+
+def test_terminal_replacement_cannot_retain_active_binding() -> None:
+    with pytest.raises(ValueError, match="must not have an active binding"):
+        replace(
+            not_current_resource(generation=4),
+            active_binding_id="still-active",
+        )
+
+
 def test_revision_gap_may_skip_handoff_and_successor_policy_transition() -> None:
     previous, _, old, successor = direct_replacement_views()
     policy_successor = replace(

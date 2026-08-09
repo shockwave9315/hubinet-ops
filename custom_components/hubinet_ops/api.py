@@ -1077,17 +1077,6 @@ class HubinetOpsSnapshot:
                     "active binding is immutable before a terminal transition"
                 )
 
-            if not old_terminal and resource.presence is PresenceState.NOT_CURRENT:
-                expected_old_security = (
-                    SecurityContinuity.REVOKED
-                    if old.security_continuity is SecurityContinuity.TRUSTED
-                    else old.security_continuity
-                )
-                if resource.security_continuity is not expected_old_security:
-                    raise ValueError(
-                        "replacement terminal security continuity is invalid"
-                    )
-
             security_relevant_transition = (
                 resource.observational_continuity
                 is not old.observational_continuity
