@@ -74,6 +74,7 @@ def auto_enable_custom_integrations(enable_custom_integrations, socket_enabled):
 BACKEND_ID = "6a172b5d-d820-4cac-904f-dfb17d42163e"
 OTHER_BACKEND_ID = "2b5d3b3b-e4b9-412a-851a-11bc4e839aa7"
 SOURCE_ID = "cfe64f8e-2529-4692-9c23-526479961dbc"
+SOURCE_B_ID = "44e24b73-f593-4625-a182-2e2db9541688"
 NODE_A = "811d7ea4-470f-42d4-aa06-d2c5c9249a1e"
 NODE_B = "6f1c0770-6ca6-4c20-ab56-8cb645f63ee3"
 RESOURCE_VM = "3a6d0ac4-f859-438d-9f96-9d21dba641f1"
@@ -106,18 +107,22 @@ def source_context(
     transport_trust_revision: int = 2,
     endpoint_id: str = "7b784024-62d8-4f3e-bb63-af9fe65fcc8e",
     canonical_transport_locator: str = "https://pve.example.test:8006",
+    canonicalization_contract_version: int = 1,
 ) -> SourceContext:
     return SourceContext(
         source_config_revision=revision,
         endpoint_id=endpoint_id,
         canonical_transport_locator=canonical_transport_locator,
-        canonicalization_contract_version=1,
+        canonicalization_contract_version=canonicalization_contract_version,
         transport_trust_revision=transport_trust_revision,
     )
 
 
 def source(
     *,
+    inventory_source_id: str = SOURCE_ID,
+    name: str = "Test Proxmox",
+    provider_kind: str = "proxmox",
     health: SourceHealth = SourceHealth.HEALTHY,
     freshness: SourceFreshness = SourceFreshness.FRESH,
     health_origin: SourceHealthOrigin = SourceHealthOrigin.DISCOVERY_RUN,
@@ -135,9 +140,9 @@ def source(
     has_commit = last_committed_run_sequence is not None
     context = current_context or source_context()
     return InventorySourceSnapshot(
-        inventory_source_id=SOURCE_ID,
-        name="Test Proxmox",
-        provider_kind="proxmox",
+        inventory_source_id=inventory_source_id,
+        name=name,
+        provider_kind=provider_kind,
         health=health,
         freshness=freshness,
         health_origin=health_origin,
@@ -179,13 +184,14 @@ def unavailable_source() -> InventorySourceSnapshot:
 def node(
     node_id: str = NODE_A,
     *,
+    inventory_source_id: str = SOURCE_ID,
     name: str = "pve-a",
     available: bool = True,
     facts: dict[str, Any] | None = None,
 ) -> NodeSnapshot:
     return NodeSnapshot(
         node_id=node_id,
-        inventory_source_id=SOURCE_ID,
+        inventory_source_id=inventory_source_id,
         name=name,
         status="online" if available else "offline",
         available=available,
@@ -1362,6 +1368,183 @@ def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> Non
 
 
 @pytest.mark.parametrize(
+    ("incoming_source", "match"),
+    [
+        (
+            source(
+                latest_completed_run_sequence=None,
+                latest_completed_outcome=None,
+            ),
+            "latest_completed_run_sequence cannot be cleared",
+        ),
+        (
+            source(
+                health=SourceHealth.DEGRADED,
+                freshness=SourceFreshness.STALE,
+                health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+                health_reason="provenance_erased",
+                last_health_run_sequence=None,
+                last_run_health_outcome=None,
+                last_committed_run_sequence=None,
+            ),
+            "last_health_run_sequence cannot be cleared",
+        ),
+        (
+            source(
+                health=SourceHealth.SOURCE_UNAVAILABLE,
+                freshness=SourceFreshness.STALE,
+                health_reason="newer_failure_without_commit_provenance",
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="source_unavailable",
+                last_health_run_sequence=6,
+                last_run_health_outcome="source_unavailable",
+                last_committed_run_sequence=None,
+            ),
+            "last_committed_run_sequence cannot be cleared",
+        ),
+    ],
+)
+def test_source_durable_sequence_cannot_return_to_unset(
+    incoming_source: InventorySourceSnapshot,
+    match: str,
+) -> None:
+    incoming = snapshot(
+        (),
+        sources=(incoming_source,),
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match=match):
+        incoming.validate_revision_successor(snapshot((), sources=(source(),)))
+
+
+@pytest.mark.parametrize(
+    ("incoming_source", "match"),
+    [
+        (
+            replace(source(), latest_completed_outcome="rewritten_completion"),
+            "latest completed outcome is immutable",
+        ),
+        (
+            replace(source(), last_run_health_outcome="rewritten_health"),
+            "last run health outcome is immutable",
+        ),
+        (
+            source(
+                current_context=source_context(revision=4),
+                committed_context=source_context(revision=4),
+            ),
+            "successful commit provenance is immutable",
+        ),
+    ],
+)
+def test_same_source_sequence_cannot_rewrite_provenance(
+    incoming_source: InventorySourceSnapshot,
+    match: str,
+) -> None:
+    incoming = snapshot(
+        (),
+        sources=(incoming_source,),
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match=match):
+        incoming.validate_revision_successor(snapshot((), sources=(source(),)))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    [
+        ("last_successful_observed_at", "2026-08-08T12:00:30+00:00"),
+        ("freshness_reference_at", "2026-08-08T12:00:00+00:00"),
+        ("freshness_valid_until", "2026-08-08T12:05:00+00:00"),
+    ],
+)
+def test_same_committed_sequence_cannot_rewrite_fixed_timestamps(
+    field_name: str,
+    changed_value: str,
+) -> None:
+    incoming_source = replace(source(), **{field_name: changed_value})
+    incoming = snapshot(
+        (),
+        sources=(incoming_source,),
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="successful commit provenance is immutable"):
+        incoming.validate_revision_successor(snapshot((), sources=(source(),)))
+
+
+def test_higher_source_sequences_may_publish_new_provenance() -> None:
+    previous = snapshot((), sources=(source(),))
+
+    higher_completion = source(
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="audit_only_inapplicable",
+        last_health_run_sequence=5,
+        last_committed_run_sequence=5,
+    )
+    snapshot(
+        (),
+        sources=(higher_completion,),
+        published_state_revision=21,
+    ).validate_revision_successor(previous)
+
+    higher_health = source(
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="newer_failed_health",
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="source_unavailable",
+        last_health_run_sequence=6,
+        last_run_health_outcome="source_unavailable",
+        last_committed_run_sequence=5,
+    )
+    snapshot(
+        (),
+        sources=(higher_health,),
+        published_state_revision=21,
+    ).validate_revision_successor(previous)
+
+    higher_commit = replace(
+        source(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            last_health_run_sequence=6,
+            last_committed_run_sequence=6,
+            current_context=source_context(revision=4),
+        ),
+        last_successful_observed_at="2026-08-08T12:01:30+00:00",
+        freshness_reference_at="2026-08-08T12:01:00+00:00",
+        freshness_valid_until="2026-08-08T12:06:00+00:00",
+    )
+    snapshot(
+        (),
+        sources=(higher_commit,),
+        inventory_revision=11,
+        published_state_revision=21,
+    ).validate_revision_successor(previous)
+
+
+def test_health_only_expiry_retains_exact_committed_provenance() -> None:
+    committed = source()
+    expired = replace(
+        committed,
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.TIME_EXPIRY,
+        health_reason="freshness_deadline_expired",
+    )
+    snapshot(
+        (),
+        sources=(expired,),
+        published_state_revision=21,
+    ).validate_revision_successor(snapshot((), sources=(committed,)))
+    assert expired.committed_context == committed.committed_context
+    assert expired.freshness_valid_until == committed.freshness_valid_until
+
+
+@pytest.mark.parametrize(
     ("previous_source", "incoming_source", "match"),
     [
         (
@@ -1471,6 +1654,59 @@ def test_source_monotonic_provenance_rejects_rollbacks(
         incoming.validate_revision_successor(previous)
 
 
+def test_provider_kind_is_immutable_for_existing_source() -> None:
+    incoming = snapshot(
+        (),
+        sources=(replace(source(), provider_kind="other-provider"),),
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="provider_kind is immutable"):
+        incoming.validate_revision_successor(snapshot((), sources=(source(),)))
+
+
+@pytest.mark.parametrize(
+    ("incoming_context", "match"),
+    [
+        (
+            source_context(endpoint_id="different-endpoint"),
+            "endpoint_id change requires a newer source_config_revision",
+        ),
+        (
+            source_context(
+                canonical_transport_locator="https://other-pve.example.test:8006"
+            ),
+            "canonical_transport_locator change requires a newer",
+        ),
+        (
+            source_context(canonicalization_contract_version=2),
+            "canonicalization_contract_version change requires a newer",
+        ),
+    ],
+)
+def test_current_route_change_requires_newer_source_config_revision(
+    incoming_context: SourceContext,
+    match: str,
+) -> None:
+    committed_context = source_context()
+    controlled_transition = source(
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="active_route_changed",
+        current_context=incoming_context,
+        committed_context=committed_context,
+    )
+    incoming = snapshot(
+        (),
+        sources=(controlled_transition,),
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match=match):
+        incoming.validate_revision_successor(
+            snapshot((), sources=(source(current_context=committed_context),))
+        )
+
+
 def test_controlled_source_context_transition_uses_revisions_not_endpoint_text() -> None:
     previous_context = source_context(
         revision=3,
@@ -1500,6 +1736,43 @@ def test_controlled_source_context_transition_uses_revisions_not_endpoint_text()
         published_state_revision=21,
     )
     incoming.validate_revision_successor(previous)
+
+
+def test_node_identity_cannot_move_between_inventory_sources() -> None:
+    previous = snapshot(
+        (),
+        sources=(source(),),
+        nodes=(node(),),
+    )
+    incoming = snapshot(
+        (),
+        sources=(source(inventory_source_id=SOURCE_B_ID),),
+        nodes=(node(inventory_source_id=SOURCE_B_ID),),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="node identity cannot move between sources"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_node_display_and_runtime_facts_may_change_within_same_source() -> None:
+    original = node(facts={"cpu": 0.1})
+    updated = replace(
+        original,
+        name="pve-a-renamed",
+        status="maintenance",
+        available=False,
+        facts={"cpu": 0.4, "maintenance": True},
+    )
+    incoming = snapshot(
+        (),
+        sources=(source(),),
+        nodes=(updated,),
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(
+        snapshot((), sources=(source(),), nodes=(original,))
+    )
 
 
 def test_published_revisions_are_monotonic_and_one_revision_is_immutable() -> None:

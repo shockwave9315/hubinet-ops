@@ -732,6 +732,8 @@ class HubinetOpsSnapshot:
             old_source = previous_sources_by_id.get(source.inventory_source_id)
             if old_source is None:
                 continue
+            if source.provider_kind != old_source.provider_kind:
+                raise ValueError("provider_kind is immutable for an inventory source")
             if (
                 source.current_context.source_config_revision
                 < old_source.current_context.source_config_revision
@@ -742,6 +744,22 @@ class HubinetOpsSnapshot:
                 < old_source.current_context.transport_trust_revision
             ):
                 raise ValueError("transport_trust_revision must not regress")
+            if (
+                source.current_context.source_config_revision
+                == old_source.current_context.source_config_revision
+            ):
+                for field_name in (
+                    "endpoint_id",
+                    "canonical_transport_locator",
+                    "canonicalization_contract_version",
+                ):
+                    if getattr(source.current_context, field_name) != getattr(
+                        old_source.current_context, field_name
+                    ):
+                        raise ValueError(
+                            f"{field_name} change requires a newer "
+                            "source_config_revision"
+                        )
             if (
                 source.last_issued_run_sequence
                 < old_source.last_issued_run_sequence
@@ -754,12 +772,62 @@ class HubinetOpsSnapshot:
             ):
                 old_sequence = getattr(old_source, field_name)
                 sequence = getattr(source, field_name)
-                if (
-                    old_sequence is not None
-                    and sequence is not None
-                    and sequence < old_sequence
-                ):
+                if old_sequence is None:
+                    continue
+                if sequence is None:
+                    raise ValueError(f"{field_name} cannot be cleared")
+                if sequence < old_sequence:
                     raise ValueError(f"{field_name} must not regress")
+
+            if (
+                source.latest_completed_run_sequence
+                == old_source.latest_completed_run_sequence
+                and source.latest_completed_run_sequence is not None
+                and source.latest_completed_outcome
+                != old_source.latest_completed_outcome
+            ):
+                raise ValueError(
+                    "latest completed outcome is immutable for its run sequence"
+                )
+            if (
+                source.last_health_run_sequence
+                == old_source.last_health_run_sequence
+                and source.last_health_run_sequence is not None
+                and source.last_run_health_outcome
+                != old_source.last_run_health_outcome
+            ):
+                raise ValueError(
+                    "last run health outcome is immutable for its run sequence"
+                )
+            if (
+                source.last_committed_run_sequence
+                == old_source.last_committed_run_sequence
+                and source.last_committed_run_sequence is not None
+                and (
+                    source.last_successful_observed_at,
+                    source.freshness_reference_at,
+                    source.freshness_valid_until,
+                    source.committed_context,
+                )
+                != (
+                    old_source.last_successful_observed_at,
+                    old_source.freshness_reference_at,
+                    old_source.freshness_valid_until,
+                    old_source.committed_context,
+                )
+            ):
+                raise ValueError(
+                    "successful commit provenance is immutable for its run sequence"
+                )
+
+        previous_nodes_by_id = previous.nodes_by_id
+        for node in self.nodes:
+            old_node = previous_nodes_by_id.get(node.node_id)
+            if (
+                old_node is not None
+                and node.inventory_source_id != old_node.inventory_source_id
+            ):
+                raise ValueError("node identity cannot move between sources")
 
         previous_by_id = previous.resources_by_id
         for resource in self.resources:
