@@ -307,8 +307,16 @@ class InventorySourceSnapshot:
             if self.last_health_run_sequence is None:
                 raise ValueError("discovery_run health origin requires run provenance")
         if self.health_origin is SourceHealthOrigin.TIME_EXPIRY:
-            if not has_successful_commit or self.freshness is not SourceFreshness.STALE:
-                raise ValueError("time_expiry requires stale committed inventory")
+            if (
+                not has_successful_commit
+                or self.freshness is not SourceFreshness.STALE
+                or self.current_context != self.committed_context
+                or self.last_health_run_sequence
+                != self.last_committed_run_sequence
+            ):
+                raise ValueError(
+                    "time_expiry requires stale exact committed run and context provenance"
+                )
         if self.health_origin is SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION:
             if self.freshness is not SourceFreshness.STALE:
                 raise ValueError("controlled context transition must be stale")
@@ -618,8 +626,19 @@ class HubinetOpsSnapshot:
 
         nodes_by_id = {node.node_id: node for node in self.nodes}
         active_locators: set[tuple[str, int]] = set()
+        locator_generations: set[tuple[str, int, int]] = set()
         active_bindings: set[str] = set()
         for resource in self.resources:
+            locator_generation = (
+                resource.inventory_source_id,
+                resource.vmid,
+                resource.locator_generation,
+            )
+            if locator_generation in locator_generations:
+                raise ValueError(
+                    "snapshot contains duplicate retained locator generation"
+                )
+            locator_generations.add(locator_generation)
             if resource.active_binding_id is not None:
                 locator = (resource.inventory_source_id, resource.vmid)
                 if locator in active_locators:
@@ -884,6 +903,19 @@ class HubinetOpsSnapshot:
                     raise ValueError(f"{field_name} cannot be cleared")
                 if sequence < old_sequence:
                     raise ValueError(f"{field_name} must not regress")
+
+            if (
+                source.last_committed_run_sequence is not None
+                and (
+                    old_source.last_committed_run_sequence is None
+                    or source.last_committed_run_sequence
+                    > old_source.last_committed_run_sequence
+                )
+                and self.inventory_revision <= previous.inventory_revision
+            ):
+                raise ValueError(
+                    "successful inventory commit requires a newer inventory_revision"
+                )
 
             if (
                 source.latest_completed_run_sequence

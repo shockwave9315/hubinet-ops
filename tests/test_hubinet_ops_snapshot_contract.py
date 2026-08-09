@@ -218,6 +218,143 @@ def confirmed_removed_resource() -> ResourceSnapshot:
     )
 
 
+def not_current_resource(
+    *,
+    resource_id: str = RESOURCE_ID,
+    generation: int = 4,
+    successor_resource_id: str = SUCCESSOR_ID,
+) -> ResourceSnapshot:
+    return resource(
+        resource_id,
+        generation=generation,
+        continuity_revision=2,
+        current_node_id=None,
+        last_known_node_id=NODE_A,
+        presence=PresenceState.NOT_CURRENT,
+        lifecycle=LifecycleState.RETIRED,
+        observational_continuity=ObservationalContinuity.REPLACED,
+        detail_status=DetailStatus.NOT_APPLICABLE,
+        node_availability=NodeAvailability.NOT_APPLICABLE,
+        status="unknown",
+        termination_reason="replaced",
+        successor_resource_id=successor_resource_id,
+    )
+
+
+def time_expiry_source(**changes: Any) -> InventorySourceSnapshot:
+    values = {
+        "health": SourceHealth.DEGRADED,
+        "freshness": SourceFreshness.STALE,
+        "health_origin": SourceHealthOrigin.TIME_EXPIRY,
+        "health_reason": "freshness_deadline_elapsed",
+    }
+    values.update(changes)
+    return replace(source(), **values)
+
+
+def successful_commit_source(sequence: int = 6) -> InventorySourceSnapshot:
+    return replace(
+        source(),
+        last_issued_run_sequence=sequence,
+        latest_completed_run_sequence=sequence,
+        latest_completed_outcome="success",
+        last_health_run_sequence=sequence,
+        last_run_health_outcome="success",
+        last_committed_run_sequence=sequence,
+        last_successful_observed_at="2026-08-08T12:01:30+00:00",
+        freshness_reference_at="2026-08-08T12:01:00+00:00",
+        freshness_valid_until="2026-08-08T12:06:00+00:00",
+    )
+
+
+def initial_source() -> InventorySourceSnapshot:
+    return replace(
+        source(),
+        health=SourceHealth.NOT_YET_OBSERVED,
+        freshness=SourceFreshness.NOT_YET_OBSERVED,
+        health_origin=SourceHealthOrigin.INITIAL,
+        health_reason="",
+        last_issued_run_sequence=0,
+        latest_completed_run_sequence=None,
+        latest_completed_outcome=None,
+        last_health_run_sequence=None,
+        last_run_health_outcome=None,
+        last_committed_run_sequence=None,
+        last_successful_observed_at=None,
+        freshness_reference_at=None,
+        freshness_valid_until=None,
+        committed_context=None,
+    )
+
+
+def test_duplicate_confirmed_removed_and_current_locator_generation_is_rejected() -> None:
+    old = confirmed_removed_resource()
+    current = resource(SUCCESSOR_ID, generation=1, name="Reused slot")
+    with pytest.raises(ValueError, match="duplicate retained locator generation"):
+        snapshot(resources=(old, current))
+
+
+def test_duplicate_not_current_and_successor_locator_generation_is_rejected() -> None:
+    old = not_current_resource(generation=4)
+    successor = resource(SUCCESSOR_ID, generation=4, name="Successor")
+    with pytest.raises(ValueError, match="duplicate retained locator generation"):
+        snapshot(resources=(old, successor))
+
+
+def test_duplicate_terminal_locator_generations_are_rejected() -> None:
+    first = confirmed_removed_resource()
+    second = replace(first, resource_id=SUCCESSOR_ID)
+    with pytest.raises(ValueError, match="duplicate retained locator generation"):
+        snapshot(resources=(first, second))
+
+
+def test_retained_and_current_distinct_locator_generations_are_accepted() -> None:
+    old = confirmed_removed_resource()
+    current = resource(SUCCESSOR_ID, generation=2, name="Reused slot")
+    view = snapshot(resources=(old, current))
+    assert {item.locator_generation for item in view.resources} == {1, 2}
+
+
+def test_direct_replacement_distinct_locator_generations_are_accepted() -> None:
+    old = not_current_resource(generation=4)
+    successor = resource(SUCCESSOR_ID, generation=5, name="Successor")
+    view = snapshot(resources=(old, successor))
+    assert view.resources_by_id[SUCCESSOR_ID].locator_generation == 5
+
+
+def test_same_locator_generation_is_legal_under_different_sources() -> None:
+    source_a_resource = replace(
+        resource(),
+        current_node_id=None,
+        node_availability=NodeAvailability.UNRESOLVED,
+    )
+    source_b_resource = replace(
+        resource(SUCCESSOR_ID),
+        inventory_source_id=SOURCE_B_ID,
+        current_node_id=None,
+        node_availability=NodeAvailability.UNRESOLVED,
+    )
+    view = snapshot(
+        sources=(source(), source(source_id=SOURCE_B_ID, name="Second")),
+        nodes=(),
+        resources=(source_a_resource, source_b_resource),
+    )
+    assert len(view.current_resources_by_locator) == 2
+
+
+def test_ambiguity_retains_exact_binding_and_generation_across_revisions() -> None:
+    previous = snapshot()
+    ambiguous = missing_resource()
+    incoming = snapshot(
+        resources=(ambiguous,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+    assert ambiguous.active_binding_id == previous.resources[0].active_binding_id
+    assert ambiguous.locator_generation == previous.resources[0].locator_generation
+
+
 def test_successor_rejects_omitted_retained_source() -> None:
     previous = snapshot(nodes=(), resources=())
     incoming = snapshot(
@@ -549,3 +686,188 @@ def test_completion_provenance_only_transition_preserves_inventory_revision() ->
     )
     incoming.validate_revision_successor(previous)
     assert incoming.inventory_projection == previous.inventory_projection
+
+
+def test_time_expiry_rejects_changed_current_context() -> None:
+    with pytest.raises(ValueError, match="exact committed run and context"):
+        time_expiry_source(current_context=context(revision=4))
+
+
+def test_time_expiry_rejects_newer_health_run() -> None:
+    with pytest.raises(ValueError, match="exact committed run and context"):
+        time_expiry_source(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome="source_unavailable",
+            last_health_run_sequence=6,
+            last_run_health_outcome="source_unavailable",
+        )
+
+
+def test_time_expiry_rejects_missing_successful_commit() -> None:
+    with pytest.raises(ValueError, match="exact committed run and context"):
+        time_expiry_source(
+            last_committed_run_sequence=None,
+            last_successful_observed_at=None,
+            freshness_reference_at=None,
+            freshness_valid_until=None,
+            committed_context=None,
+        )
+
+
+def test_time_expiry_rejects_non_stale_freshness() -> None:
+    with pytest.raises(ValueError, match="exact committed run and context"):
+        time_expiry_source(freshness=SourceFreshness.FRESH)
+
+
+def test_time_expiry_accepts_exact_committed_run_and_context() -> None:
+    expired = time_expiry_source()
+    assert expired.current_context == expired.committed_context
+    assert expired.last_health_run_sequence == expired.last_committed_run_sequence
+
+
+def test_time_expiry_allows_newer_audit_only_completion() -> None:
+    expired = time_expiry_source(
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="audit_only_inapplicable",
+    )
+    assert expired.latest_completed_run_sequence == 6
+    assert expired.last_committed_run_sequence == 5
+    assert expired.last_health_run_sequence == 5
+
+
+def test_controlled_context_transition_is_not_misclassified_as_time_expiry() -> None:
+    previous = snapshot(resources=())
+    transitioned = replace(
+        source(),
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="source_configuration_changed",
+        current_context=context(revision=4),
+    )
+    incoming = snapshot(
+        sources=(transitioned,),
+        resources=(),
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+
+
+def test_newer_failed_health_run_is_not_misclassified_as_time_expiry() -> None:
+    previous = snapshot(resources=())
+    failed = replace(
+        source(),
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="active_endpoint_timeout",
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="source_unavailable",
+        last_health_run_sequence=6,
+        last_run_health_outcome="source_unavailable",
+    )
+    incoming = snapshot(
+        sources=(failed,),
+        resources=(),
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+
+
+def test_advanced_successful_commit_requires_new_inventory_revision() -> None:
+    previous = snapshot(resources=())
+    incoming = snapshot(
+        sources=(successful_commit_source(),),
+        resources=(),
+        published_state_revision=21,
+    )
+    assert incoming.inventory_projection == previous.inventory_projection
+    with pytest.raises(
+        ValueError,
+        match="successful inventory commit requires a newer inventory_revision",
+    ):
+        incoming.validate_revision_successor(previous)
+
+
+def test_first_successful_commit_requires_new_inventory_revision() -> None:
+    previous = snapshot(sources=(initial_source(),), resources=())
+    incoming = snapshot(
+        sources=(successful_commit_source(sequence=1),),
+        resources=(),
+        published_state_revision=21,
+    )
+    assert incoming.inventory_projection == previous.inventory_projection
+    with pytest.raises(
+        ValueError,
+        match="successful inventory commit requires a newer inventory_revision",
+    ):
+        incoming.validate_revision_successor(previous)
+
+
+def test_advanced_successful_commit_accepts_new_inventory_revision() -> None:
+    previous = snapshot(resources=())
+    incoming = snapshot(
+        sources=(successful_commit_source(),),
+        resources=(),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+    assert incoming.inventory_projection == previous.inventory_projection
+
+
+def test_successful_commit_and_inventory_change_accept_new_inventory_revision() -> None:
+    previous = snapshot()
+    incoming = snapshot(
+        sources=(successful_commit_source(),),
+        resources=(replace(resource(), name="Renamed by reconciliation"),),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+
+
+def test_completion_only_advance_does_not_require_inventory_revision() -> None:
+    previous = snapshot(resources=())
+    completion_only = replace(
+        source(),
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="audit_only_inapplicable",
+    )
+    snapshot(
+        sources=(completion_only,),
+        resources=(),
+        published_state_revision=21,
+    ).validate_revision_successor(previous)
+
+
+def test_failed_health_advance_does_not_require_inventory_revision() -> None:
+    previous = snapshot(resources=())
+    failed = replace(
+        source(),
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="active_endpoint_timeout",
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="source_unavailable",
+        last_health_run_sequence=6,
+        last_run_health_outcome="source_unavailable",
+    )
+    snapshot(
+        sources=(failed,),
+        resources=(),
+        published_state_revision=21,
+    ).validate_revision_successor(previous)
+
+
+def test_time_expiry_does_not_require_inventory_revision() -> None:
+    previous = snapshot(resources=())
+    snapshot(
+        sources=(time_expiry_source(),),
+        resources=(),
+        published_state_revision=21,
+    ).validate_revision_successor(previous)
