@@ -1,16 +1,18 @@
-"""Typed read-only contract for the Hubinet Ops backend.
+"""Typed read-only contract for the authoritative Hubinet Ops snapshot.
 
-This module intentionally does not define provisional HTTP endpoint paths.  Phase 0
+This module intentionally does not define provisional HTTP endpoint paths. Phase 0
 uses an injected transport so the backend 0.5 API can be finalized independently.
+Home Assistant validates and presents a committed backend view; it never reconciles
+inventory identity, presence, continuity, policy, or source freshness locally.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Protocol, Self
+from typing import Any, Protocol
 
 
 class HubinetOpsApiError(RuntimeError):
@@ -30,7 +32,7 @@ class HubinetOpsInvalidResponse(HubinetOpsApiError):
 
 
 class ResourceType(StrEnum):
-    """Resource types exposed by Hubinet Ops inventory."""
+    """Immutable occupant types exposed by Hubinet Ops inventory."""
 
     QEMU = "qemu"
     LXC = "lxc"
@@ -47,13 +49,81 @@ class ResourceStateLevel(StrEnum):
 
 
 class PresenceState(StrEnum):
-    """Backend reconciliation state for inventory presence."""
+    """Canonical relation of one incarnation to its source-local slot."""
 
     PRESENT = "present"
-    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
-    NODE_UNAVAILABLE = "node_unavailable"
     MISSING = "missing"
     CONFIRMED_REMOVED = "confirmed_removed"
+    NOT_CURRENT = "not_current"
+
+
+class LifecycleState(StrEnum):
+    """Canonical inventory lifecycle axis."""
+
+    ACTIVE = "active"
+    QUARANTINED = "quarantined"
+    RETIRED = "retired"
+
+
+class ObservationalContinuity(StrEnum):
+    """Backend assessment of observational incarnation continuity."""
+
+    CONSISTENT = "consistent"
+    UNCERTAIN = "uncertain"
+    REPLACED = "replaced"
+
+
+class SecurityContinuity(StrEnum):
+    """Backend-owned security continuity axis."""
+
+    UNVERIFIED = "unverified"
+    TRUSTED = "trusted"
+    REVOKED = "revoked"
+
+
+class DetailStatus(StrEnum):
+    """Reconciled status of the current per-resource detail read."""
+
+    OK = "ok"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
+    ERROR = "error"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class NodeAvailability(StrEnum):
+    """Availability of the resource's current node relation."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    UNRESOLVED = "unresolved"
+    NOT_APPLICABLE = "not_applicable"
+
+
+class SourceHealth(StrEnum):
+    """Current backend-owned observation health of one inventory source."""
+
+    HEALTHY = "healthy"
+    SOURCE_UNAVAILABLE = "source_unavailable"
+    DEGRADED = "degraded"
+    CONFIGURATION_ERROR = "configuration_error"
+    NOT_YET_OBSERVED = "not_yet_observed"
+
+
+class SourceFreshness(StrEnum):
+    """Current backend-materialized freshness of one inventory source."""
+
+    FRESH = "fresh"
+    STALE = "stale"
+    NOT_YET_OBSERVED = "not_yet_observed"
+
+
+class SourceHealthOrigin(StrEnum):
+    """Provenance class for current source health/freshness."""
+
+    DISCOVERY_RUN = "discovery_run"
+    CONTROLLED_CONTEXT_TRANSITION = "controlled_context_transition"
+    TIME_EXPIRY = "time_expiry"
+    INITIAL = "initial"
 
 
 def _deep_freeze(value: Any) -> Any:
@@ -82,192 +152,601 @@ def _immutable_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return frozen
 
 
+def _require_text(value: str, field_name: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must not be empty")
+
+
+def _require_positive(value: int, field_name: str) -> None:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{field_name} must be a positive integer")
+
+
+def _require_optional_positive(value: int | None, field_name: str) -> None:
+    if value is not None:
+        _require_positive(value, field_name)
+
+
 @dataclass(frozen=True, slots=True)
 class BackendInformation:
     """Stable identity and version information for one backend instance."""
 
-    instance_id: str
+    backend_instance_id: str
     name: str
     version: str
     api_version: str
 
     def __post_init__(self) -> None:
-        if not self.instance_id.strip():
-            raise ValueError("instance_id must not be empty")
+        _require_text(self.backend_instance_id, "backend_instance_id")
 
 
-@dataclass(frozen=True, slots=True, order=True)
-class ResourceIdentity:
-    """Durable resource identity independent from name and current node."""
+@dataclass(frozen=True, slots=True)
+class SourceContext:
+    """Exact current or committed source/transport provenance."""
 
-    instance_id: str
-    resource_type: ResourceType
-    vmid: int
+    source_config_revision: int
+    endpoint_id: str
+    canonical_transport_locator: str
+    canonicalization_contract_version: int
+    transport_trust_revision: int
 
     def __post_init__(self) -> None:
-        if not self.instance_id.strip():
-            raise ValueError("instance_id must not be empty")
-        if type(self.vmid) is not int or self.vmid <= 0:
-            raise ValueError("vmid must be a positive integer")
+        _require_positive(self.source_config_revision, "source_config_revision")
+        _require_text(self.endpoint_id, "endpoint_id")
+        _require_text(
+            self.canonical_transport_locator, "canonical_transport_locator"
+        )
+        _require_positive(
+            self.canonicalization_contract_version,
+            "canonicalization_contract_version",
+        )
+        _require_positive(
+            self.transport_trust_revision, "transport_trust_revision"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class InventorySourceSnapshot:
+    """Published source identity, fixed health, freshness, and provenance."""
+
+    inventory_source_id: str
+    name: str
+    provider_kind: str
+    health: SourceHealth
+    freshness: SourceFreshness
+    health_origin: SourceHealthOrigin
+    health_reason: str
+    last_issued_run_sequence: int
+    latest_completed_run_sequence: int | None
+    latest_completed_outcome: str | None
+    last_health_run_sequence: int | None
+    last_run_health_outcome: str | None
+    last_committed_run_sequence: int | None
+    last_successful_observed_at: str | None
+    freshness_reference_at: str | None
+    freshness_valid_until: str | None
+    current_context: SourceContext
+    committed_context: SourceContext | None
+    facts: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        _require_text(self.inventory_source_id, "inventory_source_id")
+        _require_text(self.name, "source name")
+        _require_text(self.provider_kind, "provider_kind")
+        if (
+            type(self.last_issued_run_sequence) is not int
+            or self.last_issued_run_sequence < 0
+        ):
+            raise ValueError("last_issued_run_sequence must be a non-negative integer")
+        for field_name in (
+            "latest_completed_run_sequence",
+            "last_health_run_sequence",
+            "last_committed_run_sequence",
+        ):
+            _require_optional_positive(getattr(self, field_name), field_name)
+        self._validate_sequence_pair(
+            self.latest_completed_run_sequence,
+            self.latest_completed_outcome,
+            "latest completed run",
+        )
+        self._validate_sequence_pair(
+            self.last_health_run_sequence,
+            self.last_run_health_outcome,
+            "last health run",
+        )
+        sequences = (
+            self.latest_completed_run_sequence,
+            self.last_health_run_sequence,
+            self.last_committed_run_sequence,
+        )
+        if any(
+            sequence is not None and sequence > self.last_issued_run_sequence
+            for sequence in sequences
+        ):
+            raise ValueError("source run sequence exceeds last issued sequence")
+
+        successful_fields = (
+            self.last_successful_observed_at,
+            self.freshness_reference_at,
+            self.freshness_valid_until,
+            self.committed_context,
+        )
+        has_successful_commit = self.last_committed_run_sequence is not None
+        if (
+            has_successful_commit
+            and not all(item is not None for item in successful_fields)
+        ) or (
+            not has_successful_commit
+            and any(item is not None for item in successful_fields)
+        ):
+            raise ValueError(
+                "committed run, fixed freshness facts, and committed context must be published together"
+            )
+        for field_name in (
+            "last_successful_observed_at",
+            "freshness_reference_at",
+            "freshness_valid_until",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_text(value, field_name)
+
+        if self.health_origin is SourceHealthOrigin.INITIAL:
+            if self.health is not SourceHealth.NOT_YET_OBSERVED:
+                raise ValueError("initial source health must be not_yet_observed")
+            if self.freshness is not SourceFreshness.NOT_YET_OBSERVED:
+                raise ValueError("initial source freshness must be not_yet_observed")
+            if has_successful_commit:
+                raise ValueError("initial source health cannot have committed provenance")
+        else:
+            _require_text(self.health_reason, "health_reason")
+            if self.freshness is SourceFreshness.NOT_YET_OBSERVED:
+                raise ValueError("non-initial source cannot be not_yet_observed")
+
+        if self.health_origin is SourceHealthOrigin.DISCOVERY_RUN:
+            if self.last_health_run_sequence is None:
+                raise ValueError("discovery_run health origin requires run provenance")
+        if self.health_origin is SourceHealthOrigin.TIME_EXPIRY:
+            if not has_successful_commit or self.freshness is not SourceFreshness.STALE:
+                raise ValueError("time_expiry requires stale committed inventory")
+        if self.health_origin is SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION:
+            if self.freshness is not SourceFreshness.STALE:
+                raise ValueError("controlled context transition must be stale")
+
+        if self.freshness is SourceFreshness.FRESH:
+            if (
+                self.health is not SourceHealth.HEALTHY
+                or self.health_origin is not SourceHealthOrigin.DISCOVERY_RUN
+                or not has_successful_commit
+                or self.current_context != self.committed_context
+            ):
+                raise ValueError(
+                    "fresh source requires a healthy authoritative discovery commit"
+                )
+        elif self.health not in {SourceHealth.HEALTHY, SourceHealth.NOT_YET_OBSERVED}:
+            if self.freshness is not SourceFreshness.STALE:
+                raise ValueError("unhealthy source must be stale")
+
+        if has_successful_commit and (
+            self.last_health_run_sequence is None
+            or self.last_health_run_sequence < self.last_committed_run_sequence
+        ):
+            raise ValueError("committed inventory requires applied run-health provenance")
+        if (
+            self.last_health_run_sequence is not None
+            and self.latest_completed_run_sequence is not None
+            and self.latest_completed_run_sequence < self.last_health_run_sequence
+        ):
+            raise ValueError("applied health run must be included in completion provenance")
+
+        object.__setattr__(self, "facts", _immutable_mapping(self.facts))
+
+    @staticmethod
+    def _validate_sequence_pair(
+        sequence: int | None, outcome: str | None, label: str
+    ) -> None:
+        if (sequence is None) != (outcome is None):
+            raise ValueError(f"{label} sequence and outcome must be published together")
+        if outcome is not None:
+            _require_text(outcome, f"{label} outcome")
 
     @property
-    def registry_key(self) -> str:
-        """Return the deterministic HA serialization of this identity."""
+    def current_facts_available(self) -> bool:
+        """Return backend-published current-fact eligibility for presentation."""
 
-        return f"{self.instance_id}:resource:{self.resource_type.value}:{self.vmid}"
+        return (
+            self.health is SourceHealth.HEALTHY
+            and self.freshness is SourceFreshness.FRESH
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class NodeSnapshot:
-    """One node observation supplied by the backend snapshot."""
+    """One backend-owned node record in a published source view."""
 
-    instance_id: str
     node_id: str
+    inventory_source_id: str
     name: str
     status: str
     available: bool = True
     facts: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
-        if not self.instance_id.strip() or not self.node_id.strip():
-            raise ValueError("node identity fields must not be empty")
+        _require_text(self.node_id, "node_id")
+        _require_text(self.inventory_source_id, "inventory_source_id")
         object.__setattr__(self, "facts", _immutable_mapping(self.facts))
-
-    @property
-    def registry_key(self) -> str:
-        """Return the deterministic HA serialization of this node identity."""
-
-        return f"{self.instance_id}:node:{self.node_id}"
 
 
 @dataclass(frozen=True, slots=True)
 class ResourceSnapshot:
-    """One backend-owned resource observation and effective policy view."""
+    """One backend-owned resource incarnation and effective presentation view."""
 
-    identity: ResourceIdentity
+    resource_id: str
+    inventory_source_id: str
+    active_binding_id: str | None
+    resource_type: ResourceType
+    vmid: int
+    locator_generation: int
+    resource_continuity_revision: int
     name: str
-    node_id: str | None
     status: str
-    last_known_node_id: str | None = None
+    current_node_id: str | None
+    last_known_node_id: str | None
+    presence: PresenceState
+    lifecycle: LifecycleState
+    observational_continuity: ObservationalContinuity
+    security_continuity: SecurityContinuity
+    detail_status: DetailStatus
+    node_availability: NodeAvailability
     state_level: ResourceStateLevel = ResourceStateLevel.DISCOVERED
-    policy: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
-    capabilities: frozenset[str] = field(default_factory=frozenset)
-    available: bool = True
-    presence: PresenceState = PresenceState.PRESENT
+    retained_policy: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    effective_policy: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    policy_applicable: bool = False
+    suspended_reason: str | None = None
+    effective_capabilities: frozenset[str] = field(default_factory=frozenset)
     state: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    termination_reason: str | None = None
+    successor_resource_id: str | None = None
 
     def __post_init__(self) -> None:
-        if self.presence is PresenceState.PRESENT:
-            if not isinstance(self.node_id, str) or not self.node_id.strip():
-                raise ValueError("present resource must have a current node_id")
-            if self.last_known_node_id is not None:
-                raise ValueError(
-                    "present resource must not also define last_known_node_id"
-                )
-        else:
-            if self.node_id is not None:
-                raise ValueError(
-                    "non-present resource must use last_known_node_id, not node_id"
-                )
-            if (
-                not isinstance(self.last_known_node_id, str)
-                or not self.last_known_node_id.strip()
-            ):
-                raise ValueError(
-                    "non-present resource must have a last_known_node_id"
-                )
-        object.__setattr__(self, "policy", _immutable_mapping(self.policy))
+        _require_text(self.resource_id, "resource_id")
+        _require_text(self.inventory_source_id, "inventory_source_id")
+        _require_positive(self.vmid, "vmid")
+        _require_positive(self.locator_generation, "locator_generation")
+        _require_positive(
+            self.resource_continuity_revision, "resource_continuity_revision"
+        )
+
+        nonterminal = self.presence in {PresenceState.PRESENT, PresenceState.MISSING}
+        if nonterminal:
+            if self.active_binding_id is None:
+                raise ValueError("nonterminal resource requires active_binding_id")
+            _require_text(self.active_binding_id, "active_binding_id")
+        elif self.active_binding_id is not None:
+            raise ValueError("terminal resource must not have an active binding")
+
+        self._validate_state_matrix()
+        self._validate_node_relation()
+        self._validate_terminal_relation()
+
+        object.__setattr__(
+            self, "retained_policy", _immutable_mapping(self.retained_policy)
+        )
+        object.__setattr__(
+            self, "effective_policy", _immutable_mapping(self.effective_policy)
+        )
         object.__setattr__(self, "state", _immutable_mapping(self.state))
-        object.__setattr__(self, "capabilities", frozenset(self.capabilities))
+        object.__setattr__(
+            self, "effective_capabilities", frozenset(self.effective_capabilities)
+        )
+
+        policy_eligible = (
+            self.presence is PresenceState.PRESENT
+            and self.lifecycle is LifecycleState.ACTIVE
+            and self.observational_continuity is ObservationalContinuity.CONSISTENT
+            and self.security_continuity is SecurityContinuity.TRUSTED
+        )
+        if self.policy_applicable and not policy_eligible:
+            raise ValueError("policy cannot be applicable outside trusted current state")
+        if not self.policy_applicable and self.effective_capabilities:
+            raise ValueError(
+                "effective capabilities require backend-published policy applicability"
+            )
+
+    def _validate_state_matrix(self) -> None:
+        case = (
+            self.presence,
+            self.lifecycle,
+            self.observational_continuity,
+        )
+        valid_security: set[SecurityContinuity]
+        if case == (
+            PresenceState.PRESENT,
+            LifecycleState.ACTIVE,
+            ObservationalContinuity.CONSISTENT,
+        ):
+            valid_security = {
+                SecurityContinuity.UNVERIFIED,
+                SecurityContinuity.TRUSTED,
+            }
+        elif case in {
+            (
+                PresenceState.PRESENT,
+                LifecycleState.QUARANTINED,
+                ObservationalContinuity.UNCERTAIN,
+            ),
+            (
+                PresenceState.MISSING,
+                LifecycleState.QUARANTINED,
+                ObservationalContinuity.UNCERTAIN,
+            ),
+        }:
+            valid_security = {
+                SecurityContinuity.UNVERIFIED,
+                SecurityContinuity.REVOKED,
+            }
+        elif (
+            self.presence is PresenceState.CONFIRMED_REMOVED
+            and self.lifecycle is LifecycleState.RETIRED
+            and self.observational_continuity
+            in {
+                ObservationalContinuity.CONSISTENT,
+                ObservationalContinuity.UNCERTAIN,
+            }
+        ):
+            valid_security = {
+                SecurityContinuity.UNVERIFIED,
+                SecurityContinuity.REVOKED,
+            }
+        elif case == (
+            PresenceState.NOT_CURRENT,
+            LifecycleState.RETIRED,
+            ObservationalContinuity.REPLACED,
+        ):
+            valid_security = {
+                SecurityContinuity.UNVERIFIED,
+                SecurityContinuity.REVOKED,
+            }
+        else:
+            raise ValueError("resource axes violate the canonical state matrix")
+        if self.security_continuity not in valid_security:
+            raise ValueError("security continuity violates the canonical state matrix")
+
+        if self.presence is PresenceState.PRESENT:
+            if self.detail_status is DetailStatus.NOT_APPLICABLE:
+                raise ValueError("present resource requires a current detail status")
+        elif self.detail_status is not DetailStatus.NOT_APPLICABLE:
+            raise ValueError(
+                "missing, confirmed_removed, and not_current require detail_status=not_applicable"
+            )
+
+    def _validate_node_relation(self) -> None:
         if self.presence is not PresenceState.PRESENT:
-            object.__setattr__(self, "available", False)
+            if self.current_node_id is not None:
+                raise ValueError("non-present resource must not have current_node_id")
+            if self.node_availability is not NodeAvailability.NOT_APPLICABLE:
+                raise ValueError("non-present resource node availability is not_applicable")
+            if self.last_known_node_id is not None:
+                _require_text(self.last_known_node_id, "last_known_node_id")
+            return
+
+        if self.current_node_id is None:
+            if self.node_availability is not NodeAvailability.UNRESOLVED:
+                raise ValueError("unresolved current node relation must be explicit")
+            if self.last_known_node_id is not None:
+                _require_text(self.last_known_node_id, "last_known_node_id")
+            return
+
+        _require_text(self.current_node_id, "current_node_id")
+        if self.last_known_node_id is not None:
+            raise ValueError("resolved current node forbids last_known_node_id")
+        if self.node_availability not in {
+            NodeAvailability.AVAILABLE,
+            NodeAvailability.UNAVAILABLE,
+        }:
+            raise ValueError("resolved current node requires available or unavailable")
+
+    def _validate_terminal_relation(self) -> None:
+        if self.presence is PresenceState.NOT_CURRENT:
+            if self.termination_reason != "replaced":
+                raise ValueError("not_current resource requires replacement provenance")
+            if self.successor_resource_id is None:
+                raise ValueError("not_current resource requires successor_resource_id")
+            _require_text(self.successor_resource_id, "successor_resource_id")
+        elif self.presence is PresenceState.CONFIRMED_REMOVED:
+            if self.termination_reason != "confirmed_removed":
+                raise ValueError(
+                    "confirmed_removed resource requires removal provenance"
+                )
+            if self.successor_resource_id is not None:
+                raise ValueError("confirmed_removed resource cannot name a successor")
+        elif self.termination_reason is not None or self.successor_resource_id is not None:
+            raise ValueError("nonterminal resource cannot publish terminal provenance")
 
     @property
-    def relation_node_id(self) -> str:
-        """Return the current or explicit last-known node for HA topology."""
+    def relation_node_id(self) -> str | None:
+        """Return current or last-known presentation relation, if available."""
 
-        if self.presence is PresenceState.PRESENT:
-            assert self.node_id is not None
-            return self.node_id
-        assert self.last_known_node_id is not None
-        return self.last_known_node_id
-
-    def as_missing(self) -> Self:
-        """Preserve identity and last observation after an unexplained absence."""
-
-        if self.presence is PresenceState.CONFIRMED_REMOVED:
-            return self
-        return replace(
-            self,
-            node_id=None,
-            last_known_node_id=self.relation_node_id,
-            available=False,
-            presence=PresenceState.MISSING,
-        )
+        return self.current_node_id or self.last_known_node_id
 
 
 @dataclass(frozen=True, slots=True)
 class HubinetOpsSnapshot:
-    """One logical, internally consistent backend state snapshot."""
+    """One logical immutable backend view at a published-state revision."""
 
     backend: BackendInformation
+    sources: tuple[InventorySourceSnapshot, ...]
     nodes: tuple[NodeSnapshot, ...]
     resources: tuple[ResourceSnapshot, ...]
-    generated_at: str | None = None
+    inventory_revision: int
+    published_state_revision: int
+    published_at: str
 
     def __post_init__(self) -> None:
-        node_keys = {(node.instance_id, node.node_id) for node in self.nodes}
-        if len(node_keys) != len(self.nodes):
+        if type(self.inventory_revision) is not int or self.inventory_revision < 0:
+            raise ValueError("inventory_revision must be a non-negative integer")
+        _require_positive(self.published_state_revision, "published_state_revision")
+        _require_text(self.published_at, "published_at")
+
+        source_ids = {source.inventory_source_id for source in self.sources}
+        if len(source_ids) != len(self.sources):
+            raise ValueError("snapshot contains duplicate source identities")
+        node_ids = {node.node_id for node in self.nodes}
+        if len(node_ids) != len(self.nodes):
             raise ValueError("snapshot contains duplicate node identities")
-        identities = {resource.identity for resource in self.resources}
-        if len(identities) != len(self.resources):
+        resource_ids = {resource.resource_id for resource in self.resources}
+        if len(resource_ids) != len(self.resources):
             raise ValueError("snapshot contains duplicate resource identities")
-        if any(node.instance_id != self.backend.instance_id for node in self.nodes):
-            raise ValueError("node belongs to a different backend instance")
+
+        if any(node.inventory_source_id not in source_ids for node in self.nodes):
+            raise ValueError("node references an unknown inventory source")
         if any(
-            resource.identity.instance_id != self.backend.instance_id
+            resource.inventory_source_id not in source_ids
             for resource in self.resources
         ):
-            raise ValueError("resource belongs to a different backend instance")
-        invalid_present_nodes = [
-            resource.identity
-            for resource in self.resources
-            if resource.presence is PresenceState.PRESENT
-            and (resource.identity.instance_id, resource.node_id) not in node_keys
-        ]
-        if invalid_present_nodes:
-            raise ValueError(
-                "present resource references a node absent from the same snapshot"
-            )
+            raise ValueError("resource references an unknown inventory source")
+
+        nodes_by_id = {node.node_id: node for node in self.nodes}
+        active_locators: set[tuple[str, int]] = set()
+        active_bindings: set[str] = set()
+        for resource in self.resources:
+            if resource.active_binding_id is not None:
+                locator = (resource.inventory_source_id, resource.vmid)
+                if locator in active_locators:
+                    raise ValueError("snapshot contains multiple current occupants for a locator")
+                active_locators.add(locator)
+                if resource.active_binding_id in active_bindings:
+                    raise ValueError("snapshot contains duplicate active binding identities")
+                active_bindings.add(resource.active_binding_id)
+            for node_id in (resource.current_node_id, resource.last_known_node_id):
+                if node_id is None:
+                    continue
+                node = nodes_by_id.get(node_id)
+                if node is None:
+                    raise ValueError("resource references a node absent from the same snapshot")
+                if node.inventory_source_id != resource.inventory_source_id:
+                    raise ValueError("resource node relation crosses inventory sources")
+            if resource.current_node_id is not None:
+                node = nodes_by_id[resource.current_node_id]
+                expected = (
+                    NodeAvailability.AVAILABLE
+                    if node.available
+                    else NodeAvailability.UNAVAILABLE
+                )
+                if resource.node_availability is not expected:
+                    raise ValueError("resource node availability disagrees with node record")
+
+        resources_by_id = {
+            resource.resource_id: resource for resource in self.resources
+        }
+        for old in self.resources:
+            if old.successor_resource_id is None:
+                continue
+            successor = resources_by_id.get(old.successor_resource_id)
+            if successor is None:
+                raise ValueError("replacement successor is absent from the same snapshot")
+            if (
+                successor.inventory_source_id != old.inventory_source_id
+                or successor.vmid != old.vmid
+                or successor.locator_generation != old.locator_generation + 1
+                or successor.active_binding_id is None
+                or successor.presence is not PresenceState.PRESENT
+                or successor.security_continuity is not SecurityContinuity.UNVERIFIED
+                or successor.policy_applicable
+                or successor.effective_capabilities
+            ):
+                raise ValueError("replacement successor violates locator handoff invariants")
+
+        sources_by_id = {
+            source.inventory_source_id: source for source in self.sources
+        }
+        for resource in self.resources:
+            source = sources_by_id[resource.inventory_source_id]
+            if (
+                (resource.policy_applicable or resource.effective_capabilities)
+                and not source.current_facts_available
+            ):
+                raise ValueError(
+                    "policy/capabilities require a fresh healthy source snapshot"
+                )
 
     @property
-    def nodes_by_id(self) -> dict[str, NodeSnapshot]:
-        """Return nodes indexed by the backend-stable node ID."""
+    def sources_by_id(self) -> Mapping[str, InventorySourceSnapshot]:
+        """Return sources keyed only by backend-owned source identity."""
 
-        return {node.node_id: node for node in self.nodes}
-
-    @property
-    def resources_by_identity(self) -> dict[ResourceIdentity, ResourceSnapshot]:
-        """Return resources indexed by durable identity."""
-
-        return {resource.identity: resource for resource in self.resources}
-
-    def preserving_unconfirmed_missing(
-        self, previous: HubinetOpsSnapshot | None
-    ) -> HubinetOpsSnapshot:
-        """Keep resources absent once until the backend owns a removal decision."""
-
-        if previous is None or previous.backend.instance_id != self.backend.instance_id:
-            return self
-        current = self.resources_by_identity
-        retained = tuple(
-            old.as_missing()
-            for identity, old in previous.resources_by_identity.items()
-            if identity not in current
+        return MappingProxyType(
+            {source.inventory_source_id: source for source in self.sources}
         )
-        if not retained:
-            return self
-        return replace(self, resources=(*self.resources, *retained))
+
+    @property
+    def nodes_by_id(self) -> Mapping[str, NodeSnapshot]:
+        """Return nodes keyed only by backend-owned node identity."""
+
+        return MappingProxyType({node.node_id: node for node in self.nodes})
+
+    @property
+    def resources_by_id(self) -> Mapping[str, ResourceSnapshot]:
+        """Return resources keyed only by opaque backend resource identity."""
+
+        return MappingProxyType(
+            {resource.resource_id: resource for resource in self.resources}
+        )
+
+    @property
+    def current_resources_by_locator(
+        self,
+    ) -> Mapping[tuple[str, int], ResourceSnapshot]:
+        """Resolve current incumbents through active bindings, never VMID ordering."""
+
+        return MappingProxyType(
+            {
+                (resource.inventory_source_id, resource.vmid): resource
+                for resource in self.resources
+                if resource.active_binding_id is not None
+            }
+        )
+
+    def validate_revision_successor(self, previous: HubinetOpsSnapshot) -> None:
+        """Reject regressing or mutable views for an existing backend entry."""
+
+        if self.backend.backend_instance_id != previous.backend.backend_instance_id:
+            raise ValueError("snapshot belongs to a different backend instance")
+        if self.inventory_revision < previous.inventory_revision:
+            raise ValueError("inventory_revision must not regress")
+        if self.published_state_revision < previous.published_state_revision:
+            raise ValueError("published_state_revision must not regress")
+        if (
+            self.published_state_revision == previous.published_state_revision
+            and self != previous
+        ):
+            raise ValueError("one published_state_revision must identify one immutable view")
+        previous_by_id = previous.resources_by_id
+        for resource in self.resources:
+            old = previous_by_id.get(resource.resource_id)
+            if old is None:
+                continue
+            if resource.inventory_source_id != old.inventory_source_id:
+                raise ValueError("resource identity cannot move between sources")
+            if resource.resource_type is not old.resource_type:
+                raise ValueError("resource_type is immutable for an incarnation")
+            if resource.locator_generation < old.locator_generation:
+                raise ValueError("locator_generation must not regress")
+            if resource.resource_continuity_revision < old.resource_continuity_revision:
+                raise ValueError("resource_continuity_revision must not regress")
+            if (
+                resource.active_binding_id is not None
+                and resource.active_binding_id == old.active_binding_id
+                and (
+                    resource.inventory_source_id != old.inventory_source_id
+                    or resource.vmid != old.vmid
+                    or resource.locator_generation != old.locator_generation
+                )
+            ):
+                raise ValueError("active binding identity changed locator or generation")
 
 
 class HubinetOpsTransport(Protocol):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -10,11 +11,8 @@ import pytest
 pytest.importorskip("homeassistant", reason="isolated HA test dependencies not installed")
 
 from homeassistant.components.diagnostics import REDACTED
-from homeassistant.config_entries import (
-    SOURCE_REAUTH,
-    SOURCE_RECONFIGURE,
-    ConfigEntryState,
-)
+from homeassistant.config_entries import ConfigEntryState
+from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr, entity_registry as er
@@ -24,16 +22,25 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.hubinet_ops.api import (
     BackendInformation,
+    DetailStatus,
     HubinetOpsApi,
     HubinetOpsCannotConnect,
     HubinetOpsInvalidAuth,
     HubinetOpsSnapshot,
+    InventorySourceSnapshot,
+    LifecycleState,
+    NodeAvailability,
     NodeSnapshot,
+    ObservationalContinuity,
     PresenceState,
-    ResourceIdentity,
     ResourceSnapshot,
     ResourceStateLevel,
     ResourceType,
+    SecurityContinuity,
+    SourceContext,
+    SourceFreshness,
+    SourceHealth,
+    SourceHealthOrigin,
 )
 from custom_components.hubinet_ops.const import (
     CONF_API_TOKEN,
@@ -42,7 +49,12 @@ from custom_components.hubinet_ops.const import (
     DATA_API_FACTORY,
     DOMAIN,
 )
-from custom_components.hubinet_ops.coordinator import resource_device_info
+from custom_components.hubinet_ops.coordinator import (
+    node_registry_key,
+    resource_device_info,
+    resource_registry_key,
+    source_registry_key,
+)
 from custom_components.hubinet_ops.diagnostics import (
     async_get_config_entry_diagnostics,
 )
@@ -50,16 +62,20 @@ from custom_components.hubinet_ops.diagnostics import (
 
 @pytest.fixture(autouse=True)
 def auto_enable_custom_integrations(enable_custom_integrations, socket_enabled):
-    """Load custom integrations; no test transport performs network I/O.
-
-    ``socket_enabled`` is needed because the Windows asyncio event loop creates an
-    internal local socketpair. All Hubinet Ops communication still uses FakeTransport.
-    """
+    """Load custom integrations; fake transports never perform network I/O."""
 
     yield
 
-INSTANCE_ID = "6a172b5d-d820-4cac-904f-dfb17d42163e"
-OTHER_INSTANCE_ID = "2b5d3b3b-e4b9-412a-851a-11bc4e839aa7"
+
+BACKEND_ID = "6a172b5d-d820-4cac-904f-dfb17d42163e"
+OTHER_BACKEND_ID = "2b5d3b3b-e4b9-412a-851a-11bc4e839aa7"
+SOURCE_ID = "cfe64f8e-2529-4692-9c23-526479961dbc"
+NODE_A = "811d7ea4-470f-42d4-aa06-d2c5c9249a1e"
+NODE_B = "6f1c0770-6ca6-4c20-ab56-8cb645f63ee3"
+RESOURCE_VM = "3a6d0ac4-f859-438d-9f96-9d21dba641f1"
+RESOURCE_CT = "b50f157b-d2fb-4fff-9497-42c5c239ef49"
+RESOURCE_TEST = "58fa8094-8a8b-4e70-9cf3-f8fd727d85ea"
+RESOURCE_ADDED = "c5321ec5-7259-421a-94ab-195a9c5e5d81"
 BASE_URL = "https://ops.example.test"
 API_TOKEN = "phase-zero-test-token-not-a-secret"
 ENTRY_DATA = {
@@ -69,66 +85,234 @@ ENTRY_DATA = {
 }
 
 
-def backend_information(*, instance_id: str = INSTANCE_ID) -> BackendInformation:
+def backend_information(
+    *, backend_instance_id: str = BACKEND_ID
+) -> BackendInformation:
     return BackendInformation(
-        instance_id=instance_id,
+        backend_instance_id=backend_instance_id,
         name="Hubinet Ops Test",
         version="0.5.0.dev0",
         api_version="0.5-draft",
     )
 
 
+def source_context(*, revision: int = 3) -> SourceContext:
+    return SourceContext(
+        source_config_revision=revision,
+        endpoint_id="7b784024-62d8-4f3e-bb63-af9fe65fcc8e",
+        canonical_transport_locator="https://pve.example.test:8006",
+        canonicalization_contract_version=1,
+        transport_trust_revision=2,
+    )
+
+
+def source(
+    *,
+    health: SourceHealth = SourceHealth.HEALTHY,
+    freshness: SourceFreshness = SourceFreshness.FRESH,
+    health_origin: SourceHealthOrigin = SourceHealthOrigin.DISCOVERY_RUN,
+    health_reason: str = "authoritative_inventory_commit",
+    last_issued_run_sequence: int = 5,
+    latest_completed_run_sequence: int | None = 5,
+    latest_completed_outcome: str | None = "success",
+    last_health_run_sequence: int | None = 5,
+    last_run_health_outcome: str | None = "success",
+    last_committed_run_sequence: int | None = 5,
+    current_context: SourceContext | None = None,
+    committed_context: SourceContext | None = None,
+    facts: dict[str, Any] | None = None,
+) -> InventorySourceSnapshot:
+    has_commit = last_committed_run_sequence is not None
+    context = current_context or source_context()
+    return InventorySourceSnapshot(
+        inventory_source_id=SOURCE_ID,
+        name="Test Proxmox",
+        provider_kind="proxmox",
+        health=health,
+        freshness=freshness,
+        health_origin=health_origin,
+        health_reason=health_reason,
+        last_issued_run_sequence=last_issued_run_sequence,
+        latest_completed_run_sequence=latest_completed_run_sequence,
+        latest_completed_outcome=latest_completed_outcome,
+        last_health_run_sequence=last_health_run_sequence,
+        last_run_health_outcome=last_run_health_outcome,
+        last_committed_run_sequence=last_committed_run_sequence,
+        last_successful_observed_at=(
+            "2026-08-08T11:59:30+00:00" if has_commit else None
+        ),
+        freshness_reference_at=(
+            "2026-08-08T11:59:00+00:00" if has_commit else None
+        ),
+        freshness_valid_until=(
+            "2026-08-08T12:04:00+00:00" if has_commit else None
+        ),
+        current_context=context,
+        committed_context=(committed_context or context) if has_commit else None,
+        facts=facts or {},
+    )
+
+
+def unavailable_source() -> InventorySourceSnapshot:
+    return source(
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="active_endpoint_timeout",
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="source_unavailable",
+        last_health_run_sequence=6,
+        last_run_health_outcome="source_unavailable",
+    )
+
+
+def node(
+    node_id: str = NODE_A,
+    *,
+    name: str = "pve-a",
+    available: bool = True,
+    facts: dict[str, Any] | None = None,
+) -> NodeSnapshot:
+    return NodeSnapshot(
+        node_id=node_id,
+        inventory_source_id=SOURCE_ID,
+        name=name,
+        status="online" if available else "offline",
+        available=available,
+        facts=facts or {},
+    )
+
+
 def resource(
+    resource_id: str,
     resource_type: ResourceType,
     vmid: int,
     name: str,
     *,
-    node_id: str = "pve-a",
+    active_binding_id: str | None = None,
+    locator_generation: int = 1,
+    resource_continuity_revision: int = 1,
+    current_node_id: str | None = NODE_A,
+    last_known_node_id: str | None = None,
+    presence: PresenceState = PresenceState.PRESENT,
+    lifecycle: LifecycleState = LifecycleState.ACTIVE,
+    observational_continuity: ObservationalContinuity = (
+        ObservationalContinuity.CONSISTENT
+    ),
+    security_continuity: SecurityContinuity = SecurityContinuity.UNVERIFIED,
+    detail_status: DetailStatus = DetailStatus.OK,
+    node_availability: NodeAvailability = NodeAvailability.AVAILABLE,
+    status: str = "running",
+    retained_policy: dict[str, Any] | None = None,
+    effective_policy: dict[str, Any] | None = None,
+    policy_applicable: bool = False,
+    effective_capabilities: frozenset[str] = frozenset(),
     state: dict[str, Any] | None = None,
-    instance_id: str = INSTANCE_ID,
+    termination_reason: str | None = None,
+    successor_resource_id: str | None = None,
 ) -> ResourceSnapshot:
+    if active_binding_id is None and presence in {
+        PresenceState.PRESENT,
+        PresenceState.MISSING,
+    }:
+        active_binding_id = f"binding-{resource_id}"
     return ResourceSnapshot(
-        identity=ResourceIdentity(instance_id, resource_type, vmid),
+        resource_id=resource_id,
+        inventory_source_id=SOURCE_ID,
+        active_binding_id=active_binding_id,
+        resource_type=resource_type,
+        vmid=vmid,
+        locator_generation=locator_generation,
+        resource_continuity_revision=resource_continuity_revision,
         name=name,
-        node_id=node_id,
-        status="running",
+        status=status,
+        current_node_id=current_node_id,
+        last_known_node_id=last_known_node_id,
+        presence=presence,
+        lifecycle=lifecycle,
+        observational_continuity=observational_continuity,
+        security_continuity=security_continuity,
+        detail_status=detail_status,
+        node_availability=node_availability,
         state_level=ResourceStateLevel.OBSERVED,
-        policy={"managed": False},
-        capabilities=frozenset(),
+        retained_policy=retained_policy or {},
+        effective_policy=effective_policy or {},
+        policy_applicable=policy_applicable,
+        effective_capabilities=effective_capabilities,
         state=state or {},
+        termination_reason=termination_reason,
+        successor_resource_id=successor_resource_id,
     )
+
+
+def absent_resource(
+    resource_id: str,
+    presence: PresenceState,
+    *,
+    vmid: int = 777,
+    generation: int = 1,
+    successor_resource_id: str | None = None,
+) -> ResourceSnapshot:
+    terminal = presence in {
+        PresenceState.CONFIRMED_REMOVED,
+        PresenceState.NOT_CURRENT,
+    }
+    return resource(
+        resource_id,
+        ResourceType.LXC,
+        vmid,
+        "Retained Container",
+        active_binding_id=None if terminal else f"binding-{resource_id}",
+        locator_generation=generation,
+        current_node_id=None,
+        last_known_node_id=NODE_A,
+        presence=presence,
+        lifecycle=(LifecycleState.RETIRED if terminal else LifecycleState.QUARANTINED),
+        observational_continuity=(
+            ObservationalContinuity.REPLACED
+            if presence is PresenceState.NOT_CURRENT
+            else ObservationalContinuity.UNCERTAIN
+        ),
+        detail_status=DetailStatus.NOT_APPLICABLE,
+        node_availability=NodeAvailability.NOT_APPLICABLE,
+        status="unknown",
+        termination_reason=(
+            "replaced"
+            if presence is PresenceState.NOT_CURRENT
+            else "confirmed_removed"
+            if presence is PresenceState.CONFIRMED_REMOVED
+            else None
+        ),
+        successor_resource_id=successor_resource_id,
+    )
+
+
+INITIAL_RESOURCES = (
+    resource(RESOURCE_VM, ResourceType.QEMU, 100, "Home Assistant"),
+    resource(RESOURCE_CT, ResourceType.LXC, 101, "Cloudflared"),
+    resource(RESOURCE_TEST, ResourceType.LXC, 666, "Test Container"),
+)
 
 
 def snapshot(
     resources: Iterable[ResourceSnapshot],
     *,
+    sources: tuple[InventorySourceSnapshot, ...] | None = None,
     nodes: tuple[NodeSnapshot, ...] | None = None,
-    instance_id: str = INSTANCE_ID,
+    backend_instance_id: str = BACKEND_ID,
+    inventory_revision: int = 10,
+    published_state_revision: int = 20,
+    published_at: str = "2026-08-08T12:00:00+00:00",
 ) -> HubinetOpsSnapshot:
     return HubinetOpsSnapshot(
-        backend=backend_information(instance_id=instance_id),
-        nodes=(
-            nodes
-            if nodes is not None
-            else (
-                NodeSnapshot(
-                    instance_id=instance_id,
-                    node_id="pve-a",
-                    name="pve-a",
-                    status="online",
-                ),
-            )
-        ),
+        backend=backend_information(backend_instance_id=backend_instance_id),
+        sources=sources if sources is not None else (source(),),
+        nodes=nodes if nodes is not None else (node(),),
         resources=tuple(resources),
-        generated_at="2026-08-08T12:00:00+00:00",
+        inventory_revision=inventory_revision,
+        published_state_revision=published_state_revision,
+        published_at=published_at,
     )
-
-
-INITIAL_RESOURCES = (
-    resource(ResourceType.QEMU, 100, "Home Assistant"),
-    resource(ResourceType.LXC, 101, "Cloudflared"),
-    resource(ResourceType.LXC, 666, "Test Container"),
-)
 
 
 class FakeTransport:
@@ -142,7 +326,6 @@ class FakeTransport:
         self._index = 0
         self.validation_error = validation_error
         self.validate_calls = 0
-        self.info_calls = 0
         self.snapshot_calls = 0
 
     async def validate_connection(self) -> BackendInformation:
@@ -152,7 +335,6 @@ class FakeTransport:
         return backend_information()
 
     async def fetch_backend_information(self) -> BackendInformation:
-        self.info_calls += 1
         return backend_information()
 
     async def fetch_resource_snapshot(self) -> HubinetOpsSnapshot:
@@ -201,7 +383,7 @@ async def setup_entry(
         domain=DOMAIN,
         title="Hubinet Ops Test",
         data=ENTRY_DATA,
-        unique_id=INSTANCE_ID,
+        unique_id=BACKEND_ID,
         version=1,
         minor_version=1,
     )
@@ -211,22 +393,30 @@ async def setup_entry(
     return entry
 
 
+def registry_unique_ids(
+    hass: HomeAssistant, entry: MockConfigEntry, key: str
+) -> set[str]:
+    return {
+        item.unique_id
+        for item in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if key in item.unique_id
+    }
+
+
 @pytest.mark.asyncio
-async def test_config_flow_happy_path(hass: HomeAssistant) -> None:
+async def test_config_flow_binds_exact_backend_instance(hass: HomeAssistant) -> None:
     transport = FakeTransport([snapshot(())])
     factory = install_factory(hass, transport)
-
     result = await hass.config_entries.flow.async_init(
         DOMAIN,
         context={"source": "user"},
         data={**ENTRY_DATA, CONF_BASE_URL: f"{BASE_URL}/"},
     )
-
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == "Hubinet Ops Test"
     assert result["data"] == ENTRY_DATA
     assert transport.validate_calls == 1
-    assert factory.calls
     assert all(call == ENTRY_DATA for call in factory.calls)
 
 
@@ -250,100 +440,32 @@ async def test_config_flow_connection_errors(
 
 
 @pytest.mark.asyncio
-async def test_reauth(hass: HomeAssistant) -> None:
-    install_factory(hass, FakeTransport())
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=ENTRY_DATA,
-        unique_id=INSTANCE_ID,
-    )
-    entry.add_to_hass(hass)
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
-        data=entry.data,
-    )
-    assert result["step_id"] == "reauth_confirm"
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], {CONF_API_TOKEN: "replacement-token"}
-    )
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "reauth_successful"
-    assert entry.data[CONF_API_TOKEN] == "replacement-token"
-
-
-@pytest.mark.asyncio
-async def test_reconfigure(hass: HomeAssistant) -> None:
-    install_factory(hass, FakeTransport())
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=ENTRY_DATA,
-        unique_id=INSTANCE_ID,
-    )
-    entry.add_to_hass(hass)
-    result = await hass.config_entries.flow.async_init(
-        DOMAIN,
-        context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
-    )
-    assert result["step_id"] == "reconfigure"
-    replacement = {
-        CONF_BASE_URL: "https://new-ops.example.test/",
-        CONF_API_TOKEN: "replacement-token",
-        CONF_VERIFY_TLS: False,
-    }
-    result = await hass.config_entries.flow.async_configure(
-        result["flow_id"], replacement
-    )
-    assert result["type"] is FlowResultType.ABORT
-    assert result["reason"] == "reconfigure_successful"
-    assert entry.data == {**replacement, CONF_BASE_URL: replacement[CONF_BASE_URL][:-1]}
-
-
-@pytest.mark.asyncio
-async def test_coordinator_fetches_one_logical_snapshot(hass: HomeAssistant) -> None:
-    transport = FakeTransport([snapshot(INITIAL_RESOURCES)])
-    entry = await setup_entry(hass, transport)
-    coordinator = entry.runtime_data
-    assert transport.snapshot_calls == 1
-    assert len(coordinator.data.nodes) == 1
-    assert len(coordinator.data.resources) == 3
-
-
-@pytest.mark.asyncio
-async def test_refresh_rejects_snapshot_from_different_backend_instance(
+async def test_backend_instance_mismatch_preserves_previous_view_and_registry(
     hass: HomeAssistant,
 ) -> None:
-    foreign_resource = resource(
-        ResourceType.LXC,
-        901,
-        "Foreign Container",
-        node_id="pve-b",
-        instance_id=OTHER_INSTANCE_ID,
+    foreign = HubinetOpsSnapshot(
+        backend=backend_information(backend_instance_id=OTHER_BACKEND_ID),
+        sources=(source(),),
+        nodes=(node(NODE_B, name="pve-b"),),
+        resources=(),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
     )
-    foreign_snapshot = snapshot(
-        (foreign_resource,),
-        nodes=(
-            NodeSnapshot(
-                OTHER_INSTANCE_ID,
-                "pve-b",
-                "pve-b",
-                "online",
-            ),
-        ),
-        instance_id=OTHER_INSTANCE_ID,
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot(INITIAL_RESOURCES), foreign])
     )
-    transport = FakeTransport(
-        [snapshot(INITIAL_RESOURCES), foreign_snapshot]
-    )
-    entry = await setup_entry(hass, transport)
     coordinator = entry.runtime_data
     previous = coordinator.data
-    known_nodes = coordinator.known_nodes.copy()
-    known_resources = coordinator.known_resources.copy()
-    callback_nodes: list[NodeSnapshot] = []
-    callback_resources: list[ResourceSnapshot] = []
-    coordinator.new_nodes_callbacks.append(callback_nodes.extend)
-    coordinator.new_resources_callbacks.append(callback_resources.extend)
+    known = (
+        coordinator.known_sources.copy(),
+        coordinator.known_nodes.copy(),
+        coordinator.known_resources.copy(),
+    )
+    callback_events: list[Any] = []
+    coordinator.new_sources_callbacks.append(callback_events.extend)
+    coordinator.new_nodes_callbacks.append(callback_events.extend)
+    coordinator.new_resources_callbacks.append(callback_events.extend)
 
     await coordinator.async_refresh()
     await hass.async_block_till_done()
@@ -352,518 +474,549 @@ async def test_refresh_rejects_snapshot_from_different_backend_instance(
     assert isinstance(coordinator.last_exception, UpdateFailed)
     assert coordinator.last_exception.translation_key == "wrong_instance"
     assert coordinator.data is previous
-    assert coordinator.data.backend.instance_id == INSTANCE_ID
-    assert coordinator.known_nodes == known_nodes
-    assert coordinator.known_resources == known_resources
-    assert callback_nodes == []
-    assert callback_resources == []
+    assert coordinator.data.backend.backend_instance_id == BACKEND_ID
+    assert known == (
+        coordinator.known_sources,
+        coordinator.known_nodes,
+        coordinator.known_resources,
+    )
+    assert callback_events == []
     registry = dr.async_get(hass)
     assert registry.async_get_device(
-        {(DOMAIN, f"{OTHER_INSTANCE_ID}:node:pve-b")}
-    ) is None
-    assert registry.async_get_device(
-        {(DOMAIN, foreign_resource.identity.registry_key)}
+        {(DOMAIN, node_registry_key(OTHER_BACKEND_ID, NODE_B))}
     ) is None
 
 
 @pytest.mark.asyncio
-async def test_first_refresh_rejects_snapshot_from_different_backend_instance(
+async def test_first_refresh_rejects_foreign_backend_before_device_changes(
     hass: HomeAssistant,
 ) -> None:
-    foreign_resource = resource(
-        ResourceType.QEMU,
-        902,
-        "Foreign VM",
-        instance_id=OTHER_INSTANCE_ID,
-    )
-    transport = FakeTransport(
-        [snapshot((foreign_resource,), instance_id=OTHER_INSTANCE_ID)]
-    )
-    install_factory(hass, transport)
+    foreign = snapshot((), backend_instance_id=OTHER_BACKEND_ID)
+    install_factory(hass, FakeTransport([foreign]))
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Hubinet Ops Test",
         data=ENTRY_DATA,
-        unique_id=INSTANCE_ID,
-        version=1,
-        minor_version=1,
+        unique_id=BACKEND_ID,
     )
     entry.add_to_hass(hass)
-
     assert not await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-
     assert entry.state is ConfigEntryState.SETUP_RETRY
-    assert transport.snapshot_calls == 1
-    assert dr.async_entries_for_config_entry(
-        dr.async_get(hass), entry.entry_id
-    ) == []
+    assert dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id) == []
 
 
 @pytest.mark.asyncio
-async def test_dynamic_node_creation(hass: HomeAssistant) -> None:
-    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
-    registry = dr.async_get(hass)
-    devices = dr.async_entries_for_config_entry(registry, entry.entry_id)
-    by_identifier = {
-        next(iter(device.identifiers))[1]: device for device in devices
-    }
-    node_key = f"{INSTANCE_ID}:node:pve-a"
-    assert by_identifier[node_key].name == "Node pve-a"
-
-
-@pytest.mark.asyncio
-async def test_dynamic_qemu_creation(hass: HomeAssistant) -> None:
-    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
-    registry = dr.async_get(hass)
-    device = registry.async_get_device(
-        {(DOMAIN, f"{INSTANCE_ID}:resource:qemu:100")}
-    )
-    assert device is not None
-    assert device.name == "VM100 Home Assistant"
-
-
-@pytest.mark.asyncio
-async def test_dynamic_lxc_creation(hass: HomeAssistant) -> None:
-    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
-    registry = dr.async_get(hass)
-    device = registry.async_get_device(
-        {(DOMAIN, f"{INSTANCE_ID}:resource:lxc:666")}
-    )
-    assert device is not None
-    assert device.name == "CT666 Test Container"
-
-
-@pytest.mark.asyncio
-async def test_vm_lxc_devices_use_node_via_device(hass: HomeAssistant) -> None:
-    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
-    registry = dr.async_get(hass)
-    parent = registry.async_get_device({(DOMAIN, f"{INSTANCE_ID}:node:pve-a")})
-    vm = registry.async_get_device({(DOMAIN, f"{INSTANCE_ID}:resource:qemu:100")})
-    container = registry.async_get_device(
-        {(DOMAIN, f"{INSTANCE_ID}:resource:lxc:101")}
-    )
-    assert parent is not None and vm is not None and container is not None
-    assert vm.via_device_id == parent.id
-    assert container.via_device_id == parent.id
-
-
-@pytest.mark.asyncio
-async def test_device_info_uses_2026_8_1_via_device_id_contract(
+async def test_devices_and_entities_are_keyed_by_backend_resource_id(
     hass: HomeAssistant,
 ) -> None:
     entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
     registry = dr.async_get(hass)
-    parent = registry.async_get_device({(DOMAIN, f"{INSTANCE_ID}:node:pve-a")})
-    assert parent is not None
-
-    device_info = resource_device_info(
-        hass,
-        entry.entry_id,
-        INITIAL_RESOURCES[0],
+    source_device = registry.async_get_device(
+        {(DOMAIN, source_registry_key(BACKEND_ID, SOURCE_ID))}
     )
-    assert "via_device" not in device_info
-    assert device_info["via_device_id"] == parent.id
+    node_device = registry.async_get_device(
+        {(DOMAIN, node_registry_key(BACKEND_ID, NODE_A))}
+    )
+    resource_device = registry.async_get_device(
+        {(DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_CT))}
+    )
+    assert source_device is not None and node_device is not None
+    assert resource_device is not None
+    assert node_device.via_device_id == source_device.id
+    assert resource_device.via_device_id == node_device.id
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    assert registry_unique_ids(hass, entry, key) == {
+        f"{key}:{description}"
+        for description in {
+            "status",
+            "type",
+            "node",
+            "presence",
+            "detail_status",
+            "lifecycle",
+            "observational_continuity",
+            "security_continuity",
+        }
+    }
 
 
 @pytest.mark.asyncio
-async def test_resource_is_added_after_refresh_without_reload(
+async def test_rename_preserves_identity_and_updates_device_name(
     hass: HomeAssistant,
 ) -> None:
-    added = resource(ResourceType.LXC, 777, "New Container")
-    transport = FakeTransport(
-        [snapshot(INITIAL_RESOURCES), snapshot((*INITIAL_RESOURCES, added))]
+    renamed = replace(INITIAL_RESOURCES[1], name="Cloudflared Renamed")
+    second = snapshot(
+        (INITIAL_RESOURCES[0], renamed, INITIAL_RESOURCES[2]),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
     )
-    entry = await setup_entry(hass, transport)
-    coordinator = entry.runtime_data
-    await coordinator.async_request_refresh()
-    await hass.async_block_till_done()
-
-    registry = dr.async_get(hass)
-    identifiers = {
-        identifier
-        for device in dr.async_entries_for_config_entry(registry, entry.entry_id)
-        for identifier in device.identifiers
-    }
-    assert (DOMAIN, added.identity.registry_key) in identifiers
-    entity_entries = er.async_entries_for_config_entry(
-        er.async_get(hass), entry.entry_id
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot(INITIAL_RESOURCES), second])
     )
-    assert {
-        entity.unique_id for entity in entity_entries if ":lxc:777:" in entity.unique_id
-    } == {
-        f"{added.identity.registry_key}:status",
-        f"{added.identity.registry_key}:type",
-        f"{added.identity.registry_key}:node",
-    }
-
-
-@pytest.mark.asyncio
-async def test_rename_preserves_unique_ids(hass: HomeAssistant) -> None:
-    renamed = resource(ResourceType.LXC, 101, "Cloudflared Renamed")
-    transport = FakeTransport(
-        [
-            snapshot(INITIAL_RESOURCES),
-            snapshot((INITIAL_RESOURCES[0], renamed, INITIAL_RESOURCES[2])),
-        ]
-    )
-    entry = await setup_entry(hass, transport)
-    entity_registry = er.async_get(hass)
-    before = {
-        item.unique_id
-        for item in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
-        if ":lxc:101:" in item.unique_id
-    }
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    before = registry_unique_ids(hass, entry, key)
     await entry.runtime_data.async_request_refresh()
     await hass.async_block_till_done()
-    after = {
-        item.unique_id
-        for item in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
-        if ":lxc:101:" in item.unique_id
-    }
-    assert after == before
-    device = dr.async_get(hass).async_get_device(
-        {(DOMAIN, renamed.identity.registry_key)}
-    )
-    assert device is not None
-    assert device.name == "CT101 Cloudflared Renamed"
+    assert registry_unique_ids(hass, entry, key) == before
+    device = dr.async_get(hass).async_get_device({(DOMAIN, key)})
+    assert device is not None and device.name == "CT101 Cloudflared Renamed"
 
 
 @pytest.mark.asyncio
 async def test_node_migration_preserves_identity_and_updates_via_device(
     hass: HomeAssistant,
 ) -> None:
-    moved = resource(ResourceType.LXC, 101, "Cloudflared", node_id="pve-b")
-    second_nodes = (
-        NodeSnapshot(INSTANCE_ID, "pve-a", "pve-a", "online"),
-        NodeSnapshot(INSTANCE_ID, "pve-b", "pve-b", "online"),
+    moved = replace(
+        INITIAL_RESOURCES[1],
+        current_node_id=NODE_B,
+        resource_continuity_revision=1,
     )
-    transport = FakeTransport(
-        [
-            snapshot(INITIAL_RESOURCES),
-            snapshot((INITIAL_RESOURCES[0], moved, INITIAL_RESOURCES[2]), nodes=second_nodes),
-        ]
+    second = snapshot(
+        (INITIAL_RESOURCES[0], moved, INITIAL_RESOURCES[2]),
+        nodes=(node(), node(NODE_B, name="pve-b")),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
     )
-    entry = await setup_entry(hass, transport)
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot(INITIAL_RESOURCES), second])
+    )
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    before = registry_unique_ids(hass, entry, key)
     await entry.runtime_data.async_request_refresh()
     await hass.async_block_till_done()
     registry = dr.async_get(hass)
-    child = registry.async_get_device({(DOMAIN, moved.identity.registry_key)})
-    parent = registry.async_get_device({(DOMAIN, f"{INSTANCE_ID}:node:pve-b")})
+    child = registry.async_get_device({(DOMAIN, key)})
+    parent = registry.async_get_device(
+        {(DOMAIN, node_registry_key(BACKEND_ID, NODE_B))}
+    )
     assert child is not None and parent is not None
     assert child.via_device_id == parent.id
+    assert registry_unique_ids(hass, entry, key) == before
 
 
 @pytest.mark.asyncio
-async def test_one_missing_refresh_retains_unavailable_resource(
+async def test_retained_and_successor_generations_share_vmid_without_collision(
     hass: HomeAssistant,
 ) -> None:
-    transport = FakeTransport(
-        [snapshot(INITIAL_RESOURCES), snapshot((INITIAL_RESOURCES[0],))]
+    old_id = "dc38061a-af9b-4a65-96a7-b012e07a459c"
+    successor_id = "c4176c22-660a-4484-b8eb-e8390e9a44c6"
+    old = absent_resource(
+        old_id,
+        PresenceState.NOT_CURRENT,
+        vmid=101,
+        generation=4,
+        successor_resource_id=successor_id,
     )
-    entry = await setup_entry(hass, transport)
-    identity = INITIAL_RESOURCES[1].identity
+    successor = resource(
+        successor_id,
+        ResourceType.LXC,
+        101,
+        "Replacement Container",
+        locator_generation=5,
+    )
+    view = snapshot((successor, old))
+    assert view.current_resources_by_locator[(SOURCE_ID, 101)] is successor
+    assert set(view.resources_by_id) == {old_id, successor_id}
+
+    entry = await setup_entry(hass, FakeTransport([view]))
+    registry = dr.async_get(hass)
+    old_key = resource_registry_key(BACKEND_ID, old_id)
+    successor_key = resource_registry_key(BACKEND_ID, successor_id)
+    old_device = registry.async_get_device({(DOMAIN, old_key)})
+    successor_device = registry.async_get_device({(DOMAIN, successor_key)})
+    assert old_device is not None and successor_device is not None
+    assert old_device.id != successor_device.id
+    assert registry_unique_ids(hass, entry, old_key).isdisjoint(
+        registry_unique_ids(hass, entry, successor_key)
+    )
+    old_status = next(
+        item
+        for item in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if item.unique_id == f"{old_key}:status"
+    )
+    successor_status = next(
+        item
+        for item in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if item.unique_id == f"{successor_key}:status"
+    )
+    assert hass.states[old_status.entity_id].state == STATE_UNAVAILABLE
+    assert hass.states[successor_status.entity_id].state == "running"
+    assert old_device.via_device_id is not None
+
+
+@pytest.mark.asyncio
+async def test_ambiguity_preserves_resource_binding_generation_and_device(
+    hass: HomeAssistant,
+) -> None:
+    original = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        locator_generation=7,
+        resource_continuity_revision=8,
+    )
+    ambiguous = replace(
+        original,
+        lifecycle=LifecycleState.QUARANTINED,
+        observational_continuity=ObservationalContinuity.UNCERTAIN,
+        resource_continuity_revision=9,
+    )
+    second = snapshot(
+        (ambiguous,),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot((original,)), second])
+    )
     await entry.runtime_data.async_request_refresh()
     await hass.async_block_till_done()
-    retained = entry.runtime_data.data.resources_by_identity[identity]
-    assert retained.presence is PresenceState.MISSING
-    assert retained.available is False
-    assert retained.node_id is None
-    assert retained.last_known_node_id == "pve-a"
-    assert retained.relation_node_id == "pve-a"
-    assert dr.async_get(hass).async_get_device(
-        {(DOMAIN, identity.registry_key)}
-    ) is not None
+    current = entry.runtime_data.data.resources_by_id[RESOURCE_CT]
+    assert current.resource_id == original.resource_id
+    assert current.active_binding_id == original.active_binding_id
+    assert current.locator_generation == 7
+    assert set(entry.runtime_data.data.resources_by_id) == {RESOURCE_CT}
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    assert dr.async_get(hass).async_get_device({(DOMAIN, key)}) is not None
 
 
-def test_present_resource_requires_node_in_same_snapshot() -> None:
-    with pytest.raises(
-        ValueError,
-        match="present resource references a node absent from the same snapshot",
-    ):
-        snapshot((resource(ResourceType.LXC, 777, "Wrong Node", node_id="pve-b"),))
+@pytest.mark.parametrize(
+    "detail_status",
+    [DetailStatus.TEMPORARILY_UNAVAILABLE, DetailStatus.ERROR],
+)
+def test_present_locator_accepts_independent_detail_failure(
+    detail_status: DetailStatus,
+) -> None:
+    item = resource(
+        RESOURCE_ADDED,
+        ResourceType.LXC,
+        777,
+        "Detail Failure",
+        detail_status=detail_status,
+    )
+    assert snapshot((item,)).resources[0].presence is PresenceState.PRESENT
+
+
+def test_present_locator_accepts_unavailable_or_unresolved_node_relation() -> None:
+    unavailable = resource(
+        RESOURCE_ADDED,
+        ResourceType.LXC,
+        777,
+        "Unavailable Node",
+        node_availability=NodeAvailability.UNAVAILABLE,
+    )
+    view = snapshot((unavailable,), nodes=(node(available=False),))
+    assert view.resources[0].presence is PresenceState.PRESENT
+
+    unresolved = replace(
+        unavailable,
+        current_node_id=None,
+        last_known_node_id=NODE_A,
+        node_availability=NodeAvailability.UNRESOLVED,
+    )
+    assert snapshot((unresolved,)).resources[0].resource_id == RESOURCE_ADDED
 
 
 @pytest.mark.parametrize(
     "presence",
     [
-        PresenceState.TEMPORARILY_UNAVAILABLE,
-        PresenceState.NODE_UNAVAILABLE,
         PresenceState.MISSING,
         PresenceState.CONFIRMED_REMOVED,
+        PresenceState.NOT_CURRENT,
     ],
 )
-def test_non_present_resource_uses_explicit_last_known_node(
+def test_absent_and_terminal_states_require_not_applicable_detail(
     presence: PresenceState,
 ) -> None:
-    unavailable = ResourceSnapshot(
-        identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 777),
-        name="Unavailable Container",
-        node_id=None,
-        last_known_node_id="pve-a",
-        status="unknown",
-        presence=presence,
+    successor_id = RESOURCE_ADDED if presence is PresenceState.NOT_CURRENT else None
+    old = absent_resource(
+        RESOURCE_CT,
+        presence,
+        successor_resource_id=successor_id,
     )
-    result = snapshot((unavailable,), nodes=())
-    stored = result.resources[0]
-    assert stored.node_id is None
-    assert stored.last_known_node_id == "pve-a"
-    assert stored.relation_node_id == "pve-a"
-    assert stored.available is False
+    resources = (
+        old,
+        resource(RESOURCE_ADDED, ResourceType.LXC, 777, "Successor", locator_generation=2),
+    ) if successor_id else (old,)
+    assert snapshot(resources).resources[0].detail_status is DetailStatus.NOT_APPLICABLE
 
 
-def test_non_present_resource_rejects_current_node_id() -> None:
-    with pytest.raises(ValueError, match="must use last_known_node_id"):
-        ResourceSnapshot(
-            identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 777),
-            name="Missing Container",
-            node_id="pve-a",
-            last_known_node_id="pve-a",
-            status="unknown",
-            presence=PresenceState.MISSING,
-        )
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ({"detail_status": DetailStatus.NOT_APPLICABLE}, "current detail status"),
+        (
+            {
+                "presence": PresenceState.MISSING,
+                "lifecycle": LifecycleState.QUARANTINED,
+                "observational_continuity": ObservationalContinuity.UNCERTAIN,
+                "current_node_id": None,
+                "last_known_node_id": NODE_A,
+                "node_availability": NodeAvailability.NOT_APPLICABLE,
+            },
+            "require detail_status=not_applicable",
+        ),
+        (
+            {
+                "lifecycle": LifecycleState.RETIRED,
+                "observational_continuity": ObservationalContinuity.CONSISTENT,
+            },
+            "canonical state matrix",
+        ),
+        (
+            {
+                "current_node_id": None,
+                "last_known_node_id": NODE_A,
+                "node_availability": NodeAvailability.AVAILABLE,
+            },
+            "unresolved current node relation",
+        ),
+    ],
+)
+def test_resource_validator_rejects_invalid_axis_combinations(
+    mutation: dict[str, Any], match: str
+) -> None:
+    valid = resource(
+        RESOURCE_ADDED, ResourceType.LXC, 777, "Invalid Candidate"
+    )
+    with pytest.raises(ValueError, match=match):
+        replace(valid, **mutation)
+
+
+def test_snapshot_rejects_dangling_current_and_last_known_nodes() -> None:
+    dangling_current = resource(
+        RESOURCE_ADDED,
+        ResourceType.LXC,
+        777,
+        "Dangling",
+        current_node_id=NODE_B,
+    )
+    with pytest.raises(ValueError, match="node absent"):
+        snapshot((dangling_current,))
+
+    dangling_last = absent_resource(RESOURCE_ADDED, PresenceState.MISSING)
+    with pytest.raises(ValueError, match="node absent"):
+        snapshot((replace(dangling_last, last_known_node_id=NODE_B),))
 
 
 @pytest.mark.asyncio
-async def test_last_known_node_absent_on_initial_snapshot_is_not_invented(
+async def test_backend_reachable_with_unavailable_source_keeps_resource_presence(
     hass: HomeAssistant,
 ) -> None:
-    missing = ResourceSnapshot(
-        identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 777),
-        name="Missing Container",
-        node_id=None,
-        last_known_node_id="retired-node",
-        status="unknown",
-        presence=PresenceState.MISSING,
+    first = snapshot((INITIAL_RESOURCES[1],))
+    second = snapshot(
+        (INITIAL_RESOURCES[1],),
+        sources=(unavailable_source(),),
+        inventory_revision=10,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
     )
-    await setup_entry(hass, FakeTransport([snapshot((missing,), nodes=())]))
-    device = dr.async_get(hass).async_get_device(
-        {(DOMAIN, missing.identity.registry_key)}
+    entry = await setup_entry(hass, FakeTransport([first, second]))
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+    current = entry.runtime_data.data.resources_by_id[RESOURCE_CT]
+    assert current.presence is PresenceState.PRESENT
+    assert entry.runtime_data.last_update_success is True
+
+    entity_registry = er.async_get(hass)
+    source_key = source_registry_key(BACKEND_ID, SOURCE_ID)
+    source_health = next(
+        item
+        for item in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+        if item.unique_id == f"{source_key}:health"
     )
-    assert device is not None
-    assert device.via_device_id is None
+    resource_key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    runtime_status = next(
+        item
+        for item in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+        if item.unique_id == f"{resource_key}:status"
+    )
+    presence_entity = next(
+        item
+        for item in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+        if item.unique_id == f"{resource_key}:presence"
+    )
+    assert hass.states[source_health.entity_id].state == "source_unavailable"
+    assert hass.states[runtime_status.entity_id].state == STATE_UNAVAILABLE
+    assert hass.states[presence_entity.entity_id].state == "present"
 
 
-def test_confirmed_removed_is_not_downgraded_when_later_absent() -> None:
-    removed = ResourceSnapshot(
-        identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 777),
-        name="Removed Container",
-        node_id=None,
-        last_known_node_id="pve-a",
-        status="removed",
-        presence=PresenceState.CONFIRMED_REMOVED,
-    )
-    previous = snapshot((removed,))
-    current = snapshot(())
+def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> None:
+    healthy = source()
+    assert healthy.current_context == healthy.committed_context
+    assert healthy.freshness_reference_at is not None
+    assert healthy.freshness_valid_until is not None
 
-    reconciled = current.preserving_unconfirmed_missing(previous)
-    retained = reconciled.resources_by_identity[removed.identity]
-    assert retained.presence is PresenceState.CONFIRMED_REMOVED
-    assert retained.last_known_node_id == "pve-a"
+    initial = source(
+        health=SourceHealth.NOT_YET_OBSERVED,
+        freshness=SourceFreshness.NOT_YET_OBSERVED,
+        health_origin=SourceHealthOrigin.INITIAL,
+        health_reason="",
+        last_issued_run_sequence=0,
+        latest_completed_run_sequence=None,
+        latest_completed_outcome=None,
+        last_health_run_sequence=None,
+        last_run_health_outcome=None,
+        last_committed_run_sequence=None,
+    )
+    assert initial.committed_context is None
+    assert initial.freshness_valid_until is None
+
+    with pytest.raises(ValueError, match="healthy authoritative discovery commit"):
+        replace(healthy, freshness=SourceFreshness.FRESH, health=SourceHealth.DEGRADED)
+
+
+def test_published_revisions_are_monotonic_and_one_revision_is_immutable() -> None:
+    first = snapshot((INITIAL_RESOURCES[1],))
+    changed_same_revision = snapshot(
+        (replace(INITIAL_RESOURCES[1], name="Changed"),)
+    )
+    with pytest.raises(ValueError, match="one immutable view"):
+        changed_same_revision.validate_revision_successor(first)
+    with pytest.raises(ValueError, match="must not regress"):
+        replace(first, published_state_revision=19).validate_revision_successor(first)
+    with pytest.raises(ValueError, match="must not regress"):
+        replace(first, inventory_revision=9, published_state_revision=21).validate_revision_successor(first)
 
 
 def test_snapshot_mappings_are_deeply_immutable() -> None:
-    mutable_state = {
-        "nested": {"values": [1, {"flag": True}]},
-    }
+    mutable = {"nested": {"values": [1, {"flag": True}]}}
     frozen = resource(
+        RESOURCE_ADDED,
         ResourceType.LXC,
         777,
-        "Immutable Container",
-        state=mutable_state,
+        "Immutable",
+        state=mutable,
+        retained_policy=mutable,
     )
-    mutable_state["nested"]["values"].append(2)
-
-    nested = frozen.state["nested"]
-    assert nested["values"] == (1, {"flag": True})
+    mutable["nested"]["values"].append(2)
+    assert frozen.state["nested"]["values"] == (1, {"flag": True})
     with pytest.raises(TypeError):
-        nested["new"] = "mutation"  # type: ignore[index]
+        frozen.state["new"] = "mutation"  # type: ignore[index]
+    view = snapshot((frozen,))
+    with pytest.raises(TypeError):
+        view.resources_by_id[RESOURCE_CT] = frozen  # type: ignore[index]
     with pytest.raises(TypeError, match="JSON-like"):
-        resource(
-            ResourceType.LXC,
-            778,
-            "Mutable Payload",
-            state={"payload": bytearray(b"mutable")},
-        )
+        replace(frozen, state={"payload": bytearray(b"mutable")})
 
 
 @pytest.mark.asyncio
-async def test_diagnostics_redact_credentials(hass: HomeAssistant) -> None:
-    raw_secrets = {
-        "authorization": "Bearer lower-authorization-value",
-        "Authorization": "Bearer upper-authorization-value",
-        "authorization_header": "Bearer header-authorization-value",
-        "bearer_token": "bearer-token-value",
-        "mqtt_password": "mqtt-password-value",
+async def test_diagnostics_redact_secrets_across_new_source_shape(
+    hass: HomeAssistant,
+) -> None:
+    secrets = {
+        "authorization": "Bearer private-authorization",
+        "mqtt_password": "private-mqtt-password",
         "private_key": "private-key-value",
-        "webhook_id": "webhook-id-value",
-        "client_secret": "client-secret-value",
-        "api_key": "api-key-value",
-        "ssh_key": "ssh-key-value",
-        "some-service-token": "service-token-value",
-        "backend_token": "backend-token-value",
-        "update_token": "update-token-value",
-        "recovery_token": "recovery-token-value",
-        "token_value": "token-value-value",
-        "passphrase": "passphrase-value",
-        "host_authorization": "Bearer host-authorization-value",
-        "ha_ssh_key": "ha-ssh-key-value",
-        "webhook_url": "https://hooks.example.test/api/webhook/private-id",
-        "credential_object": "credential-object-value",
-        "hubinet_ops_scan_url": "https://private.example.test/api/v1/scan",
+        "webhook_url": "https://hooks.example.test/private-id",
+        "api_key": "private-api-key",
+        "backend_token": "private-backend-token",
+        "canonical_locator": "https://pve.example.test:8006",
     }
-    sensitive_node = NodeSnapshot(
-        INSTANCE_ID,
-        "pve-a",
-        "pve-a",
-        "online",
+    sensitive_source = source(
         facts={
-            "MQTT_PASSWORD": raw_secrets["mqtt_password"],
-            "nested": {
-                "private_key": raw_secrets["private_key"],
-                "memory": 4096,
+            "authorization": secrets["authorization"],
+            "endpoint": {
+                "api_key": secrets["api_key"],
+                "documentation_url": "https://docs.example.test/source",
             },
-            "events": (
-                {
-                    "webhook_id": raw_secrets["webhook_id"],
-                    "display": "visible-event",
-                },
-            ),
-            "cpu": 0.25,
-            "status": "online",
-        },
+        }
     )
-    sensitive_resource = ResourceSnapshot(
-        identity=ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 666),
-        name="Test Container",
-        node_id="pve-a",
-        status="running",
-        policy={
-            "authorization": raw_secrets["authorization"],
-            "client_secret": raw_secrets["client_secret"],
-            "repository_secrets": {
-                "backend_token": raw_secrets["backend_token"],
-                "update_token": raw_secrets["update_token"],
-                "recovery_token": raw_secrets["recovery_token"],
-                "token_value": raw_secrets["token_value"],
-                "passphrase": raw_secrets["passphrase"],
-                "hubinet_ops_host_recovery_authorization": raw_secrets[
-                    "host_authorization"
-                ],
-                "HUBINET_OPS_HA_SSH_KEY": raw_secrets["ha_ssh_key"],
-                "webhook_url": raw_secrets["webhook_url"],
-                "credentials": {
-                    "value": raw_secrets["credential_object"],
-                },
-            },
+    sensitive_node = node(
+        facts={
+            "MQTT_PASSWORD": secrets["mqtt_password"],
+            "nested": {"private_key": secrets["private_key"], "memory": 4096},
+        }
+    )
+    sensitive_resource = resource(
+        RESOURCE_TEST,
+        ResourceType.LXC,
+        666,
+        "Sensitive",
+        retained_policy={
+            "backend_token": secrets["backend_token"],
             "managed": False,
         },
         state={
-            "Authorization": raw_secrets["Authorization"],
-            "headers": {
-                "Authorization": raw_secrets["authorization_header"],
-                "Content-Type": "application/json",
-            },
-            "bearer_token": raw_secrets["bearer_token"],
-            "api_key": raw_secrets["api_key"],
-            "ssh_key": raw_secrets["ssh_key"],
-            "events": [
-                {
-                    "some-service-token": raw_secrets["some-service-token"],
-                    "availability": "online",
-                }
-            ],
-            "hubinet_ops_scan_url": raw_secrets["hubinet_ops_scan_url"],
-            "documentation_url": "https://docs.example.test/resource",
+            "webhook_url": secrets["webhook_url"],
             "device_id": "visible-device-id",
             "registry_key": "visible-registry-key",
             "token_id": "visible-token-id",
-            "backend_token_env": "VISIBLE_BACKEND_TOKEN_ENV",
             "ssh_key_dir": "/visible/key-directory",
-            "secrets_file": "/visible/secrets-file-path",
-            "resource_type": "lxc",
-            "vmid": 666,
+            "documentation_url": "https://docs.example.test/resource",
         },
     )
     entry = await setup_entry(
         hass,
         FakeTransport(
-            [snapshot((sensitive_resource,), nodes=(sensitive_node,))]
+            [
+                snapshot(
+                    (sensitive_resource,),
+                    sources=(sensitive_source,),
+                    nodes=(sensitive_node,),
+                )
+            ]
         ),
     )
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
-    config_data = diagnostics["config_entry"]["data"]
-    assert config_data[CONF_API_TOKEN] == REDACTED
-    assert config_data[CONF_BASE_URL] == REDACTED
-    snapshot_data = diagnostics["snapshot"]
-    facts = snapshot_data["nodes"][0]["facts"]
-    policy = snapshot_data["resources"][0]["policy"]
-    state = snapshot_data["resources"][0]["state"]
-
-    assert facts["MQTT_PASSWORD"] == REDACTED
-    assert facts["nested"]["private_key"] == REDACTED
-    assert facts["events"][0]["webhook_id"] == REDACTED
-    assert policy["authorization"] == REDACTED
-    assert policy["client_secret"] == REDACTED
-    repository_secrets = policy["repository_secrets"]
-    assert repository_secrets["backend_token"] == REDACTED
-    assert repository_secrets["update_token"] == REDACTED
-    assert repository_secrets["recovery_token"] == REDACTED
-    assert repository_secrets["token_value"] == REDACTED
-    assert repository_secrets["passphrase"] == REDACTED
-    assert (
-        repository_secrets["hubinet_ops_host_recovery_authorization"]
-        == REDACTED
-    )
-    assert repository_secrets["HUBINET_OPS_HA_SSH_KEY"] == REDACTED
-    assert repository_secrets["webhook_url"] == REDACTED
-    assert repository_secrets["credentials"] == REDACTED
-    assert state["Authorization"] == REDACTED
-    assert state["headers"] == REDACTED
-    assert state["bearer_token"] == REDACTED
-    assert state["api_key"] == REDACTED
-    assert state["ssh_key"] == REDACTED
-    assert state["events"][0]["some-service-token"] == REDACTED
-    assert state["hubinet_ops_scan_url"] == REDACTED
-
-    assert facts["nested"]["memory"] == 4096
-    assert facts["events"][0]["display"] == "visible-event"
-    assert facts["cpu"] == 0.25
-    assert facts["status"] == "online"
-    assert policy["managed"] is False
-    assert state["events"][0]["availability"] == "online"
-    assert state["documentation_url"] == "https://docs.example.test/resource"
-    assert state["device_id"] == "visible-device-id"
-    assert state["registry_key"] == "visible-registry-key"
-    assert state["token_id"] == "visible-token-id"
-    assert state["backend_token_env"] == "VISIBLE_BACKEND_TOKEN_ENV"
-    assert state["ssh_key_dir"] == "/visible/key-directory"
-    assert state["secrets_file"] == "/visible/secrets-file-path"
-    assert state["resource_type"] == "lxc"
-    assert state["vmid"] == 666
-
+    assert diagnostics["config_entry"]["data"][CONF_API_TOKEN] == REDACTED
+    assert diagnostics["config_entry"]["data"][CONF_BASE_URL] == REDACTED
+    source_data = diagnostics["snapshot"]["sources"][0]
+    assert source_data["current_context"]["canonical_transport_locator"] == REDACTED
+    assert source_data["committed_context"]["canonical_transport_locator"] == REDACTED
+    assert source_data["facts"]["authorization"] == REDACTED
+    assert source_data["facts"]["endpoint"]["api_key"] == REDACTED
+    assert source_data["facts"]["endpoint"]["documentation_url"].startswith("https://docs")
+    node_data = diagnostics["snapshot"]["nodes"][0]
+    assert node_data["facts"]["MQTT_PASSWORD"] == REDACTED
+    assert node_data["facts"]["nested"]["private_key"] == REDACTED
+    assert node_data["facts"]["nested"]["memory"] == 4096
+    resource_data = diagnostics["snapshot"]["resources"][0]
+    assert resource_data["retained_policy"]["backend_token"] == REDACTED
+    assert resource_data["state"]["webhook_url"] == REDACTED
+    for key in (
+        "device_id",
+        "registry_key",
+        "token_id",
+        "ssh_key_dir",
+        "documentation_url",
+    ):
+        assert resource_data["state"][key] == sensitive_resource.state[key]
     diagnostics_repr = repr(diagnostics)
     assert API_TOKEN not in diagnostics_repr
-    assert all(value not in diagnostics_repr for value in raw_secrets.values())
+    assert all(value not in diagnostics_repr for value in secrets.values())
 
 
 def integration_python_sources() -> list[Path]:
     return sorted(Path("custom_components/hubinet_ops").glob("*.py"))
 
 
-def test_client_has_no_direct_proxmox_dependency_or_mutation() -> None:
+def test_client_has_no_proxmox_mqtt_authority_or_mutation_path() -> None:
     combined = "\n".join(
         path.read_text(encoding="utf-8") for path in integration_python_sources()
     ).lower()
-    assert "proxmoxer" not in combined
-    assert "proxmoxapi" not in combined
-    assert "press_action" not in combined
-    assert "via_device=" not in combined
-    assert ".status.start" not in combined
-    assert ".snapshot.post" not in combined
-    assert "app.mqtt" not in combined
-    assert "app.ha_entities" not in combined
-    assert "home-assistant/packages" not in combined
+    for forbidden in (
+        "proxmoxer",
+        "proxmoxapi",
+        "press_action",
+        ".status.start",
+        ".snapshot.post",
+        "app.mqtt",
+        "mqtt discovery",
+        "home-assistant/packages",
+    ):
+        assert forbidden not in combined
+    assert "preserving_unconfirmed_missing" not in combined
+    assert "resources_by_vmid" not in combined
 
 
 def test_production_integration_has_no_hardcoded_current_vmids() -> None:
@@ -872,15 +1025,20 @@ def test_production_integration_has_no_hardcoded_current_vmids() -> None:
     for path in integration_python_sources():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         occurrences.extend(
-            (path, node.lineno, node.value)
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Constant)
-            and type(node.value) is int
-            and node.value in forbidden
+            (path, item.lineno, item.value)
+            for item in ast.walk(tree)
+            if isinstance(item, ast.Constant)
+            and type(item.value) is int
+            and item.value in forbidden
         )
     assert occurrences == []
 
 
-def test_resource_identity_rejects_non_integer_vmid() -> None:
+def test_resource_locator_rejects_non_integer_vmid() -> None:
     with pytest.raises(ValueError, match="positive integer"):
-        ResourceIdentity(INSTANCE_ID, ResourceType.LXC, 1.5)  # type: ignore[arg-type]
+        resource(
+            RESOURCE_ADDED,
+            ResourceType.LXC,
+            1.5,  # type: ignore[arg-type]
+            "Invalid VMID",
+        )

@@ -8,6 +8,7 @@
     "error": {
       "cannot_connect": "Nie można połączyć się z backendem Hubinet Ops.",
       "invalid_auth": "Token API Hubinet Ops jest nieprawidłowy.",
+      "invalid_snapshot": "Backend zwrócił nieprawidłowy lub cofnięty opublikowany snapshot.",
       "invalid_url": "Podaj prawidłowy bazowy URL HTTP lub HTTPS bez credentials, query i fragmentu.",
       "unknown": "Wystąpił nieoczekiwany błąd backendu Hubinet Ops.",
       "wrong_instance": "Połączenie wskazuje inną instancję backendu Hubinet Ops."
@@ -46,8 +47,17 @@
   "entity": {
     "sensor": {
       "node_status": {"name": "Stan"},
+      "source_health": {"name": "Stan źródła"},
+      "source_freshness": {"name": "Świeżość"},
+      "source_last_successful_observation": {"name": "Ostatnia udana obserwacja"},
+      "source_freshness_valid_until": {"name": "Świeżość ważna do"},
       "resource_node": {"name": "Node"},
       "resource_status": {"name": "Stan"},
+      "resource_presence": {"name": "Obecność"},
+      "resource_detail_status": {"name": "Stan szczegółów"},
+      "resource_lifecycle": {"name": "Cykl życia"},
+      "resource_observational_continuity": {"name": "Ciągłość obserwacyjna"},
+      "resource_security_continuity": {"name": "Ciągłość bezpieczeństwa"},
       "resource_type": {"name": "Typ"}
     }
   },
@@ -57,6 +67,9 @@
     },
     "invalid_auth": {
       "message": "Token API Hubinet Ops jest nieprawidłowy."
+    },
+    "invalid_snapshot": {
+      "message": "Backend zwrócił nieprawidłowy lub cofnięty opublikowany snapshot."
     },
     "wrong_instance": {
       "message": "Połączenie wskazuje inną instancję backendu Hubinet Ops."
