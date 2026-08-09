@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -83,6 +84,8 @@ RESOURCE_VM = "3a6d0ac4-f859-438d-9f96-9d21dba641f1"
 RESOURCE_CT = "b50f157b-d2fb-4fff-9497-42c5c239ef49"
 RESOURCE_TEST = "58fa8094-8a8b-4e70-9cf3-f8fd727d85ea"
 RESOURCE_ADDED = "c5321ec5-7259-421a-94ab-195a9c5e5d81"
+ENDPOINT_A_ID = "7b784024-62d8-4f3e-bb63-af9fe65fcc8e"
+ENDPOINT_B_ID = "9e2ef36f-f6db-4e23-93fe-85ad573682f5"
 BASE_URL = "https://ops.example.test"
 API_TOKEN = "phase-zero-test-token-not-a-secret"
 ENTRY_DATA = {
@@ -90,6 +93,12 @@ ENTRY_DATA = {
     CONF_API_TOKEN: API_TOKEN,
     CONF_VERIFY_TLS: True,
 }
+
+
+def _test_only_binding_id(label: str) -> str:
+    """Return a stable UUID for one test binding without production semantics."""
+
+    return str(uuid5(NAMESPACE_URL, f"hubinet-ops test binding: {label}"))
 
 
 def backend_information(
@@ -107,7 +116,7 @@ def source_context(
     *,
     revision: int = 3,
     transport_trust_revision: int = 2,
-    endpoint_id: str = "7b784024-62d8-4f3e-bb63-af9fe65fcc8e",
+    endpoint_id: str = ENDPOINT_A_ID,
     canonical_transport_locator: str = "https://pve.example.test:8006",
     canonicalization_contract_version: int = 1,
 ) -> SourceContext:
@@ -233,7 +242,7 @@ def resource(
         PresenceState.PRESENT,
         PresenceState.MISSING,
     }:
-        active_binding_id = f"binding-{resource_id}"
+        active_binding_id = _test_only_binding_id(resource_id)
     return ResourceSnapshot(
         resource_id=resource_id,
         inventory_source_id=SOURCE_ID,
@@ -281,7 +290,9 @@ def absent_resource(
         ResourceType.LXC,
         vmid,
         "Retained Container",
-        active_binding_id=None if terminal else f"binding-{resource_id}",
+        active_binding_id=(
+            None if terminal else _test_only_binding_id(resource_id)
+        ),
         locator_generation=generation,
         resource_continuity_revision=resource_continuity_revision,
         current_node_id=None,
@@ -1083,7 +1094,7 @@ async def test_ambiguity_preserves_resource_binding_generation_and_device(
     ("mutation", "match"),
     [
         (
-            {"active_binding_id": "replacement-binding"},
+            {"active_binding_id": _test_only_binding_id("replacement")},
             "active binding is immutable",
         ),
         ({"vmid": 102}, "resource locator is immutable"),
@@ -1098,7 +1109,7 @@ def test_same_resource_cannot_change_locator_binding_or_generation(
         ResourceType.LXC,
         101,
         "Cloudflared",
-        active_binding_id="binding-a",
+        active_binding_id=_test_only_binding_id("binding a"),
         locator_generation=4,
         resource_continuity_revision=8,
     )
@@ -1128,7 +1139,7 @@ def test_terminal_resource_cannot_be_reopened_as_nonterminal(
             ResourceType.LXC,
             101,
             "Reopened",
-            active_binding_id="binding-reopened",
+            active_binding_id=_test_only_binding_id("reopened"),
             locator_generation=4,
             resource_continuity_revision=10,
         )
@@ -1222,7 +1233,7 @@ def test_ambiguity_and_missing_keep_exact_binding_and_generation(
         ResourceType.LXC,
         101,
         "Cloudflared",
-        active_binding_id="binding-a",
+        active_binding_id=_test_only_binding_id("binding a"),
         locator_generation=4,
         resource_continuity_revision=8,
     )
@@ -1261,7 +1272,7 @@ def test_accepted_terminal_closure_keeps_incarnation_locator() -> None:
         ResourceType.LXC,
         101,
         "Cloudflared",
-        active_binding_id="binding-a",
+        active_binding_id=_test_only_binding_id("binding a"),
         locator_generation=4,
         resource_continuity_revision=8,
     )
@@ -1304,7 +1315,7 @@ def test_direct_replacement_closes_old_and_uses_separate_successor_resource() ->
         ResourceType.LXC,
         101,
         "Old Container",
-        active_binding_id="binding-old",
+        active_binding_id=_test_only_binding_id("old"),
         locator_generation=4,
         resource_continuity_revision=8,
     )
@@ -1321,7 +1332,7 @@ def test_direct_replacement_closes_old_and_uses_separate_successor_resource() ->
         ResourceType.LXC,
         101,
         "Successor",
-        active_binding_id="binding-successor",
+        active_binding_id=_test_only_binding_id("successor"),
         locator_generation=5,
     )
     incoming = snapshot(
@@ -1845,7 +1856,7 @@ def test_provider_kind_is_immutable_for_existing_source() -> None:
     ("incoming_context", "match"),
     [
         (
-            source_context(endpoint_id="different-endpoint"),
+            source_context(endpoint_id=ENDPOINT_B_ID),
             "endpoint_id is immutable",
         ),
         (
@@ -1886,12 +1897,12 @@ def test_unrevisioned_current_route_change_is_rejected(
 
 def test_active_endpoint_is_immutable_even_with_newer_source_config_revision() -> None:
     previous_context = source_context(
-        endpoint_id="endpoint-a",
+        endpoint_id=ENDPOINT_A_ID,
         canonical_transport_locator="https://pve-a.example.test:8006",
     )
     incoming_context = source_context(
         revision=4,
-        endpoint_id="endpoint-b",
+        endpoint_id=ENDPOINT_B_ID,
         canonical_transport_locator="https://pve-a.example.test:8006",
     )
     controlled_transition = source(
@@ -1915,12 +1926,12 @@ def test_active_endpoint_is_immutable_even_with_newer_source_config_revision() -
 
 def test_canonical_locator_cannot_change_within_same_contract_version() -> None:
     previous_context = source_context(
-        endpoint_id="endpoint-a",
+        endpoint_id=ENDPOINT_A_ID,
         canonical_transport_locator="https://pve-a.example.test:8006",
     )
     incoming_context = source_context(
         revision=4,
-        endpoint_id="endpoint-a",
+        endpoint_id=ENDPOINT_A_ID,
         canonical_transport_locator="https://pve-alias.example.test:8006",
     )
     controlled_transition = source(
@@ -1985,13 +1996,13 @@ def test_transport_trust_revision_may_rise_for_same_endpoint() -> None:
 def test_controlled_canonicalization_migration_may_change_locator() -> None:
     previous_context = source_context(
         revision=3,
-        endpoint_id="endpoint-a",
+        endpoint_id=ENDPOINT_A_ID,
         canonical_transport_locator="https://PVE.EXAMPLE.test:8006/",
         canonicalization_contract_version=1,
     )
     migrated_context = source_context(
         revision=4,
-        endpoint_id="endpoint-a",
+        endpoint_id=ENDPOINT_A_ID,
         canonical_transport_locator="https://pve.example.test:8006",
         canonicalization_contract_version=2,
     )

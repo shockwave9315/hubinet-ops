@@ -5,6 +5,7 @@ import importlib.util
 from pathlib import Path
 import sys
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -48,6 +49,18 @@ SUCCESSOR_ID = "c5321ec5-7259-421a-94ab-195a9c5e5d81"
 THIRD_RESOURCE_ID = "727f79b7-9d89-45e5-88da-21adfd94f08a"
 ENDPOINT_A_ID = "7b784024-62d8-4f3e-bb63-af9fe65fcc8e"
 ENDPOINT_B_ID = "9e2ef36f-f6db-4e23-93fe-85ad573682f5"
+
+
+def _test_only_binding_id(label: str) -> str:
+    """Return a stable UUID for one test binding without production semantics."""
+
+    return str(uuid5(NAMESPACE_URL, f"hubinet-ops test binding: {label}"))
+
+
+def _test_only_resource_id(label: str) -> str:
+    """Return a stable UUID for one test resource without production semantics."""
+
+    return str(uuid5(NAMESPACE_URL, f"hubinet-ops test resource: {label}"))
 
 
 def context(
@@ -151,7 +164,9 @@ def resource(
     return ResourceSnapshot(
         resource_id=resource_id,
         inventory_source_id=SOURCE_ID,
-        active_binding_id=None if terminal else f"binding-{resource_id}",
+        active_binding_id=(
+            None if terminal else _test_only_binding_id(resource_id)
+        ),
         resource_type=ResourceType.LXC,
         vmid=101,
         locator_generation=generation,
@@ -307,7 +322,9 @@ def retained_generation_resources(
     return tuple(
         replace(
             confirmed_removed_resource(),
-            resource_id=f"{source_id}-retained-generation-{generation}",
+            resource_id=_test_only_resource_id(
+                f"{source_id} retained generation {generation}"
+            ),
             inventory_source_id=source_id,
             locator_generation=generation,
             last_known_node_id=NODE_A if source_id == SOURCE_ID else None,
@@ -331,6 +348,99 @@ def nonterminal_security_resource(
         continuity_revision=continuity_revision,
         security_continuity=security_continuity,
     )
+
+
+INVALID_UUID_TEXT = (
+    "110",
+    "resource-110",
+    "not-a-uuid",
+    "",
+    " ",
+    BACKEND_ID.upper(),
+    BACKEND_ID.replace("-", ""),
+    f"{{{BACKEND_ID}}}",
+    f"urn:uuid:{BACKEND_ID}",
+    "00000000-0000-0000-0000-000000000000",
+)
+
+
+def construct_published_uuid_field(field_name: str, value: str) -> object:
+    """Construct one Phase 0 record with a selected UUID field value."""
+
+    if field_name == "backend_instance_id":
+        return BackendInformation(value, "Backend", "0.5.0", "0.5-draft")
+    if field_name == "endpoint_id":
+        return replace(context(), endpoint_id=value)
+    if field_name == "source.inventory_source_id":
+        return replace(source(), inventory_source_id=value)
+    if field_name == "node_id":
+        return replace(node(), node_id=value)
+    if field_name == "node.inventory_source_id":
+        return replace(node(), inventory_source_id=value)
+    if field_name == "resource_id":
+        return replace(resource(), resource_id=value)
+    if field_name == "resource.inventory_source_id":
+        return replace(resource(), inventory_source_id=value)
+    if field_name == "active_binding_id":
+        return replace(resource(), active_binding_id=value)
+    if field_name == "current_node_id":
+        return replace(resource(), current_node_id=value)
+    if field_name == "last_known_node_id":
+        return replace(missing_resource(), last_known_node_id=value)
+    if field_name == "successor_resource_id":
+        return not_current_resource(successor_resource_id=value)
+    raise AssertionError(f"uncovered test field: {field_name}")
+
+
+PUBLISHED_UUID_FIELDS = (
+    "backend_instance_id",
+    "endpoint_id",
+    "source.inventory_source_id",
+    "node_id",
+    "node.inventory_source_id",
+    "resource_id",
+    "resource.inventory_source_id",
+    "active_binding_id",
+    "current_node_id",
+    "last_known_node_id",
+    "successor_resource_id",
+)
+
+
+@pytest.mark.parametrize("field_name", PUBLISHED_UUID_FIELDS)
+@pytest.mark.parametrize("invalid_uuid", INVALID_UUID_TEXT)
+def test_all_published_uuid_identity_fields_reject_noncanonical_or_nil_text(
+    field_name: str, invalid_uuid: str
+) -> None:
+    with pytest.raises(ValueError):
+        construct_published_uuid_field(field_name, invalid_uuid)
+
+
+@pytest.mark.parametrize("field_name", PUBLISHED_UUID_FIELDS)
+def test_all_published_uuid_identity_fields_accept_canonical_non_nil_uuid(
+    field_name: str,
+) -> None:
+    construct_published_uuid_field(field_name, BACKEND_ID)
+
+
+def test_uuid_identity_fields_require_strings() -> None:
+    with pytest.raises(ValueError, match="backend_instance_id"):
+        BackendInformation(
+            None, "Backend", "0.5.0", "0.5-draft"  # type: ignore[arg-type]
+        )
+
+
+def test_resource_vmid_text_is_rejected_before_snapshot_registry_publication() -> None:
+    with pytest.raises(ValueError, match="resource_id"):
+        resource(resource_id="110")
+
+
+def test_uuid_text_aliases_are_not_normalized_into_registry_identity() -> None:
+    assert resource(resource_id=BACKEND_ID).resource_id == BACKEND_ID
+    with pytest.raises(ValueError, match="canonical"):
+        resource(resource_id=BACKEND_ID.upper())
+    with pytest.raises(ValueError, match="canonical"):
+        resource(resource_id=BACKEND_ID.replace("-", ""))
 
 
 def test_duplicate_confirmed_removed_and_current_locator_generation_is_rejected() -> None:
@@ -526,13 +636,13 @@ def test_revision_successor_accepts_same_resource_retaining_binding() -> None:
 def test_revision_successor_rejects_binding_reassignment_across_locators() -> None:
     previous_resource = replace(
         resource(generation=4),
-        active_binding_id="binding-observed-owner",
+        active_binding_id=_test_only_binding_id("observed owner"),
     )
     previous = snapshot(resources=(previous_resource,))
     closed = replace(confirmed_removed_resource(), locator_generation=4)
     different_locator = replace(
         resource(SUCCESSOR_ID, name="Different locator"),
-        active_binding_id="binding-observed-owner",
+        active_binding_id=_test_only_binding_id("observed owner"),
         vmid=202,
     )
     incoming = snapshot(
@@ -896,7 +1006,7 @@ def test_terminal_replacement_cannot_retain_active_binding() -> None:
     with pytest.raises(ValueError, match="must not have an active binding"):
         replace(
             not_current_resource(generation=4),
-            active_binding_id="still-active",
+            active_binding_id=_test_only_binding_id("still active"),
         )
 
 
@@ -2137,11 +2247,11 @@ def test_endpoint_identity_cannot_move_to_new_source_across_snapshots() -> None:
                 source(),
                 current_context=context(
                     revision=4,
-                    endpoint_id="replacement-endpoint-a",
+                    endpoint_id=ENDPOINT_B_ID,
                 ),
                 committed_context=context(
                     revision=4,
-                    endpoint_id="replacement-endpoint-a",
+                    endpoint_id=ENDPOINT_B_ID,
                 ),
             ),
             replace(

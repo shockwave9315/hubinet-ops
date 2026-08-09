@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Protocol
+from uuid import UUID
 
 
 class HubinetOpsApiError(RuntimeError):
@@ -157,6 +158,22 @@ def _require_text(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must not be empty")
 
 
+def _require_uuid_identity(value: str, field_name: str) -> None:
+    """Require one canonical non-NIL UUID identity/reference."""
+
+    _require_text(value, field_name)
+    try:
+        parsed = UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError(f"{field_name} must be a canonical UUID") from None
+    if parsed.int == 0:
+        raise ValueError(f"{field_name} must not be the NIL UUID")
+    if value != str(parsed):
+        raise ValueError(
+            f"{field_name} must use canonical lower-case hyphenated UUID text"
+        )
+
+
 def _require_positive(value: int, field_name: str) -> None:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{field_name} must be a positive integer")
@@ -177,7 +194,7 @@ class BackendInformation:
     api_version: str
 
     def __post_init__(self) -> None:
-        _require_text(self.backend_instance_id, "backend_instance_id")
+        _require_uuid_identity(self.backend_instance_id, "backend_instance_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,7 +209,7 @@ class SourceContext:
 
     def __post_init__(self) -> None:
         _require_positive(self.source_config_revision, "source_config_revision")
-        _require_text(self.endpoint_id, "endpoint_id")
+        _require_uuid_identity(self.endpoint_id, "endpoint_id")
         _require_text(
             self.canonical_transport_locator, "canonical_transport_locator"
         )
@@ -230,7 +247,7 @@ class InventorySourceSnapshot:
     facts: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
-        _require_text(self.inventory_source_id, "inventory_source_id")
+        _require_uuid_identity(self.inventory_source_id, "inventory_source_id")
         _require_text(self.name, "source name")
         _require_text(self.provider_kind, "provider_kind")
         if (
@@ -425,8 +442,8 @@ class NodeSnapshot:
     facts: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
-        _require_text(self.node_id, "node_id")
-        _require_text(self.inventory_source_id, "inventory_source_id")
+        _require_uuid_identity(self.node_id, "node_id")
+        _require_uuid_identity(self.inventory_source_id, "inventory_source_id")
         object.__setattr__(self, "facts", _immutable_mapping(self.facts))
 
 
@@ -466,8 +483,8 @@ class ResourceSnapshot:
     successor_resource_id: str | None = None
 
     def __post_init__(self) -> None:
-        _require_text(self.resource_id, "resource_id")
-        _require_text(self.inventory_source_id, "inventory_source_id")
+        _require_uuid_identity(self.resource_id, "resource_id")
+        _require_uuid_identity(self.inventory_source_id, "inventory_source_id")
         _require_positive(self.vmid, "vmid")
         _require_positive(self.locator_generation, "locator_generation")
         _require_positive(
@@ -478,7 +495,7 @@ class ResourceSnapshot:
         if nonterminal:
             if self.active_binding_id is None:
                 raise ValueError("nonterminal resource requires active_binding_id")
-            _require_text(self.active_binding_id, "active_binding_id")
+            _require_uuid_identity(self.active_binding_id, "active_binding_id")
         elif self.active_binding_id is not None:
             raise ValueError("terminal resource must not have an active binding")
 
@@ -584,17 +601,21 @@ class ResourceSnapshot:
             if self.node_availability is not NodeAvailability.NOT_APPLICABLE:
                 raise ValueError("non-present resource node availability is not_applicable")
             if self.last_known_node_id is not None:
-                _require_text(self.last_known_node_id, "last_known_node_id")
+                _require_uuid_identity(
+                    self.last_known_node_id, "last_known_node_id"
+                )
             return
 
         if self.current_node_id is None:
             if self.node_availability is not NodeAvailability.UNRESOLVED:
                 raise ValueError("unresolved current node relation must be explicit")
             if self.last_known_node_id is not None:
-                _require_text(self.last_known_node_id, "last_known_node_id")
+                _require_uuid_identity(
+                    self.last_known_node_id, "last_known_node_id"
+                )
             return
 
-        _require_text(self.current_node_id, "current_node_id")
+        _require_uuid_identity(self.current_node_id, "current_node_id")
         if self.last_known_node_id is not None:
             raise ValueError("resolved current node forbids last_known_node_id")
         if self.node_availability not in {
@@ -609,7 +630,9 @@ class ResourceSnapshot:
                 raise ValueError("not_current resource requires replacement provenance")
             if self.successor_resource_id is None:
                 raise ValueError("not_current resource requires successor_resource_id")
-            _require_text(self.successor_resource_id, "successor_resource_id")
+            _require_uuid_identity(
+                self.successor_resource_id, "successor_resource_id"
+            )
         elif self.presence is PresenceState.CONFIRMED_REMOVED:
             if self.termination_reason != "confirmed_removed":
                 raise ValueError(
