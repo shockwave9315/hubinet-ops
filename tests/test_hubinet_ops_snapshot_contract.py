@@ -300,6 +300,39 @@ def initial_source() -> InventorySourceSnapshot:
     )
 
 
+def retained_generation_resources(
+    *generations: int,
+    source_id: str = SOURCE_ID,
+) -> tuple[ResourceSnapshot, ...]:
+    return tuple(
+        replace(
+            confirmed_removed_resource(),
+            resource_id=f"{source_id}-retained-generation-{generation}",
+            inventory_source_id=source_id,
+            locator_generation=generation,
+            last_known_node_id=NODE_A if source_id == SOURCE_ID else None,
+        )
+        for generation in generations
+    )
+
+
+def nonterminal_security_resource(
+    security_continuity: SecurityContinuity,
+    *,
+    continuity_revision: int,
+) -> ResourceSnapshot:
+    if security_continuity is SecurityContinuity.REVOKED:
+        return replace(
+            missing_resource(),
+            resource_continuity_revision=continuity_revision,
+            security_continuity=security_continuity,
+        )
+    return resource(
+        continuity_revision=continuity_revision,
+        security_continuity=security_continuity,
+    )
+
+
 def test_duplicate_confirmed_removed_and_current_locator_generation_is_rejected() -> None:
     old = confirmed_removed_resource()
     current = resource(SUCCESSOR_ID, generation=1, name="Reused slot")
@@ -353,6 +386,73 @@ def test_same_locator_generation_is_legal_under_different_sources() -> None:
         resources=(source_a_resource, source_b_resource),
     )
     assert len(view.current_resources_by_locator) == 2
+
+
+@pytest.mark.parametrize(
+    "generations",
+    [(4,), (4, 5), (4, 5, 6), (1_000_000_000, 1_000_000_001)],
+    ids=["single", "pair", "three", "large-values"],
+)
+def test_retained_locator_generation_history_is_consecutive(
+    generations: tuple[int, ...],
+) -> None:
+    view = snapshot(resources=retained_generation_resources(*generations))
+    assert tuple(item.locator_generation for item in view.resources) == generations
+
+
+@pytest.mark.parametrize(
+    "generations",
+    [(4, 6), (4, 5, 7), (1_000_000_000, 2_000_000_000)],
+    ids=["single-gap", "later-gap", "large-gap"],
+)
+def test_retained_locator_generation_history_rejects_internal_gaps(
+    generations: tuple[int, ...],
+) -> None:
+    with pytest.raises(ValueError, match="generations must be consecutive"):
+        snapshot(resources=retained_generation_resources(*generations))
+
+
+def test_gapped_terminal_history_is_rejected_before_valid_current_generation() -> None:
+    retained = retained_generation_resources(4, 6)
+    current = resource(SUCCESSOR_ID, generation=7, name="Current after gap")
+    with pytest.raises(ValueError, match="generations must be consecutive"):
+        snapshot(resources=(*retained, current))
+
+
+def test_new_resource_cannot_backfill_older_locator_history() -> None:
+    previous_current = resource(generation=4)
+    previous = snapshot(resources=(previous_current,))
+    backfilled = replace(
+        confirmed_removed_resource(),
+        resource_id=SUCCESSOR_ID,
+        locator_generation=3,
+    )
+    incoming = snapshot(
+        resources=(backfilled, previous_current),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="follow all previously retained generations"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_consecutive_terminal_history_accepts_exact_current_generation() -> None:
+    retained = retained_generation_resources(4, 5)
+    current = resource(SUCCESSOR_ID, generation=6, name="Current occupant")
+    snapshot(resources=(*retained, current))
+
+
+def test_locator_generation_consecutiveness_is_independent_between_sources() -> None:
+    source_a = retained_generation_resources(4, 5)
+    source_b = retained_generation_resources(
+        4,
+        5,
+        source_id=SOURCE_B_ID,
+    )
+    snapshot(
+        sources=(source(), source(source_id=SOURCE_B_ID, name="Second")),
+        resources=(*source_a, *source_b),
+    )
 
 
 def test_ambiguity_retains_exact_binding_and_generation_across_revisions() -> None:
@@ -549,6 +649,90 @@ def test_retained_terminal_resource_cannot_downgrade_revoked_security(
     )
     with pytest.raises(ValueError, match="cannot erase known security history"):
         incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    ("previous_security", "incoming_security"),
+    [
+        (SecurityContinuity.UNVERIFIED, SecurityContinuity.UNVERIFIED),
+        (SecurityContinuity.UNVERIFIED, SecurityContinuity.TRUSTED),
+        (SecurityContinuity.UNVERIFIED, SecurityContinuity.REVOKED),
+        (SecurityContinuity.TRUSTED, SecurityContinuity.TRUSTED),
+        (SecurityContinuity.TRUSTED, SecurityContinuity.REVOKED),
+        (SecurityContinuity.REVOKED, SecurityContinuity.REVOKED),
+        (SecurityContinuity.REVOKED, SecurityContinuity.TRUSTED),
+    ],
+    ids=[
+        "unverified-unverified",
+        "unverified-trusted",
+        "unverified-revoked",
+        "trusted-trusted",
+        "trusted-revoked",
+        "revoked-revoked",
+        "revoked-trusted",
+    ],
+)
+def test_known_security_lower_bound_accepts_canonical_nonterminal_transitions(
+    previous_security: SecurityContinuity,
+    incoming_security: SecurityContinuity,
+) -> None:
+    previous_resource = nonterminal_security_resource(
+        previous_security,
+        continuity_revision=2,
+    )
+    security_changed = incoming_security is not previous_security
+    incoming_resource = nonterminal_security_resource(
+        incoming_security,
+        continuity_revision=3 if security_changed else 2,
+    )
+    incoming = snapshot(
+        resources=(incoming_resource,),
+        inventory_revision=11 if security_changed else 10,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(
+        snapshot(resources=(previous_resource,))
+    )
+
+
+@pytest.mark.parametrize(
+    ("previous_security", "incoming_resource"),
+    [
+        (
+            SecurityContinuity.TRUSTED,
+            resource(
+                continuity_revision=3,
+                security_continuity=SecurityContinuity.UNVERIFIED,
+            ),
+        ),
+        (
+            SecurityContinuity.REVOKED,
+            replace(
+                missing_resource(),
+                resource_continuity_revision=3,
+                security_continuity=SecurityContinuity.UNVERIFIED,
+            ),
+        ),
+    ],
+    ids=["trusted-present-unverified", "revoked-missing-unverified"],
+)
+def test_known_security_lower_bound_rejects_nonterminal_erasure(
+    previous_security: SecurityContinuity,
+    incoming_resource: ResourceSnapshot,
+) -> None:
+    previous_resource = nonterminal_security_resource(
+        previous_security,
+        continuity_revision=2,
+    )
+    incoming = snapshot(
+        resources=(incoming_resource,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="cannot erase known security history"):
+        incoming.validate_revision_successor(
+            snapshot(resources=(previous_resource,))
+        )
 
 
 def test_revision_gap_may_skip_handoff_and_observe_trusted_successor() -> None:
@@ -1295,6 +1479,152 @@ def test_completion_provenance_only_transition_preserves_inventory_revision() ->
     assert incoming.inventory_projection == previous.inventory_projection
 
 
+def source_with_run_lattice(
+    *,
+    issued: int,
+    completed: int | None,
+    health: int | None,
+    committed: int | None,
+) -> InventorySourceSnapshot:
+    changes: dict[str, Any] = {
+        "last_issued_run_sequence": issued,
+        "latest_completed_run_sequence": completed,
+        "latest_completed_outcome": (
+            None
+            if completed is None
+            else "success" if completed == committed else "audit_or_failure"
+        ),
+        "last_health_run_sequence": health,
+        "last_run_health_outcome": (
+            None
+            if health is None
+            else "success" if health == committed else "source_unavailable"
+        ),
+        "last_committed_run_sequence": committed,
+    }
+    if committed is None:
+        changes.update(
+            last_successful_observed_at=None,
+            freshness_reference_at=None,
+            freshness_valid_until=None,
+            committed_context=None,
+        )
+    if health is None:
+        changes.update(
+            health=SourceHealth.NOT_YET_OBSERVED,
+            freshness=SourceFreshness.NOT_YET_OBSERVED,
+            health_origin=SourceHealthOrigin.INITIAL,
+            health_reason="",
+        )
+    elif health == committed:
+        changes.update(
+            health=SourceHealth.HEALTHY,
+            freshness=SourceFreshness.FRESH,
+            health_origin=SourceHealthOrigin.DISCOVERY_RUN,
+            health_reason="authoritative_inventory_commit",
+        )
+    else:
+        changes.update(
+            health=SourceHealth.SOURCE_UNAVAILABLE,
+            freshness=SourceFreshness.STALE,
+            health_origin=SourceHealthOrigin.DISCOVERY_RUN,
+            health_reason="applicable_run_failed",
+        )
+    return replace(source(), **changes)
+
+
+@pytest.mark.parametrize(
+    ("issued", "completed", "health", "committed"),
+    [
+        (5, 5, 5, 5),
+        (8, 7, 6, 5),
+        (5, 5, None, None),
+        (5, 5, 5, None),
+    ],
+    ids=[
+        "all-equal",
+        "ordered-gaps",
+        "completion-only",
+        "health-without-commit",
+    ],
+)
+def test_source_run_provenance_accepts_partial_order(
+    issued: int,
+    completed: int | None,
+    health: int | None,
+    committed: int | None,
+) -> None:
+    run_source = source_with_run_lattice(
+        issued=issued,
+        completed=completed,
+        health=health,
+        committed=committed,
+    )
+    assert run_source.last_issued_run_sequence == issued
+
+
+@pytest.mark.parametrize(
+    ("issued", "completed", "health", "committed"),
+    [
+        (5, None, 5, None),
+        (6, 5, 6, None),
+        (6, 6, 5, 6),
+        (5, 6, None, None),
+        (5, 6, 6, None),
+    ],
+    ids=[
+        "health-without-completion",
+        "health-after-completion",
+        "commit-after-health",
+        "completion-after-issued",
+        "health-after-issued",
+    ],
+)
+def test_source_run_provenance_rejects_partial_order_violation(
+    issued: int,
+    completed: int | None,
+    health: int | None,
+    committed: int | None,
+) -> None:
+    with pytest.raises(ValueError, match="source run provenance must satisfy"):
+        source_with_run_lattice(
+            issued=issued,
+            completed=completed,
+            health=health,
+            committed=committed,
+        )
+
+
+def test_initial_source_accepts_issued_and_completion_only_provenance() -> None:
+    issued_only = replace(initial_source(), last_issued_run_sequence=3)
+    completion_only = source_with_run_lattice(
+        issued=5,
+        completed=5,
+        health=None,
+        committed=None,
+    )
+    assert issued_only.last_health_run_sequence is None
+    assert completion_only.latest_completed_run_sequence == 5
+    assert completion_only.last_health_run_sequence is None
+
+
+def test_initial_source_rejects_applied_run_health_provenance() -> None:
+    applied = source_with_run_lattice(
+        issued=5,
+        completed=5,
+        health=5,
+        committed=None,
+    )
+    with pytest.raises(ValueError, match="cannot have applied run"):
+        replace(
+            applied,
+            health=SourceHealth.NOT_YET_OBSERVED,
+            freshness=SourceFreshness.NOT_YET_OBSERVED,
+            health_origin=SourceHealthOrigin.INITIAL,
+            health_reason="",
+        )
+
+
 def test_time_expiry_rejects_changed_current_context() -> None:
     with pytest.raises(ValueError, match="exact committed run and context"):
         time_expiry_source(current_context=context(revision=4))
@@ -1497,6 +1827,209 @@ def controlled_source(
     )
 
 
+def test_current_and_committed_context_may_match_exactly() -> None:
+    current = source()
+    assert current.current_context == current.committed_context
+
+
+@pytest.mark.parametrize(
+    ("current", "committed"),
+    [
+        (context(revision=4), context(revision=3)),
+        (context(trust_revision=3), context(trust_revision=2)),
+        (
+            context(
+                revision=4,
+                locator="https://canonical-v2.example.test:8006",
+                canonicalization_version=2,
+            ),
+            context(revision=3, canonicalization_version=1),
+        ),
+    ],
+    ids=["newer-config", "newer-trust", "canonicalization-migration"],
+)
+def test_current_context_accepts_controlled_progression_from_committed_context(
+    current: SourceContext,
+    committed: SourceContext,
+) -> None:
+    transitioned = controlled_source(
+        source_id=SOURCE_ID,
+        current=current,
+        committed=committed,
+    )
+    assert transitioned.current_context.source_config_revision >= (
+        transitioned.committed_context.source_config_revision
+    )
+
+
+@pytest.mark.parametrize(
+    ("current", "committed", "match"),
+    [
+        (
+            context(revision=3),
+            context(revision=4),
+            "source_config_revision cannot predate",
+        ),
+        (
+            context(trust_revision=3),
+            context(trust_revision=4),
+            "transport_trust_revision cannot predate",
+        ),
+        (
+            context(endpoint_id=ENDPOINT_A_ID),
+            context(endpoint_id=ENDPOINT_B_ID),
+            "same endpoint",
+        ),
+        (
+            context(locator="https://current.example.test:8006"),
+            context(locator="https://committed.example.test:8006"),
+            "cannot reinterpret",
+        ),
+        (
+            context(revision=4, canonicalization_version=1),
+            context(revision=3, canonicalization_version=2),
+            "canonicalization contract cannot predate",
+        ),
+        (
+            context(
+                revision=3,
+                locator="https://canonical-v2.example.test:8006",
+                canonicalization_version=2,
+            ),
+            context(revision=3, canonicalization_version=1),
+            "requires newer current source configuration",
+        ),
+    ],
+    ids=[
+        "config-regression",
+        "trust-regression",
+        "endpoint-mismatch",
+        "same-version-locator-mismatch",
+        "canonicalization-regression",
+        "migration-without-config-progression",
+    ],
+)
+def test_current_context_rejects_incoherent_committed_provenance(
+    current: SourceContext,
+    committed: SourceContext,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        controlled_source(
+            source_id=SOURCE_ID,
+            current=current,
+            committed=committed,
+        )
+
+
+def stale_source_after_successful_commit(
+    *,
+    current: SourceContext,
+    committed: SourceContext,
+) -> InventorySourceSnapshot:
+    return replace(
+        successful_commit_source(sequence=6),
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="source_context_changed_after_commit",
+        current_context=current,
+        committed_context=committed,
+    )
+
+
+@pytest.mark.parametrize(
+    ("current", "committed", "match"),
+    [
+        (
+            context(revision=4),
+            context(revision=2),
+            "committed source_config_revision must not regress",
+        ),
+        (
+            context(revision=4, trust_revision=3),
+            context(revision=3, trust_revision=1),
+            "committed transport_trust_revision must not regress",
+        ),
+        (
+            context(
+                revision=4,
+                locator="https://canonical-v2.example.test:8006",
+                canonicalization_version=2,
+            ),
+            context(
+                revision=3,
+                locator="https://rewritten-v1.example.test:8006",
+                canonicalization_version=1,
+            ),
+            "committed canonical locator is immutable",
+        ),
+        (
+            context(
+                revision=4,
+                locator="https://canonical-v2.example.test:8006",
+                canonicalization_version=2,
+            ),
+            context(
+                revision=3,
+                locator="https://canonical-v2.example.test:8006",
+                canonicalization_version=2,
+            ),
+            "committed canonicalization migration requires a newer",
+        ),
+    ],
+    ids=[
+        "committed-config-regression",
+        "committed-trust-regression",
+        "committed-locator-rewrite",
+        "committed-migration-without-config-progression",
+    ],
+)
+def test_successor_rejects_regressing_committed_context_history(
+    current: SourceContext,
+    committed: SourceContext,
+    match: str,
+) -> None:
+    incoming = snapshot(
+        sources=(
+            stale_source_after_successful_commit(
+                current=current,
+                committed=committed,
+            ),
+        ),
+        nodes=(),
+        resources=(),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match=match):
+        incoming.validate_revision_successor(snapshot(nodes=(), resources=()))
+
+
+def test_successor_accepts_progressing_committed_canonicalization_history() -> None:
+    migrated = stale_source_after_successful_commit(
+        current=context(
+            revision=5,
+            trust_revision=3,
+            locator="https://canonical-v2.example.test:8006",
+            canonicalization_version=2,
+        ),
+        committed=context(
+            revision=4,
+            trust_revision=3,
+            locator="https://canonical-v2.example.test:8006",
+            canonicalization_version=2,
+        ),
+    )
+    snapshot(
+        sources=(migrated,),
+        nodes=(),
+        resources=(),
+        inventory_revision=11,
+        published_state_revision=21,
+    ).validate_revision_successor(snapshot(nodes=(), resources=()))
+
+
 def test_snapshot_rejects_shared_current_endpoint_identity() -> None:
     shared = context(endpoint_id=ENDPOINT_A_ID)
     second = replace(
@@ -1512,7 +2045,7 @@ def test_snapshot_rejects_committed_to_current_endpoint_sharing() -> None:
     shared = context(endpoint_id=ENDPOINT_A_ID)
     first = controlled_source(
         source_id=SOURCE_ID,
-        current=context(revision=4, endpoint_id="endpoint-a-current"),
+        current=shared,
         committed=shared,
     )
     second = replace(
@@ -1528,7 +2061,7 @@ def test_snapshot_rejects_current_to_committed_endpoint_sharing() -> None:
     shared = context(endpoint_id=ENDPOINT_A_ID)
     second = controlled_source(
         source_id=SOURCE_B_ID,
-        current=context(revision=4, endpoint_id=ENDPOINT_B_ID),
+        current=shared,
         committed=shared,
     )
     with pytest.raises(ValueError, match="shared across inventory sources"):

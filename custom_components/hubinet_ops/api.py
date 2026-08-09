@@ -254,16 +254,7 @@ class InventorySourceSnapshot:
             self.last_run_health_outcome,
             "last health run",
         )
-        sequences = (
-            self.latest_completed_run_sequence,
-            self.last_health_run_sequence,
-            self.last_committed_run_sequence,
-        )
-        if any(
-            sequence is not None and sequence > self.last_issued_run_sequence
-            for sequence in sequences
-        ):
-            raise ValueError("source run sequence exceeds last issued sequence")
+        self._validate_run_sequence_lattice()
 
         successful_fields = (
             self.last_successful_observed_at,
@@ -291,13 +282,17 @@ class InventorySourceSnapshot:
             if value is not None:
                 _require_text(value, field_name)
 
+        self._validate_context_provenance()
+
         if self.health_origin is SourceHealthOrigin.INITIAL:
             if self.health is not SourceHealth.NOT_YET_OBSERVED:
                 raise ValueError("initial source health must be not_yet_observed")
             if self.freshness is not SourceFreshness.NOT_YET_OBSERVED:
                 raise ValueError("initial source freshness must be not_yet_observed")
-            if has_successful_commit:
-                raise ValueError("initial source health cannot have committed provenance")
+            if self.last_health_run_sequence is not None or has_successful_commit:
+                raise ValueError(
+                    "initial source health cannot have applied run or committed provenance"
+                )
         else:
             _require_text(self.health_reason, "health_reason")
             if self.freshness is SourceFreshness.NOT_YET_OBSERVED:
@@ -337,18 +332,6 @@ class InventorySourceSnapshot:
             if self.freshness is not SourceFreshness.STALE:
                 raise ValueError("unhealthy source must be stale")
 
-        if has_successful_commit and (
-            self.last_health_run_sequence is None
-            or self.last_health_run_sequence < self.last_committed_run_sequence
-        ):
-            raise ValueError("committed inventory requires applied run-health provenance")
-        if (
-            self.last_health_run_sequence is not None
-            and self.latest_completed_run_sequence is not None
-            and self.latest_completed_run_sequence < self.last_health_run_sequence
-        ):
-            raise ValueError("applied health run must be included in completion provenance")
-
         object.__setattr__(self, "facts", _immutable_mapping(self.facts))
 
     @staticmethod
@@ -359,6 +342,66 @@ class InventorySourceSnapshot:
             raise ValueError(f"{label} sequence and outcome must be published together")
         if outcome is not None:
             _require_text(outcome, f"{label} outcome")
+
+    def _validate_run_sequence_lattice(self) -> None:
+        sequence_lattice = (
+            ("last_committed_run_sequence", self.last_committed_run_sequence),
+            ("last_health_run_sequence", self.last_health_run_sequence),
+            ("latest_completed_run_sequence", self.latest_completed_run_sequence),
+            ("last_issued_run_sequence", self.last_issued_run_sequence),
+        )
+        for (lower_name, lower), (upper_name, upper) in zip(
+            sequence_lattice, sequence_lattice[1:]
+        ):
+            if lower is not None and (upper is None or lower > upper):
+                raise ValueError(
+                    "source run provenance must satisfy "
+                    "last_committed_run_sequence <= last_health_run_sequence "
+                    "<= latest_completed_run_sequence <= last_issued_run_sequence "
+                    f"({lower_name} exceeds {upper_name})"
+                )
+
+    def _validate_context_provenance(self) -> None:
+        committed = self.committed_context
+        if committed is None:
+            return
+
+        current = self.current_context
+        if current.source_config_revision < committed.source_config_revision:
+            raise ValueError(
+                "current source_config_revision cannot predate committed context"
+            )
+        if current.transport_trust_revision < committed.transport_trust_revision:
+            raise ValueError(
+                "current transport_trust_revision cannot predate committed context"
+            )
+        if current.endpoint_id != committed.endpoint_id:
+            raise ValueError(
+                "current and committed context must reference the same endpoint"
+            )
+        if (
+            current.canonicalization_contract_version
+            < committed.canonicalization_contract_version
+        ):
+            raise ValueError(
+                "current canonicalization contract cannot predate committed context"
+            )
+        if (
+            current.canonicalization_contract_version
+            == committed.canonicalization_contract_version
+        ):
+            if (
+                current.canonical_transport_locator
+                != committed.canonical_transport_locator
+            ):
+                raise ValueError(
+                    "one canonicalization contract version cannot reinterpret "
+                    "the committed transport locator"
+                )
+        elif current.source_config_revision <= committed.source_config_revision:
+            raise ValueError(
+                "canonicalization migration requires newer current source configuration"
+            )
 
     @property
     def current_facts_available(self) -> bool:
@@ -702,6 +745,16 @@ class HubinetOpsSnapshot:
                 raise ValueError(
                     "current locator generation must follow retained terminal history"
                 )
+            generations = sorted(
+                resource.locator_generation for resource in locator_resources
+            )
+            for previous_generation, generation in zip(
+                generations, generations[1:]
+            ):
+                if generation != previous_generation + 1:
+                    raise ValueError(
+                        "retained locator generations must be consecutive"
+                    )
 
         resources_by_id = {
             resource.resource_id: resource for resource in self.resources
@@ -876,6 +929,26 @@ class HubinetOpsSnapshot:
         if missing_resource_ids:
             raise ValueError("published snapshot cannot omit a retained resource")
 
+        previous_max_generation_by_locator: dict[tuple[str, int], int] = {}
+        for old_resource in previous.resources:
+            locator = (old_resource.inventory_source_id, old_resource.vmid)
+            previous_max_generation_by_locator[locator] = max(
+                previous_max_generation_by_locator.get(locator, 0),
+                old_resource.locator_generation,
+            )
+        for resource in self.resources:
+            if resource.resource_id in previous_resources_by_id:
+                continue
+            locator = (resource.inventory_source_id, resource.vmid)
+            previous_max_generation = previous_max_generation_by_locator.get(locator)
+            if (
+                previous_max_generation is not None
+                and resource.locator_generation <= previous_max_generation
+            ):
+                raise ValueError(
+                    "new locator history must follow all previously retained generations"
+                )
+
         if (
             self.inventory_projection != previous.inventory_projection
             and self.inventory_revision <= previous.inventory_revision
@@ -954,6 +1027,51 @@ class HubinetOpsSnapshot:
                 ):
                     raise ValueError(
                         "canonicalization_contract_version must increase during migration"
+                    )
+
+            old_committed = old_source.committed_context
+            committed = source.committed_context
+            if old_committed is not None and committed is not None:
+                if (
+                    committed.source_config_revision
+                    < old_committed.source_config_revision
+                ):
+                    raise ValueError(
+                        "committed source_config_revision must not regress"
+                    )
+                if (
+                    committed.transport_trust_revision
+                    < old_committed.transport_trust_revision
+                ):
+                    raise ValueError(
+                        "committed transport_trust_revision must not regress"
+                    )
+                if (
+                    committed.canonicalization_contract_version
+                    < old_committed.canonicalization_contract_version
+                ):
+                    raise ValueError(
+                        "committed canonicalization contract must not regress"
+                    )
+                if (
+                    committed.canonicalization_contract_version
+                    == old_committed.canonicalization_contract_version
+                ):
+                    if (
+                        committed.canonical_transport_locator
+                        != old_committed.canonical_transport_locator
+                    ):
+                        raise ValueError(
+                            "committed canonical locator is immutable within a "
+                            "canonicalization contract version"
+                        )
+                elif (
+                    committed.source_config_revision
+                    <= old_committed.source_config_revision
+                ):
+                    raise ValueError(
+                        "committed canonicalization migration requires a newer "
+                        "source_config_revision"
                     )
             if (
                 source.last_issued_run_sequence
@@ -1062,14 +1180,11 @@ class HubinetOpsSnapshot:
                 PresenceState.NOT_CURRENT,
             }
             if (
-                terminal
-                and old.security_continuity
+                old.security_continuity
                 in {SecurityContinuity.TRUSTED, SecurityContinuity.REVOKED}
-                and resource.security_continuity is not SecurityContinuity.REVOKED
+                and resource.security_continuity is SecurityContinuity.UNVERIFIED
             ):
-                raise ValueError(
-                    "terminal resource cannot erase known security history"
-                )
+                raise ValueError("resource cannot erase known security history")
             if old_terminal:
                 if (
                     not terminal

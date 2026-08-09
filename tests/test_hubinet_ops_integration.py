@@ -1539,8 +1539,15 @@ def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> Non
     [
         (
             source(
+                health=SourceHealth.DEGRADED,
+                freshness=SourceFreshness.STALE,
+                health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+                health_reason="completion_provenance_erased",
                 latest_completed_run_sequence=None,
                 latest_completed_outcome=None,
+                last_health_run_sequence=None,
+                last_run_health_outcome=None,
+                last_committed_run_sequence=None,
             ),
             "latest_completed_run_sequence cannot be cleared",
         ),
@@ -1862,7 +1869,7 @@ def test_unrevisioned_current_route_change_is_rejected(
         health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
         health_reason="active_route_changed",
         current_context=incoming_context,
-        committed_context=committed_context,
+        committed_context=incoming_context,
     )
     incoming = snapshot(
         (),
@@ -1891,7 +1898,7 @@ def test_active_endpoint_is_immutable_even_with_newer_source_config_revision() -
         health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
         health_reason="active_endpoint_replacement_attempt",
         current_context=incoming_context,
-        committed_context=previous_context,
+        committed_context=incoming_context,
     )
     incoming = snapshot(
         (),
@@ -1920,7 +1927,7 @@ def test_canonical_locator_cannot_change_within_same_contract_version() -> None:
         health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
         health_reason="canonical_locator_rewrite_attempt",
         current_context=incoming_context,
-        committed_context=previous_context,
+        committed_context=incoming_context,
     )
     incoming = snapshot(
         (),
