@@ -60,6 +60,8 @@ from custom_components.hubinet_ops.coordinator import (
     source_registry_key,
 )
 from custom_components.hubinet_ops.diagnostics import (
+    _normalize_diagnostic_key,
+    _redact_repository_secrets,
     async_get_config_entry_diagnostics,
 )
 
@@ -2090,6 +2092,107 @@ def test_snapshot_mappings_are_deeply_immutable() -> None:
         replace(frozen, state={"payload": bytearray(b"mutable")})
 
 
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("bearerToken", "bearer_token"),
+        ("BearerToken", "bearer_token"),
+        ("authorizationHeader", "authorization_header"),
+        ("privateKey", "private_key"),
+        ("sshPrivateKey", "ssh_private_key"),
+        ("SSHPrivateKey", "ssh_private_key"),
+        ("webhookId", "webhook_id"),
+        ("apiKey", "api_key"),
+        ("APIKey", "api_key"),
+        ("tokenValue", "token_value"),
+        ("bearer-token", "bearer_token"),
+        ("bearer.token", "bearer_token"),
+        ("bearer token", "bearer_token"),
+        ("BEARER_TOKEN", "bearer_token"),
+    ],
+)
+def test_diagnostics_key_normalization_recognizes_common_word_boundaries(
+    key: str, expected: str
+) -> None:
+    assert _normalize_diagnostic_key(key) == expected
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "bearerToken",
+        "BearerToken",
+        "authorizationHeader",
+        "privateKey",
+        "sshPrivateKey",
+        "SSHPrivateKey",
+        "webhookId",
+        "apiKey",
+        "APIKey",
+        "tokenValue",
+        "clientSecret",
+        "accessToken",
+        "refreshToken",
+        "apiToken",
+        "baseUrl",
+        "canonicalTransportLocator",
+        "webhookUrl",
+        "bearer_token",
+        "bearer-token",
+        "bearer.token",
+    ],
+)
+def test_diagnostics_redact_secret_key_spelling_variants(key: str) -> None:
+    assert _redact_repository_secrets({key: "secret-value"}) == {key: REDACTED}
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "monkey",
+        "keyboard_layout",
+        "hockey_score",
+        "tokenizer_version",
+        "private_network_status",
+        "webhook_enabled",
+        "authorization_mode",
+        "documentationUrl",
+        "normalValue",
+    ],
+)
+def test_diagnostics_do_not_over_redact_benign_keys(key: str) -> None:
+    assert _redact_repository_secrets({key: "visible-value"}) == {
+        key: "visible-value"
+    }
+
+
+def test_diagnostics_redact_camel_case_secrets_recursively() -> None:
+    original = {
+        "outer": {
+            "authorizationHeader": "authorization-value",
+            "nested": [
+                {"SSHPrivateKey": "private-key-value"},
+                {"normalValue": "visible-value"},
+            ],
+            "tuple": ({"apiKey": "api-key-value"},),
+        }
+    }
+
+    redacted = _redact_repository_secrets(original)
+
+    assert redacted == {
+        "outer": {
+            "authorizationHeader": REDACTED,
+            "nested": [
+                {"SSHPrivateKey": REDACTED},
+                {"normalValue": "visible-value"},
+            ],
+            "tuple": [{"apiKey": REDACTED}],
+        }
+    }
+    assert original["outer"]["authorizationHeader"] == "authorization-value"
+
+
 @pytest.mark.asyncio
 async def test_diagnostics_redact_secrets_across_new_source_shape(
     hass: HomeAssistant,
@@ -2119,15 +2222,31 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
         "private_scan_url": "https://private.example.test/api/v1/scan",
         "private_service_url": "https://private.example.test/api/v1/service",
         "canonical_locator": "https://pve.example.test:8006",
+        "camel_bearer_token": "camel-bearer-token-value",
+        "camel_authorization_header": "camel-authorization-header-value",
+        "camel_private_key": "camel-private-key-value",
+        "camel_ssh_private_key": "camel-ssh-private-key-value",
+        "camel_webhook_id": "camel-webhook-id-value",
+        "camel_api_key": "camel-api-key-value",
+        "camel_token_value": "camel-token-value-value",
+        "camel_client_secret": "camel-client-secret-value",
+        "camel_access_token": "camel-access-token-value",
+        "camel_refresh_token": "camel-refresh-token-value",
     }
     sensitive_source = source(
         facts={
             "authorization": secrets["authorization"],
+            "bearerToken": secrets["camel_bearer_token"],
+            "authorizationHeader": secrets["camel_authorization_header"],
             "endpoint": {
                 "api_key": secrets["api_key"],
                 "documentation_url": "https://docs.example.test/source",
             },
             "service": {"client_secret": secrets["client_secret"]},
+            "nested": [
+                {"SSHPrivateKey": secrets["camel_ssh_private_key"]},
+                {"normalValue": "visible-source-value"},
+            ],
             "hubinet_ops_service_url": secrets["private_service_url"],
         }
     )
@@ -2138,9 +2257,11 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
             "events": (
                 {
                     "webhook_id": secrets["webhook_id"],
+                    "webhookId": secrets["camel_webhook_id"],
                     "display": "visible-event",
                 },
             ),
+            "privateKey": secrets["camel_private_key"],
             "cpu": 0.25,
         }
     )
@@ -2152,6 +2273,8 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
         retained_policy={
             "authorization": secrets["authorization"],
             "client_secret": secrets["client_secret"],
+            "clientSecret": secrets["camel_client_secret"],
+            "accessToken": secrets["camel_access_token"],
             "backend_token": secrets["backend_token"],
             "repository_secrets": {
                 "update_token": secrets["update_token"],
@@ -2167,6 +2290,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
             },
             "managed": False,
         },
+        effective_policy={"refreshToken": secrets["camel_refresh_token"]},
         state={
             "Authorization": secrets["Authorization"],
             "authorization_header": secrets["authorization_header"],
@@ -2176,6 +2300,8 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
             },
             "bearer_token": secrets["bearer_token"],
             "api_key": secrets["api_key"],
+            "APIKey": secrets["camel_api_key"],
+            "tokenValue": secrets["camel_token_value"],
             "ssh_key": secrets["ssh_key"],
             "webhook_url": secrets["webhook_url"],
             "events": [
@@ -2219,14 +2345,23 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert source_data["current_context"]["canonical_transport_locator"] == REDACTED
     assert source_data["committed_context"]["canonical_transport_locator"] == REDACTED
     assert source_data["facts"]["authorization"] == REDACTED
+    assert source_data["facts"]["bearerToken"] == REDACTED
+    assert source_data["facts"]["authorizationHeader"] == REDACTED
     assert source_data["facts"]["endpoint"]["api_key"] == REDACTED
     assert source_data["facts"]["service"]["client_secret"] == REDACTED
     assert source_data["facts"]["hubinet_ops_service_url"] == REDACTED
+    assert source_data["facts"]["nested"][0]["SSHPrivateKey"] == REDACTED
+    assert (
+        source_data["facts"]["nested"][1]["normalValue"]
+        == "visible-source-value"
+    )
     assert source_data["facts"]["endpoint"]["documentation_url"].startswith("https://docs")
     node_data = diagnostics["snapshot"]["nodes"][0]
     assert node_data["facts"]["MQTT_PASSWORD"] == REDACTED
     assert node_data["facts"]["nested"]["private_key"] == REDACTED
     assert node_data["facts"]["events"][0]["webhook_id"] == REDACTED
+    assert node_data["facts"]["events"][0]["webhookId"] == REDACTED
+    assert node_data["facts"]["privateKey"] == REDACTED
     assert node_data["facts"]["nested"]["memory"] == 4096
     assert node_data["facts"]["events"][0]["display"] == "visible-event"
     assert node_data["facts"]["cpu"] == 0.25
@@ -2234,7 +2369,10 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     policy = resource_data["retained_policy"]
     assert policy["authorization"] == REDACTED
     assert policy["client_secret"] == REDACTED
+    assert policy["clientSecret"] == REDACTED
+    assert policy["accessToken"] == REDACTED
     assert policy["managed"] is False
+    assert resource_data["effective_policy"]["refreshToken"] == REDACTED
     assert resource_data["retained_policy"]["backend_token"] == REDACTED
     repository_secrets = policy["repository_secrets"]
     assert repository_secrets["update_token"] == REDACTED
@@ -2250,6 +2388,8 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert resource_data["state"]["headers"] == REDACTED
     assert resource_data["state"]["bearer_token"] == REDACTED
     assert resource_data["state"]["api_key"] == REDACTED
+    assert resource_data["state"]["APIKey"] == REDACTED
+    assert resource_data["state"]["tokenValue"] == REDACTED
     assert resource_data["state"]["ssh_key"] == REDACTED
     assert resource_data["state"]["webhook_url"] == REDACTED
     assert resource_data["state"]["events"][0]["some-service-token"] == REDACTED

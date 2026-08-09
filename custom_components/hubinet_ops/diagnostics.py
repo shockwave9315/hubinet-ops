@@ -13,6 +13,8 @@ from .api import HubinetOpsSnapshot, SourceContext
 from .const import CONF_API_TOKEN, CONF_BASE_URL
 from .coordinator import HubinetOpsConfigEntry
 
+_ACRONYM_WORD_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _KEY_SEPARATOR = re.compile(r"[^a-z0-9]+")
 
 _REPOSITORY_SECRET_KEYS = frozenset(
@@ -55,9 +57,11 @@ _REPOSITORY_SECRET_SUFFIXES = (
 
 
 def _normalize_diagnostic_key(key: Any) -> str:
-    """Normalize case and separators without changing the published key."""
+    """Normalize word boundaries and separators without changing the published key."""
 
-    return _KEY_SEPARATOR.sub("_", str(key).casefold()).strip("_")
+    normalized = _ACRONYM_WORD_BOUNDARY.sub("_", str(key))
+    normalized = _CAMEL_WORD_BOUNDARY.sub("_", normalized)
+    return _KEY_SEPARATOR.sub("_", normalized.casefold()).strip("_")
 
 
 def _is_repository_secret_key(key: Any) -> bool:
