@@ -45,14 +45,24 @@ NODE_A = "811d7ea4-470f-42d4-aa06-d2c5c9249a1e"
 NODE_B = "6f1c0770-6ca6-4c20-ab56-8cb645f63ee3"
 RESOURCE_ID = "b50f157b-d2fb-4fff-9497-42c5c239ef49"
 SUCCESSOR_ID = "c5321ec5-7259-421a-94ab-195a9c5e5d81"
+THIRD_RESOURCE_ID = "727f79b7-9d89-45e5-88da-21adfd94f08a"
+ENDPOINT_A_ID = "7b784024-62d8-4f3e-bb63-af9fe65fcc8e"
+ENDPOINT_B_ID = "9e2ef36f-f6db-4e23-93fe-85ad573682f5"
 
 
-def context(*, revision: int = 3, trust_revision: int = 2) -> SourceContext:
+def context(
+    *,
+    revision: int = 3,
+    trust_revision: int = 2,
+    endpoint_id: str = ENDPOINT_A_ID,
+    locator: str = "https://pve.example.test:8006",
+    canonicalization_version: int = 1,
+) -> SourceContext:
     return SourceContext(
         source_config_revision=revision,
-        endpoint_id="7b784024-62d8-4f3e-bb63-af9fe65fcc8e",
-        canonical_transport_locator="https://pve.example.test:8006",
-        canonicalization_contract_version=1,
+        endpoint_id=endpoint_id,
+        canonical_transport_locator=locator,
+        canonicalization_contract_version=canonicalization_version,
         transport_trust_revision=trust_revision,
     )
 
@@ -63,7 +73,9 @@ def source(
     name: str = "Test Proxmox",
     facts: dict[str, Any] | None = None,
 ) -> InventorySourceSnapshot:
-    current_context = context()
+    current_context = context(
+        endpoint_id=ENDPOINT_B_ID if source_id == SOURCE_B_ID else ENDPOINT_A_ID
+    )
     return InventorySourceSnapshot(
         inventory_source_id=source_id,
         name=name,
@@ -353,6 +365,359 @@ def test_ambiguity_retains_exact_binding_and_generation_across_revisions() -> No
     incoming.validate_revision_successor(previous)
     assert ambiguous.active_binding_id == previous.resources[0].active_binding_id
     assert ambiguous.locator_generation == previous.resources[0].locator_generation
+
+
+def direct_replacement_views() -> tuple[
+    HubinetOpsSnapshot,
+    HubinetOpsSnapshot,
+    ResourceSnapshot,
+    ResourceSnapshot,
+]:
+    previous = snapshot(resources=(resource(generation=4),))
+    old = not_current_resource(generation=4)
+    successor = resource(SUCCESSOR_ID, generation=5, name="Successor")
+    incoming = snapshot(
+        resources=(old, successor),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    return previous, incoming, old, successor
+
+
+def test_direct_replacement_introduction_rejects_trusted_successor() -> None:
+    previous, _, old, successor = direct_replacement_views()
+    incoming = snapshot(
+        resources=(
+            old,
+            replace(
+                successor,
+                security_continuity=SecurityContinuity.TRUSTED,
+            ),
+        ),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="introduction violates handoff"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_direct_replacement_introduction_rejects_successor_policy() -> None:
+    previous, _, old, successor = direct_replacement_views()
+    policy_successor = replace(
+        successor,
+        security_continuity=SecurityContinuity.TRUSTED,
+        retained_policy={"managed": True},
+        effective_policy={"managed": True},
+        policy_applicable=True,
+        effective_capabilities=frozenset({"restart"}),
+    )
+    incoming = snapshot(
+        resources=(old, policy_successor),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="introduction violates handoff"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_direct_replacement_introduction_rejects_noncurrent_successor() -> None:
+    previous, _, old, successor = direct_replacement_views()
+    removed_successor = replace(
+        successor,
+        active_binding_id=None,
+        resource_continuity_revision=2,
+        current_node_id=None,
+        last_known_node_id=NODE_A,
+        presence=PresenceState.CONFIRMED_REMOVED,
+        lifecycle=LifecycleState.RETIRED,
+        detail_status=DetailStatus.NOT_APPLICABLE,
+        node_availability=NodeAvailability.NOT_APPLICABLE,
+        status="unknown",
+        termination_reason="confirmed_removed",
+    )
+    incoming = snapshot(
+        resources=(old, removed_successor),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="introduction violates handoff"):
+        incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    "successor_changes",
+    [
+        {"inventory_source_id": SOURCE_B_ID},
+        {"vmid": 102},
+        {"locator_generation": 6},
+    ],
+    ids=["wrong-source", "wrong-vmid", "wrong-generation"],
+)
+def test_direct_replacement_rejects_wrong_successor_locator_history(
+    successor_changes: dict[str, Any],
+) -> None:
+    _, _, old, successor = direct_replacement_views()
+    changed = replace(successor, **successor_changes)
+    if changed.inventory_source_id == SOURCE_B_ID:
+        changed = replace(
+            changed,
+            current_node_id=None,
+            node_availability=NodeAvailability.UNRESOLVED,
+        )
+    sources = (
+        (source(), source(source_id=SOURCE_B_ID, name="Second"))
+        if changed.inventory_source_id == SOURCE_B_ID
+        else (source(),)
+    )
+    with pytest.raises(
+        ValueError,
+        match="locator history|retained terminal history",
+    ):
+        snapshot(sources=sources, resources=(old, changed))
+
+
+def test_terminal_successor_lineage_cannot_be_rewritten() -> None:
+    previous, _, old, _ = direct_replacement_views()
+    accepted = snapshot(
+        resources=(old, resource(SUCCESSOR_ID, generation=5, name="Successor")),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    accepted.validate_revision_successor(previous)
+
+    rewritten_old = replace(old, successor_resource_id=THIRD_RESOURCE_ID)
+    rewritten = snapshot(
+        resources=(
+            rewritten_old,
+            resource(THIRD_RESOURCE_ID, generation=5, name="Different successor"),
+        ),
+        inventory_revision=12,
+        published_state_revision=22,
+    )
+    with pytest.raises(ValueError, match="replacement lineage is immutable"):
+        rewritten.validate_revision_successor(accepted)
+
+
+def test_not_current_successor_pointer_cannot_be_cleared() -> None:
+    old = not_current_resource(generation=4)
+    with pytest.raises(ValueError, match="requires successor_resource_id"):
+        replace(old, successor_resource_id=None)
+
+
+def test_replacement_lineage_cannot_reference_itself() -> None:
+    old = not_current_resource(
+        generation=4,
+        successor_resource_id=RESOURCE_ID,
+    )
+    with pytest.raises(ValueError, match="cannot reference itself"):
+        snapshot(resources=(old,))
+
+
+def test_valid_direct_replacement_handoff_is_accepted() -> None:
+    previous, incoming, _, _ = direct_replacement_views()
+    incoming.validate_revision_successor(previous)
+
+
+def test_historical_successor_may_later_become_trusted() -> None:
+    previous, accepted, old, successor = direct_replacement_views()
+    accepted.validate_revision_successor(previous)
+    trusted = replace(
+        successor,
+        resource_continuity_revision=2,
+        security_continuity=SecurityContinuity.TRUSTED,
+    )
+    snapshot(
+        resources=(old, trusted),
+        inventory_revision=12,
+        published_state_revision=22,
+    ).validate_revision_successor(accepted)
+
+
+def test_historical_successor_may_later_enter_quarantine() -> None:
+    previous, accepted, old, successor = direct_replacement_views()
+    accepted.validate_revision_successor(previous)
+    quarantined = replace(
+        successor,
+        resource_continuity_revision=2,
+        lifecycle=LifecycleState.QUARANTINED,
+        observational_continuity=ObservationalContinuity.UNCERTAIN,
+    )
+    snapshot(
+        resources=(old, quarantined),
+        inventory_revision=12,
+        published_state_revision=22,
+    ).validate_revision_successor(accepted)
+
+
+def test_historical_successor_may_later_be_confirmed_removed() -> None:
+    previous, accepted, old, successor = direct_replacement_views()
+    accepted.validate_revision_successor(previous)
+    removed = replace(
+        successor,
+        active_binding_id=None,
+        resource_continuity_revision=2,
+        current_node_id=None,
+        last_known_node_id=NODE_A,
+        presence=PresenceState.CONFIRMED_REMOVED,
+        lifecycle=LifecycleState.RETIRED,
+        detail_status=DetailStatus.NOT_APPLICABLE,
+        node_availability=NodeAvailability.NOT_APPLICABLE,
+        status="unknown",
+        termination_reason="confirmed_removed",
+    )
+    later = snapshot(
+        resources=(old, removed),
+        inventory_revision=12,
+        published_state_revision=22,
+    )
+    later.validate_revision_successor(accepted)
+    assert later.resources_by_id[RESOURCE_ID].successor_resource_id == SUCCESSOR_ID
+    assert later.resources_by_id[SUCCESSOR_ID].active_binding_id is None
+
+
+def test_retained_replacement_lineage_may_form_a_chain() -> None:
+    previous, accepted, old_a, successor_b = direct_replacement_views()
+    accepted.validate_revision_successor(previous)
+    old_b = not_current_resource(
+        resource_id=SUCCESSOR_ID,
+        generation=5,
+        successor_resource_id=THIRD_RESOURCE_ID,
+    )
+    successor_c = resource(
+        THIRD_RESOURCE_ID,
+        generation=6,
+        name="Second successor",
+    )
+    chained = snapshot(
+        resources=(old_a, old_b, successor_c),
+        inventory_revision=12,
+        published_state_revision=22,
+    )
+    chained.validate_revision_successor(accepted)
+    assert chained.resources_by_id[RESOURCE_ID].successor_resource_id == SUCCESSOR_ID
+    assert chained.resources_by_id[SUCCESSOR_ID].successor_resource_id == THIRD_RESOURCE_ID
+    assert successor_b.resource_id == SUCCESSOR_ID
+
+
+@pytest.mark.parametrize(
+    ("generation", "match"),
+    [
+        (3, "follow retained terminal history"),
+        (4, "duplicate retained locator generation"),
+        (6, "follow retained terminal history"),
+    ],
+)
+def test_current_binding_must_use_next_retained_generation(
+    generation: int,
+    match: str,
+) -> None:
+    terminal = replace(confirmed_removed_resource(), locator_generation=4)
+    current = resource(SUCCESSOR_ID, generation=generation, name="New occupant")
+    with pytest.raises(ValueError, match=match):
+        snapshot(resources=(terminal, current))
+
+
+def test_direct_replacement_cannot_skip_locator_generation() -> None:
+    old = not_current_resource(generation=4)
+    successor = resource(SUCCESSOR_ID, generation=6, name="Successor")
+    with pytest.raises(ValueError, match="follow retained terminal history"):
+        snapshot(resources=(old, successor))
+
+
+def test_current_binding_uses_maximum_retained_generation_plus_one() -> None:
+    terminal_ids = (RESOURCE_ID, SUCCESSOR_ID, THIRD_RESOURCE_ID)
+    terminal = tuple(
+        replace(
+            confirmed_removed_resource(),
+            resource_id=resource_id,
+            locator_generation=generation,
+        )
+        for generation, resource_id in enumerate(terminal_ids, start=1)
+    )
+    invalid_current = resource(
+        "df27e5ab-308d-4f4a-a2ab-26c70142395e",
+        generation=5,
+        name="Skipped generation",
+    )
+    with pytest.raises(ValueError, match="follow retained terminal history"):
+        snapshot(resources=(*terminal, invalid_current))
+
+
+def test_terminal_history_accepts_exact_next_generation() -> None:
+    terminal = replace(confirmed_removed_resource(), locator_generation=4)
+    current = resource(SUCCESSOR_ID, generation=5, name="New occupant")
+    view = snapshot(resources=(terminal, current))
+    assert view.current_resources_by_locator[(SOURCE_ID, 101)] is current
+
+
+def test_multiple_terminal_generations_accept_exact_next_generation() -> None:
+    terminal_ids = (RESOURCE_ID, SUCCESSOR_ID, THIRD_RESOURCE_ID)
+    terminal = tuple(
+        replace(
+            confirmed_removed_resource(),
+            resource_id=resource_id,
+            locator_generation=generation,
+        )
+        for generation, resource_id in enumerate(terminal_ids, start=1)
+    )
+    current = resource(
+        "df27e5ab-308d-4f4a-a2ab-26c70142395e",
+        generation=4,
+        name="Current occupant",
+    )
+    snapshot(resources=(*terminal, current))
+
+
+def test_locator_generation_histories_are_independent_between_sources() -> None:
+    terminal_a = replace(confirmed_removed_resource(), locator_generation=4)
+    current_a = resource(SUCCESSOR_ID, generation=5, name="Source A current")
+    terminal_b = replace(
+        confirmed_removed_resource(),
+        resource_id=THIRD_RESOURCE_ID,
+        inventory_source_id=SOURCE_B_ID,
+        locator_generation=9,
+        last_known_node_id=None,
+    )
+    current_b = replace(
+        resource(
+            "df27e5ab-308d-4f4a-a2ab-26c70142395e",
+            generation=10,
+            name="Source B current",
+        ),
+        inventory_source_id=SOURCE_B_ID,
+        current_node_id=None,
+        node_availability=NodeAvailability.UNRESOLVED,
+    )
+    snapshot(
+        sources=(source(), source(source_id=SOURCE_B_ID, name="Second")),
+        resources=(terminal_a, current_a, terminal_b, current_b),
+    )
+
+
+def test_missing_resource_returns_present_without_generation_change() -> None:
+    missing = missing_resource()
+    previous = snapshot(resources=(missing,))
+    returned = resource(continuity_revision=3)
+    incoming = snapshot(
+        resources=(returned,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+    assert returned.locator_generation == missing.locator_generation
+    assert returned.active_binding_id == missing.active_binding_id
+
+
+def test_nonterminal_inventory_change_does_not_bump_locator_generation() -> None:
+    previous = snapshot()
+    renamed = replace(resource(), name="Renamed")
+    incoming = snapshot(
+        resources=(renamed,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+    assert renamed.locator_generation == previous.resources[0].locator_generation
 
 
 def test_successor_rejects_omitted_retained_source() -> None:
@@ -871,3 +1236,146 @@ def test_time_expiry_does_not_require_inventory_revision() -> None:
         resources=(),
         published_state_revision=21,
     ).validate_revision_successor(previous)
+
+
+def controlled_source(
+    *,
+    source_id: str,
+    current: SourceContext,
+    committed: SourceContext,
+) -> InventorySourceSnapshot:
+    return replace(
+        source(source_id=source_id),
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="source_context_changed",
+        current_context=current,
+        committed_context=committed,
+    )
+
+
+def test_snapshot_rejects_shared_current_endpoint_identity() -> None:
+    shared = context(endpoint_id=ENDPOINT_A_ID)
+    second = replace(
+        source(source_id=SOURCE_B_ID),
+        current_context=shared,
+        committed_context=shared,
+    )
+    with pytest.raises(ValueError, match="shared across inventory sources"):
+        snapshot(sources=(source(), second), nodes=(), resources=())
+
+
+def test_snapshot_rejects_committed_to_current_endpoint_sharing() -> None:
+    shared = context(endpoint_id=ENDPOINT_A_ID)
+    first = controlled_source(
+        source_id=SOURCE_ID,
+        current=context(revision=4, endpoint_id="endpoint-a-current"),
+        committed=shared,
+    )
+    second = replace(
+        source(source_id=SOURCE_B_ID),
+        current_context=shared,
+        committed_context=shared,
+    )
+    with pytest.raises(ValueError, match="shared across inventory sources"):
+        snapshot(sources=(first, second), nodes=(), resources=())
+
+
+def test_snapshot_rejects_current_to_committed_endpoint_sharing() -> None:
+    shared = context(endpoint_id=ENDPOINT_A_ID)
+    second = controlled_source(
+        source_id=SOURCE_B_ID,
+        current=context(revision=4, endpoint_id=ENDPOINT_B_ID),
+        committed=shared,
+    )
+    with pytest.raises(ValueError, match="shared across inventory sources"):
+        snapshot(sources=(source(), second), nodes=(), resources=())
+
+
+def test_endpoint_identity_cannot_move_to_new_source_across_snapshots() -> None:
+    previous = snapshot(nodes=(), resources=())
+    moved_to_second = context(endpoint_id=ENDPOINT_A_ID)
+    incoming = snapshot(
+        sources=(
+            replace(
+                source(),
+                current_context=context(
+                    revision=4,
+                    endpoint_id="replacement-endpoint-a",
+                ),
+                committed_context=context(
+                    revision=4,
+                    endpoint_id="replacement-endpoint-a",
+                ),
+            ),
+            replace(
+                source(source_id=SOURCE_B_ID),
+                current_context=moved_to_second,
+                committed_context=moved_to_second,
+            ),
+        ),
+        nodes=(),
+        resources=(),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="cannot move between inventory sources"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_current_and_committed_endpoint_identity_may_match_within_source() -> None:
+    view = snapshot(nodes=(), resources=())
+    assert view.sources[0].current_context.endpoint_id == ENDPOINT_A_ID
+    assert view.sources[0].committed_context.endpoint_id == ENDPOINT_A_ID
+
+
+def test_distinct_sources_accept_distinct_endpoint_identities() -> None:
+    view = snapshot(
+        sources=(source(), source(source_id=SOURCE_B_ID, name="Second")),
+        nodes=(),
+        resources=(),
+    )
+    assert {item.current_context.endpoint_id for item in view.sources} == {
+        ENDPOINT_A_ID,
+        ENDPOINT_B_ID,
+    }
+
+
+def test_same_source_preserves_endpoint_during_config_and_trust_transition() -> None:
+    previous = snapshot(nodes=(), resources=())
+    transitioned = controlled_source(
+        source_id=SOURCE_ID,
+        current=context(revision=4, trust_revision=3),
+        committed=context(),
+    )
+    incoming = snapshot(
+        sources=(transitioned,),
+        nodes=(),
+        resources=(),
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+    assert transitioned.current_context.endpoint_id == ENDPOINT_A_ID
+
+
+def test_controlled_canonicalization_migration_preserves_endpoint_owner() -> None:
+    previous = snapshot(nodes=(), resources=())
+    migrated = controlled_source(
+        source_id=SOURCE_ID,
+        current=context(
+            revision=4,
+            endpoint_id=ENDPOINT_A_ID,
+            locator="https://canonical-v2.example.test:8006",
+            canonicalization_version=2,
+        ),
+        committed=context(),
+    )
+    incoming = snapshot(
+        sources=(migrated,),
+        nodes=(),
+        resources=(),
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+    assert migrated.current_context.endpoint_id == ENDPOINT_A_ID

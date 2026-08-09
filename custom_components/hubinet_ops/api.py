@@ -609,6 +609,19 @@ class HubinetOpsSnapshot:
         source_ids = {source.inventory_source_id for source in self.sources}
         if len(source_ids) != len(self.sources):
             raise ValueError("snapshot contains duplicate source identities")
+        endpoint_owners: dict[str, str] = {}
+        for source in self.sources:
+            contexts = (source.current_context, source.committed_context)
+            for context in contexts:
+                if context is None:
+                    continue
+                owner = endpoint_owners.setdefault(
+                    context.endpoint_id, source.inventory_source_id
+                )
+                if owner != source.inventory_source_id:
+                    raise ValueError(
+                        "endpoint identity cannot be shared across inventory sources"
+                    )
         node_ids = {node.node_id for node in self.nodes}
         if len(node_ids) != len(self.nodes):
             raise ValueError("snapshot contains duplicate node identities")
@@ -627,8 +640,11 @@ class HubinetOpsSnapshot:
         nodes_by_id = {node.node_id: node for node in self.nodes}
         active_locators: set[tuple[str, int]] = set()
         locator_generations: set[tuple[str, int, int]] = set()
+        resources_by_locator: dict[tuple[str, int], list[ResourceSnapshot]] = {}
         active_bindings: set[str] = set()
         for resource in self.resources:
+            locator = (resource.inventory_source_id, resource.vmid)
+            resources_by_locator.setdefault(locator, []).append(resource)
             locator_generation = (
                 resource.inventory_source_id,
                 resource.vmid,
@@ -640,7 +656,6 @@ class HubinetOpsSnapshot:
                 )
             locator_generations.add(locator_generation)
             if resource.active_binding_id is not None:
-                locator = (resource.inventory_source_id, resource.vmid)
                 if locator in active_locators:
                     raise ValueError("snapshot contains multiple current occupants for a locator")
                 active_locators.add(locator)
@@ -665,12 +680,37 @@ class HubinetOpsSnapshot:
                 if resource.node_availability is not expected:
                     raise ValueError("resource node availability disagrees with node record")
 
+        for locator_resources in resources_by_locator.values():
+            current = next(
+                (
+                    resource
+                    for resource in locator_resources
+                    if resource.active_binding_id is not None
+                ),
+                None,
+            )
+            terminal_generations = [
+                resource.locator_generation
+                for resource in locator_resources
+                if resource.active_binding_id is None
+            ]
+            if (
+                current is not None
+                and terminal_generations
+                and current.locator_generation != max(terminal_generations) + 1
+            ):
+                raise ValueError(
+                    "current locator generation must follow retained terminal history"
+                )
+
         resources_by_id = {
             resource.resource_id: resource for resource in self.resources
         }
         for old in self.resources:
             if old.successor_resource_id is None:
                 continue
+            if old.successor_resource_id == old.resource_id:
+                raise ValueError("replacement lineage cannot reference itself")
             successor = resources_by_id.get(old.successor_resource_id)
             if successor is None:
                 raise ValueError("replacement successor is absent from the same snapshot")
@@ -678,13 +718,10 @@ class HubinetOpsSnapshot:
                 successor.inventory_source_id != old.inventory_source_id
                 or successor.vmid != old.vmid
                 or successor.locator_generation != old.locator_generation + 1
-                or successor.active_binding_id is None
-                or successor.presence is not PresenceState.PRESENT
-                or successor.security_continuity is not SecurityContinuity.UNVERIFIED
-                or successor.policy_applicable
-                or successor.effective_capabilities
             ):
-                raise ValueError("replacement successor violates locator handoff invariants")
+                raise ValueError(
+                    "replacement lineage violates locator history invariants"
+                )
 
         sources_by_id = {
             source.inventory_source_id: source for source in self.sources
@@ -816,6 +853,19 @@ class HubinetOpsSnapshot:
         current_node_ids = set(self.nodes_by_id)
         current_resource_ids = set(self.resources_by_id)
 
+        for resource_id, old_resource in previous_resources_by_id.items():
+            resource = self.resources_by_id.get(resource_id)
+            if (
+                resource is not None
+                and old_resource.presence is PresenceState.NOT_CURRENT
+                and (
+                    resource.termination_reason != old_resource.termination_reason
+                    or resource.successor_resource_id
+                    != old_resource.successor_resource_id
+                )
+            ):
+                raise ValueError("terminal replacement lineage is immutable")
+
         missing_source_ids = set(previous_sources_by_id) - current_source_ids
         if missing_source_ids:
             raise ValueError("published snapshot cannot omit a retained inventory source")
@@ -833,6 +883,26 @@ class HubinetOpsSnapshot:
             raise ValueError(
                 "inventory-owned changes require a newer inventory_revision"
             )
+
+        previous_endpoint_owners: dict[str, str] = {}
+        for old_source in previous.sources:
+            for context in (
+                old_source.current_context,
+                old_source.committed_context,
+            ):
+                if context is not None:
+                    previous_endpoint_owners.setdefault(
+                        context.endpoint_id, old_source.inventory_source_id
+                    )
+        for source in self.sources:
+            for context in (source.current_context, source.committed_context):
+                if context is None:
+                    continue
+                old_owner = previous_endpoint_owners.get(context.endpoint_id)
+                if old_owner is not None and old_owner != source.inventory_source_id:
+                    raise ValueError(
+                        "endpoint identity cannot move between inventory sources"
+                    )
 
         for source in self.sources:
             old_source = previous_sources_by_id.get(source.inventory_source_id)
@@ -992,7 +1062,12 @@ class HubinetOpsSnapshot:
                 PresenceState.NOT_CURRENT,
             }
             if old_terminal:
-                if not terminal or resource.presence is not old.presence:
+                if (
+                    not terminal
+                    or resource.presence is not old.presence
+                    or resource.termination_reason != old.termination_reason
+                    or resource.successor_resource_id != old.successor_resource_id
+                ):
                     raise ValueError("terminal resource cannot be reopened or reclassified")
             elif terminal:
                 if resource.active_binding_id is not None:
@@ -1001,6 +1076,35 @@ class HubinetOpsSnapshot:
                 raise ValueError(
                     "active binding is immutable before a terminal transition"
                 )
+
+            if (
+                not old_terminal
+                and resource.presence is PresenceState.NOT_CURRENT
+            ):
+                successor = self.resources_by_id[resource.successor_resource_id]
+                expected_old_security = (
+                    SecurityContinuity.REVOKED
+                    if old.security_continuity is SecurityContinuity.TRUSTED
+                    else old.security_continuity
+                )
+                if (
+                    successor.resource_id in previous_resources_by_id
+                    or resource.security_continuity is not expected_old_security
+                    or resource.policy_applicable
+                    or resource.effective_capabilities
+                    or successor.active_binding_id is None
+                    or successor.presence is not PresenceState.PRESENT
+                    or successor.lifecycle is not LifecycleState.ACTIVE
+                    or successor.observational_continuity
+                    is not ObservationalContinuity.CONSISTENT
+                    or successor.security_continuity
+                    is not SecurityContinuity.UNVERIFIED
+                    or successor.policy_applicable
+                    or successor.effective_capabilities
+                ):
+                    raise ValueError(
+                        "direct replacement introduction violates handoff invariants"
+                    )
 
             security_relevant_transition = (
                 resource.observational_continuity

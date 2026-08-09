@@ -2011,7 +2011,15 @@ def test_node_identity_cannot_move_between_inventory_sources() -> None:
     )
     incoming = snapshot(
         (),
-        sources=(source(), source(inventory_source_id=SOURCE_B_ID)),
+        sources=(
+            source(),
+            source(
+                inventory_source_id=SOURCE_B_ID,
+                current_context=source_context(
+                    endpoint_id="9e2ef36f-f6db-4e23-93fe-85ad573682f5"
+                ),
+            ),
+        ),
         nodes=(node(inventory_source_id=SOURCE_B_ID),),
         inventory_revision=11,
         published_state_revision=21,
