@@ -485,6 +485,66 @@ def direct_replacement_views() -> tuple[
     return previous, incoming, old, successor
 
 
+def test_revision_successor_rejects_observed_binding_reassignment() -> None:
+    previous, _, old, successor = direct_replacement_views()
+    previous_binding = previous.resources[0].active_binding_id
+    assert previous_binding is not None
+    reused_successor = replace(successor, active_binding_id=previous_binding)
+    incoming = snapshot(
+        resources=(old, reused_successor),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match="binding identity cannot move"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_revision_successor_accepts_fresh_successor_binding() -> None:
+    previous, incoming, _, successor = direct_replacement_views()
+    previous_binding = previous.resources[0].active_binding_id
+    assert previous_binding is not None
+    assert successor.active_binding_id != previous_binding
+
+    incoming.validate_revision_successor(previous)
+
+
+def test_revision_successor_accepts_same_resource_retaining_binding() -> None:
+    previous = snapshot()
+    previous_binding = previous.resources[0].active_binding_id
+    renamed = replace(previous.resources[0], name="Renamed")
+    incoming = snapshot(
+        resources=(renamed,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert incoming.resources[0].active_binding_id == previous_binding
+
+
+def test_revision_successor_rejects_binding_reassignment_across_locators() -> None:
+    previous_resource = replace(
+        resource(generation=4),
+        active_binding_id="binding-observed-owner",
+    )
+    previous = snapshot(resources=(previous_resource,))
+    closed = replace(confirmed_removed_resource(), locator_generation=4)
+    different_locator = replace(
+        resource(SUCCESSOR_ID, name="Different locator"),
+        active_binding_id="binding-observed-owner",
+        vmid=202,
+    )
+    incoming = snapshot(
+        resources=(closed, different_locator),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match="binding identity cannot move"):
+        incoming.validate_revision_successor(previous)
+
+
 def resource_before_terminal(
     security_continuity: SecurityContinuity,
 ) -> ResourceSnapshot:

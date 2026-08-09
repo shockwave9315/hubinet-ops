@@ -929,6 +929,20 @@ class HubinetOpsSnapshot:
         if missing_resource_ids:
             raise ValueError("published snapshot cannot omit a retained resource")
 
+        previous_binding_owners = {
+            resource.active_binding_id: resource.resource_id
+            for resource in previous.resources
+            if resource.active_binding_id is not None
+        }
+        for resource in self.resources:
+            if resource.active_binding_id is None:
+                continue
+            previous_owner = previous_binding_owners.get(resource.active_binding_id)
+            if previous_owner is not None and previous_owner != resource.resource_id:
+                raise ValueError(
+                    "active binding identity cannot move between resources"
+                )
+
         previous_max_generation_by_locator: dict[tuple[str, int], int] = {}
         for old_resource in previous.resources:
             locator = (old_resource.inventory_source_id, old_resource.vmid)
