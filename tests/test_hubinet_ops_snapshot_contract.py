@@ -385,6 +385,172 @@ def direct_replacement_views() -> tuple[
     return previous, incoming, old, successor
 
 
+def resource_before_terminal(
+    security_continuity: SecurityContinuity,
+) -> ResourceSnapshot:
+    if security_continuity is SecurityContinuity.REVOKED:
+        return replace(
+            missing_resource(),
+            locator_generation=4,
+            security_continuity=SecurityContinuity.REVOKED,
+        )
+    return resource(
+        generation=4,
+        continuity_revision=2,
+        security_continuity=security_continuity,
+    )
+
+
+def terminal_resources(
+    presence: PresenceState,
+    security_continuity: SecurityContinuity,
+    *,
+    continuity_revision: int,
+) -> tuple[ResourceSnapshot, ...]:
+    if presence is PresenceState.NOT_CURRENT:
+        old = replace(
+            not_current_resource(generation=4),
+            resource_continuity_revision=continuity_revision,
+            security_continuity=security_continuity,
+        )
+        return (old, resource(SUCCESSOR_ID, generation=5, name="Successor"))
+    removed = replace(
+        confirmed_removed_resource(),
+        locator_generation=4,
+        resource_continuity_revision=continuity_revision,
+        security_continuity=security_continuity,
+    )
+    return (removed,)
+
+
+@pytest.mark.parametrize(
+    "presence",
+    [PresenceState.NOT_CURRENT, PresenceState.CONFIRMED_REMOVED],
+    ids=["not-current", "confirmed-removed"],
+)
+@pytest.mark.parametrize(
+    ("previous_security", "terminal_security"),
+    [
+        (SecurityContinuity.UNVERIFIED, SecurityContinuity.UNVERIFIED),
+        (SecurityContinuity.UNVERIFIED, SecurityContinuity.REVOKED),
+        (SecurityContinuity.TRUSTED, SecurityContinuity.REVOKED),
+        (SecurityContinuity.REVOKED, SecurityContinuity.REVOKED),
+    ],
+    ids=[
+        "unverified-to-unverified",
+        "unverified-to-revoked",
+        "trusted-to-revoked",
+        "revoked-to-revoked",
+    ],
+)
+def test_terminal_security_history_accepts_valid_transition_matrix(
+    presence: PresenceState,
+    previous_security: SecurityContinuity,
+    terminal_security: SecurityContinuity,
+) -> None:
+    previous = snapshot(
+        resources=(resource_before_terminal(previous_security),),
+    )
+    incoming = snapshot(
+        resources=terminal_resources(
+            presence,
+            terminal_security,
+            continuity_revision=7,
+        ),
+        inventory_revision=11,
+        published_state_revision=27,
+    )
+    incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    "presence",
+    [PresenceState.NOT_CURRENT, PresenceState.CONFIRMED_REMOVED],
+    ids=["not-current", "confirmed-removed"],
+)
+@pytest.mark.parametrize(
+    "previous_security",
+    [SecurityContinuity.TRUSTED, SecurityContinuity.REVOKED],
+    ids=["trusted", "revoked"],
+)
+def test_terminal_security_history_rejects_known_state_erasure(
+    presence: PresenceState,
+    previous_security: SecurityContinuity,
+) -> None:
+    previous = snapshot(
+        resources=(resource_before_terminal(previous_security),),
+    )
+    incoming = snapshot(
+        resources=terminal_resources(
+            presence,
+            SecurityContinuity.UNVERIFIED,
+            continuity_revision=7,
+        ),
+        inventory_revision=11,
+        published_state_revision=27,
+    )
+    with pytest.raises(ValueError, match="cannot erase known security history"):
+        incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    "presence",
+    [PresenceState.NOT_CURRENT, PresenceState.CONFIRMED_REMOVED],
+    ids=["not-current", "confirmed-removed"],
+)
+def test_retained_terminal_resource_preserves_revoked_security(
+    presence: PresenceState,
+) -> None:
+    retained = terminal_resources(
+        presence,
+        SecurityContinuity.REVOKED,
+        continuity_revision=3,
+    )
+    previous = snapshot(
+        resources=retained,
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming = snapshot(
+        resources=retained,
+        inventory_revision=11,
+        published_state_revision=22,
+    )
+    incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    "presence",
+    [PresenceState.NOT_CURRENT, PresenceState.CONFIRMED_REMOVED],
+    ids=["not-current", "confirmed-removed"],
+)
+def test_retained_terminal_resource_cannot_downgrade_revoked_security(
+    presence: PresenceState,
+) -> None:
+    previous_resources = terminal_resources(
+        presence,
+        SecurityContinuity.REVOKED,
+        continuity_revision=3,
+    )
+    incoming_resources = terminal_resources(
+        presence,
+        SecurityContinuity.UNVERIFIED,
+        continuity_revision=4,
+    )
+    previous = snapshot(
+        resources=previous_resources,
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming = snapshot(
+        resources=incoming_resources,
+        inventory_revision=12,
+        published_state_revision=22,
+    )
+    with pytest.raises(ValueError, match="cannot erase known security history"):
+        incoming.validate_revision_successor(previous)
+
+
 def test_revision_gap_may_skip_handoff_and_observe_trusted_successor() -> None:
     previous, _, old, successor = direct_replacement_views()
     incoming = snapshot(

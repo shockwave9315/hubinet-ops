@@ -1061,6 +1061,15 @@ class HubinetOpsSnapshot:
                 PresenceState.CONFIRMED_REMOVED,
                 PresenceState.NOT_CURRENT,
             }
+            if (
+                terminal
+                and old.security_continuity
+                in {SecurityContinuity.TRUSTED, SecurityContinuity.REVOKED}
+                and resource.security_continuity is not SecurityContinuity.REVOKED
+            ):
+                raise ValueError(
+                    "terminal resource cannot erase known security history"
+                )
             if old_terminal:
                 if (
                     not terminal
