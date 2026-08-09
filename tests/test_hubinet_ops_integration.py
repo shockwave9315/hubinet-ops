@@ -11,7 +11,11 @@ import pytest
 pytest.importorskip("homeassistant", reason="isolated HA test dependencies not installed")
 
 from homeassistant.components.diagnostics import REDACTED
-from homeassistant.config_entries import ConfigEntryState
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigEntryState,
+)
 from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -96,13 +100,19 @@ def backend_information(
     )
 
 
-def source_context(*, revision: int = 3) -> SourceContext:
+def source_context(
+    *,
+    revision: int = 3,
+    transport_trust_revision: int = 2,
+    endpoint_id: str = "7b784024-62d8-4f3e-bb63-af9fe65fcc8e",
+    canonical_transport_locator: str = "https://pve.example.test:8006",
+) -> SourceContext:
     return SourceContext(
         source_config_revision=revision,
-        endpoint_id="7b784024-62d8-4f3e-bb63-af9fe65fcc8e",
-        canonical_transport_locator="https://pve.example.test:8006",
+        endpoint_id=endpoint_id,
+        canonical_transport_locator=canonical_transport_locator,
         canonicalization_contract_version=1,
-        transport_trust_revision=2,
+        transport_trust_revision=transport_trust_revision,
     )
 
 
@@ -251,6 +261,7 @@ def absent_resource(
     *,
     vmid: int = 777,
     generation: int = 1,
+    resource_continuity_revision: int = 1,
     successor_resource_id: str | None = None,
 ) -> ResourceSnapshot:
     terminal = presence in {
@@ -264,6 +275,7 @@ def absent_resource(
         "Retained Container",
         active_binding_id=None if terminal else f"binding-{resource_id}",
         locator_generation=generation,
+        resource_continuity_revision=resource_continuity_revision,
         current_node_id=None,
         last_known_node_id=NODE_A,
         presence=presence,
@@ -321,10 +333,12 @@ class FakeTransport:
         snapshots: Iterable[HubinetOpsSnapshot] = (),
         *,
         validation_error: Exception | None = None,
+        validation_backend_instance_id: str = BACKEND_ID,
     ) -> None:
         self._snapshots = list(snapshots)
         self._index = 0
         self.validation_error = validation_error
+        self.validation_backend_instance_id = validation_backend_instance_id
         self.validate_calls = 0
         self.snapshot_calls = 0
 
@@ -332,7 +346,9 @@ class FakeTransport:
         self.validate_calls += 1
         if self.validation_error is not None:
             raise self.validation_error
-        return backend_information()
+        return backend_information(
+            backend_instance_id=self.validation_backend_instance_id
+        )
 
     async def fetch_backend_information(self) -> BackendInformation:
         return backend_information()
@@ -437,6 +453,130 @@ async def test_config_flow_connection_errors(
     )
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": expected}
+
+
+@pytest.mark.asyncio
+async def test_reauth_preserves_backend_identity(hass: HomeAssistant) -> None:
+    transport = FakeTransport()
+    install_factory(hass, transport)
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    assert result["step_id"] == "reauth_confirm"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_TOKEN: "replacement-token"}
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert entry.unique_id == BACKEND_ID
+    assert entry.data[CONF_API_TOKEN] == "replacement-token"
+
+
+@pytest.mark.asyncio
+async def test_reauth_rejects_wrong_backend_instance(hass: HomeAssistant) -> None:
+    install_factory(
+        hass,
+        FakeTransport(validation_backend_instance_id=OTHER_BACKEND_ID),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_TOKEN: "foreign-backend-token"}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reauth_confirm"
+    assert result["errors"] == {"base": "wrong_instance"}
+    assert entry.unique_id == BACKEND_ID
+    assert entry.data == ENTRY_DATA
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_preserves_backend_identity(hass: HomeAssistant) -> None:
+    install_factory(hass, FakeTransport())
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+    )
+    assert result["step_id"] == "reconfigure"
+    replacement = {
+        CONF_BASE_URL: "https://new-ops.example.test/",
+        CONF_API_TOKEN: "replacement-token",
+        CONF_VERIFY_TLS: False,
+    }
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], replacement
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert entry.unique_id == BACKEND_ID
+    assert entry.data == {
+        **replacement,
+        CONF_BASE_URL: "https://new-ops.example.test",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_rejects_wrong_backend_instance(
+    hass: HomeAssistant,
+) -> None:
+    install_factory(
+        hass,
+        FakeTransport(validation_backend_instance_id=OTHER_BACKEND_ID),
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id},
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_BASE_URL: "https://foreign-ops.example.test",
+            CONF_API_TOKEN: "foreign-backend-token",
+            CONF_VERIFY_TLS: True,
+        },
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {"base": "wrong_instance"}
+    assert entry.unique_id == BACKEND_ID
+    assert entry.data == ENTRY_DATA
 
 
 @pytest.mark.asyncio
@@ -598,6 +738,81 @@ async def test_node_migration_preserves_identity_and_updates_via_device(
 
 
 @pytest.mark.asyncio
+async def test_unresolved_node_without_history_clears_via_device_id(
+    hass: HomeAssistant,
+) -> None:
+    unresolved = replace(
+        INITIAL_RESOURCES[1],
+        current_node_id=None,
+        last_known_node_id=None,
+        node_availability=NodeAvailability.UNRESOLVED,
+    )
+    second = snapshot(
+        (unresolved,),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport([snapshot((INITIAL_RESOURCES[1],)), second]),
+    )
+    registry = dr.async_get(hass)
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    child = registry.async_get_device({(DOMAIN, key)})
+    parent = registry.async_get_device(
+        {(DOMAIN, node_registry_key(BACKEND_ID, NODE_A))}
+    )
+    assert child is not None and parent is not None
+    original_device_id = child.id
+    assert child.via_device_id == parent.id
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    child = registry.async_get_device({(DOMAIN, key)})
+    assert child is not None
+    assert child.id == original_device_id
+    assert child.via_device_id is None
+
+
+@pytest.mark.asyncio
+async def test_unresolved_node_retains_last_known_via_device_id(
+    hass: HomeAssistant,
+) -> None:
+    unresolved = replace(
+        INITIAL_RESOURCES[1],
+        current_node_id=None,
+        last_known_node_id=NODE_A,
+        node_availability=NodeAvailability.UNRESOLVED,
+    )
+    second = snapshot(
+        (unresolved,),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport([snapshot((INITIAL_RESOURCES[1],)), second]),
+    )
+    registry = dr.async_get(hass)
+    parent = registry.async_get_device(
+        {(DOMAIN, node_registry_key(BACKEND_ID, NODE_A))}
+    )
+    assert parent is not None
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    child = registry.async_get_device(
+        {(DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_CT))}
+    )
+    assert child is not None
+    assert child.via_device_id == parent.id
+
+
+@pytest.mark.asyncio
 async def test_retained_and_successor_generations_share_vmid_without_collision(
     hass: HomeAssistant,
 ) -> None:
@@ -687,6 +902,260 @@ async def test_ambiguity_preserves_resource_binding_generation_and_device(
     assert set(entry.runtime_data.data.resources_by_id) == {RESOURCE_CT}
     key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
     assert dr.async_get(hass).async_get_device({(DOMAIN, key)}) is not None
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (
+            {"active_binding_id": "replacement-binding"},
+            "active binding is immutable",
+        ),
+        ({"vmid": 102}, "resource locator is immutable"),
+        ({"locator_generation": 5}, "locator_generation is immutable"),
+    ],
+)
+def test_same_resource_cannot_change_locator_binding_or_generation(
+    mutation: dict[str, Any], match: str
+) -> None:
+    original = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        active_binding_id="binding-a",
+        locator_generation=4,
+        resource_continuity_revision=8,
+    )
+    incoming = replace(original, **mutation)
+    with pytest.raises(ValueError, match=match):
+        snapshot(
+            (incoming,),
+            inventory_revision=11,
+            published_state_revision=21,
+        ).validate_revision_successor(snapshot((original,)))
+
+
+@pytest.mark.parametrize("reopened_presence", [PresenceState.PRESENT, PresenceState.MISSING])
+def test_terminal_resource_cannot_be_reopened_as_nonterminal(
+    reopened_presence: PresenceState,
+) -> None:
+    terminal = absent_resource(
+        RESOURCE_CT,
+        PresenceState.CONFIRMED_REMOVED,
+        vmid=101,
+        generation=4,
+        resource_continuity_revision=9,
+    )
+    if reopened_presence is PresenceState.PRESENT:
+        reopened = resource(
+            RESOURCE_CT,
+            ResourceType.LXC,
+            101,
+            "Reopened",
+            active_binding_id="binding-reopened",
+            locator_generation=4,
+            resource_continuity_revision=10,
+        )
+    else:
+        reopened = absent_resource(
+            RESOURCE_CT,
+            PresenceState.MISSING,
+            vmid=101,
+            generation=4,
+            resource_continuity_revision=10,
+        )
+    with pytest.raises(ValueError, match="terminal resource cannot be reopened"):
+        snapshot(
+            (reopened,),
+            inventory_revision=12,
+            published_state_revision=22,
+        ).validate_revision_successor(
+            snapshot(
+                (terminal,),
+                inventory_revision=11,
+                published_state_revision=21,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "incoming",
+    [
+        replace(
+            resource(
+                RESOURCE_CT,
+                ResourceType.LXC,
+                101,
+                "Cloudflared",
+                resource_continuity_revision=8,
+            ),
+            lifecycle=LifecycleState.QUARANTINED,
+            observational_continuity=ObservationalContinuity.UNCERTAIN,
+        ),
+        replace(
+            resource(
+                RESOURCE_CT,
+                ResourceType.LXC,
+                101,
+                "Cloudflared",
+                resource_continuity_revision=8,
+                security_continuity=SecurityContinuity.TRUSTED,
+            ),
+            lifecycle=LifecycleState.QUARANTINED,
+            observational_continuity=ObservationalContinuity.UNCERTAIN,
+            security_continuity=SecurityContinuity.REVOKED,
+        ),
+        absent_resource(
+            RESOURCE_CT,
+            PresenceState.CONFIRMED_REMOVED,
+            vmid=101,
+            resource_continuity_revision=8,
+        ),
+    ],
+)
+def test_security_relevant_transition_requires_newer_continuity_revision(
+    incoming: ResourceSnapshot,
+) -> None:
+    previous_security = (
+        SecurityContinuity.TRUSTED
+        if incoming.security_continuity is SecurityContinuity.REVOKED
+        else SecurityContinuity.UNVERIFIED
+    )
+    original = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        resource_continuity_revision=8,
+        security_continuity=previous_security,
+    )
+    with pytest.raises(ValueError, match="requires a newer"):
+        snapshot(
+            (incoming,),
+            inventory_revision=11,
+            published_state_revision=21,
+        ).validate_revision_successor(snapshot((original,)))
+
+
+@pytest.mark.parametrize("ambiguous_presence", [PresenceState.PRESENT, PresenceState.MISSING])
+def test_ambiguity_and_missing_keep_exact_binding_and_generation(
+    ambiguous_presence: PresenceState,
+) -> None:
+    original = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        active_binding_id="binding-a",
+        locator_generation=4,
+        resource_continuity_revision=8,
+    )
+    ambiguous = replace(
+        original,
+        presence=ambiguous_presence,
+        lifecycle=LifecycleState.QUARANTINED,
+        observational_continuity=ObservationalContinuity.UNCERTAIN,
+        detail_status=(
+            DetailStatus.OK
+            if ambiguous_presence is PresenceState.PRESENT
+            else DetailStatus.NOT_APPLICABLE
+        ),
+        current_node_id=(NODE_A if ambiguous_presence is PresenceState.PRESENT else None),
+        last_known_node_id=(None if ambiguous_presence is PresenceState.PRESENT else NODE_A),
+        node_availability=(
+            NodeAvailability.AVAILABLE
+            if ambiguous_presence is PresenceState.PRESENT
+            else NodeAvailability.NOT_APPLICABLE
+        ),
+        resource_continuity_revision=9,
+    )
+    incoming = snapshot(
+        (ambiguous,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(snapshot((original,)))
+    assert ambiguous.active_binding_id == original.active_binding_id
+    assert ambiguous.locator_generation == original.locator_generation
+
+
+def test_accepted_terminal_closure_keeps_incarnation_locator() -> None:
+    original = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        active_binding_id="binding-a",
+        locator_generation=4,
+        resource_continuity_revision=8,
+    )
+    terminal = absent_resource(
+        RESOURCE_CT,
+        PresenceState.CONFIRMED_REMOVED,
+        vmid=101,
+        generation=4,
+        resource_continuity_revision=9,
+    )
+    snapshot(
+        (terminal,),
+        inventory_revision=11,
+        published_state_revision=21,
+    ).validate_revision_successor(snapshot((original,)))
+    assert terminal.active_binding_id is None
+
+
+def test_continuity_revision_may_advance_without_visible_axis_change() -> None:
+    original = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        resource_continuity_revision=8,
+    )
+    revised = replace(original, resource_continuity_revision=11)
+    snapshot(
+        (revised,),
+        inventory_revision=11,
+        published_state_revision=21,
+    ).validate_revision_successor(snapshot((original,)))
+
+
+def test_direct_replacement_closes_old_and_uses_separate_successor_resource() -> None:
+    old_id = "dc38061a-af9b-4a65-96a7-b012e07a459c"
+    successor_id = "c4176c22-660a-4484-b8eb-e8390e9a44c6"
+    original = resource(
+        old_id,
+        ResourceType.LXC,
+        101,
+        "Old Container",
+        active_binding_id="binding-old",
+        locator_generation=4,
+        resource_continuity_revision=8,
+    )
+    old_terminal = absent_resource(
+        old_id,
+        PresenceState.NOT_CURRENT,
+        vmid=101,
+        generation=4,
+        resource_continuity_revision=9,
+        successor_resource_id=successor_id,
+    )
+    successor = resource(
+        successor_id,
+        ResourceType.LXC,
+        101,
+        "Successor",
+        active_binding_id="binding-successor",
+        locator_generation=5,
+    )
+    incoming = snapshot(
+        (old_terminal, successor),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(snapshot((original,)))
+    assert incoming.current_resources_by_locator[(SOURCE_ID, 101)] is successor
 
 
 @pytest.mark.parametrize(
@@ -874,6 +1343,164 @@ def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> Non
     with pytest.raises(ValueError, match="healthy authoritative discovery commit"):
         replace(healthy, freshness=SourceFreshness.FRESH, health=SourceHealth.DEGRADED)
 
+    with pytest.raises(ValueError, match="healthy authoritative discovery commit"):
+        source(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            last_health_run_sequence=6,
+            last_committed_run_sequence=5,
+        )
+
+    later_audit_only_completion = source(
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="audit_only_inapplicable",
+        last_health_run_sequence=5,
+        last_committed_run_sequence=5,
+    )
+    assert later_audit_only_completion.freshness is SourceFreshness.FRESH
+
+
+@pytest.mark.parametrize(
+    ("previous_source", "incoming_source", "match"),
+    [
+        (
+            source(current_context=source_context(revision=4)),
+            source(current_context=source_context(revision=3)),
+            "source_config_revision",
+        ),
+        (
+            source(
+                current_context=source_context(transport_trust_revision=3)
+            ),
+            source(
+                current_context=source_context(transport_trust_revision=2)
+            ),
+            "transport_trust_revision",
+        ),
+        (
+            source(last_issued_run_sequence=6),
+            source(last_issued_run_sequence=5),
+            "last_issued_run_sequence",
+        ),
+        (
+            source(
+                health=SourceHealth.SOURCE_UNAVAILABLE,
+                freshness=SourceFreshness.STALE,
+                health_reason="audit_only_completion",
+                last_issued_run_sequence=7,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="audit_only",
+                last_health_run_sequence=5,
+                last_run_health_outcome="success",
+                last_committed_run_sequence=5,
+            ),
+            source(
+                health=SourceHealth.SOURCE_UNAVAILABLE,
+                freshness=SourceFreshness.STALE,
+                health_reason="older_audit_completion",
+                last_issued_run_sequence=8,
+                latest_completed_run_sequence=5,
+                latest_completed_outcome="success",
+                last_health_run_sequence=5,
+                last_run_health_outcome="success",
+                last_committed_run_sequence=5,
+            ),
+            "latest_completed_run_sequence",
+        ),
+        (
+            source(
+                health=SourceHealth.SOURCE_UNAVAILABLE,
+                freshness=SourceFreshness.STALE,
+                health_reason="newer_failed_health",
+                last_issued_run_sequence=7,
+                latest_completed_run_sequence=7,
+                latest_completed_outcome="source_unavailable",
+                last_health_run_sequence=6,
+                last_run_health_outcome="source_unavailable",
+                last_committed_run_sequence=5,
+            ),
+            source(
+                health=SourceHealth.SOURCE_UNAVAILABLE,
+                freshness=SourceFreshness.STALE,
+                health_reason="older_failed_health",
+                last_issued_run_sequence=8,
+                latest_completed_run_sequence=8,
+                latest_completed_outcome="source_unavailable",
+                last_health_run_sequence=5,
+                last_run_health_outcome="source_unavailable",
+                last_committed_run_sequence=5,
+            ),
+            "last_health_run_sequence",
+        ),
+        (
+            source(
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                last_health_run_sequence=6,
+                last_committed_run_sequence=6,
+            ),
+            source(
+                health=SourceHealth.SOURCE_UNAVAILABLE,
+                freshness=SourceFreshness.STALE,
+                health_reason="newer_failure_retains_older_commit",
+                last_issued_run_sequence=7,
+                latest_completed_run_sequence=7,
+                latest_completed_outcome="source_unavailable",
+                last_health_run_sequence=7,
+                last_run_health_outcome="source_unavailable",
+                last_committed_run_sequence=5,
+            ),
+            "last_committed_run_sequence",
+        ),
+    ],
+)
+def test_source_monotonic_provenance_rejects_rollbacks(
+    previous_source: InventorySourceSnapshot,
+    incoming_source: InventorySourceSnapshot,
+    match: str,
+) -> None:
+    previous = snapshot((), sources=(previous_source,))
+    incoming = snapshot(
+        (),
+        sources=(incoming_source,),
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    with pytest.raises(ValueError, match=match):
+        incoming.validate_revision_successor(previous)
+
+
+def test_controlled_source_context_transition_uses_revisions_not_endpoint_text() -> None:
+    previous_context = source_context(
+        revision=3,
+        transport_trust_revision=2,
+        endpoint_id="endpoint-a",
+        canonical_transport_locator="https://pve-a.example.test:8006",
+    )
+    incoming_context = source_context(
+        revision=4,
+        transport_trust_revision=3,
+        endpoint_id="endpoint-b",
+        canonical_transport_locator="https://pve-b.example.test:8006",
+    )
+    previous = snapshot((), sources=(source(current_context=previous_context),))
+    incoming = snapshot(
+        (),
+        sources=(
+            source(
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                last_health_run_sequence=6,
+                last_committed_run_sequence=6,
+                current_context=incoming_context,
+            ),
+        ),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    incoming.validate_revision_successor(previous)
+
 
 def test_published_revisions_are_monotonic_and_one_revision_is_immutable() -> None:
     first = snapshot((INITIAL_RESOURCES[1],))
@@ -914,12 +1541,29 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     hass: HomeAssistant,
 ) -> None:
     secrets = {
-        "authorization": "Bearer private-authorization",
-        "mqtt_password": "private-mqtt-password",
+        "authorization": "Bearer lower-authorization-value",
+        "Authorization": "Bearer upper-authorization-value",
+        "authorization_header": "Bearer header-authorization-value",
+        "bearer_token": "bearer-token-value",
+        "mqtt_password": "mqtt-password-value",
         "private_key": "private-key-value",
-        "webhook_url": "https://hooks.example.test/private-id",
-        "api_key": "private-api-key",
-        "backend_token": "private-backend-token",
+        "webhook_id": "webhook-id-value",
+        "client_secret": "client-secret-value",
+        "api_key": "api-key-value",
+        "ssh_key": "ssh-key-value",
+        "some-service-token": "service-token-value",
+        "backend_token": "backend-token-value",
+        "update_token": "update-token-value",
+        "recovery_token": "recovery-token-value",
+        "token_value": "token-value-value",
+        "passphrase": "passphrase-value",
+        "host_authorization": "Bearer host-authorization-value",
+        "ha_ssh_key": "ha-ssh-key-value",
+        "webhook_url": "https://hooks.example.test/api/webhook/private-id",
+        "credential_object": "credential-object-value",
+        "nested_secret": "nested-secret-container-value",
+        "private_scan_url": "https://private.example.test/api/v1/scan",
+        "private_service_url": "https://private.example.test/api/v1/service",
         "canonical_locator": "https://pve.example.test:8006",
     }
     sensitive_source = source(
@@ -929,12 +1573,21 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
                 "api_key": secrets["api_key"],
                 "documentation_url": "https://docs.example.test/source",
             },
+            "service": {"client_secret": secrets["client_secret"]},
+            "hubinet_ops_service_url": secrets["private_service_url"],
         }
     )
     sensitive_node = node(
         facts={
             "MQTT_PASSWORD": secrets["mqtt_password"],
             "nested": {"private_key": secrets["private_key"], "memory": 4096},
+            "events": (
+                {
+                    "webhook_id": secrets["webhook_id"],
+                    "display": "visible-event",
+                },
+            ),
+            "cpu": 0.25,
         }
     )
     sensitive_resource = resource(
@@ -943,16 +1596,54 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
         666,
         "Sensitive",
         retained_policy={
+            "authorization": secrets["authorization"],
+            "client_secret": secrets["client_secret"],
             "backend_token": secrets["backend_token"],
+            "repository_secrets": {
+                "update_token": secrets["update_token"],
+                "recovery_token": secrets["recovery_token"],
+                "token_value": secrets["token_value"],
+                "passphrase": secrets["passphrase"],
+                "hubinet_ops_host_recovery_authorization": secrets[
+                    "host_authorization"
+                ],
+                "HUBINET_OPS_HA_SSH_KEY": secrets["ha_ssh_key"],
+                "webhook_url": secrets["webhook_url"],
+                "credentials": {"value": secrets["credential_object"]},
+            },
             "managed": False,
         },
         state={
+            "Authorization": secrets["Authorization"],
+            "authorization_header": secrets["authorization_header"],
+            "headers": {
+                "Authorization": secrets["authorization_header"],
+                "Content-Type": "application/json",
+            },
+            "bearer_token": secrets["bearer_token"],
+            "api_key": secrets["api_key"],
+            "ssh_key": secrets["ssh_key"],
             "webhook_url": secrets["webhook_url"],
+            "events": [
+                {
+                    "some-service-token": secrets["some-service-token"],
+                    "availability": "online",
+                }
+            ],
+            "hubinet_ops_scan_url": secrets["private_scan_url"],
+            "security": {
+                "secrets": {"value": secrets["nested_secret"]},
+                "mode": "visible-mode",
+            },
             "device_id": "visible-device-id",
             "registry_key": "visible-registry-key",
             "token_id": "visible-token-id",
+            "backend_token_env": "VISIBLE_BACKEND_TOKEN_ENV",
             "ssh_key_dir": "/visible/key-directory",
+            "secrets_file": "/visible/secrets-file-path",
             "documentation_url": "https://docs.example.test/resource",
+            "resource_type": "lxc",
+            "vmid": 666,
         },
     )
     entry = await setup_entry(
@@ -975,22 +1666,55 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert source_data["committed_context"]["canonical_transport_locator"] == REDACTED
     assert source_data["facts"]["authorization"] == REDACTED
     assert source_data["facts"]["endpoint"]["api_key"] == REDACTED
+    assert source_data["facts"]["service"]["client_secret"] == REDACTED
+    assert source_data["facts"]["hubinet_ops_service_url"] == REDACTED
     assert source_data["facts"]["endpoint"]["documentation_url"].startswith("https://docs")
     node_data = diagnostics["snapshot"]["nodes"][0]
     assert node_data["facts"]["MQTT_PASSWORD"] == REDACTED
     assert node_data["facts"]["nested"]["private_key"] == REDACTED
+    assert node_data["facts"]["events"][0]["webhook_id"] == REDACTED
     assert node_data["facts"]["nested"]["memory"] == 4096
+    assert node_data["facts"]["events"][0]["display"] == "visible-event"
+    assert node_data["facts"]["cpu"] == 0.25
     resource_data = diagnostics["snapshot"]["resources"][0]
+    policy = resource_data["retained_policy"]
+    assert policy["authorization"] == REDACTED
+    assert policy["client_secret"] == REDACTED
+    assert policy["managed"] is False
     assert resource_data["retained_policy"]["backend_token"] == REDACTED
+    repository_secrets = policy["repository_secrets"]
+    assert repository_secrets["update_token"] == REDACTED
+    assert repository_secrets["recovery_token"] == REDACTED
+    assert repository_secrets["token_value"] == REDACTED
+    assert repository_secrets["passphrase"] == REDACTED
+    assert repository_secrets["hubinet_ops_host_recovery_authorization"] == REDACTED
+    assert repository_secrets["HUBINET_OPS_HA_SSH_KEY"] == REDACTED
+    assert repository_secrets["webhook_url"] == REDACTED
+    assert repository_secrets["credentials"] == REDACTED
+    assert resource_data["state"]["Authorization"] == REDACTED
+    assert resource_data["state"]["authorization_header"] == REDACTED
+    assert resource_data["state"]["headers"] == REDACTED
+    assert resource_data["state"]["bearer_token"] == REDACTED
+    assert resource_data["state"]["api_key"] == REDACTED
+    assert resource_data["state"]["ssh_key"] == REDACTED
     assert resource_data["state"]["webhook_url"] == REDACTED
+    assert resource_data["state"]["events"][0]["some-service-token"] == REDACTED
+    assert resource_data["state"]["hubinet_ops_scan_url"] == REDACTED
+    assert resource_data["state"]["security"]["secrets"] == REDACTED
+    assert resource_data["state"]["security"]["mode"] == "visible-mode"
     for key in (
         "device_id",
         "registry_key",
         "token_id",
+        "backend_token_env",
         "ssh_key_dir",
+        "secrets_file",
         "documentation_url",
+        "resource_type",
+        "vmid",
     ):
         assert resource_data["state"][key] == sensitive_resource.state[key]
+    assert resource_data["state"]["events"][0]["availability"] == "online"
     diagnostics_repr = repr(diagnostics)
     assert API_TOKEN not in diagnostics_repr
     assert all(value not in diagnostics_repr for value in secrets.values())
@@ -1008,6 +1732,7 @@ def test_client_has_no_proxmox_mqtt_authority_or_mutation_path() -> None:
         "proxmoxer",
         "proxmoxapi",
         "press_action",
+        "via_device=",
         ".status.start",
         ".snapshot.post",
         "app.mqtt",

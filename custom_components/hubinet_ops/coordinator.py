@@ -160,6 +160,7 @@ def resource_device_info(
         manufacturer=MANUFACTURER,
         model=MODEL_QEMU if resource.resource_type is ResourceType.QEMU else MODEL_LXC,
         name=resource_device_name(resource),
+        via_device_id=None,
     )
     relation_node_id = resource.relation_node_id
     if relation_node_id is not None:

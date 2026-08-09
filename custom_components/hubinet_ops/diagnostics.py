@@ -31,6 +31,7 @@ _REPOSITORY_SECRET_KEYS = frozenset(
         "password",
         "private_key",
         "secret",
+        "secrets",
         "ssh_key",
         "ssh_private_key",
         "token",

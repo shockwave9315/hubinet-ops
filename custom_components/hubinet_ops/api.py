@@ -319,6 +319,8 @@ class InventorySourceSnapshot:
                 or self.health_origin is not SourceHealthOrigin.DISCOVERY_RUN
                 or not has_successful_commit
                 or self.current_context != self.committed_context
+                or self.last_health_run_sequence
+                != self.last_committed_run_sequence
             ):
                 raise ValueError(
                     "fresh source requires a healthy authoritative discovery commit"
@@ -724,6 +726,41 @@ class HubinetOpsSnapshot:
             and self != previous
         ):
             raise ValueError("one published_state_revision must identify one immutable view")
+
+        previous_sources_by_id = previous.sources_by_id
+        for source in self.sources:
+            old_source = previous_sources_by_id.get(source.inventory_source_id)
+            if old_source is None:
+                continue
+            if (
+                source.current_context.source_config_revision
+                < old_source.current_context.source_config_revision
+            ):
+                raise ValueError("source_config_revision must not regress")
+            if (
+                source.current_context.transport_trust_revision
+                < old_source.current_context.transport_trust_revision
+            ):
+                raise ValueError("transport_trust_revision must not regress")
+            if (
+                source.last_issued_run_sequence
+                < old_source.last_issued_run_sequence
+            ):
+                raise ValueError("last_issued_run_sequence must not regress")
+            for field_name in (
+                "latest_completed_run_sequence",
+                "last_health_run_sequence",
+                "last_committed_run_sequence",
+            ):
+                old_sequence = getattr(old_source, field_name)
+                sequence = getattr(source, field_name)
+                if (
+                    old_sequence is not None
+                    and sequence is not None
+                    and sequence < old_sequence
+                ):
+                    raise ValueError(f"{field_name} must not regress")
+
         previous_by_id = previous.resources_by_id
         for resource in self.resources:
             old = previous_by_id.get(resource.resource_id)
@@ -733,20 +770,53 @@ class HubinetOpsSnapshot:
                 raise ValueError("resource identity cannot move between sources")
             if resource.resource_type is not old.resource_type:
                 raise ValueError("resource_type is immutable for an incarnation")
-            if resource.locator_generation < old.locator_generation:
-                raise ValueError("locator_generation must not regress")
+            if resource.vmid != old.vmid:
+                raise ValueError("resource locator is immutable for an incarnation")
+            if resource.locator_generation != old.locator_generation:
+                raise ValueError(
+                    "locator_generation is immutable for an incarnation"
+                )
             if resource.resource_continuity_revision < old.resource_continuity_revision:
                 raise ValueError("resource_continuity_revision must not regress")
-            if (
-                resource.active_binding_id is not None
-                and resource.active_binding_id == old.active_binding_id
-                and (
-                    resource.inventory_source_id != old.inventory_source_id
-                    or resource.vmid != old.vmid
-                    or resource.locator_generation != old.locator_generation
+
+            old_terminal = old.presence in {
+                PresenceState.CONFIRMED_REMOVED,
+                PresenceState.NOT_CURRENT,
+            }
+            terminal = resource.presence in {
+                PresenceState.CONFIRMED_REMOVED,
+                PresenceState.NOT_CURRENT,
+            }
+            if old_terminal:
+                if not terminal or resource.presence is not old.presence:
+                    raise ValueError("terminal resource cannot be reopened or reclassified")
+            elif terminal:
+                if resource.active_binding_id is not None:
+                    raise ValueError("terminal transition must close the active binding")
+            elif resource.active_binding_id != old.active_binding_id:
+                raise ValueError(
+                    "active binding is immutable before a terminal transition"
                 )
+
+            security_relevant_transition = (
+                resource.observational_continuity
+                is not old.observational_continuity
+                or resource.security_continuity is not old.security_continuity
+                or (
+                    (old.lifecycle is LifecycleState.QUARANTINED)
+                    != (resource.lifecycle is LifecycleState.QUARANTINED)
+                )
+                or (terminal and not old_terminal)
+            )
+            if (
+                security_relevant_transition
+                and resource.resource_continuity_revision
+                <= old.resource_continuity_revision
             ):
-                raise ValueError("active binding identity changed locator or generation")
+                raise ValueError(
+                    "security-relevant resource transition requires a newer "
+                    "resource_continuity_revision"
+                )
 
 
 class HubinetOpsTransport(Protocol):
