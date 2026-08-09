@@ -2,7 +2,7 @@
 
 The dynamic platform callback pattern was adapted from Home Assistant Core's
 Apache-2.0 ``proxmoxve`` integration. Availability is deliberately split:
-retained identity/history facts remain present while current detail/node facts
+resource devices/entities remain retained, while present-resource current facts
 fail closed on source freshness, detail status, or node relation.
 """
 
@@ -249,6 +249,8 @@ class HubinetOpsResourceSensor(HubinetOpsResourceEntity, SensorEntity):
         if not super().available:
             return False
         resource = self.resource
+        if resource.presence is not PresenceState.PRESENT:
+            return False
         source = self.coordinator.data.sources_by_id[resource.inventory_source_id]
         description = self.entity_description
         if description.requires_current_source and not source.current_facts_available:

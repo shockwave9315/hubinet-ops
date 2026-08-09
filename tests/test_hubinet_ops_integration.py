@@ -427,6 +427,23 @@ def registry_unique_ids(
     }
 
 
+def resource_entity_states(
+    hass: HomeAssistant, entry: MockConfigEntry, resource_id: str
+) -> dict[str, str]:
+    key = resource_registry_key(BACKEND_ID, resource_id)
+    prefix = f"{key}:"
+    states: dict[str, str] = {}
+    for item in er.async_entries_for_config_entry(
+        er.async_get(hass), entry.entry_id
+    ):
+        if not item.unique_id.startswith(prefix):
+            continue
+        state = hass.states.get(item.entity_id)
+        assert state is not None
+        states[item.unique_id.removeprefix(prefix)] = state.state
+    return states
+
+
 @pytest.mark.asyncio
 async def test_config_flow_binds_exact_backend_instance(hass: HomeAssistant) -> None:
     transport = FakeTransport([snapshot(())])
@@ -853,23 +870,173 @@ async def test_retained_and_successor_generations_share_vmid_without_collision(
     assert registry_unique_ids(hass, entry, old_key).isdisjoint(
         registry_unique_ids(hass, entry, successor_key)
     )
-    old_status = next(
-        item
-        for item in er.async_entries_for_config_entry(
-            er.async_get(hass), entry.entry_id
-        )
-        if item.unique_id == f"{old_key}:status"
+    assert set(resource_entity_states(hass, entry, old_id).values()) == {
+        STATE_UNAVAILABLE
+    }
+    assert all(
+        state != STATE_UNAVAILABLE
+        for state in resource_entity_states(hass, entry, successor_id).values()
     )
-    successor_status = next(
-        item
-        for item in er.async_entries_for_config_entry(
-            er.async_get(hass), entry.entry_id
-        )
-        if item.unique_id == f"{successor_key}:status"
-    )
-    assert hass.states.get(old_status.entity_id).state == STATE_UNAVAILABLE
-    assert hass.states.get(successor_status.entity_id).state == "running"
     assert old_device.via_device_id is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "retained",
+    [
+        absent_resource(
+            RESOURCE_CT,
+            PresenceState.MISSING,
+            resource_continuity_revision=2,
+        ),
+        absent_resource(
+            RESOURCE_CT,
+            PresenceState.CONFIRMED_REMOVED,
+            resource_continuity_revision=2,
+        ),
+    ],
+    ids=("missing", "confirmed-removed"),
+)
+async def test_absent_resource_transition_retains_all_entities_unavailable(
+    hass: HomeAssistant,
+    retained: ResourceSnapshot,
+) -> None:
+    first = snapshot((INITIAL_RESOURCES[1],))
+    second = snapshot(
+        (retained,),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    entry = await setup_entry(hass, FakeTransport([first, second]))
+    before = registry_unique_ids(
+        hass, entry, resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    )
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    after = registry_unique_ids(
+        hass, entry, resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    )
+    assert after == before
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    assert set(states) == {
+        "status",
+        "type",
+        "node",
+        "presence",
+        "detail_status",
+        "lifecycle",
+        "observational_continuity",
+        "security_continuity",
+    }
+    assert set(states.values()) == {STATE_UNAVAILABLE}
+
+
+@pytest.mark.asyncio
+async def test_replacement_transition_retains_old_entities_unavailable(
+    hass: HomeAssistant,
+) -> None:
+    successor_id = "c4176c22-660a-4484-b8eb-e8390e9a44c6"
+    original = replace(
+        INITIAL_RESOURCES[1],
+        locator_generation=4,
+        resource_continuity_revision=8,
+    )
+    old = absent_resource(
+        RESOURCE_CT,
+        PresenceState.NOT_CURRENT,
+        vmid=101,
+        generation=4,
+        resource_continuity_revision=9,
+        successor_resource_id=successor_id,
+    )
+    successor = resource(
+        successor_id,
+        ResourceType.LXC,
+        101,
+        "Replacement Container",
+        locator_generation=5,
+    )
+    second = snapshot(
+        (old, successor),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot((original,)), second])
+    )
+    old_key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    before = registry_unique_ids(hass, entry, old_key)
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert registry_unique_ids(hass, entry, old_key) == before
+    assert set(resource_entity_states(hass, entry, RESOURCE_CT).values()) == {
+        STATE_UNAVAILABLE
+    }
+    successor_states = resource_entity_states(hass, entry, successor_id)
+    assert successor_states
+    assert all(state != STATE_UNAVAILABLE for state in successor_states.values())
+
+
+@pytest.mark.asyncio
+async def test_present_detail_error_keeps_independent_entities_available(
+    hass: HomeAssistant,
+) -> None:
+    detail_error = replace(
+        INITIAL_RESOURCES[1],
+        detail_status=DetailStatus.ERROR,
+    )
+    second = snapshot(
+        (detail_error,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot((INITIAL_RESOURCES[1],)), second])
+    )
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    assert states["status"] == STATE_UNAVAILABLE
+    assert states["detail_status"] == "error"
+    assert states["presence"] == "present"
+    assert states["type"] == "lxc"
+    assert states["node"] != STATE_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_present_unavailable_node_only_blocks_node_dependent_entities(
+    hass: HomeAssistant,
+) -> None:
+    unavailable_node = node(available=False)
+    node_unavailable = replace(
+        INITIAL_RESOURCES[1],
+        node_availability=NodeAvailability.UNAVAILABLE,
+    )
+    second = snapshot(
+        (node_unavailable,),
+        nodes=(unavailable_node,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot((INITIAL_RESOURCES[1],)), second])
+    )
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    assert {
+        key for key, state in states.items() if state == STATE_UNAVAILABLE
+    } == {"status", "node"}
+    assert states["presence"] == "present"
+    assert states["detail_status"] == "ok"
 
 
 @pytest.mark.asyncio
@@ -1658,6 +1825,7 @@ def test_provider_kind_is_immutable_for_existing_source() -> None:
     incoming = snapshot(
         (),
         sources=(replace(source(), provider_kind="other-provider"),),
+        inventory_revision=11,
         published_state_revision=21,
     )
     with pytest.raises(ValueError, match="provider_kind is immutable"):
@@ -1843,7 +2011,7 @@ def test_node_identity_cannot_move_between_inventory_sources() -> None:
     )
     incoming = snapshot(
         (),
-        sources=(source(inventory_source_id=SOURCE_B_ID),),
+        sources=(source(), source(inventory_source_id=SOURCE_B_ID)),
         nodes=(node(inventory_source_id=SOURCE_B_ID),),
         inventory_revision=11,
         published_state_revision=21,
@@ -1865,6 +2033,7 @@ def test_node_display_and_runtime_facts_may_change_within_same_source() -> None:
         (),
         sources=(source(),),
         nodes=(updated,),
+        inventory_revision=11,
         published_state_revision=21,
     )
     incoming.validate_revision_successor(

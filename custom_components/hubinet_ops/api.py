@@ -589,6 +589,10 @@ class HubinetOpsSnapshot:
     published_at: str
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "sources", tuple(self.sources))
+        object.__setattr__(self, "nodes", tuple(self.nodes))
+        object.__setattr__(self, "resources", tuple(self.resources))
+
         if type(self.inventory_revision) is not int or self.inventory_revision < 0:
             raise ValueError("inventory_revision must be a non-negative integer")
         _require_positive(self.published_state_revision, "published_state_revision")
@@ -712,6 +716,65 @@ class HubinetOpsSnapshot:
             }
         )
 
+    @property
+    def inventory_projection(self) -> tuple[tuple[Any, ...], ...]:
+        """Return the explicit inventory-owned portion of this published view."""
+
+        sources = tuple(
+            sorted(
+                (
+                    source.inventory_source_id,
+                    source.name,
+                    source.provider_kind,
+                    source.facts,
+                )
+                for source in self.sources
+            )
+        )
+        nodes = tuple(
+            sorted(
+                (
+                    node.node_id,
+                    node.inventory_source_id,
+                    node.name,
+                    node.status,
+                    node.available,
+                    node.facts,
+                )
+                for node in self.nodes
+            )
+        )
+        resources = tuple(
+            sorted(
+                (
+                    resource.resource_id,
+                    resource.inventory_source_id,
+                    resource.active_binding_id,
+                    resource.resource_type,
+                    resource.vmid,
+                    resource.locator_generation,
+                    resource.resource_continuity_revision,
+                    resource.name,
+                    resource.status,
+                    resource.current_node_id,
+                    resource.last_known_node_id,
+                    resource.presence,
+                    resource.lifecycle,
+                    resource.observational_continuity,
+                    resource.security_continuity,
+                    resource.detail_status,
+                    resource.node_availability,
+                    resource.state_level,
+                    resource.retained_policy,
+                    resource.state,
+                    resource.termination_reason,
+                    resource.successor_resource_id,
+                )
+                for resource in self.resources
+            )
+        )
+        return sources, nodes, resources
+
     def validate_revision_successor(self, previous: HubinetOpsSnapshot) -> None:
         """Reject regressing or mutable views for an existing backend entry."""
 
@@ -728,6 +791,30 @@ class HubinetOpsSnapshot:
             raise ValueError("one published_state_revision must identify one immutable view")
 
         previous_sources_by_id = previous.sources_by_id
+        previous_nodes_by_id = previous.nodes_by_id
+        previous_resources_by_id = previous.resources_by_id
+        current_source_ids = set(self.sources_by_id)
+        current_node_ids = set(self.nodes_by_id)
+        current_resource_ids = set(self.resources_by_id)
+
+        missing_source_ids = set(previous_sources_by_id) - current_source_ids
+        if missing_source_ids:
+            raise ValueError("published snapshot cannot omit a retained inventory source")
+        missing_node_ids = set(previous_nodes_by_id) - current_node_ids
+        if missing_node_ids:
+            raise ValueError("published snapshot cannot omit a retained node")
+        missing_resource_ids = set(previous_resources_by_id) - current_resource_ids
+        if missing_resource_ids:
+            raise ValueError("published snapshot cannot omit a retained resource")
+
+        if (
+            self.inventory_projection != previous.inventory_projection
+            and self.inventory_revision <= previous.inventory_revision
+        ):
+            raise ValueError(
+                "inventory-owned changes require a newer inventory_revision"
+            )
+
         for source in self.sources:
             old_source = previous_sources_by_id.get(source.inventory_source_id)
             if old_source is None:
@@ -839,7 +926,6 @@ class HubinetOpsSnapshot:
                     "successful commit provenance is immutable for its run sequence"
                 )
 
-        previous_nodes_by_id = previous.nodes_by_id
         for node in self.nodes:
             old_node = previous_nodes_by_id.get(node.node_id)
             if (
@@ -848,9 +934,8 @@ class HubinetOpsSnapshot:
             ):
                 raise ValueError("node identity cannot move between sources")
 
-        previous_by_id = previous.resources_by_id
         for resource in self.resources:
-            old = previous_by_id.get(resource.resource_id)
+            old = previous_resources_by_id.get(resource.resource_id)
             if old is None:
                 continue
             if resource.inventory_source_id != old.inventory_source_id:
