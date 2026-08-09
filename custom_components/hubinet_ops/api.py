@@ -127,6 +127,9 @@ class SourceHealthOrigin(StrEnum):
     INITIAL = "initial"
 
 
+_SUCCESSFUL_RUN_OUTCOME = "success"
+
+
 def _deep_freeze(value: Any) -> Any:
     """Recursively freeze one JSON-like backend snapshot value."""
 
@@ -272,6 +275,7 @@ class InventorySourceSnapshot:
             "last health run",
         )
         self._validate_run_sequence_lattice()
+        self._validate_committed_run_outcomes()
 
         successful_fields = (
             self.last_successful_observed_at,
@@ -377,6 +381,25 @@ class InventorySourceSnapshot:
                     "<= latest_completed_run_sequence <= last_issued_run_sequence "
                     f"({lower_name} exceeds {upper_name})"
                 )
+
+    def _validate_committed_run_outcomes(self) -> None:
+        committed_sequence = self.last_committed_run_sequence
+        if committed_sequence is None:
+            return
+        if (
+            self.last_health_run_sequence == committed_sequence
+            and self.last_run_health_outcome != _SUCCESSFUL_RUN_OUTCOME
+        ):
+            raise ValueError(
+                "the committed run must retain a successful health outcome"
+            )
+        if (
+            self.latest_completed_run_sequence == committed_sequence
+            and self.latest_completed_outcome != _SUCCESSFUL_RUN_OUTCOME
+        ):
+            raise ValueError(
+                "the committed run must retain a successful completion outcome"
+            )
 
     def _validate_context_provenance(self) -> None:
         committed = self.committed_context
@@ -1018,6 +1041,20 @@ class HubinetOpsSnapshot:
             old_source = previous_sources_by_id.get(source.inventory_source_id)
             if old_source is None:
                 continue
+            if (
+                old_source.freshness is SourceFreshness.STALE
+                and source.freshness is SourceFreshness.FRESH
+                and (
+                    old_source.last_committed_run_sequence is None
+                    or source.last_committed_run_sequence is None
+                    or source.last_committed_run_sequence
+                    <= old_source.last_committed_run_sequence
+                )
+            ):
+                raise ValueError(
+                    "a stale source requires a newer successful inventory "
+                    "commit before returning to fresh"
+                )
             if source.provider_kind != old_source.provider_kind:
                 raise ValueError("provider_kind is immutable for an inventory source")
             if (

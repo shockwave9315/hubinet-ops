@@ -1606,17 +1606,46 @@ def test_source_durable_sequence_cannot_return_to_unset(
 
 
 @pytest.mark.parametrize(
-    ("incoming_source", "match"),
+    ("previous_source", "incoming_source", "match"),
     [
         (
-            replace(source(), latest_completed_outcome="rewritten_completion"),
+            source(
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="audit_only_inapplicable",
+            ),
+            source(
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="rewritten_audit_outcome",
+            ),
             "latest completed outcome is immutable",
         ),
         (
-            replace(source(), last_run_health_outcome="rewritten_health"),
+            source(
+                health=SourceHealth.SOURCE_UNAVAILABLE,
+                freshness=SourceFreshness.STALE,
+                health_reason="active_endpoint_timeout",
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="source_unavailable",
+                last_health_run_sequence=6,
+                last_run_health_outcome="source_unavailable",
+            ),
+            source(
+                health=SourceHealth.SOURCE_UNAVAILABLE,
+                freshness=SourceFreshness.STALE,
+                health_reason="active_endpoint_timeout",
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="source_unavailable",
+                last_health_run_sequence=6,
+                last_run_health_outcome="rewritten_health",
+            ),
             "last run health outcome is immutable",
         ),
         (
+            source(),
             source(
                 current_context=source_context(revision=4),
                 committed_context=source_context(revision=4),
@@ -1626,6 +1655,7 @@ def test_source_durable_sequence_cannot_return_to_unset(
     ],
 )
 def test_same_source_sequence_cannot_rewrite_provenance(
+    previous_source: InventorySourceSnapshot,
     incoming_source: InventorySourceSnapshot,
     match: str,
 ) -> None:
@@ -1635,7 +1665,9 @@ def test_same_source_sequence_cannot_rewrite_provenance(
         published_state_revision=21,
     )
     with pytest.raises(ValueError, match=match):
-        incoming.validate_revision_successor(snapshot((), sources=(source(),)))
+        incoming.validate_revision_successor(
+            snapshot((), sources=(previous_source,))
+        )
 
 
 @pytest.mark.parametrize(
@@ -1791,14 +1823,15 @@ def test_health_only_expiry_retains_exact_committed_provenance() -> None:
                 last_committed_run_sequence=5,
             ),
             source(
-                health=SourceHealth.SOURCE_UNAVAILABLE,
+                health=SourceHealth.HEALTHY,
                 freshness=SourceFreshness.STALE,
-                health_reason="older_failed_health",
+                health_origin=SourceHealthOrigin.TIME_EXPIRY,
+                health_reason="older_committed_health_expired",
                 last_issued_run_sequence=8,
                 latest_completed_run_sequence=8,
-                latest_completed_outcome="source_unavailable",
+                latest_completed_outcome="audit_only_inapplicable",
                 last_health_run_sequence=5,
-                last_run_health_outcome="source_unavailable",
+                last_run_health_outcome="success",
                 last_committed_run_sequence=5,
             ),
             "last_health_run_sequence",

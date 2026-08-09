@@ -1795,6 +1795,36 @@ def test_initial_source_rejects_applied_run_health_provenance() -> None:
         )
 
 
+def test_fresh_source_requires_successful_exact_committed_health_outcome() -> None:
+    with pytest.raises(ValueError, match="successful health outcome"):
+        replace(source(), last_run_health_outcome="source_unavailable")
+
+
+def test_fresh_source_requires_successful_exact_committed_completion_outcome() -> None:
+    with pytest.raises(ValueError, match="successful completion outcome"):
+        replace(source(), latest_completed_outcome="source_unavailable")
+
+
+def test_normal_successful_commit_is_fresh_and_current() -> None:
+    committed = source()
+    assert committed.last_run_health_outcome == "success"
+    assert committed.latest_completed_outcome == "success"
+    assert committed.current_facts_available
+
+
+def test_fresh_source_allows_newer_audit_only_completion() -> None:
+    committed = replace(
+        source(),
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="audit_only_inapplicable",
+    )
+    assert committed.last_committed_run_sequence == 5
+    assert committed.last_health_run_sequence == 5
+    assert committed.latest_completed_run_sequence == 6
+    assert committed.current_facts_available
+
+
 def test_time_expiry_rejects_changed_current_context() -> None:
     with pytest.raises(ValueError, match="exact committed run and context"):
         time_expiry_source(current_context=context(revision=4))
@@ -1842,6 +1872,68 @@ def test_time_expiry_allows_newer_audit_only_completion() -> None:
     assert expired.latest_completed_run_sequence == 6
     assert expired.last_committed_run_sequence == 5
     assert expired.last_health_run_sequence == 5
+
+
+@pytest.mark.parametrize("published_state_revision", [21, 500])
+def test_expired_commit_cannot_return_to_fresh_without_new_commit(
+    published_state_revision: int,
+) -> None:
+    previous = snapshot(
+        sources=(time_expiry_source(),),
+        resources=(),
+    )
+    incoming = snapshot(
+        sources=(source(),),
+        resources=(),
+        published_state_revision=published_state_revision,
+    )
+
+    with pytest.raises(ValueError, match="stale source requires a newer"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_expired_source_recovers_after_skipped_new_successful_commit() -> None:
+    previous = snapshot(
+        sources=(time_expiry_source(),),
+        resources=(),
+    )
+    incoming = snapshot(
+        sources=(successful_commit_source(sequence=7),),
+        resources=(),
+        inventory_revision=11,
+        published_state_revision=500,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert incoming.sources[0].last_committed_run_sequence == 7
+    assert incoming.sources[0].current_facts_available
+
+
+def test_expiry_cannot_be_hidden_by_intermediate_stale_view() -> None:
+    expired = snapshot(
+        sources=(time_expiry_source(),),
+        resources=(),
+    )
+    still_stale = snapshot(
+        sources=(
+            replace(
+                time_expiry_source(),
+                health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+                health_reason="authority_remains_invalidated",
+            ),
+        ),
+        resources=(),
+        published_state_revision=21,
+    )
+    still_stale.validate_revision_successor(expired)
+    resurrected = snapshot(
+        sources=(source(),),
+        resources=(),
+        published_state_revision=22,
+    )
+
+    with pytest.raises(ValueError, match="stale source requires a newer"):
+        resurrected.validate_revision_successor(still_stale)
 
 
 def test_controlled_context_transition_is_not_misclassified_as_time_expiry() -> None:
