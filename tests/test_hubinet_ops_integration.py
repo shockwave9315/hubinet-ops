@@ -1669,21 +1669,21 @@ def test_provider_kind_is_immutable_for_existing_source() -> None:
     [
         (
             source_context(endpoint_id="different-endpoint"),
-            "endpoint_id change requires a newer source_config_revision",
+            "endpoint_id is immutable",
         ),
         (
             source_context(
                 canonical_transport_locator="https://other-pve.example.test:8006"
             ),
-            "canonical_transport_locator change requires a newer",
+            "canonical transport locator is immutable",
         ),
         (
             source_context(canonicalization_contract_version=2),
-            "canonicalization_contract_version change requires a newer",
+            "canonicalization migration requires a newer",
         ),
     ],
 )
-def test_current_route_change_requires_newer_source_config_revision(
+def test_unrevisioned_current_route_change_is_rejected(
     incoming_context: SourceContext,
     match: str,
 ) -> None:
@@ -1707,35 +1707,132 @@ def test_current_route_change_requires_newer_source_config_revision(
         )
 
 
-def test_controlled_source_context_transition_uses_revisions_not_endpoint_text() -> None:
+def test_active_endpoint_is_immutable_even_with_newer_source_config_revision() -> None:
     previous_context = source_context(
-        revision=3,
-        transport_trust_revision=2,
         endpoint_id="endpoint-a",
         canonical_transport_locator="https://pve-a.example.test:8006",
     )
     incoming_context = source_context(
         revision=4,
-        transport_trust_revision=3,
         endpoint_id="endpoint-b",
-        canonical_transport_locator="https://pve-b.example.test:8006",
+        canonical_transport_locator="https://pve-a.example.test:8006",
     )
-    previous = snapshot((), sources=(source(current_context=previous_context),))
+    controlled_transition = source(
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="active_endpoint_replacement_attempt",
+        current_context=incoming_context,
+        committed_context=previous_context,
+    )
     incoming = snapshot(
         (),
-        sources=(
-            source(
-                last_issued_run_sequence=6,
-                latest_completed_run_sequence=6,
-                last_health_run_sequence=6,
-                last_committed_run_sequence=6,
-                current_context=incoming_context,
-            ),
-        ),
-        inventory_revision=11,
+        sources=(controlled_transition,),
         published_state_revision=21,
     )
-    incoming.validate_revision_successor(previous)
+    with pytest.raises(ValueError, match="endpoint_id is immutable"):
+        incoming.validate_revision_successor(
+            snapshot((), sources=(source(current_context=previous_context),))
+        )
+
+
+def test_canonical_locator_cannot_change_within_same_contract_version() -> None:
+    previous_context = source_context(
+        endpoint_id="endpoint-a",
+        canonical_transport_locator="https://pve-a.example.test:8006",
+    )
+    incoming_context = source_context(
+        revision=4,
+        endpoint_id="endpoint-a",
+        canonical_transport_locator="https://pve-alias.example.test:8006",
+    )
+    controlled_transition = source(
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="canonical_locator_rewrite_attempt",
+        current_context=incoming_context,
+        committed_context=previous_context,
+    )
+    incoming = snapshot(
+        (),
+        sources=(controlled_transition,),
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match="canonical transport locator is immutable"):
+        incoming.validate_revision_successor(
+            snapshot((), sources=(source(current_context=previous_context),))
+        )
+
+
+def test_source_config_revision_may_rise_without_route_change() -> None:
+    previous_context = source_context(revision=3)
+    current_context = source_context(revision=4)
+    controlled_transition = source(
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="credential_configuration_changed",
+        current_context=current_context,
+        committed_context=previous_context,
+    )
+    snapshot(
+        (),
+        sources=(controlled_transition,),
+        published_state_revision=21,
+    ).validate_revision_successor(
+        snapshot((), sources=(source(current_context=previous_context),))
+    )
+
+
+def test_transport_trust_revision_may_rise_for_same_endpoint() -> None:
+    previous_context = source_context(transport_trust_revision=2)
+    current_context = source_context(transport_trust_revision=3)
+    controlled_transition = source(
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="transport_trust_changed",
+        current_context=current_context,
+        committed_context=previous_context,
+    )
+    snapshot(
+        (),
+        sources=(controlled_transition,),
+        published_state_revision=21,
+    ).validate_revision_successor(
+        snapshot((), sources=(source(current_context=previous_context),))
+    )
+
+
+def test_controlled_canonicalization_migration_may_change_locator() -> None:
+    previous_context = source_context(
+        revision=3,
+        endpoint_id="endpoint-a",
+        canonical_transport_locator="https://PVE.EXAMPLE.test:8006/",
+        canonicalization_contract_version=1,
+    )
+    migrated_context = source_context(
+        revision=4,
+        endpoint_id="endpoint-a",
+        canonical_transport_locator="https://pve.example.test:8006",
+        canonicalization_contract_version=2,
+    )
+    controlled_transition = source(
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="canonicalization_contract_migrated",
+        current_context=migrated_context,
+        committed_context=previous_context,
+    )
+    snapshot(
+        (),
+        sources=(controlled_transition,),
+        published_state_revision=21,
+    ).validate_revision_successor(
+        snapshot((), sources=(source(current_context=previous_context),))
+    )
 
 
 def test_node_identity_cannot_move_between_inventory_sources() -> None:

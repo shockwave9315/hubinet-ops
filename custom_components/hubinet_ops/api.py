@@ -745,21 +745,40 @@ class HubinetOpsSnapshot:
             ):
                 raise ValueError("transport_trust_revision must not regress")
             if (
-                source.current_context.source_config_revision
-                == old_source.current_context.source_config_revision
+                source.current_context.endpoint_id
+                != old_source.current_context.endpoint_id
             ):
-                for field_name in (
-                    "endpoint_id",
-                    "canonical_transport_locator",
-                    "canonicalization_contract_version",
+                raise ValueError(
+                    "endpoint_id is immutable for an existing inventory source"
+                )
+            if (
+                source.current_context.canonicalization_contract_version
+                == old_source.current_context.canonicalization_contract_version
+            ):
+                if (
+                    source.current_context.canonical_transport_locator
+                    != old_source.current_context.canonical_transport_locator
                 ):
-                    if getattr(source.current_context, field_name) != getattr(
-                        old_source.current_context, field_name
-                    ):
-                        raise ValueError(
-                            f"{field_name} change requires a newer "
-                            "source_config_revision"
-                        )
+                    raise ValueError(
+                        "canonical transport locator is immutable within a "
+                        "canonicalization contract version"
+                    )
+            else:
+                if (
+                    source.current_context.source_config_revision
+                    <= old_source.current_context.source_config_revision
+                ):
+                    raise ValueError(
+                        "canonicalization migration requires a newer "
+                        "source_config_revision"
+                    )
+                if (
+                    source.current_context.canonicalization_contract_version
+                    < old_source.current_context.canonicalization_contract_version
+                ):
+                    raise ValueError(
+                        "canonicalization_contract_version must increase during migration"
+                    )
             if (
                 source.last_issued_run_sequence
                 < old_source.last_issued_run_sequence
