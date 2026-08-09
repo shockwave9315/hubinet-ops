@@ -22,6 +22,7 @@ _REPOSITORY_SECRET_KEYS = frozenset(
         CONF_API_TOKEN,
         CONF_BASE_URL,
         "api_key",
+        "auth_header",
         "authorization",
         "authorization_header",
         "canonical_transport_locator",
@@ -33,6 +34,8 @@ _REPOSITORY_SECRET_KEYS = frozenset(
         "password",
         "private_key",
         "secret",
+        "secret_access_key",
+        "secret_key",
         "secrets",
         "ssh_key",
         "ssh_private_key",
@@ -45,14 +48,23 @@ _REPOSITORY_SECRET_KEYS = frozenset(
 
 _REPOSITORY_SECRET_SUFFIXES = (
     "_api_key",
+    "_auth_header",
     "_authorization",
+    "_authorization_header",
+    "_base_url",
+    "_credential",
     "_credentials",
     "_passphrase",
     "_password",
     "_private_key",
     "_secret",
+    "_secret_access_key",
+    "_secret_key",
+    "_ssh_key",
     "_token",
+    "_token_value",
     "_webhook_id",
+    "_webhook_url",
 )
 
 

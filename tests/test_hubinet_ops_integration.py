@@ -2137,6 +2137,19 @@ def test_diagnostics_key_normalization_recognizes_common_word_boundaries(
         "baseUrl",
         "canonicalTransportLocator",
         "webhookUrl",
+        "secretKey",
+        "clientSecretKey",
+        "secretAccessKey",
+        "awsSecretAccessKey",
+        "dbCredential",
+        "apiCredential",
+        "authHeader",
+        "proxyAuthorizationHeader",
+        "deploySshKey",
+        "serviceWebhookUrl",
+        "serviceTokenValue",
+        "backendBaseUrl",
+        "serviceBaseUrl",
         "bearer_token",
         "bearer-token",
         "bearer.token",
@@ -2158,6 +2171,8 @@ def test_diagnostics_redact_secret_key_spelling_variants(key: str) -> None:
         "authorization_mode",
         "documentationUrl",
         "normalValue",
+        "credential_status",
+        "secret_rotation_status",
     ],
 )
 def test_diagnostics_do_not_over_redact_benign_keys(key: str) -> None:
@@ -2232,6 +2247,14 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
         "camel_client_secret": "camel-client-secret-value",
         "camel_access_token": "camel-access-token-value",
         "camel_refresh_token": "camel-refresh-token-value",
+        "namespaced_secret_access_key": "namespaced-secret-access-key-value",
+        "namespaced_credential": "namespaced-credential-value",
+        "namespaced_auth_header": "namespaced-auth-header-value",
+        "namespaced_secret_key": "namespaced-secret-key-value",
+        "namespaced_ssh_key": "namespaced-ssh-key-value",
+        "namespaced_webhook_url": "https://hooks.example.test/service/private-id",
+        "namespaced_token_value": "namespaced-token-value",
+        "namespaced_base_url": "https://backend.example.test/private-base",
     }
     sensitive_source = source(
         facts={
@@ -2244,7 +2267,12 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
             },
             "service": {"client_secret": secrets["client_secret"]},
             "nested": [
-                {"SSHPrivateKey": secrets["camel_ssh_private_key"]},
+                {
+                    "SSHPrivateKey": secrets["camel_ssh_private_key"],
+                    "awsSecretAccessKey": secrets[
+                        "namespaced_secret_access_key"
+                    ],
+                },
                 {"normalValue": "visible-source-value"},
             ],
             "hubinet_ops_service_url": secrets["private_service_url"],
@@ -2262,6 +2290,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
                 },
             ),
             "privateKey": secrets["camel_private_key"],
+            "dbCredential": secrets["namespaced_credential"],
             "cpu": 0.25,
         }
     )
@@ -2274,7 +2303,9 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
             "authorization": secrets["authorization"],
             "client_secret": secrets["client_secret"],
             "clientSecret": secrets["camel_client_secret"],
+            "clientSecretKey": secrets["namespaced_secret_key"],
             "accessToken": secrets["camel_access_token"],
+            "proxyAuthorizationHeader": secrets["namespaced_auth_header"],
             "backend_token": secrets["backend_token"],
             "repository_secrets": {
                 "update_token": secrets["update_token"],
@@ -2290,7 +2321,10 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
             },
             "managed": False,
         },
-        effective_policy={"refreshToken": secrets["camel_refresh_token"]},
+        effective_policy={
+            "refreshToken": secrets["camel_refresh_token"],
+            "serviceWebhookUrl": secrets["namespaced_webhook_url"],
+        },
         state={
             "Authorization": secrets["Authorization"],
             "authorization_header": secrets["authorization_header"],
@@ -2302,7 +2336,10 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
             "api_key": secrets["api_key"],
             "APIKey": secrets["camel_api_key"],
             "tokenValue": secrets["camel_token_value"],
+            "serviceTokenValue": secrets["namespaced_token_value"],
             "ssh_key": secrets["ssh_key"],
+            "deploySshKey": secrets["namespaced_ssh_key"],
+            "backendBaseUrl": secrets["namespaced_base_url"],
             "webhook_url": secrets["webhook_url"],
             "events": [
                 {
@@ -2351,6 +2388,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert source_data["facts"]["service"]["client_secret"] == REDACTED
     assert source_data["facts"]["hubinet_ops_service_url"] == REDACTED
     assert source_data["facts"]["nested"][0]["SSHPrivateKey"] == REDACTED
+    assert source_data["facts"]["nested"][0]["awsSecretAccessKey"] == REDACTED
     assert (
         source_data["facts"]["nested"][1]["normalValue"]
         == "visible-source-value"
@@ -2362,6 +2400,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert node_data["facts"]["events"][0]["webhook_id"] == REDACTED
     assert node_data["facts"]["events"][0]["webhookId"] == REDACTED
     assert node_data["facts"]["privateKey"] == REDACTED
+    assert node_data["facts"]["dbCredential"] == REDACTED
     assert node_data["facts"]["nested"]["memory"] == 4096
     assert node_data["facts"]["events"][0]["display"] == "visible-event"
     assert node_data["facts"]["cpu"] == 0.25
@@ -2370,9 +2409,12 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert policy["authorization"] == REDACTED
     assert policy["client_secret"] == REDACTED
     assert policy["clientSecret"] == REDACTED
+    assert policy["clientSecretKey"] == REDACTED
     assert policy["accessToken"] == REDACTED
+    assert policy["proxyAuthorizationHeader"] == REDACTED
     assert policy["managed"] is False
     assert resource_data["effective_policy"]["refreshToken"] == REDACTED
+    assert resource_data["effective_policy"]["serviceWebhookUrl"] == REDACTED
     assert resource_data["retained_policy"]["backend_token"] == REDACTED
     repository_secrets = policy["repository_secrets"]
     assert repository_secrets["update_token"] == REDACTED
@@ -2390,7 +2432,10 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert resource_data["state"]["api_key"] == REDACTED
     assert resource_data["state"]["APIKey"] == REDACTED
     assert resource_data["state"]["tokenValue"] == REDACTED
+    assert resource_data["state"]["serviceTokenValue"] == REDACTED
     assert resource_data["state"]["ssh_key"] == REDACTED
+    assert resource_data["state"]["deploySshKey"] == REDACTED
+    assert resource_data["state"]["backendBaseUrl"] == REDACTED
     assert resource_data["state"]["webhook_url"] == REDACTED
     assert resource_data["state"]["events"][0]["some-service-token"] == REDACTED
     assert resource_data["state"]["hubinet_ops_scan_url"] == REDACTED
