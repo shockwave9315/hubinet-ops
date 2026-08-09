@@ -646,8 +646,8 @@ async def test_retained_and_successor_generations_share_vmid_without_collision(
         )
         if item.unique_id == f"{successor_key}:status"
     )
-    assert hass.states[old_status.entity_id].state == STATE_UNAVAILABLE
-    assert hass.states[successor_status.entity_id].state == "running"
+    assert hass.states.get(old_status.entity_id).state == STATE_UNAVAILABLE
+    assert hass.states.get(successor_status.entity_id).state == "running"
     assert old_device.via_device_id is not None
 
 
@@ -845,9 +845,9 @@ async def test_backend_reachable_with_unavailable_source_keeps_resource_presence
         for item in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
         if item.unique_id == f"{resource_key}:presence"
     )
-    assert hass.states[source_health.entity_id].state == "source_unavailable"
-    assert hass.states[runtime_status.entity_id].state == STATE_UNAVAILABLE
-    assert hass.states[presence_entity.entity_id].state == "present"
+    assert hass.states.get(source_health.entity_id).state == "source_unavailable"
+    assert hass.states.get(runtime_status.entity_id).state == STATE_UNAVAILABLE
+    assert hass.states.get(presence_entity.entity_id).state == "present"
 
 
 def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> None:
