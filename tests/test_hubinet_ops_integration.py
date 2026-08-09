@@ -1763,6 +1763,39 @@ def test_health_only_expiry_retains_exact_committed_provenance() -> None:
     assert expired.freshness_valid_until == committed.freshness_valid_until
 
 
+def test_first_successful_commit_recovers_from_precommit_source_failure() -> None:
+    failed_before_first_commit = source(
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="first_observation_failed",
+        last_issued_run_sequence=1,
+        latest_completed_run_sequence=1,
+        latest_completed_outcome="source_unavailable",
+        last_health_run_sequence=1,
+        last_run_health_outcome="source_unavailable",
+        last_committed_run_sequence=None,
+    )
+    first_successful_commit = source(
+        last_issued_run_sequence=2,
+        latest_completed_run_sequence=2,
+        latest_completed_outcome="success",
+        last_health_run_sequence=2,
+        last_run_health_outcome="success",
+        last_committed_run_sequence=2,
+    )
+    previous = snapshot((), sources=(failed_before_first_commit,))
+    incoming = snapshot(
+        (),
+        sources=(first_successful_commit,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert incoming.sources[0].freshness is SourceFreshness.FRESH
+    assert incoming.sources[0].last_committed_run_sequence == 2
+
+
 @pytest.mark.parametrize(
     ("previous_source", "incoming_source", "match"),
     [

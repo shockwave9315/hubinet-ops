@@ -1044,17 +1044,16 @@ class HubinetOpsSnapshot:
             if (
                 old_source.freshness is SourceFreshness.STALE
                 and source.freshness is SourceFreshness.FRESH
-                and (
-                    old_source.last_committed_run_sequence is None
-                    or source.last_committed_run_sequence is None
-                    or source.last_committed_run_sequence
-                    <= old_source.last_committed_run_sequence
-                )
             ):
-                raise ValueError(
-                    "a stale source requires a newer successful inventory "
-                    "commit before returning to fresh"
-                )
+                old_commit = old_source.last_committed_run_sequence
+                new_commit = source.last_committed_run_sequence
+                if new_commit is None or (
+                    old_commit is not None and new_commit <= old_commit
+                ):
+                    raise ValueError(
+                        "a stale source requires a newer successful inventory "
+                        "commit before returning to fresh"
+                    )
             if source.provider_kind != old_source.provider_kind:
                 raise ValueError("provider_kind is immutable for an inventory source")
             if (
