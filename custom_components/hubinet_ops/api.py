@@ -591,9 +591,14 @@ class ResourceSnapshot:
             and self.lifecycle is LifecycleState.ACTIVE
             and self.observational_continuity is ObservationalContinuity.CONSISTENT
             and self.security_continuity is SecurityContinuity.TRUSTED
+            and self.state_level
+            in {ResourceStateLevel.MANAGED, ResourceStateLevel.MAINTENANCE}
         )
         if self.policy_applicable and not policy_eligible:
-            raise ValueError("policy cannot be applicable outside trusted current state")
+            raise ValueError(
+                "policy cannot be applicable outside managed/maintenance "
+                "trusted current state"
+            )
         if not self.policy_applicable and self.effective_capabilities:
             raise ValueError(
                 "effective capabilities require backend-published policy applicability"

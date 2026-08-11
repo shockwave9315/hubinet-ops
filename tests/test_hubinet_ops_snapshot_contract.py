@@ -599,6 +599,77 @@ def test_resource_snapshot_accepts_canonical_state_enum_members() -> None:
     assert item.state_level is ResourceStateLevel.OBSERVED
 
 
+@pytest.mark.parametrize(
+    ("state_level", "effective_capabilities"),
+    [
+        pytest.param(
+            ResourceStateLevel.DISCOVERED,
+            frozenset({"restart"}),
+            id="discovered-with-capability",
+        ),
+        pytest.param(
+            ResourceStateLevel.OBSERVED,
+            frozenset(),
+            id="observed",
+        ),
+        pytest.param(
+            ResourceStateLevel.BREAK_GLASS,
+            frozenset(),
+            id="break-glass",
+        ),
+    ],
+)
+def test_normal_policy_rejects_ineligible_resource_state_levels(
+    state_level: ResourceStateLevel,
+    effective_capabilities: frozenset[str],
+) -> None:
+    with pytest.raises(ValueError, match="managed/maintenance"):
+        resource(
+            security_continuity=SecurityContinuity.TRUSTED,
+            state_level=state_level,
+            policy_applicable=True,
+            effective_capabilities=effective_capabilities,
+        )
+
+
+@pytest.mark.parametrize(
+    "state_level",
+    [ResourceStateLevel.MANAGED, ResourceStateLevel.MAINTENANCE],
+)
+def test_normal_policy_accepts_managed_resource_state_levels(
+    state_level: ResourceStateLevel,
+) -> None:
+    item = resource(
+        security_continuity=SecurityContinuity.TRUSTED,
+        state_level=state_level,
+        policy_applicable=True,
+        effective_capabilities=frozenset({"restart"}),
+    )
+    assert item.policy_applicable
+    assert item.effective_capabilities == frozenset({"restart"})
+
+
+@pytest.mark.parametrize(
+    "state_level",
+    [
+        ResourceStateLevel.DISCOVERED,
+        ResourceStateLevel.OBSERVED,
+        ResourceStateLevel.BREAK_GLASS,
+    ],
+)
+def test_policy_ineligible_state_levels_remain_representable_without_authority(
+    state_level: ResourceStateLevel,
+) -> None:
+    item = resource(
+        security_continuity=SecurityContinuity.TRUSTED,
+        state_level=state_level,
+        policy_applicable=False,
+        effective_capabilities=frozenset(),
+    )
+    assert not item.policy_applicable
+    assert not item.effective_capabilities
+
+
 def test_uuid_text_aliases_are_not_normalized_into_registry_identity() -> None:
     assert resource(resource_id=BACKEND_ID).resource_id == BACKEND_ID
     with pytest.raises(ValueError, match="canonical"):
@@ -2055,6 +2126,7 @@ def test_health_only_source_transition_preserves_inventory_revision() -> None:
 def test_time_expiry_and_capability_removal_preserve_inventory_revision() -> None:
     applicable = resource(
         security_continuity=SecurityContinuity.TRUSTED,
+        state_level=ResourceStateLevel.MANAGED,
         retained_policy={"managed": True},
         effective_policy={"managed": True},
         policy_applicable=True,
