@@ -458,6 +458,58 @@ def test_resource_vmid_text_is_rejected_before_snapshot_registry_publication() -
         resource(resource_id="110")
 
 
+@pytest.mark.parametrize(
+    ("field_name", "malformed_value"),
+    [
+        pytest.param("resource_type", "bogus", id="resource-type-unknown"),
+        pytest.param("resource_type", "lxc", id="resource-type-lxc-string"),
+        pytest.param("resource_type", "qemu", id="resource-type-qemu-string"),
+        pytest.param("resource_type", "", id="resource-type-empty"),
+        pytest.param("resource_type", None, id="resource-type-none"),
+        pytest.param("resource_type", 1, id="resource-type-integer"),
+        pytest.param("presence", "present", id="presence-string"),
+        pytest.param("lifecycle", "active", id="lifecycle-string"),
+        pytest.param(
+            "observational_continuity",
+            "consistent",
+            id="observational-continuity-string",
+        ),
+        pytest.param(
+            "security_continuity", "trusted", id="security-continuity-string"
+        ),
+        pytest.param("detail_status", "ok", id="detail-status-string"),
+        pytest.param(
+            "node_availability", "available", id="node-availability-string"
+        ),
+        pytest.param("state_level", "observed", id="state-level-string"),
+    ],
+)
+def test_resource_snapshot_rejects_noncanonical_enum_values(
+    field_name: str, malformed_value: object
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        replace(resource(), **{field_name: malformed_value})
+
+
+@pytest.mark.parametrize("resource_type", [ResourceType.LXC, ResourceType.QEMU])
+def test_resource_snapshot_accepts_canonical_resource_types(
+    resource_type: ResourceType,
+) -> None:
+    item = replace(resource(), resource_type=resource_type)
+    assert item.resource_type is resource_type
+
+
+def test_resource_snapshot_accepts_canonical_state_enum_members() -> None:
+    item = resource()
+    assert item.presence is PresenceState.PRESENT
+    assert item.lifecycle is LifecycleState.ACTIVE
+    assert item.observational_continuity is ObservationalContinuity.CONSISTENT
+    assert item.security_continuity is SecurityContinuity.UNVERIFIED
+    assert item.detail_status is DetailStatus.OK
+    assert item.node_availability is NodeAvailability.AVAILABLE
+    assert item.state_level is ResourceStateLevel.OBSERVED
+
+
 def test_uuid_text_aliases_are_not_normalized_into_registry_identity() -> None:
     assert resource(resource_id=BACKEND_ID).resource_id == BACKEND_ID
     with pytest.raises(ValueError, match="canonical"):

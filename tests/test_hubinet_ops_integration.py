@@ -53,6 +53,7 @@ from custom_components.hubinet_ops.const import (
     CONF_VERIFY_TLS,
     DATA_API_FACTORY,
     DOMAIN,
+    MODEL_LXC,
 )
 from custom_components.hubinet_ops.coordinator import (
     node_registry_key,
@@ -1557,6 +1558,62 @@ async def test_source_failure_cannot_publish_missing_through_coordinator(
         entry.runtime_data.data.resources_by_id[RESOURCE_CT].presence
         is PresenceState.PRESENT
     )
+
+
+@pytest.mark.asyncio
+async def test_malformed_resource_type_is_rejected_before_publication_and_registry(
+    hass: HomeAssistant,
+) -> None:
+    class MalformedResourceTypeTransport(FakeTransport):
+        async def fetch_resource_snapshot(self) -> HubinetOpsSnapshot:
+            if self.snapshot_calls == 0:
+                return await super().fetch_resource_snapshot()
+            self.snapshot_calls += 1
+            malformed = replace(
+                INITIAL_RESOURCES[1],
+                resource_id=RESOURCE_ADDED,
+                active_binding_id=_test_only_binding_id(RESOURCE_ADDED),
+                resource_type="bogus",
+                vmid=777,
+            )
+            return snapshot((*INITIAL_RESOURCES, malformed))
+
+    entry = await setup_entry(
+        hass,
+        MalformedResourceTypeTransport([snapshot(INITIAL_RESOURCES)]),
+    )
+    coordinator = entry.runtime_data
+    previous = coordinator.data
+    known = (
+        coordinator.known_sources.copy(),
+        coordinator.known_nodes.copy(),
+        coordinator.known_resources.copy(),
+    )
+    callback_events: list[Any] = []
+    coordinator.new_resources_callbacks.append(callback_events.extend)
+
+    await coordinator.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.last_update_success is False
+    assert isinstance(coordinator.last_exception, ValueError)
+    assert "resource_type" in str(coordinator.last_exception)
+    assert coordinator.data is previous
+    assert known == (
+        coordinator.known_sources,
+        coordinator.known_nodes,
+        coordinator.known_resources,
+    )
+    assert callback_events == []
+    registry = dr.async_get(hass)
+    assert registry.async_get_device(
+        {(DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_ADDED))}
+    ) is None
+    existing = registry.async_get_device(
+        {(DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_CT))}
+    )
+    assert existing is not None
+    assert existing.model == MODEL_LXC
 
 
 def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> None:

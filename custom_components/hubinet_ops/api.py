@@ -161,6 +161,17 @@ def _require_text(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must not be empty")
 
 
+def _require_enum_instance(
+    value: object, enum_type: type[StrEnum], field_name: str
+) -> None:
+    """Require one canonical enum member without normalizing wire values."""
+
+    if not isinstance(value, enum_type):
+        raise ValueError(
+            f"{field_name} must be a canonical {enum_type.__name__} member"
+        )
+
+
 def _require_uuid_identity(value: str, field_name: str) -> None:
     """Require one canonical non-NIL UUID identity/reference."""
 
@@ -508,6 +519,25 @@ class ResourceSnapshot:
     def __post_init__(self) -> None:
         _require_uuid_identity(self.resource_id, "resource_id")
         _require_uuid_identity(self.inventory_source_id, "inventory_source_id")
+        for value, enum_type, field_name in (
+            (self.resource_type, ResourceType, "resource_type"),
+            (self.presence, PresenceState, "presence"),
+            (self.lifecycle, LifecycleState, "lifecycle"),
+            (
+                self.observational_continuity,
+                ObservationalContinuity,
+                "observational_continuity",
+            ),
+            (
+                self.security_continuity,
+                SecurityContinuity,
+                "security_continuity",
+            ),
+            (self.detail_status, DetailStatus, "detail_status"),
+            (self.node_availability, NodeAvailability, "node_availability"),
+            (self.state_level, ResourceStateLevel, "state_level"),
+        ):
+            _require_enum_instance(value, enum_type, field_name)
         _require_positive(self.vmid, "vmid")
         _require_positive(self.locator_generation, "locator_generation")
         _require_positive(
