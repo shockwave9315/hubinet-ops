@@ -261,6 +261,11 @@ class InventorySourceSnapshot:
     facts: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
+        _require_enum_instance(self.health, SourceHealth, "health")
+        _require_enum_instance(self.freshness, SourceFreshness, "freshness")
+        _require_enum_instance(
+            self.health_origin, SourceHealthOrigin, "health_origin"
+        )
         _require_uuid_identity(self.inventory_source_id, "inventory_source_id")
         _require_text(self.name, "source name")
         _require_text(self.provider_kind, "provider_kind")

@@ -461,6 +461,95 @@ def test_resource_vmid_text_is_rejected_before_snapshot_registry_publication() -
 @pytest.mark.parametrize(
     ("field_name", "malformed_value"),
     [
+        pytest.param("health", "healthy", id="health-healthy-string"),
+        pytest.param(
+            "health", "source_unavailable", id="health-unavailable-string"
+        ),
+        pytest.param("health", "bogus", id="health-unknown-string"),
+        pytest.param("health", None, id="health-none"),
+        pytest.param("freshness", "fresh", id="freshness-fresh-string"),
+        pytest.param("freshness", "stale", id="freshness-stale-string"),
+        pytest.param("freshness", "bogus", id="freshness-unknown-string"),
+        pytest.param("freshness", None, id="freshness-none"),
+        pytest.param(
+            "health_origin", "discovery_run", id="origin-discovery-string"
+        ),
+        pytest.param(
+            "health_origin", "time_expiry", id="origin-time-expiry-string"
+        ),
+        pytest.param(
+            "health_origin",
+            "controlled_context_transition",
+            id="origin-context-transition-string",
+        ),
+        pytest.param("health_origin", "initial", id="origin-initial-string"),
+        pytest.param("health_origin", "bogus", id="origin-unknown-string"),
+        pytest.param("health_origin", None, id="origin-none"),
+    ],
+)
+def test_source_snapshot_rejects_noncanonical_enum_values(
+    field_name: str, malformed_value: object
+) -> None:
+    with pytest.raises(ValueError, match=field_name):
+        replace(source(), **{field_name: malformed_value})
+
+
+def test_source_snapshot_rejects_all_string_expiry_before_provenance_logic() -> None:
+    with pytest.raises(ValueError, match="health"):
+        replace(
+            source(),
+            health="healthy",
+            freshness="stale",
+            health_origin="time_expiry",
+            last_committed_run_sequence=None,
+            last_successful_observed_at=None,
+            freshness_reference_at=None,
+            freshness_valid_until=None,
+            committed_context=None,
+        )
+
+
+def test_source_snapshot_accepts_canonical_enum_state_fixtures() -> None:
+    unavailable = replace(
+        source(),
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="active_endpoint_timeout",
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="source_unavailable",
+        last_health_run_sequence=6,
+        last_run_health_outcome="source_unavailable",
+    )
+    configuration_error = replace(
+        unavailable,
+        health=SourceHealth.CONFIGURATION_ERROR,
+        health_reason="invalid_source_configuration",
+        latest_completed_outcome="configuration_error",
+        last_run_health_outcome="configuration_error",
+    )
+    controlled_transition = replace(
+        time_expiry_source(),
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="source_context_changed",
+    )
+    states = (
+        source(),
+        unavailable,
+        time_expiry_source(),
+        configuration_error,
+        initial_source(),
+        controlled_transition,
+    )
+
+    assert {item.health for item in states} == set(SourceHealth)
+    assert {item.freshness for item in states} == set(SourceFreshness)
+    assert {item.health_origin for item in states} == set(SourceHealthOrigin)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "malformed_value"),
+    [
         pytest.param("resource_type", "bogus", id="resource-type-unknown"),
         pytest.param("resource_type", "lxc", id="resource-type-lxc-string"),
         pytest.param("resource_type", "qemu", id="resource-type-qemu-string"),

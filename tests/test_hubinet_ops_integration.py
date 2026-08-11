@@ -1616,6 +1616,109 @@ async def test_malformed_resource_type_is_rejected_before_publication_and_regist
     assert existing.model == MODEL_LXC
 
 
+@pytest.mark.asyncio
+async def test_malformed_source_enum_is_rejected_before_publication_and_registry(
+    hass: HomeAssistant,
+) -> None:
+    class MalformedSourceEnumTransport(FakeTransport):
+        async def fetch_resource_snapshot(self) -> HubinetOpsSnapshot:
+            if self.snapshot_calls == 0:
+                return await super().fetch_resource_snapshot()
+            self.snapshot_calls += 1
+            malformed = replace(
+                source(),
+                health="healthy",
+                freshness="stale",
+                health_origin="time_expiry",
+                last_committed_run_sequence=None,
+                last_successful_observed_at=None,
+                freshness_reference_at=None,
+                freshness_valid_until=None,
+                committed_context=None,
+            )
+            return snapshot(INITIAL_RESOURCES, sources=(malformed,))
+
+    entry = await setup_entry(
+        hass,
+        MalformedSourceEnumTransport([snapshot(INITIAL_RESOURCES)]),
+    )
+    coordinator = entry.runtime_data
+    previous = coordinator.data
+    known = (
+        coordinator.known_sources.copy(),
+        coordinator.known_nodes.copy(),
+        coordinator.known_resources.copy(),
+    )
+    callback_events: list[Any] = []
+    coordinator.new_sources_callbacks.append(callback_events.extend)
+    coordinator.new_nodes_callbacks.append(callback_events.extend)
+    coordinator.new_resources_callbacks.append(callback_events.extend)
+
+    entity_registry = er.async_get(hass)
+    source_key = source_registry_key(BACKEND_ID, SOURCE_ID)
+    source_entities = {
+        item.unique_id: item.entity_id
+        for item in er.async_entries_for_config_entry(entity_registry, entry.entry_id)
+        if item.unique_id.startswith(f"{source_key}:")
+    }
+    registry_state = (
+        {
+            item.id
+            for item in dr.async_entries_for_config_entry(
+                dr.async_get(hass), entry.entry_id
+            )
+        },
+        {
+            item.entity_id
+            for item in er.async_entries_for_config_entry(
+                entity_registry, entry.entry_id
+            )
+        },
+    )
+    health_before = hass.states.get(source_entities[f"{source_key}:health"])
+    freshness_before = hass.states.get(source_entities[f"{source_key}:freshness"])
+    assert health_before is not None and freshness_before is not None
+
+    await coordinator.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.last_update_success is False
+    assert isinstance(coordinator.last_exception, ValueError)
+    assert "health" in str(coordinator.last_exception)
+    assert coordinator.data is previous
+    assert known == (
+        coordinator.known_sources,
+        coordinator.known_nodes,
+        coordinator.known_resources,
+    )
+    assert callback_events == []
+    assert registry_state == (
+        {
+            item.id
+            for item in dr.async_entries_for_config_entry(
+                dr.async_get(hass), entry.entry_id
+            )
+        },
+        {
+            item.entity_id
+            for item in er.async_entries_for_config_entry(
+                entity_registry, entry.entry_id
+            )
+        },
+    )
+    health_after = hass.states.get(source_entities[f"{source_key}:health"])
+    freshness_after = hass.states.get(source_entities[f"{source_key}:freshness"])
+    assert health_after is not None and freshness_after is not None
+    assert health_before.state == "healthy"
+    assert freshness_before.state == "fresh"
+    assert health_after.state == STATE_UNAVAILABLE
+    assert freshness_after.state == STATE_UNAVAILABLE
+    retained_source = coordinator.data.sources_by_id[SOURCE_ID]
+    assert retained_source.health is SourceHealth.HEALTHY
+    assert retained_source.freshness is SourceFreshness.FRESH
+    assert retained_source.health_origin is SourceHealthOrigin.DISCOVERY_RUN
+
+
 def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> None:
     healthy = source()
     assert healthy.current_context == healthy.committed_context
