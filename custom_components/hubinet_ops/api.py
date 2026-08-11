@@ -407,6 +407,13 @@ class InventorySourceSnapshot:
             raise ValueError(
                 "successful applied health requires the exact committed run sequence"
             )
+        if (
+            self.latest_completed_outcome == _SUCCESSFUL_RUN_OUTCOME
+            and self.latest_completed_run_sequence != committed_sequence
+        ):
+            raise ValueError(
+                "successful completion requires the exact committed run sequence"
+            )
         if committed_sequence is None:
             return
         if (

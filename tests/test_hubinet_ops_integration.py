@@ -1747,6 +1747,7 @@ def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> Non
         source(
             last_issued_run_sequence=6,
             latest_completed_run_sequence=6,
+            latest_completed_outcome="source_unavailable",
             last_health_run_sequence=6,
             last_run_health_outcome="source_unavailable",
             last_committed_run_sequence=5,
@@ -1785,6 +1786,7 @@ def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> Non
                 freshness=SourceFreshness.STALE,
                 health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
                 health_reason="provenance_erased",
+                latest_completed_outcome="audit_only_inapplicable",
                 last_health_run_sequence=None,
                 last_run_health_outcome=None,
                 last_committed_run_sequence=None,
@@ -2469,6 +2471,11 @@ def test_diagnostics_redact_secret_key_spelling_variants(key: str) -> None:
         "normalValue",
         "credential_status",
         "secret_rotation_status",
+        "header_count",
+        "headers_count",
+        "request_header_count",
+        "header_name",
+        "http_header_status",
     ],
 )
 def test_diagnostics_do_not_over_redact_benign_keys(key: str) -> None:
@@ -2502,6 +2509,31 @@ def test_diagnostics_redact_camel_case_secrets_recursively() -> None:
         }
     }
     assert original["outer"]["authorizationHeader"] == "authorization-value"
+
+
+def test_diagnostics_redact_namespaced_header_containers_as_a_whole() -> None:
+    original = {
+        "requestHeaders": "Authorization: Bearer SUPER_SECRET",
+        "httpHeaders": [
+            "Authorization: Bearer SUPER_SECRET",
+            "X-Trace: harmless",
+        ],
+        "nested": {
+            "proxyHeaders": {
+                "Authorization": "Bearer SUPER_SECRET",
+                "X-Trace": "harmless",
+            }
+        },
+    }
+
+    redacted = _redact_repository_secrets(original)
+
+    assert redacted == {
+        "requestHeaders": REDACTED,
+        "httpHeaders": REDACTED,
+        "nested": {"proxyHeaders": REDACTED},
+    }
+    assert "SUPER_SECRET" not in repr(redacted)
 
 
 @pytest.mark.asyncio
@@ -2551,6 +2583,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
         "namespaced_webhook_url": "https://hooks.example.test/service/private-id",
         "namespaced_token_value": "namespaced-token-value",
         "namespaced_base_url": "https://backend.example.test/private-base",
+        "header_secret": "SUPER_SECRET",
     }
     sensitive_source = source(
         facts={
@@ -2572,6 +2605,9 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
                 {"normalValue": "visible-source-value"},
             ],
             "hubinet_ops_service_url": secrets["private_service_url"],
+            "requestHeaders": (
+                f"Authorization: Bearer {secrets['header_secret']}"
+            ),
         }
     )
     sensitive_node = node(
@@ -2616,6 +2652,10 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
                 "credentials": {"value": secrets["credential_object"]},
             },
             "managed": False,
+            "providerHttpHeaders": [
+                f"Authorization: Bearer {secrets['header_secret']}",
+                "X-Trace: harmless",
+            ],
         },
         effective_policy={
             "refreshToken": secrets["camel_refresh_token"],
@@ -2627,6 +2667,10 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
             "headers": {
                 "Authorization": secrets["authorization_header"],
                 "Content-Type": "application/json",
+            },
+            "proxyHeaders": {
+                "Authorization": f"Bearer {secrets['header_secret']}",
+                "X-Trace": "harmless",
             },
             "bearer_token": secrets["bearer_token"],
             "api_key": secrets["api_key"],
@@ -2683,6 +2727,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert source_data["facts"]["endpoint"]["api_key"] == REDACTED
     assert source_data["facts"]["service"]["client_secret"] == REDACTED
     assert source_data["facts"]["hubinet_ops_service_url"] == REDACTED
+    assert source_data["facts"]["requestHeaders"] == REDACTED
     assert source_data["facts"]["nested"][0]["SSHPrivateKey"] == REDACTED
     assert source_data["facts"]["nested"][0]["awsSecretAccessKey"] == REDACTED
     assert (
@@ -2709,6 +2754,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert policy["accessToken"] == REDACTED
     assert policy["proxyAuthorizationHeader"] == REDACTED
     assert policy["managed"] is False
+    assert policy["providerHttpHeaders"] == REDACTED
     assert resource_data["effective_policy"]["refreshToken"] == REDACTED
     assert resource_data["effective_policy"]["serviceWebhookUrl"] == REDACTED
     assert resource_data["retained_policy"]["backend_token"] == REDACTED
@@ -2724,6 +2770,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert resource_data["state"]["Authorization"] == REDACTED
     assert resource_data["state"]["authorization_header"] == REDACTED
     assert resource_data["state"]["headers"] == REDACTED
+    assert resource_data["state"]["proxyHeaders"] == REDACTED
     assert resource_data["state"]["bearer_token"] == REDACTED
     assert resource_data["state"]["api_key"] == REDACTED
     assert resource_data["state"]["APIKey"] == REDACTED
@@ -2752,6 +2799,7 @@ async def test_diagnostics_redact_secrets_across_new_source_shape(
     assert resource_data["state"]["events"][0]["availability"] == "online"
     diagnostics_repr = repr(diagnostics)
     assert API_TOKEN not in diagnostics_repr
+    assert "SUPER_SECRET" not in diagnostics_repr
     assert all(value not in diagnostics_repr for value in secrets.values())
 
 

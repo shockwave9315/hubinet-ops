@@ -2281,6 +2281,38 @@ def test_successful_applied_health_requires_exact_committed_run(
         replace(source(), **changes)
 
 
+@pytest.mark.parametrize(
+    "source_factory",
+    [
+        pytest.param(
+            lambda: replace(
+                initial_source(),
+                last_issued_run_sequence=1,
+                latest_completed_run_sequence=1,
+                latest_completed_outcome="success",
+            ),
+            id="before-first-commit",
+        ),
+        pytest.param(
+            lambda: replace(
+                source(),
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="success",
+            ),
+            id="after-prior-commit",
+        ),
+    ],
+)
+def test_successful_completion_requires_exact_committed_run(
+    source_factory: Any,
+) -> None:
+    with pytest.raises(
+        ValueError, match="successful completion requires the exact committed"
+    ):
+        source_factory()
+
+
 def test_fresh_source_requires_successful_exact_committed_health_outcome() -> None:
     with pytest.raises(ValueError, match="successful health outcome"):
         replace(source(), last_run_health_outcome="source_unavailable")
@@ -2330,6 +2362,7 @@ def test_time_expiry_rejects_newer_health_run() -> None:
 def test_time_expiry_rejects_missing_successful_commit() -> None:
     with pytest.raises(ValueError, match="exact committed run and context"):
         time_expiry_source(
+            latest_completed_outcome="source_unavailable",
             last_run_health_outcome="source_unavailable",
             last_committed_run_sequence=None,
             last_successful_observed_at=None,

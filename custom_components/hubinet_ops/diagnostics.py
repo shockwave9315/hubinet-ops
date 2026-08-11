@@ -54,6 +54,7 @@ _REPOSITORY_SECRET_SUFFIXES = (
     "_base_url",
     "_credential",
     "_credentials",
+    "_headers",
     "_passphrase",
     "_password",
     "_private_key",
