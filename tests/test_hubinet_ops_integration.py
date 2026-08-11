@@ -1748,6 +1748,7 @@ def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> Non
             last_issued_run_sequence=6,
             latest_completed_run_sequence=6,
             last_health_run_sequence=6,
+            last_run_health_outcome="source_unavailable",
             last_committed_run_sequence=5,
         )
 

@@ -2248,6 +2248,39 @@ def test_initial_source_rejects_applied_run_health_provenance() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("committed_sequence", "health_sequence"),
+    [
+        pytest.param(None, 1, id="successful-health-before-first-commit"),
+        pytest.param(5, 6, id="successful-health-after-prior-commit"),
+    ],
+)
+def test_successful_applied_health_requires_exact_committed_run(
+    committed_sequence: int | None,
+    health_sequence: int,
+) -> None:
+    changes: dict[str, Any] = {
+        "last_issued_run_sequence": health_sequence,
+        "latest_completed_run_sequence": health_sequence,
+        "latest_completed_outcome": "success",
+        "last_health_run_sequence": health_sequence,
+        "last_run_health_outcome": "success",
+        "last_committed_run_sequence": committed_sequence,
+    }
+    if committed_sequence is None:
+        changes.update(
+            last_successful_observed_at=None,
+            freshness_reference_at=None,
+            freshness_valid_until=None,
+            committed_context=None,
+        )
+
+    with pytest.raises(
+        ValueError, match="successful applied health requires the exact committed"
+    ):
+        replace(source(), **changes)
+
+
 def test_fresh_source_requires_successful_exact_committed_health_outcome() -> None:
     with pytest.raises(ValueError, match="successful health outcome"):
         replace(source(), last_run_health_outcome="source_unavailable")
@@ -2297,6 +2330,7 @@ def test_time_expiry_rejects_newer_health_run() -> None:
 def test_time_expiry_rejects_missing_successful_commit() -> None:
     with pytest.raises(ValueError, match="exact committed run and context"):
         time_expiry_source(
+            last_run_health_outcome="source_unavailable",
             last_committed_run_sequence=None,
             last_successful_observed_at=None,
             freshness_reference_at=None,

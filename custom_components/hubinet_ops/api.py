@@ -400,6 +400,13 @@ class InventorySourceSnapshot:
 
     def _validate_committed_run_outcomes(self) -> None:
         committed_sequence = self.last_committed_run_sequence
+        if (
+            self.last_run_health_outcome == _SUCCESSFUL_RUN_OUTCOME
+            and self.last_health_run_sequence != committed_sequence
+        ):
+            raise ValueError(
+                "successful applied health requires the exact committed run sequence"
+            )
         if committed_sequence is None:
             return
         if (
