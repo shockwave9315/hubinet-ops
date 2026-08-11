@@ -280,9 +280,14 @@ def time_expiry_source(**changes: Any) -> InventorySourceSnapshot:
     return replace(source(), **values)
 
 
-def successful_commit_source(sequence: int = 6) -> InventorySourceSnapshot:
+def successful_commit_source(
+    sequence: int = 6,
+    *,
+    previous: InventorySourceSnapshot | None = None,
+) -> InventorySourceSnapshot:
+    committed = source() if previous is None else previous
     return replace(
-        source(),
+        committed,
         last_issued_run_sequence=sequence,
         latest_completed_run_sequence=sequence,
         latest_completed_outcome="success",
@@ -292,6 +297,24 @@ def successful_commit_source(sequence: int = 6) -> InventorySourceSnapshot:
         last_successful_observed_at="2026-08-08T12:01:30+00:00",
         freshness_reference_at="2026-08-08T12:01:00+00:00",
         freshness_valid_until="2026-08-08T12:06:00+00:00",
+        committed_context=committed.current_context,
+    )
+
+
+def with_successful_source_commit(
+    view: HubinetOpsSnapshot,
+    *,
+    sequence: int = 7,
+    source_id: str = SOURCE_ID,
+) -> HubinetOpsSnapshot:
+    return replace(
+        view,
+        sources=tuple(
+            successful_commit_source(sequence, previous=item)
+            if item.inventory_source_id == source_id
+            else item
+            for item in view.sources
+        ),
     )
 
 
@@ -573,6 +596,7 @@ def test_ambiguity_retains_exact_binding_and_generation_across_revisions() -> No
         inventory_revision=11,
         published_state_revision=21,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
     assert ambiguous.active_binding_id == previous.resources[0].active_binding_id
     assert ambiguous.locator_generation == previous.resources[0].locator_generation
@@ -592,6 +616,7 @@ def direct_replacement_views() -> tuple[
         inventory_revision=11,
         published_state_revision=21,
     )
+    incoming = with_successful_source_commit(incoming)
     return previous, incoming, old, successor
 
 
@@ -628,6 +653,7 @@ def test_revision_successor_accepts_same_resource_retaining_binding() -> None:
         inventory_revision=11,
         published_state_revision=21,
     )
+    incoming = with_successful_source_commit(incoming)
 
     incoming.validate_revision_successor(previous)
     assert incoming.resources[0].active_binding_id == previous_binding
@@ -730,6 +756,7 @@ def test_terminal_security_history_accepts_valid_transition_matrix(
         inventory_revision=11,
         published_state_revision=27,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
 
 
@@ -860,9 +887,13 @@ def test_known_security_lower_bound_accepts_canonical_nonterminal_transitions(
         inventory_revision=11 if security_changed else 10,
         published_state_revision=21,
     )
-    incoming.validate_revision_successor(
-        snapshot(resources=(previous_resource,))
-    )
+    previous = snapshot(resources=(previous_resource,))
+    if (
+        incoming.source_reconciliation_projection
+        != previous.source_reconciliation_projection
+    ):
+        incoming = with_successful_source_commit(incoming)
+    incoming.validate_revision_successor(previous)
 
 
 @pytest.mark.parametrize(
@@ -919,6 +950,7 @@ def test_revision_gap_may_skip_handoff_and_observe_trusted_successor() -> None:
         inventory_revision=12,
         published_state_revision=23,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
 
 
@@ -934,6 +966,7 @@ def test_revision_gap_allows_skipped_enrollment_before_replacement() -> None:
         inventory_revision=12,
         published_state_revision=23,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
 
 
@@ -957,6 +990,7 @@ def test_trusted_predecessor_may_be_revoked_by_replacement() -> None:
         inventory_revision=11,
         published_state_revision=21,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
 
 
@@ -972,6 +1006,7 @@ def test_revision_gap_does_not_reconstruct_predecessor_security_path() -> None:
         inventory_revision=15,
         published_state_revision=27,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
 
 
@@ -1027,6 +1062,7 @@ def test_revision_gap_may_skip_handoff_and_successor_policy_transition() -> None
         inventory_revision=13,
         published_state_revision=24,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
 
 
@@ -1069,6 +1105,7 @@ def test_terminal_successor_lineage_cannot_be_rewritten() -> None:
         inventory_revision=11,
         published_state_revision=21,
     )
+    accepted = with_successful_source_commit(accepted)
     accepted.validate_revision_successor(previous)
 
     rewritten_old = replace(old, successor_resource_id=THIRD_RESOURCE_ID)
@@ -1080,6 +1117,7 @@ def test_terminal_successor_lineage_cannot_be_rewritten() -> None:
         inventory_revision=12,
         published_state_revision=22,
     )
+    rewritten = replace(rewritten, sources=accepted.sources)
     with pytest.raises(ValueError, match="replacement lineage is immutable"):
         rewritten.validate_revision_successor(accepted)
 
@@ -1100,6 +1138,7 @@ def test_terminal_successor_lineage_cannot_be_cleared() -> None:
         inventory_revision=12,
         published_state_revision=22,
     )
+    incoming = replace(incoming, sources=accepted.sources)
     with pytest.raises(ValueError, match="replacement lineage is immutable"):
         incoming.validate_revision_successor(accepted)
 
@@ -1140,11 +1179,12 @@ def test_revision_gap_may_observe_historical_successor_in_quarantine() -> None:
         lifecycle=LifecycleState.QUARANTINED,
         observational_continuity=ObservationalContinuity.UNCERTAIN,
     )
-    snapshot(
+    incoming = snapshot(
         resources=(old, quarantined),
         inventory_revision=12,
         published_state_revision=23,
-    ).validate_revision_successor(previous)
+    )
+    with_successful_source_commit(incoming).validate_revision_successor(previous)
 
 
 def test_revision_gap_may_observe_historical_successor_confirmed_removed() -> None:
@@ -1167,6 +1207,7 @@ def test_revision_gap_may_observe_historical_successor_confirmed_removed() -> No
         inventory_revision=12,
         published_state_revision=23,
     )
+    later = with_successful_source_commit(later)
     later.validate_revision_successor(previous)
     assert later.resources_by_id[RESOURCE_ID].successor_resource_id == SUCCESSOR_ID
     assert later.resources_by_id[SUCCESSOR_ID].active_binding_id is None
@@ -1189,6 +1230,7 @@ def test_revision_gap_may_skip_entire_intermediate_successor_generation() -> Non
         inventory_revision=13,
         published_state_revision=24,
     )
+    chained = with_successful_source_commit(chained)
     chained.validate_revision_successor(previous)
     assert chained.resources_by_id[RESOURCE_ID].successor_resource_id == SUCCESSOR_ID
     assert chained.resources_by_id[SUCCESSOR_ID].successor_resource_id == THIRD_RESOURCE_ID
@@ -1299,6 +1341,7 @@ def test_missing_resource_returns_present_without_generation_change() -> None:
         inventory_revision=11,
         published_state_revision=21,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
     assert returned.locator_generation == missing.locator_generation
     assert returned.active_binding_id == missing.active_binding_id
@@ -1312,6 +1355,7 @@ def test_nonterminal_inventory_change_does_not_bump_locator_generation() -> None
         inventory_revision=11,
         published_state_revision=21,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
     assert renamed.locator_generation == previous.resources[0].locator_generation
 
@@ -1377,16 +1421,18 @@ def test_trusted_current_resource_cannot_cross_an_omitted_published_view() -> No
 
 def test_retained_resource_states_replace_omission() -> None:
     previous = snapshot()
-    snapshot(
+    missing = snapshot(
         resources=(missing_resource(),),
         inventory_revision=11,
         published_state_revision=21,
-    ).validate_revision_successor(previous)
-    snapshot(
+    )
+    with_successful_source_commit(missing).validate_revision_successor(previous)
+    removed = snapshot(
         resources=(confirmed_removed_resource(),),
         inventory_revision=11,
         published_state_revision=21,
-    ).validate_revision_successor(previous)
+    )
+    with_successful_source_commit(removed).validate_revision_successor(previous)
 
 
 def test_direct_replacement_retains_old_and_adds_successor() -> None:
@@ -1410,6 +1456,7 @@ def test_direct_replacement_retains_old_and_adds_successor() -> None:
         inventory_revision=11,
         published_state_revision=21,
     )
+    incoming = with_successful_source_commit(incoming)
     incoming.validate_revision_successor(previous)
     assert set(incoming.resources_by_id) == {RESOURCE_ID, SUCCESSOR_ID}
 
@@ -1442,14 +1489,15 @@ def test_top_level_snapshot_collections_are_defensively_frozen() -> None:
     assert view.resources == expected.resources
 
 
-def inventory_change_cases() -> list[tuple[str, HubinetOpsSnapshot, HubinetOpsSnapshot]]:
+def reconciliation_inventory_change_cases(
+) -> list[tuple[str, HubinetOpsSnapshot, HubinetOpsSnapshot]]:
     base = snapshot(nodes=(node(), node(NODE_B, name="pve-b")))
     return [
         (
-            "source-name-and-facts",
+            "source-facts",
             snapshot(resources=()),
             snapshot(
-                sources=(source(name="Renamed Source", facts={"cluster": "lab"}),),
+                sources=(source(facts={"cluster": "lab"}),),
                 resources=(),
                 published_state_revision=21,
             ),
@@ -1497,15 +1545,6 @@ def inventory_change_cases() -> list[tuple[str, HubinetOpsSnapshot, HubinetOpsSn
             ),
         ),
         (
-            "retained-policy",
-            base,
-            snapshot(
-                nodes=base.nodes,
-                resources=(resource(retained_policy={"managed": False}),),
-                published_state_revision=21,
-            ),
-        ),
-        (
             "node-presentation-facts",
             snapshot(resources=()),
             snapshot(
@@ -1535,6 +1574,31 @@ def inventory_change_cases() -> list[tuple[str, HubinetOpsSnapshot, HubinetOpsSn
             snapshot(resources=()),
             snapshot(resources=(resource(),), published_state_revision=21),
         ),
+    ]
+
+
+def independently_owned_inventory_change_cases(
+) -> list[tuple[str, HubinetOpsSnapshot, HubinetOpsSnapshot]]:
+    base = snapshot(nodes=(node(), node(NODE_B, name="pve-b")))
+    return [
+        (
+            "source-display-name",
+            snapshot(resources=()),
+            snapshot(
+                sources=(source(name="Renamed Source"),),
+                resources=(),
+                published_state_revision=21,
+            ),
+        ),
+        (
+            "retained-policy",
+            base,
+            snapshot(
+                nodes=base.nodes,
+                resources=(resource(retained_policy={"managed": False}),),
+                published_state_revision=21,
+            ),
+        ),
         (
             "source-member-addition",
             snapshot(nodes=(), resources=()),
@@ -1546,6 +1610,13 @@ def inventory_change_cases() -> list[tuple[str, HubinetOpsSnapshot, HubinetOpsSn
             ),
         ),
     ]
+
+
+def inventory_change_cases() -> list[tuple[str, HubinetOpsSnapshot, HubinetOpsSnapshot]]:
+    return (
+        reconciliation_inventory_change_cases()
+        + independently_owned_inventory_change_cases()
+    )
 
 
 @pytest.mark.parametrize(
@@ -1565,16 +1636,257 @@ def test_inventory_change_requires_new_inventory_revision(
 
 @pytest.mark.parametrize(
     ("name", "previous", "incoming"),
-    inventory_change_cases(),
+    reconciliation_inventory_change_cases(),
     ids=lambda value: value if isinstance(value, str) else None,
 )
-def test_inventory_change_accepts_newer_inventory_revision(
+def test_reconciliation_inventory_change_rejects_only_newer_inventory_revision(
+    name: str,
+    previous: HubinetOpsSnapshot,
+    incoming: HubinetOpsSnapshot,
+) -> None:
+    del name
+    with pytest.raises(ValueError, match="newer last_committed_run_sequence"):
+        replace(incoming, inventory_revision=11).validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    ("name", "previous", "incoming"),
+    reconciliation_inventory_change_cases(),
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_reconciliation_inventory_change_accepts_skipped_successful_commit(
+    name: str,
+    previous: HubinetOpsSnapshot,
+    incoming: HubinetOpsSnapshot,
+) -> None:
+    del name
+    with_successful_source_commit(
+        replace(incoming, inventory_revision=11), sequence=7
+    ).validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    ("name", "previous", "incoming"),
+    independently_owned_inventory_change_cases(),
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_independently_owned_inventory_change_does_not_require_source_commit(
     name: str,
     previous: HubinetOpsSnapshot,
     incoming: HubinetOpsSnapshot,
 ) -> None:
     del name
     replace(incoming, inventory_revision=11).validate_revision_successor(previous)
+
+
+def test_new_resource_cannot_be_accepted_by_global_inventory_revision_alone() -> None:
+    previous = snapshot(resources=())
+    incoming = snapshot(
+        resources=(resource(),),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match="newer last_committed_run_sequence"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_source_failure_cannot_create_missing_inventory_transition() -> None:
+    previous = snapshot()
+    failed_source = replace(
+        source(),
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="active_endpoint_timeout",
+        last_issued_run_sequence=6,
+        latest_completed_run_sequence=6,
+        latest_completed_outcome="source_unavailable",
+        last_health_run_sequence=6,
+        last_run_health_outcome="source_unavailable",
+    )
+    incoming = snapshot(
+        sources=(failed_source,),
+        resources=(missing_resource(),),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match="newer last_committed_run_sequence"):
+        incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    "precommit_source",
+    [
+        initial_source(),
+        replace(
+            initial_source(),
+            health=SourceHealth.SOURCE_UNAVAILABLE,
+            freshness=SourceFreshness.STALE,
+            health_origin=SourceHealthOrigin.DISCOVERY_RUN,
+            health_reason="first_observation_failed",
+            last_issued_run_sequence=1,
+            latest_completed_run_sequence=1,
+            latest_completed_outcome="source_unavailable",
+            last_health_run_sequence=1,
+            last_run_health_outcome="source_unavailable",
+        ),
+    ],
+    ids=["initial-not-yet-observed", "failed-before-first-commit"],
+)
+@pytest.mark.parametrize("inventory_kind", ["node", "resource"])
+def test_precommit_source_cannot_publish_node_or_resource_inventory(
+    precommit_source: InventorySourceSnapshot,
+    inventory_kind: str,
+) -> None:
+    nodes = (node(),) if inventory_kind == "node" else ()
+    resources = (resource(),) if inventory_kind == "resource" else ()
+
+    with pytest.raises(ValueError, match="without a successful inventory commit"):
+        snapshot(
+            sources=(precommit_source,),
+            nodes=nodes,
+            resources=resources,
+        )
+
+
+def test_precommit_source_may_coexist_with_other_committed_source_inventory() -> None:
+    second_source = replace(
+        initial_source(),
+        inventory_source_id=SOURCE_B_ID,
+        name="Not yet observed",
+        current_context=context(endpoint_id=ENDPOINT_B_ID),
+    )
+
+    view = snapshot(sources=(source(), second_source))
+
+    assert view.resources[0].inventory_source_id == SOURCE_ID
+    assert view.sources_by_id[SOURCE_B_ID].last_committed_run_sequence is None
+
+
+@pytest.mark.parametrize(
+    "resource_change",
+    [
+        {"status": "stopped"},
+        {"state": {"memory": 2048}},
+        {"detail_status": DetailStatus.ERROR},
+        {"current_node_id": NODE_B},
+        {"name": "Provider Rename"},
+    ],
+    ids=["status", "state-facts", "detail-status", "current-node", "name"],
+)
+def test_discovery_owned_resource_facts_cannot_rewrite_under_same_commit(
+    resource_change: dict[str, Any],
+) -> None:
+    nodes = (node(), node(NODE_B, name="pve-b"))
+    previous = snapshot(nodes=nodes)
+    incoming = snapshot(
+        nodes=nodes,
+        resources=(replace(resource(), **resource_change),),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match="newer last_committed_run_sequence"):
+        incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    "node_change",
+    [
+        {"name": "pve-renamed"},
+        {"status": "maintenance"},
+        {"available": False, "status": "offline"},
+        {"facts": {"cpu": 0.4}},
+    ],
+    ids=["name", "status", "availability", "facts"],
+)
+def test_node_observation_cannot_rewrite_under_same_commit(
+    node_change: dict[str, Any],
+) -> None:
+    previous = snapshot(nodes=(node(),), resources=())
+    incoming = snapshot(
+        nodes=(replace(node(), **node_change),),
+        resources=(),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match="newer last_committed_run_sequence"):
+        incoming.validate_revision_successor(previous)
+
+
+def test_successful_commit_then_failure_can_publish_newer_committed_missing() -> None:
+    previous = snapshot()
+    commit_six_then_failure_seven = replace(
+        successful_commit_source(sequence=6),
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="active_endpoint_timeout",
+        last_issued_run_sequence=7,
+        latest_completed_run_sequence=7,
+        latest_completed_outcome="source_unavailable",
+        last_health_run_sequence=7,
+        last_run_health_outcome="source_unavailable",
+    )
+    incoming = snapshot(
+        sources=(commit_six_then_failure_seven,),
+        resources=(missing_resource(),),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert incoming.sources[0].last_committed_run_sequence == 6
+    assert incoming.resources[0].presence is PresenceState.MISSING
+
+
+def test_security_only_transition_does_not_require_discovery_commit() -> None:
+    previous = snapshot()
+    enrolled = replace(
+        resource(),
+        security_continuity=SecurityContinuity.TRUSTED,
+        resource_continuity_revision=2,
+    )
+    incoming = snapshot(
+        resources=(enrolled,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert (
+        incoming.source_reconciliation_projection
+        == previous.source_reconciliation_projection
+    )
+
+
+def test_security_continuity_resolution_remains_independent_of_discovery() -> None:
+    quarantined = resource(
+        continuity_revision=2,
+        lifecycle=LifecycleState.QUARANTINED,
+        observational_continuity=ObservationalContinuity.UNCERTAIN,
+        security_continuity=SecurityContinuity.REVOKED,
+    )
+    previous = snapshot(resources=(quarantined,))
+    resolved = replace(
+        quarantined,
+        resource_continuity_revision=3,
+        lifecycle=LifecycleState.ACTIVE,
+        observational_continuity=ObservationalContinuity.CONSISTENT,
+        security_continuity=SecurityContinuity.TRUSTED,
+    )
+    incoming = snapshot(
+        resources=(resolved,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert (
+        incoming.source_reconciliation_projection
+        == previous.source_reconciliation_projection
+    )
 
 
 def test_health_only_source_transition_preserves_inventory_revision() -> None:
@@ -1991,9 +2303,10 @@ def test_advanced_successful_commit_requires_new_inventory_revision() -> None:
 
 
 def test_first_successful_commit_requires_new_inventory_revision() -> None:
-    previous = snapshot(sources=(initial_source(),), resources=())
+    previous = snapshot(sources=(initial_source(),), nodes=(), resources=())
     incoming = snapshot(
         sources=(successful_commit_source(sequence=1),),
+        nodes=(),
         resources=(),
         published_state_revision=21,
     )

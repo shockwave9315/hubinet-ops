@@ -726,6 +726,23 @@ class HubinetOpsSnapshot:
         ):
             raise ValueError("resource references an unknown inventory source")
 
+        uncommitted_source_ids = {
+            source.inventory_source_id
+            for source in self.sources
+            if source.last_committed_run_sequence is None
+        }
+        if any(
+            node.inventory_source_id in uncommitted_source_ids
+            for node in self.nodes
+        ) or any(
+            resource.inventory_source_id in uncommitted_source_ids
+            for resource in self.resources
+        ):
+            raise ValueError(
+                "a source without a successful inventory commit cannot publish "
+                "node or resource inventory"
+            )
+
         nodes_by_id = {node.node_id: node for node in self.nodes}
         active_locators: set[tuple[str, int]] = set()
         locator_generations: set[tuple[str, int, int]] = set()
@@ -930,6 +947,62 @@ class HubinetOpsSnapshot:
         )
         return sources, nodes, resources
 
+    @property
+    def source_reconciliation_projection(
+        self,
+    ) -> Mapping[str, tuple[Any, ...]]:
+        """Return successful discovery/reconciliation-owned state per source.
+
+        This deliberately excludes source configuration, display labels, policy,
+        enrollment/security state, revision tokens, and derived capabilities.
+        Those fields have independent authoritative owners and must not require a
+        fabricated discovery commit.
+        """
+
+        projections: dict[str, tuple[Any, ...]] = {}
+        for source in self.sources:
+            source_id = source.inventory_source_id
+            nodes = tuple(
+                sorted(
+                    (
+                        node.node_id,
+                        node.inventory_source_id,
+                        node.name,
+                        node.status,
+                        node.available,
+                        node.facts,
+                    )
+                    for node in self.nodes
+                    if node.inventory_source_id == source_id
+                )
+            )
+            resources = tuple(
+                sorted(
+                    (
+                        resource.resource_id,
+                        resource.inventory_source_id,
+                        resource.active_binding_id,
+                        resource.resource_type,
+                        resource.vmid,
+                        resource.locator_generation,
+                        resource.name,
+                        resource.status,
+                        resource.current_node_id,
+                        resource.last_known_node_id,
+                        resource.presence,
+                        resource.detail_status,
+                        resource.node_availability,
+                        resource.state,
+                        resource.termination_reason,
+                        resource.successor_resource_id,
+                    )
+                    for resource in self.resources
+                    if resource.inventory_source_id == source_id
+                )
+            )
+            projections[source_id] = (source.facts, nodes, resources)
+        return MappingProxyType(projections)
+
     def validate_revision_successor(self, previous: HubinetOpsSnapshot) -> None:
         """Reject regressing or mutable views for an existing backend entry."""
 
@@ -948,6 +1021,16 @@ class HubinetOpsSnapshot:
         previous_sources_by_id = previous.sources_by_id
         previous_nodes_by_id = previous.nodes_by_id
         previous_resources_by_id = previous.resources_by_id
+        previous_reconciliation_projection = (
+            previous.source_reconciliation_projection
+        )
+        reconciliation_projection = self.source_reconciliation_projection
+        reconciliation_changed_source_ids = {
+            source_id
+            for source_id in set(previous_sources_by_id) & set(self.sources_by_id)
+            if reconciliation_projection[source_id]
+            != previous_reconciliation_projection[source_id]
+        }
         current_source_ids = set(self.sources_by_id)
         current_node_ids = set(self.nodes_by_id)
         current_resource_ids = set(self.resources_by_id)
@@ -1292,6 +1375,19 @@ class HubinetOpsSnapshot:
                 raise ValueError(
                     "security-relevant resource transition requires a newer "
                     "resource_continuity_revision"
+                )
+
+        for source_id in reconciliation_changed_source_ids:
+            old_commit = previous_sources_by_id[
+                source_id
+            ].last_committed_run_sequence
+            new_commit = self.sources_by_id[source_id].last_committed_run_sequence
+            if new_commit is None or (
+                old_commit is not None and new_commit <= old_commit
+            ):
+                raise ValueError(
+                    "discovery/reconciliation-owned source inventory changes "
+                    "require a newer last_committed_run_sequence"
                 )
 
 

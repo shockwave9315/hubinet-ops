@@ -192,6 +192,17 @@ def unavailable_source() -> InventorySourceSnapshot:
     )
 
 
+def successful_source(sequence: int = 7) -> InventorySourceSnapshot:
+    return source(
+        last_issued_run_sequence=sequence,
+        latest_completed_run_sequence=sequence,
+        latest_completed_outcome="success",
+        last_health_run_sequence=sequence,
+        last_run_health_outcome="success",
+        last_committed_run_sequence=sequence,
+    )
+
+
 def node(
     node_id: str = NODE_A,
     *,
@@ -724,6 +735,7 @@ async def test_rename_preserves_identity_and_updates_device_name(
     renamed = replace(INITIAL_RESOURCES[1], name="Cloudflared Renamed")
     second = snapshot(
         (INITIAL_RESOURCES[0], renamed, INITIAL_RESOURCES[2]),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
         published_at="2026-08-08T12:01:00+00:00",
@@ -751,6 +763,7 @@ async def test_node_migration_preserves_identity_and_updates_via_device(
     )
     second = snapshot(
         (INITIAL_RESOURCES[0], moved, INITIAL_RESOURCES[2]),
+        sources=(successful_source(),),
         nodes=(node(), node(NODE_B, name="pve-b")),
         inventory_revision=11,
         published_state_revision=21,
@@ -785,6 +798,7 @@ async def test_unresolved_node_without_history_clears_via_device_id(
     )
     second = snapshot(
         (unresolved,),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
         published_at="2026-08-08T12:01:00+00:00",
@@ -824,6 +838,7 @@ async def test_unresolved_node_retains_last_known_via_device_id(
     )
     second = snapshot(
         (unresolved,),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
         published_at="2026-08-08T12:01:00+00:00",
@@ -917,6 +932,7 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
     first = snapshot((INITIAL_RESOURCES[1],))
     second = snapshot(
         (retained,),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
         published_at="2026-08-08T12:01:00+00:00",
@@ -974,6 +990,7 @@ async def test_replacement_transition_retains_old_entities_unavailable(
     )
     second = snapshot(
         (old, successor),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
         published_at="2026-08-08T12:01:00+00:00",
@@ -1006,6 +1023,7 @@ async def test_present_detail_error_keeps_independent_entities_available(
     )
     second = snapshot(
         (detail_error,),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
     )
@@ -1034,6 +1052,7 @@ async def test_present_unavailable_node_only_blocks_node_dependent_entities(
     )
     second = snapshot(
         (node_unavailable,),
+        sources=(successful_source(),),
         nodes=(unavailable_node,),
         inventory_revision=11,
         published_state_revision=21,
@@ -1072,6 +1091,7 @@ async def test_ambiguity_preserves_resource_binding_generation_and_device(
     )
     second = snapshot(
         (ambiguous,),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
         published_at="2026-08-08T12:01:00+00:00",
@@ -1258,6 +1278,7 @@ def test_ambiguity_and_missing_keep_exact_binding_and_generation(
     )
     incoming = snapshot(
         (ambiguous,),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
     )
@@ -1285,6 +1306,7 @@ def test_accepted_terminal_closure_keeps_incarnation_locator() -> None:
     )
     snapshot(
         (terminal,),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
     ).validate_revision_successor(snapshot((original,)))
@@ -1337,6 +1359,7 @@ def test_direct_replacement_closes_old_and_uses_separate_successor_resource() ->
     )
     incoming = snapshot(
         (old_terminal, successor),
+        sources=(successful_source(),),
         inventory_revision=11,
         published_state_revision=21,
     )
@@ -1505,6 +1528,37 @@ async def test_backend_reachable_with_unavailable_source_keeps_resource_presence
     assert hass.states.get(presence_entity.entity_id).state == "present"
 
 
+@pytest.mark.asyncio
+async def test_source_failure_cannot_publish_missing_through_coordinator(
+    hass: HomeAssistant,
+) -> None:
+    present = INITIAL_RESOURCES[1]
+    first = snapshot((present,))
+    false_missing = absent_resource(
+        RESOURCE_CT,
+        PresenceState.MISSING,
+        vmid=101,
+        resource_continuity_revision=2,
+    )
+    invalid = snapshot(
+        (false_missing,),
+        sources=(unavailable_source(),),
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    entry = await setup_entry(hass, FakeTransport([first, invalid]))
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    assert entry.runtime_data.last_update_success is False
+    assert (
+        entry.runtime_data.data.resources_by_id[RESOURCE_CT].presence
+        is PresenceState.PRESENT
+    )
+
+
 def test_source_contract_carries_fixed_provenance_and_initial_semantics() -> None:
     healthy = source()
     assert healthy.current_context == healthy.committed_context
@@ -1599,10 +1653,13 @@ def test_source_durable_sequence_cannot_return_to_unset(
     incoming = snapshot(
         (),
         sources=(incoming_source,),
+        nodes=(),
         published_state_revision=21,
     )
     with pytest.raises(ValueError, match=match):
-        incoming.validate_revision_successor(snapshot((), sources=(source(),)))
+        incoming.validate_revision_successor(
+            snapshot((), sources=(source(),), nodes=())
+        )
 
 
 @pytest.mark.parametrize(
@@ -1783,10 +1840,11 @@ def test_first_successful_commit_recovers_from_precommit_source_failure() -> Non
         last_run_health_outcome="success",
         last_committed_run_sequence=2,
     )
-    previous = snapshot((), sources=(failed_before_first_commit,))
+    previous = snapshot((), sources=(failed_before_first_commit,), nodes=())
     incoming = snapshot(
         (),
         sources=(first_successful_commit,),
+        nodes=(),
         inventory_revision=11,
         published_state_revision=21,
     )
@@ -2125,7 +2183,7 @@ def test_node_display_and_runtime_facts_may_change_within_same_source() -> None:
     )
     incoming = snapshot(
         (),
-        sources=(source(),),
+        sources=(successful_source(),),
         nodes=(updated,),
         inventory_revision=11,
         published_state_revision=21,
