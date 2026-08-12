@@ -20,6 +20,33 @@ make a test pass.
 ADR acceptance does not mean the Phase 0 Amendment is implemented. Respect the
 documented phase gates and prerequisites before starting later-phase work.
 
+## Code Review Rules
+
+- Review the exact current diff against `docs/architecture/0.5-implementation-status.md`
+  and the relevant ACCEPTED architecture sources. Green tests are evidence, not
+  proof that a contract is correct.
+- A P1/P2 finding must identify a concrete witness or failure mode and the exact
+  accepted contract, security boundary, or runtime behavior it violates. A new
+  hardening idea that is not required by accepted architecture is a NEW
+  architectural decision or non-blocking follow-up, not an invented blocker.
+- Respect the Phase 0 / Phase 1 boundary. Do not require SQLite, CAS, durable run
+  history, persistent binding history, or other backend-owned Phase 1 guarantees
+  from the Phase 0 Home Assistant validator.
+- Home Assistant polling may skip arbitrary published revisions. Never infer
+  numeric `N -> N+1` adjacency, hidden intermediate state, or backend transaction
+  adjacency from two snapshots observed by HA.
+- When one concrete defect is found, inspect only the bounded same-family surface
+  needed to determine whether it is isolated or systemic. Once that exact family
+  is closed by code and regression evidence, stop; do not restart a broad audit
+  or expand into unrelated parser/schema/general hardening without new evidence.
+- A targeted fix review must remain targeted. Re-open previously closed review
+  scope only when the new diff or a concrete new witness materially affects it.
+- Preserve existing regression tests and fail-closed behavior. Do not weaken a
+  test or accepted invariant merely to make a proposed fix pass.
+- For detailed repository review procedure, use
+  `.agents/skills/hubinet-contract-review/SKILL.md`; skills are procedures and do
+  not override accepted ADRs or this repository-wide review boundary.
+
 ## Authority, identity, and discovery
 
 - The backend and SQLite are authoritative for inventory identity, policy,
