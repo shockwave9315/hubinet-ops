@@ -4,22 +4,40 @@ from dataclasses import replace
 import importlib.util
 from pathlib import Path
 import sys
+from types import ModuleType
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
-API_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "custom_components"
-    / "hubinet_ops"
-    / "api.py"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+CUSTOM_COMPONENTS_PATH = REPOSITORY_ROOT / "custom_components"
+HUBINET_OPS_PATH = CUSTOM_COMPONENTS_PATH / "hubinet_ops"
+for package_name, package_path in (
+    ("custom_components", CUSTOM_COMPONENTS_PATH),
+    ("custom_components.hubinet_ops", HUBINET_OPS_PATH),
+):
+    if package_name not in sys.modules:
+        package = ModuleType(package_name)
+        package.__path__ = [str(package_path)]
+        sys.modules[package_name] = package
+
+API_PATH = HUBINET_OPS_PATH / "api.py"
+API_SPEC = importlib.util.spec_from_file_location(
+    "custom_components.hubinet_ops.api", API_PATH
 )
-API_SPEC = importlib.util.spec_from_file_location("hubinet_ops_api_contract", API_PATH)
 assert API_SPEC is not None and API_SPEC.loader is not None
 api = importlib.util.module_from_spec(API_SPEC)
 sys.modules[API_SPEC.name] = api
 API_SPEC.loader.exec_module(api)
+
+from custom_components.hubinet_ops.contract import (  # noqa: E402
+    HubinetOpsSnapshot as ContractHubinetOpsSnapshot,
+    InventorySourceSnapshot as ContractInventorySourceSnapshot,
+    PresenceState as ContractPresenceState,
+    ResourceSnapshot as ContractResourceSnapshot,
+    ResourceType as ContractResourceType,
+)
 
 BackendInformation = api.BackendInformation
 DetailStatus = api.DetailStatus
@@ -38,6 +56,14 @@ SourceContext = api.SourceContext
 SourceFreshness = api.SourceFreshness
 SourceHealth = api.SourceHealth
 SourceHealthOrigin = api.SourceHealthOrigin
+
+
+def test_api_facade_reexports_contract_objects_by_identity() -> None:
+    assert ResourceSnapshot is ContractResourceSnapshot
+    assert HubinetOpsSnapshot is ContractHubinetOpsSnapshot
+    assert InventorySourceSnapshot is ContractInventorySourceSnapshot
+    assert PresenceState is ContractPresenceState
+    assert ResourceType is ContractResourceType
 
 BACKEND_ID = "6a172b5d-d820-4cac-904f-dfb17d42163e"
 SOURCE_ID = "cfe64f8e-2529-4692-9c23-526479961dbc"
