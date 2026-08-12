@@ -1309,6 +1309,21 @@ class HubinetOpsSnapshot:
                     or source.last_committed_run_sequence
                     > old_source.last_committed_run_sequence
                 )
+                and old_source.latest_completed_run_sequence is not None
+                and source.last_committed_run_sequence
+                <= old_source.latest_completed_run_sequence
+            ):
+                raise ValueError(
+                    "a new commit must postdate every previously finalized run"
+                )
+
+            if (
+                source.last_committed_run_sequence is not None
+                and (
+                    old_source.last_committed_run_sequence is None
+                    or source.last_committed_run_sequence
+                    > old_source.last_committed_run_sequence
+                )
                 and self.inventory_revision <= previous.inventory_revision
             ):
                 raise ValueError(

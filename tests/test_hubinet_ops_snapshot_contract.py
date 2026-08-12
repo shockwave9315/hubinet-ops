@@ -2053,6 +2053,172 @@ def test_successful_commit_then_failure_can_publish_newer_committed_missing() ->
     assert incoming.resources[0].presence is PresenceState.MISSING
 
 
+def failed_run_after_commit(
+    *,
+    committed_sequence: int,
+    failed_sequence: int,
+    completion_outcome: str = "source_unavailable",
+) -> InventorySourceSnapshot:
+    return replace(
+        successful_commit_source(sequence=committed_sequence),
+        health=SourceHealth.SOURCE_UNAVAILABLE,
+        freshness=SourceFreshness.STALE,
+        health_reason="active_endpoint_timeout",
+        last_issued_run_sequence=failed_sequence,
+        latest_completed_run_sequence=failed_sequence,
+        latest_completed_outcome=completion_outcome,
+        last_health_run_sequence=failed_sequence,
+        last_run_health_outcome="source_unavailable",
+    )
+
+
+@pytest.mark.parametrize(
+    "previous_source",
+    [
+        pytest.param(
+            failed_run_after_commit(committed_sequence=5, failed_sequence=6),
+            id="applicable-failure",
+        ),
+        pytest.param(
+            replace(
+                source(),
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="audit_only_inapplicable",
+            ),
+            id="audit-only-completion",
+        ),
+    ],
+)
+def test_finalized_run_cannot_be_retroactively_committed_after_maxima_advance(
+    previous_source: InventorySourceSnapshot,
+) -> None:
+    previous = snapshot(sources=(previous_source,))
+    incoming_source = failed_run_after_commit(
+        committed_sequence=6,
+        failed_sequence=7,
+    )
+    incoming = snapshot(
+        sources=(incoming_source,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match="postdate every previously finalized run"):
+        incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    ("new_commit", "accepted"),
+    [
+        pytest.param(5, False, id="first-finalized-run"),
+        pytest.param(6, False, id="middle-finalized-run"),
+        pytest.param(7, False, id="latest-finalized-run"),
+        pytest.param(8, True, id="next-unfinalized-run"),
+        pytest.param(10, True, id="polling-gap"),
+    ],
+)
+def test_new_commit_must_postdate_previous_completion_maximum(
+    new_commit: int,
+    accepted: bool,
+) -> None:
+    previous_source = failed_run_after_commit(
+        committed_sequence=4,
+        failed_sequence=7,
+        completion_outcome="audit_or_failure",
+    )
+    previous = snapshot(sources=(previous_source,))
+    incoming_source = failed_run_after_commit(
+        committed_sequence=new_commit,
+        failed_sequence=11,
+    )
+    incoming = snapshot(
+        sources=(incoming_source,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    if accepted:
+        incoming.validate_revision_successor(previous)
+        assert incoming_source.last_committed_run_sequence == new_commit
+    else:
+        with pytest.raises(
+            ValueError, match="postdate every previously finalized run"
+        ):
+            incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    ("new_commit", "accepted"),
+    [
+        pytest.param(4, False, id="already-finalized-first-commit"),
+        pytest.param(5, True, id="first-unfinalized-commit"),
+    ],
+)
+def test_first_commit_must_postdate_previous_completion_maximum(
+    new_commit: int,
+    accepted: bool,
+) -> None:
+    previous_source = replace(
+        initial_source(),
+        last_issued_run_sequence=4,
+        latest_completed_run_sequence=4,
+        latest_completed_outcome="audit_only_inapplicable",
+    )
+    previous = snapshot(sources=(previous_source,), nodes=(), resources=())
+    incoming = snapshot(
+        sources=(successful_commit_source(sequence=new_commit),),
+        nodes=(),
+        resources=(),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    if accepted:
+        incoming.validate_revision_successor(previous)
+    else:
+        with pytest.raises(
+            ValueError, match="postdate every previously finalized run"
+        ):
+            incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(
+    ("previous_source", "new_commit"),
+    [
+        pytest.param(
+            failed_run_after_commit(committed_sequence=5, failed_sequence=6),
+            7,
+            id="next-run-after-failure",
+        ),
+        pytest.param(
+            replace(
+                source(),
+                last_issued_run_sequence=6,
+                latest_completed_run_sequence=6,
+                latest_completed_outcome="audit_only_inapplicable",
+            ),
+            10,
+            id="polling-gap-after-audit",
+        ),
+        pytest.param(source(), 6, id="ordinary-next-commit"),
+    ],
+)
+def test_unfinalized_successful_commit_remains_legal(
+    previous_source: InventorySourceSnapshot,
+    new_commit: int,
+) -> None:
+    previous = snapshot(sources=(previous_source,))
+    incoming = snapshot(
+        sources=(successful_commit_source(sequence=new_commit),),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert incoming.sources[0].last_committed_run_sequence == new_commit
+
+
 def test_security_only_transition_does_not_require_discovery_commit() -> None:
     previous = snapshot()
     enrolled = replace(
