@@ -111,7 +111,7 @@ class HubinetOpsConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Validate initial setup and bind the entry to backend instance_id."""
+        """Validate setup and bind the entry to exact backend_instance_id."""
 
         errors: dict[str, str] = {}
         data: dict[str, Any] | None = None
@@ -129,7 +129,7 @@ class HubinetOpsConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.debug("Hubinet Ops setup validation failed", exc_info=True)
                 errors["base"] = "unknown"
             else:
-                await self.async_set_unique_id(info.instance_id)
+                await self.async_set_unique_id(info.backend_instance_id)
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(title=info.name, data=data)
 
@@ -158,7 +158,7 @@ class HubinetOpsConfigFlow(ConfigFlow, domain=DOMAIN):
             try:
                 data = _normalize_input({**entry.data, **user_input})
                 info = await _async_validate(self.hass, data)
-                if info.instance_id != entry.unique_id:
+                if info.backend_instance_id != entry.unique_id:
                     errors["base"] = "wrong_instance"
                 else:
                     return self.async_update_reload_and_abort(
@@ -193,7 +193,7 @@ class HubinetOpsConfigFlow(ConfigFlow, domain=DOMAIN):
             try:
                 data = _normalize_input(user_input)
                 info = await _async_validate(self.hass, data)
-                if info.instance_id != entry.unique_id:
+                if info.backend_instance_id != entry.unique_id:
                     errors["base"] = "wrong_instance"
                 else:
                     return self.async_update_reload_and_abort(

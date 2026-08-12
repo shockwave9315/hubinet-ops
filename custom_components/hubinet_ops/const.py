@@ -14,6 +14,7 @@ DEFAULT_UPDATE_INTERVAL = timedelta(seconds=60)
 DATA_API_FACTORY = "api_factory"
 
 MANUFACTURER = "Hubinet Ops"
+MODEL_SOURCE = "Proxmox inventory source via Hubinet Ops"
 MODEL_NODE = "Proxmox node via Hubinet Ops"
 MODEL_QEMU = "QEMU virtual machine via Hubinet Ops"
 MODEL_LXC = "LXC container via Hubinet Ops"

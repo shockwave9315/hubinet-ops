@@ -546,8 +546,11 @@ false continuity must never transfer destructive authority
 
 ## PHASE 0 AMENDMENT REQUIRED
 
-Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Phase
-1**. Wymagany amendment obejmuje łącznie:
+Status implementacji: wymagany tutaj contract shape, walidacja i natywna
+prezentacja HA zostały zrealizowane przez Phase 0 Amendment. Persistent backend
+enforcement wymieniony w wymaganiach pozostaje bramką Phase 1+.
+
+Przed implementacją Phase 1 amendment musi obejmować łącznie:
 
 - zastąpienie `ResourceIdentity(instance_id, resource_type, vmid)` przez jawne
   `backend_instance_id`, `inventory_source_id` i backendowy `resource_id`;
@@ -592,10 +595,10 @@ Obecny kod i kontrakt Phase 0 muszą zostać zmienione **przed implementacją Ph
   `missing`, `confirmed_removed` i `not_current` oraz zabraniające tej wartości
   w normalized provider entry obecnym w current baseline.
 
-Obecny `docs/architecture/0.5-foundation.md` dokumentuje faktyczny kontrakt
-Phase 0 i nie jest w tym PR przepisywany tak, jakby amendment już wdrożono.
-Trusted operations muszą osobno wymagać zaakceptowanego security continuity
-proof. Niniejsza faza nie modyfikuje kodu ani testów.
+`docs/architecture/0.5-foundation.md` dokumentuje faktyczny kontrakt po
+Amendment. Trusted operations nadal muszą osobno wymagać zaakceptowanego
+security continuity proof; Phase 0 nie implementuje mutation authority ani
+persistent reconciliation.
 
 ## Nierozstrzygnięte kwestie
 

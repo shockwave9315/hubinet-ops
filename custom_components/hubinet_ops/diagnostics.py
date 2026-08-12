@@ -1,8 +1,4 @@
-"""Diagnostics for Hubinet Ops.
-
-The redaction shape follows Home Assistant Core's Apache-2.0 ``proxmoxve``
-diagnostics and is expanded for bearer/header safety.
-"""
+"""Credentials-redacted diagnostics for the published Hubinet Ops view."""
 
 from __future__ import annotations
 
@@ -13,10 +9,12 @@ from typing import Any
 from homeassistant.components.diagnostics import REDACTED
 from homeassistant.core import HomeAssistant
 
-from .api import HubinetOpsSnapshot
+from .api import HubinetOpsSnapshot, SourceContext
 from .const import CONF_API_TOKEN, CONF_BASE_URL
 from .coordinator import HubinetOpsConfigEntry
 
+_ACRONYM_WORD_BOUNDARY = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
+_CAMEL_WORD_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _KEY_SEPARATOR = re.compile(r"[^a-z0-9]+")
 
 _REPOSITORY_SECRET_KEYS = frozenset(
@@ -24,8 +22,10 @@ _REPOSITORY_SECRET_KEYS = frozenset(
         CONF_API_TOKEN,
         CONF_BASE_URL,
         "api_key",
+        "auth_header",
         "authorization",
         "authorization_header",
+        "canonical_transport_locator",
         "credential",
         "credentials",
         "headers",
@@ -34,6 +34,9 @@ _REPOSITORY_SECRET_KEYS = frozenset(
         "password",
         "private_key",
         "secret",
+        "secret_access_key",
+        "secret_key",
+        "secrets",
         "ssh_key",
         "ssh_private_key",
         "token",
@@ -45,21 +48,33 @@ _REPOSITORY_SECRET_KEYS = frozenset(
 
 _REPOSITORY_SECRET_SUFFIXES = (
     "_api_key",
+    "_auth_header",
     "_authorization",
+    "_authorization_header",
+    "_base_url",
+    "_credential",
     "_credentials",
+    "_headers",
     "_passphrase",
     "_password",
     "_private_key",
     "_secret",
+    "_secret_access_key",
+    "_secret_key",
+    "_ssh_key",
     "_token",
+    "_token_value",
     "_webhook_id",
+    "_webhook_url",
 )
 
 
 def _normalize_diagnostic_key(key: Any) -> str:
-    """Normalize case and separators without changing the published key."""
+    """Normalize word boundaries and separators without changing the published key."""
 
-    return _KEY_SEPARATOR.sub("_", str(key).casefold()).strip("_")
+    normalized = _ACRONYM_WORD_BOUNDARY.sub("_", str(key))
+    normalized = _CAMEL_WORD_BOUNDARY.sub("_", normalized)
+    return _KEY_SEPARATOR.sub("_", normalized.casefold()).strip("_")
 
 
 def _is_repository_secret_key(key: Any) -> bool:
@@ -103,18 +118,63 @@ def _diagnostic_value(value: Any) -> Any:
     return value
 
 
+def _context_diagnostics(context: SourceContext | None) -> dict[str, Any] | None:
+    if context is None:
+        return None
+    return {
+        "source_config_revision": context.source_config_revision,
+        "endpoint_id": context.endpoint_id,
+        "canonical_transport_locator": context.canonical_transport_locator,
+        "canonicalization_contract_version": (
+            context.canonicalization_contract_version
+        ),
+        "transport_trust_revision": context.transport_trust_revision,
+    }
+
+
 def _snapshot_diagnostics(snapshot: HubinetOpsSnapshot) -> dict[str, Any]:
     return {
         "backend": {
-            "instance_id": snapshot.backend.instance_id,
+            "backend_instance_id": snapshot.backend.backend_instance_id,
             "name": snapshot.backend.name,
             "version": snapshot.backend.version,
             "api_version": snapshot.backend.api_version,
         },
-        "generated_at": snapshot.generated_at,
+        "inventory_revision": snapshot.inventory_revision,
+        "published_state_revision": snapshot.published_state_revision,
+        "published_at": snapshot.published_at,
+        "sources": [
+            {
+                "inventory_source_id": source.inventory_source_id,
+                "name": source.name,
+                "provider_kind": source.provider_kind,
+                "health": source.health.value,
+                "freshness": source.freshness.value,
+                "health_origin": source.health_origin.value,
+                "health_reason": source.health_reason,
+                "last_issued_run_sequence": source.last_issued_run_sequence,
+                "latest_completed_run_sequence": (
+                    source.latest_completed_run_sequence
+                ),
+                "latest_completed_outcome": source.latest_completed_outcome,
+                "last_health_run_sequence": source.last_health_run_sequence,
+                "last_run_health_outcome": source.last_run_health_outcome,
+                "last_committed_run_sequence": source.last_committed_run_sequence,
+                "last_successful_observed_at": (
+                    source.last_successful_observed_at
+                ),
+                "freshness_reference_at": source.freshness_reference_at,
+                "freshness_valid_until": source.freshness_valid_until,
+                "current_context": _context_diagnostics(source.current_context),
+                "committed_context": _context_diagnostics(source.committed_context),
+                "facts": _diagnostic_value(source.facts),
+            }
+            for source in snapshot.sources
+        ],
         "nodes": [
             {
                 "node_id": node.node_id,
+                "inventory_source_id": node.inventory_source_id,
                 "name": node.name,
                 "status": node.status,
                 "available": node.available,
@@ -124,20 +184,37 @@ def _snapshot_diagnostics(snapshot: HubinetOpsSnapshot) -> dict[str, Any]:
         ],
         "resources": [
             {
-                "identity": {
-                    "instance_id": resource.identity.instance_id,
-                    "resource_type": resource.identity.resource_type.value,
-                    "vmid": resource.identity.vmid,
-                },
+                "resource_id": resource.resource_id,
+                "inventory_source_id": resource.inventory_source_id,
+                "active_binding_id": resource.active_binding_id,
+                "resource_type": resource.resource_type.value,
+                "vmid": resource.vmid,
+                "locator_generation": resource.locator_generation,
+                "resource_continuity_revision": (
+                    resource.resource_continuity_revision
+                ),
                 "name": resource.name,
-                "node_id": resource.node_id,
+                "current_node_id": resource.current_node_id,
                 "last_known_node_id": resource.last_known_node_id,
                 "status": resource.status,
                 "state_level": resource.state_level.value,
-                "policy": _diagnostic_value(resource.policy),
-                "capabilities": sorted(resource.capabilities),
-                "available": resource.available,
                 "presence": resource.presence.value,
+                "lifecycle": resource.lifecycle.value,
+                "observational_continuity": (
+                    resource.observational_continuity.value
+                ),
+                "security_continuity": resource.security_continuity.value,
+                "detail_status": resource.detail_status.value,
+                "node_availability": resource.node_availability.value,
+                "retained_policy": _diagnostic_value(resource.retained_policy),
+                "effective_policy": _diagnostic_value(resource.effective_policy),
+                "policy_applicable": resource.policy_applicable,
+                "suspended_reason": resource.suspended_reason,
+                "effective_capabilities": sorted(
+                    resource.effective_capabilities
+                ),
+                "termination_reason": resource.termination_reason,
+                "successor_resource_id": resource.successor_resource_id,
                 "state": _diagnostic_value(resource.state),
             }
             for resource in snapshot.resources

@@ -8,6 +8,7 @@
     "error": {
       "cannot_connect": "Cannot connect to the Hubinet Ops backend.",
       "invalid_auth": "The Hubinet Ops API token is invalid.",
+      "invalid_snapshot": "The backend returned an invalid or regressing published snapshot.",
       "invalid_url": "Enter a valid HTTP or HTTPS Hubinet Ops base URL without credentials, query, or fragment.",
       "unknown": "An unexpected Hubinet Ops backend error occurred.",
       "wrong_instance": "The connection points to a different Hubinet Ops backend instance."
@@ -46,8 +47,17 @@
   "entity": {
     "sensor": {
       "node_status": {"name": "Status"},
+      "source_health": {"name": "Health"},
+      "source_freshness": {"name": "Freshness"},
+      "source_last_successful_observation": {"name": "Last successful observation"},
+      "source_freshness_valid_until": {"name": "Freshness valid until"},
       "resource_node": {"name": "Node"},
       "resource_status": {"name": "Status"},
+      "resource_presence": {"name": "Presence"},
+      "resource_detail_status": {"name": "Detail status"},
+      "resource_lifecycle": {"name": "Lifecycle"},
+      "resource_observational_continuity": {"name": "Observational continuity"},
+      "resource_security_continuity": {"name": "Security continuity"},
       "resource_type": {"name": "Type"}
     }
   },
@@ -57,6 +67,9 @@
     },
     "invalid_auth": {
       "message": "The Hubinet Ops API token is invalid."
+    },
+    "invalid_snapshot": {
+      "message": "The backend returned an invalid or regressing published snapshot."
     },
     "wrong_instance": {
       "message": "The connection points to a different Hubinet Ops backend instance."
