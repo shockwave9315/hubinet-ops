@@ -670,6 +670,69 @@ def test_policy_ineligible_state_levels_remain_representable_without_authority(
     assert not item.effective_capabilities
 
 
+@pytest.mark.parametrize(
+    "malformed_value",
+    [
+        pytest.param("false", id="false-string"),
+        pytest.param("true", id="true-string"),
+        pytest.param(0, id="zero"),
+        pytest.param(1, id="one"),
+        pytest.param(None, id="none"),
+        pytest.param([], id="list"),
+        pytest.param({}, id="mapping"),
+    ],
+)
+def test_policy_applicable_rejects_non_boolean_values(
+    malformed_value: object,
+) -> None:
+    with pytest.raises(ValueError, match="policy_applicable must be a boolean"):
+        resource(
+            security_continuity=SecurityContinuity.TRUSTED,
+            state_level=ResourceStateLevel.MANAGED,
+            policy_applicable=malformed_value,
+            effective_capabilities=frozenset({"restart"}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("policy_applicable", "state_level", "security_continuity"),
+    [
+        pytest.param(
+            False,
+            ResourceStateLevel.OBSERVED,
+            SecurityContinuity.UNVERIFIED,
+            id="false-observed",
+        ),
+        pytest.param(
+            True,
+            ResourceStateLevel.MANAGED,
+            SecurityContinuity.TRUSTED,
+            id="true-managed",
+        ),
+        pytest.param(
+            True,
+            ResourceStateLevel.MAINTENANCE,
+            SecurityContinuity.TRUSTED,
+            id="true-maintenance",
+        ),
+    ],
+)
+def test_policy_applicable_accepts_actual_boolean_values(
+    policy_applicable: bool,
+    state_level: ResourceStateLevel,
+    security_continuity: SecurityContinuity,
+) -> None:
+    item = resource(
+        security_continuity=security_continuity,
+        state_level=state_level,
+        policy_applicable=policy_applicable,
+        effective_capabilities=(
+            frozenset({"restart"}) if policy_applicable else frozenset()
+        ),
+    )
+    assert item.policy_applicable is policy_applicable
+
+
 def test_uuid_text_aliases_are_not_normalized_into_registry_identity() -> None:
     assert resource(resource_id=BACKEND_ID).resource_id == BACKEND_ID
     with pytest.raises(ValueError, match="canonical"):
@@ -2237,6 +2300,116 @@ def test_security_only_transition_does_not_require_discovery_commit() -> None:
         incoming.source_reconciliation_projection
         == previous.source_reconciliation_projection
     )
+
+
+STATE_LEVEL_TRANSITIONS = (
+    pytest.param(
+        ResourceStateLevel.DISCOVERED,
+        ResourceStateLevel.OBSERVED,
+        id="discovered-to-observed",
+    ),
+    pytest.param(
+        ResourceStateLevel.OBSERVED,
+        ResourceStateLevel.MANAGED,
+        id="observed-to-managed",
+    ),
+    pytest.param(
+        ResourceStateLevel.MANAGED,
+        ResourceStateLevel.MAINTENANCE,
+        id="managed-to-maintenance",
+    ),
+    pytest.param(
+        ResourceStateLevel.MAINTENANCE,
+        ResourceStateLevel.MANAGED,
+        id="maintenance-to-managed",
+    ),
+    pytest.param(
+        ResourceStateLevel.MANAGED,
+        ResourceStateLevel.OBSERVED,
+        id="managed-to-observed",
+    ),
+    pytest.param(
+        ResourceStateLevel.OBSERVED,
+        ResourceStateLevel.BREAK_GLASS,
+        id="observed-to-break-glass",
+    ),
+)
+
+
+@pytest.mark.parametrize(("old_level", "new_level"), STATE_LEVEL_TRANSITIONS)
+def test_state_level_transition_requires_newer_continuity_revision(
+    old_level: ResourceStateLevel,
+    new_level: ResourceStateLevel,
+) -> None:
+    previous_resource = resource(
+        continuity_revision=5,
+        security_continuity=SecurityContinuity.TRUSTED,
+        state_level=old_level,
+    )
+    incoming_resource = replace(previous_resource, state_level=new_level)
+    previous = snapshot(resources=(previous_resource,))
+    incoming = snapshot(
+        resources=(incoming_resource,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="security-relevant resource transition requires a newer",
+    ):
+        incoming.validate_revision_successor(previous)
+
+
+@pytest.mark.parametrize(("old_level", "new_level"), STATE_LEVEL_TRANSITIONS)
+def test_state_level_transition_accepts_nonadjacent_continuity_revision(
+    old_level: ResourceStateLevel,
+    new_level: ResourceStateLevel,
+) -> None:
+    previous_resource = resource(
+        continuity_revision=5,
+        security_continuity=SecurityContinuity.TRUSTED,
+        state_level=old_level,
+    )
+    incoming_resource = replace(
+        previous_resource,
+        resource_continuity_revision=7,
+        state_level=new_level,
+    )
+    previous = snapshot(resources=(previous_resource,))
+    incoming = snapshot(
+        resources=(incoming_resource,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert incoming_resource.resource_continuity_revision == 7
+
+
+@pytest.mark.parametrize(
+    "presentation_change",
+    [
+        pytest.param({"name": "Renamed resource"}, id="rename"),
+        pytest.param({"status": "stopped"}, id="runtime-status"),
+        pytest.param({"detail_status": DetailStatus.ERROR}, id="detail-refresh"),
+    ],
+)
+def test_nonsecurity_presentation_change_does_not_require_continuity_revision(
+    presentation_change: dict[str, Any],
+) -> None:
+    previous_resource = resource(continuity_revision=5)
+    incoming_resource = replace(previous_resource, **presentation_change)
+    previous = snapshot(resources=(previous_resource,))
+    incoming = snapshot(
+        sources=(successful_commit_source(sequence=6),),
+        resources=(incoming_resource,),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    incoming.validate_revision_successor(previous)
+    assert incoming_resource.resource_continuity_revision == 5
 
 
 def test_security_continuity_resolution_remains_independent_of_discovery() -> None:

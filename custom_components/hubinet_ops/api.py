@@ -557,6 +557,8 @@ class ResourceSnapshot:
             (self.state_level, ResourceStateLevel, "state_level"),
         ):
             _require_enum_instance(value, enum_type, field_name)
+        if not isinstance(self.policy_applicable, bool):
+            raise ValueError("policy_applicable must be a boolean")
         _require_positive(self.vmid, "vmid")
         _require_positive(self.locator_generation, "locator_generation")
         _require_positive(
@@ -1430,6 +1432,7 @@ class HubinetOpsSnapshot:
                 resource.observational_continuity
                 is not old.observational_continuity
                 or resource.security_continuity is not old.security_continuity
+                or resource.state_level is not old.state_level
                 or (
                     (old.lifecycle is LifecycleState.QUARANTINED)
                     != (resource.lifecycle is LifecycleState.QUARANTINED)
