@@ -207,13 +207,57 @@ ACCEPTED_RESOURCE_CASES = [
         {"security_continuity": SecurityContinuity.TRUSTED},
         id="normal-current-trusted",
     ),
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "detail_status": DetailStatus.TEMPORARILY_UNAVAILABLE,
+        },
+        id="normal-current-trusted-detail-temporarily-unavailable",
+    ),
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "detail_status": DetailStatus.ERROR,
+        },
+        id="normal-current-trusted-detail-error",
+    ),
     pytest.param(AMBIGUOUS_PRESENT, id="ambiguous-current-unverified"),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "detail_status": DetailStatus.TEMPORARILY_UNAVAILABLE,
+        },
+        id="ambiguous-current-unverified-detail-temporarily-unavailable",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "detail_status": DetailStatus.ERROR,
+        },
+        id="ambiguous-current-unverified-detail-error",
+    ),
     pytest.param(
         {
             **AMBIGUOUS_PRESENT,
             "security_continuity": SecurityContinuity.REVOKED,
         },
         id="ambiguous-current-revoked",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "security_continuity": SecurityContinuity.REVOKED,
+            "detail_status": DetailStatus.TEMPORARILY_UNAVAILABLE,
+        },
+        id="ambiguous-current-revoked-detail-temporarily-unavailable",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "security_continuity": SecurityContinuity.REVOKED,
+            "detail_status": DetailStatus.ERROR,
+        },
+        id="ambiguous-current-revoked-detail-error",
     ),
     pytest.param(AMBIGUOUS_MISSING, id="ambiguous-missing-unverified"),
     pytest.param(
