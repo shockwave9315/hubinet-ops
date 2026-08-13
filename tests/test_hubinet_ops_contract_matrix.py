@@ -3184,8 +3184,8 @@ def test_locator_binding_matrix_rejects_older_generation_backfill() -> None:
         current.validate_revision_successor(previous)
 
 
-FAMILY_G_CANONICAL_LOCATOR_V2 = "https://canonical-v2.example.test:8006"
-FAMILY_G_CANONICAL_LOCATOR_V3 = "https://canonical-v3.example.test:8006"
+FAMILY_G_CANONICAL_LOCATOR_V2 = "https://PVE-A.EXAMPLE.TEST:8006/"
+FAMILY_G_CANONICAL_LOCATOR_V3 = "https://pve-a.example.test:8006/"
 FAMILY_G_REWRITTEN_LOCATOR = "https://rewritten.example.test:8006"
 
 

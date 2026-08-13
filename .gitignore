@@ -6,6 +6,7 @@ __pycache__/
 .pytest-tmp-*/
 .pytest-run-*/
 .test-tmp/
+.hypothesis/
 .mypy_cache/
 .ruff_cache/
 .coverage
