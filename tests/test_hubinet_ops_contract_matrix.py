@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -750,3 +751,321 @@ def test_canonical_resource_state_matrix_rejects_same_view_contradictions(
 ) -> None:
     with pytest.raises(ValueError):
         snapshot(resources, nodes=nodes, sources=sources)
+
+
+FAMILY_B_RETAINED_POLICY = {"managed": True}
+FAMILY_B_CAPABILITIES = frozenset({"restart"})
+
+
+FAMILY_B_ACCEPTED_RESOURCE_CASES = [
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MANAGED,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+            "effective_policy": {"managed": True},
+            "policy_applicable": True,
+            "effective_capabilities": FAMILY_B_CAPABILITIES,
+        },
+        True,
+        FAMILY_B_CAPABILITIES,
+        id="policy-accept-managed-trusted-applicable",
+    ),
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MAINTENANCE,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+            "effective_policy": {"managed": True},
+            "policy_applicable": True,
+            "effective_capabilities": FAMILY_B_CAPABILITIES,
+        },
+        True,
+        FAMILY_B_CAPABILITIES,
+        id="policy-accept-maintenance-trusted-applicable",
+    ),
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MANAGED,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-managed-trusted-not-applicable",
+    ),
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MAINTENANCE,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-maintenance-trusted-not-applicable",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-retained-while-quarantined",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_MISSING,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-retained-while-missing",
+    ),
+    pytest.param(
+        {
+            **CONFIRMED_REMOVED,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-retained-after-confirmed-removal",
+    ),
+    pytest.param(
+        {
+            **NOT_CURRENT,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-retained-on-not-current-predecessor",
+    ),
+    pytest.param(
+        {
+            "state_level": ResourceStateLevel.DISCOVERED,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-discovered-retained-but-not-applicable",
+    ),
+    pytest.param(
+        {
+            "state_level": ResourceStateLevel.OBSERVED,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-observed-retained-but-not-applicable",
+    ),
+    pytest.param(
+        {
+            "state_level": ResourceStateLevel.BREAK_GLASS,
+            "retained_policy": FAMILY_B_RETAINED_POLICY,
+        },
+        False,
+        frozenset(),
+        id="policy-accept-break-glass-retained-but-not-applicable",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_applicable", "expected_capabilities"),
+    FAMILY_B_ACCEPTED_RESOURCE_CASES,
+)
+def test_policy_matrix_accepts_supported_resource_relationships(
+    changes: dict[str, Any],
+    expected_applicable: bool,
+    expected_capabilities: frozenset[str],
+) -> None:
+    item = resource(**changes)
+    assert item.retained_policy == FAMILY_B_RETAINED_POLICY
+    assert item.policy_applicable is expected_applicable
+    assert item.effective_capabilities == expected_capabilities
+
+
+FAMILY_B_REJECTED_POLICY_CASES = [
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.DISCOVERED,
+        },
+        id="policy-reject-discovered-applicable",
+    ),
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.OBSERVED,
+        },
+        id="policy-reject-observed-applicable",
+    ),
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.BREAK_GLASS,
+        },
+        id="policy-reject-break-glass-applicable",
+    ),
+    pytest.param(
+        {"state_level": ResourceStateLevel.MANAGED},
+        id="policy-reject-unverified-managed-applicable",
+    ),
+    pytest.param(
+        {"state_level": ResourceStateLevel.MAINTENANCE},
+        id="policy-reject-unverified-maintenance-applicable",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        id="policy-reject-quarantined-unverified-applicable",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "security_continuity": SecurityContinuity.REVOKED,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        id="policy-reject-quarantined-revoked-applicable",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_MISSING,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        id="policy-reject-missing-applicable",
+    ),
+    pytest.param(
+        {
+            **CONFIRMED_REMOVED,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        id="policy-reject-confirmed-removed-applicable",
+    ),
+    pytest.param(
+        {
+            **NOT_CURRENT,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        id="policy-reject-not-current-applicable",
+    ),
+]
+
+
+@pytest.mark.parametrize("changes", FAMILY_B_REJECTED_POLICY_CASES)
+def test_policy_matrix_rejects_applicability_outside_eligibility_envelope(
+    changes: dict[str, Any],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="managed/maintenance trusted current state",
+    ):
+        resource(
+            **changes,
+            retained_policy=FAMILY_B_RETAINED_POLICY,
+            policy_applicable=True,
+        )
+
+
+FAMILY_B_REJECTED_CAPABILITY_CASES = [
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        id="capability-reject-managed-without-applicability",
+    ),
+    pytest.param(
+        {
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MAINTENANCE,
+        },
+        id="capability-reject-maintenance-without-applicability",
+    ),
+    pytest.param(
+        {"state_level": ResourceStateLevel.DISCOVERED},
+        id="capability-reject-discovered-without-applicability",
+    ),
+    pytest.param(
+        {"state_level": ResourceStateLevel.OBSERVED},
+        id="capability-reject-observed-without-applicability",
+    ),
+    pytest.param(
+        AMBIGUOUS_PRESENT,
+        id="capability-reject-quarantined-without-applicability",
+    ),
+]
+
+
+@pytest.mark.parametrize("changes", FAMILY_B_REJECTED_CAPABILITY_CASES)
+def test_capability_matrix_rejects_authority_without_applicability(
+    changes: dict[str, Any],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="effective capabilities require backend-published policy applicability",
+    ):
+        resource(
+            **changes,
+            policy_applicable=False,
+            effective_capabilities=FAMILY_B_CAPABILITIES,
+        )
+
+
+FAMILY_B_SOURCE_POLICY_CASES = [
+    pytest.param(
+        ResourceStateLevel.MANAGED,
+        id="source-policy-managed-trusted-applicable",
+    ),
+    pytest.param(
+        ResourceStateLevel.MAINTENANCE,
+        id="source-policy-maintenance-trusted-applicable",
+    ),
+]
+
+
+def time_expiry_source() -> InventorySourceSnapshot:
+    return replace(
+        source(),
+        health=SourceHealth.HEALTHY,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.TIME_EXPIRY,
+        health_reason="freshness_deadline_elapsed",
+    )
+
+
+@pytest.mark.parametrize("state_level", FAMILY_B_SOURCE_POLICY_CASES)
+def test_source_policy_matrix_accepts_current_facts(
+    state_level: ResourceStateLevel,
+) -> None:
+    item = resource(
+        security_continuity=SecurityContinuity.TRUSTED,
+        state_level=state_level,
+        retained_policy=FAMILY_B_RETAINED_POLICY,
+        policy_applicable=True,
+        effective_capabilities=FAMILY_B_CAPABILITIES,
+    )
+    view = snapshot((item,), nodes=(node(),))
+    assert view.sources[0].current_facts_available
+
+
+@pytest.mark.parametrize("state_level", FAMILY_B_SOURCE_POLICY_CASES)
+def test_source_policy_matrix_rejects_stale_current_facts(
+    state_level: ResourceStateLevel,
+) -> None:
+    item = resource(
+        security_continuity=SecurityContinuity.TRUSTED,
+        state_level=state_level,
+        retained_policy=FAMILY_B_RETAINED_POLICY,
+        policy_applicable=True,
+        effective_capabilities=FAMILY_B_CAPABILITIES,
+    )
+    stale = time_expiry_source()
+    assert not stale.current_facts_available
+    with pytest.raises(
+        ValueError,
+        match="policy/capabilities require a fresh healthy source snapshot",
+    ):
+        snapshot((item,), sources=(stale,), nodes=(node(),))
