@@ -54,6 +54,11 @@ ASCII_TEXT = st.text(
     min_size=1,
     max_size=24,
 )
+DNS_LABEL = st.text(
+    alphabet="abcdefghijklmnopqrstuvwxyz0123456789",
+    min_size=1,
+    max_size=24,
+)
 NON_SUCCESS_OUTCOME = st.sampled_from(("failed", "partial", "audit_only"))
 
 
@@ -1226,7 +1231,7 @@ def test_active_binding_owner_cannot_move_between_resources(
     published_revision=POSITIVE_REVISION,
     published_delta=POSITIVE_DELTA,
     inventory_revision=INVENTORY_REVISION,
-    locator_label=ASCII_TEXT,
+    locator_label=DNS_LABEL,
     ids=st.lists(CANONICAL_UUID, min_size=3, max_size=3, unique=True),
 )
 def test_source_context_canonicalization_migration_is_controlled(
@@ -1241,8 +1246,10 @@ def test_source_context_canonicalization_migration_is_controlled(
     ids: list[str],
 ) -> None:
     backend_id, source_id, endpoint_id = ids
-    old_locator = f"https://{locator_label}.old.test:8006"
-    new_locator = f"https://{locator_label}.new.test:8006"
+    old_locator = f"https://{locator_label}.example.test"
+    new_locator = f"https://{locator_label.upper()}.example.test:443/"
+    # Model a versioned representation change of one retained endpoint namespace,
+    # not replacement with a different transport target.
     committed_context = _context(
         endpoint_id=endpoint_id,
         config_revision=config_revision,
