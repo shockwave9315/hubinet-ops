@@ -52,9 +52,11 @@ NODE_UNAVAILABLE_ID = "6f1c0770-6ca6-4c20-ab56-8cb645f63ee3"
 RESOURCE_ID = "b50f157b-d2fb-4fff-9497-42c5c239ef49"
 SUCCESSOR_ID = "c5321ec5-7259-421a-94ab-195a9c5e5d81"
 THIRD_RESOURCE_ID = "727f79b7-9d89-45e5-88da-21adfd94f08a"
+FOURTH_RESOURCE_ID = "4f83c2af-84ae-4f54-8a3e-6b98ffb85543"
 BINDING_ID = "16fa5f7e-94c4-4f9a-879b-6221a59f5cd0"
 SUCCESSOR_BINDING_ID = "d485a25a-b0f3-4dfa-b7c7-89c73b67b4bc"
 THIRD_BINDING_ID = "708f1b4a-e26e-49b8-8b98-8625038182c0"
+FOURTH_BINDING_ID = "ab077823-a177-4c48-bc72-4c6c001b2e21"
 
 
 BASE_RESOURCE: dict[str, Any] = {
@@ -2420,3 +2422,763 @@ def test_polling_gap_matrix_rejects_observed_lineage_rewrite() -> None:
         match="terminal replacement lineage is immutable",
     ):
         rewritten.validate_revision_successor(accepted)
+
+
+def family_f_current_resource(
+    *,
+    resource_id: str = RESOURCE_ID,
+    source_id: str = SOURCE_A_ID,
+    binding_id: str = BINDING_ID,
+    vmid: int = 101,
+    generation: int = 4,
+    resource_type: ResourceType = ResourceType.LXC,
+    **changes: Any,
+) -> ResourceSnapshot:
+    values = {
+        "resource_id": resource_id,
+        "inventory_source_id": source_id,
+        "active_binding_id": binding_id,
+        "resource_type": resource_type,
+        "vmid": vmid,
+        "locator_generation": generation,
+        "current_node_id": None,
+        "last_known_node_id": None,
+        "node_availability": NodeAvailability.UNRESOLVED,
+    }
+    values.update(changes)
+    return resource(**values)
+
+
+def family_f_removed_resource(
+    *,
+    resource_id: str = RESOURCE_ID,
+    source_id: str = SOURCE_A_ID,
+    vmid: int = 101,
+    generation: int = 4,
+    resource_type: ResourceType = ResourceType.LXC,
+    **changes: Any,
+) -> ResourceSnapshot:
+    values = {
+        **CONFIRMED_REMOVED,
+        "resource_id": resource_id,
+        "inventory_source_id": source_id,
+        "resource_type": resource_type,
+        "vmid": vmid,
+        "locator_generation": generation,
+        "resource_continuity_revision": 2,
+        "last_known_node_id": None,
+    }
+    values.update(changes)
+    return resource(**values)
+
+
+def family_f_replaced_resource(
+    *,
+    successor_resource_id: str,
+    resource_id: str = RESOURCE_ID,
+    source_id: str = SOURCE_A_ID,
+    vmid: int = 101,
+    generation: int = 4,
+    resource_type: ResourceType = ResourceType.LXC,
+    **changes: Any,
+) -> ResourceSnapshot:
+    values = {
+        **NOT_CURRENT,
+        "resource_id": resource_id,
+        "inventory_source_id": source_id,
+        "resource_type": resource_type,
+        "vmid": vmid,
+        "locator_generation": generation,
+        "resource_continuity_revision": 2,
+        "last_known_node_id": None,
+        "successor_resource_id": successor_resource_id,
+    }
+    values.update(changes)
+    return resource(**values)
+
+
+def family_f_missing_resource(
+    *,
+    resource_id: str = RESOURCE_ID,
+    source_id: str = SOURCE_A_ID,
+    binding_id: str = BINDING_ID,
+    vmid: int = 101,
+    generation: int = 4,
+    **changes: Any,
+) -> ResourceSnapshot:
+    values = {
+        **AMBIGUOUS_MISSING,
+        "resource_continuity_revision": 2,
+        "last_known_node_id": None,
+    }
+    values.update(changes)
+    return family_f_current_resource(
+        resource_id=resource_id,
+        source_id=source_id,
+        binding_id=binding_id,
+        vmid=vmid,
+        generation=generation,
+        **values,
+    )
+
+
+FAMILY_F_SINGLE_VIEW_ACCEPT_CASES = [
+    pytest.param(
+        (
+            family_f_current_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                source_id=SOURCE_B_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=4,
+            ),
+        ),
+        (source(), source(SOURCE_B_ID)),
+        {
+            (SOURCE_A_ID, 101): RESOURCE_ID,
+            (SOURCE_B_ID, 101): SUCCESSOR_ID,
+        },
+        (
+            (SOURCE_A_ID, 101, 4),
+            (SOURCE_B_ID, 101, 4),
+        ),
+        id="locator-accept-same-vmid-different-sources",
+    ),
+    pytest.param(
+        (
+            family_f_removed_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+            ),
+        ),
+        (source(),),
+        {(SOURCE_A_ID, 101): SUCCESSOR_ID},
+        (
+            (SOURCE_A_ID, 101, 4),
+            (SOURCE_A_ID, 101, 5),
+        ),
+        id="generation-accept-terminal-four-current-five",
+    ),
+    pytest.param(
+        (
+            family_f_removed_resource(generation=4),
+            family_f_removed_resource(
+                resource_id=SUCCESSOR_ID,
+                generation=5,
+            ),
+            family_f_current_resource(
+                resource_id=THIRD_RESOURCE_ID,
+                binding_id=THIRD_BINDING_ID,
+                generation=6,
+            ),
+        ),
+        (source(),),
+        {(SOURCE_A_ID, 101): THIRD_RESOURCE_ID},
+        (
+            (SOURCE_A_ID, 101, 4),
+            (SOURCE_A_ID, 101, 5),
+            (SOURCE_A_ID, 101, 6),
+        ),
+        id="generation-accept-two-terminal-generations-current-six",
+    ),
+    pytest.param(
+        (
+            family_f_removed_resource(generation=100),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=101,
+            ),
+        ),
+        (source(),),
+        {(SOURCE_A_ID, 101): SUCCESSOR_ID},
+        (
+            (SOURCE_A_ID, 101, 100),
+            (SOURCE_A_ID, 101, 101),
+        ),
+        id="generation-accept-history-minimum-one-hundred",
+    ),
+    pytest.param(
+        (
+            family_f_removed_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+            ),
+            family_f_removed_resource(
+                resource_id=THIRD_RESOURCE_ID,
+                source_id=SOURCE_B_ID,
+                generation=9,
+            ),
+            family_f_current_resource(
+                resource_id=FOURTH_RESOURCE_ID,
+                source_id=SOURCE_B_ID,
+                binding_id=FOURTH_BINDING_ID,
+                generation=10,
+            ),
+        ),
+        (source(), source(SOURCE_B_ID)),
+        {
+            (SOURCE_A_ID, 101): SUCCESSOR_ID,
+            (SOURCE_B_ID, 101): FOURTH_RESOURCE_ID,
+        },
+        (
+            (SOURCE_A_ID, 101, 4),
+            (SOURCE_A_ID, 101, 5),
+            (SOURCE_B_ID, 101, 9),
+            (SOURCE_B_ID, 101, 10),
+        ),
+        id="generation-accept-source-local-independent-histories",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("resources", "sources", "expected_current", "expected_history"),
+    FAMILY_F_SINGLE_VIEW_ACCEPT_CASES,
+)
+def test_locator_binding_matrix_accepts_source_local_slot_geometry(
+    resources: tuple[ResourceSnapshot, ...],
+    sources: tuple[InventorySourceSnapshot, ...],
+    expected_current: dict[tuple[str, int], str],
+    expected_history: tuple[tuple[str, int, int], ...],
+) -> None:
+    view = snapshot(resources, sources=sources)
+
+    assert {
+        locator: item.resource_id
+        for locator, item in view.current_resources_by_locator.items()
+    } == expected_current
+    assert sorted(
+        (
+            item.inventory_source_id,
+            item.vmid,
+            item.locator_generation,
+        )
+        for item in view.resources
+    ) == sorted(expected_history)
+
+
+FAMILY_F_SINGLE_VIEW_REJECT_CASES = [
+    pytest.param(
+        (
+            family_f_current_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+            ),
+        ),
+        (source(),),
+        "snapshot contains multiple current occupants for a locator",
+        id="locator-reject-two-current-same-slot",
+    ),
+    pytest.param(
+        (
+            family_f_current_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+                resource_type=ResourceType.QEMU,
+            ),
+        ),
+        (source(),),
+        "snapshot contains multiple current occupants for a locator",
+        id="locator-reject-lxc-qemu-concurrent-slot",
+    ),
+    pytest.param(
+        (
+            family_f_current_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                source_id=SOURCE_B_ID,
+                binding_id=BINDING_ID,
+                vmid=202,
+                generation=9,
+            ),
+        ),
+        (source(), source(SOURCE_B_ID)),
+        "snapshot contains duplicate active binding identities",
+        id="binding-reject-duplicate-active-identity-across-locators",
+    ),
+    pytest.param(
+        (
+            family_f_removed_resource(generation=4),
+            family_f_removed_resource(
+                resource_id=SUCCESSOR_ID,
+                generation=4,
+            ),
+        ),
+        (source(),),
+        "snapshot contains duplicate retained locator generation",
+        id="generation-reject-duplicate-retained-generation",
+    ),
+    pytest.param(
+        (
+            family_f_removed_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=6,
+            ),
+        ),
+        (source(),),
+        "current locator generation must follow retained terminal history",
+        id="generation-reject-confirmed-removal-reuse-skips-five",
+    ),
+    pytest.param(
+        (
+            family_f_replaced_resource(
+                successor_resource_id=SUCCESSOR_ID,
+            ),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                source_id=SOURCE_B_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+            ),
+        ),
+        (source(), source(SOURCE_B_ID)),
+        "replacement lineage violates locator history invariants",
+        id="replacement-reject-successor-wrong-source",
+    ),
+    pytest.param(
+        (
+            family_f_replaced_resource(
+                successor_resource_id=SUCCESSOR_ID,
+            ),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                vmid=102,
+                generation=5,
+            ),
+        ),
+        (source(),),
+        "replacement lineage violates locator history invariants",
+        id="replacement-reject-successor-wrong-vmid",
+    ),
+    pytest.param(
+        (
+            family_f_replaced_resource(
+                successor_resource_id=SUCCESSOR_ID,
+            ),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=6,
+            ),
+        ),
+        (source(),),
+        "current locator generation must follow retained terminal history",
+        id="replacement-reject-successor-wrong-generation",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("resources", "sources", "message"),
+    FAMILY_F_SINGLE_VIEW_REJECT_CASES,
+)
+def test_locator_binding_matrix_rejects_single_view_ownership_conflicts(
+    resources: tuple[ResourceSnapshot, ...],
+    sources: tuple[InventorySourceSnapshot, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        snapshot(resources, sources=sources)
+
+
+FAMILY_F_GENERATION_GAP_REJECT_CASES = [
+    pytest.param((4, 6), id="generation-reject-internal-gap-four-six"),
+    pytest.param((4, 5, 7), id="generation-reject-internal-gap-four-five-seven"),
+    pytest.param((100, 102), id="generation-reject-internal-gap-hundred"),
+]
+
+
+@pytest.mark.parametrize("generations", FAMILY_F_GENERATION_GAP_REJECT_CASES)
+def test_locator_binding_matrix_rejects_internal_generation_gaps(
+    generations: tuple[int, ...],
+) -> None:
+    resource_ids = (RESOURCE_ID, SUCCESSOR_ID, THIRD_RESOURCE_ID)
+    retained = tuple(
+        family_f_removed_resource(
+            resource_id=resource_ids[index],
+            generation=generation,
+        )
+        for index, generation in enumerate(generations)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="retained locator generations must be consecutive",
+    ):
+        snapshot(retained)
+
+
+FAMILY_F_TERMINAL_AND_REPLACEMENT_ACCEPT_CASES = [
+    pytest.param(
+        (family_f_current_resource(generation=4),),
+        (family_f_removed_resource(generation=4),),
+        None,
+        None,
+        id="binding-accept-present-to-confirmed-removed-closes-binding",
+    ),
+    pytest.param(
+        (family_f_current_resource(generation=4),),
+        (
+            family_f_replaced_resource(
+                successor_resource_id=SUCCESSOR_ID,
+            ),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+            ),
+        ),
+        SUCCESSOR_ID,
+        ResourceType.LXC,
+        id="replacement-accept-present-predecessor-fresh-binding",
+    ),
+    pytest.param(
+        (family_f_missing_resource(),),
+        (
+            family_f_replaced_resource(
+                successor_resource_id=SUCCESSOR_ID,
+                resource_continuity_revision=3,
+            ),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+            ),
+        ),
+        SUCCESSOR_ID,
+        ResourceType.LXC,
+        id="replacement-accept-missing-predecessor-fresh-binding",
+    ),
+    pytest.param(
+        (family_f_current_resource(generation=4),),
+        (
+            family_f_replaced_resource(
+                successor_resource_id=SUCCESSOR_ID,
+            ),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+                resource_type=ResourceType.QEMU,
+            ),
+        ),
+        SUCCESSOR_ID,
+        ResourceType.QEMU,
+        id="replacement-accept-lxc-to-qemu-same-slot",
+    ),
+    pytest.param(
+        (family_f_removed_resource(generation=4),),
+        (
+            family_f_removed_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=5,
+            ),
+        ),
+        SUCCESSOR_ID,
+        ResourceType.LXC,
+        id="replacement-accept-confirmed-removal-slot-reuse",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    (
+        "previous_resources",
+        "current_resources",
+        "expected_current_id",
+        "expected_current_type",
+    ),
+    FAMILY_F_TERMINAL_AND_REPLACEMENT_ACCEPT_CASES,
+)
+def test_locator_binding_matrix_accepts_terminal_and_replacement_transitions(
+    previous_resources: tuple[ResourceSnapshot, ...],
+    current_resources: tuple[ResourceSnapshot, ...],
+    expected_current_id: str | None,
+    expected_current_type: ResourceType | None,
+) -> None:
+    previous = snapshot(
+        previous_resources,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = snapshot(
+        current_resources,
+        sources=(successful_source_run(12),),
+        inventory_revision=16,
+        published_state_revision=47,
+    )
+
+    current.validate_revision_successor(previous)
+
+    retained = current.resources_by_id[RESOURCE_ID]
+    assert retained.active_binding_id is None
+    if expected_current_id is not None:
+        occupant = current.resources_by_id[expected_current_id]
+        assert occupant.active_binding_id == SUCCESSOR_BINDING_ID
+        assert occupant.active_binding_id != BINDING_ID
+        assert occupant.locator_generation == 5
+        assert occupant.resource_type is expected_current_type
+    assert current.sources[0].last_committed_run_sequence == 12
+
+
+FAMILY_F_NONTERMINAL_CONTINUITY_ACCEPT_CASES = [
+    pytest.param(
+        family_f_current_resource(generation=4),
+        family_f_missing_resource(),
+        PresenceState.MISSING,
+        id="binding-accept-present-to-missing-retains-identity",
+    ),
+    pytest.param(
+        family_f_missing_resource(),
+        family_f_current_resource(
+            generation=4,
+            resource_continuity_revision=3,
+        ),
+        PresenceState.PRESENT,
+        id="binding-accept-missing-to-present-retains-identity",
+    ),
+    pytest.param(
+        family_f_current_resource(generation=4),
+        family_f_current_resource(
+            generation=4,
+            resource_continuity_revision=2,
+            lifecycle=LifecycleState.QUARANTINED,
+            observational_continuity=ObservationalContinuity.UNCERTAIN,
+        ),
+        PresenceState.PRESENT,
+        id="binding-accept-quarantine-retains-identity",
+    ),
+    pytest.param(
+        family_f_current_resource(generation=4, name="Before rename"),
+        family_f_current_resource(generation=4, name="After rename"),
+        PresenceState.PRESENT,
+        id="generation-accept-rename-does-not-create-incarnation",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_resource", "current_resource", "expected_presence"),
+    FAMILY_F_NONTERMINAL_CONTINUITY_ACCEPT_CASES,
+)
+def test_locator_binding_matrix_accepts_nonterminal_identity_continuity(
+    previous_resource: ResourceSnapshot,
+    current_resource: ResourceSnapshot,
+    expected_presence: PresenceState,
+) -> None:
+    previous = snapshot(
+        (previous_resource,),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = snapshot(
+        (current_resource,),
+        sources=(successful_source_run(12),),
+        inventory_revision=16,
+        published_state_revision=47,
+    )
+
+    current.validate_revision_successor(previous)
+
+    assert current_resource.presence is expected_presence
+    assert current_resource.resource_id == previous_resource.resource_id
+    assert current_resource.inventory_source_id == previous_resource.inventory_source_id
+    assert current_resource.resource_type is previous_resource.resource_type
+    assert current_resource.vmid == previous_resource.vmid
+    assert current_resource.locator_generation == previous_resource.locator_generation
+    assert current_resource.active_binding_id == previous_resource.active_binding_id
+
+
+def test_locator_binding_matrix_rejects_nonterminal_binding_change() -> None:
+    previous_resource = family_f_current_resource(generation=4)
+    changed_binding = family_f_current_resource(
+        generation=4,
+        binding_id=SUCCESSOR_BINDING_ID,
+    )
+    previous = snapshot(
+        (previous_resource,),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = snapshot(
+        (changed_binding,),
+        sources=(successful_source_run(12),),
+        inventory_revision=16,
+        published_state_revision=47,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="active binding is immutable before a terminal transition",
+    ):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_F_BINDING_OWNER_MOVE_REJECT_CASES = [
+    pytest.param(
+        (
+            family_f_replaced_resource(
+                successor_resource_id=SUCCESSOR_ID,
+            ),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=BINDING_ID,
+                generation=5,
+            ),
+        ),
+        (successful_source_run(12),),
+        id="binding-reject-successor-reuses-predecessor-binding",
+    ),
+    pytest.param(
+        (
+            family_f_removed_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                binding_id=BINDING_ID,
+                vmid=202,
+                generation=1,
+            ),
+        ),
+        (successful_source_run(12),),
+        id="binding-reject-owner-move-to-different-vmid",
+    ),
+    pytest.param(
+        (
+            family_f_removed_resource(generation=4),
+            family_f_current_resource(
+                resource_id=SUCCESSOR_ID,
+                source_id=SOURCE_B_ID,
+                binding_id=BINDING_ID,
+                vmid=202,
+                generation=1,
+            ),
+        ),
+        (successful_source_run(12), source(SOURCE_B_ID)),
+        id="binding-reject-owner-move-to-different-source",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("current_resources", "current_sources"),
+    FAMILY_F_BINDING_OWNER_MOVE_REJECT_CASES,
+)
+def test_locator_binding_matrix_rejects_binding_owner_move(
+    current_resources: tuple[ResourceSnapshot, ...],
+    current_sources: tuple[InventorySourceSnapshot, ...],
+) -> None:
+    previous = snapshot(
+        (family_f_current_resource(generation=4),),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = snapshot(
+        current_resources,
+        sources=current_sources,
+        inventory_revision=16,
+        published_state_revision=47,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="active binding identity cannot move between resources",
+    ):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_F_INCARNATION_IMMUTABILITY_REJECT_CASES = [
+    pytest.param(
+        family_f_current_resource(
+            source_id=SOURCE_B_ID,
+            generation=4,
+        ),
+        (successful_source_run(12), source(SOURCE_B_ID)),
+        "resource identity cannot move between sources",
+        id="incarnation-reject-source-change",
+    ),
+    pytest.param(
+        family_f_current_resource(
+            generation=4,
+            resource_type=ResourceType.QEMU,
+        ),
+        (successful_source_run(12),),
+        "resource_type is immutable for an incarnation",
+        id="incarnation-reject-type-change",
+    ),
+    pytest.param(
+        family_f_current_resource(vmid=102, generation=4),
+        (successful_source_run(12),),
+        "resource locator is immutable for an incarnation",
+        id="incarnation-reject-vmid-change",
+    ),
+    pytest.param(
+        family_f_current_resource(generation=5),
+        (successful_source_run(12),),
+        "locator_generation is immutable for an incarnation",
+        id="incarnation-reject-generation-change",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("current_resource", "current_sources", "message"),
+    FAMILY_F_INCARNATION_IMMUTABILITY_REJECT_CASES,
+)
+def test_locator_binding_matrix_rejects_incarnation_identity_mutation(
+    current_resource: ResourceSnapshot,
+    current_sources: tuple[InventorySourceSnapshot, ...],
+    message: str,
+) -> None:
+    previous = snapshot(
+        (family_f_current_resource(generation=4),),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = snapshot(
+        (current_resource,),
+        sources=current_sources,
+        inventory_revision=16,
+        published_state_revision=47,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        current.validate_revision_successor(previous)
+
+
+def test_locator_binding_matrix_rejects_older_generation_backfill() -> None:
+    current_resource = family_f_current_resource(generation=4)
+    previous = snapshot(
+        (current_resource,),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    backfilled = family_f_removed_resource(
+        resource_id=SUCCESSOR_ID,
+        generation=3,
+    )
+    current = snapshot(
+        (backfilled, current_resource),
+        sources=(successful_source_run(12),),
+        inventory_revision=16,
+        published_state_revision=47,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="new locator history must follow all previously retained generations",
+    ):
+        current.validate_revision_successor(previous)
