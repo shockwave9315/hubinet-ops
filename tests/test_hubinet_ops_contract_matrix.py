@@ -2090,3 +2090,333 @@ def test_source_run_matrix_rejects_reconciliation_change_without_new_commit(
         "a newer last_committed_run_sequence",
     ):
         current.validate_revision_successor(previous)
+
+
+FAMILY_E_SUCCESSOR_POLICY = {"owner": "successor"}
+FAMILY_E_SUCCESSOR_CAPABILITIES = frozenset({"restart"})
+
+
+def polling_gap_previous_snapshot() -> HubinetOpsSnapshot:
+    return snapshot(
+        (
+            resource(
+                locator_generation=4,
+                resource_continuity_revision=1,
+            ),
+        ),
+        nodes=(node(),),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+
+
+def polling_gap_current_snapshot(
+    resources: tuple[ResourceSnapshot, ...],
+    *,
+    commit_sequence: int = 12,
+    inventory_revision: int = 16,
+    published_state_revision: int = 47,
+) -> HubinetOpsSnapshot:
+    return snapshot(
+        resources,
+        sources=(successful_source_run(commit_sequence),),
+        nodes=(node(),),
+        inventory_revision=inventory_revision,
+        published_state_revision=published_state_revision,
+    )
+
+
+FAMILY_E_SUCCESSOR_EVOLUTION_ACCEPT_CASES = [
+    pytest.param(
+        {},
+        {
+            "resource_continuity_revision": 5,
+            "security_continuity": SecurityContinuity.TRUSTED,
+        },
+        PresenceState.PRESENT,
+        LifecycleState.ACTIVE,
+        SecurityContinuity.TRUSTED,
+        False,
+        frozenset(),
+        id="polling-gap-accept-trusted-successor",
+    ),
+    pytest.param(
+        {},
+        {
+            "resource_continuity_revision": 6,
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MANAGED,
+            "retained_policy": FAMILY_E_SUCCESSOR_POLICY,
+            "effective_policy": FAMILY_E_SUCCESSOR_POLICY,
+            "policy_applicable": True,
+            "effective_capabilities": FAMILY_E_SUCCESSOR_CAPABILITIES,
+        },
+        PresenceState.PRESENT,
+        LifecycleState.ACTIVE,
+        SecurityContinuity.TRUSTED,
+        True,
+        FAMILY_E_SUCCESSOR_CAPABILITIES,
+        id="polling-gap-accept-managed-policy-successor",
+    ),
+    pytest.param(
+        {},
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 5,
+        },
+        PresenceState.PRESENT,
+        LifecycleState.QUARANTINED,
+        SecurityContinuity.UNVERIFIED,
+        False,
+        frozenset(),
+        id="polling-gap-accept-quarantined-successor",
+    ),
+    pytest.param(
+        {},
+        {
+            **CONFIRMED_REMOVED,
+            "resource_continuity_revision": 5,
+        },
+        PresenceState.CONFIRMED_REMOVED,
+        LifecycleState.RETIRED,
+        SecurityContinuity.UNVERIFIED,
+        False,
+        frozenset(),
+        id="polling-gap-accept-removed-successor",
+    ),
+    pytest.param(
+        {
+            "resource_continuity_revision": 7,
+            "security_continuity": SecurityContinuity.REVOKED,
+        },
+        {"resource_continuity_revision": 5},
+        PresenceState.PRESENT,
+        LifecycleState.ACTIVE,
+        SecurityContinuity.UNVERIFIED,
+        False,
+        frozenset(),
+        id="polling-gap-accept-skipped-predecessor-security-path",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    (
+        "predecessor_changes",
+        "successor_changes",
+        "expected_presence",
+        "expected_lifecycle",
+        "expected_security",
+        "expected_policy_applicable",
+        "expected_capabilities",
+    ),
+    FAMILY_E_SUCCESSOR_EVOLUTION_ACCEPT_CASES,
+)
+def test_polling_gap_matrix_accepts_later_successor_evolution(
+    predecessor_changes: dict[str, Any],
+    successor_changes: dict[str, Any],
+    expected_presence: PresenceState,
+    expected_lifecycle: LifecycleState,
+    expected_security: SecurityContinuity,
+    expected_policy_applicable: bool,
+    expected_capabilities: frozenset[str],
+) -> None:
+    previous = polling_gap_previous_snapshot()
+    retained_predecessor = replace(predecessor(), **predecessor_changes)
+    later_successor = successor(**successor_changes)
+    current = polling_gap_current_snapshot(
+        (retained_predecessor, later_successor)
+    )
+
+    current.validate_revision_successor(previous)
+
+    retained = current.resources_by_id[RESOURCE_ID]
+    observed_successor = current.resources_by_id[SUCCESSOR_ID]
+    assert retained.successor_resource_id == SUCCESSOR_ID
+    assert observed_successor.resource_id == SUCCESSOR_ID
+    assert observed_successor.locator_generation == 5
+    assert observed_successor.presence is expected_presence
+    assert observed_successor.lifecycle is expected_lifecycle
+    assert observed_successor.security_continuity is expected_security
+    assert observed_successor.policy_applicable is expected_policy_applicable
+    assert observed_successor.effective_capabilities == expected_capabilities
+    if expected_presence is PresenceState.CONFIRMED_REMOVED:
+        assert observed_successor.active_binding_id is None
+    if predecessor_changes:
+        assert retained.security_continuity is SecurityContinuity.REVOKED
+        assert retained.resource_continuity_revision == 7
+    assert current.sources[0].last_committed_run_sequence == 12
+    assert current.inventory_revision - previous.inventory_revision > 1
+    assert (
+        current.published_state_revision
+        - previous.published_state_revision
+        > 1
+    )
+
+
+def test_polling_gap_matrix_accepts_ambiguity_without_identity_replacement() -> None:
+    previous = polling_gap_previous_snapshot()
+    old = previous.resources_by_id[RESOURCE_ID]
+    ambiguous = replace(
+        old,
+        resource_continuity_revision=5,
+        lifecycle=LifecycleState.QUARANTINED,
+        observational_continuity=ObservationalContinuity.UNCERTAIN,
+        security_continuity=SecurityContinuity.REVOKED,
+    )
+    current = polling_gap_current_snapshot((ambiguous,))
+
+    current.validate_revision_successor(previous)
+
+    retained = current.resources_by_id[RESOURCE_ID]
+    assert retained.resource_id == old.resource_id
+    assert retained.active_binding_id == old.active_binding_id
+    assert retained.locator_generation == old.locator_generation == 4
+    assert retained.effective_capabilities == frozenset()
+
+
+def test_polling_gap_matrix_accepts_complete_skipped_successor_chain() -> None:
+    previous = polling_gap_previous_snapshot()
+    old_a = replace(predecessor(), resource_continuity_revision=5)
+    old_b = successor(
+        **{
+            **NOT_CURRENT,
+            "resource_continuity_revision": 7,
+            "successor_resource_id": THIRD_RESOURCE_ID,
+        }
+    )
+    current_c = resource(
+        resource_id=THIRD_RESOURCE_ID,
+        active_binding_id=THIRD_BINDING_ID,
+        locator_generation=6,
+        resource_continuity_revision=5,
+        name="Third occupant",
+    )
+    current = polling_gap_current_snapshot((old_a, old_b, current_c))
+
+    current.validate_revision_successor(previous)
+
+    assert (
+        current.resources_by_id[RESOURCE_ID].successor_resource_id
+        == SUCCESSOR_ID
+    )
+    assert (
+        current.resources_by_id[SUCCESSOR_ID].successor_resource_id
+        == THIRD_RESOURCE_ID
+    )
+    assert current.resources_by_id[SUCCESSOR_ID].active_binding_id is None
+    assert current.resources_by_id[THIRD_RESOURCE_ID].active_binding_id == (
+        THIRD_BINDING_ID
+    )
+    assert sorted(
+        item.locator_generation for item in current.resources
+    ) == [4, 5, 6]
+
+
+FAMILY_E_RETENTION_REJECT_CASES = [
+    pytest.param(
+        snapshot(
+            (),
+            sources=(source(),),
+            nodes=(),
+            inventory_revision=10,
+            published_state_revision=20,
+        ),
+        snapshot(
+            (),
+            sources=(),
+            nodes=(),
+            inventory_revision=16,
+            published_state_revision=50,
+        ),
+        "published snapshot cannot omit a retained inventory source",
+        id="polling-gap-reject-retained-source-omission",
+    ),
+    pytest.param(
+        snapshot(
+            (),
+            nodes=(node(),),
+            inventory_revision=10,
+            published_state_revision=20,
+        ),
+        snapshot(
+            (),
+            sources=(successful_source_run(12),),
+            nodes=(),
+            inventory_revision=16,
+            published_state_revision=50,
+        ),
+        "published snapshot cannot omit a retained node",
+        id="polling-gap-reject-retained-node-omission",
+    ),
+    pytest.param(
+        polling_gap_previous_snapshot(),
+        snapshot(
+            (),
+            sources=(successful_source_run(12),),
+            nodes=(node(),),
+            inventory_revision=16,
+            published_state_revision=50,
+        ),
+        "published snapshot cannot omit a retained resource",
+        id="polling-gap-reject-retained-resource-omission",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous", "current", "message"),
+    FAMILY_E_RETENTION_REJECT_CASES,
+)
+def test_polling_gap_matrix_rejects_retained_entity_omission(
+    previous: HubinetOpsSnapshot,
+    current: HubinetOpsSnapshot,
+    message: str,
+) -> None:
+    assert (
+        current.published_state_revision
+        - previous.published_state_revision
+        > 1
+    )
+    with pytest.raises(ValueError, match=message):
+        current.validate_revision_successor(previous)
+
+
+def test_polling_gap_matrix_rejects_observed_lineage_rewrite() -> None:
+    accepted = polling_gap_current_snapshot(
+        (predecessor(), successor()),
+        commit_sequence=12,
+        inventory_revision=16,
+        published_state_revision=47,
+    )
+    rewritten_predecessor = replace(
+        predecessor(),
+        successor_resource_id=THIRD_RESOURCE_ID,
+    )
+    different_successor = resource(
+        resource_id=THIRD_RESOURCE_ID,
+        active_binding_id=THIRD_BINDING_ID,
+        locator_generation=5,
+        name="Rewritten successor",
+    )
+    rewritten = polling_gap_current_snapshot(
+        (rewritten_predecessor, different_successor),
+        commit_sequence=18,
+        inventory_revision=22,
+        published_state_revision=90,
+    )
+
+    assert (
+        accepted.resources_by_id[RESOURCE_ID].successor_resource_id
+        == SUCCESSOR_ID
+    )
+    assert (
+        rewritten.published_state_revision
+        - accepted.published_state_revision
+        > 1
+    )
+    with pytest.raises(
+        ValueError,
+        match="terminal replacement lineage is immutable",
+    ):
+        rewritten.validate_revision_successor(accepted)
