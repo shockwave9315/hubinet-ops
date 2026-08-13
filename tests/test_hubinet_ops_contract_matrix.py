@@ -185,6 +185,8 @@ def snapshot(
     *,
     sources: tuple[InventorySourceSnapshot, ...] | None = None,
     nodes: tuple[NodeSnapshot, ...] = (),
+    inventory_revision: int = 10,
+    published_state_revision: int = 20,
 ) -> HubinetOpsSnapshot:
     return HubinetOpsSnapshot(
         backend=BackendInformation(
@@ -196,8 +198,8 @@ def snapshot(
         sources=(source(),) if sources is None else sources,
         nodes=nodes,
         resources=resources,
-        inventory_revision=10,
-        published_state_revision=20,
+        inventory_revision=inventory_revision,
+        published_state_revision=published_state_revision,
         published_at="2026-08-12T12:00:00+00:00",
     )
 
@@ -1069,3 +1071,334 @@ def test_source_policy_matrix_rejects_stale_current_facts(
         match="policy/capabilities require a fresh healthy source snapshot",
     ):
         snapshot((item,), sources=(stale,), nodes=(node(),))
+
+
+def continuity_snapshot(
+    changes: dict[str, Any],
+    *,
+    inventory_revision: int,
+    published_state_revision: int,
+) -> HubinetOpsSnapshot:
+    return snapshot(
+        (resource(**changes),),
+        nodes=(node(),),
+        inventory_revision=inventory_revision,
+        published_state_revision=published_state_revision,
+    )
+
+
+FAMILY_C_ACCEPTED_TRANSITION_CASES = [
+    pytest.param(
+        {"resource_continuity_revision": 2},
+        {
+            "resource_continuity_revision": 3,
+            "security_continuity": SecurityContinuity.TRUSTED,
+        },
+        11,
+        id="continuity-accept-unverified-to-trusted",
+    ),
+    pytest.param(
+        {"resource_continuity_revision": 2},
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 3,
+            "security_continuity": SecurityContinuity.REVOKED,
+        },
+        11,
+        id="continuity-accept-unverified-to-revoked-skipped-history",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.REVOKED,
+        },
+        {
+            "resource_continuity_revision": 3,
+            "security_continuity": SecurityContinuity.TRUSTED,
+        },
+        11,
+        id="continuity-accept-revoked-to-trusted-resolution",
+    ),
+    pytest.param(
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+        },
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+        },
+        10,
+        id="continuity-accept-trusted-stable-without-bump",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.REVOKED,
+        },
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.REVOKED,
+        },
+        10,
+        id="continuity-accept-revoked-stable-without-bump",
+    ),
+    pytest.param(
+        {"resource_continuity_revision": 2},
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 3,
+        },
+        11,
+        id="continuity-accept-enter-quarantine-with-bump",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 2,
+        },
+        {"resource_continuity_revision": 3},
+        11,
+        id="continuity-accept-leave-quarantine-with-bump",
+    ),
+    pytest.param(
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.OBSERVED,
+        },
+        {
+            "resource_continuity_revision": 3,
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        11,
+        id="continuity-accept-observed-to-managed-with-bump",
+    ),
+    pytest.param(
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.OBSERVED,
+        },
+        {
+            "resource_continuity_revision": 7,
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        11,
+        id="continuity-accept-non-adjacent-revision-jump",
+    ),
+    pytest.param(
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+        },
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 3,
+            "security_continuity": SecurityContinuity.REVOKED,
+        },
+        11,
+        id="continuity-accept-trusted-to-revoked",
+    ),
+    pytest.param(
+        {"resource_continuity_revision": 2},
+        {"resource_continuity_revision": 7},
+        11,
+        id="continuity-accept-newer-revision-with-hidden-transitions",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_changes", "current_changes", "current_inventory_revision"),
+    FAMILY_C_ACCEPTED_TRANSITION_CASES,
+)
+def test_continuity_revision_matrix_accepts_observable_transitions(
+    previous_changes: dict[str, Any],
+    current_changes: dict[str, Any],
+    current_inventory_revision: int,
+) -> None:
+    previous = continuity_snapshot(
+        previous_changes,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = continuity_snapshot(
+        current_changes,
+        inventory_revision=current_inventory_revision,
+        published_state_revision=21,
+    )
+    current.validate_revision_successor(previous)
+    assert (
+        current.source_reconciliation_projection
+        == previous.source_reconciliation_projection
+    )
+
+
+FAMILY_C_REJECTED_UNBUMPED_TRANSITION_CASES = [
+    pytest.param(
+        {"resource_continuity_revision": 2},
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+        },
+        id="continuity-reject-unverified-to-trusted-without-bump",
+    ),
+    pytest.param(
+        {"resource_continuity_revision": 2},
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 2,
+        },
+        id="continuity-reject-enter-quarantine-without-bump",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 2,
+        },
+        {"resource_continuity_revision": 2},
+        id="continuity-reject-leave-quarantine-without-bump",
+    ),
+    pytest.param(
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.OBSERVED,
+        },
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+            "state_level": ResourceStateLevel.MANAGED,
+        },
+        id="continuity-reject-observed-to-managed-without-bump",
+    ),
+    pytest.param(
+        {"resource_continuity_revision": 2},
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.REVOKED,
+        },
+        id="continuity-reject-unverified-to-revoked-without-bump",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_changes", "current_changes"),
+    FAMILY_C_REJECTED_UNBUMPED_TRANSITION_CASES,
+)
+def test_continuity_revision_matrix_rejects_security_change_without_bump(
+    previous_changes: dict[str, Any],
+    current_changes: dict[str, Any],
+) -> None:
+    previous = continuity_snapshot(
+        previous_changes,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = continuity_snapshot(
+        current_changes,
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="security-relevant resource transition requires a newer "
+        "resource_continuity_revision",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_continuity_revision_matrix_rejects_revision_regression() -> None:
+    previous = continuity_snapshot(
+        {"resource_continuity_revision": 5},
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = continuity_snapshot(
+        {"resource_continuity_revision": 4},
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="resource_continuity_revision must not regress",
+    ):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_C_REJECTED_SECURITY_HISTORY_CASES = [
+    pytest.param(
+        {
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.TRUSTED,
+        },
+        {"resource_continuity_revision": 3},
+        id="continuity-reject-trusted-to-unverified",
+    ),
+    pytest.param(
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 2,
+            "security_continuity": SecurityContinuity.REVOKED,
+        },
+        {
+            **AMBIGUOUS_PRESENT,
+            "resource_continuity_revision": 3,
+        },
+        id="continuity-reject-revoked-to-unverified",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_changes", "current_changes"),
+    FAMILY_C_REJECTED_SECURITY_HISTORY_CASES,
+)
+def test_continuity_revision_matrix_rejects_security_history_erasure(
+    previous_changes: dict[str, Any],
+    current_changes: dict[str, Any],
+) -> None:
+    previous = continuity_snapshot(
+        previous_changes,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = continuity_snapshot(
+        current_changes,
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="resource cannot erase known security history",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_continuity_revision_matrix_rejects_terminal_reopening() -> None:
+    previous = continuity_snapshot(
+        {
+            **CONFIRMED_REMOVED,
+            "resource_continuity_revision": 2,
+        },
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = continuity_snapshot(
+        {"resource_continuity_revision": 3},
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="terminal resource cannot be reopened or reclassified",
+    ):
+        current.validate_revision_successor(previous)
