@@ -3934,3 +3934,607 @@ def test_source_context_freshness_matrix_accepts_non_adjacent_stale_recovery(
     assert current_source.last_committed_run_sequence == 9
     assert current_source.last_committed_run_sequence - 5 > 1
     assert current_source.current_facts_available
+
+
+FAMILY_H_FOREIGN_BACKEND_ID = "5b42fc41-61f3-4895-a04e-57fc761bc2c4"
+
+
+def family_h_initial_source_b() -> InventorySourceSnapshot:
+    return replace(
+        initial_source_with_run_provenance(),
+        inventory_source_id=SOURCE_B_ID,
+        name="Initial matrix source B",
+        current_context=source(SOURCE_B_ID).current_context,
+    )
+
+
+def test_snapshot_consistency_matrix_accepts_equal_immutable_view() -> None:
+    previous = snapshot(())
+    current = snapshot(())
+
+    current.validate_revision_successor(previous)
+
+    assert current == previous
+    assert current.published_state_revision == previous.published_state_revision
+
+
+def test_snapshot_consistency_matrix_rejects_changed_view_at_same_revision(
+) -> None:
+    previous = snapshot(())
+    current = replace(
+        previous,
+        backend=replace(previous.backend, version="0.5.0.dev1"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="one published_state_revision must identify one immutable view",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_snapshot_consistency_matrix_rejects_published_revision_regression(
+) -> None:
+    previous = snapshot(())
+    current = snapshot((), published_state_revision=19)
+
+    with pytest.raises(
+        ValueError,
+        match="published_state_revision must not regress",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_snapshot_consistency_matrix_accepts_non_adjacent_presentation_revision(
+) -> None:
+    previous = snapshot(())
+    current = replace(
+        snapshot((), published_state_revision=90),
+        backend=replace(previous.backend, version="0.5.0.dev9"),
+    )
+
+    current.validate_revision_successor(previous)
+
+    assert current.inventory_revision == previous.inventory_revision
+    assert current.published_state_revision - previous.published_state_revision > 1
+
+
+def test_snapshot_consistency_matrix_rejects_inventory_revision_regression(
+) -> None:
+    previous = snapshot(())
+    current = snapshot(
+        (),
+        inventory_revision=9,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="inventory_revision must not regress",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_snapshot_consistency_matrix_rejects_foreign_backend_instance() -> None:
+    previous = snapshot(())
+    current = replace(
+        snapshot(
+            (),
+            inventory_revision=11,
+            published_state_revision=21,
+        ),
+        backend=replace(
+            previous.backend,
+            backend_instance_id=FAMILY_H_FOREIGN_BACKEND_ID,
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="snapshot belongs to a different backend instance",
+    ):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_H_DUAL_REVISION_CASES = [
+    pytest.param(
+        10,
+        21,
+        "inventory-owned changes require a newer inventory_revision",
+        id="revision-reject-inventory-change-with-published-bump-only",
+    ),
+    pytest.param(
+        11,
+        20,
+        "one published_state_revision must identify one immutable view",
+        id="revision-reject-inventory-change-with-inventory-bump-only",
+    ),
+    pytest.param(
+        11,
+        21,
+        None,
+        id="revision-accept-inventory-change-with-both-bumps",
+    ),
+    pytest.param(
+        50,
+        90,
+        None,
+        id="revision-accept-inventory-change-with-non-adjacent-bumps",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("inventory_revision", "published_state_revision", "message"),
+    FAMILY_H_DUAL_REVISION_CASES,
+)
+def test_snapshot_consistency_matrix_enforces_dual_revision_ownership(
+    inventory_revision: int,
+    published_state_revision: int,
+    message: str | None,
+) -> None:
+    previous = snapshot((), sources=(source(),))
+    renamed_source = replace(source(), name="Renamed matrix source")
+    current = snapshot(
+        (),
+        sources=(renamed_source,),
+        inventory_revision=inventory_revision,
+        published_state_revision=published_state_revision,
+    )
+
+    assert current.inventory_projection != previous.inventory_projection
+    assert (
+        current.source_reconciliation_projection
+        == previous.source_reconciliation_projection
+    )
+    if message is None:
+        current.validate_revision_successor(previous)
+        return
+
+    with pytest.raises(ValueError, match=message):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_H_RETAINED_POLICY_REVISION_CASES = [
+    pytest.param(
+        10,
+        "inventory-owned changes require a newer inventory_revision",
+        id="inventory-reject-retained-policy-change-without-bump",
+    ),
+    pytest.param(
+        11,
+        None,
+        id="inventory-accept-retained-policy-change-with-bump",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("inventory_revision", "message"),
+    FAMILY_H_RETAINED_POLICY_REVISION_CASES,
+)
+def test_snapshot_consistency_matrix_enforces_retained_policy_ownership(
+    inventory_revision: int,
+    message: str | None,
+) -> None:
+    previous = snapshot((resource(),), nodes=(node(),))
+    current_resource = replace(
+        resource(),
+        retained_policy={"maintenance_window": "manual"},
+    )
+    current = snapshot(
+        (current_resource,),
+        nodes=(node(),),
+        inventory_revision=inventory_revision,
+        published_state_revision=21,
+    )
+
+    assert current.inventory_projection != previous.inventory_projection
+    assert (
+        current.source_reconciliation_projection
+        == previous.source_reconciliation_projection
+    )
+    if message is None:
+        current.validate_revision_successor(previous)
+        return
+
+    with pytest.raises(ValueError, match=message):
+        current.validate_revision_successor(previous)
+
+
+def test_snapshot_consistency_matrix_accepts_new_precommit_source_member(
+) -> None:
+    previous = snapshot(())
+    initial_source_b = family_h_initial_source_b()
+    current = snapshot(
+        (),
+        sources=(source(), initial_source_b),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    current.validate_revision_successor(previous)
+
+    assert current.inventory_projection != previous.inventory_projection
+    assert current.sources_by_id[SOURCE_B_ID].last_committed_run_sequence is None
+
+
+def test_snapshot_consistency_matrix_accepts_health_only_without_inventory_bump(
+) -> None:
+    previous = snapshot(())
+    current = snapshot(
+        (),
+        sources=(time_expiry_source(),),
+        inventory_revision=10,
+        published_state_revision=90,
+    )
+
+    current.validate_revision_successor(previous)
+
+    assert current.inventory_projection == previous.inventory_projection
+    assert current.inventory_revision == previous.inventory_revision
+    assert current.published_state_revision - previous.published_state_revision > 1
+
+
+FAMILY_H_REVISION_PRIMITIVE_ACCEPT_CASES = [
+    pytest.param(0, 1, id="primitive-accept-zero-inventory-revision"),
+    pytest.param(10**12, 1, id="primitive-accept-large-inventory-revision"),
+    pytest.param(0, 1, id="primitive-accept-one-published-revision"),
+    pytest.param(0, 10**12, id="primitive-accept-large-published-revision"),
+]
+
+
+@pytest.mark.parametrize(
+    ("inventory_revision", "published_state_revision"),
+    FAMILY_H_REVISION_PRIMITIVE_ACCEPT_CASES,
+)
+def test_snapshot_consistency_matrix_accepts_revision_primitives(
+    inventory_revision: int,
+    published_state_revision: int,
+) -> None:
+    view = snapshot(
+        (),
+        inventory_revision=inventory_revision,
+        published_state_revision=published_state_revision,
+    )
+
+    assert view.inventory_revision == inventory_revision
+    assert view.published_state_revision == published_state_revision
+
+
+FAMILY_H_REVISION_PRIMITIVE_REJECT_CASES = [
+    pytest.param(
+        -1,
+        1,
+        "inventory_revision must be a non-negative integer",
+        id="primitive-reject-negative-inventory-revision",
+    ),
+    pytest.param(
+        True,
+        1,
+        "inventory_revision must be a non-negative integer",
+        id="primitive-reject-boolean-inventory-revision",
+    ),
+    pytest.param(
+        0,
+        0,
+        "published_state_revision must be a positive integer",
+        id="primitive-reject-zero-published-revision",
+    ),
+    pytest.param(
+        0,
+        False,
+        "published_state_revision must be a positive integer",
+        id="primitive-reject-boolean-published-revision",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("inventory_revision", "published_state_revision", "message"),
+    FAMILY_H_REVISION_PRIMITIVE_REJECT_CASES,
+)
+def test_snapshot_consistency_matrix_rejects_revision_primitives(
+    inventory_revision: int,
+    published_state_revision: int,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        snapshot(
+            (),
+            inventory_revision=inventory_revision,
+            published_state_revision=published_state_revision,
+        )
+
+
+def test_snapshot_consistency_matrix_rejects_empty_published_at() -> None:
+    with pytest.raises(ValueError, match="published_at must not be empty"):
+        replace(snapshot(()), published_at="")
+
+
+FAMILY_H_DUPLICATE_IDENTITY_REJECT_CASES = [
+    pytest.param(
+        (source(), source()),
+        (),
+        (),
+        "snapshot contains duplicate source identities",
+        id="identity-reject-duplicate-source-id",
+    ),
+    pytest.param(
+        (source(),),
+        (node(), node()),
+        (),
+        "snapshot contains duplicate node identities",
+        id="identity-reject-duplicate-node-id",
+    ),
+    pytest.param(
+        (source(),),
+        (),
+        (resource(), resource()),
+        "snapshot contains duplicate resource identities",
+        id="identity-reject-duplicate-resource-id",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("sources", "nodes", "resources", "message"),
+    FAMILY_H_DUPLICATE_IDENTITY_REJECT_CASES,
+)
+def test_snapshot_consistency_matrix_rejects_duplicate_top_level_identity(
+    sources: tuple[InventorySourceSnapshot, ...],
+    nodes: tuple[NodeSnapshot, ...],
+    resources: tuple[ResourceSnapshot, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        snapshot(resources, sources=sources, nodes=nodes)
+
+
+FAMILY_H_UNKNOWN_SOURCE_REJECT_CASES = [
+    pytest.param(
+        (node(source_id=SOURCE_B_ID),),
+        (),
+        "node references an unknown inventory source",
+        id="membership-reject-node-unknown-source",
+    ),
+    pytest.param(
+        (),
+        (
+            family_f_current_resource(
+                source_id=SOURCE_B_ID,
+                binding_id=SUCCESSOR_BINDING_ID,
+                generation=1,
+            ),
+        ),
+        "resource references an unknown inventory source",
+        id="membership-reject-resource-unknown-source",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("nodes", "resources", "message"),
+    FAMILY_H_UNKNOWN_SOURCE_REJECT_CASES,
+)
+def test_snapshot_consistency_matrix_rejects_unknown_source_reference(
+    nodes: tuple[NodeSnapshot, ...],
+    resources: tuple[ResourceSnapshot, ...],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        snapshot(resources, nodes=nodes)
+
+
+FAMILY_H_PRECOMMIT_INVENTORY_REJECT_CASES = [
+    pytest.param(
+        (node(),),
+        (),
+        id="precommit-reject-node-inventory",
+    ),
+    pytest.param(
+        (),
+        (family_f_current_resource(generation=1),),
+        id="precommit-reject-resource-inventory",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("nodes", "resources"),
+    FAMILY_H_PRECOMMIT_INVENTORY_REJECT_CASES,
+)
+def test_snapshot_consistency_matrix_rejects_precommit_source_inventory(
+    nodes: tuple[NodeSnapshot, ...],
+    resources: tuple[ResourceSnapshot, ...],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="a source without a successful inventory commit cannot publish "
+        "node or resource inventory",
+    ):
+        snapshot(
+            resources,
+            sources=(initial_source_with_run_provenance(),),
+            nodes=nodes,
+        )
+
+
+def test_snapshot_consistency_matrix_accepts_precommit_source_coexistence(
+) -> None:
+    initial_source_b = family_h_initial_source_b()
+    view = snapshot(
+        (resource(),),
+        sources=(source(), initial_source_b),
+        nodes=(node(),),
+    )
+
+    assert view.resources_by_id[RESOURCE_ID].inventory_source_id == SOURCE_A_ID
+    assert view.sources_by_id[SOURCE_B_ID].last_committed_run_sequence is None
+
+
+FAMILY_H_ABSENT_NODE_REJECT_CASES = [
+    pytest.param(
+        resource(),
+        id="graph-reject-current-node-absent",
+    ),
+    pytest.param(
+        resource(**AMBIGUOUS_MISSING),
+        id="graph-reject-last-known-node-absent",
+    ),
+]
+
+
+@pytest.mark.parametrize("item", FAMILY_H_ABSENT_NODE_REJECT_CASES)
+def test_snapshot_consistency_matrix_rejects_absent_node_reference(
+    item: ResourceSnapshot,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="resource references a node absent from the same snapshot",
+    ):
+        snapshot((item,))
+
+
+FAMILY_H_CROSS_SOURCE_NODE_REJECT_CASES = [
+    pytest.param(
+        resource(),
+        node(source_id=SOURCE_B_ID),
+        id="graph-reject-current-node-crosses-source",
+    ),
+    pytest.param(
+        resource(**AMBIGUOUS_MISSING),
+        node(source_id=SOURCE_B_ID),
+        id="graph-reject-last-known-node-crosses-source",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("item", "related_node"),
+    FAMILY_H_CROSS_SOURCE_NODE_REJECT_CASES,
+)
+def test_snapshot_consistency_matrix_rejects_cross_source_node_relation(
+    item: ResourceSnapshot,
+    related_node: NodeSnapshot,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="resource node relation crosses inventory sources",
+    ):
+        snapshot(
+            (item,),
+            sources=(source(), source(SOURCE_B_ID)),
+            nodes=(related_node,),
+        )
+
+
+FAMILY_H_NODE_AVAILABILITY_ACCEPT_CASES = [
+    pytest.param(
+        resource(),
+        node(),
+        id="graph-accept-available-node-agreement",
+    ),
+    pytest.param(
+        resource(
+            current_node_id=NODE_UNAVAILABLE_ID,
+            node_availability=NodeAvailability.UNAVAILABLE,
+        ),
+        node(NODE_UNAVAILABLE_ID, available=False),
+        id="graph-accept-unavailable-node-agreement",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("item", "related_node"),
+    FAMILY_H_NODE_AVAILABILITY_ACCEPT_CASES,
+)
+def test_snapshot_consistency_matrix_accepts_complete_same_view_graph(
+    item: ResourceSnapshot,
+    related_node: NodeSnapshot,
+) -> None:
+    view = snapshot((item,), nodes=(related_node,))
+
+    assert view.sources_by_id[SOURCE_A_ID] == view.sources[0]
+    assert view.nodes_by_id[related_node.node_id] == related_node
+    assert view.resources_by_id[item.resource_id] == item
+    assert item.current_node_id == related_node.node_id
+
+
+FAMILY_H_NODE_AVAILABILITY_REJECT_CASES = [
+    pytest.param(
+        resource(node_availability=NodeAvailability.UNAVAILABLE),
+        node(),
+        id="graph-reject-available-node-published-unavailable",
+    ),
+    pytest.param(
+        resource(
+            current_node_id=NODE_UNAVAILABLE_ID,
+            node_availability=NodeAvailability.AVAILABLE,
+        ),
+        node(NODE_UNAVAILABLE_ID, available=False),
+        id="graph-reject-unavailable-node-published-available",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("item", "related_node"),
+    FAMILY_H_NODE_AVAILABILITY_REJECT_CASES,
+)
+def test_snapshot_consistency_matrix_rejects_node_availability_disagreement(
+    item: ResourceSnapshot,
+    related_node: NodeSnapshot,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="resource node availability disagrees with node record",
+    ):
+        snapshot((item,), nodes=(related_node,))
+
+
+def test_snapshot_consistency_matrix_rejects_node_identity_source_move() -> None:
+    previous = snapshot(
+        (),
+        sources=(source(), source(SOURCE_B_ID)),
+        nodes=(node(),),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = snapshot(
+        (),
+        sources=(source(), source(SOURCE_B_ID)),
+        nodes=(node(source_id=SOURCE_B_ID),),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="node identity cannot move between sources",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_snapshot_consistency_matrix_defensively_freezes_top_level_collections(
+) -> None:
+    source_items = [source()]
+    node_items = [node()]
+    resource_items = [resource()]
+    view = snapshot(
+        resource_items,
+        sources=source_items,
+        nodes=node_items,
+    )
+
+    source_items.clear()
+    node_items.clear()
+    resource_items.clear()
+
+    assert isinstance(view.sources, tuple)
+    assert isinstance(view.nodes, tuple)
+    assert isinstance(view.resources, tuple)
+    assert tuple(item.inventory_source_id for item in view.sources) == (SOURCE_A_ID,)
+    assert tuple(item.node_id for item in view.nodes) == (NODE_AVAILABLE_ID,)
+    assert tuple(item.resource_id for item in view.resources) == (RESOURCE_ID,)
