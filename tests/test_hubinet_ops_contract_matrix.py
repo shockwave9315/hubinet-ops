@@ -1402,3 +1402,691 @@ def test_continuity_revision_matrix_rejects_terminal_reopening() -> None:
         match="terminal resource cannot be reopened or reclassified",
     ):
         current.validate_revision_successor(previous)
+
+
+FAMILY_D_AUDIT_ONLY_OUTCOME = "audit_only_inapplicable"
+FAMILY_D_FAILURE_OUTCOME = "source_unavailable"
+FAMILY_D_OTHER_FAILURE_OUTCOME = "audit_or_failure"
+
+FAMILY_D_INITIAL_SOURCE_CHANGES: dict[str, Any] = {
+    "health": SourceHealth.NOT_YET_OBSERVED,
+    "freshness": SourceFreshness.NOT_YET_OBSERVED,
+    "health_origin": SourceHealthOrigin.INITIAL,
+    "health_reason": "",
+    "last_issued_run_sequence": 0,
+    "latest_completed_run_sequence": None,
+    "latest_completed_outcome": None,
+    "last_health_run_sequence": None,
+    "last_run_health_outcome": None,
+    "last_committed_run_sequence": None,
+    "last_successful_observed_at": None,
+    "freshness_reference_at": None,
+    "freshness_valid_until": None,
+    "committed_context": None,
+}
+
+FAMILY_D_DEGRADED_SOURCE_CHANGES: dict[str, Any] = {
+    "health": SourceHealth.SOURCE_UNAVAILABLE,
+    "freshness": SourceFreshness.STALE,
+    "health_origin": SourceHealthOrigin.DISCOVERY_RUN,
+    "health_reason": "active_endpoint_timeout",
+}
+
+
+def source_with_run_provenance(**changes: Any) -> InventorySourceSnapshot:
+    return replace(source(), **changes)
+
+
+def initial_source_with_run_provenance(
+    **changes: Any,
+) -> InventorySourceSnapshot:
+    return source_with_run_provenance(
+        **{**FAMILY_D_INITIAL_SOURCE_CHANGES, **changes}
+    )
+
+
+def successful_source_run(
+    sequence: int,
+    **changes: Any,
+) -> InventorySourceSnapshot:
+    successful_changes = {
+        "last_issued_run_sequence": sequence,
+        "latest_completed_run_sequence": sequence,
+        "latest_completed_outcome": "success",
+        "last_health_run_sequence": sequence,
+        "last_run_health_outcome": "success",
+        "last_committed_run_sequence": sequence,
+        "last_successful_observed_at": "2026-08-12T12:01:30+00:00",
+        "freshness_reference_at": "2026-08-12T12:01:00+00:00",
+        "freshness_valid_until": "2026-08-12T12:06:00+00:00",
+        "committed_context": source().current_context,
+    }
+    return source_with_run_provenance(**{**successful_changes, **changes})
+
+
+def source_only_snapshot(
+    item: InventorySourceSnapshot,
+    *,
+    inventory_revision: int,
+    published_state_revision: int,
+) -> HubinetOpsSnapshot:
+    return snapshot(
+        (),
+        sources=(item,),
+        nodes=(),
+        inventory_revision=inventory_revision,
+        published_state_revision=published_state_revision,
+    )
+
+
+FAMILY_D_ACCEPTED_SINGLE_VIEW_CASES = [
+    pytest.param(
+        {},
+        id="source-run-accept-canonical-successful-commit",
+    ),
+    pytest.param(
+        {"last_issued_run_sequence": 6},
+        id="source-run-accept-newer-issued-without-completion",
+    ),
+    pytest.param(
+        {
+            "last_issued_run_sequence": 6,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME,
+        },
+        id="source-run-accept-newer-non-success-completion",
+    ),
+    pytest.param(
+        {
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            "last_issued_run_sequence": 9,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME,
+            "last_health_run_sequence": 4,
+            "last_run_health_outcome": FAMILY_D_FAILURE_OUTCOME,
+            "last_committed_run_sequence": 3,
+        },
+        id="source-run-accept-ordered-non-adjacent-gaps",
+    ),
+    pytest.param(
+        {
+            **FAMILY_D_INITIAL_SOURCE_CHANGES,
+            "last_issued_run_sequence": 3,
+        },
+        id="source-run-accept-initial-issued-only",
+    ),
+    pytest.param(
+        {
+            **FAMILY_D_INITIAL_SOURCE_CHANGES,
+            "last_issued_run_sequence": 5,
+            "latest_completed_run_sequence": 4,
+            "latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME,
+        },
+        id="source-run-accept-initial-completion-only",
+    ),
+]
+
+
+@pytest.mark.parametrize("changes", FAMILY_D_ACCEPTED_SINGLE_VIEW_CASES)
+def test_source_run_matrix_accepts_supported_single_view_provenance(
+    changes: dict[str, Any],
+) -> None:
+    item = source_with_run_provenance(**changes)
+    assert item.last_issued_run_sequence == changes.get(
+        "last_issued_run_sequence", 5
+    )
+
+
+FAMILY_D_REJECTED_LATTICE_CASES = [
+    pytest.param(
+        {
+            "last_issued_run_sequence": 6,
+            "last_health_run_sequence": 5,
+            "last_committed_run_sequence": 6,
+        },
+        id="source-run-reject-committed-after-health",
+    ),
+    pytest.param(
+        {
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            "last_issued_run_sequence": 6,
+            "last_health_run_sequence": 6,
+            "last_run_health_outcome": FAMILY_D_FAILURE_OUTCOME,
+        },
+        id="source-run-reject-health-after-completion",
+    ),
+    pytest.param(
+        {
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME,
+        },
+        id="source-run-reject-completion-after-issued",
+    ),
+    pytest.param(
+        {
+            "last_health_run_sequence": None,
+            "last_run_health_outcome": None,
+        },
+        id="source-run-reject-committed-without-health",
+    ),
+    pytest.param(
+        {
+            "latest_completed_run_sequence": None,
+            "latest_completed_outcome": None,
+        },
+        id="source-run-reject-health-without-completion",
+    ),
+]
+
+
+@pytest.mark.parametrize("changes", FAMILY_D_REJECTED_LATTICE_CASES)
+def test_source_run_matrix_rejects_sequence_lattice_violations(
+    changes: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError, match="source run provenance must satisfy"):
+        source_with_run_provenance(**changes)
+
+
+FAMILY_D_REJECTED_SEQUENCE_OUTCOME_PAIR_CASES = [
+    pytest.param(
+        {
+            "last_issued_run_sequence": 6,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": None,
+        },
+        "latest completed run sequence and outcome must be published together",
+        id="source-run-reject-completed-sequence-without-outcome",
+    ),
+    pytest.param(
+        {
+            "latest_completed_run_sequence": None,
+            "latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME,
+        },
+        "latest completed run sequence and outcome must be published together",
+        id="source-run-reject-completed-outcome-without-sequence",
+    ),
+    pytest.param(
+        {
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            "last_issued_run_sequence": 6,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME,
+            "last_health_run_sequence": 6,
+            "last_run_health_outcome": None,
+        },
+        "last health run sequence and outcome must be published together",
+        id="source-run-reject-health-sequence-without-outcome",
+    ),
+    pytest.param(
+        {
+            "last_health_run_sequence": None,
+            "last_run_health_outcome": FAMILY_D_FAILURE_OUTCOME,
+        },
+        "last health run sequence and outcome must be published together",
+        id="source-run-reject-health-outcome-without-sequence",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    FAMILY_D_REJECTED_SEQUENCE_OUTCOME_PAIR_CASES,
+)
+def test_source_run_matrix_rejects_unpaired_sequences_and_outcomes(
+    changes: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        source_with_run_provenance(**changes)
+
+
+FAMILY_D_REJECTED_SUCCESS_OUTCOME_CASES = [
+    pytest.param(
+        {
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            "last_issued_run_sequence": 6,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME,
+            "last_health_run_sequence": 6,
+            "last_run_health_outcome": "success",
+        },
+        "successful applied health requires the exact committed run sequence",
+        id="source-run-reject-successful-health-not-committed",
+    ),
+    pytest.param(
+        {
+            "last_issued_run_sequence": 6,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": "success",
+        },
+        "successful completion requires the exact committed run sequence",
+        id="source-run-reject-successful-completion-not-committed",
+    ),
+    pytest.param(
+        {
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            "last_issued_run_sequence": 6,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME,
+            "last_run_health_outcome": FAMILY_D_FAILURE_OUTCOME,
+        },
+        "the committed run must retain a successful health outcome",
+        id="source-run-reject-committed-health-non-success",
+    ),
+    pytest.param(
+        {"latest_completed_outcome": FAMILY_D_AUDIT_ONLY_OUTCOME},
+        "the committed run must retain a successful completion outcome",
+        id="source-run-reject-committed-completion-non-success",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    FAMILY_D_REJECTED_SUCCESS_OUTCOME_CASES,
+)
+def test_source_run_matrix_rejects_incoherent_success_outcomes(
+    changes: dict[str, Any],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        source_with_run_provenance(**changes)
+
+
+FAMILY_D_COMMITTED_BUNDLE_FIELDS = [
+    pytest.param(
+        "last_successful_observed_at",
+        id="source-run-bundle-last-successful-observed-at",
+    ),
+    pytest.param(
+        "freshness_reference_at",
+        id="source-run-bundle-freshness-reference-at",
+    ),
+    pytest.param(
+        "freshness_valid_until",
+        id="source-run-bundle-freshness-valid-until",
+    ),
+    pytest.param(
+        "committed_context",
+        id="source-run-bundle-committed-context",
+    ),
+]
+
+
+@pytest.mark.parametrize("field_name", FAMILY_D_COMMITTED_BUNDLE_FIELDS)
+def test_source_run_matrix_rejects_incomplete_committed_provenance_bundle(
+    field_name: str,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="committed run, fixed freshness facts, and committed context "
+        "must be published together",
+    ):
+        source_with_run_provenance(**{field_name: None})
+
+
+@pytest.mark.parametrize("field_name", FAMILY_D_COMMITTED_BUNDLE_FIELDS)
+def test_source_run_matrix_rejects_provenance_without_committed_run(
+    field_name: str,
+) -> None:
+    retained_value = getattr(source(), field_name)
+    with pytest.raises(
+        ValueError,
+        match="committed run, fixed freshness facts, and committed context "
+        "must be published together",
+    ):
+        initial_source_with_run_provenance(**{field_name: retained_value})
+
+
+FAMILY_D_REJECTED_MONOTONICITY_CASES = [
+    pytest.param(
+        source_with_run_provenance(
+            last_issued_run_sequence=9,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        source_with_run_provenance(
+            last_issued_run_sequence=8,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        "last_issued_run_sequence must not regress",
+        id="source-run-reject-issued-regression",
+    ),
+    pytest.param(
+        source_with_run_provenance(
+            last_issued_run_sequence=9,
+            latest_completed_run_sequence=8,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        source_with_run_provenance(
+            last_issued_run_sequence=9,
+            latest_completed_run_sequence=7,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        "latest_completed_run_sequence must not regress",
+        id="source-run-reject-completed-regression",
+    ),
+    pytest.param(
+        source_with_run_provenance(
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            last_issued_run_sequence=9,
+            latest_completed_run_sequence=8,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+            last_health_run_sequence=7,
+            last_run_health_outcome=FAMILY_D_FAILURE_OUTCOME,
+        ),
+        source_with_run_provenance(
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            last_issued_run_sequence=9,
+            latest_completed_run_sequence=8,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+            last_health_run_sequence=6,
+            last_run_health_outcome=FAMILY_D_FAILURE_OUTCOME,
+        ),
+        "last_health_run_sequence must not regress",
+        id="source-run-reject-health-regression",
+    ),
+    pytest.param(
+        source_with_run_provenance(
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            last_issued_run_sequence=9,
+            latest_completed_run_sequence=8,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+            last_health_run_sequence=8,
+            last_run_health_outcome=FAMILY_D_FAILURE_OUTCOME,
+            last_committed_run_sequence=7,
+        ),
+        source_with_run_provenance(
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            last_issued_run_sequence=9,
+            latest_completed_run_sequence=8,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+            last_health_run_sequence=8,
+            last_run_health_outcome=FAMILY_D_FAILURE_OUTCOME,
+            last_committed_run_sequence=6,
+        ),
+        "last_committed_run_sequence must not regress",
+        id="source-run-reject-committed-regression",
+    ),
+    pytest.param(
+        source_with_run_provenance(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        initial_source_with_run_provenance(last_issued_run_sequence=6),
+        "latest_completed_run_sequence cannot be cleared",
+        id="source-run-reject-clear-completed",
+    ),
+    pytest.param(
+        source_with_run_provenance(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        initial_source_with_run_provenance(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        "last_health_run_sequence cannot be cleared",
+        id="source-run-reject-clear-health",
+    ),
+    pytest.param(
+        source(),
+        source_with_run_provenance(
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+            last_health_run_sequence=6,
+            last_run_health_outcome=FAMILY_D_FAILURE_OUTCOME,
+            last_committed_run_sequence=None,
+            last_successful_observed_at=None,
+            freshness_reference_at=None,
+            freshness_valid_until=None,
+            committed_context=None,
+        ),
+        "last_committed_run_sequence cannot be cleared",
+        id="source-run-reject-clear-committed",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_source", "current_source", "message"),
+    FAMILY_D_REJECTED_MONOTONICITY_CASES,
+)
+def test_source_run_matrix_rejects_sequence_regression_or_clearing(
+    previous_source: InventorySourceSnapshot,
+    current_source: InventorySourceSnapshot,
+    message: str,
+) -> None:
+    previous = source_only_snapshot(
+        previous_source,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        current_source,
+        inventory_revision=10,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match=message):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_D_ACCEPTED_TRANSITION_CASES = [
+    pytest.param(
+        source(),
+        source_with_run_provenance(last_issued_run_sequence=9),
+        10,
+        id="source-run-accept-issued-gap-five-to-nine",
+    ),
+    pytest.param(
+        source(),
+        source_with_run_provenance(
+            last_issued_run_sequence=9,
+            latest_completed_run_sequence=8,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        10,
+        id="source-run-accept-completed-gap-five-to-eight",
+    ),
+    pytest.param(
+        source(),
+        successful_source_run(9),
+        11,
+        id="source-run-accept-successful-commit-gap-five-to-nine",
+    ),
+    pytest.param(
+        source_with_run_provenance(
+            last_issued_run_sequence=7,
+            latest_completed_run_sequence=7,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        successful_source_run(8),
+        11,
+        id="source-run-accept-new-commit-postdates-finalized-seven",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_source", "current_source", "current_inventory_revision"),
+    FAMILY_D_ACCEPTED_TRANSITION_CASES,
+)
+def test_source_run_matrix_accepts_non_adjacent_sequence_progression(
+    previous_source: InventorySourceSnapshot,
+    current_source: InventorySourceSnapshot,
+    current_inventory_revision: int,
+) -> None:
+    previous = source_only_snapshot(
+        previous_source,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        current_source,
+        inventory_revision=current_inventory_revision,
+        published_state_revision=21,
+    )
+    current.validate_revision_successor(previous)
+
+
+def test_source_run_matrix_rejects_commit_of_previously_finalized_run() -> None:
+    previous_source = source_with_run_provenance(
+        last_issued_run_sequence=7,
+        latest_completed_run_sequence=7,
+        latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+    )
+    current_source = successful_source_run(7)
+    previous = source_only_snapshot(
+        previous_source,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        current_source,
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="a new commit must postdate every previously finalized run",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_source_run_matrix_rejects_commit_without_inventory_revision() -> None:
+    previous = source_only_snapshot(
+        source(),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        successful_source_run(9),
+        inventory_revision=10,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="successful inventory commit requires a newer inventory_revision",
+    ):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_D_REJECTED_OUTCOME_REWRITE_CASES = [
+    pytest.param(
+        source_with_run_provenance(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        source_with_run_provenance(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_OTHER_FAILURE_OUTCOME,
+        ),
+        "latest completed outcome is immutable for its run sequence",
+        id="source-run-reject-rewrite-completed-outcome",
+    ),
+    pytest.param(
+        source_with_run_provenance(
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+            last_health_run_sequence=6,
+            last_run_health_outcome=FAMILY_D_FAILURE_OUTCOME,
+        ),
+        source_with_run_provenance(
+            **FAMILY_D_DEGRADED_SOURCE_CHANGES,
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+            last_health_run_sequence=6,
+            last_run_health_outcome=FAMILY_D_OTHER_FAILURE_OUTCOME,
+        ),
+        "last run health outcome is immutable for its run sequence",
+        id="source-run-reject-rewrite-health-outcome",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_source", "current_source", "message"),
+    FAMILY_D_REJECTED_OUTCOME_REWRITE_CASES,
+)
+def test_source_run_matrix_rejects_finalized_outcome_rewrite(
+    previous_source: InventorySourceSnapshot,
+    current_source: InventorySourceSnapshot,
+    message: str,
+) -> None:
+    previous = source_only_snapshot(
+        previous_source,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        current_source,
+        inventory_revision=10,
+        published_state_revision=21,
+    )
+    with pytest.raises(ValueError, match=message):
+        current.validate_revision_successor(previous)
+
+
+def test_source_run_matrix_rejects_successful_commit_provenance_rewrite() -> None:
+    previous = source_only_snapshot(
+        source(),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        source_with_run_provenance(
+            last_successful_observed_at="2026-08-12T12:00:30+00:00"
+        ),
+        inventory_revision=10,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="successful commit provenance is immutable for its run sequence",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_source_run_matrix_accepts_reconciliation_change_with_new_commit() -> None:
+    previous = source_only_snapshot(
+        source_with_run_provenance(facts={"cluster": "alpha"}),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        successful_source_run(9, facts={"cluster": "beta"}),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    current.validate_revision_successor(previous)
+
+
+def test_source_run_matrix_rejects_reconciliation_change_without_new_commit(
+) -> None:
+    previous = source_only_snapshot(
+        source_with_run_provenance(facts={"cluster": "alpha"}),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        source_with_run_provenance(facts={"cluster": "beta"}),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+    with pytest.raises(
+        ValueError,
+        match="discovery/reconciliation-owned source inventory changes require "
+        "a newer last_committed_run_sequence",
+    ):
+        current.validate_revision_successor(previous)
