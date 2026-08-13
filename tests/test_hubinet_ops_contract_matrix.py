@@ -3182,3 +3182,755 @@ def test_locator_binding_matrix_rejects_older_generation_backfill() -> None:
         match="new locator history must follow all previously retained generations",
     ):
         current.validate_revision_successor(previous)
+
+
+FAMILY_G_CANONICAL_LOCATOR_V2 = "https://canonical-v2.example.test:8006"
+FAMILY_G_CANONICAL_LOCATOR_V3 = "https://canonical-v3.example.test:8006"
+FAMILY_G_REWRITTEN_LOCATOR = "https://rewritten.example.test:8006"
+
+
+def family_g_context(
+    *,
+    config_revision: int = 3,
+    endpoint_id: str = ENDPOINT_A_ID,
+    locator: str = "https://pve-a.example.test:8006",
+    canonicalization_version: int = 1,
+    trust_revision: int = 2,
+) -> SourceContext:
+    return SourceContext(
+        source_config_revision=config_revision,
+        endpoint_id=endpoint_id,
+        canonical_transport_locator=locator,
+        canonicalization_contract_version=canonicalization_version,
+        transport_trust_revision=trust_revision,
+    )
+
+
+def family_g_controlled_source(
+    *,
+    current: SourceContext,
+    committed: SourceContext,
+    source_id: str = SOURCE_A_ID,
+    **changes: Any,
+) -> InventorySourceSnapshot:
+    values = {
+        "health": SourceHealth.DEGRADED,
+        "freshness": SourceFreshness.STALE,
+        "health_origin": SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        "health_reason": "source_context_changed",
+        "current_context": current,
+        "committed_context": committed,
+    }
+    values.update(changes)
+    return replace(source(source_id), **values)
+
+
+FAMILY_G_CONTEXT_ACCEPT_CASES = [
+    pytest.param(
+        family_g_context(),
+        family_g_context(),
+        True,
+        id="context-accept-exact-current-and-committed",
+    ),
+    pytest.param(
+        family_g_context(config_revision=4),
+        family_g_context(config_revision=3),
+        False,
+        id="context-accept-config-progression",
+    ),
+    pytest.param(
+        family_g_context(trust_revision=3),
+        family_g_context(trust_revision=2),
+        False,
+        id="context-accept-trust-progression",
+    ),
+    pytest.param(
+        family_g_context(
+            config_revision=4,
+            locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+            canonicalization_version=2,
+        ),
+        family_g_context(config_revision=3),
+        False,
+        id="context-accept-canonicalization-migration",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("current_context", "committed_context", "expected_available"),
+    FAMILY_G_CONTEXT_ACCEPT_CASES,
+)
+def test_source_context_freshness_matrix_accepts_context_provenance(
+    current_context: SourceContext,
+    committed_context: SourceContext,
+    expected_available: bool,
+) -> None:
+    if current_context == committed_context:
+        item = replace(
+            source(),
+            current_context=current_context,
+            committed_context=committed_context,
+        )
+    else:
+        item = family_g_controlled_source(
+            current=current_context,
+            committed=committed_context,
+        )
+
+    assert item.current_context.endpoint_id == item.committed_context.endpoint_id
+    assert item.current_context.source_config_revision >= (
+        item.committed_context.source_config_revision
+    )
+    assert item.current_context.transport_trust_revision >= (
+        item.committed_context.transport_trust_revision
+    )
+    assert item.current_context.canonicalization_contract_version >= (
+        item.committed_context.canonicalization_contract_version
+    )
+    assert item.current_facts_available is expected_available
+
+
+FAMILY_G_CONTEXT_REJECT_CASES = [
+    pytest.param(
+        family_g_context(config_revision=3),
+        family_g_context(config_revision=4),
+        "current source_config_revision cannot predate committed context",
+        id="context-reject-current-config-before-commit",
+    ),
+    pytest.param(
+        family_g_context(trust_revision=2),
+        family_g_context(trust_revision=3),
+        "current transport_trust_revision cannot predate committed context",
+        id="context-reject-current-trust-before-commit",
+    ),
+    pytest.param(
+        family_g_context(endpoint_id=ENDPOINT_A_ID),
+        family_g_context(endpoint_id=ENDPOINT_B_ID),
+        "current and committed context must reference the same endpoint",
+        id="context-reject-current-committed-endpoint-mismatch",
+    ),
+    pytest.param(
+        family_g_context(locator=FAMILY_G_REWRITTEN_LOCATOR),
+        family_g_context(),
+        "one canonicalization contract version cannot reinterpret the committed transport locator",
+        id="context-reject-same-version-locator-reinterpretation",
+    ),
+    pytest.param(
+        family_g_context(
+            config_revision=4,
+            canonicalization_version=1,
+        ),
+        family_g_context(
+            config_revision=3,
+            locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+            canonicalization_version=2,
+        ),
+        "current canonicalization contract cannot predate committed context",
+        id="context-reject-current-canonicalization-before-commit",
+    ),
+    pytest.param(
+        family_g_context(
+            config_revision=3,
+            locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+            canonicalization_version=2,
+        ),
+        family_g_context(config_revision=3),
+        "canonicalization migration requires newer current source configuration",
+        id="context-reject-migration-without-current-config-progression",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("current_context", "committed_context", "message"),
+    FAMILY_G_CONTEXT_REJECT_CASES,
+)
+def test_source_context_freshness_matrix_rejects_context_incoherence(
+    current_context: SourceContext,
+    committed_context: SourceContext,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        family_g_controlled_source(
+            current=current_context,
+            committed=committed_context,
+        )
+
+
+def test_source_context_freshness_matrix_rejects_shared_endpoint_identity(
+) -> None:
+    shared = family_g_context(endpoint_id=ENDPOINT_A_ID)
+    second_source = replace(
+        source(SOURCE_B_ID),
+        current_context=shared,
+        committed_context=shared,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="endpoint identity cannot be shared across inventory sources",
+    ):
+        snapshot(
+            (),
+            sources=(source(), second_source),
+            nodes=(),
+        )
+
+
+def test_source_context_freshness_matrix_rejects_endpoint_owner_move(
+) -> None:
+    previous = source_only_snapshot(
+        source(),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    source_a_new_endpoint = family_g_context(
+        config_revision=4,
+        endpoint_id=ENDPOINT_B_ID,
+    )
+    source_b_old_endpoint = family_g_context(
+        endpoint_id=ENDPOINT_A_ID,
+        locator="https://pve-b.example.test:8006",
+    )
+    current = snapshot(
+        (),
+        sources=(
+            replace(
+                source(),
+                current_context=source_a_new_endpoint,
+                committed_context=source_a_new_endpoint,
+            ),
+            replace(
+                source(SOURCE_B_ID),
+                current_context=source_b_old_endpoint,
+                committed_context=source_b_old_endpoint,
+            ),
+        ),
+        nodes=(),
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="endpoint identity cannot move between inventory sources",
+    ):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_G_CROSS_SNAPSHOT_CONTEXT_REJECT_CASES = [
+    pytest.param(
+        source(),
+        replace(
+            source(),
+            current_context=family_g_context(
+                config_revision=4,
+                endpoint_id=ENDPOINT_B_ID,
+            ),
+            committed_context=family_g_context(
+                config_revision=4,
+                endpoint_id=ENDPOINT_B_ID,
+            ),
+        ),
+        10,
+        "endpoint_id is immutable for an existing inventory source",
+        id="endpoint-reject-existing-source-identity-change",
+    ),
+    pytest.param(
+        source(),
+        replace(source(), provider_kind="other_provider"),
+        11,
+        "provider_kind is immutable for an inventory source",
+        id="context-reject-provider-kind-change",
+    ),
+    pytest.param(
+        family_g_controlled_source(
+            current=family_g_context(config_revision=4),
+            committed=family_g_context(config_revision=3),
+        ),
+        family_g_controlled_source(
+            current=family_g_context(config_revision=3),
+            committed=family_g_context(config_revision=3),
+        ),
+        10,
+        "source_config_revision must not regress",
+        id="context-reject-config-revision-regression",
+    ),
+    pytest.param(
+        family_g_controlled_source(
+            current=family_g_context(trust_revision=3),
+            committed=family_g_context(trust_revision=2),
+        ),
+        family_g_controlled_source(
+            current=family_g_context(trust_revision=2),
+            committed=family_g_context(trust_revision=2),
+        ),
+        10,
+        "transport_trust_revision must not regress",
+        id="context-reject-trust-revision-regression",
+    ),
+    pytest.param(
+        source(),
+        replace(
+            source(),
+            current_context=family_g_context(
+                config_revision=4,
+                locator=FAMILY_G_REWRITTEN_LOCATOR,
+            ),
+            committed_context=family_g_context(
+                config_revision=4,
+                locator=FAMILY_G_REWRITTEN_LOCATOR,
+            ),
+        ),
+        10,
+        "canonical transport locator is immutable within a canonicalization contract version",
+        id="canonicalization-reject-same-version-locator-rewrite",
+    ),
+    pytest.param(
+        source(),
+        replace(
+            source(),
+            current_context=family_g_context(
+                config_revision=3,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+                canonicalization_version=2,
+            ),
+            committed_context=family_g_context(
+                config_revision=3,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+                canonicalization_version=2,
+            ),
+        ),
+        10,
+        "canonicalization migration requires a newer source_config_revision",
+        id="canonicalization-reject-migration-without-config-bump",
+    ),
+    pytest.param(
+        replace(
+            source(),
+            current_context=family_g_context(
+                config_revision=3,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+                canonicalization_version=2,
+            ),
+            committed_context=family_g_context(
+                config_revision=3,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+                canonicalization_version=2,
+            ),
+        ),
+        replace(
+            source(),
+            current_context=family_g_context(config_revision=4),
+            committed_context=family_g_context(config_revision=4),
+        ),
+        10,
+        "canonicalization_contract_version must increase during migration",
+        id="canonicalization-reject-version-regression",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_source", "current_source", "inventory_revision", "message"),
+    FAMILY_G_CROSS_SNAPSHOT_CONTEXT_REJECT_CASES,
+)
+def test_source_context_freshness_matrix_rejects_cross_snapshot_context_change(
+    previous_source: InventorySourceSnapshot,
+    current_source: InventorySourceSnapshot,
+    inventory_revision: int,
+    message: str,
+) -> None:
+    previous = source_only_snapshot(
+        previous_source,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        current_source,
+        inventory_revision=inventory_revision,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        current.validate_revision_successor(previous)
+
+
+def test_source_context_freshness_matrix_accepts_non_adjacent_canonicalization_migration(
+) -> None:
+    previous = source_only_snapshot(
+        source(),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current_source = family_g_controlled_source(
+        current=family_g_context(
+            config_revision=5,
+            locator=FAMILY_G_CANONICAL_LOCATOR_V3,
+            canonicalization_version=3,
+        ),
+        committed=family_g_context(config_revision=3),
+    )
+    current = source_only_snapshot(
+        current_source,
+        inventory_revision=10,
+        published_state_revision=50,
+    )
+
+    current.validate_revision_successor(previous)
+
+    assert current_source.current_context.canonicalization_contract_version == 3
+    assert current_source.current_context.source_config_revision == 5
+    assert current_source.current_context.endpoint_id == ENDPOINT_A_ID
+    assert current_source.current_context != current_source.committed_context
+    assert not current_source.current_facts_available
+    assert current.inventory_revision == previous.inventory_revision
+
+
+def family_g_committed_history_source(
+    *,
+    current: SourceContext,
+    committed: SourceContext,
+) -> InventorySourceSnapshot:
+    return successful_source_run(
+        9,
+        health=SourceHealth.DEGRADED,
+        freshness=SourceFreshness.STALE,
+        health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+        health_reason="source_context_changed_after_commit",
+        current_context=current,
+        committed_context=committed,
+    )
+
+
+FAMILY_G_COMMITTED_HISTORY_REJECT_CASES = [
+    pytest.param(
+        source(),
+        family_g_committed_history_source(
+            current=family_g_context(config_revision=4),
+            committed=family_g_context(config_revision=2),
+        ),
+        "committed source_config_revision must not regress",
+        id="committed-context-reject-config-regression",
+    ),
+    pytest.param(
+        source(),
+        family_g_committed_history_source(
+            current=family_g_context(config_revision=4, trust_revision=3),
+            committed=family_g_context(
+                config_revision=3,
+                trust_revision=1,
+            ),
+        ),
+        "committed transport_trust_revision must not regress",
+        id="committed-context-reject-trust-regression",
+    ),
+    pytest.param(
+        replace(
+            source(),
+            current_context=family_g_context(
+                config_revision=4,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+                canonicalization_version=2,
+            ),
+            committed_context=family_g_context(
+                config_revision=4,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+                canonicalization_version=2,
+            ),
+        ),
+        family_g_committed_history_source(
+            current=family_g_context(
+                config_revision=6,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V3,
+                canonicalization_version=3,
+            ),
+            committed=family_g_context(config_revision=5),
+        ),
+        "committed canonicalization contract must not regress",
+        id="committed-context-reject-canonicalization-regression",
+    ),
+    pytest.param(
+        source(),
+        family_g_committed_history_source(
+            current=family_g_context(
+                config_revision=5,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+                canonicalization_version=2,
+            ),
+            committed=family_g_context(
+                config_revision=4,
+                locator=FAMILY_G_REWRITTEN_LOCATOR,
+            ),
+        ),
+        "committed canonical locator is immutable within a canonicalization contract version",
+        id="committed-context-reject-same-version-locator-rewrite",
+    ),
+    pytest.param(
+        source(),
+        family_g_committed_history_source(
+            current=family_g_context(
+                config_revision=4,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V3,
+                canonicalization_version=3,
+            ),
+            committed=family_g_context(
+                config_revision=3,
+                locator=FAMILY_G_CANONICAL_LOCATOR_V2,
+                canonicalization_version=2,
+            ),
+        ),
+        "committed canonicalization migration requires a newer source_config_revision",
+        id="committed-context-reject-migration-without-config-progression",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("previous_source", "current_source", "message"),
+    FAMILY_G_COMMITTED_HISTORY_REJECT_CASES,
+)
+def test_source_context_freshness_matrix_rejects_committed_context_regression(
+    previous_source: InventorySourceSnapshot,
+    current_source: InventorySourceSnapshot,
+    message: str,
+) -> None:
+    previous = source_only_snapshot(
+        previous_source,
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        current_source,
+        inventory_revision=11,
+        published_state_revision=21,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        current.validate_revision_successor(previous)
+
+
+FAMILY_G_FRESHNESS_ACCEPT_CASES = [
+    pytest.param(
+        time_expiry_source(),
+        SourceHealthOrigin.TIME_EXPIRY,
+        5,
+        False,
+        id="freshness-accept-time-expiry-exact-commit",
+    ),
+    pytest.param(
+        replace(
+            time_expiry_source(),
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        SourceHealthOrigin.TIME_EXPIRY,
+        6,
+        False,
+        id="freshness-accept-time-expiry-newer-audit-completion",
+    ),
+    pytest.param(
+        source_with_run_provenance(
+            last_issued_run_sequence=6,
+            latest_completed_run_sequence=6,
+            latest_completed_outcome=FAMILY_D_AUDIT_ONLY_OUTCOME,
+        ),
+        SourceHealthOrigin.DISCOVERY_RUN,
+        6,
+        True,
+        id="freshness-accept-fresh-with-newer-audit-completion",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("item", "expected_origin", "expected_completed", "expected_available"),
+    FAMILY_G_FRESHNESS_ACCEPT_CASES,
+)
+def test_source_context_freshness_matrix_accepts_materialized_freshness(
+    item: InventorySourceSnapshot,
+    expected_origin: SourceHealthOrigin,
+    expected_completed: int,
+    expected_available: bool,
+) -> None:
+    assert item.health_origin is expected_origin
+    assert item.latest_completed_run_sequence == expected_completed
+    assert item.current_context == item.committed_context
+    assert item.last_health_run_sequence == item.last_committed_run_sequence
+    assert item.current_facts_available is expected_available
+
+
+FAMILY_G_FRESHNESS_REJECT_CASES = [
+    pytest.param(
+        {"health": SourceHealth.SOURCE_UNAVAILABLE},
+        id="freshness-reject-source-unavailable-as-fresh",
+    ),
+    pytest.param(
+        {"health": SourceHealth.DEGRADED},
+        id="freshness-reject-degraded-as-fresh",
+    ),
+    pytest.param(
+        {"health": SourceHealth.CONFIGURATION_ERROR},
+        id="freshness-reject-configuration-error-as-fresh",
+    ),
+    pytest.param(
+        {
+            "current_context": family_g_context(config_revision=4),
+            "committed_context": family_g_context(config_revision=3),
+        },
+        id="freshness-reject-current-context-differs-from-commit",
+    ),
+    pytest.param(
+        {
+            "last_issued_run_sequence": 6,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": FAMILY_D_FAILURE_OUTCOME,
+            "last_health_run_sequence": 6,
+            "last_run_health_outcome": FAMILY_D_FAILURE_OUTCOME,
+        },
+        id="freshness-reject-applied-health-newer-than-commit",
+    ),
+    pytest.param(
+        {
+            "last_issued_run_sequence": 1,
+            "latest_completed_run_sequence": 1,
+            "latest_completed_outcome": FAMILY_D_FAILURE_OUTCOME,
+            "last_health_run_sequence": 1,
+            "last_run_health_outcome": FAMILY_D_FAILURE_OUTCOME,
+            "last_committed_run_sequence": None,
+            "last_successful_observed_at": None,
+            "freshness_reference_at": None,
+            "freshness_valid_until": None,
+            "committed_context": None,
+        },
+        id="freshness-reject-without-successful-commit",
+    ),
+]
+
+
+@pytest.mark.parametrize("changes", FAMILY_G_FRESHNESS_REJECT_CASES)
+def test_source_context_freshness_matrix_rejects_non_authoritative_fresh_view(
+    changes: dict[str, Any],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="fresh source requires a healthy authoritative discovery commit",
+    ):
+        source_with_run_provenance(**changes)
+
+
+def test_source_context_freshness_matrix_rejects_discovery_origin_without_run(
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="discovery_run health origin requires run provenance",
+    ):
+        initial_source_with_run_provenance(
+            health=SourceHealth.DEGRADED,
+            freshness=SourceFreshness.STALE,
+            health_origin=SourceHealthOrigin.DISCOVERY_RUN,
+            health_reason="missing_run_provenance",
+        )
+
+
+def test_source_context_freshness_matrix_rejects_fresh_controlled_transition(
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="controlled context transition must be stale",
+    ):
+        source_with_run_provenance(
+            health_origin=SourceHealthOrigin.CONTROLLED_CONTEXT_TRANSITION,
+            health_reason="source_context_changed",
+        )
+
+
+FAMILY_G_TIME_EXPIRY_REJECT_CASES = [
+    pytest.param(
+        {"current_context": family_g_context(config_revision=4)},
+        id="freshness-reject-time-expiry-changed-context",
+    ),
+    pytest.param(
+        {
+            "last_issued_run_sequence": 6,
+            "latest_completed_run_sequence": 6,
+            "latest_completed_outcome": FAMILY_D_FAILURE_OUTCOME,
+            "last_health_run_sequence": 6,
+            "last_run_health_outcome": FAMILY_D_FAILURE_OUTCOME,
+        },
+        id="freshness-reject-time-expiry-newer-applied-health",
+    ),
+    pytest.param(
+        {
+            "last_issued_run_sequence": 1,
+            "latest_completed_run_sequence": 1,
+            "latest_completed_outcome": FAMILY_D_FAILURE_OUTCOME,
+            "last_health_run_sequence": 1,
+            "last_run_health_outcome": FAMILY_D_FAILURE_OUTCOME,
+            "last_committed_run_sequence": None,
+            "last_successful_observed_at": None,
+            "freshness_reference_at": None,
+            "freshness_valid_until": None,
+            "committed_context": None,
+        },
+        id="freshness-reject-time-expiry-without-commit",
+    ),
+    pytest.param(
+        {"freshness": SourceFreshness.FRESH},
+        id="freshness-reject-time-expiry-as-fresh",
+    ),
+]
+
+
+@pytest.mark.parametrize("changes", FAMILY_G_TIME_EXPIRY_REJECT_CASES)
+def test_source_context_freshness_matrix_rejects_invalid_time_expiry(
+    changes: dict[str, Any],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="time_expiry requires stale exact committed run and context provenance",
+    ):
+        replace(time_expiry_source(), **changes)
+
+
+def test_source_context_freshness_matrix_rejects_stale_resurrection_same_commit(
+) -> None:
+    previous = source_only_snapshot(
+        time_expiry_source(),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current = source_only_snapshot(
+        source(),
+        inventory_revision=10,
+        published_state_revision=500,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="a stale source requires a newer successful inventory commit before returning to fresh",
+    ):
+        current.validate_revision_successor(previous)
+
+
+def test_source_context_freshness_matrix_accepts_non_adjacent_stale_recovery(
+) -> None:
+    previous = source_only_snapshot(
+        time_expiry_source(),
+        inventory_revision=10,
+        published_state_revision=20,
+    )
+    current_source = successful_source_run(9)
+    current = source_only_snapshot(
+        current_source,
+        inventory_revision=11,
+        published_state_revision=500,
+    )
+
+    current.validate_revision_successor(previous)
+
+    assert current_source.last_committed_run_sequence == 9
+    assert current_source.last_committed_run_sequence - 5 > 1
+    assert current_source.current_facts_available
