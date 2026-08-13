@@ -55,6 +55,22 @@ def test_canonicalization_normalizes_ipv6_representation() -> None:
 
 
 @pytest.mark.parametrize(
+    ("locator", "canonical"),
+    (
+        ("https://pve1.example.test", "https://pve1.example.test"),
+        ("https://123.example.test", "https://123.example.test"),
+        ("https://node-127.example.test", "https://node-127.example.test"),
+        ("https://127.0.0.1", "https://127.0.0.1"),
+        ("https://192.0.2.10:8006", "https://192.0.2.10:8006"),
+    ),
+)
+def test_canonicalization_accepts_numeric_dns_labels_and_canonical_ipv4(
+    locator: str, canonical: str
+) -> None:
+    assert canonicalize_transport_locator(locator) == canonical
+
+
+@pytest.mark.parametrize(
     "locator",
     (
         "http://pve.example",
@@ -71,6 +87,11 @@ def test_canonicalization_normalizes_ipv6_representation() -> None:
         "https://2001:db8::1",
         "https://[v1.example]",
         "https://127.000.000.001",
+        "https://127.1",
+        "https://127.0.1",
+        "https://2130706433",
+        "https://0x7f000001",
+        "https://017700000001",
         "pve.example:8006",
         "https://pve..example",
         " https://pve.example",

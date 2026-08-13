@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 CANONICALIZATION_CONTRACT_VERSION = 1
 
 _DNS_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_LEGACY_NUMERIC_HOST_LABEL = re.compile(r"^(?:[0-9]+|0x[0-9a-f]+)$")
 
 
 def canonicalize_transport_locator(raw_locator: str) -> str:
@@ -88,8 +89,10 @@ def _canonical_dns_name(host: str) -> str:
     labels = lowered.split(".")
     if not labels or any(not _DNS_LABEL.fullmatch(label) for label in labels):
         raise ValueError("transport locator DNS host is invalid")
-    if len(labels) == 4 and all(label.isdigit() for label in labels):
-        raise ValueError("transport locator numeric host is not canonical IPv4")
+    if len(labels) <= 4 and all(
+        _LEGACY_NUMERIC_HOST_LABEL.fullmatch(label) for label in labels
+    ):
+        raise ValueError("transport locator numeric host is ambiguous or non-canonical")
     return lowered
 
 
