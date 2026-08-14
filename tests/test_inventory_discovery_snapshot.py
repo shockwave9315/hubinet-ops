@@ -21,7 +21,9 @@ RUN_ID = str(uuid.uuid4())
 ENDPOINT_ID = str(uuid.uuid4())
 
 
-def snapshot(*, resources=(), nodes=(), source_id: str = SOURCE_ID, **changes):
+def snapshot(*, resources=(), nodes=None, source_id: str = SOURCE_ID, **changes):
+    if nodes is None:
+        nodes = (node(),)
     values = dict(
         run_id=RUN_ID,
         discovery_run_sequence=1,
@@ -113,6 +115,37 @@ def test_complete_baseline_requires_matching_boundary_and_permission_coverage() 
         snapshot(acl_topology_hash_after="changed")
     with pytest.raises(ValueError, match="consistent complete"):
         snapshot(permission_coverage_complete=False)
+
+
+@pytest.mark.parametrize(
+    "mode,nodes,covered_nodes",
+    (
+        (BaselineMode.CLUSTER, (), ()),
+        (BaselineMode.STANDALONE, (), ()),
+        (BaselineMode.CLUSTER, (node("pve-a"),), ()),
+        (BaselineMode.CLUSTER, (), ("pve-a",)),
+        (BaselineMode.CLUSTER, (node("pve-a"),), ("pve-b",)),
+    ),
+)
+def test_complete_baseline_requires_exact_non_empty_node_coverage(
+    mode, nodes, covered_nodes
+) -> None:
+    with pytest.raises(ValueError, match="covered node scope"):
+        snapshot(baseline_mode=mode, nodes=nodes, covered_nodes=covered_nodes)
+
+
+def test_complete_baseline_accepts_valid_mode_specific_node_coverage() -> None:
+    standalone = snapshot(
+        baseline_mode=BaselineMode.STANDALONE,
+        nodes=(node("pve-a"),),
+        covered_nodes=("pve-a",),
+    )
+    cluster = snapshot(
+        nodes=(node("pve-b"), node("pve-a")),
+        covered_nodes=("pve-a", "pve-b"),
+    )
+    assert standalone.covered_nodes == ("pve-a",)
+    assert set(cluster.covered_nodes) == {"pve-a", "pve-b"}
 
 
 def test_snapshot_hash_covers_security_and_issuance_provenance() -> None:

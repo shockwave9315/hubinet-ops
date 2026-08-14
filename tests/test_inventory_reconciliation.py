@@ -190,12 +190,58 @@ def test_first_unresolved_observation_has_no_invented_last_known_node(tmp_path: 
         authority,
         source_id,
         resources=(guest(node=None),),
-        nodes=(),
+        nodes=(DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),),
     )
     resource = store.list_resources(source_id)[0]
     assert resource.current_node_id is None
     assert resource.last_known_node_id is None
     assert resource.node_availability == "unresolved"
+
+
+def test_invalid_complete_node_coverage_cannot_mark_retained_resource_missing(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    complete_snapshot(store, authority, source_id, resources=(guest(),))
+    retained = store.list_resources(source_id)[0]
+    before_inventory_revision = store.backend_instance().inventory_revision
+
+    run = authority.issue_discovery_run(source_id, 1)
+    authority.mark_discovery_run_running(source_id, run.run_id)
+    with pytest.raises(ValueError, match="covered node scope"):
+        NormalizedDiscoverySnapshot(
+            run_id=run.run_id,
+            discovery_run_sequence=run.discovery_run_sequence,
+            inventory_source_id=source_id,
+            expected_source_config_revision=run.expected_source_config_revision,
+            endpoint_id=run.expected_endpoint_id,
+            canonical_transport_locator=run.expected_canonical_transport_locator,
+            canonicalization_contract_version=run.expected_canonicalization_contract_version,
+            expected_transport_trust_revision=run.expected_transport_trust_revision,
+            provider_contract_version=run.provider_contract_version,
+            observed_at=NOW.isoformat(),
+            source_facts={"release": "9.0"},
+            source_availability=SourceAvailability.AVAILABLE,
+            baseline_completeness=BaselineCompleteness.COMPLETE,
+            baseline_mode=BaselineMode.CLUSTER,
+            acl_topology_hash_before="acl",
+            acl_topology_hash_after="acl",
+            permission_snapshot_hash_before="perms",
+            permission_snapshot_hash_after="perms",
+            permission_coverage_complete=True,
+            boundary_consistent=True,
+            covered_nodes=(),
+            failed_baseline_scopes=(),
+            detail_summary={"ok_count": 0, "temporarily_unavailable_count": 0, "error_count": 0},
+            failed_detail_scopes=(),
+            nodes=(),
+            resources=(),
+        )
+
+    current = store.list_resources(source_id)[0]
+    assert current.resource_id == retained.resource_id
+    assert current.presence == "present"
+    assert store.backend_instance().inventory_revision == before_inventory_revision
 
 
 def test_unresolved_history_survives_missing_and_direct_replacement(tmp_path: Path) -> None:

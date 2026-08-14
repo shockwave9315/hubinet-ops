@@ -7,9 +7,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 import hashlib
 import json
+import re
 from types import MappingProxyType
 from typing import Any
 import uuid
+
+
+_EXTERNAL_NODE_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 
 
 class BaselineCompleteness(StrEnum):
@@ -93,7 +97,10 @@ class DiscoveredNode:
     facts: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     def __post_init__(self) -> None:
-        _text(self.external_node_name, "external_node_name")
+        if not isinstance(self.external_node_name, str) or not _EXTERNAL_NODE_NAME.fullmatch(
+            self.external_node_name
+        ):
+            raise ValueError("external_node_name must be a canonical node name")
         _text(self.status, "node status")
         if type(self.available) is not bool:
             raise ValueError("node available must be a boolean")
@@ -194,9 +201,17 @@ class NormalizedDiscoverySnapshot:
         self._validate()
 
     def _validate(self) -> None:
+        covered_node_names = list(self.covered_nodes)
         node_names = [node.external_node_name for node in self.nodes]
         if len(set(node_names)) != len(node_names):
             raise ValueError("normalized snapshot contains duplicate external node name")
+        if any(
+            not isinstance(name, str) or not _EXTERNAL_NODE_NAME.fullmatch(name)
+            for name in covered_node_names
+        ):
+            raise ValueError("covered_nodes must contain canonical node names")
+        if len(set(covered_node_names)) != len(covered_node_names):
+            raise ValueError("normalized snapshot contains duplicate covered node name")
         slots: set[tuple[str, int]] = set()
         for resource in self.resources:
             if resource.inventory_source_id != self.inventory_source_id:
@@ -208,6 +223,12 @@ class NormalizedDiscoverySnapshot:
             if resource.current_node_name is not None and resource.current_node_name not in node_names:
                 raise ValueError("normalized resource references an unknown node name")
         if self.baseline_completeness is BaselineCompleteness.COMPLETE:
+            if not node_names or set(covered_node_names) != set(node_names):
+                raise ValueError(
+                    "complete baseline requires exact non-empty covered node scope"
+                )
+            if self.baseline_mode is BaselineMode.STANDALONE and len(node_names) != 1:
+                raise ValueError("complete standalone baseline requires exactly one covered node")
             hashes = (
                 self.acl_topology_hash_before,
                 self.acl_topology_hash_after,
