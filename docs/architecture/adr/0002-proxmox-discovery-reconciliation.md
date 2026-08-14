@@ -229,11 +229,39 @@ non-authoritative partial view.
 
 Wbudowany `PVEAuditor` jest read-only i prosty operacyjnie, lecz jego zakres jest
 szerszy niż projektowany discovery contract. Nie przyjmujemy go automatycznie.
-Powyższa lista nie jest jeszcze finalną minimal permission matrix. Przed
-implementacją powstanie dokładna macierz endpoint → ACL path → privilege,
-sprawdzona testami kontraktowymi i negatywnymi. Żadna rola discovery nie może
-zawierać `VM.Allocate`, `VM.PowerMgmt`, `VM.Backup`, `VM.Clone`,
-`Sys.PowerMgmt` ani pozostałych uprawnień mutacyjnych.
+### Provider contract v1: support i endpoint/ACL matrix
+
+Phase 1B zamyka provider contract version `1` wąsko dla PVE `9.x`. Release
+starszy, nowszy, brakujący albo malformed jest `configuration_error`; ten wybór
+nie twierdzi, że inne wersje PVE są niezgodne, tylko nie obejmuje ich
+zweryfikowanym kontraktem v1. Evidence opiera się wyłącznie na oficjalnym
+[PVE 9 Administration Guide](https://pve.proxmox.com/pve-docs/pve-admin-guide.pdf)
+oraz upstream source dla
+[`/version`](https://github.com/proxmox/pve-manager/blob/master/PVE/API2.pm),
+[`/cluster/resources` i `/cluster/status`](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Cluster.pm),
+[`/access/permissions`](https://github.com/proxmox/pve-access-control/blob/master/src/PVE/API2/AccessControl.pm)
+i [`/access/acl`](https://github.com/proxmox/pve-access-control/blob/master/src/PVE/API2/ACL.pm).
+
+Finalna macierz contract v1 jest następująca:
+
+| Endpoint | Rola | Upstream effective privilege/path | Klasa |
+| --- | --- | --- | --- |
+| `GET /version` | dokładny release PVE | authenticated read | baseline prerequisite |
+| `GET /access/acl` | pełna ACL topology na obu granicach | `Sys.Audit` na `/access` | baseline prerequisite |
+| `GET /access/permissions?path=...` | upstream effective evaluation dla każdego wymaganego path | wynik Proxmox dla exact path | baseline prerequisite |
+| `GET /cluster/status` | jawne rozróżnienie cluster/standalone | `Sys.Audit` na `/` | baseline prerequisite |
+| `GET /nodes` i wymagane node facts | pełny node scope | `Sys.Audit` na `/nodes` i wymaganych descendants | baseline prerequisite |
+| `GET /cluster/resources?type=vm` | cluster guest locator baseline | upstream `VM.Audit` na każdym `/vms/<vmid>` | cluster baseline prerequisite |
+| `GET /nodes/<node>/qemu` + `.../lxc` | dokładny local guest locator baseline | upstream `VM.Audit` na wymaganym `/vms` tree | standalone baseline prerequisite |
+| `GET /nodes/<node>/<type>/<vmid>/config` | opcjonalne detail facts | `VM.Audit` na `/vms/<vmid>` | detail-only |
+
+Standalone contract v1 nie zakłada semantyki `/cluster/resources`: enumeruje
+jeden dokładny local node przez osobne QEMU i LXC GET-y. Duplicate slot między
+tymi odpowiedziami jest `invalid`. Brak pełnej topology, brak effective proof,
+descendant denial albo brak required coverage jest fail-closed; nie powstaje
+dowód absence. Żadna rola discovery nie może zawierać `VM.Allocate`,
+`VM.PowerMgmt`, `VM.Backup`, `VM.Clone`, `Sys.PowerMgmt` ani pozostałych
+uprawnień mutacyjnych.
 
 Token nigdy nie jest logowany ani zwracany przez Hubinet Ops API/diagnostics.
 Authorization header powstaje wyłącznie w adapterze transportowym.
