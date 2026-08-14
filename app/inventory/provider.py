@@ -127,7 +127,7 @@ def evaluate_permission_coverage(
         if not isinstance(path, str) or not path.startswith(("/vms/", "/nodes/")):
             return False
         required[path] = "VM.Audit" if path.startswith("/vms/") else "Sys.Audit"
-    return all(permissions_by_path.get(path, {}).get(privilege) in {1, True} for path, privilege in required.items())
+    return all(privilege in permissions_by_path.get(path, {}) for path, privilege in required.items())
 
 
 def classify_boundary(

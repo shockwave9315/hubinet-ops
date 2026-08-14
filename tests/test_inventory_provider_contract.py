@@ -409,12 +409,12 @@ def test_cluster_status_ambiguous_cluster_or_local_identity_fails_closed() -> No
         ProxmoxProviderV1.validate_cluster_status_payload({"data": contradictory})
 
 
-@pytest.mark.parametrize("exact_node_grant", ({}, {"Sys.Audit": 0}))
+@pytest.mark.parametrize("exact_node_permissions", ({}, {"VM.Audit": 1}))
 def test_parent_node_grant_never_substitutes_exact_node_permission(
-    exact_node_grant,
+    exact_node_permissions,
 ) -> None:
     permissions = required_grants()
-    permissions["/nodes/pve-a"] = exact_node_grant
+    permissions["/nodes/pve-a"] = exact_node_permissions
     transport = BoundaryTransport(permissions_before=permissions)
     result = ProxmoxProviderV1.collect_boundary_baseline(transport)
     assert result.permission_coverage_complete is False
@@ -422,10 +422,21 @@ def test_parent_node_grant_never_substitutes_exact_node_permission(
     assert exact_permission_calls(transport).count("/nodes/pve-a") == 2
 
 
+def test_non_propagating_exact_permission_is_an_effective_grant() -> None:
+    permissions = required_grants()
+    permissions["/nodes/pve-a"] = {"Sys.Audit": 0}
+    result = ProxmoxProviderV1.collect_boundary_baseline(
+        BoundaryTransport(permissions_before=permissions)
+    )
+    assert result.permission_coverage_complete is True
+    assert result.completeness is BaselineCompleteness.COMPLETE
+    assert result.permission_hash_before == result.permission_hash_after
+
+
 def test_topology_descendant_denial_is_checked_upstream_without_inheritance() -> None:
     topology = ({"path": "/vms/100", "roleid": "NoAccess"},)
     permissions = required_grants(descendants=("/vms/100",))
-    permissions["/vms/100"] = {"VM.Audit": 0}
+    permissions["/vms/100"] = {}
     transport = BoundaryTransport(
         topology_before=topology,
         permissions_before=permissions,
@@ -438,8 +449,10 @@ def test_topology_descendant_denial_is_checked_upstream_without_inheritance() ->
 
 def test_exact_permission_change_across_boundary_is_invalid() -> None:
     before = required_grants()
+    before["/nodes/pve-a"] = {"Sys.Audit": 0}
     after = required_grants()
-    after["/nodes/pve-a"] = {"Sys.Audit": 0}
+    assert evaluate_permission_coverage(before, node_names=("pve-a",))
+    assert evaluate_permission_coverage(after, node_names=("pve-a",))
     result = ProxmoxProviderV1.collect_boundary_baseline(
         BoundaryTransport(permissions_before=before, permissions_after=after)
     )
