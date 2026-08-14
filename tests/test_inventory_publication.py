@@ -126,7 +126,14 @@ def make_system(tmp_path: Path, *, duration: int = 300):
     return clock, db_path, store, authority, source.source.inventory_source_id
 
 
-def reconcile(authority, source_id, *, resource_type="qemu"):
+def reconcile(
+    authority,
+    source_id,
+    *,
+    resource_type="qemu",
+    current_node_name="pve-a",
+    node_names=("pve-a",),
+):
     run = authority.issue_discovery_run(source_id, 1)
     snapshot = NormalizedDiscoverySnapshot(
         run_id=run.run_id,
@@ -149,11 +156,14 @@ def reconcile(authority, source_id, *, resource_type="qemu"):
         permission_snapshot_hash_after="perm",
         permission_coverage_complete=True,
         boundary_consistent=True,
-        covered_nodes=("pve-a",),
+        covered_nodes=node_names,
         failed_baseline_scopes=(),
         detail_summary={"ok_count": 1, "temporarily_unavailable_count": 0, "error_count": 0},
         failed_detail_scopes=(),
-        nodes=(DiscoveredNode("pve-a", "online", True, START.isoformat(), {}),),
+        nodes=tuple(
+            DiscoveredNode(name, "online", True, START.isoformat(), {})
+            for name in node_names
+        ),
         resources=(
             DiscoveredResource(
                 source_id,
@@ -161,7 +171,7 @@ def reconcile(authority, source_id, *, resource_type="qemu"):
                 resource_type,
                 "guest",
                 "running",
-                "pve-a",
+                current_node_name,
                 START.isoformat(),
                 DetailReadStatus.OK,
                 {},
@@ -179,6 +189,27 @@ def test_backend_publication_is_accepted_by_phase0_contract_oracle(tmp_path: Pat
     assert len(snapshot.nodes) == len(snapshot.resources) == 1
     assert snapshot.resources[0].inventory_source_id == snapshot.sources[0].inventory_source_id
     assert snapshot.resources[0].current_node_id == snapshot.nodes[0].node_id
+
+
+def test_publication_retains_known_node_for_unresolved_current_relation(tmp_path: Path) -> None:
+    _, _, store, authority, source_id = make_system(tmp_path)
+    reconcile(authority, source_id)
+    previous = store.list_resources(source_id)[0]
+    reconcile(
+        authority,
+        source_id,
+        current_node_name=None,
+        node_names=("pve-a",),
+    )
+    snapshot = contract_snapshot(InventoryPublication(store, authority).read())
+    resource = snapshot.resources[0]
+    assert resource.resource_id == previous.resource_id
+    assert resource.active_binding_id == previous.active_binding_id
+    assert resource.locator_generation == previous.locator_generation
+    assert resource.current_node_id is None
+    assert resource.last_known_node_id == previous.current_node_id
+    assert resource.node_availability is NodeAvailability.UNRESOLVED
+    assert resource.last_known_node_id in snapshot.nodes_by_id
 
 
 def test_direct_replacement_publishes_retained_predecessor_and_current_successor(tmp_path: Path) -> None:

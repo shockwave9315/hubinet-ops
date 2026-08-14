@@ -112,6 +112,136 @@ def test_stable_rename_and_node_migration_preserve_resource_and_binding_identity
     assert current.current_node_id != old.current_node_id
 
 
+def test_unresolved_current_relation_preserves_and_then_clears_last_known_node(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    complete_snapshot(store, authority, source_id, resources=(guest(node="pve-a"),))
+    original = store.list_resources(source_id)[0]
+    pve_a_node_id = original.current_node_id
+
+    pve_a = (DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),)
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(node=None),),
+        nodes=pve_a,
+    )
+    unresolved = store.list_resources(source_id)[0]
+    assert unresolved.resource_id == original.resource_id
+    assert unresolved.active_binding_id == original.active_binding_id
+    assert unresolved.locator_generation == original.locator_generation
+    assert unresolved.presence == "present"
+    assert unresolved.node_availability == "unresolved"
+    assert unresolved.current_node_id is None
+    assert unresolved.last_known_node_id == pve_a_node_id
+
+    # Repeating an unresolved observation retains the same presentation history.
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(node=None),),
+        nodes=pve_a,
+    )
+    assert store.list_resources(source_id)[0].last_known_node_id == pve_a_node_id
+
+    # Resolving to the same node makes it current again and clears last-known.
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(node="pve-a"),),
+        nodes=pve_a,
+    )
+    resolved_same = store.list_resources(source_id)[0]
+    assert resolved_same.current_node_id == pve_a_node_id
+    assert resolved_same.last_known_node_id is None
+
+    # A later unresolved relation may resolve to a different retained node.
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(node=None),),
+        nodes=pve_a,
+    )
+    pve_b = (DiscoveredNode("pve-b", "online", True, NOW.isoformat(), {}),)
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(node="pve-b"),),
+        nodes=pve_b,
+    )
+    resolved_other = store.list_resources(source_id)[0]
+    assert resolved_other.resource_id == original.resource_id
+    assert resolved_other.active_binding_id == original.active_binding_id
+    assert resolved_other.locator_generation == original.locator_generation
+    assert resolved_other.current_node_id != pve_a_node_id
+    assert resolved_other.last_known_node_id is None
+
+
+def test_first_unresolved_observation_has_no_invented_last_known_node(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(node=None),),
+        nodes=(),
+    )
+    resource = store.list_resources(source_id)[0]
+    assert resource.current_node_id is None
+    assert resource.last_known_node_id is None
+    assert resource.node_availability == "unresolved"
+
+
+def test_unresolved_history_survives_missing_and_direct_replacement(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    complete_snapshot(store, authority, source_id, resources=(guest(node="pve-a"),))
+    old = store.list_resources(source_id)[0]
+    pve_a_node_id = old.current_node_id
+    pve_a = (DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),)
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(node=None),),
+        nodes=pve_a,
+    )
+    complete_snapshot(store, authority, source_id, resources=(), nodes=pve_a)
+    missing = store.list_resources(source_id)[0]
+    assert missing.last_known_node_id == pve_a_node_id
+
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(node=None),),
+        nodes=pve_a,
+    )
+    unresolved_predecessor = store.list_resources(source_id)[0]
+    assert unresolved_predecessor.presence == "present"
+    assert unresolved_predecessor.node_availability == "unresolved"
+    assert unresolved_predecessor.last_known_node_id == pve_a_node_id
+
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(kind="lxc", node=None),),
+        nodes=pve_a,
+    )
+    resources = store.list_resources(source_id)
+    predecessor = next(item for item in resources if item.resource_id == old.resource_id)
+    successor = next(item for item in resources if item.active_binding_id is not None)
+    assert predecessor.last_known_node_id == pve_a_node_id
+    assert successor.current_node_id is None
+    assert successor.last_known_node_id is None
+
+
 def test_detail_error_preserves_present_and_complete_absence_marks_missing(tmp_path: Path) -> None:
     store, authority, source_id = make_authority(tmp_path)
     complete_snapshot(store, authority, source_id, resources=(guest(),))

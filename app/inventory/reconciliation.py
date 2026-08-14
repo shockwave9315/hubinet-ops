@@ -89,9 +89,14 @@ class InventoryReconciler:
             security = str(old["security_continuity"])
             if returning_from_gap and security == "trusted":
                 security = "revoked"
+            last_known_node_id = (
+                None
+                if node_id is not None
+                else old["current_node_id"] or old["last_known_node_id"]
+            )
             connection.execute(
                 "UPDATE resource_incarnations SET name=?, status=?, current_node_id=?, "
-                "last_known_node_id=NULL, presence='present', lifecycle=?, "
+                "last_known_node_id=?, presence='present', lifecycle=?, "
                 "observational_continuity=?, security_continuity=?, detail_status=?, "
                 "node_availability=?, facts_json=?, resource_continuity_revision="
                 "resource_continuity_revision+?, updated_at=? WHERE resource_id=?",
@@ -99,6 +104,7 @@ class InventoryReconciler:
                     observed.name,
                     observed.status,
                     node_id,
+                    last_known_node_id,
                     "quarantined" if returning_from_gap else str(old["lifecycle"]),
                     "uncertain" if returning_from_gap else str(old["observational_continuity"]),
                     security,
