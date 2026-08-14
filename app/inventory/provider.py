@@ -70,6 +70,13 @@ class BoundaryBaselineResult:
     completeness: BaselineCompleteness
 
 
+@dataclass(frozen=True, slots=True)
+class ClusterStatusResult:
+    mode: BaselineMode
+    local_node: str
+    node_names: tuple[str, ...]
+
+
 ENDPOINT_ACL_MATRIX = (
     EndpointRequirement("/version", "provider version", "/", None, True),
     EndpointRequirement("/access/acl", "ACL topology boundary", "/access", "Sys.Audit", True),
@@ -197,13 +204,60 @@ class ProxmoxProviderV1:
                 combined.append({**row, "type": guest_type, "node": row.get("node", node)})
         return _validate_guest_rows(tuple(combined))
 
+    @staticmethod
+    def validate_cluster_status_payload(payload: object) -> ClusterStatusResult:
+        """Derive provider-v1 mode from the exact PVE 9 cluster-status shape."""
+
+        rows = _response_rows(payload, "/cluster/status")
+        if not rows:
+            raise ProviderContractError("cluster status cannot classify an empty source")
+        cluster_rows: list[Mapping[str, Any]] = []
+        node_rows: list[Mapping[str, Any]] = []
+        for row in rows:
+            row_type = row.get("type")
+            if row_type == "cluster":
+                _validate_cluster_status_cluster_row(row)
+                cluster_rows.append(row)
+            elif row_type == "node":
+                _validate_cluster_status_node_row(row)
+                node_rows.append(row)
+            else:
+                raise ProviderContractError("cluster status contains an unsupported row type")
+
+        local_nodes = tuple(
+            str(row["name"])
+            for row in node_rows
+            if _pve_boolean(row["local"], "cluster status local")
+        )
+        if len(local_nodes) != 1:
+            raise ProviderContractError("cluster status has ambiguous local node identity")
+        node_names = tuple(str(row["name"]) for row in node_rows)
+        if len(set(node_names)) != len(node_names):
+            raise ProviderContractError("cluster status contains duplicate node identity")
+
+        if cluster_rows:
+            if len(cluster_rows) != 1:
+                raise ProviderContractError("cluster status has multiple cluster identities")
+            declared_nodes = cluster_rows[0]["nodes"]
+            if declared_nodes != len(node_rows) or not node_rows:
+                raise ProviderContractError("cluster status member scope is inconsistent")
+            if any(row["nodeid"] <= 0 for row in node_rows):
+                raise ProviderContractError("cluster status contains a standalone node identity")
+            return ClusterStatusResult(BaselineMode.CLUSTER, local_nodes[0], node_names)
+
+        if len(node_rows) != 1:
+            raise ProviderContractError("cluster status cannot unambiguously classify standalone mode")
+        node = node_rows[0]
+        if node["nodeid"] != 0 or not _pve_boolean(node["online"], "cluster status online"):
+            raise ProviderContractError("standalone cluster status row is not canonical")
+        return ClusterStatusResult(BaselineMode.STANDALONE, local_nodes[0], node_names)
+
     @classmethod
     def collect_boundary_baseline(
         cls,
         transport: object,
         *,
-        mode: BaselineMode,
-        standalone_node: str | None = None,
+        expected_mode: BaselineMode | None = None,
     ) -> BoundaryBaselineResult:
         """Capture a boundary-consistent baseline using one injected credential."""
 
@@ -211,7 +265,12 @@ class ProxmoxProviderV1:
         release = cls.validate_version_payload(_response_mapping(reader.get("/version"), "/version"))
         topology_before = _response_rows(reader.get("/access/acl"), "/access/acl")
         permissions_before = _response_mapping(reader.get("/access/permissions"), "/access/permissions")
-        _response_rows(reader.get("/cluster/status"), "/cluster/status")
+        status = cls.validate_cluster_status_payload(reader.get("/cluster/status"))
+        if expected_mode is not None:
+            if not isinstance(expected_mode, BaselineMode):
+                raise ProviderContractError("expected baseline mode is unsupported")
+            if expected_mode is not status.mode:
+                raise ProviderContractError("expected baseline mode disagrees with cluster status")
         node_rows = _response_rows(reader.get("/nodes"), "/nodes")
         discovered_nodes = tuple(
             str(row["node"])
@@ -220,14 +279,16 @@ class ProxmoxProviderV1:
         )
         if len(discovered_nodes) != len(node_rows) or len(set(discovered_nodes)) != len(discovered_nodes):
             raise ProviderContractError("node baseline is malformed or ambiguous")
-        if mode is BaselineMode.STANDALONE:
-            if standalone_node is None or discovered_nodes != (standalone_node,):
+        if set(discovered_nodes) != set(status.node_names):
+            raise ProviderContractError("node baseline disagrees with cluster status scope")
+        if status.mode is BaselineMode.STANDALONE:
+            if discovered_nodes != (status.local_node,):
                 raise ProviderContractError("standalone node scope is incomplete")
-            baseline_nodes = (standalone_node,)
+            baseline_nodes = (status.local_node,)
         else:
             baseline_nodes = discovered_nodes
         guest_rows = cls.collect_guest_baseline(
-            reader, mode=mode, node_names=baseline_nodes
+            reader, mode=status.mode, node_names=baseline_nodes
         )
         topology_after = _response_rows(reader.get("/access/acl"), "/access/acl")
         permissions_after = _response_mapping(reader.get("/access/permissions"), "/access/permissions")
@@ -250,7 +311,7 @@ class ProxmoxProviderV1:
             baseline_complete=True,
         )
         return BoundaryBaselineResult(
-            mode=mode,
+            mode=status.mode,
             release=release,
             node_rows=node_rows,
             guest_rows=guest_rows,
@@ -264,6 +325,48 @@ class ProxmoxProviderV1:
 
 
 _NODE_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
+def _validate_cluster_status_cluster_row(row: Mapping[str, Any]) -> None:
+    required = {"type", "id", "name", "nodes", "version", "quorate"}
+    allowed = required
+    if set(row) != allowed:
+        raise ProviderContractError("cluster status cluster row is malformed")
+    if row["id"] != "cluster" or not isinstance(row["name"], str) or not row["name"].strip():
+        raise ProviderContractError("cluster status cluster identity is malformed")
+    if type(row["nodes"]) is not int or row["nodes"] <= 0:
+        raise ProviderContractError("cluster status node count is malformed")
+    if type(row["version"]) is not int or row["version"] < 0:
+        raise ProviderContractError("cluster status version is malformed")
+    _pve_boolean(row["quorate"], "cluster status quorate")
+
+
+def _validate_cluster_status_node_row(row: Mapping[str, Any]) -> None:
+    required = {"type", "id", "name", "nodeid", "local", "online"}
+    allowed = required | {"ip", "level"}
+    if not required.issubset(row) or not set(row).issubset(allowed):
+        raise ProviderContractError("cluster status node row is malformed")
+    name = row["name"]
+    if not isinstance(name, str) or not _NODE_NAME.fullmatch(name):
+        raise ProviderContractError("cluster status node name is malformed")
+    if row["id"] != f"node/{name}":
+        raise ProviderContractError("cluster status node identity is malformed")
+    if type(row["nodeid"]) is not int or row["nodeid"] < 0:
+        raise ProviderContractError("cluster status node id is malformed")
+    _pve_boolean(row["local"], "cluster status local")
+    _pve_boolean(row["online"], "cluster status online")
+    if "ip" in row and (not isinstance(row["ip"], str) or not row["ip"].strip()):
+        raise ProviderContractError("cluster status node IP is malformed")
+    if "level" in row and not isinstance(row["level"], str):
+        raise ProviderContractError("cluster status node level is malformed")
+
+
+def _pve_boolean(value: object, field: str) -> bool:
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in {0, 1}:
+        return bool(value)
+    raise ProviderContractError(f"{field} is malformed")
 
 
 def _response_rows(payload: object, path: str) -> tuple[Mapping[str, Any], ...]:

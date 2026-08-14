@@ -112,6 +112,44 @@ class FakeTransport:
         return self.responses[path]
 
 
+def cluster_status(*, name="cluster-a", node="pve-a"):
+    return {
+        "data": [
+            {
+                "type": "cluster",
+                "id": "cluster",
+                "name": name,
+                "nodes": 1,
+                "version": 7,
+                "quorate": 1,
+            },
+            {
+                "type": "node",
+                "id": f"node/{node}",
+                "name": node,
+                "nodeid": 1,
+                "local": 1,
+                "online": 1,
+            },
+        ]
+    }
+
+
+def standalone_status(*, node="pve-a"):
+    return {
+        "data": [
+            {
+                "type": "node",
+                "id": f"node/{node}",
+                "name": node,
+                "nodeid": 0,
+                "local": 1,
+                "online": 1,
+            }
+        ]
+    }
+
+
 def test_cluster_baseline_uses_source_wide_cluster_resources_get() -> None:
     transport = FakeTransport(
         {"/cluster/resources": {"data": [{"vmid": 100, "type": "qemu", "node": "pve-a"}]}}
@@ -176,7 +214,7 @@ def test_boundary_window_orders_security_evidence_around_cluster_baseline() -> N
                 "/version": {"data": {"release": "9.0"}},
                 "/access/acl": {"data": []},
                 "/access/permissions": {"data": permissions},
-                "/cluster/status": {"data": [{"type": "cluster", "name": "cluster-a"}]},
+                "/cluster/status": cluster_status(),
                 "/nodes": {"data": [{"node": "pve-a"}]},
                 "/cluster/resources": {
                     "data": [{"vmid": 100, "type": "qemu", "node": "pve-a"}]
@@ -185,9 +223,8 @@ def test_boundary_window_orders_security_evidence_around_cluster_baseline() -> N
             return responses[path]
 
     transport = SequenceTransport()
-    result = ProxmoxProviderV1.collect_boundary_baseline(
-        transport, mode=BaselineMode.CLUSTER
-    )
+    result = ProxmoxProviderV1.collect_boundary_baseline(transport)
+    assert result.mode is BaselineMode.CLUSTER
     assert result.completeness is BaselineCompleteness.COMPLETE
     assert [path for path, _ in transport.calls] == [
         "/version",
@@ -199,6 +236,103 @@ def test_boundary_window_orders_security_evidence_around_cluster_baseline() -> N
         "/access/acl",
         "/access/permissions",
     ]
+
+
+def test_boundary_window_derives_standalone_and_uses_only_local_qemu_lxc() -> None:
+    permissions = {
+        "/": {"Sys.Audit": 1},
+        "/access": {"Sys.Audit": 1},
+        "/nodes": {"Sys.Audit": 1},
+        "/vms": {"VM.Audit": 1},
+    }
+    transport = FakeTransport(
+        {
+            "/version": {"data": {"release": "9.0"}},
+            "/access/acl": {"data": []},
+            "/access/permissions": {"data": permissions},
+            "/cluster/status": standalone_status(),
+            "/nodes": {"data": [{"node": "pve-a"}]},
+            "/nodes/pve-a/qemu": {"data": [{"vmid": 100}]},
+            "/nodes/pve-a/lxc": {"data": [{"vmid": 101}]},
+        }
+    )
+    result = ProxmoxProviderV1.collect_boundary_baseline(transport)
+    paths = [path for path, _ in transport.calls]
+    assert result.mode is BaselineMode.STANDALONE
+    assert result.completeness is BaselineCompleteness.COMPLETE
+    assert "/nodes/pve-a/qemu" in paths
+    assert "/nodes/pve-a/lxc" in paths
+    assert "/cluster/resources" not in paths
+
+
+@pytest.mark.parametrize(
+    "status_payload,expected_mode,forbidden_path",
+    (
+        (standalone_status(), BaselineMode.CLUSTER, "/cluster/resources"),
+        (cluster_status(), BaselineMode.STANDALONE, "/nodes/pve-a/qemu"),
+    ),
+)
+def test_caller_expectation_cannot_override_observed_mode(
+    status_payload, expected_mode, forbidden_path
+) -> None:
+    permissions = {
+        "/": {"Sys.Audit": 1},
+        "/access": {"Sys.Audit": 1},
+        "/nodes": {"Sys.Audit": 1},
+        "/vms": {"VM.Audit": 1},
+    }
+    transport = FakeTransport(
+        {
+            "/version": {"data": {"release": "9.0"}},
+            "/access/acl": {"data": []},
+            "/access/permissions": {"data": permissions},
+            "/cluster/status": status_payload,
+        }
+    )
+    with pytest.raises(ProviderContractError, match="disagrees"):
+        ProxmoxProviderV1.collect_boundary_baseline(
+            transport, expected_mode=expected_mode
+        )
+    assert forbidden_path not in [path for path, _ in transport.calls]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"unexpected": []},
+        {"data": []},
+        {"data": [{"type": "node", "name": "pve-a"}]},
+        {"data": [{"type": "unknown", "id": "unknown", "name": "pve-a"}]},
+    ),
+)
+def test_cluster_status_malformed_or_empty_payload_fails_closed(payload) -> None:
+    with pytest.raises(ProviderContractError):
+        ProxmoxProviderV1.validate_cluster_status_payload(payload)
+
+
+def test_cluster_status_ambiguous_cluster_or_local_identity_fails_closed() -> None:
+    duplicate_cluster = cluster_status()["data"]
+    duplicate_cluster.insert(1, dict(duplicate_cluster[0], name="cluster-b"))
+    with pytest.raises(ProviderContractError, match="multiple cluster"):
+        ProxmoxProviderV1.validate_cluster_status_payload({"data": duplicate_cluster})
+
+    ambiguous_local = standalone_status()["data"] + [
+        {
+            "type": "node",
+            "id": "node/pve-b",
+            "name": "pve-b",
+            "nodeid": 0,
+            "local": 1,
+            "online": 1,
+        }
+    ]
+    with pytest.raises(ProviderContractError, match="ambiguous local"):
+        ProxmoxProviderV1.validate_cluster_status_payload({"data": ambiguous_local})
+
+    contradictory = cluster_status()["data"]
+    contradictory[1] = dict(contradictory[1], nodeid=0)
+    with pytest.raises(ProviderContractError, match="standalone node identity"):
+        ProxmoxProviderV1.validate_cluster_status_payload({"data": contradictory})
 
 
 def test_boundary_window_detects_descendant_denial_and_boundary_mismatch() -> None:
@@ -226,7 +360,7 @@ def test_boundary_window_detects_descendant_denial_and_boundary_mismatch() -> No
             if path == "/access/permissions":
                 return {"data": granted}
             if path == "/cluster/status":
-                return {"data": []}
+                return cluster_status()
             if path == "/nodes":
                 return {"data": [{"node": "pve-a"}]}
             if path == "/cluster/resources":
@@ -234,10 +368,10 @@ def test_boundary_window_detects_descendant_denial_and_boundary_mismatch() -> No
             raise AssertionError(path)
 
     denied = ProxmoxProviderV1.collect_boundary_baseline(
-        BoundaryTransport(), mode=BaselineMode.CLUSTER
+        BoundaryTransport(), expected_mode=BaselineMode.CLUSTER
     )
     assert denied.completeness is BaselineCompleteness.CONFIGURATION_ERROR
     mismatched = ProxmoxProviderV1.collect_boundary_baseline(
-        BoundaryTransport(change_topology=True), mode=BaselineMode.CLUSTER
+        BoundaryTransport(change_topology=True), expected_mode=BaselineMode.CLUSTER
     )
     assert mismatched.completeness is BaselineCompleteness.INVALID
