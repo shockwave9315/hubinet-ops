@@ -238,6 +238,35 @@ def test_older_nested_observation_is_stale_on_arrival_without_changing_snapshot_
     assert not authority.source_is_fresh_for_future_mutation(source_id)
 
 
+def test_durable_run_hash_commits_nested_observations_used_by_freshness(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, source_id = make_authority(tmp_path, duration=3600)
+    run = authority.issue_discovery_run(source_id, 1)
+    oldest = START - timedelta(minutes=30)
+    normalized = snapshot_for(
+        store,
+        run,
+        node_observed_at=(oldest.isoformat(),),
+        resource_observed_at=((START - timedelta(minutes=15)).isoformat(),),
+    )
+    clock.value = START + timedelta(minutes=1)
+    authority.finalize_successful_discovery_run(source_id, run.run_id, normalized)
+
+    completed = store.discovery_run(run.run_id)
+    health = store.source_state(source_id).runtime_health
+    assert completed.normalized_snapshot_hash == normalized.snapshot_hash
+    assert health.freshness_reference_at == oldest.isoformat()
+
+    changed = snapshot_for(
+        store,
+        run,
+        node_observed_at=((START - timedelta(minutes=20)).isoformat(),),
+        resource_observed_at=((START - timedelta(minutes=15)).isoformat(),),
+    )
+    assert changed.snapshot_hash != normalized.snapshot_hash
+
+
 @pytest.mark.parametrize(
     (
         "snapshot_time",

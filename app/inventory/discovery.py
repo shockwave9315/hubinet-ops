@@ -275,11 +275,11 @@ class NormalizedDiscoverySnapshot:
             "failed_detail_scopes": list(self.failed_detail_scopes),
             "source_facts": _thaw(self.source_facts),
             "nodes": [
-                {"name": node.external_node_name, "status": node.status, "available": node.available, "facts": _thaw(node.facts)}
+                {"name": node.external_node_name, "status": node.status, "available": node.available, "observed_at": node.observed_at, "facts": _thaw(node.facts)}
                 for node in self.nodes
             ],
             "resources": [
-                {"vmid": item.vmid, "type": item.resource_type, "name": item.name, "status": item.status, "node": item.current_node_name, "detail": item.detail_status.value, "facts": _thaw(item.facts), "evidence": _thaw(item.continuity_evidence)}
+                {"vmid": item.vmid, "type": item.resource_type, "name": item.name, "status": item.status, "node": item.current_node_name, "observed_at": item.observed_at, "detail": item.detail_status.value, "facts": _thaw(item.facts), "evidence": _thaw(item.continuity_evidence)}
                 for item in self.resources
             ],
         }

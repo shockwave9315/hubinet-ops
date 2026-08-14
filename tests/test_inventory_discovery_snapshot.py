@@ -56,13 +56,19 @@ def snapshot(*, resources=(), nodes=None, source_id: str = SOURCE_ID, **changes)
     return NormalizedDiscoverySnapshot(**values)
 
 
-def node(name="pve-a"):
-    return DiscoveredNode(name, "online", True, "2026-08-14T12:00:00+00:00", {"cpu": {"count": 8}})
+def node(name="pve-a", observed_at="2026-08-14T12:00:00+00:00"):
+    return DiscoveredNode(name, "online", True, observed_at, {"cpu": {"count": 8}})
 
 
-def resource(vmid=100, kind="qemu", source_id=SOURCE_ID, node_name="pve-a"):
+def resource(
+    vmid=100,
+    kind="qemu",
+    source_id=SOURCE_ID,
+    node_name="pve-a",
+    observed_at="2026-08-14T12:00:00+00:00",
+):
     return DiscoveredResource(source_id, vmid, kind, f"guest-{vmid}", "running", node_name,
-                              "2026-08-14T12:00:00+00:00", DetailReadStatus.OK,
+                              observed_at, DetailReadStatus.OK,
                               {"config": {"memory": 1024}})
 
 
@@ -155,3 +161,32 @@ def test_snapshot_hash_covers_security_and_issuance_provenance() -> None:
         permission_snapshot_hash_after="other",
     )
     assert changed.snapshot_hash != original.snapshot_hash
+
+
+def test_snapshot_hash_covers_nested_observation_timestamps() -> None:
+    original = snapshot(nodes=(node(),), resources=(resource(),))
+    changed_node = snapshot(
+        nodes=(node(observed_at="2026-08-14T11:30:00+00:00"),),
+        resources=(resource(),),
+    )
+    changed_resource = snapshot(
+        nodes=(node(),),
+        resources=(resource(observed_at="2026-08-14T11:30:00+00:00"),),
+    )
+    assert changed_node.snapshot_hash != original.snapshot_hash
+    assert changed_resource.snapshot_hash != original.snapshot_hash
+
+
+def test_snapshot_hash_is_stable_with_identical_nested_observation_evidence() -> None:
+    nodes = (
+        node("pve-a", "2026-08-14T11:00:00+00:00"),
+        node("pve-b", "2026-08-14T11:30:00+00:00"),
+    )
+    resources = (
+        resource(100, node_name="pve-a", observed_at="2026-08-14T11:15:00+00:00"),
+        resource(101, "lxc", node_name="pve-b", observed_at="2026-08-14T11:45:00+00:00"),
+    )
+    first = snapshot(nodes=nodes, resources=resources)
+    second = snapshot(nodes=tuple(nodes), resources=tuple(resources))
+    assert first.to_json_value() == second.to_json_value()
+    assert first.snapshot_hash == second.snapshot_hash
