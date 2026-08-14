@@ -58,15 +58,21 @@ class InventoryPublication:
         self._api_version = api_version
 
     def read(self) -> PublishedInventoryView:
-        """Materialize due expiry, then assemble every component in one read snapshot."""
+        """Materialize expiry and assemble one view in the same transaction."""
 
-        source_ids = tuple(
-            state.source.inventory_source_id for state in self._store.list_source_states()
-        )
-        for source_id in source_ids:
-            self._authority.materialize_due_expiry(source_id)
-
-        with self._store._read_transaction() as connection:
+        with self._store._transaction() as connection:
+            decision_time = self._authority._authority_decision_time()
+            source_ids = tuple(
+                str(row["inventory_source_id"])
+                for row in connection.execute(
+                    "SELECT inventory_source_id FROM inventory_sources "
+                    "ORDER BY inventory_source_id"
+                ).fetchall()
+            )
+            for source_id in source_ids:
+                self._authority._materialize_due_expiry_in_transaction(
+                    connection, source_id, now=decision_time
+                )
             backend_rows = connection.execute("SELECT * FROM backend_instance").fetchall()
             if len(backend_rows) != 1:
                 raise RuntimeError("authority database must contain one backend instance")

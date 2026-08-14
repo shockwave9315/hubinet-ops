@@ -242,13 +242,28 @@ def test_same_published_revision_returns_value_identical_immutable_view(tmp_path
         raise AssertionError("published view is mutable")
 
 
-def test_expired_freshness_is_materialized_before_snapshot_read(tmp_path: Path) -> None:
+def test_expired_freshness_is_materialized_in_snapshot_transaction(
+    tmp_path: Path, monkeypatch
+) -> None:
     clock, _, store, authority, source_id = make_system(tmp_path, duration=10)
     reconcile(authority, source_id)
     before = store.backend_instance()
     clock.value = START + timedelta(seconds=11)
+    split_wrapper_calls = 0
+    original_materialize = authority.materialize_due_expiry
+
+    def split_transaction_trap(*args, **kwargs):
+        nonlocal split_wrapper_calls
+        split_wrapper_calls += 1
+        clock.value = START + timedelta(seconds=9)
+        result = original_materialize(*args, **kwargs)
+        clock.value = START + timedelta(seconds=11)
+        return result
+
+    monkeypatch.setattr(authority, "materialize_due_expiry", split_transaction_trap)
     snapshot = contract_snapshot(InventoryPublication(store, authority).read())
     source = snapshot.sources[0]
+    assert split_wrapper_calls == 0
     assert source.freshness is SourceFreshness.STALE
     assert source.health_origin is SourceHealthOrigin.TIME_EXPIRY
     assert snapshot.inventory_revision == before.inventory_revision

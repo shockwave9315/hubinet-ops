@@ -583,43 +583,91 @@ class InventoryAuthority:
         expected_deadline: str | None = None,
     ) -> bool:
         source_id = _require_uuid(inventory_source_id, "inventory_source_id")
-        changed = False
         with self._store._transaction() as connection:
-            source = self._require_source_row(connection, source_id)
-            health = connection.execute(
-                "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
-                (source_id,),
-            ).fetchone()
-            endpoint = self._require_active_endpoint_row(connection, source_id)
-            if health is None or health["freshness"] != "fresh":
-                return False
-            if expected_run_sequence is not None and source["last_committed_run_sequence"] != expected_run_sequence:
-                return False
-            if expected_deadline is not None and health["freshness_valid_until"] != expected_deadline:
-                return False
-            if not self._committed_context_is_current(source, endpoint, health):
-                return False
-            deadline = _parse_timestamp(str(health["freshness_valid_until"]), "freshness_valid_until")
-            if self._now().astimezone(UTC) < deadline:
-                return False
-            connection.execute(
-                "UPDATE source_runtime_health SET freshness='stale', "
-                "health_origin='time_expiry', health_reason='freshness_deadline_elapsed' "
-                "WHERE inventory_source_id=?",
-                (source_id,),
+            decision_time = self._authority_decision_time()
+            return self._materialize_due_expiry_in_transaction(
+                connection,
+                source_id,
+                now=decision_time,
+                expected_run_sequence=expected_run_sequence,
+                expected_deadline=expected_deadline,
             )
-            self._bump_global_revisions(
-                connection, inventory_changed=False, published_changed=True
-            )
-            changed = True
-        return changed
 
     def source_is_fresh_for_future_mutation(self, inventory_source_id: str) -> bool:
         """Read-only Phase 1C precondition guard; grants no mutation authority."""
 
-        self.materialize_due_expiry(inventory_source_id)
-        state = self._store.source_state(inventory_source_id)
-        return state.runtime_health.health.value == "healthy" and state.runtime_health.freshness.value == "fresh"
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        with self._store._transaction() as connection:
+            decision_time = self._authority_decision_time()
+            self._materialize_due_expiry_in_transaction(
+                connection, source_id, now=decision_time
+            )
+            source = self._require_source_row(connection, source_id)
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+            health = connection.execute(
+                "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+                (source_id,),
+            ).fetchone()
+            if health is None:
+                raise AuthorityInvariantError(
+                    "inventory source must have exactly one runtime health record"
+                )
+            return (
+                health["health"] == "healthy"
+                and health["freshness"] == "fresh"
+                and self._committed_context_is_current(source, endpoint, health)
+            )
+
+    def _authority_decision_time(self) -> datetime:
+        return _parse_timestamp(_timestamp(self._now()), "authority decision time")
+
+    def _materialize_due_expiry_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        source_id: str,
+        *,
+        now: datetime,
+        expected_run_sequence: int | None = None,
+        expected_deadline: str | None = None,
+    ) -> bool:
+        source = self._require_source_row(connection, source_id)
+        health = connection.execute(
+            "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+            (source_id,),
+        ).fetchone()
+        endpoint = self._require_active_endpoint_row(connection, source_id)
+        if health is None or health["freshness"] != "fresh":
+            return False
+        if (
+            expected_run_sequence is not None
+            and source["last_committed_run_sequence"] != expected_run_sequence
+        ):
+            return False
+        if (
+            expected_deadline is not None
+            and health["freshness_valid_until"] != expected_deadline
+        ):
+            return False
+        if not self._committed_context_is_current(source, endpoint, health):
+            return False
+        deadline = _parse_timestamp(
+            str(health["freshness_valid_until"]), "freshness_valid_until"
+        )
+        if now < deadline:
+            return False
+        connection.execute(
+            "UPDATE source_runtime_health SET freshness='stale', "
+            "health_origin='time_expiry', health_reason='freshness_deadline_elapsed' "
+            "WHERE inventory_source_id=?",
+            (source_id,),
+        )
+        self._bump_global_revisions(
+            connection,
+            inventory_changed=False,
+            published_changed=True,
+            published_at=now,
+        )
+        return True
 
     def _change_source_configuration(
         self,
@@ -900,6 +948,7 @@ class InventoryAuthority:
         *,
         inventory_changed: bool,
         published_changed: bool,
+        published_at: datetime | None = None,
     ) -> None:
         if inventory_changed and not published_changed:
             raise AuthorityInvariantError(
@@ -914,7 +963,7 @@ class InventoryAuthority:
                 int(inventory_changed),
                 int(published_changed),
                 int(published_changed),
-                _timestamp(self._now()),
+                _timestamp(published_at if published_at is not None else self._now()),
             ),
         )
         if updated.rowcount != 1:

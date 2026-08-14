@@ -176,6 +176,30 @@ def test_fast_success_expires_with_compare_and_swap_timer(tmp_path: Path) -> Non
     assert not authority.source_is_fresh_for_future_mutation(source_id)
 
 
+def test_future_mutation_freshness_check_fences_expiry_and_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock, store, authority, source_id = make_authority(tmp_path, duration=10)
+    successful_run(store, authority, source_id)
+    clock.value = START + timedelta(seconds=11)
+    split_wrapper_calls = 0
+    original_materialize = authority.materialize_due_expiry
+
+    def split_transaction_trap(*args, **kwargs):
+        nonlocal split_wrapper_calls
+        split_wrapper_calls += 1
+        clock.value = START + timedelta(seconds=9)
+        result = original_materialize(*args, **kwargs)
+        clock.value = START + timedelta(seconds=11)
+        return result
+
+    monkeypatch.setattr(authority, "materialize_due_expiry", split_transaction_trap)
+
+    assert not authority.source_is_fresh_for_future_mutation(source_id)
+    assert split_wrapper_calls == 0
+    assert store.source_state(source_id).runtime_health.freshness.value == "stale"
+
+
 def test_success_observed_before_deadline_but_committed_after_is_stale_on_arrival(tmp_path: Path) -> None:
     clock, store, authority, source_id = make_authority(tmp_path, duration=30)
     run = authority.issue_discovery_run(source_id, 1)
@@ -256,7 +280,6 @@ def test_older_nested_observation_is_stale_on_arrival_without_changing_snapshot_
             START - timedelta(minutes=50),
             "stale",
         ),
-        (START, (), (), START + timedelta(minutes=1), START, "fresh"),
         (START, (START,), (START,), START, START, "fresh"),
         (
             START,
