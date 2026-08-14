@@ -330,8 +330,10 @@ class InventoryAuthority:
                     connection, snapshot, committed_at=committed_at
                 )
                 self._after_reconciliation(connection, snapshot)
-                observed = _parse_timestamp(snapshot.observed_at, "observed_at")
-                deadline = observed + timedelta(seconds=int(source["freshness_duration_seconds"]))
+                freshness_reference = _freshness_reference_at(snapshot)
+                deadline = freshness_reference + timedelta(
+                    seconds=int(source["freshness_duration_seconds"])
+                )
                 now = self._now().astimezone(UTC)
                 freshness = "stale" if now >= deadline else "fresh"
                 origin = "time_expiry" if freshness == "stale" else "discovery_run"
@@ -362,7 +364,7 @@ class InventoryAuthority:
                         sequence,
                         sequence,
                         snapshot.observed_at,
-                        snapshot.observed_at,
+                        freshness_reference.isoformat(),
                         deadline.isoformat(),
                         int(source["source_config_revision"]),
                         str(endpoint["endpoint_id"]),
@@ -1012,3 +1014,17 @@ def _parse_timestamp(value: str, field_name: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     return parsed.astimezone(UTC)
+
+
+def _freshness_reference_at(snapshot: NormalizedDiscoverySnapshot) -> datetime:
+    """Return provider-v1's oldest freshness-relevant observation in UTC."""
+
+    observations = [_parse_timestamp(snapshot.observed_at, "observed_at")]
+    observations.extend(
+        _parse_timestamp(node.observed_at, "node observed_at") for node in snapshot.nodes
+    )
+    observations.extend(
+        _parse_timestamp(resource.observed_at, "resource observed_at")
+        for resource in snapshot.resources
+    )
+    return min(observations)

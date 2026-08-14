@@ -44,9 +44,21 @@ def make_authority(tmp_path: Path, *, duration: int = 300, authority_type=Invent
     return clock, store, authority, source.source.inventory_source_id
 
 
-def snapshot_for(store, run, *, observed_at: str | None = None):
+def snapshot_for(
+    store,
+    run,
+    *,
+    observed_at: str | None = None,
+    node_observed_at: tuple[str, ...] | None = None,
+    resource_observed_at: tuple[str, ...] | None = None,
+):
     source_id = run.inventory_source_id
     observed = observed_at or START.isoformat()
+    node_times = node_observed_at if node_observed_at is not None else (observed,)
+    resource_times = (
+        resource_observed_at if resource_observed_at is not None else (observed,)
+    )
+    node_names = tuple(f"pve-{chr(ord('a') + index)}" for index in range(len(node_times)))
     return NormalizedDiscoverySnapshot(
         run_id=run.run_id,
         discovery_run_sequence=run.discovery_run_sequence,
@@ -68,23 +80,31 @@ def snapshot_for(store, run, *, observed_at: str | None = None):
         permission_snapshot_hash_after="perm",
         permission_coverage_complete=True,
         boundary_consistent=True,
-        covered_nodes=("pve-a",),
+        covered_nodes=node_names,
         failed_baseline_scopes=(),
-        detail_summary={"ok_count": 1, "temporarily_unavailable_count": 0, "error_count": 0},
+        detail_summary={
+            "ok_count": len(resource_times),
+            "temporarily_unavailable_count": 0,
+            "error_count": 0,
+        },
         failed_detail_scopes=(),
-        nodes=(DiscoveredNode("pve-a", "online", True, observed, {}),),
-        resources=(
+        nodes=tuple(
+            DiscoveredNode(node_name, "online", True, node_time, {})
+            for node_name, node_time in zip(node_names, node_times, strict=True)
+        ),
+        resources=tuple(
             DiscoveredResource(
                 source_id,
-                100,
+                100 + index,
                 "qemu",
-                "guest",
+                f"guest-{index}",
                 "running",
-                "pve-a",
-                observed,
+                node_names[index % len(node_names)] if node_names else None,
+                resource_time,
                 DetailReadStatus.OK,
                 {"memory": 1024},
-            ),
+            )
+            for index, resource_time in enumerate(resource_times)
         ),
     )
 
@@ -164,6 +184,153 @@ def test_success_observed_before_deadline_but_committed_after_is_stale_on_arriva
     health = store.source_state(source_id).runtime_health
     assert health.freshness.value == "stale"
     assert health.health_origin.value == "time_expiry"
+
+
+def test_older_nested_observation_is_stale_on_arrival_without_changing_snapshot_provenance(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, source_id = make_authority(tmp_path, duration=300)
+    run = authority.issue_discovery_run(source_id, 1)
+    oldest = START - timedelta(hours=1)
+    clock.value = START + timedelta(minutes=1)
+    authority.finalize_successful_discovery_run(
+        source_id,
+        run.run_id,
+        snapshot_for(
+            store,
+            run,
+            node_observed_at=(oldest.isoformat(),),
+            resource_observed_at=(oldest.isoformat(),),
+        ),
+    )
+    health = store.source_state(source_id).runtime_health
+    assert health.last_successful_observed_at == START.isoformat()
+    assert health.freshness_reference_at == oldest.isoformat()
+    assert health.freshness_valid_until == (oldest + timedelta(seconds=300)).isoformat()
+    assert health.freshness.value == "stale"
+    assert health.health_origin.value == "time_expiry"
+    assert health.health_reason == "freshness_deadline_elapsed_before_commit"
+    assert len(store.list_resources(source_id)) == 1
+    assert not authority.source_is_fresh_for_future_mutation(source_id)
+
+
+@pytest.mark.parametrize(
+    (
+        "snapshot_time",
+        "node_times",
+        "resource_times",
+        "commit_time",
+        "expected_reference",
+        "expected_freshness",
+    ),
+    (
+        (
+            START,
+            (START + timedelta(minutes=1),),
+            (START + timedelta(minutes=1),),
+            START + timedelta(minutes=1),
+            START,
+            "fresh",
+        ),
+        (
+            START,
+            (START - timedelta(hours=1),),
+            (START - timedelta(minutes=30),),
+            START,
+            START - timedelta(hours=1),
+            "stale",
+        ),
+        (
+            START,
+            (START - timedelta(minutes=30),),
+            (START - timedelta(hours=1, minutes=15),),
+            START,
+            START - timedelta(hours=1, minutes=15),
+            "stale",
+        ),
+        (
+            START,
+            (START - timedelta(minutes=10), START - timedelta(minutes=40)),
+            (START - timedelta(minutes=20), START - timedelta(minutes=50)),
+            START,
+            START - timedelta(minutes=50),
+            "stale",
+        ),
+        (START, (), (), START + timedelta(minutes=1), START, "fresh"),
+        (START, (START,), (START,), START + timedelta(minutes=1), START, "fresh"),
+        (
+            START,
+            (START - timedelta(minutes=2),),
+            (START - timedelta(minutes=1),),
+            START + timedelta(minutes=1),
+            START - timedelta(minutes=2),
+            "fresh",
+        ),
+    ),
+)
+def test_freshness_reference_is_oldest_relevant_observation(
+    tmp_path: Path,
+    snapshot_time: datetime,
+    node_times: tuple[datetime, ...],
+    resource_times: tuple[datetime, ...],
+    commit_time: datetime,
+    expected_reference: datetime,
+    expected_freshness: str,
+) -> None:
+    clock, store, authority, source_id = make_authority(tmp_path, duration=300)
+    run = authority.issue_discovery_run(source_id, 1)
+    clock.value = commit_time
+    authority.finalize_successful_discovery_run(
+        source_id,
+        run.run_id,
+        snapshot_for(
+            store,
+            run,
+            observed_at=snapshot_time.isoformat(),
+            node_observed_at=tuple(value.isoformat() for value in node_times),
+            resource_observed_at=tuple(value.isoformat() for value in resource_times),
+        ),
+    )
+    health = store.source_state(source_id).runtime_health
+    assert health.last_successful_observed_at == snapshot_time.isoformat()
+    assert health.freshness_reference_at == expected_reference.isoformat()
+    assert health.freshness_valid_until == (
+        expected_reference + timedelta(seconds=300)
+    ).isoformat()
+    assert health.freshness.value == expected_freshness
+
+
+@pytest.mark.parametrize(
+    ("timestamp_kwargs", "error"),
+    (
+        (
+            {"node_observed_at": ("not-a-timestamp",)},
+            "node observed_at must be an ISO timestamp",
+        ),
+        (
+            {"resource_observed_at": (START.replace(tzinfo=None).isoformat(),)},
+            "resource observed_at must be timezone-aware",
+        ),
+    ),
+)
+def test_malformed_nested_observation_rolls_back_success_atomically(
+    tmp_path: Path,
+    timestamp_kwargs: dict[str, tuple[str, ...]],
+    error: str,
+) -> None:
+    _, store, authority, source_id = make_authority(tmp_path)
+    run = authority.issue_discovery_run(source_id, 1)
+    before = store.backend_instance()
+    with pytest.raises(ValueError, match=error):
+        authority.finalize_successful_discovery_run(
+            source_id,
+            run.run_id,
+            snapshot_for(store, run, **timestamp_kwargs),
+        )
+    assert store.list_resources(source_id) == ()
+    assert store.source_state(source_id).source.active_discovery_run_id == run.run_id
+    assert store.discovery_run(run.run_id).lifecycle.value == "issued"
+    assert store.backend_instance() == before
 
 
 def test_newer_success_replaces_expired_anchor_and_old_timer_is_noop(tmp_path: Path) -> None:
