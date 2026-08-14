@@ -253,6 +253,28 @@ class ProxmoxProviderV1:
         return ClusterStatusResult(BaselineMode.STANDALONE, local_nodes[0], node_names)
 
     @classmethod
+    def collect_effective_permissions(
+        cls,
+        transport: object,
+        required_paths: tuple[str, ...],
+    ) -> Mapping[str, Mapping[str, bool]]:
+        """Ask Proxmox to evaluate effective permissions for every exact path."""
+
+        reader = cls.require_get_transport(transport)
+        if required_paths != tuple(sorted(set(required_paths))):
+            raise ProviderContractError("required permission paths are not canonical")
+        evidence: dict[str, Mapping[str, bool]] = {}
+        for path in required_paths:
+            if not _is_canonical_acl_path(path):
+                raise ProviderContractError("required permission path is malformed")
+            payload = _response_mapping(
+                reader.get("/access/permissions", params={"path": path}),
+                "/access/permissions",
+            )
+            evidence[path] = _validate_exact_permission_response(payload, path)
+        return evidence
+
+    @classmethod
     def collect_boundary_baseline(
         cls,
         transport: object,
@@ -264,13 +286,21 @@ class ProxmoxProviderV1:
         reader = cls.require_get_transport(transport)
         release = cls.validate_version_payload(_response_mapping(reader.get("/version"), "/version"))
         topology_before = _response_rows(reader.get("/access/acl"), "/access/acl")
-        permissions_before = _response_mapping(reader.get("/access/permissions"), "/access/permissions")
         status = cls.validate_cluster_status_payload(reader.get("/cluster/status"))
         if expected_mode is not None:
             if not isinstance(expected_mode, BaselineMode):
                 raise ProviderContractError("expected baseline mode is unsupported")
             if expected_mode is not status.mode:
                 raise ProviderContractError("expected baseline mode disagrees with cluster status")
+        descendant_paths = _security_descendant_paths(topology_before)
+        required_permission_paths = _required_permission_paths(
+            node_names=status.node_names,
+            security_relevant_descendant_paths=descendant_paths,
+        )
+        permissions_before = cls.collect_effective_permissions(
+            reader,
+            required_permission_paths,
+        )
         node_rows = _response_rows(reader.get("/nodes"), "/nodes")
         discovered_nodes = tuple(
             str(row["node"])
@@ -291,13 +321,17 @@ class ProxmoxProviderV1:
             reader, mode=status.mode, node_names=baseline_nodes
         )
         topology_after = _response_rows(reader.get("/access/acl"), "/access/acl")
-        permissions_after = _response_mapping(reader.get("/access/permissions"), "/access/permissions")
-        descendant_paths = _security_descendant_paths(topology_before)
+        permissions_after = cls.collect_effective_permissions(
+            reader,
+            required_permission_paths,
+        )
         coverage = evaluate_permission_coverage(
             permissions_before,
+            node_names=status.node_names,
             security_relevant_descendant_paths=descendant_paths,
         ) and evaluate_permission_coverage(
             permissions_after,
+            node_names=status.node_names,
             security_relevant_descendant_paths=descendant_paths,
         )
         completeness = classify_boundary(
@@ -387,13 +421,56 @@ def _response_mapping(payload: object, path: str) -> Mapping[str, Any]:
 
 
 def _security_descendant_paths(topology: tuple[Mapping[str, Any], ...]) -> tuple[str, ...]:
-    paths = {
-        str(row["path"])
-        for row in topology
-        if isinstance(row.get("path"), str)
-        and str(row["path"]).startswith(("/vms/", "/nodes/"))
-    }
+    paths: set[str] = set()
+    for row in topology:
+        path = row.get("path")
+        if not isinstance(path, str) or not _is_canonical_acl_path(path):
+            raise ProviderContractError("ACL topology contains a malformed path")
+        if path.startswith(("/vms/", "/nodes/")):
+            paths.add(path)
     return tuple(sorted(paths))
+
+
+def _required_permission_paths(
+    *,
+    node_names: tuple[str, ...],
+    security_relevant_descendant_paths: tuple[str, ...],
+) -> tuple[str, ...]:
+    paths = {"/", "/access", "/nodes", "/vms"}
+    for node_name in node_names:
+        if not isinstance(node_name, str) or not _NODE_NAME.fullmatch(node_name):
+            raise ProviderContractError("permission node scope is malformed")
+        paths.add(f"/nodes/{node_name}")
+    for path in security_relevant_descendant_paths:
+        if not _is_canonical_acl_path(path) or not path.startswith(("/vms/", "/nodes/")):
+            raise ProviderContractError("security-relevant ACL path is malformed")
+        paths.add(path)
+    return tuple(sorted(paths))
+
+
+def _validate_exact_permission_response(
+    payload: Mapping[str, Any],
+    requested_path: str,
+) -> Mapping[str, bool]:
+    if not payload:
+        return {}
+    if set(payload) != {requested_path} or not isinstance(payload[requested_path], Mapping):
+        raise ProviderContractError("effective permission response does not match requested path")
+    privileges: dict[str, bool] = {}
+    for privilege, granted in payload[requested_path].items():
+        if not isinstance(privilege, str) or not privilege:
+            raise ProviderContractError("effective permission privilege is malformed")
+        privileges[privilege] = _pve_boolean(granted, "effective permission value")
+    return privileges
+
+
+def _is_canonical_acl_path(path: object) -> bool:
+    if not isinstance(path, str) or not path.startswith("/"):
+        return False
+    if path == "/":
+        return True
+    parts = path[1:].split("/")
+    return all(part not in {"", ".", ".."} for part in parts)
 
 
 def _validate_guest_rows(rows: tuple[Mapping[str, Any], ...]) -> tuple[Mapping[str, Any], ...]:

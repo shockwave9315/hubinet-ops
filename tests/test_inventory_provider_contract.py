@@ -109,28 +109,32 @@ class FakeTransport:
 
     def get(self, path, *, params=None):
         self.calls.append((path, params))
-        return self.responses[path]
+        response = self.responses[path]
+        return response(params) if callable(response) else response
 
 
-def cluster_status(*, name="cluster-a", node="pve-a"):
+def cluster_status(*, name="cluster-a", nodes=("pve-a",), local_node="pve-a"):
     return {
         "data": [
             {
                 "type": "cluster",
                 "id": "cluster",
                 "name": name,
-                "nodes": 1,
+                "nodes": len(nodes),
                 "version": 7,
                 "quorate": 1,
             },
-            {
-                "type": "node",
-                "id": f"node/{node}",
-                "name": node,
-                "nodeid": 1,
-                "local": 1,
-                "online": 1,
-            },
+            *(
+                {
+                    "type": "node",
+                    "id": f"node/{node}",
+                    "name": node,
+                    "nodeid": index,
+                    "local": int(node == local_node),
+                    "online": 1,
+                }
+                for index, node in enumerate(nodes, start=1)
+            ),
         ]
     }
 
@@ -148,6 +152,93 @@ def standalone_status(*, node="pve-a"):
             }
         ]
     }
+
+
+def required_grants(*, nodes=("pve-a",), descendants=()):
+    paths = {"/", "/access", "/nodes", "/vms"}
+    paths.update(f"/nodes/{node}" for node in nodes)
+    paths.update(descendants)
+    return {
+        path: {
+            "VM.Audit" if path == "/vms" or path.startswith("/vms/") else "Sys.Audit": 1
+        }
+        for path in paths
+    }
+
+
+class BoundaryTransport:
+    def __init__(
+        self,
+        *,
+        status_payload=None,
+        node_names=("pve-a",),
+        topology_before=(),
+        topology_after=None,
+        permissions_before=None,
+        permissions_after=None,
+        permission_overrides=None,
+        cluster_guests=(),
+        qemu_guests=(),
+        lxc_guests=(),
+    ):
+        self.status_payload = status_payload or cluster_status(nodes=node_names)
+        self.node_names = node_names
+        self.topology_before = tuple(topology_before)
+        self.topology_after = tuple(
+            topology_before if topology_after is None else topology_after
+        )
+        self.permissions_before = permissions_before or required_grants(nodes=node_names)
+        self.permissions_after = permissions_after or self.permissions_before
+        self.permission_overrides = permission_overrides or {}
+        self.cluster_guests = tuple(cluster_guests)
+        self.qemu_guests = tuple(qemu_guests)
+        self.lxc_guests = tuple(lxc_guests)
+        self.calls = []
+        self.acl_reads = 0
+        self.permission_reads = {}
+
+    def get(self, path, *, params=None):
+        self.calls.append((path, params))
+        if path == "/version":
+            return {"data": {"release": "9.0"}}
+        if path == "/access/acl":
+            rows = self.topology_before if self.acl_reads == 0 else self.topology_after
+            self.acl_reads += 1
+            return {"data": list(rows)}
+        if path == "/cluster/status":
+            return self.status_payload
+        if path == "/access/permissions":
+            if not isinstance(params, dict) or set(params) != {"path"}:
+                raise AssertionError("effective permission read must name one exact path")
+            permission_path = params["path"]
+            boundary = self.permission_reads.get(permission_path, 0)
+            self.permission_reads[permission_path] = boundary + 1
+            override = self.permission_overrides.get((boundary, permission_path))
+            if override is not None:
+                return override
+            permission_map = (
+                self.permissions_before if boundary == 0 else self.permissions_after
+            )
+            privileges = permission_map.get(permission_path, {})
+            return {"data": {permission_path: privileges} if privileges else {}}
+        if path == "/nodes":
+            return {"data": [{"node": node} for node in self.node_names]}
+        if path == "/cluster/resources":
+            assert params == {"type": "vm"}
+            return {"data": list(self.cluster_guests)}
+        if path == f"/nodes/{self.node_names[0]}/qemu":
+            return {"data": list(self.qemu_guests)}
+        if path == f"/nodes/{self.node_names[0]}/lxc":
+            return {"data": list(self.lxc_guests)}
+        raise AssertionError(path)
+
+
+def exact_permission_calls(transport):
+    return [
+        params["path"]
+        for path, params in transport.calls
+        if path == "/access/permissions"
+    ]
 
 
 def test_cluster_baseline_uses_source_wide_cluster_resources_get() -> None:
@@ -197,69 +288,63 @@ def test_standalone_duplicate_slot_or_malformed_envelope_fails_closed() -> None:
 
 
 def test_boundary_window_orders_security_evidence_around_cluster_baseline() -> None:
-    permissions = {
-        "/": {"Sys.Audit": 1},
-        "/access": {"Sys.Audit": 1},
-        "/nodes": {"Sys.Audit": 1},
-        "/vms": {"VM.Audit": 1},
-    }
-
-    class SequenceTransport:
-        def __init__(self):
-            self.calls = []
-
-        def get(self, path, *, params=None):
-            self.calls.append((path, params))
-            responses = {
-                "/version": {"data": {"release": "9.0"}},
-                "/access/acl": {"data": []},
-                "/access/permissions": {"data": permissions},
-                "/cluster/status": cluster_status(),
-                "/nodes": {"data": [{"node": "pve-a"}]},
-                "/cluster/resources": {
-                    "data": [{"vmid": 100, "type": "qemu", "node": "pve-a"}]
-                },
-            }
-            return responses[path]
-
-    transport = SequenceTransport()
+    transport = BoundaryTransport(
+        cluster_guests=({"vmid": 100, "type": "qemu", "node": "pve-a"},)
+    )
     result = ProxmoxProviderV1.collect_boundary_baseline(transport)
     assert result.mode is BaselineMode.CLUSTER
     assert result.completeness is BaselineCompleteness.COMPLETE
-    assert [path for path, _ in transport.calls] == [
-        "/version",
-        "/access/acl",
-        "/access/permissions",
-        "/cluster/status",
-        "/nodes",
-        "/cluster/resources",
-        "/access/acl",
-        "/access/permissions",
+    assert transport.calls == [
+        ("/version", None),
+        ("/access/acl", None),
+        ("/cluster/status", None),
+        ("/access/permissions", {"path": "/"}),
+        ("/access/permissions", {"path": "/access"}),
+        ("/access/permissions", {"path": "/nodes"}),
+        ("/access/permissions", {"path": "/nodes/pve-a"}),
+        ("/access/permissions", {"path": "/vms"}),
+        ("/nodes", None),
+        ("/cluster/resources", {"type": "vm"}),
+        ("/access/acl", None),
+        ("/access/permissions", {"path": "/"}),
+        ("/access/permissions", {"path": "/access"}),
+        ("/access/permissions", {"path": "/nodes"}),
+        ("/access/permissions", {"path": "/nodes/pve-a"}),
+        ("/access/permissions", {"path": "/vms"}),
     ]
+    assert all(
+        params is not None
+        for path, params in transport.calls
+        if path == "/access/permissions"
+    )
+
+
+def test_boundary_checks_each_cluster_node_at_both_boundaries() -> None:
+    node_names = ("pve-b", "pve-a")
+    transport = BoundaryTransport(
+        status_payload=cluster_status(nodes=node_names, local_node="pve-a"),
+        node_names=node_names,
+        permissions_before=required_grants(nodes=node_names),
+        cluster_guests=({"vmid": 100, "type": "qemu", "node": "pve-a"},),
+    )
+    result = ProxmoxProviderV1.collect_boundary_baseline(transport)
+    required = ["/", "/access", "/nodes", "/nodes/pve-a", "/nodes/pve-b", "/vms"]
+    assert result.completeness is BaselineCompleteness.COMPLETE
+    assert exact_permission_calls(transport) == required + required
 
 
 def test_boundary_window_derives_standalone_and_uses_only_local_qemu_lxc() -> None:
-    permissions = {
-        "/": {"Sys.Audit": 1},
-        "/access": {"Sys.Audit": 1},
-        "/nodes": {"Sys.Audit": 1},
-        "/vms": {"VM.Audit": 1},
-    }
-    transport = FakeTransport(
-        {
-            "/version": {"data": {"release": "9.0"}},
-            "/access/acl": {"data": []},
-            "/access/permissions": {"data": permissions},
-            "/cluster/status": standalone_status(),
-            "/nodes": {"data": [{"node": "pve-a"}]},
-            "/nodes/pve-a/qemu": {"data": [{"vmid": 100}]},
-            "/nodes/pve-a/lxc": {"data": [{"vmid": 101}]},
-        }
+    transport = BoundaryTransport(
+        status_payload=standalone_status(),
+        qemu_guests=({"vmid": 100},),
+        lxc_guests=({"vmid": 101},),
     )
     result = ProxmoxProviderV1.collect_boundary_baseline(transport)
     paths = [path for path, _ in transport.calls]
     assert result.mode is BaselineMode.STANDALONE
     assert result.completeness is BaselineCompleteness.COMPLETE
+    assert paths.count("/access/permissions") == 10
+    assert exact_permission_calls(transport).count("/nodes/pve-a") == 2
     assert "/nodes/pve-a/qemu" in paths
     assert "/nodes/pve-a/lxc" in paths
     assert "/cluster/resources" not in paths
@@ -275,25 +360,14 @@ def test_boundary_window_derives_standalone_and_uses_only_local_qemu_lxc() -> No
 def test_caller_expectation_cannot_override_observed_mode(
     status_payload, expected_mode, forbidden_path
 ) -> None:
-    permissions = {
-        "/": {"Sys.Audit": 1},
-        "/access": {"Sys.Audit": 1},
-        "/nodes": {"Sys.Audit": 1},
-        "/vms": {"VM.Audit": 1},
-    }
-    transport = FakeTransport(
-        {
-            "/version": {"data": {"release": "9.0"}},
-            "/access/acl": {"data": []},
-            "/access/permissions": {"data": permissions},
-            "/cluster/status": status_payload,
-        }
-    )
+    transport = BoundaryTransport(status_payload=status_payload)
     with pytest.raises(ProviderContractError, match="disagrees"):
         ProxmoxProviderV1.collect_boundary_baseline(
             transport, expected_mode=expected_mode
         )
-    assert forbidden_path not in [path for path, _ in transport.calls]
+    paths = [path for path, _ in transport.calls]
+    assert forbidden_path not in paths
+    assert "/access/permissions" not in paths
 
 
 @pytest.mark.parametrize(
@@ -335,43 +409,107 @@ def test_cluster_status_ambiguous_cluster_or_local_identity_fails_closed() -> No
         ProxmoxProviderV1.validate_cluster_status_payload({"data": contradictory})
 
 
-def test_boundary_window_detects_descendant_denial_and_boundary_mismatch() -> None:
-    granted = {
-        "/": {"Sys.Audit": 1},
-        "/access": {"Sys.Audit": 1},
-        "/nodes": {"Sys.Audit": 1},
-        "/vms": {"VM.Audit": 1},
-    }
+@pytest.mark.parametrize("exact_node_grant", ({}, {"Sys.Audit": 0}))
+def test_parent_node_grant_never_substitutes_exact_node_permission(
+    exact_node_grant,
+) -> None:
+    permissions = required_grants()
+    permissions["/nodes/pve-a"] = exact_node_grant
+    transport = BoundaryTransport(permissions_before=permissions)
+    result = ProxmoxProviderV1.collect_boundary_baseline(transport)
+    assert result.permission_coverage_complete is False
+    assert result.completeness is BaselineCompleteness.CONFIGURATION_ERROR
+    assert exact_permission_calls(transport).count("/nodes/pve-a") == 2
 
-    class BoundaryTransport:
-        def __init__(self, *, change_topology=False):
-            self.acl_reads = 0
-            self.change_topology = change_topology
 
-        def get(self, path, *, params=None):
-            if path == "/version":
-                return {"data": {"release": "9.0"}}
-            if path == "/access/acl":
-                self.acl_reads += 1
-                rows = [{"path": "/vms/100", "roleid": "NoAccess"}]
-                if self.change_topology and self.acl_reads == 2:
-                    rows.append({"path": "/vms/101", "roleid": "NoAccess"})
-                return {"data": rows}
-            if path == "/access/permissions":
-                return {"data": granted}
-            if path == "/cluster/status":
-                return cluster_status()
-            if path == "/nodes":
-                return {"data": [{"node": "pve-a"}]}
-            if path == "/cluster/resources":
-                return {"data": []}
-            raise AssertionError(path)
-
-    denied = ProxmoxProviderV1.collect_boundary_baseline(
-        BoundaryTransport(), expected_mode=BaselineMode.CLUSTER
+def test_topology_descendant_denial_is_checked_upstream_without_inheritance() -> None:
+    topology = ({"path": "/vms/100", "roleid": "NoAccess"},)
+    permissions = required_grants(descendants=("/vms/100",))
+    permissions["/vms/100"] = {"VM.Audit": 0}
+    transport = BoundaryTransport(
+        topology_before=topology,
+        permissions_before=permissions,
     )
-    assert denied.completeness is BaselineCompleteness.CONFIGURATION_ERROR
-    mismatched = ProxmoxProviderV1.collect_boundary_baseline(
-        BoundaryTransport(change_topology=True), expected_mode=BaselineMode.CLUSTER
+    result = ProxmoxProviderV1.collect_boundary_baseline(transport)
+    assert result.permission_coverage_complete is False
+    assert result.completeness is BaselineCompleteness.CONFIGURATION_ERROR
+    assert exact_permission_calls(transport).count("/vms/100") == 2
+
+
+def test_exact_permission_change_across_boundary_is_invalid() -> None:
+    before = required_grants()
+    after = required_grants()
+    after["/nodes/pve-a"] = {"Sys.Audit": 0}
+    result = ProxmoxProviderV1.collect_boundary_baseline(
+        BoundaryTransport(permissions_before=before, permissions_after=after)
     )
-    assert mismatched.completeness is BaselineCompleteness.INVALID
+    assert result.permission_hash_before != result.permission_hash_after
+    assert result.completeness is BaselineCompleteness.INVALID
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    (
+        {"unexpected": {}},
+        {"data": {"/wrong": {"Sys.Audit": 1}}},
+        {"data": {"/nodes/pve-a": ["Sys.Audit"]}},
+        {"data": {"/nodes/pve-a": {"Sys.Audit": 2}}},
+    ),
+)
+def test_malformed_exact_permission_response_fails_closed(malformed) -> None:
+    transport = BoundaryTransport(
+        permission_overrides={(0, "/nodes/pve-a"): malformed}
+    )
+    with pytest.raises(ProviderContractError):
+        ProxmoxProviderV1.collect_boundary_baseline(transport)
+
+
+def test_required_path_order_and_permission_hash_are_deterministic() -> None:
+    topology_a = (
+        {"path": "/vms/100", "roleid": "PVEAuditor"},
+        {"path": "/nodes/pve-b", "roleid": "PVEAuditor"},
+    )
+    topology_b = tuple(reversed(topology_a))
+    nodes_a = ("pve-a", "pve-b")
+    nodes_b = tuple(reversed(nodes_a))
+    permissions = required_grants(
+        nodes=nodes_a,
+        descendants=("/vms/100", "/nodes/pve-b"),
+    )
+    first = BoundaryTransport(
+        status_payload=cluster_status(nodes=nodes_a, local_node="pve-a"),
+        node_names=nodes_a,
+        topology_before=topology_a,
+        permissions_before=permissions,
+    )
+    second = BoundaryTransport(
+        status_payload=cluster_status(nodes=nodes_b, local_node="pve-a"),
+        node_names=nodes_b,
+        topology_before=topology_b,
+        permissions_before=permissions,
+    )
+    first_result = ProxmoxProviderV1.collect_boundary_baseline(first)
+    second_result = ProxmoxProviderV1.collect_boundary_baseline(second)
+    assert first_result.completeness is BaselineCompleteness.COMPLETE
+    assert second_result.completeness is BaselineCompleteness.COMPLETE
+    assert exact_permission_calls(first) == exact_permission_calls(second)
+    assert first_result.permission_hash_before == second_result.permission_hash_before
+
+
+def test_acl_topology_mismatch_remains_invalid_with_same_exact_path_set() -> None:
+    before_topology = ({"path": "/vms/100", "roleid": "PVEAuditor"},)
+    after_topology = before_topology + (
+        {"path": "/vms/101", "roleid": "NoAccess"},
+    )
+    permissions = required_grants(descendants=("/vms/100",))
+    transport = BoundaryTransport(
+        topology_before=before_topology,
+        topology_after=after_topology,
+        permissions_before=permissions,
+    )
+    result = ProxmoxProviderV1.collect_boundary_baseline(
+        transport,
+        expected_mode=BaselineMode.CLUSTER,
+    )
+    assert result.completeness is BaselineCompleteness.INVALID
+    assert "/vms/101" not in exact_permission_calls(transport)
