@@ -106,13 +106,54 @@ def test_normalized_resource_rejects_unsupported_type_and_malformed_detail_facts
                            {"bad": object()})
 
 
-def test_detail_failure_does_not_degrade_complete_baseline() -> None:
+@pytest.mark.parametrize(
+    "detail_status",
+    (DetailReadStatus.TEMPORARILY_UNAVAILABLE, DetailReadStatus.ERROR),
+)
+def test_detail_failure_does_not_degrade_complete_baseline(detail_status) -> None:
     item = DiscoveredResource(SOURCE_ID, 100, "qemu", "guest", "unknown", "pve-a",
                               "2026-08-14T12:00:00+00:00",
-                              DetailReadStatus.TEMPORARILY_UNAVAILABLE, {})
-    current = snapshot(nodes=(node(),), resources=(item,),
-                       detail_summary={"ok_count": 0, "temporarily_unavailable_count": 1, "error_count": 0},
-                       failed_detail_scopes=("/nodes/pve-a/qemu/100/config",))
+                              detail_status, {})
+    current = snapshot(
+        nodes=(node(),),
+        resources=(item,),
+        detail_summary={
+            "ok_count": 0,
+            "temporarily_unavailable_count": int(
+                detail_status is DetailReadStatus.TEMPORARILY_UNAVAILABLE
+            ),
+            "error_count": int(detail_status is DetailReadStatus.ERROR),
+        },
+        failed_detail_scopes=("/nodes/pve-a/qemu/100/config",),
+    )
+    assert current.baseline_completeness is BaselineCompleteness.COMPLETE
+
+
+@pytest.mark.parametrize(
+    "source_availability,failed_baseline_scopes",
+    (
+        (SourceAvailability.UNAVAILABLE, ()),
+        (SourceAvailability.AVAILABLE, ("/cluster/resources",)),
+        (SourceAvailability.UNAVAILABLE, ("/nodes",)),
+    ),
+)
+def test_complete_baseline_rejects_contradictory_outcome_evidence(
+    source_availability, failed_baseline_scopes
+) -> None:
+    with pytest.raises(
+        ValueError, match="available source and no failed baseline scopes"
+    ):
+        snapshot(
+            source_availability=source_availability,
+            failed_baseline_scopes=failed_baseline_scopes,
+        )
+
+
+def test_complete_baseline_accepts_available_source_without_baseline_failures() -> None:
+    current = snapshot(
+        source_availability=SourceAvailability.AVAILABLE,
+        failed_baseline_scopes=(),
+    )
     assert current.baseline_completeness is BaselineCompleteness.COMPLETE
 
 

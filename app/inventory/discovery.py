@@ -223,6 +223,13 @@ class NormalizedDiscoverySnapshot:
             if resource.current_node_name is not None and resource.current_node_name not in node_names:
                 raise ValueError("normalized resource references an unknown node name")
         if self.baseline_completeness is BaselineCompleteness.COMPLETE:
+            if (
+                self.source_availability is not SourceAvailability.AVAILABLE
+                or self.failed_baseline_scopes
+            ):
+                raise ValueError(
+                    "complete baseline requires an available source and no failed baseline scopes"
+                )
             if not node_names or set(covered_node_names) != set(node_names):
                 raise ValueError(
                     "complete baseline requires exact non-empty covered node scope"

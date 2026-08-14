@@ -33,14 +33,19 @@ def make_authority(tmp_path: Path):
     return store, authority, source.source.inventory_source_id
 
 
-def complete_snapshot(store, authority, source_id, *, resources, nodes=None):
-    run = authority.issue_discovery_run(source_id, 1)
-    authority.mark_discovery_run_running(source_id, run.run_id)
-    state = store.source_state(source_id)
+def normalized_snapshot_for(
+    run,
+    source_id,
+    *,
+    resources,
+    nodes=None,
+    source_availability=SourceAvailability.AVAILABLE,
+    failed_baseline_scopes=(),
+):
     nodes = nodes if nodes is not None else (
         DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),
     )
-    normalized = NormalizedDiscoverySnapshot(
+    return NormalizedDiscoverySnapshot(
         run_id=run.run_id,
         discovery_run_sequence=run.discovery_run_sequence,
         inventory_source_id=source_id,
@@ -52,7 +57,7 @@ def complete_snapshot(store, authority, source_id, *, resources, nodes=None):
         provider_contract_version=run.provider_contract_version,
         observed_at=NOW.isoformat(),
         source_facts={"release": "9.0"},
-        source_availability=SourceAvailability.AVAILABLE,
+        source_availability=source_availability,
         baseline_completeness=BaselineCompleteness.COMPLETE,
         baseline_mode=BaselineMode.CLUSTER,
         acl_topology_hash_before="acl",
@@ -62,7 +67,7 @@ def complete_snapshot(store, authority, source_id, *, resources, nodes=None):
         permission_coverage_complete=True,
         boundary_consistent=True,
         covered_nodes=tuple(node.external_node_name for node in nodes),
-        failed_baseline_scopes=(),
+        failed_baseline_scopes=failed_baseline_scopes,
         detail_summary={"ok_count": len(resources), "temporarily_unavailable_count": 0, "error_count": 0},
         failed_detail_scopes=(),
         nodes=nodes,
@@ -71,6 +76,14 @@ def complete_snapshot(store, authority, source_id, *, resources, nodes=None):
                                NOW.isoformat(), detail, facts)
             for vmid, kind, name, status, node_name, detail, facts in resources
         ),
+    )
+
+
+def complete_snapshot(store, authority, source_id, *, resources, nodes=None):
+    run = authority.issue_discovery_run(source_id, 1)
+    authority.mark_discovery_run_running(source_id, run.run_id)
+    normalized = normalized_snapshot_for(
+        run, source_id, resources=resources, nodes=nodes
     )
     authority.finalize_successful_discovery_run(source_id, run.run_id, normalized)
     return run, normalized
@@ -240,6 +253,44 @@ def test_invalid_complete_node_coverage_cannot_mark_retained_resource_missing(
 
     current = store.list_resources(source_id)[0]
     assert current.resource_id == retained.resource_id
+    assert current.presence == "present"
+    assert store.backend_instance().inventory_revision == before_inventory_revision
+
+
+@pytest.mark.parametrize(
+    "source_availability,failed_baseline_scopes",
+    (
+        (SourceAvailability.AVAILABLE, ("/cluster/resources",)),
+        (SourceAvailability.UNAVAILABLE, ()),
+    ),
+)
+def test_contradictory_complete_outcome_cannot_mark_retained_resource_missing(
+    tmp_path: Path,
+    source_availability: SourceAvailability,
+    failed_baseline_scopes: tuple[str, ...],
+) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    complete_snapshot(store, authority, source_id, resources=(guest(),))
+    retained = store.list_resources(source_id)[0]
+    before_inventory_revision = store.backend_instance().inventory_revision
+
+    run = authority.issue_discovery_run(source_id, 1)
+    authority.mark_discovery_run_running(source_id, run.run_id)
+    with pytest.raises(
+        ValueError, match="available source and no failed baseline scopes"
+    ):
+        normalized_snapshot_for(
+            run,
+            source_id,
+            resources=(),
+            source_availability=source_availability,
+            failed_baseline_scopes=failed_baseline_scopes,
+        )
+
+    current = store.list_resources(source_id)[0]
+    assert current.resource_id == retained.resource_id
+    assert current.active_binding_id == retained.active_binding_id
+    assert current.locator_generation == retained.locator_generation
     assert current.presence == "present"
     assert store.backend_instance().inventory_revision == before_inventory_revision
 
