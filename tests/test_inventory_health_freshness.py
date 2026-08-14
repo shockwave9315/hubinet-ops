@@ -257,7 +257,7 @@ def test_older_nested_observation_is_stale_on_arrival_without_changing_snapshot_
             "stale",
         ),
         (START, (), (), START + timedelta(minutes=1), START, "fresh"),
-        (START, (START,), (START,), START + timedelta(minutes=1), START, "fresh"),
+        (START, (START,), (START,), START, START, "fresh"),
         (
             START,
             (START - timedelta(minutes=2),),
@@ -331,6 +331,65 @@ def test_malformed_nested_observation_rolls_back_success_atomically(
     assert store.source_state(source_id).source.active_discovery_run_id == run.run_id
     assert store.discovery_run(run.run_id).lifecycle.value == "issued"
     assert store.backend_instance() == before
+
+
+def test_future_freshness_reference_commits_last_known_inventory_but_never_fresh(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, source_id = make_authority(tmp_path, duration=300)
+    run = authority.issue_discovery_run(source_id, 1)
+    future_observation = START + timedelta(hours=1)
+    authority.finalize_successful_discovery_run(
+        source_id,
+        run.run_id,
+        snapshot_for(store, run, observed_at=future_observation.isoformat()),
+    )
+
+    state = store.source_state(source_id)
+    completed = store.discovery_run(run.run_id)
+    health = state.runtime_health
+    assert len(store.list_resources(source_id)) == 1
+    assert completed.lifecycle.value == "completed"
+    assert completed.provider_outcome == "success"
+    assert state.source.last_committed_run_sequence == run.discovery_run_sequence
+    assert health.last_successful_observed_at == future_observation.isoformat()
+    assert health.freshness_reference_at == future_observation.isoformat()
+    assert health.freshness_valid_until == (
+        future_observation + timedelta(seconds=300)
+    ).isoformat()
+    assert health.health.value == "healthy"
+    assert health.freshness.value == "stale"
+    assert health.health_origin.value == "discovery_run"
+    assert health.health_reason == "clock_anomaly_future_observation"
+    assert not authority.source_is_fresh_for_future_mutation(source_id)
+
+    before_catch_up = store.backend_instance()
+    clock.value = future_observation + timedelta(minutes=1)
+    assert not authority.source_is_fresh_for_future_mutation(source_id)
+    assert store.backend_instance() == before_catch_up
+
+
+def test_backward_clock_before_finalization_fails_closed_without_later_revival(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, source_id = make_authority(tmp_path, duration=300)
+    run = authority.issue_discovery_run(source_id, 1)
+    clock.value = START - timedelta(minutes=10)
+    authority.finalize_successful_discovery_run(
+        source_id,
+        run.run_id,
+        snapshot_for(store, run, observed_at=START.isoformat()),
+    )
+    health = store.source_state(source_id).runtime_health
+    assert health.freshness_reference_at == START.isoformat()
+    assert health.freshness_valid_until == (START + timedelta(seconds=300)).isoformat()
+    assert health.freshness.value == "stale"
+    assert health.health_origin.value == "discovery_run"
+    assert health.health_reason == "clock_anomaly_future_observation"
+
+    clock.value = START + timedelta(minutes=1)
+    assert not authority.source_is_fresh_for_future_mutation(source_id)
+    assert store.source_state(source_id).runtime_health == health
 
 
 def test_newer_success_replaces_expired_anchor_and_old_timer_is_noop(tmp_path: Path) -> None:

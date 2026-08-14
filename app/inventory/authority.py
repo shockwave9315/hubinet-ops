@@ -334,14 +334,19 @@ class InventoryAuthority:
                 deadline = freshness_reference + timedelta(
                     seconds=int(source["freshness_duration_seconds"])
                 )
-                now = self._now().astimezone(UTC)
-                freshness = "stale" if now >= deadline else "fresh"
-                origin = "time_expiry" if freshness == "stale" else "discovery_run"
-                reason = (
-                    "freshness_deadline_elapsed_before_commit"
-                    if freshness == "stale"
-                    else "successful_authoritative_reconciliation"
-                )
+                now = _parse_timestamp(committed_at, "committed_at")
+                if freshness_reference > now:
+                    freshness = "stale"
+                    origin = "discovery_run"
+                    reason = "clock_anomaly_future_observation"
+                elif now >= deadline:
+                    freshness = "stale"
+                    origin = "time_expiry"
+                    reason = "freshness_deadline_elapsed_before_commit"
+                else:
+                    freshness = "fresh"
+                    origin = "discovery_run"
+                    reason = "successful_authoritative_reconciliation"
                 connection.execute(
                     "UPDATE inventory_sources SET last_committed_run_sequence=? "
                     "WHERE inventory_source_id=?",
