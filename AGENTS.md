@@ -18,7 +18,13 @@ do not silently adapt the architecture. Do not change architecture merely to
 make a test pass.
 
 ADR acceptance does not mean the Phase 0 Amendment is implemented. Respect the
-documented phase gates and prerequisites before starting later-phase work.
+documented distinction between implementation staging and runtime activation
+when starting later-phase work. Phase 1 components may be developed
+incrementally only where the architecture explicitly keeps them dormant. Before
+the complete Phase 1 runtime activation gate is satisfied, agents must not wire
+a partial Phase 1 subsystem into application startup, production provider I/O,
+HTTP or Home Assistant runtime, scheduling/background work, mutation authority,
+or any legacy 0.4 dependency, fallback, or dual-write path.
 
 ## Code Review Rules
 
