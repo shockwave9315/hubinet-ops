@@ -46,7 +46,7 @@ def test_issuance_allocates_sequence_and_exact_context_and_published_revision(
     state = store.source_state(source_id)
     before = store.backend_instance()
 
-    run = InventoryAuthority(store, now=fixed_now).issue_discovery_run(source_id, 3)
+    run = InventoryAuthority(store, now=fixed_now).issue_discovery_run(source_id, 1)
     current = store.source_state(source_id)
     after = store.backend_instance()
 
@@ -63,7 +63,7 @@ def test_issuance_allocates_sequence_and_exact_context_and_published_revision(
     assert run.expected_transport_trust_revision == (
         state.active_endpoint.transport_trust_revision
     )
-    assert run.provider_contract_version == 3
+    assert run.provider_contract_version == 1
     assert current.source.active_discovery_run_id == run.run_id
     assert current.source.last_issued_run_sequence == 1
     assert after.inventory_revision == before.inventory_revision

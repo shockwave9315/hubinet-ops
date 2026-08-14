@@ -42,11 +42,11 @@ def test_fresh_authority_database_initializes_one_persistent_backend(
             "SELECT marker, schema_version FROM authority_schema"
         ).fetchone()
         assert marker == (AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION)
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == AUTHORITY_SCHEMA_VERSION
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
-                "INSERT INTO backend_instance VALUES(2, ?, ?, 0, 1)",
-                (str(uuid.uuid4()), FIXED_NOW.isoformat()),
+                "INSERT INTO backend_instance VALUES(2, ?, ?, 0, 1, ?)",
+                (str(uuid.uuid4()), FIXED_NOW.isoformat(), FIXED_NOW.isoformat()),
             )
 
 
@@ -109,6 +109,23 @@ def test_unknown_nonempty_database_is_rejected_without_modification(
     assert path.read_bytes() == before
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT value FROM unrelated").fetchone()[0] == "retained"
+
+
+def test_dormant_phase1a_schema_is_rejected_without_preactivation_migration(tmp_path: Path) -> None:
+    path = tmp_path / "phase1a.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE authority_schema (singleton INTEGER PRIMARY KEY, marker TEXT, schema_version INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO authority_schema VALUES(1, ?, 1)",
+            (AUTHORITY_SCHEMA_MARKER,),
+        )
+        connection.execute("PRAGMA user_version=1")
+    before = path.read_bytes()
+    with pytest.raises(AuthorityDatabaseRejected, match="unsupported"):
+        InventoryAuthorityStore(path, now=fixed_now)
+    assert path.read_bytes() == before
 
 
 def test_store_connections_enforce_foreign_keys(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 import sqlite3
 import uuid
@@ -19,16 +20,19 @@ from .models import (
     EndpointLifecycle,
     InventorySource,
     InventorySourceState,
+    InventoryNode,
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
     SourceEndpoint,
     SourceRuntimeHealth,
+    ResourceIncarnation,
+    ResourceLocatorBinding,
 )
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 1
+AUTHORITY_SCHEMA_VERSION = 2
 BUSY_TIMEOUT_MS = 5_000
 
 _REQUIRED_TABLES = frozenset(
@@ -39,6 +43,11 @@ _REQUIRED_TABLES = frozenset(
         "source_endpoints",
         "source_runtime_health",
         "discovery_runs",
+        "inventory_nodes",
+        "resource_incarnations",
+        "resource_locator_bindings",
+        "resource_terminations",
+        "canonicalization_migrations",
     }
 )
 _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
@@ -47,10 +56,15 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "backend_instance_identity_immutable",
         "inventory_source_identity_immutable",
         "source_endpoint_identity_immutable",
+        "source_endpoint_canonical_pair_migration_only",
         "active_run_must_belong_to_source",
         "discovery_run_issuance_immutable",
         "discovery_run_terminalization_once",
         "discovery_run_release_before_terminalization",
+        "one_active_binding_per_locator",
+        "one_active_binding_per_resource",
+        "resource_identity_immutable",
+        "binding_identity_immutable",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -79,7 +93,7 @@ class InventoryAuthorityStore:
         with self._read_connection() as connection:
             rows = connection.execute(
                 "SELECT backend_instance_id, created_at, inventory_revision, "
-                "published_state_revision FROM backend_instance"
+                "published_state_revision, published_at FROM backend_instance"
             ).fetchall()
         if len(rows) != 1:
             raise AuthorityInvariantError(
@@ -132,6 +146,59 @@ class InventoryAuthorityStore:
                     (inventory_source_id,),
                 ).fetchall()
         return tuple(_discovery_run(row) for row in rows)
+
+    def list_nodes(
+        self, inventory_source_id: str | None = None
+    ) -> tuple[InventoryNode, ...]:
+        with self._read_connection() as connection:
+            if inventory_source_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM inventory_nodes ORDER BY inventory_source_id, external_node_name"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM inventory_nodes WHERE inventory_source_id=? "
+                    "ORDER BY external_node_name",
+                    (inventory_source_id,),
+                ).fetchall()
+        return tuple(_inventory_node(row) for row in rows)
+
+    def list_resources(
+        self, inventory_source_id: str | None = None
+    ) -> tuple[ResourceIncarnation, ...]:
+        with self._read_connection() as connection:
+            query = (
+                "SELECT r.*, b.binding_id AS active_binding_id, "
+                "COALESCE(b.locator_generation, (SELECT MAX(history.locator_generation) "
+                "FROM resource_locator_bindings history WHERE history.resource_id=r.resource_id)) "
+                "AS locator_generation FROM resource_incarnations r "
+                "LEFT JOIN resource_locator_bindings b ON b.resource_id=r.resource_id "
+                "AND b.valid_to_run_sequence IS NULL"
+            )
+            params: tuple[object, ...] = ()
+            if inventory_source_id is not None:
+                query += " WHERE r.inventory_source_id=?"
+                params = (inventory_source_id,)
+            query += " ORDER BY r.inventory_source_id, r.vmid, locator_generation"
+            rows = connection.execute(query, params).fetchall()
+        return tuple(_resource_incarnation(row) for row in rows)
+
+    def list_bindings(
+        self, inventory_source_id: str | None = None
+    ) -> tuple[ResourceLocatorBinding, ...]:
+        with self._read_connection() as connection:
+            if inventory_source_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM resource_locator_bindings "
+                    "ORDER BY inventory_source_id, vmid, locator_generation"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM resource_locator_bindings WHERE inventory_source_id=? "
+                    "ORDER BY vmid, locator_generation",
+                    (inventory_source_id,),
+                ).fetchall()
+        return tuple(_resource_locator_binding(row) for row in rows)
 
     def record_counts(self) -> dict[str, int]:
         """Return bounded schema diagnostics without exposing SQL execution."""
@@ -323,8 +390,8 @@ class InventoryAuthorityStore:
             connection.execute(
                 "INSERT INTO backend_instance("
                 "singleton, backend_instance_id, created_at, inventory_revision, "
-                "published_state_revision) VALUES(1, ?, ?, 0, 1)",
-                (backend_instance_id, created_at),
+                "published_state_revision, published_at) VALUES(1, ?, ?, 0, 1, ?)",
+                (backend_instance_id, created_at, created_at),
             )
             connection.execute(f"PRAGMA user_version={AUTHORITY_SCHEMA_VERSION}")
             connection.commit()
@@ -397,6 +464,7 @@ def _backend_instance(row: sqlite3.Row) -> BackendInstance:
         created_at=str(row["created_at"]),
         inventory_revision=int(row["inventory_revision"]),
         published_state_revision=int(row["published_state_revision"]),
+        published_at=str(row["published_at"]),
     )
 
 
@@ -420,6 +488,9 @@ def _inventory_source(row: sqlite3.Row) -> InventorySource:
             if row["active_discovery_run_id"] is not None
             else None
         ),
+        provider_contract_version=int(row["provider_contract_version"]),
+        freshness_duration_seconds=int(row["freshness_duration_seconds"]),
+        facts=json.loads(str(row["facts_json"])),
     )
 
 
@@ -504,6 +575,67 @@ def _discovery_run(row: sqlite3.Row) -> DiscoveryRun:
         provider_outcome=row["provider_outcome"],
         observed_at=row["observed_at"],
         normalized_snapshot_hash=row["normalized_snapshot_hash"],
+        baseline_completeness=row["baseline_completeness"],
+        acl_topology_hash_before=row["acl_topology_hash_before"],
+        acl_topology_hash_after=row["acl_topology_hash_after"],
+        permission_snapshot_hash_before=row["permission_snapshot_hash_before"],
+        permission_snapshot_hash_after=row["permission_snapshot_hash_after"],
+        detail_ok_count=(int(row["detail_ok_count"]) if row["detail_ok_count"] is not None else None),
+        detail_temporarily_unavailable_count=(int(row["detail_temporarily_unavailable_count"]) if row["detail_temporarily_unavailable_count"] is not None else None),
+        detail_error_count=(int(row["detail_error_count"]) if row["detail_error_count"] is not None else None),
+    )
+
+
+def _inventory_node(row: sqlite3.Row) -> InventoryNode:
+    return InventoryNode(
+        node_id=str(row["node_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        external_node_name=str(row["external_node_name"]),
+        status=str(row["status"]),
+        available=bool(row["available"]),
+        facts=json.loads(str(row["facts_json"])),
+    )
+
+
+def _resource_incarnation(row: sqlite3.Row) -> ResourceIncarnation:
+    generation = row["locator_generation"]
+    if generation is None:
+        raise AuthorityInvariantError("resource incarnation has no locator history")
+    return ResourceIncarnation(
+        resource_id=str(row["resource_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        resource_type=str(row["resource_type"]),
+        vmid=int(row["vmid"]),
+        resource_continuity_revision=int(row["resource_continuity_revision"]),
+        name=str(row["name"]),
+        status=str(row["status"]),
+        current_node_id=row["current_node_id"],
+        last_known_node_id=row["last_known_node_id"],
+        presence=str(row["presence"]),
+        lifecycle=str(row["lifecycle"]),
+        observational_continuity=str(row["observational_continuity"]),
+        security_continuity=str(row["security_continuity"]),
+        detail_status=str(row["detail_status"]),
+        node_availability=str(row["node_availability"]),
+        state_level=str(row["state_level"]),
+        active_binding_id=row["active_binding_id"],
+        locator_generation=int(generation),
+        facts=json.loads(str(row["facts_json"])),
+        termination_reason=row["termination_reason"],
+        successor_resource_id=row["successor_resource_id"],
+    )
+
+
+def _resource_locator_binding(row: sqlite3.Row) -> ResourceLocatorBinding:
+    return ResourceLocatorBinding(
+        binding_id=str(row["binding_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        vmid=int(row["vmid"]),
+        locator_generation=int(row["locator_generation"]),
+        resource_id=str(row["resource_id"]),
+        valid_from_run_sequence=int(row["valid_from_run_sequence"]),
+        valid_to_run_sequence=(int(row["valid_to_run_sequence"]) if row["valid_to_run_sequence"] is not None else None),
+        closure_reason=row["closure_reason"],
     )
 
 
@@ -512,7 +644,7 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 1)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 2)
     )
     """,
     """
@@ -523,7 +655,8 @@ _SCHEMA_STATEMENTS = (
         inventory_revision INTEGER NOT NULL
             CHECK(typeof(inventory_revision) = 'integer' AND inventory_revision >= 0),
         published_state_revision INTEGER NOT NULL
-            CHECK(typeof(published_state_revision) = 'integer' AND published_state_revision > 0)
+            CHECK(typeof(published_state_revision) = 'integer' AND published_state_revision > 0),
+        published_at TEXT NOT NULL
     )
     """,
     """
@@ -542,6 +675,11 @@ _SCHEMA_STATEMENTS = (
             CHECK(last_committed_run_sequence IS NULL OR
                   (typeof(last_committed_run_sequence) = 'integer' AND last_committed_run_sequence > 0)),
         active_discovery_run_id TEXT,
+        provider_contract_version INTEGER NOT NULL DEFAULT 1
+            CHECK(typeof(provider_contract_version) = 'integer' AND provider_contract_version > 0),
+        freshness_duration_seconds INTEGER NOT NULL DEFAULT 300
+            CHECK(typeof(freshness_duration_seconds) = 'integer' AND freshness_duration_seconds > 0),
+        facts_json TEXT NOT NULL DEFAULT '{}',
         FOREIGN KEY(backend_instance_id) REFERENCES backend_instance(backend_instance_id),
         FOREIGN KEY(active_discovery_run_id) REFERENCES discovery_runs(run_id)
             DEFERRABLE INITIALLY DEFERRED
@@ -642,6 +780,15 @@ _SCHEMA_STATEMENTS = (
         provider_outcome TEXT,
         observed_at TEXT,
         normalized_snapshot_hash TEXT,
+        baseline_completeness TEXT CHECK(baseline_completeness IS NULL OR baseline_completeness IN (
+            'complete', 'partial', 'configuration_error', 'source_unavailable', 'invalid')),
+        acl_topology_hash_before TEXT,
+        acl_topology_hash_after TEXT,
+        permission_snapshot_hash_before TEXT,
+        permission_snapshot_hash_after TEXT,
+        detail_ok_count INTEGER,
+        detail_temporarily_unavailable_count INTEGER,
+        detail_error_count INTEGER,
         FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
         FOREIGN KEY(inventory_source_id, expected_endpoint_id)
             REFERENCES source_endpoints(inventory_source_id, endpoint_id),
@@ -651,9 +798,115 @@ _SCHEMA_STATEMENTS = (
               (lifecycle = 'abandoned' AND terminalized_at IS NOT NULL AND
                length(trim(terminal_reason)) > 0 AND completed_at IS NULL AND
                provider_outcome IS NULL AND observed_at IS NULL AND
-               normalized_snapshot_hash IS NULL) OR
+               normalized_snapshot_hash IS NULL AND baseline_completeness IS NULL) OR
               (lifecycle = 'completed' AND terminalized_at IS NOT NULL AND
                completed_at IS NOT NULL AND length(trim(provider_outcome)) > 0))
+    )
+    """,
+    """
+    CREATE TABLE inventory_nodes (
+        node_id TEXT PRIMARY KEY,
+        inventory_source_id TEXT NOT NULL,
+        external_node_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        available INTEGER NOT NULL CHECK(available IN (0, 1)),
+        facts_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
+        UNIQUE(inventory_source_id, external_node_name),
+        UNIQUE(inventory_source_id, node_id)
+    )
+    """,
+    """
+    CREATE TABLE resource_incarnations (
+        resource_id TEXT PRIMARY KEY,
+        inventory_source_id TEXT NOT NULL,
+        resource_type TEXT NOT NULL CHECK(resource_type IN ('qemu', 'lxc')),
+        vmid INTEGER NOT NULL CHECK(typeof(vmid) = 'integer' AND vmid > 0),
+        resource_continuity_revision INTEGER NOT NULL
+            CHECK(typeof(resource_continuity_revision) = 'integer' AND resource_continuity_revision > 0),
+        name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        current_node_id TEXT,
+        last_known_node_id TEXT,
+        presence TEXT NOT NULL CHECK(presence IN ('present', 'missing', 'confirmed_removed', 'not_current')),
+        lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active', 'quarantined', 'retired')),
+        observational_continuity TEXT NOT NULL CHECK(observational_continuity IN ('consistent', 'uncertain', 'replaced')),
+        security_continuity TEXT NOT NULL CHECK(security_continuity IN ('unverified', 'trusted', 'revoked')),
+        detail_status TEXT NOT NULL CHECK(detail_status IN ('ok', 'temporarily_unavailable', 'error', 'not_applicable')),
+        node_availability TEXT NOT NULL CHECK(node_availability IN ('available', 'unavailable', 'unresolved', 'not_applicable')),
+        state_level TEXT NOT NULL DEFAULT 'discovered' CHECK(state_level IN ('discovered', 'observed', 'managed', 'maintenance', 'break_glass')),
+        facts_json TEXT NOT NULL,
+        termination_reason TEXT,
+        successor_resource_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
+        FOREIGN KEY(inventory_source_id, current_node_id) REFERENCES inventory_nodes(inventory_source_id, node_id),
+        FOREIGN KEY(inventory_source_id, last_known_node_id) REFERENCES inventory_nodes(inventory_source_id, node_id),
+        FOREIGN KEY(successor_resource_id) REFERENCES resource_incarnations(resource_id)
+            DEFERRABLE INITIALLY DEFERRED,
+        UNIQUE(inventory_source_id, resource_id),
+        CHECK((presence = 'present' AND detail_status != 'not_applicable' AND node_availability != 'not_applicable') OR
+              (presence != 'present' AND detail_status = 'not_applicable' AND node_availability = 'not_applicable'))
+    )
+    """,
+    """
+    CREATE TABLE resource_locator_bindings (
+        binding_id TEXT PRIMARY KEY,
+        inventory_source_id TEXT NOT NULL,
+        vmid INTEGER NOT NULL CHECK(typeof(vmid) = 'integer' AND vmid > 0),
+        locator_generation INTEGER NOT NULL CHECK(typeof(locator_generation) = 'integer' AND locator_generation > 0),
+        resource_id TEXT NOT NULL,
+        valid_from_run_sequence INTEGER NOT NULL CHECK(valid_from_run_sequence > 0),
+        valid_to_run_sequence INTEGER,
+        closure_reason TEXT,
+        FOREIGN KEY(inventory_source_id, resource_id) REFERENCES resource_incarnations(inventory_source_id, resource_id),
+        UNIQUE(inventory_source_id, vmid, locator_generation),
+        UNIQUE(inventory_source_id, binding_id),
+        CHECK((valid_to_run_sequence IS NULL AND closure_reason IS NULL) OR
+              (valid_to_run_sequence IS NOT NULL AND valid_to_run_sequence >= valid_from_run_sequence AND length(trim(closure_reason)) > 0))
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX one_active_binding_per_locator
+    ON resource_locator_bindings(inventory_source_id, vmid)
+    WHERE valid_to_run_sequence IS NULL
+    """,
+    """
+    CREATE UNIQUE INDEX one_active_binding_per_resource
+    ON resource_locator_bindings(resource_id)
+    WHERE valid_to_run_sequence IS NULL
+    """,
+    """
+    CREATE TABLE resource_terminations (
+        resource_id TEXT PRIMARY KEY,
+        inventory_source_id TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        locator_generation INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        successor_resource_id TEXT,
+        run_sequence INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id),
+        FOREIGN KEY(binding_id) REFERENCES resource_locator_bindings(binding_id),
+        FOREIGN KEY(successor_resource_id) REFERENCES resource_incarnations(resource_id)
+            DEFERRABLE INITIALLY DEFERRED
+    )
+    """,
+    """
+    CREATE TABLE canonicalization_migrations (
+        migration_id TEXT NOT NULL,
+        inventory_source_id TEXT NOT NULL,
+        endpoint_id TEXT NOT NULL,
+        old_contract_version INTEGER NOT NULL,
+        old_canonical_locator TEXT NOT NULL,
+        new_contract_version INTEGER NOT NULL,
+        new_canonical_locator TEXT NOT NULL,
+        migrated_at TEXT NOT NULL,
+        PRIMARY KEY(migration_id, endpoint_id),
+        FOREIGN KEY(inventory_source_id, endpoint_id) REFERENCES source_endpoints(inventory_source_id, endpoint_id)
     )
     """,
     """
@@ -669,10 +922,37 @@ _SCHEMA_STATEMENTS = (
     """,
     """
     CREATE TRIGGER source_endpoint_identity_immutable
-    BEFORE UPDATE OF endpoint_id, inventory_source_id, canonical_transport_locator,
-                     canonicalization_contract_version, created_at
+    BEFORE UPDATE OF endpoint_id, inventory_source_id, created_at
     ON source_endpoints
-    BEGIN SELECT RAISE(ABORT, 'endpoint identity and canonical pair are immutable'); END
+    BEGIN SELECT RAISE(ABORT, 'endpoint identity is immutable'); END
+    """,
+    """
+    CREATE TRIGGER source_endpoint_canonical_pair_migration_only
+    BEFORE UPDATE OF canonical_transport_locator, canonicalization_contract_version
+    ON source_endpoints
+    WHEN NOT EXISTS (
+        SELECT 1 FROM canonicalization_migrations m
+        WHERE m.inventory_source_id=OLD.inventory_source_id
+          AND m.endpoint_id=OLD.endpoint_id
+          AND m.old_contract_version=OLD.canonicalization_contract_version
+          AND m.old_canonical_locator=OLD.canonical_transport_locator
+          AND m.new_contract_version=NEW.canonicalization_contract_version
+          AND m.new_canonical_locator=NEW.canonical_transport_locator
+    )
+    BEGIN SELECT RAISE(ABORT, 'endpoint identity canonical pair requires migration provenance'); END
+    """,
+    """
+    CREATE TRIGGER resource_identity_immutable
+    BEFORE UPDATE OF resource_id, inventory_source_id, resource_type, vmid, created_at
+    ON resource_incarnations
+    BEGIN SELECT RAISE(ABORT, 'resource incarnation identity is immutable'); END
+    """,
+    """
+    CREATE TRIGGER binding_identity_immutable
+    BEFORE UPDATE OF binding_id, inventory_source_id, vmid, locator_generation,
+                     resource_id, valid_from_run_sequence
+    ON resource_locator_bindings
+    BEGIN SELECT RAISE(ABORT, 'locator binding identity is immutable'); END
     """,
     """
     CREATE TRIGGER active_run_must_belong_to_source

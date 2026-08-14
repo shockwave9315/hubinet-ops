@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta
 import sqlite3
 import uuid
 
@@ -19,20 +19,25 @@ from .models import (
     DiscoveryRunLifecycle,
     InventorySourceState,
 )
+from .discovery import BaselineCompleteness, NormalizedDiscoverySnapshot
+from .provider import PROVIDER_CONTRACT_VERSION
+from .reconciliation import InventoryReconciler, ReconciliationSummary
 from .store import InventoryAuthorityStore
 
 
 class InventoryAuthority:
-    """Expose only explicit authority-changing Phase 1A operations."""
+    """Expose explicit dormant Phase 1 source and reconciliation transitions."""
 
     def __init__(
         self,
         store: InventoryAuthorityStore,
         *,
         now: Callable[[], datetime] | None = None,
+        _test_migration_contracts: Mapping[int, Callable[[str], str]] | None = None,
     ) -> None:
         self._store = store
         self._now = now or (lambda: datetime.now(UTC))
+        self._migration_contracts = dict(_test_migration_contracts or {})
 
     def create_inventory_source(
         self,
@@ -41,14 +46,22 @@ class InventoryAuthority:
         display_name: str,
         credential_reference: str,
         transport_locator: str,
+        freshness_duration_seconds: int = 300,
+        provider_contract_version: int = PROVIDER_CONTRACT_VERSION,
     ) -> InventorySourceState:
         """Atomically establish one source, active endpoint, and initial health."""
 
         provider_kind = _require_text(provider_kind, "provider_kind", max_length=100)
         display_name = _require_text(display_name, "display_name", max_length=300)
-        credential_reference = _require_text(
-            credential_reference, "credential_reference", max_length=500
+        credential_reference = _require_credential_reference(credential_reference)
+        freshness_duration = _require_positive_integer(
+            freshness_duration_seconds, "freshness_duration_seconds"
         )
+        contract_version = _require_positive_integer(
+            provider_contract_version, "provider_contract_version"
+        )
+        if contract_version != PROVIDER_CONTRACT_VERSION:
+            raise ValueError("provider contract version is unsupported")
         canonical_locator = canonicalize_transport_locator(transport_locator)
         source_id = _new_uuid()
         endpoint_id = _new_uuid()
@@ -67,7 +80,9 @@ class InventoryAuthority:
                 "inventory_source_id, backend_instance_id, provider_kind, display_name, "
                 "credential_reference, created_at, source_config_revision, "
                 "last_issued_run_sequence, last_committed_run_sequence, "
-                "active_discovery_run_id) VALUES(?, ?, ?, ?, ?, ?, 1, 0, NULL, NULL)",
+                "active_discovery_run_id, provider_contract_version, "
+                "freshness_duration_seconds, facts_json) "
+                "VALUES(?, ?, ?, ?, ?, ?, 1, 0, NULL, NULL, ?, ?, '{}')",
                 (
                     source_id,
                     str(backend[0]["backend_instance_id"]),
@@ -75,6 +90,8 @@ class InventoryAuthority:
                     display_name,
                     credential_reference,
                     created_at,
+                    contract_version,
+                    freshness_duration,
                 ),
             )
             self._insert_initial_endpoint(
@@ -127,6 +144,12 @@ class InventoryAuthority:
 
         with self._store._transaction() as connection:
             source = self._require_source_row(connection, source_id)
+            if contract_version != PROVIDER_CONTRACT_VERSION:
+                raise ValueError("provider contract version is unsupported")
+            if contract_version != int(source["provider_contract_version"]):
+                raise AuthorityConflict(
+                    "provider contract version does not match current source configuration"
+                )
             if source["active_discovery_run_id"] is not None:
                 raise AuthorityConflict(
                     "inventory source already has an active discovery run"
@@ -247,6 +270,554 @@ class InventoryAuthority:
 
         return self._store.discovery_run(canonical_run_id)
 
+    def finalize_successful_discovery_run(
+        self,
+        inventory_source_id: str,
+        run_id: str,
+        snapshot: NormalizedDiscoverySnapshot,
+    ) -> ReconciliationSummary:
+        """Atomically finalize, reconcile, publish health, and release exact ownership."""
+
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        canonical_run_id = _require_uuid(run_id, "run_id")
+        committed_at = _timestamp(self._now())
+        context_rejected = False
+        summary = ReconciliationSummary()
+
+        with self._store._transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            run = self._require_run_row(connection, canonical_run_id)
+            self._require_exact_run_owner(source, run, source_id, canonical_run_id)
+            self._require_nonterminal_run(run)
+            self._validate_snapshot_issuance(snapshot, run)
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+
+            if not self._run_context_is_current(source, endpoint, run):
+                self._release_run(connection, source_id, canonical_run_id)
+                self._complete_run(
+                    connection,
+                    run,
+                    completed_at=committed_at,
+                    outcome="invalid",
+                    observed_at=snapshot.observed_at,
+                    snapshot=snapshot,
+                )
+                self._update_completion_provenance(
+                    connection,
+                    source_id=source_id,
+                    sequence=int(run["discovery_run_sequence"]),
+                    outcome="invalid",
+                )
+                self._bump_global_revisions(
+                    connection, inventory_changed=False, published_changed=True
+                )
+                context_rejected = True
+            else:
+                sequence = int(run["discovery_run_sequence"])
+                committed_sequence = source["last_committed_run_sequence"]
+                health = connection.execute(
+                    "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+                    (source_id,),
+                ).fetchone()
+                if health is None:
+                    raise AuthorityInvariantError("source runtime health is missing")
+                if committed_sequence is not None and sequence <= int(committed_sequence):
+                    raise AuthorityConflict("successful run does not advance committed sequence")
+                if health["last_health_run_sequence"] is not None and sequence <= int(health["last_health_run_sequence"]):
+                    raise AuthorityConflict("successful run does not advance health sequence")
+
+                summary = InventoryReconciler(new_uuid=_new_uuid).reconcile(
+                    connection, snapshot, committed_at=committed_at
+                )
+                self._after_reconciliation(connection, snapshot)
+                observed = _parse_timestamp(snapshot.observed_at, "observed_at")
+                deadline = observed + timedelta(seconds=int(source["freshness_duration_seconds"]))
+                now = self._now().astimezone(UTC)
+                freshness = "stale" if now >= deadline else "fresh"
+                origin = "time_expiry" if freshness == "stale" else "discovery_run"
+                reason = (
+                    "freshness_deadline_elapsed_before_commit"
+                    if freshness == "stale"
+                    else "successful_authoritative_reconciliation"
+                )
+                connection.execute(
+                    "UPDATE inventory_sources SET last_committed_run_sequence=? "
+                    "WHERE inventory_source_id=?",
+                    (sequence, source_id),
+                )
+                connection.execute(
+                    "UPDATE source_runtime_health SET health='healthy', freshness=?, "
+                    "health_origin=?, health_reason=?, latest_completed_run_sequence=?, "
+                    "latest_completed_outcome='success', last_health_run_sequence=?, "
+                    "last_run_health_outcome='success', last_successful_observed_at=?, "
+                    "freshness_reference_at=?, freshness_valid_until=?, "
+                    "committed_source_config_revision=?, committed_endpoint_id=?, "
+                    "committed_canonical_transport_locator=?, "
+                    "committed_canonicalization_contract_version=?, "
+                    "committed_transport_trust_revision=? WHERE inventory_source_id=?",
+                    (
+                        freshness,
+                        origin,
+                        reason,
+                        sequence,
+                        sequence,
+                        snapshot.observed_at,
+                        snapshot.observed_at,
+                        deadline.isoformat(),
+                        int(source["source_config_revision"]),
+                        str(endpoint["endpoint_id"]),
+                        str(endpoint["canonical_transport_locator"]),
+                        int(endpoint["canonicalization_contract_version"]),
+                        int(endpoint["transport_trust_revision"]),
+                        source_id,
+                    ),
+                )
+                self._after_health_update(connection, snapshot)
+                self._release_run(connection, source_id, canonical_run_id)
+                self._complete_run(
+                    connection,
+                    run,
+                    completed_at=committed_at,
+                    outcome="success",
+                    observed_at=snapshot.observed_at,
+                    snapshot=snapshot,
+                )
+                self._bump_global_revisions(
+                    connection, inventory_changed=True, published_changed=True
+                )
+
+        if context_rejected:
+            raise AuthorityConflict(
+                "discovery run context changed; completion audited without reconciliation"
+            )
+        return summary
+
+    def finalize_failed_discovery_run(
+        self,
+        inventory_source_id: str,
+        run_id: str,
+        *,
+        outcome: BaselineCompleteness,
+        reason: str,
+        observed_at: str | None = None,
+    ) -> DiscoveryRun:
+        """Finalize one non-success run and apply health only to its exact context."""
+
+        if outcome is BaselineCompleteness.COMPLETE:
+            raise ValueError("complete outcome must use successful reconciliation")
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        canonical_run_id = _require_uuid(run_id, "run_id")
+        health_reason = _require_text(reason, "reason", max_length=500)
+        completed_at = _timestamp(self._now())
+        if observed_at is not None:
+            _parse_timestamp(observed_at, "observed_at")
+
+        with self._store._transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            run = self._require_run_row(connection, canonical_run_id)
+            self._require_exact_run_owner(source, run, source_id, canonical_run_id)
+            self._require_nonterminal_run(run)
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+            sequence = int(run["discovery_run_sequence"])
+            applicable = self._run_context_is_current(source, endpoint, run)
+            self._release_run(connection, source_id, canonical_run_id)
+            self._complete_run(
+                connection,
+                run,
+                completed_at=completed_at,
+                outcome=outcome.value,
+                observed_at=observed_at,
+                snapshot=None,
+                baseline_completeness=outcome.value,
+            )
+            if applicable:
+                health_row = connection.execute(
+                    "SELECT last_health_run_sequence FROM source_runtime_health "
+                    "WHERE inventory_source_id=?",
+                    (source_id,),
+                ).fetchone()
+                if health_row is None:
+                    raise AuthorityInvariantError("source runtime health is missing")
+                old_health_sequence = health_row["last_health_run_sequence"]
+                if old_health_sequence is None or sequence > int(old_health_sequence):
+                    health = {
+                        BaselineCompleteness.SOURCE_UNAVAILABLE: "source_unavailable",
+                        BaselineCompleteness.CONFIGURATION_ERROR: "configuration_error",
+                        BaselineCompleteness.PARTIAL: "degraded",
+                        BaselineCompleteness.INVALID: "degraded",
+                    }[outcome]
+                    connection.execute(
+                        "UPDATE source_runtime_health SET health=?, freshness='stale', "
+                        "health_origin='discovery_run', health_reason=?, "
+                        "last_health_run_sequence=?, last_run_health_outcome=? "
+                        "WHERE inventory_source_id=?",
+                        (health, health_reason, sequence, outcome.value, source_id),
+                    )
+            self._update_completion_provenance(
+                connection, source_id=source_id, sequence=sequence, outcome=outcome.value
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+        return self._store.discovery_run(canonical_run_id)
+
+    def rotate_credential_reference(
+        self, inventory_source_id: str, credential_reference: str
+    ) -> InventorySourceState:
+        return self._change_source_configuration(
+            inventory_source_id,
+            column="credential_reference",
+            value=_require_credential_reference(credential_reference),
+            reason="credential_reference_rotated",
+        )
+
+    def configure_freshness_duration(
+        self, inventory_source_id: str, freshness_duration_seconds: int
+    ) -> InventorySourceState:
+        return self._change_source_configuration(
+            inventory_source_id,
+            column="freshness_duration_seconds",
+            value=_require_positive_integer(freshness_duration_seconds, "freshness_duration_seconds"),
+            reason="freshness_duration_changed",
+        )
+
+    def rotate_transport_trust(self, inventory_source_id: str) -> InventorySourceState:
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        with self._store._transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            self._require_no_active_run(source)
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+            connection.execute(
+                "UPDATE source_endpoints SET transport_trust_revision=transport_trust_revision+1 "
+                "WHERE endpoint_id=?",
+                (str(endpoint["endpoint_id"]),),
+            )
+            connection.execute(
+                "UPDATE inventory_sources SET source_config_revision=source_config_revision+1 "
+                "WHERE inventory_source_id=?",
+                (source_id,),
+            )
+            self._mark_controlled_context_transition(
+                connection, source_id, "transport_trust_rotated"
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+        return self._store.source_state(source_id)
+
+    def migrate_canonicalization_contract(
+        self, inventory_source_id: str, target_version: int
+    ) -> InventorySourceState:
+        """Atomically migrate a retained source namespace through a registered contract."""
+
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        version = _require_positive_integer(target_version, "target_version")
+        canonicalizer = self._migration_contracts.get(version)
+        if canonicalizer is None:
+            raise ValueError("canonicalization migration contract is not registered")
+        migration_id = _new_uuid()
+        migrated_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            self._require_no_active_run(source)
+            endpoints = connection.execute(
+                "SELECT * FROM source_endpoints WHERE inventory_source_id=? ORDER BY endpoint_id",
+                (source_id,),
+            ).fetchall()
+            if not endpoints:
+                raise AuthorityInvariantError("source has no retained endpoint namespace")
+            pairs: list[tuple[sqlite3.Row, str]] = []
+            seen: set[str] = set()
+            for endpoint in endpoints:
+                new_locator = canonicalizer(str(endpoint["canonical_transport_locator"]))
+                if not isinstance(new_locator, str) or not new_locator.strip():
+                    raise ValueError("migration produced an invalid canonical locator")
+                if new_locator in seen:
+                    raise AuthorityConflict("canonicalization migration creates a retained locator collision")
+                seen.add(new_locator)
+                pairs.append((endpoint, new_locator))
+            for endpoint, new_locator in pairs:
+                connection.execute(
+                    "INSERT INTO canonicalization_migrations VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        migration_id,
+                        source_id,
+                        str(endpoint["endpoint_id"]),
+                        int(endpoint["canonicalization_contract_version"]),
+                        str(endpoint["canonical_transport_locator"]),
+                        version,
+                        new_locator,
+                        migrated_at,
+                    ),
+                )
+                connection.execute(
+                    "UPDATE source_endpoints SET canonical_transport_locator=?, "
+                    "canonicalization_contract_version=? WHERE endpoint_id=?",
+                    (new_locator, version, str(endpoint["endpoint_id"])),
+                )
+            connection.execute(
+                "UPDATE inventory_sources SET source_config_revision=source_config_revision+1 "
+                "WHERE inventory_source_id=?",
+                (source_id,),
+            )
+            self._mark_controlled_context_transition(
+                connection, source_id, "canonicalization_contract_migrated"
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+        return self._store.source_state(source_id)
+
+    def materialize_due_expiry(
+        self,
+        inventory_source_id: str,
+        *,
+        expected_run_sequence: int | None = None,
+        expected_deadline: str | None = None,
+    ) -> bool:
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        changed = False
+        with self._store._transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            health = connection.execute(
+                "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+                (source_id,),
+            ).fetchone()
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+            if health is None or health["freshness"] != "fresh":
+                return False
+            if expected_run_sequence is not None and source["last_committed_run_sequence"] != expected_run_sequence:
+                return False
+            if expected_deadline is not None and health["freshness_valid_until"] != expected_deadline:
+                return False
+            if not self._committed_context_is_current(source, endpoint, health):
+                return False
+            deadline = _parse_timestamp(str(health["freshness_valid_until"]), "freshness_valid_until")
+            if self._now().astimezone(UTC) < deadline:
+                return False
+            connection.execute(
+                "UPDATE source_runtime_health SET freshness='stale', "
+                "health_origin='time_expiry', health_reason='freshness_deadline_elapsed' "
+                "WHERE inventory_source_id=?",
+                (source_id,),
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+            changed = True
+        return changed
+
+    def source_is_fresh_for_future_mutation(self, inventory_source_id: str) -> bool:
+        """Read-only Phase 1C precondition guard; grants no mutation authority."""
+
+        self.materialize_due_expiry(inventory_source_id)
+        state = self._store.source_state(inventory_source_id)
+        return state.runtime_health.health.value == "healthy" and state.runtime_health.freshness.value == "fresh"
+
+    def _change_source_configuration(
+        self,
+        inventory_source_id: str,
+        *,
+        column: str,
+        value: object,
+        reason: str,
+    ) -> InventorySourceState:
+        if column not in {"credential_reference", "freshness_duration_seconds"}:
+            raise AuthorityInvariantError("unsupported controlled source configuration field")
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        with self._store._transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            self._require_no_active_run(source)
+            if source[column] != value:
+                connection.execute(
+                    f"UPDATE inventory_sources SET {column}=?, "
+                    "source_config_revision=source_config_revision+1 "
+                    "WHERE inventory_source_id=?",
+                    (value, source_id),
+                )
+                self._mark_controlled_context_transition(connection, source_id, reason)
+                self._bump_global_revisions(
+                    connection, inventory_changed=False, published_changed=True
+                )
+        return self._store.source_state(source_id)
+
+    @staticmethod
+    def _require_no_active_run(source: sqlite3.Row) -> None:
+        if source["active_discovery_run_id"] is not None:
+            raise AuthorityConflict(
+                "source configuration transition waits for active run terminalization"
+            )
+
+    @staticmethod
+    def _mark_controlled_context_transition(
+        connection: sqlite3.Connection, source_id: str, reason: str
+    ) -> None:
+        connection.execute(
+            "UPDATE source_runtime_health SET freshness='stale', "
+            "health=CASE WHEN health='not_yet_observed' THEN 'not_yet_observed' ELSE health END, "
+            "health_origin='controlled_context_transition', health_reason=? "
+            "WHERE inventory_source_id=?",
+            (reason, source_id),
+        )
+
+    @staticmethod
+    def _require_nonterminal_run(run: sqlite3.Row) -> None:
+        if run["lifecycle"] not in {
+            DiscoveryRunLifecycle.ISSUED.value,
+            DiscoveryRunLifecycle.RUNNING.value,
+        }:
+            raise AuthorityConflict("discovery run is already terminal")
+
+    @staticmethod
+    def _require_active_endpoint_row(
+        connection: sqlite3.Connection, source_id: str
+    ) -> sqlite3.Row:
+        rows = connection.execute(
+            "SELECT * FROM source_endpoints WHERE inventory_source_id=? AND lifecycle='active'",
+            (source_id,),
+        ).fetchall()
+        if len(rows) != 1:
+            raise AuthorityInvariantError("inventory source must have exactly one active endpoint")
+        return rows[0]
+
+    @staticmethod
+    def _run_context_is_current(
+        source: sqlite3.Row, endpoint: sqlite3.Row, run: sqlite3.Row
+    ) -> bool:
+        return (
+            int(source["source_config_revision"]) == int(run["expected_source_config_revision"])
+            and str(endpoint["endpoint_id"]) == str(run["expected_endpoint_id"])
+            and str(endpoint["canonical_transport_locator"]) == str(run["expected_canonical_transport_locator"])
+            and int(endpoint["canonicalization_contract_version"]) == int(run["expected_canonicalization_contract_version"])
+            and int(endpoint["transport_trust_revision"]) == int(run["expected_transport_trust_revision"])
+            and int(source["provider_contract_version"]) == int(run["provider_contract_version"])
+        )
+
+    @staticmethod
+    def _committed_context_is_current(
+        source: sqlite3.Row, endpoint: sqlite3.Row, health: sqlite3.Row
+    ) -> bool:
+        return (
+            health["committed_source_config_revision"] == source["source_config_revision"]
+            and health["committed_endpoint_id"] == endpoint["endpoint_id"]
+            and health["committed_canonical_transport_locator"] == endpoint["canonical_transport_locator"]
+            and health["committed_canonicalization_contract_version"] == endpoint["canonicalization_contract_version"]
+            and health["committed_transport_trust_revision"] == endpoint["transport_trust_revision"]
+        )
+
+    @staticmethod
+    def _validate_snapshot_issuance(
+        snapshot: NormalizedDiscoverySnapshot, run: sqlite3.Row
+    ) -> None:
+        expected = (
+            snapshot.run_id,
+            snapshot.inventory_source_id,
+            snapshot.discovery_run_sequence,
+            snapshot.expected_source_config_revision,
+            snapshot.endpoint_id,
+            snapshot.canonical_transport_locator,
+            snapshot.canonicalization_contract_version,
+            snapshot.expected_transport_trust_revision,
+            snapshot.provider_contract_version,
+        )
+        actual = (
+            str(run["run_id"]),
+            str(run["inventory_source_id"]),
+            int(run["discovery_run_sequence"]),
+            int(run["expected_source_config_revision"]),
+            str(run["expected_endpoint_id"]),
+            str(run["expected_canonical_transport_locator"]),
+            int(run["expected_canonicalization_contract_version"]),
+            int(run["expected_transport_trust_revision"]),
+            int(run["provider_contract_version"]),
+        )
+        if expected != actual:
+            raise AuthorityConflict("normalized snapshot does not match immutable run issuance context")
+        if snapshot.baseline_completeness is not BaselineCompleteness.COMPLETE:
+            raise ValueError("successful reconciliation requires a complete baseline")
+
+    @staticmethod
+    def _release_run(
+        connection: sqlite3.Connection, source_id: str, run_id: str
+    ) -> None:
+        released = connection.execute(
+            "UPDATE inventory_sources SET active_discovery_run_id=NULL "
+            "WHERE inventory_source_id=? AND active_discovery_run_id=?",
+            (source_id, run_id),
+        )
+        if released.rowcount != 1:
+            raise AuthorityConflict("discovery run no longer owns the source")
+
+    @staticmethod
+    def _complete_run(
+        connection: sqlite3.Connection,
+        run: sqlite3.Row,
+        *,
+        completed_at: str,
+        outcome: str,
+        observed_at: str | None,
+        snapshot: NormalizedDiscoverySnapshot | None,
+        baseline_completeness: str | None = None,
+    ) -> None:
+        detail = snapshot.detail_summary if snapshot is not None else {}
+        completeness = (
+            snapshot.baseline_completeness.value
+            if snapshot is not None
+            else baseline_completeness
+        )
+        updated = connection.execute(
+            "UPDATE discovery_runs SET lifecycle='completed', terminalized_at=?, "
+            "terminal_reason=NULL, completed_at=?, provider_outcome=?, observed_at=?, "
+            "normalized_snapshot_hash=?, baseline_completeness=?, "
+            "acl_topology_hash_before=?, acl_topology_hash_after=?, "
+            "permission_snapshot_hash_before=?, permission_snapshot_hash_after=?, "
+            "detail_ok_count=?, detail_temporarily_unavailable_count=?, detail_error_count=? "
+            "WHERE run_id=? AND lifecycle IN ('issued', 'running')",
+            (
+                completed_at,
+                completed_at,
+                outcome,
+                observed_at,
+                snapshot.snapshot_hash if snapshot is not None else None,
+                completeness,
+                snapshot.acl_topology_hash_before if snapshot is not None else None,
+                snapshot.acl_topology_hash_after if snapshot is not None else None,
+                snapshot.permission_snapshot_hash_before if snapshot is not None else None,
+                snapshot.permission_snapshot_hash_after if snapshot is not None else None,
+                int(detail.get("ok_count", 0)) if snapshot is not None else None,
+                int(detail.get("temporarily_unavailable_count", 0)) if snapshot is not None else None,
+                int(detail.get("error_count", 0)) if snapshot is not None else None,
+                str(run["run_id"]),
+            ),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict("discovery run could not be finalized")
+
+    @staticmethod
+    def _update_completion_provenance(
+        connection: sqlite3.Connection,
+        *,
+        source_id: str,
+        sequence: int,
+        outcome: str,
+    ) -> None:
+        connection.execute(
+            "UPDATE source_runtime_health SET latest_completed_run_sequence=?, "
+            "latest_completed_outcome=? WHERE inventory_source_id=? AND "
+            "(latest_completed_run_sequence IS NULL OR latest_completed_run_sequence < ?)",
+            (sequence, outcome, source_id, sequence),
+        )
+
+    def _after_reconciliation(
+        self, connection: sqlite3.Connection, snapshot: NormalizedDiscoverySnapshot
+    ) -> None:
+        """Test injection seam inside the success transaction."""
+
+    def _after_health_update(
+        self, connection: sqlite3.Connection, snapshot: NormalizedDiscoverySnapshot
+    ) -> None:
+        """Test injection seam inside the success transaction."""
+
     def _insert_initial_endpoint(
         self,
         connection: sqlite3.Connection,
@@ -316,8 +887,8 @@ class InventoryAuthority:
         if updated.rowcount != 1:
             raise AuthorityConflict("discovery run could not be abandoned")
 
-    @staticmethod
     def _bump_global_revisions(
+        self,
         connection: sqlite3.Connection,
         *,
         inventory_changed: bool,
@@ -330,8 +901,14 @@ class InventoryAuthority:
         updated = connection.execute(
             "UPDATE backend_instance SET "
             "inventory_revision=inventory_revision+?, "
-            "published_state_revision=published_state_revision+? WHERE singleton=1",
-            (int(inventory_changed), int(published_changed)),
+            "published_state_revision=published_state_revision+?, "
+            "published_at=CASE WHEN ? THEN ? ELSE published_at END WHERE singleton=1",
+            (
+                int(inventory_changed),
+                int(published_changed),
+                int(published_changed),
+                _timestamp(self._now()),
+            ),
         )
         if updated.rowcount != 1:
             raise AuthorityInvariantError(
@@ -412,7 +989,26 @@ def _require_text(value: str, field_name: str, *, max_length: int) -> str:
     return value
 
 
+def _require_credential_reference(value: str) -> str:
+    reference = _require_text(value, "credential_reference", max_length=500)
+    if not reference.startswith("secret://"):
+        raise ValueError("credential_reference must be an opaque secret reference")
+    return reference
+
+
 def _timestamp(value: datetime) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise ValueError("authority clock must return a timezone-aware datetime")
     return value.astimezone(UTC).isoformat()
+
+
+def _parse_timestamp(value: str, field_name: str) -> datetime:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    return parsed.astimezone(UTC)
