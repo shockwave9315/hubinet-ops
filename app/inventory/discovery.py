@@ -63,7 +63,11 @@ def _freeze(value: Any) -> Any:
 
 
 def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    result = _freeze(value or {})
+    if value is None:
+        value = {}
+    if not isinstance(value, Mapping):
+        raise TypeError("discovery mapping value must be a mapping")
+    result = _freeze(value)
     assert isinstance(result, Mapping)
     return result
 
@@ -220,8 +224,7 @@ class NormalizedDiscoverySnapshot:
                 for resource in self.resources
             ),
             "error_count": sum(
-                resource.detail_status is DetailReadStatus.ERROR
-                for resource in self.resources
+                resource.detail_status is DetailReadStatus.ERROR for resource in self.resources
             ),
         }
         if dict(self.detail_summary) != expected_detail_counts:
