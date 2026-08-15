@@ -670,16 +670,32 @@ class InventoryAuthority:
             return False
         if not self._committed_context_is_current(source, endpoint, health):
             return False
-        deadline = _parse_timestamp(
-            str(health["freshness_valid_until"]), "freshness_valid_until"
-        )
-        if now < deadline:
+        reference_value = health["freshness_reference_at"]
+        deadline_value = health["freshness_valid_until"]
+        if reference_value is None or deadline_value is None:
+            raise AuthorityInvariantError(
+                "fresh source must have a freshness reference and deadline"
+            )
+        try:
+            reference = _parse_timestamp(
+                str(reference_value), "freshness_reference_at"
+            )
+            deadline = _parse_timestamp(str(deadline_value), "freshness_valid_until")
+        except ValueError as exc:
+            raise AuthorityInvariantError(
+                "fresh source has an invalid persisted freshness interval"
+            ) from exc
+        if now < reference:
+            reason = "freshness_clock_rollback_before_reference"
+        elif now < deadline:
             return False
+        else:
+            reason = "freshness_deadline_elapsed"
         connection.execute(
             "UPDATE source_runtime_health SET freshness='stale', "
-            "health_origin='time_expiry', health_reason='freshness_deadline_elapsed' "
+            "health_origin='time_expiry', health_reason=? "
             "WHERE inventory_source_id=?",
-            (source_id,),
+            (reason, source_id),
         )
         self._bump_global_revisions(
             connection,

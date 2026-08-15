@@ -448,9 +448,78 @@ def test_fast_success_expires_with_compare_and_swap_timer(tmp_path: Path) -> Non
     current = store.backend_instance()
     assert current.inventory_revision == old_revision.inventory_revision
     assert current.published_state_revision == old_revision.published_state_revision + 1
-    assert store.source_state(source_id).runtime_health.health_origin.value == "time_expiry"
+    expired = store.source_state(source_id).runtime_health
+    assert expired.health_origin.value == "time_expiry"
+    assert expired.health_reason == "freshness_deadline_elapsed"
     assert not authority.materialize_due_expiry(source_id)
     assert not authority.source_is_fresh_for_future_mutation(source_id)
+
+
+def test_post_commit_clock_rollback_materializes_once_and_new_success_recovers(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, source_id = make_authority(tmp_path, duration=300)
+    successful_run(store, authority, source_id)
+    committed_health = store.source_state(source_id).runtime_health
+    committed_resources = store.list_resources(source_id)
+    before = store.backend_instance()
+    assert committed_health.freshness.value == "fresh"
+
+    clock.value = START - timedelta(minutes=10)
+    assert not authority.source_is_fresh_for_future_mutation(source_id)
+
+    stale = store.source_state(source_id).runtime_health
+    after_rollback = store.backend_instance()
+    assert stale.freshness.value == "stale"
+    assert stale.health_origin.value == "time_expiry"
+    assert stale.health_reason == "freshness_clock_rollback_before_reference"
+    assert stale.freshness_reference_at == committed_health.freshness_reference_at
+    assert stale.freshness_valid_until == committed_health.freshness_valid_until
+    assert store.list_resources(source_id) == committed_resources
+    assert after_rollback.inventory_revision == before.inventory_revision
+    assert (
+        after_rollback.published_state_revision
+        == before.published_state_revision + 1
+    )
+
+    clock.value = START + timedelta(minutes=1)
+    assert not authority.source_is_fresh_for_future_mutation(source_id)
+    assert store.source_state(source_id).runtime_health == stale
+    assert store.backend_instance() == after_rollback
+
+    clock.value = START + timedelta(minutes=2)
+    successful_run(
+        store, authority, source_id, observed_at=clock.value.isoformat()
+    )
+    recovered = store.source_state(source_id).runtime_health
+    assert recovered.freshness.value == "fresh"
+    assert recovered.health_origin.value == "discovery_run"
+    assert recovered.freshness_reference_at == clock.value.isoformat()
+    assert authority.source_is_fresh_for_future_mutation(source_id)
+
+
+@pytest.mark.parametrize(
+    "missing_column", ["freshness_reference_at", "freshness_valid_until"]
+)
+def test_fresh_state_missing_fixed_interval_fails_closed(
+    tmp_path: Path, missing_column: str
+) -> None:
+    _, store, authority, source_id = make_authority(tmp_path)
+    successful_run(store, authority, source_id)
+    with store._transaction() as connection:
+        connection.execute(
+            f"UPDATE source_runtime_health SET {missing_column}=NULL "
+            "WHERE inventory_source_id=?",
+            (source_id,),
+        )
+    before = store.backend_instance()
+
+    with pytest.raises(
+        AuthorityInvariantError, match="freshness reference and deadline"
+    ):
+        authority.source_is_fresh_for_future_mutation(source_id)
+
+    assert store.backend_instance() == before
 
 
 def test_future_mutation_freshness_check_fences_expiry_and_decision(

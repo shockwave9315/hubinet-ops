@@ -270,6 +270,33 @@ def test_expired_freshness_is_materialized_in_snapshot_transaction(
     assert snapshot.published_state_revision == before.published_state_revision + 1
 
 
+def test_clock_rollback_is_materialized_before_publication_without_revival(
+    tmp_path: Path,
+) -> None:
+    clock, _, store, authority, source_id = make_system(tmp_path, duration=300)
+    reconcile(authority, source_id)
+    committed_resources = store.list_resources(source_id)
+    before = store.backend_instance()
+
+    clock.value = START - timedelta(minutes=10)
+    snapshot = contract_snapshot(InventoryPublication(store, authority).read())
+    source = snapshot.sources[0]
+    assert source.freshness is SourceFreshness.STALE
+    assert source.health_origin is SourceHealthOrigin.TIME_EXPIRY
+    assert source.health_reason == "freshness_clock_rollback_before_reference"
+    assert snapshot.inventory_revision == before.inventory_revision
+    assert snapshot.published_state_revision == before.published_state_revision + 1
+    assert store.list_resources(source_id) == committed_resources
+
+    clock.value = START + timedelta(minutes=1)
+    after_rollback = store.backend_instance()
+    caught_up = contract_snapshot(InventoryPublication(store, authority).read())
+    assert not authority.source_is_fresh_for_future_mutation(source_id)
+    assert caught_up.sources[0].freshness is SourceFreshness.STALE
+    assert caught_up.sources[0].health_reason == source.health_reason
+    assert store.backend_instance() == after_rollback
+
+
 def test_concurrent_commits_allocate_two_publications_and_reads_never_tear(tmp_path: Path) -> None:
     _, db_path, store, authority, first_id = make_system(tmp_path)
     second_id = authority.create_inventory_source(
