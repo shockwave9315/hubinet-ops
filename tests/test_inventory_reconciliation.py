@@ -18,6 +18,7 @@ from app.inventory import (
     SourceAvailability,
     evaluate_permission_coverage,
 )
+from app.inventory.discovery import ProviderNodeScope
 
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
@@ -41,12 +42,16 @@ def normalized_snapshot_for(
     *,
     resources,
     nodes=None,
+    provider_node_names=None,
     source_availability=SourceAvailability.AVAILABLE,
     failed_baseline_scopes=(),
 ):
     resources = tuple(resources)
     nodes = nodes if nodes is not None else (
         DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),
+    )
+    provider_node_names = provider_node_names or tuple(
+        node.external_node_name for node in nodes
     )
     return NormalizedDiscoverySnapshot(
         run_id=run.run_id,
@@ -91,6 +96,9 @@ def normalized_snapshot_for(
             DiscoveredResource(source_id, vmid, kind, name, status, node_name,
                                NOW.isoformat(), detail, facts)
             for vmid, kind, name, status, node_name, detail, facts in resources
+        ),
+        provider_node_scope=ProviderNodeScope._from_provider(
+            BaselineMode.CLUSTER, tuple(sorted(provider_node_names))
         ),
     )
 
@@ -231,46 +239,88 @@ def test_invalid_complete_node_coverage_cannot_mark_retained_resource_missing(
     tmp_path: Path,
 ) -> None:
     store, authority, source_id = make_authority(tmp_path)
-    complete_snapshot(store, authority, source_id, resources=(guest(),))
-    retained = store.list_resources(source_id)[0]
-    before_inventory_revision = store.backend_instance().inventory_revision
+    nodes = (
+        DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),
+        DiscoveredNode("pve-b", "online", True, NOW.isoformat(), {}),
+    )
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(vmid=100, node="pve-a"), guest(vmid=101, node="pve-b")),
+        nodes=nodes,
+    )
+    retained = next(
+        resource for resource in store.list_resources(source_id) if resource.vmid == 101
+    )
+    retained_binding = next(
+        binding for binding in store.list_bindings(source_id) if binding.vmid == 101
+    )
 
     run = authority.issue_discovery_run(source_id, 1)
     authority.mark_discovery_run_running(source_id, run.run_id)
-    with pytest.raises(ValueError, match="covered node scope"):
-        NormalizedDiscoverySnapshot(
-            run_id=run.run_id,
-            discovery_run_sequence=run.discovery_run_sequence,
-            inventory_source_id=source_id,
-            expected_source_config_revision=run.expected_source_config_revision,
-            endpoint_id=run.expected_endpoint_id,
-            canonical_transport_locator=run.expected_canonical_transport_locator,
-            canonicalization_contract_version=run.expected_canonicalization_contract_version,
-            expected_transport_trust_revision=run.expected_transport_trust_revision,
-            provider_contract_version=run.provider_contract_version,
-            observed_at=NOW.isoformat(),
-            source_facts={"release": "9.0"},
-            source_availability=SourceAvailability.AVAILABLE,
-            baseline_completeness=BaselineCompleteness.COMPLETE,
-            baseline_mode=BaselineMode.CLUSTER,
-            acl_topology_hash_before="acl",
-            acl_topology_hash_after="acl",
-            permission_snapshot_hash_before="perms",
-            permission_snapshot_hash_after="perms",
-            permission_coverage_complete=True,
-            boundary_consistent=True,
-            covered_nodes=(),
-            failed_baseline_scopes=(),
-            detail_summary={"ok_count": 0, "temporarily_unavailable_count": 0, "error_count": 0},
-            failed_detail_scopes=(),
-            nodes=(),
-            resources=(),
+    before_backend = store.backend_instance()
+    before_resources = store.list_resources(source_id)
+    before_bindings = store.list_bindings(source_id)
+    with pytest.raises(ValueError, match="provider-established covered node scope"):
+        normalized_snapshot_for(
+            run,
+            source_id,
+            resources=(guest(vmid=100, node="pve-a"),),
+            nodes=(nodes[0],),
+            provider_node_names=("pve-a", "pve-b"),
         )
 
-    current = store.list_resources(source_id)[0]
+    current = next(
+        resource for resource in store.list_resources(source_id) if resource.vmid == 101
+    )
     assert current.resource_id == retained.resource_id
     assert current.presence == "present"
-    assert store.backend_instance().inventory_revision == before_inventory_revision
+    assert current.active_binding_id == retained.active_binding_id
+    assert current.locator_generation == retained.locator_generation
+    assert current.successor_resource_id is None
+    assert store.list_resources(source_id) == before_resources
+    assert store.list_bindings(source_id) == before_bindings
+    assert retained_binding.valid_to_run_sequence is None
+    assert store.backend_instance() == before_backend
+    assert store.discovery_run(run.run_id).lifecycle.value == "running"
+    assert store.source_state(source_id).source.active_discovery_run_id == run.run_id
+    with store._transaction() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM resource_terminations WHERE inventory_source_id=?",
+            (source_id,),
+        ).fetchone()[0] == 0
+
+
+def test_complete_multinode_scope_reconciles_and_persists_exact_audit(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    nodes = (
+        DiscoveredNode("pve-b", "online", True, NOW.isoformat(), {}),
+        DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),
+    )
+    run, normalized = complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(vmid=100, node="pve-a"), guest(vmid=101, node="pve-b")),
+        nodes=nodes,
+    )
+    resources = store.list_resources(source_id)
+    completed = store.discovery_run(run.run_id)
+    assert {resource.vmid for resource in resources} == {100, 101}
+    assert all(resource.presence == "present" for resource in resources)
+    assert normalized.covered_nodes == ("pve-a", "pve-b")
+    assert completed.covered_nodes == normalized.covered_nodes
+    assert completed.normalized_snapshot_hash == normalized.snapshot_hash
+
+    store.close()
+    restarted = InventoryAuthorityStore(tmp_path / "authority.db").discovery_run(
+        run.run_id
+    )
+    assert restarted.covered_nodes == ("pve-a", "pve-b")
+    assert restarted.normalized_snapshot_hash == normalized.snapshot_hash
 
 
 @pytest.mark.parametrize(

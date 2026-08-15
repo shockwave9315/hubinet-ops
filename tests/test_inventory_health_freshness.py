@@ -20,6 +20,7 @@ from app.inventory import (
     NormalizedDiscoverySnapshot,
     SourceAvailability,
 )
+from app.inventory.discovery import ProviderNodeScope
 
 
 START = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
@@ -120,6 +121,9 @@ def snapshot_for(
                 {"memory": 1024},
             )
             for index, resource_time in enumerate(resource_times)
+        ),
+        provider_node_scope=ProviderNodeScope._from_provider(
+            BaselineMode.CLUSTER, tuple(sorted(node_names))
         ),
     )
 

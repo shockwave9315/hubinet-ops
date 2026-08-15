@@ -14,6 +14,7 @@ from app.inventory import (
     NormalizedDiscoverySnapshot,
     SourceAvailability,
 )
+from app.inventory.discovery import ProviderNodeScope
 
 
 SOURCE_ID = str(uuid.uuid4())
@@ -53,6 +54,15 @@ def snapshot(*, resources=(), nodes=None, source_id: str = SOURCE_ID, **changes)
         resources=resources,
     )
     values.update(changes)
+    if "provider_node_scope" not in values:
+        provider_names = tuple(
+            sorted({node.external_node_name for node in values["nodes"]})
+        )
+        if not provider_names:
+            provider_names = tuple(sorted(values["covered_nodes"])) or ("pve-a",)
+        values["provider_node_scope"] = ProviderNodeScope._from_provider(
+            values["baseline_mode"], provider_names
+        )
     return NormalizedDiscoverySnapshot(**values)
 
 
@@ -270,6 +280,17 @@ def test_complete_baseline_accepts_valid_mode_specific_node_coverage() -> None:
     assert set(cluster.covered_nodes) == {"pve-a", "pve-b"}
 
 
+def test_complete_baseline_rejects_two_truncated_snapshot_collections_against_provider_scope() -> None:
+    with pytest.raises(ValueError, match="provider-established covered node scope"):
+        snapshot(
+            nodes=(node("pve-a"),),
+            covered_nodes=("pve-a",),
+            provider_node_scope=ProviderNodeScope._from_provider(
+                BaselineMode.CLUSTER, ("pve-a", "pve-b")
+            ),
+        )
+
+
 def test_snapshot_hash_covers_security_and_issuance_provenance() -> None:
     original = snapshot()
     changed = snapshot(
@@ -277,6 +298,16 @@ def test_snapshot_hash_covers_security_and_issuance_provenance() -> None:
         permission_snapshot_hash_after="other",
     )
     assert changed.snapshot_hash != original.snapshot_hash
+
+
+def test_snapshot_hash_commits_to_canonical_provider_node_scope() -> None:
+    single = snapshot(nodes=(node("pve-a"),), covered_nodes=("pve-a",))
+    multi = snapshot(
+        nodes=(node("pve-b"), node("pve-a")),
+        covered_nodes=("pve-b", "pve-a"),
+    )
+    assert single.snapshot_hash != multi.snapshot_hash
+    assert multi.covered_nodes == ("pve-a", "pve-b")
 
 
 def test_snapshot_hash_covers_nested_observation_timestamps() -> None:
@@ -303,6 +334,6 @@ def test_snapshot_hash_is_stable_with_identical_nested_observation_evidence() ->
         resource(101, "lxc", node_name="pve-b", observed_at="2026-08-14T11:45:00+00:00"),
     )
     first = snapshot(nodes=nodes, resources=resources)
-    second = snapshot(nodes=tuple(nodes), resources=tuple(resources))
+    second = snapshot(nodes=tuple(reversed(nodes)), resources=tuple(resources))
     assert first.to_json_value() == second.to_json_value()
     assert first.snapshot_hash == second.snapshot_hash

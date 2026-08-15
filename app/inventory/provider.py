@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import re
 from typing import Any, Protocol
 from enum import StrEnum
 
-from .discovery import BaselineCompleteness, BaselineMode
+from .discovery import BaselineCompleteness, BaselineMode, ProviderNodeScope
 
 
 PROVIDER_CONTRACT_VERSION = 1
 SUPPORTED_PVE_MAJOR = 9
+_PROVIDER_RESULT_TOKEN = object()
 
 
 class ProviderContractError(ValueError):
@@ -74,6 +75,30 @@ class BoundaryBaselineResult:
     permission_hash_after: str
     permission_coverage_complete: bool
     completeness: BaselineCompleteness
+    _token: object = field(repr=False, compare=False)
+    node_scope: ProviderNodeScope = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self._token is not _PROVIDER_RESULT_TOKEN:
+            raise TypeError(
+                "boundary baseline result must originate from provider collection"
+            )
+        node_names = tuple(
+            str(row["node"])
+            for row in self.node_rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("node"), str)
+            and _NODE_NAME.fullmatch(str(row["node"]))
+        )
+        if len(node_names) != len(self.node_rows) or len(set(node_names)) != len(
+            node_names
+        ):
+            raise ProviderContractError("provider result node scope is malformed")
+        try:
+            scope = ProviderNodeScope._from_provider(self.mode, node_names)
+        except (TypeError, ValueError) as exc:
+            raise ProviderContractError("provider result node scope is malformed") from exc
+        object.__setattr__(self, "node_scope", scope)
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +409,7 @@ class ProxmoxProviderV1:
             permission_hash_after=canonical_evidence_hash(permissions_after),
             permission_coverage_complete=coverage,
             completeness=completeness,
+            _token=_PROVIDER_RESULT_TOKEN,
         )
 
 

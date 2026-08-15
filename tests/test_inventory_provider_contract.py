@@ -6,9 +6,12 @@ from app.inventory import (
     ENDPOINT_ACL_MATRIX,
     BaselineCompleteness,
     BaselineMode,
+    DiscoveredNode,
+    NormalizedDiscoverySnapshot,
     ProviderContractError,
     ProviderFailureKind,
     ProxmoxProviderV1,
+    SourceAvailability,
     classify_boundary,
     classify_provider_failure,
     evaluate_permission_coverage,
@@ -241,6 +244,34 @@ def exact_permission_calls(transport):
     ]
 
 
+def normalized_from_provider_result(result, *, nodes, resources=()):
+    source_id = "00000000-0000-4000-8000-000000000001"
+    return NormalizedDiscoverySnapshot.from_provider_baseline(
+        result,
+        run_id="00000000-0000-4000-8000-000000000002",
+        discovery_run_sequence=1,
+        inventory_source_id=source_id,
+        expected_source_config_revision=1,
+        endpoint_id="00000000-0000-4000-8000-000000000003",
+        canonical_transport_locator="https://pve.example:8006",
+        canonicalization_contract_version=1,
+        expected_transport_trust_revision=1,
+        provider_contract_version=1,
+        observed_at="2026-08-14T12:00:00+00:00",
+        source_facts={"release": "9.0"},
+        source_availability=SourceAvailability.AVAILABLE,
+        failed_baseline_scopes=(),
+        detail_summary={
+            "ok_count": len(resources),
+            "temporarily_unavailable_count": 0,
+            "error_count": 0,
+        },
+        failed_detail_scopes=(),
+        nodes=nodes,
+        resources=resources,
+    )
+
+
 def test_cluster_baseline_uses_source_wide_cluster_resources_get() -> None:
     transport = FakeTransport(
         {"/cluster/resources": {"data": [{"vmid": 100, "type": "qemu", "node": "pve-a"}]}}
@@ -330,7 +361,66 @@ def test_boundary_checks_each_cluster_node_at_both_boundaries() -> None:
     result = ProxmoxProviderV1.collect_boundary_baseline(transport)
     required = ["/", "/access", "/nodes", "/nodes/pve-a", "/nodes/pve-b", "/vms"]
     assert result.completeness is BaselineCompleteness.COMPLETE
+    assert result.node_scope.node_names == ("pve-a", "pve-b")
     assert exact_permission_calls(transport) == required + required
+
+
+def test_provider_scope_rejects_truncated_complete_normalization() -> None:
+    result = ProxmoxProviderV1.collect_boundary_baseline(
+        BoundaryTransport(
+            status_payload=cluster_status(
+                nodes=("pve-a", "pve-b"), local_node="pve-a"
+            ),
+            node_names=("pve-a", "pve-b"),
+            permissions_before=required_grants(nodes=("pve-a", "pve-b")),
+        )
+    )
+    with pytest.raises(ValueError, match="provider-established covered node scope"):
+        normalized_from_provider_result(
+            result,
+            nodes=(
+                DiscoveredNode(
+                    "pve-a", "online", True, "2026-08-14T12:00:00+00:00", {}
+                ),
+            ),
+        )
+
+
+def test_provider_scope_order_is_canonical_and_snapshot_hash_is_deterministic() -> None:
+    first_result = ProxmoxProviderV1.collect_boundary_baseline(
+        BoundaryTransport(
+            status_payload=cluster_status(
+                nodes=("pve-b", "pve-a"), local_node="pve-a"
+            ),
+            node_names=("pve-a", "pve-b"),
+            permissions_before=required_grants(nodes=("pve-a", "pve-b")),
+        )
+    )
+    second_result = ProxmoxProviderV1.collect_boundary_baseline(
+        BoundaryTransport(
+            status_payload=cluster_status(
+                nodes=("pve-a", "pve-b"), local_node="pve-a"
+            ),
+            node_names=("pve-b", "pve-a"),
+            permissions_before=required_grants(nodes=("pve-a", "pve-b")),
+        )
+    )
+    node_a = DiscoveredNode(
+        "pve-a", "online", True, "2026-08-14T12:00:00+00:00", {}
+    )
+    node_b = DiscoveredNode(
+        "pve-b", "online", True, "2026-08-14T12:00:00+00:00", {}
+    )
+    first = normalized_from_provider_result(
+        first_result, nodes=(node_b, node_a)
+    )
+    second = normalized_from_provider_result(
+        second_result, nodes=(node_a, node_b)
+    )
+    assert first_result.node_scope.node_names == ("pve-a", "pve-b")
+    assert second_result.node_scope.node_names == ("pve-a", "pve-b")
+    assert first.covered_nodes == second.covered_nodes == ("pve-a", "pve-b")
+    assert first.snapshot_hash == second.snapshot_hash
 
 
 def test_boundary_window_derives_standalone_and_uses_only_local_qemu_lxc() -> None:
@@ -343,6 +433,7 @@ def test_boundary_window_derives_standalone_and_uses_only_local_qemu_lxc() -> No
     paths = [path for path, _ in transport.calls]
     assert result.mode is BaselineMode.STANDALONE
     assert result.completeness is BaselineCompleteness.COMPLETE
+    assert result.node_scope.node_names == ("pve-a",)
     assert paths.count("/access/permissions") == 10
     assert exact_permission_calls(transport).count("/nodes/pve-a") == 2
     assert "/nodes/pve-a/qemu" in paths

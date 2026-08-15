@@ -9,8 +9,11 @@ import hashlib
 import json
 import re
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import uuid
+
+if TYPE_CHECKING:
+    from .provider import BoundaryBaselineResult
 
 
 _EXTERNAL_NODE_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
@@ -41,6 +44,43 @@ class SourceAvailability(StrEnum):
 class BaselineMode(StrEnum):
     CLUSTER = "cluster"
     STANDALONE = "standalone"
+
+
+_PROVIDER_NODE_SCOPE_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderNodeScope:
+    """Opaque canonical node-scope proof produced by the provider boundary."""
+
+    mode: BaselineMode
+    node_names: tuple[str, ...]
+    _token: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._token is not _PROVIDER_NODE_SCOPE_TOKEN:
+            raise TypeError("provider node scope must originate from provider evidence")
+        if not isinstance(self.mode, BaselineMode):
+            raise ValueError("provider node scope mode must be canonical")
+        names = tuple(sorted(self.node_names))
+        if (
+            not names
+            or any(
+                not isinstance(name, str) or not _EXTERNAL_NODE_NAME.fullmatch(name)
+                for name in names
+            )
+            or len(set(names)) != len(names)
+        ):
+            raise ValueError("provider node scope must contain unique canonical names")
+        if self.mode is BaselineMode.STANDALONE and len(names) != 1:
+            raise ValueError("standalone provider node scope must contain one node")
+        object.__setattr__(self, "node_names", names)
+
+    @classmethod
+    def _from_provider(
+        cls, mode: BaselineMode, node_names: tuple[str, ...]
+    ) -> ProviderNodeScope:
+        return cls(mode, tuple(node_names), _PROVIDER_NODE_SCOPE_TOKEN)
 
 
 class ContinuityEvidenceKind(StrEnum):
@@ -176,6 +216,73 @@ class NormalizedDiscoverySnapshot:
     failed_detail_scopes: tuple[str, ...]
     nodes: tuple[DiscoveredNode, ...]
     resources: tuple[DiscoveredResource, ...]
+    provider_node_scope: ProviderNodeScope | None = None
+
+    @classmethod
+    def from_provider_baseline(
+        cls,
+        provider_baseline: BoundaryBaselineResult,
+        *,
+        run_id: str,
+        discovery_run_sequence: int,
+        inventory_source_id: str,
+        expected_source_config_revision: int,
+        endpoint_id: str,
+        canonical_transport_locator: str,
+        canonicalization_contract_version: int,
+        expected_transport_trust_revision: int,
+        provider_contract_version: int,
+        observed_at: str,
+        source_facts: Mapping[str, Any],
+        source_availability: SourceAvailability,
+        failed_baseline_scopes: tuple[str, ...],
+        detail_summary: Mapping[str, Any],
+        failed_detail_scopes: tuple[str, ...],
+        nodes: tuple[DiscoveredNode, ...],
+        resources: tuple[DiscoveredResource, ...],
+    ) -> NormalizedDiscoverySnapshot:
+        """Normalize provider evidence without accepting a substitute node scope."""
+
+        from .provider import BoundaryBaselineResult
+
+        if not isinstance(provider_baseline, BoundaryBaselineResult):
+            raise TypeError("provider_baseline must be boundary provider evidence")
+        return cls(
+            run_id=run_id,
+            discovery_run_sequence=discovery_run_sequence,
+            inventory_source_id=inventory_source_id,
+            expected_source_config_revision=expected_source_config_revision,
+            endpoint_id=endpoint_id,
+            canonical_transport_locator=canonical_transport_locator,
+            canonicalization_contract_version=canonicalization_contract_version,
+            expected_transport_trust_revision=expected_transport_trust_revision,
+            provider_contract_version=provider_contract_version,
+            observed_at=observed_at,
+            source_facts=source_facts,
+            source_availability=source_availability,
+            baseline_completeness=provider_baseline.completeness,
+            baseline_mode=provider_baseline.mode,
+            acl_topology_hash_before=provider_baseline.topology_hash_before,
+            acl_topology_hash_after=provider_baseline.topology_hash_after,
+            permission_snapshot_hash_before=provider_baseline.permission_hash_before,
+            permission_snapshot_hash_after=provider_baseline.permission_hash_after,
+            permission_coverage_complete=(
+                provider_baseline.permission_coverage_complete
+            ),
+            boundary_consistent=(
+                provider_baseline.topology_hash_before
+                == provider_baseline.topology_hash_after
+                and provider_baseline.permission_hash_before
+                == provider_baseline.permission_hash_after
+            ),
+            covered_nodes=provider_baseline.node_scope.node_names,
+            failed_baseline_scopes=failed_baseline_scopes,
+            detail_summary=detail_summary,
+            failed_detail_scopes=failed_detail_scopes,
+            nodes=nodes,
+            resources=resources,
+            provider_node_scope=provider_baseline.node_scope,
+        )
 
     def __post_init__(self) -> None:
         _uuid(self.run_id, "run_id")
@@ -200,10 +307,14 @@ class NormalizedDiscoverySnapshot:
             raise ValueError("boundary_consistent must be boolean")
         object.__setattr__(self, "source_facts", _mapping(self.source_facts))
         object.__setattr__(self, "detail_summary", _mapping(self.detail_summary))
-        object.__setattr__(self, "covered_nodes", tuple(self.covered_nodes))
+        object.__setattr__(self, "covered_nodes", tuple(sorted(self.covered_nodes)))
         object.__setattr__(self, "failed_baseline_scopes", tuple(self.failed_baseline_scopes))
         object.__setattr__(self, "failed_detail_scopes", tuple(self.failed_detail_scopes))
-        object.__setattr__(self, "nodes", tuple(self.nodes))
+        object.__setattr__(
+            self,
+            "nodes",
+            tuple(sorted(self.nodes, key=lambda node: node.external_node_name)),
+        )
         object.__setattr__(self, "resources", tuple(self.resources))
         self._validate()
 
@@ -240,6 +351,11 @@ class NormalizedDiscoverySnapshot:
             raise ValueError("failed_detail_scopes must not contain duplicates")
         covered_node_names = list(self.covered_nodes)
         node_names = [node.external_node_name for node in self.nodes]
+        if self.provider_node_scope is not None:
+            if not isinstance(self.provider_node_scope, ProviderNodeScope):
+                raise ValueError("provider_node_scope must be provider evidence")
+            if self.provider_node_scope.mode is not self.baseline_mode:
+                raise ValueError("provider node scope mode disagrees with baseline mode")
         if len(set(node_names)) != len(node_names):
             raise ValueError("normalized snapshot contains duplicate external node name")
         if any(
@@ -267,9 +383,17 @@ class NormalizedDiscoverySnapshot:
                 raise ValueError(
                     "complete baseline requires an available source and no failed baseline scopes"
                 )
-            if not node_names or set(covered_node_names) != set(node_names):
+            if self.provider_node_scope is None:
                 raise ValueError(
-                    "complete baseline requires exact non-empty covered node scope"
+                    "complete baseline requires provider node-scope provenance"
+                )
+            required_node_names = self.provider_node_scope.node_names
+            if (
+                tuple(node_names) != required_node_names
+                or tuple(covered_node_names) != required_node_names
+            ):
+                raise ValueError(
+                    "complete baseline requires exact provider-established covered node scope"
                 )
             if self.baseline_mode is BaselineMode.STANDALONE and len(node_names) != 1:
                 raise ValueError("complete standalone baseline requires exactly one covered node")

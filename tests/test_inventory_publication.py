@@ -18,6 +18,7 @@ from app.inventory import (
     NormalizedDiscoverySnapshot,
     SourceAvailability,
 )
+from app.inventory.discovery import ProviderNodeScope
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CUSTOM_COMPONENTS_PATH = REPOSITORY_ROOT / "custom_components"
@@ -176,6 +177,9 @@ def reconcile(
                 DetailReadStatus.OK,
                 {},
             ),
+        ),
+        provider_node_scope=ProviderNodeScope._from_provider(
+            BaselineMode.CLUSTER, tuple(sorted(node_names))
         ),
     )
     authority.finalize_successful_discovery_run(source_id, run.run_id, snapshot)
