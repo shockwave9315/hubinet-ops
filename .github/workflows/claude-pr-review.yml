@@ -30,53 +30,25 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Verify review target
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ACTUAL_HEAD="$(git rev-parse HEAD)"
-          EXPECTED_HEAD="${{ github.event.pull_request.head.sha }}"
-
-          echo "Expected HEAD: $EXPECTED_HEAD"
-          echo "Actual HEAD:   $ACTUAL_HEAD"
-
-          test "$ACTUAL_HEAD" = "$EXPECTED_HEAD"
-
-      - name: Install Claude Code
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          curl -fsSL https://claude.ai/install.sh | bash -s 2.1.233
-
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Verify Claude Code
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          claude --version
-
       - name: Claude native PR review
-        shell: bash
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
 
-        run: |
-          set -euo pipefail
+          track_progress: false
+          include_fix_links: false
+          classify_inline_comments: false
 
-          claude -p \
-            "/code-review medium ${{ github.event.pull_request.number }} --comment" \
-            --model sonnet \
-            --allowedTools \
-              "Read" \
-              "Glob" \
-              "Grep" \
-              "Bash(git *)" \
-              "Bash(gh *)" \
-            --disallowedTools \
-              "Edit" \
-              "Write"
+          # Do not inject the old Codex/Claude bot review history.
+          exclude_comments_by_actor: "*[bot]"
+
+          prompt: |
+            /code-review medium ${{ github.event.pull_request.number }} --comment
+
+          claude_args: |
+            --model sonnet
+            --max-budget-usd 2.50
+            --append-system-prompt "For this repository, AGENTS.md and ACCEPTED ADRs are authoritative. Before reporting a blocking correctness finding, read the relevant accepted contract surface and require a concrete reachable witness with an observable incorrect result. Do not report speculative hardening or new architecture as an existing blocker. Phase 1B is dormant and read-only; runtime activation and Phase 1C mutation authority are out of scope."
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh api:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
+            --disallowedTools "Edit,Write,Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git rm:*)"
