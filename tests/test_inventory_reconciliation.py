@@ -43,6 +43,7 @@ def normalized_snapshot_for(
     source_availability=SourceAvailability.AVAILABLE,
     failed_baseline_scopes=(),
 ):
+    resources = tuple(resources)
     nodes = nodes if nodes is not None else (
         DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),
     )
@@ -69,7 +70,20 @@ def normalized_snapshot_for(
         boundary_consistent=True,
         covered_nodes=tuple(node.external_node_name for node in nodes),
         failed_baseline_scopes=failed_baseline_scopes,
-        detail_summary={"ok_count": len(resources), "temporarily_unavailable_count": 0, "error_count": 0},
+        detail_summary={
+            "ok_count": sum(
+                detail is DetailReadStatus.OK
+                for _, _, _, _, _, detail, _ in resources
+            ),
+            "temporarily_unavailable_count": sum(
+                detail is DetailReadStatus.TEMPORARILY_UNAVAILABLE
+                for _, _, _, _, _, detail, _ in resources
+            ),
+            "error_count": sum(
+                detail is DetailReadStatus.ERROR
+                for _, _, _, _, _, detail, _ in resources
+            ),
+        },
         failed_detail_scopes=(),
         nodes=nodes,
         resources=tuple(

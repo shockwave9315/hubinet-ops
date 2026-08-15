@@ -14,6 +14,9 @@ import uuid
 
 
 _EXTERNAL_NODE_NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+_DETAIL_SUMMARY_KEYS = frozenset(
+    {"ok_count", "temporarily_unavailable_count", "error_count"}
+)
 
 
 class BaselineCompleteness(StrEnum):
@@ -201,6 +204,37 @@ class NormalizedDiscoverySnapshot:
         self._validate()
 
     def _validate(self) -> None:
+        if set(self.detail_summary) != _DETAIL_SUMMARY_KEYS:
+            raise ValueError("detail_summary must contain exactly the canonical keys")
+        for key in _DETAIL_SUMMARY_KEYS:
+            value = self.detail_summary[key]
+            if type(value) is not int or value < 0:
+                raise ValueError("detail_summary values must be nonnegative integers")
+        expected_detail_counts = {
+            "ok_count": sum(
+                resource.detail_status is DetailReadStatus.OK
+                for resource in self.resources
+            ),
+            "temporarily_unavailable_count": sum(
+                resource.detail_status is DetailReadStatus.TEMPORARILY_UNAVAILABLE
+                for resource in self.resources
+            ),
+            "error_count": sum(
+                resource.detail_status is DetailReadStatus.ERROR
+                for resource in self.resources
+            ),
+        }
+        if dict(self.detail_summary) != expected_detail_counts:
+            raise ValueError("detail_summary must exactly match resource detail statuses")
+        if any(
+            not isinstance(scope, str)
+            or not scope
+            or scope != scope.strip()
+            for scope in self.failed_detail_scopes
+        ):
+            raise ValueError("failed_detail_scopes must contain canonical non-empty text")
+        if len(set(self.failed_detail_scopes)) != len(self.failed_detail_scopes):
+            raise ValueError("failed_detail_scopes must not contain duplicates")
         covered_node_names = list(self.covered_nodes)
         node_names = [node.external_node_name for node in self.nodes]
         if len(set(node_names)) != len(node_names):

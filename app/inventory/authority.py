@@ -839,9 +839,9 @@ class InventoryAuthority:
                 snapshot.acl_topology_hash_after if snapshot is not None else None,
                 snapshot.permission_snapshot_hash_before if snapshot is not None else None,
                 snapshot.permission_snapshot_hash_after if snapshot is not None else None,
-                int(detail.get("ok_count", 0)) if snapshot is not None else None,
-                int(detail.get("temporarily_unavailable_count", 0)) if snapshot is not None else None,
-                int(detail.get("error_count", 0)) if snapshot is not None else None,
+                detail["ok_count"] if snapshot is not None else None,
+                detail["temporarily_unavailable_count"] if snapshot is not None else None,
+                detail["error_count"] if snapshot is not None else None,
                 str(run["run_id"]),
             ),
         )

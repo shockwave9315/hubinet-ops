@@ -66,9 +66,10 @@ def resource(
     source_id=SOURCE_ID,
     node_name="pve-a",
     observed_at="2026-08-14T12:00:00+00:00",
+    detail_status=DetailReadStatus.OK,
 ):
     return DiscoveredResource(source_id, vmid, kind, f"guest-{vmid}", "running", node_name,
-                              observed_at, DetailReadStatus.OK,
+                              observed_at, detail_status,
                               {"config": {"memory": 1024}})
 
 
@@ -127,6 +128,80 @@ def test_detail_failure_does_not_degrade_complete_baseline(detail_status) -> Non
         failed_detail_scopes=("/nodes/pve-a/qemu/100/config",),
     )
     assert current.baseline_completeness is BaselineCompleteness.COMPLETE
+
+
+@pytest.mark.parametrize(
+    "item,detail_summary",
+    (
+        (
+            resource(detail_status=DetailReadStatus.ERROR),
+            {"ok_count": 0, "temporarily_unavailable_count": 0, "error_count": "1"},
+        ),
+        (
+            resource(detail_status=DetailReadStatus.ERROR),
+            {"ok_count": 0, "temporarily_unavailable_count": 0, "error_count": -1},
+        ),
+        (
+            resource(detail_status=DetailReadStatus.ERROR),
+            {"ok_count": 1, "temporarily_unavailable_count": 0, "error_count": 0},
+        ),
+        (
+            resource(),
+            {"ok_count": 0, "temporarily_unavailable_count": 0, "error_count": 1},
+        ),
+        (
+            resource(),
+            {"ok_count": True, "temporarily_unavailable_count": 0, "error_count": 0},
+        ),
+        (
+            resource(),
+            {"ok_count": 1, "error_count": 0},
+        ),
+        (
+            resource(),
+            {
+                "ok_count": 1,
+                "temporarily_unavailable_count": 0,
+                "error_count": 0,
+                "unknown_count": 0,
+            },
+        ),
+    ),
+)
+def test_detail_summary_rejects_malformed_or_contradictory_aggregates(
+    item, detail_summary
+) -> None:
+    with pytest.raises(ValueError, match="detail_summary"):
+        snapshot(resources=(item,), detail_summary=detail_summary)
+
+
+def test_mixed_detail_summary_exactly_matches_resource_statuses() -> None:
+    resources = (
+        resource(100),
+        resource(101, detail_status=DetailReadStatus.TEMPORARILY_UNAVAILABLE),
+        resource(102, detail_status=DetailReadStatus.ERROR),
+    )
+    current = snapshot(
+        resources=resources,
+        detail_summary={
+            "ok_count": 1,
+            "temporarily_unavailable_count": 1,
+            "error_count": 1,
+        },
+        failed_detail_scopes=(),
+    )
+    assert current.baseline_completeness is BaselineCompleteness.COMPLETE
+
+
+@pytest.mark.parametrize(
+    "failed_detail_scopes",
+    (("",), (" /nodes/pve-a/qemu/100/config",), ("scope", "scope"), (1,)),
+)
+def test_failed_detail_scopes_require_unique_canonical_text(
+    failed_detail_scopes,
+) -> None:
+    with pytest.raises(ValueError, match="failed_detail_scopes"):
+        snapshot(failed_detail_scopes=failed_detail_scopes)
 
 
 @pytest.mark.parametrize(
