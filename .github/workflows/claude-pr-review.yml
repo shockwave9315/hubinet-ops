@@ -75,8 +75,8 @@ jobs:
               "Read" \
               "Glob" \
               "Grep" \
-              "Bash(git:*)" \
-              "Bash(gh:*)" \
+              "Bash(git *)" \
+              "Bash(gh *)" \
             --disallowedTools \
               "Edit" \
               "Write"
