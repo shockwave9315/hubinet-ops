@@ -289,6 +289,9 @@ def test_partial_classified_failure_evidence_survives_restart(tmp_path: Path) ->
     assert completed.failed_detail_scopes is None
     assert completed.completion_source_config_revision is None
     assert completed.completion_endpoint_id is None
+    assert completed.completion_canonical_transport_locator is None
+    assert completed.completion_canonicalization_contract_version is None
+    assert completed.completion_transport_trust_revision is None
 
 
 def test_source_unavailable_retains_only_genuinely_known_evidence_after_restart(
@@ -324,6 +327,10 @@ def test_source_unavailable_retains_only_genuinely_known_evidence_after_restart(
     assert completed.detail_ok_count is None
     assert completed.failed_detail_scopes is None
     assert completed.completion_source_config_revision is None
+    assert completed.completion_endpoint_id is None
+    assert completed.completion_canonical_transport_locator is None
+    assert completed.completion_canonicalization_contract_version is None
+    assert completed.completion_transport_trust_revision is None
 
 
 def test_failed_completion_rejects_untyped_evidence(tmp_path: Path) -> None:
@@ -764,18 +771,64 @@ def test_late_old_context_worker_is_audited_but_cannot_commit(tmp_path: Path, ch
     assert completed.terminal_reason == "completion_context_changed"
     assert completed.normalized_snapshot_hash == normalized.snapshot_hash
     assert completed.expected_source_config_revision == run.expected_source_config_revision
+    assert completed.expected_endpoint_id == run.expected_endpoint_id
     assert completed.expected_transport_trust_revision == run.expected_transport_trust_revision
-    assert completed.completion_source_config_revision == (
-        run.expected_source_config_revision + int(changed_field == "config")
-    )
-    assert completed.completion_endpoint_id == run.expected_endpoint_id
-    assert completed.completion_transport_trust_revision == (
-        run.expected_transport_trust_revision + int(changed_field == "trust")
-    )
-    assert store.source_state(source_id).source.active_discovery_run_id is None
-    assert store.backend_instance().inventory_revision == before.inventory_revision
+    assert completed.completion_source_config_revision is None
+    assert completed.completion_endpoint_id is None
+    assert completed.completion_canonical_transport_locator is None
+    assert completed.completion_canonicalization_contract_version is None
+    assert completed.completion_transport_trust_revision is None
+    state = store.source_state(source_id)
+    assert state.source.active_discovery_run_id is None
+    assert state.source.last_committed_run_sequence is None
+    assert state.runtime_health.latest_completed_run_sequence == run.discovery_run_sequence
+    assert state.runtime_health.latest_completed_outcome == "invalid"
+    assert state.runtime_health.last_health_run_sequence is None
+    after = store.backend_instance()
+    assert after.inventory_revision == before.inventory_revision
+    assert after.published_state_revision == before.published_state_revision + 1
     store.close()
-    assert InventoryAuthorityStore(tmp_path / "authority.db").discovery_run(run.run_id) == completed
+    reopened = InventoryAuthorityStore(tmp_path / "authority.db")
+    restarted = reopened.discovery_run(run.run_id)
+    assert restarted == completed
+    assert restarted.completion_source_config_revision is None
+    assert restarted.completion_endpoint_id is None
+    assert restarted.completion_canonical_transport_locator is None
+    assert restarted.completion_canonicalization_contract_version is None
+    assert restarted.completion_transport_trust_revision is None
+
+
+def test_context_rejection_rolls_back_all_terminal_state_on_internal_failure(
+    tmp_path: Path,
+) -> None:
+    class FailingAfterCompletion(InventoryAuthority):
+        def _after_run_completion(self, connection, *, run_id: str) -> None:
+            raise RuntimeError("injected context rejection rollback")
+
+    _, store, authority, source_id = make_authority(
+        tmp_path, authority_type=FailingAfterCompletion
+    )
+    run = authority.issue_discovery_run(source_id, 1)
+    normalized = snapshot_for(store, run)
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE inventory_sources SET source_config_revision=source_config_revision+1 "
+            "WHERE inventory_source_id=?",
+            (source_id,),
+        )
+        authority._mark_controlled_context_transition(
+            connection, source_id, "test_config_transition"
+        )
+    before_backend = store.backend_instance()
+    before_state = store.source_state(source_id)
+
+    with pytest.raises(RuntimeError, match="context rejection rollback"):
+        authority.finalize_successful_discovery_run(source_id, run.run_id, normalized)
+
+    assert store.discovery_run(run.run_id) == run
+    assert store.source_state(source_id) == before_state
+    assert store.backend_instance() == before_backend
+    assert store.list_resources(source_id) == ()
 
 
 def test_context_transition_is_controlled_and_serialized_with_run_owner(tmp_path: Path) -> None:

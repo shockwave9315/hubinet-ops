@@ -307,8 +307,8 @@ class InventoryAuthority:
                     outcome="invalid",
                     terminal_reason="completion_context_changed",
                     evidence=completion_evidence,
-                    completion_source=source,
-                    completion_endpoint=endpoint,
+                    completion_source=None,
+                    completion_endpoint=None,
                 )
                 self._after_run_completion(
                     connection, run_id=canonical_run_id
