@@ -422,15 +422,69 @@ def test_parent_node_grant_never_substitutes_exact_node_permission(
     assert exact_permission_calls(transport).count("/nodes/pve-a") == 2
 
 
-def test_non_propagating_exact_permission_is_an_effective_grant() -> None:
+@pytest.mark.parametrize(
+    "path,privilege",
+    (("/", "Sys.Audit"), ("/access", "Sys.Audit"), ("/nodes/pve-a", "Sys.Audit")),
+)
+def test_non_propagating_exact_permission_is_an_effective_grant(
+    path: str, privilege: str
+) -> None:
     permissions = required_grants()
-    permissions["/nodes/pve-a"] = {"Sys.Audit": 0}
+    permissions[path] = {privilege: 0}
     result = ProxmoxProviderV1.collect_boundary_baseline(
         BoundaryTransport(permissions_before=permissions)
     )
     assert result.permission_coverage_complete is True
     assert result.completeness is BaselineCompleteness.COMPLETE
     assert result.permission_hash_before == result.permission_hash_after
+
+
+@pytest.mark.parametrize(
+    "tree_root,privilege",
+    (("/vms", "VM.Audit"), ("/nodes", "Sys.Audit")),
+)
+def test_source_wide_tree_root_requires_propagation(
+    tree_root: str, privilege: str
+) -> None:
+    permissions = required_grants()
+    permissions[tree_root] = {privilege: 0}
+    result = ProxmoxProviderV1.collect_boundary_baseline(
+        BoundaryTransport(permissions_before=permissions)
+    )
+    assert result.permission_coverage_complete is False
+    assert result.completeness is BaselineCompleteness.CONFIGURATION_ERROR
+
+
+@pytest.mark.parametrize(
+    "path,privilege",
+    (("/vms/100", "VM.Audit"), ("/nodes/pve-a/qemu", "Sys.Audit")),
+)
+def test_non_propagating_descendant_permission_remains_an_exact_grant(
+    path: str, privilege: str
+) -> None:
+    topology = ({"path": path, "roleid": "PVEAuditor"},)
+    permissions = required_grants(descendants=(path,))
+    permissions[path] = {privilege: 0}
+    result = ProxmoxProviderV1.collect_boundary_baseline(
+        BoundaryTransport(
+            topology_before=topology,
+            permissions_before=permissions,
+        )
+    )
+    assert result.permission_coverage_complete is True
+    assert result.completeness is BaselineCompleteness.COMPLETE
+
+
+def test_lost_source_wide_propagation_across_boundary_cannot_be_complete() -> None:
+    before = required_grants()
+    after = required_grants()
+    after["/vms"] = {"VM.Audit": 0}
+    result = ProxmoxProviderV1.collect_boundary_baseline(
+        BoundaryTransport(permissions_before=before, permissions_after=after)
+    )
+    assert result.permission_hash_before != result.permission_hash_after
+    assert result.permission_coverage_complete is False
+    assert result.completeness is BaselineCompleteness.INVALID
 
 
 def test_topology_descendant_denial_is_checked_upstream_without_inheritance() -> None:

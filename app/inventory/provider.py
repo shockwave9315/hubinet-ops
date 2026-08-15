@@ -57,6 +57,12 @@ class EndpointRequirement:
 
 
 @dataclass(frozen=True, slots=True)
+class PermissionRequirement:
+    privilege: str
+    require_propagation: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class BoundaryBaselineResult:
     mode: BaselineMode
     release: tuple[int, int]
@@ -121,13 +127,36 @@ def evaluate_permission_coverage(
 ) -> bool:
     """Compare upstream-evaluated effective permissions; never evaluate ACL inheritance."""
 
-    required = {"/": "Sys.Audit", "/access": "Sys.Audit", "/nodes": "Sys.Audit", "/vms": "VM.Audit"}
-    required.update({f"/nodes/{name}": "Sys.Audit" for name in node_names})
+    required = {
+        "/": PermissionRequirement("Sys.Audit"),
+        "/access": PermissionRequirement("Sys.Audit"),
+        "/nodes": PermissionRequirement("Sys.Audit", require_propagation=True),
+        "/vms": PermissionRequirement("VM.Audit", require_propagation=True),
+    }
+    required.update(
+        {
+            f"/nodes/{name}": PermissionRequirement("Sys.Audit")
+            for name in node_names
+        }
+    )
     for path in security_relevant_descendant_paths:
         if not isinstance(path, str) or not path.startswith(("/vms/", "/nodes/")):
             return False
-        required[path] = "VM.Audit" if path.startswith("/vms/") else "Sys.Audit"
-    return all(privilege in permissions_by_path.get(path, {}) for path, privilege in required.items())
+        required[path] = PermissionRequirement(
+            "VM.Audit" if path.startswith("/vms/") else "Sys.Audit"
+        )
+    for path, requirement in required.items():
+        permissions = permissions_by_path.get(path, {})
+        if requirement.privilege not in permissions:
+            return False
+        if requirement.require_propagation:
+            propagation = permissions[requirement.privilege]
+            if not (
+                (type(propagation) is bool and propagation)
+                or (type(propagation) is int and propagation == 1)
+            ):
+                return False
+    return True
 
 
 def classify_boundary(

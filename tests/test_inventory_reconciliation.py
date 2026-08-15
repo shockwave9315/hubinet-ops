@@ -15,6 +15,7 @@ from app.inventory import (
     InventoryAuthorityStore,
     NormalizedDiscoverySnapshot,
     SourceAvailability,
+    evaluate_permission_coverage,
 )
 
 
@@ -364,6 +365,29 @@ def test_partial_failed_run_does_not_create_missing_transition(tmp_path: Path) -
     authority.finalize_failed_discovery_run(
         source_id, run.run_id, outcome=BaselineCompleteness.PARTIAL,
         reason="locator baseline page failed",
+    )
+    assert store.list_resources(source_id)[0].presence == "present"
+
+
+def test_non_propagating_guest_tree_cannot_mark_retained_resource_missing(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    complete_snapshot(store, authority, source_id, resources=(guest(),))
+    run = authority.issue_discovery_run(source_id, 1)
+    permissions = {
+        "/": {"Sys.Audit": 0},
+        "/access": {"Sys.Audit": 0},
+        "/nodes": {"Sys.Audit": 1},
+        "/nodes/pve-a": {"Sys.Audit": 0},
+        "/vms": {"VM.Audit": 0},
+    }
+    assert not evaluate_permission_coverage(permissions, node_names=("pve-a",))
+    authority.finalize_failed_discovery_run(
+        source_id,
+        run.run_id,
+        outcome=BaselineCompleteness.CONFIGURATION_ERROR,
+        reason="source-wide VM permission does not propagate",
     )
     assert store.list_resources(source_id)[0].presence == "present"
 
