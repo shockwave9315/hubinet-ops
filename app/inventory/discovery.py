@@ -326,6 +326,144 @@ class NormalizedDiscoverySnapshot:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoveryRunCompletionEvidence:
+    """Validated classified provider evidence retained by one terminal run."""
+
+    baseline_completeness: BaselineCompleteness
+    observed_at: str | None = None
+    source_availability: SourceAvailability | None = None
+    baseline_mode: BaselineMode | None = None
+    permission_coverage_complete: bool | None = None
+    boundary_consistent: bool | None = None
+    covered_nodes: tuple[str, ...] | None = None
+    failed_baseline_scopes: tuple[str, ...] | None = None
+    acl_topology_hash_before: str | None = None
+    acl_topology_hash_after: str | None = None
+    permission_snapshot_hash_before: str | None = None
+    permission_snapshot_hash_after: str | None = None
+    normalized_snapshot_hash: str | None = None
+    detail_ok_count: int | None = None
+    detail_temporarily_unavailable_count: int | None = None
+    detail_error_count: int | None = None
+    failed_detail_scopes: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.baseline_completeness, BaselineCompleteness):
+            raise ValueError("completion baseline_completeness must be canonical")
+        if self.observed_at is not None:
+            _text(self.observed_at, "completion observed_at")
+        if self.source_availability is not None and not isinstance(
+            self.source_availability, SourceAvailability
+        ):
+            raise ValueError("completion source_availability must be canonical")
+        if self.baseline_mode is not None and not isinstance(
+            self.baseline_mode, BaselineMode
+        ):
+            raise ValueError("completion baseline_mode must be canonical")
+        for value, name in (
+            (self.permission_coverage_complete, "permission_coverage_complete"),
+            (self.boundary_consistent, "boundary_consistent"),
+        ):
+            if value is not None and type(value) is not bool:
+                raise ValueError(f"completion {name} must be boolean or unknown")
+        object.__setattr__(
+            self,
+            "covered_nodes",
+            _completion_text_tuple(
+                self.covered_nodes,
+                "covered_nodes",
+                node_names=True,
+            ),
+        )
+        object.__setattr__(
+            self,
+            "failed_baseline_scopes",
+            _completion_text_tuple(
+                self.failed_baseline_scopes, "failed_baseline_scopes"
+            ),
+        )
+        object.__setattr__(
+            self,
+            "failed_detail_scopes",
+            _completion_text_tuple(
+                self.failed_detail_scopes, "failed_detail_scopes"
+            ),
+        )
+        for value, name in (
+            (self.acl_topology_hash_before, "acl_topology_hash_before"),
+            (self.acl_topology_hash_after, "acl_topology_hash_after"),
+            (self.permission_snapshot_hash_before, "permission_snapshot_hash_before"),
+            (self.permission_snapshot_hash_after, "permission_snapshot_hash_after"),
+        ):
+            if value is not None:
+                _text(value, f"completion {name}")
+        if self.normalized_snapshot_hash is not None and not re.fullmatch(
+            r"[0-9a-f]{64}", self.normalized_snapshot_hash
+        ):
+            raise ValueError("completion normalized_snapshot_hash must be canonical")
+        detail_counts = (
+            self.detail_ok_count,
+            self.detail_temporarily_unavailable_count,
+            self.detail_error_count,
+        )
+        if any(value is not None for value in detail_counts):
+            if any(type(value) is not int or value < 0 for value in detail_counts):
+                raise ValueError(
+                    "completion detail counts must be jointly known nonnegative integers"
+                )
+
+    @classmethod
+    def from_snapshot(
+        cls, snapshot: NormalizedDiscoverySnapshot
+    ) -> DiscoveryRunCompletionEvidence:
+        if not isinstance(snapshot, NormalizedDiscoverySnapshot):
+            raise TypeError("completion evidence requires a normalized snapshot")
+        return cls(
+            baseline_completeness=snapshot.baseline_completeness,
+            observed_at=snapshot.observed_at,
+            source_availability=snapshot.source_availability,
+            baseline_mode=snapshot.baseline_mode,
+            permission_coverage_complete=snapshot.permission_coverage_complete,
+            boundary_consistent=snapshot.boundary_consistent,
+            covered_nodes=snapshot.covered_nodes,
+            failed_baseline_scopes=snapshot.failed_baseline_scopes,
+            acl_topology_hash_before=snapshot.acl_topology_hash_before,
+            acl_topology_hash_after=snapshot.acl_topology_hash_after,
+            permission_snapshot_hash_before=snapshot.permission_snapshot_hash_before,
+            permission_snapshot_hash_after=snapshot.permission_snapshot_hash_after,
+            normalized_snapshot_hash=snapshot.snapshot_hash,
+            detail_ok_count=snapshot.detail_summary["ok_count"],
+            detail_temporarily_unavailable_count=snapshot.detail_summary[
+                "temporarily_unavailable_count"
+            ],
+            detail_error_count=snapshot.detail_summary["error_count"],
+            failed_detail_scopes=snapshot.failed_detail_scopes,
+        )
+
+
+def _completion_text_tuple(
+    value: tuple[str, ...] | None,
+    name: str,
+    *,
+    node_names: bool = False,
+) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    result = tuple(value)
+    if any(
+        not isinstance(item, str)
+        or not item
+        or item != item.strip()
+        or (node_names and not _EXTERNAL_NODE_NAME.fullmatch(item))
+        for item in result
+    ):
+        raise ValueError(f"completion {name} must contain canonical non-empty text")
+    if len(set(result)) != len(result):
+        raise ValueError(f"completion {name} must not contain duplicates")
+    return result
+
+
 def _thaw(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {key: _thaw(item) for key, item in value.items()}

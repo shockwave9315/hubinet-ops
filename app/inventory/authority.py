@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+import json
 import sqlite3
 import uuid
 
@@ -19,7 +20,11 @@ from .models import (
     DiscoveryRunLifecycle,
     InventorySourceState,
 )
-from .discovery import BaselineCompleteness, NormalizedDiscoverySnapshot
+from .discovery import (
+    BaselineCompleteness,
+    DiscoveryRunCompletionEvidence,
+    NormalizedDiscoverySnapshot,
+)
 from .provider import PROVIDER_CONTRACT_VERSION
 from .reconciliation import InventoryReconciler, ReconciliationSummary
 from .store import InventoryAuthorityStore
@@ -281,6 +286,7 @@ class InventoryAuthority:
         source_id = _require_uuid(inventory_source_id, "inventory_source_id")
         canonical_run_id = _require_uuid(run_id, "run_id")
         committed_at = _timestamp(self._now())
+        completion_evidence = DiscoveryRunCompletionEvidence.from_snapshot(snapshot)
         context_rejected = False
         summary = ReconciliationSummary()
 
@@ -299,8 +305,13 @@ class InventoryAuthority:
                     run,
                     completed_at=committed_at,
                     outcome="invalid",
-                    observed_at=snapshot.observed_at,
-                    snapshot=snapshot,
+                    terminal_reason="completion_context_changed",
+                    evidence=completion_evidence,
+                    completion_source=source,
+                    completion_endpoint=endpoint,
+                )
+                self._after_run_completion(
+                    connection, run_id=canonical_run_id
                 )
                 self._update_completion_provenance(
                     connection,
@@ -386,8 +397,13 @@ class InventoryAuthority:
                     run,
                     completed_at=committed_at,
                     outcome="success",
-                    observed_at=snapshot.observed_at,
-                    snapshot=snapshot,
+                    terminal_reason=None,
+                    evidence=completion_evidence,
+                    completion_source=source,
+                    completion_endpoint=endpoint,
+                )
+                self._after_run_completion(
+                    connection, run_id=canonical_run_id
                 )
                 self._bump_global_revisions(
                     connection, inventory_changed=True, published_changed=True
@@ -404,20 +420,22 @@ class InventoryAuthority:
         inventory_source_id: str,
         run_id: str,
         *,
-        outcome: BaselineCompleteness,
+        completion_evidence: DiscoveryRunCompletionEvidence,
         reason: str,
-        observed_at: str | None = None,
     ) -> DiscoveryRun:
         """Finalize one non-success run and apply health only to its exact context."""
 
+        if not isinstance(completion_evidence, DiscoveryRunCompletionEvidence):
+            raise TypeError("failed discovery completion requires typed evidence")
+        outcome = completion_evidence.baseline_completeness
         if outcome is BaselineCompleteness.COMPLETE:
             raise ValueError("complete outcome must use successful reconciliation")
         source_id = _require_uuid(inventory_source_id, "inventory_source_id")
         canonical_run_id = _require_uuid(run_id, "run_id")
         health_reason = _require_text(reason, "reason", max_length=500)
         completed_at = _timestamp(self._now())
-        if observed_at is not None:
-            _parse_timestamp(observed_at, "observed_at")
+        if completion_evidence.observed_at is not None:
+            _parse_timestamp(completion_evidence.observed_at, "observed_at")
 
         with self._store._transaction() as connection:
             source = self._require_source_row(connection, source_id)
@@ -433,10 +451,12 @@ class InventoryAuthority:
                 run,
                 completed_at=completed_at,
                 outcome=outcome.value,
-                observed_at=observed_at,
-                snapshot=None,
-                baseline_completeness=outcome.value,
+                terminal_reason=health_reason,
+                evidence=completion_evidence,
+                completion_source=None,
+                completion_endpoint=None,
             )
+            self._after_run_completion(connection, run_id=canonical_run_id)
             if applicable:
                 health_row = connection.execute(
                     "SELECT last_health_run_sequence FROM source_runtime_health "
@@ -810,38 +830,78 @@ class InventoryAuthority:
         *,
         completed_at: str,
         outcome: str,
-        observed_at: str | None,
-        snapshot: NormalizedDiscoverySnapshot | None,
-        baseline_completeness: str | None = None,
+        terminal_reason: str | None,
+        evidence: DiscoveryRunCompletionEvidence,
+        completion_source: sqlite3.Row | None,
+        completion_endpoint: sqlite3.Row | None,
     ) -> None:
-        detail = snapshot.detail_summary if snapshot is not None else {}
-        completeness = (
-            snapshot.baseline_completeness.value
-            if snapshot is not None
-            else baseline_completeness
-        )
+        if (completion_source is None) != (completion_endpoint is None):
+            raise AuthorityInvariantError("completion context must be jointly known")
         updated = connection.execute(
             "UPDATE discovery_runs SET lifecycle='completed', terminalized_at=?, "
-            "terminal_reason=NULL, completed_at=?, provider_outcome=?, observed_at=?, "
-            "normalized_snapshot_hash=?, baseline_completeness=?, "
+            "terminal_reason=?, completed_at=?, provider_outcome=?, observed_at=?, "
+            "normalized_snapshot_hash=?, baseline_completeness=?, source_availability=?, "
+            "baseline_mode=?, permission_coverage_complete=?, boundary_consistent=?, "
+            "covered_nodes_json=?, failed_baseline_scopes_json=?, "
             "acl_topology_hash_before=?, acl_topology_hash_after=?, "
             "permission_snapshot_hash_before=?, permission_snapshot_hash_after=?, "
-            "detail_ok_count=?, detail_temporarily_unavailable_count=?, detail_error_count=? "
+            "detail_ok_count=?, detail_temporarily_unavailable_count=?, detail_error_count=?, "
+            "failed_detail_scopes_json=?, completion_source_config_revision=?, "
+            "completion_endpoint_id=?, completion_canonical_transport_locator=?, "
+            "completion_canonicalization_contract_version=?, "
+            "completion_transport_trust_revision=? "
             "WHERE run_id=? AND lifecycle IN ('issued', 'running')",
             (
                 completed_at,
+                terminal_reason,
                 completed_at,
                 outcome,
-                observed_at,
-                snapshot.snapshot_hash if snapshot is not None else None,
-                completeness,
-                snapshot.acl_topology_hash_before if snapshot is not None else None,
-                snapshot.acl_topology_hash_after if snapshot is not None else None,
-                snapshot.permission_snapshot_hash_before if snapshot is not None else None,
-                snapshot.permission_snapshot_hash_after if snapshot is not None else None,
-                detail["ok_count"] if snapshot is not None else None,
-                detail["temporarily_unavailable_count"] if snapshot is not None else None,
-                detail["error_count"] if snapshot is not None else None,
+                evidence.observed_at,
+                evidence.normalized_snapshot_hash,
+                evidence.baseline_completeness.value,
+                (
+                    evidence.source_availability.value
+                    if evidence.source_availability is not None
+                    else None
+                ),
+                evidence.baseline_mode.value if evidence.baseline_mode is not None else None,
+                evidence.permission_coverage_complete,
+                evidence.boundary_consistent,
+                _completion_collection_json(evidence.covered_nodes),
+                _completion_collection_json(evidence.failed_baseline_scopes),
+                evidence.acl_topology_hash_before,
+                evidence.acl_topology_hash_after,
+                evidence.permission_snapshot_hash_before,
+                evidence.permission_snapshot_hash_after,
+                evidence.detail_ok_count,
+                evidence.detail_temporarily_unavailable_count,
+                evidence.detail_error_count,
+                _completion_collection_json(evidence.failed_detail_scopes),
+                (
+                    int(completion_source["source_config_revision"])
+                    if completion_source is not None
+                    else None
+                ),
+                (
+                    str(completion_endpoint["endpoint_id"])
+                    if completion_endpoint is not None
+                    else None
+                ),
+                (
+                    str(completion_endpoint["canonical_transport_locator"])
+                    if completion_endpoint is not None
+                    else None
+                ),
+                (
+                    int(completion_endpoint["canonicalization_contract_version"])
+                    if completion_endpoint is not None
+                    else None
+                ),
+                (
+                    int(completion_endpoint["transport_trust_revision"])
+                    if completion_endpoint is not None
+                    else None
+                ),
                 str(run["run_id"]),
             ),
         )
@@ -872,6 +932,11 @@ class InventoryAuthority:
         self, connection: sqlite3.Connection, snapshot: NormalizedDiscoverySnapshot
     ) -> None:
         """Test injection seam inside the success transaction."""
+
+    def _after_run_completion(
+        self, connection: sqlite3.Connection, *, run_id: str
+    ) -> None:
+        """Test injection seam after evidence write inside terminal transactions."""
 
     def _insert_initial_endpoint(
         self,
@@ -1082,3 +1147,9 @@ def _freshness_reference_at(snapshot: NormalizedDiscoverySnapshot) -> datetime:
         for resource in snapshot.resources
     )
     return min(observations)
+
+
+def _completion_collection_json(value: tuple[str, ...] | None) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(list(value), ensure_ascii=True, separators=(",", ":"))

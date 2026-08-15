@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import sqlite3
 
 import pytest
 
 from app.inventory import (
     AuthorityConflict,
+    AuthorityInvariantError,
     BaselineCompleteness,
     BaselineMode,
     DetailReadStatus,
+    DiscoveryRunCompletionEvidence,
     DiscoveredNode,
     DiscoveredResource,
     InventoryAuthority,
@@ -51,6 +54,8 @@ def snapshot_for(
     observed_at: str | None = None,
     node_observed_at: tuple[str, ...] | None = None,
     resource_observed_at: tuple[str, ...] | None = None,
+    detail_statuses: tuple[DetailReadStatus, ...] | None = None,
+    failed_detail_scopes: tuple[str, ...] = (),
 ):
     source_id = run.inventory_source_id
     observed = observed_at or START.isoformat()
@@ -58,6 +63,11 @@ def snapshot_for(
     resource_times = (
         resource_observed_at if resource_observed_at is not None else (observed,)
     )
+    statuses = detail_statuses or tuple(
+        DetailReadStatus.OK for _ in resource_times
+    )
+    if len(statuses) != len(resource_times):
+        raise ValueError("detail status fixture must match resource observations")
     node_names = tuple(f"pve-{chr(ord('a') + index)}" for index in range(len(node_times)))
     return NormalizedDiscoverySnapshot(
         run_id=run.run_id,
@@ -83,11 +93,16 @@ def snapshot_for(
         covered_nodes=node_names,
         failed_baseline_scopes=(),
         detail_summary={
-            "ok_count": len(resource_times),
-            "temporarily_unavailable_count": 0,
-            "error_count": 0,
+            "ok_count": sum(status is DetailReadStatus.OK for status in statuses),
+            "temporarily_unavailable_count": sum(
+                status is DetailReadStatus.TEMPORARILY_UNAVAILABLE
+                for status in statuses
+            ),
+            "error_count": sum(
+                status is DetailReadStatus.ERROR for status in statuses
+            ),
         },
-        failed_detail_scopes=(),
+        failed_detail_scopes=failed_detail_scopes,
         nodes=tuple(
             DiscoveredNode(node_name, "online", True, node_time, {})
             for node_name, node_time in zip(node_names, node_times, strict=True)
@@ -101,7 +116,7 @@ def snapshot_for(
                 "running",
                 node_names[index % len(node_names)] if node_names else None,
                 resource_time,
-                DetailReadStatus.OK,
+                statuses[index],
                 {"memory": 1024},
             )
             for index, resource_time in enumerate(resource_times)
@@ -133,6 +148,71 @@ def test_successful_completion_is_write_once_and_persists_restart(tmp_path: Path
     assert reopened.source_state(source_id).runtime_health.last_successful_observed_at == START.isoformat()
 
 
+def test_successful_classified_evidence_and_completion_context_survive_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "authority.db"
+    _, store, authority, source_id = make_authority(tmp_path)
+    run = authority.issue_discovery_run(source_id, 1)
+    resource_times = (
+        START.isoformat(),
+        (START + timedelta(seconds=1)).isoformat(),
+        (START + timedelta(seconds=2)).isoformat(),
+    )
+    normalized = snapshot_for(
+        store,
+        run,
+        resource_observed_at=resource_times,
+        detail_statuses=(
+            DetailReadStatus.OK,
+            DetailReadStatus.TEMPORARILY_UNAVAILABLE,
+            DetailReadStatus.ERROR,
+        ),
+        failed_detail_scopes=(
+            "/nodes/pve-a/qemu/101/config",
+            "/nodes/pve-a/qemu/102/config",
+        ),
+    )
+    authority.finalize_successful_discovery_run(source_id, run.run_id, normalized)
+    store.close()
+
+    reopened = InventoryAuthorityStore(path)
+    completed = reopened.discovery_run(run.run_id)
+    assert completed.normalized_snapshot_hash == normalized.snapshot_hash
+    assert completed.baseline_completeness == "complete"
+    assert completed.source_availability == "available"
+    assert completed.baseline_mode == "cluster"
+    assert completed.permission_coverage_complete is True
+    assert completed.boundary_consistent is True
+    assert completed.covered_nodes == ("pve-a",)
+    assert completed.failed_baseline_scopes == ()
+    assert completed.acl_topology_hash_before == "acl"
+    assert completed.acl_topology_hash_after == "acl"
+    assert completed.permission_snapshot_hash_before == "perm"
+    assert completed.permission_snapshot_hash_after == "perm"
+    assert completed.detail_ok_count == 1
+    assert completed.detail_temporarily_unavailable_count == 1
+    assert completed.detail_error_count == 1
+    assert completed.failed_detail_scopes == (
+        "/nodes/pve-a/qemu/101/config",
+        "/nodes/pve-a/qemu/102/config",
+    )
+    assert completed.completion_source_config_revision == run.expected_source_config_revision
+    assert completed.completion_endpoint_id == run.expected_endpoint_id
+    assert (
+        completed.completion_canonical_transport_locator
+        == run.expected_canonical_transport_locator
+    )
+    assert (
+        completed.completion_canonicalization_contract_version
+        == run.expected_canonicalization_contract_version
+    )
+    assert (
+        completed.completion_transport_trust_revision
+        == run.expected_transport_trust_revision
+    )
+
+
 def test_failed_completion_is_visible_but_does_not_mutate_inventory(tmp_path: Path) -> None:
     _, store, authority, source_id = make_authority(tmp_path)
     run = authority.issue_discovery_run(source_id, 1)
@@ -140,7 +220,9 @@ def test_failed_completion_is_visible_but_does_not_mutate_inventory(tmp_path: Pa
     completed = authority.finalize_failed_discovery_run(
         source_id,
         run.run_id,
-        outcome=BaselineCompleteness.SOURCE_UNAVAILABLE,
+        completion_evidence=DiscoveryRunCompletionEvidence(
+            BaselineCompleteness.SOURCE_UNAVAILABLE
+        ),
         reason="transport unavailable",
     )
     after = store.backend_instance()
@@ -152,8 +234,196 @@ def test_failed_completion_is_visible_but_does_not_mutate_inventory(tmp_path: Pa
     assert after.published_state_revision == before.published_state_revision + 1
     with pytest.raises(AuthorityConflict):
         authority.finalize_failed_discovery_run(
-            source_id, run.run_id, outcome=BaselineCompleteness.PARTIAL, reason="late"
+            source_id,
+            run.run_id,
+            completion_evidence=DiscoveryRunCompletionEvidence(
+                BaselineCompleteness.PARTIAL
+            ),
+            reason="late",
         )
+
+
+def test_partial_classified_failure_evidence_survives_restart(tmp_path: Path) -> None:
+    path = tmp_path / "authority.db"
+    _, store, authority, source_id = make_authority(tmp_path)
+    run = authority.issue_discovery_run(source_id, 1)
+    evidence = DiscoveryRunCompletionEvidence(
+        baseline_completeness=BaselineCompleteness.PARTIAL,
+        observed_at=START.isoformat(),
+        source_availability=SourceAvailability.AVAILABLE,
+        baseline_mode=BaselineMode.CLUSTER,
+        permission_coverage_complete=False,
+        boundary_consistent=True,
+        covered_nodes=("pve-a",),
+        failed_baseline_scopes=("/nodes",),
+        acl_topology_hash_before="acl-before",
+        acl_topology_hash_after="acl-after",
+        permission_snapshot_hash_before="perm-before",
+        permission_snapshot_hash_after="perm-after",
+    )
+    authority.finalize_failed_discovery_run(
+        source_id,
+        run.run_id,
+        completion_evidence=evidence,
+        reason="node baseline unavailable",
+    )
+    store.close()
+
+    reopened = InventoryAuthorityStore(path)
+    completed = reopened.discovery_run(run.run_id)
+    assert completed.provider_outcome == "partial"
+    assert completed.terminal_reason == "node baseline unavailable"
+    assert completed.observed_at == START.isoformat()
+    assert completed.source_availability == "available"
+    assert completed.baseline_mode == "cluster"
+    assert completed.permission_coverage_complete is False
+    assert completed.boundary_consistent is True
+    assert completed.covered_nodes == ("pve-a",)
+    assert completed.failed_baseline_scopes == ("/nodes",)
+    assert completed.acl_topology_hash_before == "acl-before"
+    assert completed.acl_topology_hash_after == "acl-after"
+    assert completed.permission_snapshot_hash_before == "perm-before"
+    assert completed.permission_snapshot_hash_after == "perm-after"
+    assert completed.normalized_snapshot_hash is None
+    assert completed.detail_ok_count is None
+    assert completed.failed_detail_scopes is None
+    assert completed.completion_source_config_revision is None
+    assert completed.completion_endpoint_id is None
+
+
+def test_source_unavailable_retains_only_genuinely_known_evidence_after_restart(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "authority.db"
+    _, store, authority, source_id = make_authority(tmp_path)
+    run = authority.issue_discovery_run(source_id, 1)
+    authority.finalize_failed_discovery_run(
+        source_id,
+        run.run_id,
+        completion_evidence=DiscoveryRunCompletionEvidence(
+            baseline_completeness=BaselineCompleteness.SOURCE_UNAVAILABLE,
+            observed_at=START.isoformat(),
+            source_availability=SourceAvailability.UNAVAILABLE,
+        ),
+        reason="transport unavailable",
+    )
+    store.close()
+
+    completed = InventoryAuthorityStore(path).discovery_run(run.run_id)
+    assert completed.provider_outcome == "source_unavailable"
+    assert completed.observed_at == START.isoformat()
+    assert completed.source_availability == "unavailable"
+    assert completed.baseline_mode is None
+    assert completed.permission_coverage_complete is None
+    assert completed.boundary_consistent is None
+    assert completed.covered_nodes is None
+    assert completed.failed_baseline_scopes is None
+    assert completed.acl_topology_hash_before is None
+    assert completed.permission_snapshot_hash_before is None
+    assert completed.normalized_snapshot_hash is None
+    assert completed.detail_ok_count is None
+    assert completed.failed_detail_scopes is None
+    assert completed.completion_source_config_revision is None
+
+
+def test_failed_completion_rejects_untyped_evidence(tmp_path: Path) -> None:
+    _, _, authority, source_id = make_authority(tmp_path)
+    run = authority.issue_discovery_run(source_id, 1)
+    with pytest.raises(TypeError, match="typed evidence"):
+        authority.finalize_failed_discovery_run(
+            source_id,
+            run.run_id,
+            completion_evidence={"baseline_completeness": "partial"},  # type: ignore[arg-type]
+            reason="untyped",
+        )
+
+
+def test_terminal_completion_evidence_is_database_immutable(tmp_path: Path) -> None:
+    _, store, authority, source_id = make_authority(tmp_path)
+    completed = successful_run(store, authority, source_id)
+    with pytest.raises(sqlite3.IntegrityError, match="already terminal"):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE discovery_runs SET covered_nodes_json='[]' WHERE run_id=?",
+                (completed.run_id,),
+            )
+    assert store.discovery_run(completed.run_id) == completed
+
+
+def test_completion_evidence_inventory_health_release_and_revisions_are_atomic(
+    tmp_path: Path,
+) -> None:
+    class FailingAfterCompletion(InventoryAuthority):
+        def _after_run_completion(self, connection, *, run_id: str) -> None:
+            raise RuntimeError("injected after completion evidence")
+
+    _, store, authority, source_id = make_authority(
+        tmp_path, authority_type=FailingAfterCompletion
+    )
+    run = authority.issue_discovery_run(source_id, 1)
+    before_backend = store.backend_instance()
+    before_state = store.source_state(source_id)
+    with pytest.raises(RuntimeError, match="after completion evidence"):
+        authority.finalize_successful_discovery_run(
+            source_id, run.run_id, snapshot_for(store, run)
+        )
+    after = store.discovery_run(run.run_id)
+    assert after.lifecycle.value == "issued"
+    assert after.provider_outcome is None
+    assert after.baseline_completeness is None
+    assert after.covered_nodes is None
+    assert after.completion_source_config_revision is None
+    assert store.list_resources(source_id) == ()
+    assert store.source_state(source_id) == before_state
+    assert store.backend_instance() == before_backend
+
+
+def test_failed_completion_evidence_health_release_and_revision_are_atomic(
+    tmp_path: Path,
+) -> None:
+    class FailingAfterCompletion(InventoryAuthority):
+        def _after_run_completion(self, connection, *, run_id: str) -> None:
+            raise RuntimeError("injected failed completion rollback")
+
+    _, store, authority, source_id = make_authority(
+        tmp_path, authority_type=FailingAfterCompletion
+    )
+    run = authority.issue_discovery_run(source_id, 1)
+    before_backend = store.backend_instance()
+    before_state = store.source_state(source_id)
+    with pytest.raises(RuntimeError, match="failed completion rollback"):
+        authority.finalize_failed_discovery_run(
+            source_id,
+            run.run_id,
+            completion_evidence=DiscoveryRunCompletionEvidence(
+                BaselineCompleteness.PARTIAL,
+                observed_at=START.isoformat(),
+                failed_baseline_scopes=("/nodes",),
+            ),
+            reason="partial",
+        )
+    after = store.discovery_run(run.run_id)
+    assert after.lifecycle.value == "issued"
+    assert after.baseline_completeness is None
+    assert after.failed_baseline_scopes is None
+    assert store.source_state(source_id) == before_state
+    assert store.backend_instance() == before_backend
+
+
+def test_malformed_persisted_completion_collection_fails_closed_on_read(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "authority.db"
+    _, store, authority, source_id = make_authority(tmp_path)
+    run = authority.issue_discovery_run(source_id, 1)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA ignore_check_constraints=ON")
+        connection.execute(
+            "UPDATE discovery_runs SET covered_nodes_json='not-json' WHERE run_id=?",
+            (run.run_id,),
+        )
+    with pytest.raises(AuthorityInvariantError, match="covered_nodes_json"):
+        store.discovery_run(run.run_id)
 
 
 def test_fast_success_expires_with_compare_and_swap_timer(tmp_path: Path) -> None:
@@ -466,6 +736,7 @@ def test_newer_success_replaces_expired_anchor_and_old_timer_is_noop(tmp_path: P
 def test_late_old_context_worker_is_audited_but_cannot_commit(tmp_path: Path, changed_field: str) -> None:
     _, store, authority, source_id = make_authority(tmp_path)
     run = authority.issue_discovery_run(source_id, 1)
+    normalized = snapshot_for(store, run)
     # Simulate an independently serialized context commit to exercise finalization's
     # defense-in-depth CAS; public transition methods reject while this run owns source.
     with store._transaction() as connection:
@@ -486,11 +757,25 @@ def test_late_old_context_worker_is_audited_but_cannot_commit(tmp_path: Path, ch
         )
     before = store.backend_instance()
     with pytest.raises(AuthorityConflict, match="context changed"):
-        authority.finalize_successful_discovery_run(source_id, run.run_id, snapshot_for(store, run))
+        authority.finalize_successful_discovery_run(source_id, run.run_id, normalized)
     assert store.list_resources(source_id) == ()
-    assert store.discovery_run(run.run_id).provider_outcome == "invalid"
+    completed = store.discovery_run(run.run_id)
+    assert completed.provider_outcome == "invalid"
+    assert completed.terminal_reason == "completion_context_changed"
+    assert completed.normalized_snapshot_hash == normalized.snapshot_hash
+    assert completed.expected_source_config_revision == run.expected_source_config_revision
+    assert completed.expected_transport_trust_revision == run.expected_transport_trust_revision
+    assert completed.completion_source_config_revision == (
+        run.expected_source_config_revision + int(changed_field == "config")
+    )
+    assert completed.completion_endpoint_id == run.expected_endpoint_id
+    assert completed.completion_transport_trust_revision == (
+        run.expected_transport_trust_revision + int(changed_field == "trust")
+    )
     assert store.source_state(source_id).source.active_discovery_run_id is None
     assert store.backend_instance().inventory_revision == before.inventory_revision
+    store.close()
+    assert InventoryAuthorityStore(tmp_path / "authority.db").discovery_run(run.run_id) == completed
 
 
 def test_context_transition_is_controlled_and_serialized_with_run_owner(tmp_path: Path) -> None:

@@ -111,17 +111,20 @@ def test_unknown_nonempty_database_is_rejected_without_modification(
         assert connection.execute("SELECT value FROM unrelated").fetchone()[0] == "retained"
 
 
-def test_dormant_phase1a_schema_is_rejected_without_preactivation_migration(tmp_path: Path) -> None:
+@pytest.mark.parametrize("old_version", (1, 2))
+def test_older_dormant_authority_schema_is_rejected_without_migration(
+    tmp_path: Path, old_version: int
+) -> None:
     path = tmp_path / "phase1a.db"
     with sqlite3.connect(path) as connection:
         connection.execute(
             "CREATE TABLE authority_schema (singleton INTEGER PRIMARY KEY, marker TEXT, schema_version INTEGER)"
         )
         connection.execute(
-            "INSERT INTO authority_schema VALUES(1, ?, 1)",
-            (AUTHORITY_SCHEMA_MARKER,),
+            "INSERT INTO authority_schema VALUES(1, ?, ?)",
+            (AUTHORITY_SCHEMA_MARKER, old_version),
         )
-        connection.execute("PRAGMA user_version=1")
+        connection.execute(f"PRAGMA user_version={old_version}")
     before = path.read_bytes()
     with pytest.raises(AuthorityDatabaseRejected, match="unsupported"):
         InventoryAuthorityStore(path, now=fixed_now)

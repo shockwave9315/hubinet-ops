@@ -9,6 +9,7 @@ from app.inventory import (
     BaselineCompleteness,
     BaselineMode,
     DetailReadStatus,
+    DiscoveryRunCompletionEvidence,
     DiscoveredNode,
     DiscoveredResource,
     InventoryAuthority,
@@ -377,7 +378,11 @@ def test_partial_failed_run_does_not_create_missing_transition(tmp_path: Path) -
     complete_snapshot(store, authority, source_id, resources=(guest(),))
     run = authority.issue_discovery_run(source_id, 1)
     authority.finalize_failed_discovery_run(
-        source_id, run.run_id, outcome=BaselineCompleteness.PARTIAL,
+        source_id,
+        run.run_id,
+        completion_evidence=DiscoveryRunCompletionEvidence(
+            BaselineCompleteness.PARTIAL
+        ),
         reason="locator baseline page failed",
     )
     assert store.list_resources(source_id)[0].presence == "present"
@@ -400,7 +405,9 @@ def test_non_propagating_guest_tree_cannot_mark_retained_resource_missing(
     authority.finalize_failed_discovery_run(
         source_id,
         run.run_id,
-        outcome=BaselineCompleteness.CONFIGURATION_ERROR,
+        completion_evidence=DiscoveryRunCompletionEvidence(
+            BaselineCompleteness.CONFIGURATION_ERROR
+        ),
         reason="source-wide VM permission does not propagate",
     )
     assert store.list_resources(source_id)[0].presence == "present"

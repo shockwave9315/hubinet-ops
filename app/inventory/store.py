@@ -32,7 +32,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 2
+AUTHORITY_SCHEMA_VERSION = 3
 BUSY_TIMEOUT_MS = 5_000
 
 _REQUIRED_TABLES = frozenset(
@@ -358,7 +358,7 @@ class InventoryAuthorityStore:
             )
         if objects != _REQUIRED_SCHEMA_OBJECTS:
             raise AuthorityDatabaseRejected(
-                "authority database schema objects do not match version 1"
+                "authority database schema objects do not match version 3"
             )
         if len(backend_rows) != 1 or not _is_canonical_uuid(
             backend_rows[0]["backend_instance_id"]
@@ -576,6 +576,18 @@ def _discovery_run(row: sqlite3.Row) -> DiscoveryRun:
         observed_at=row["observed_at"],
         normalized_snapshot_hash=row["normalized_snapshot_hash"],
         baseline_completeness=row["baseline_completeness"],
+        source_availability=row["source_availability"],
+        baseline_mode=row["baseline_mode"],
+        permission_coverage_complete=_optional_sqlite_boolean(
+            row["permission_coverage_complete"], "permission_coverage_complete"
+        ),
+        boundary_consistent=_optional_sqlite_boolean(
+            row["boundary_consistent"], "boundary_consistent"
+        ),
+        covered_nodes=_optional_completion_collection(row, "covered_nodes_json"),
+        failed_baseline_scopes=_optional_completion_collection(
+            row, "failed_baseline_scopes_json"
+        ),
         acl_topology_hash_before=row["acl_topology_hash_before"],
         acl_topology_hash_after=row["acl_topology_hash_after"],
         permission_snapshot_hash_before=row["permission_snapshot_hash_before"],
@@ -583,7 +595,66 @@ def _discovery_run(row: sqlite3.Row) -> DiscoveryRun:
         detail_ok_count=(int(row["detail_ok_count"]) if row["detail_ok_count"] is not None else None),
         detail_temporarily_unavailable_count=(int(row["detail_temporarily_unavailable_count"]) if row["detail_temporarily_unavailable_count"] is not None else None),
         detail_error_count=(int(row["detail_error_count"]) if row["detail_error_count"] is not None else None),
+        failed_detail_scopes=_optional_completion_collection(
+            row, "failed_detail_scopes_json"
+        ),
+        completion_source_config_revision=(
+            int(row["completion_source_config_revision"])
+            if row["completion_source_config_revision"] is not None
+            else None
+        ),
+        completion_endpoint_id=row["completion_endpoint_id"],
+        completion_canonical_transport_locator=row[
+            "completion_canonical_transport_locator"
+        ],
+        completion_canonicalization_contract_version=(
+            int(row["completion_canonicalization_contract_version"])
+            if row["completion_canonicalization_contract_version"] is not None
+            else None
+        ),
+        completion_transport_trust_revision=(
+            int(row["completion_transport_trust_revision"])
+            if row["completion_transport_trust_revision"] is not None
+            else None
+        ),
     )
+
+
+def _optional_sqlite_boolean(value: object, field: str) -> bool | None:
+    if value is None:
+        return None
+    if type(value) is not int or value not in {0, 1}:
+        raise AuthorityInvariantError(f"discovery run {field} is malformed")
+    return bool(value)
+
+
+def _optional_completion_collection(
+    row: sqlite3.Row, field: str
+) -> tuple[str, ...] | None:
+    raw = row[field]
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise AuthorityInvariantError(f"discovery run {field} is malformed")
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise AuthorityInvariantError(
+            f"discovery run {field} is malformed"
+        ) from exc
+    if (
+        not isinstance(value, list)
+        or any(
+            not isinstance(item, str)
+            or not item
+            or item != item.strip()
+            for item in value
+        )
+        or len(set(value)) != len(value)
+        or json.dumps(value, ensure_ascii=True, separators=(",", ":")) != raw
+    ):
+        raise AuthorityInvariantError(f"discovery run {field} is malformed")
+    return tuple(value)
 
 
 def _inventory_node(row: sqlite3.Row) -> InventoryNode:
@@ -644,7 +715,7 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 2)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 3)
     )
     """,
     """
@@ -777,18 +848,58 @@ _SCHEMA_STATEMENTS = (
         terminalized_at TEXT,
         terminal_reason TEXT,
         completed_at TEXT,
-        provider_outcome TEXT,
+        provider_outcome TEXT CHECK(provider_outcome IS NULL OR provider_outcome IN (
+            'success', 'partial', 'configuration_error', 'source_unavailable', 'invalid')),
         observed_at TEXT,
         normalized_snapshot_hash TEXT,
         baseline_completeness TEXT CHECK(baseline_completeness IS NULL OR baseline_completeness IN (
             'complete', 'partial', 'configuration_error', 'source_unavailable', 'invalid')),
+        source_availability TEXT CHECK(source_availability IS NULL OR source_availability IN (
+            'available', 'unavailable')),
+        baseline_mode TEXT CHECK(baseline_mode IS NULL OR baseline_mode IN ('cluster', 'standalone')),
+        permission_coverage_complete INTEGER CHECK(
+            permission_coverage_complete IS NULL OR permission_coverage_complete IN (0, 1)),
+        boundary_consistent INTEGER CHECK(
+            boundary_consistent IS NULL OR boundary_consistent IN (0, 1)),
+        covered_nodes_json TEXT CHECK(
+            covered_nodes_json IS NULL OR
+            (json_valid(covered_nodes_json) AND json_type(covered_nodes_json) = 'array')),
+        failed_baseline_scopes_json TEXT CHECK(
+            failed_baseline_scopes_json IS NULL OR
+            (json_valid(failed_baseline_scopes_json) AND
+             json_type(failed_baseline_scopes_json) = 'array')),
         acl_topology_hash_before TEXT,
         acl_topology_hash_after TEXT,
         permission_snapshot_hash_before TEXT,
         permission_snapshot_hash_after TEXT,
-        detail_ok_count INTEGER,
-        detail_temporarily_unavailable_count INTEGER,
-        detail_error_count INTEGER,
+        detail_ok_count INTEGER CHECK(
+            detail_ok_count IS NULL OR
+            (typeof(detail_ok_count) = 'integer' AND detail_ok_count >= 0)),
+        detail_temporarily_unavailable_count INTEGER CHECK(
+            detail_temporarily_unavailable_count IS NULL OR
+            (typeof(detail_temporarily_unavailable_count) = 'integer' AND
+             detail_temporarily_unavailable_count >= 0)),
+        detail_error_count INTEGER CHECK(
+            detail_error_count IS NULL OR
+            (typeof(detail_error_count) = 'integer' AND detail_error_count >= 0)),
+        failed_detail_scopes_json TEXT CHECK(
+            failed_detail_scopes_json IS NULL OR
+            (json_valid(failed_detail_scopes_json) AND
+             json_type(failed_detail_scopes_json) = 'array')),
+        completion_source_config_revision INTEGER CHECK(
+            completion_source_config_revision IS NULL OR
+            (typeof(completion_source_config_revision) = 'integer' AND
+             completion_source_config_revision > 0)),
+        completion_endpoint_id TEXT,
+        completion_canonical_transport_locator TEXT,
+        completion_canonicalization_contract_version INTEGER CHECK(
+            completion_canonicalization_contract_version IS NULL OR
+            (typeof(completion_canonicalization_contract_version) = 'integer' AND
+             completion_canonicalization_contract_version > 0)),
+        completion_transport_trust_revision INTEGER CHECK(
+            completion_transport_trust_revision IS NULL OR
+            (typeof(completion_transport_trust_revision) = 'integer' AND
+             completion_transport_trust_revision > 0)),
         FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
         FOREIGN KEY(inventory_source_id, expected_endpoint_id)
             REFERENCES source_endpoints(inventory_source_id, endpoint_id),
@@ -800,7 +911,50 @@ _SCHEMA_STATEMENTS = (
                provider_outcome IS NULL AND observed_at IS NULL AND
                normalized_snapshot_hash IS NULL AND baseline_completeness IS NULL) OR
               (lifecycle = 'completed' AND terminalized_at IS NOT NULL AND
-               completed_at IS NOT NULL AND length(trim(provider_outcome)) > 0))
+               completed_at IS NOT NULL AND length(trim(provider_outcome)) > 0)),
+        CHECK(lifecycle = 'completed' OR (
+            observed_at IS NULL AND normalized_snapshot_hash IS NULL AND
+            baseline_completeness IS NULL AND
+            source_availability IS NULL AND baseline_mode IS NULL AND
+            permission_coverage_complete IS NULL AND boundary_consistent IS NULL AND
+            covered_nodes_json IS NULL AND failed_baseline_scopes_json IS NULL AND
+            acl_topology_hash_before IS NULL AND acl_topology_hash_after IS NULL AND
+            permission_snapshot_hash_before IS NULL AND permission_snapshot_hash_after IS NULL AND
+            detail_ok_count IS NULL AND detail_temporarily_unavailable_count IS NULL AND
+            detail_error_count IS NULL AND failed_detail_scopes_json IS NULL AND
+            completion_source_config_revision IS NULL AND completion_endpoint_id IS NULL AND
+            completion_canonical_transport_locator IS NULL AND
+            completion_canonicalization_contract_version IS NULL AND
+            completion_transport_trust_revision IS NULL)),
+        CHECK((detail_ok_count IS NULL AND detail_temporarily_unavailable_count IS NULL AND
+               detail_error_count IS NULL) OR
+              (detail_ok_count IS NOT NULL AND
+               detail_temporarily_unavailable_count IS NOT NULL AND
+               detail_error_count IS NOT NULL)),
+        CHECK((completion_source_config_revision IS NULL AND completion_endpoint_id IS NULL AND
+               completion_canonical_transport_locator IS NULL AND
+               completion_canonicalization_contract_version IS NULL AND
+               completion_transport_trust_revision IS NULL) OR
+              (completion_source_config_revision IS NOT NULL AND
+               length(trim(completion_endpoint_id)) > 0 AND
+               length(trim(completion_canonical_transport_locator)) > 0 AND
+               completion_canonicalization_contract_version IS NOT NULL AND
+               completion_transport_trust_revision IS NOT NULL)),
+        CHECK(lifecycle != 'completed' OR baseline_completeness IS NOT NULL),
+        CHECK(lifecycle != 'completed' OR provider_outcome = 'success' OR
+              length(trim(terminal_reason)) > 0),
+        CHECK(provider_outcome != 'success' OR (
+            terminal_reason IS NULL AND baseline_completeness = 'complete' AND
+            source_availability = 'available' AND baseline_mode IS NOT NULL AND
+            permission_coverage_complete = 1 AND boundary_consistent = 1 AND
+            covered_nodes_json IS NOT NULL AND covered_nodes_json != '[]' AND
+            failed_baseline_scopes_json = '[]' AND
+            acl_topology_hash_before IS NOT NULL AND acl_topology_hash_after IS NOT NULL AND
+            permission_snapshot_hash_before IS NOT NULL AND
+            permission_snapshot_hash_after IS NOT NULL AND
+            normalized_snapshot_hash IS NOT NULL AND detail_ok_count IS NOT NULL AND
+            failed_detail_scopes_json IS NOT NULL AND
+            completion_source_config_revision IS NOT NULL))
     )
     """,
     """

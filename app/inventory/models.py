@@ -141,6 +141,12 @@ class DiscoveryRun:
     observed_at: str | None
     normalized_snapshot_hash: str | None
     baseline_completeness: str | None
+    source_availability: str | None
+    baseline_mode: str | None
+    permission_coverage_complete: bool | None
+    boundary_consistent: bool | None
+    covered_nodes: tuple[str, ...] | None
+    failed_baseline_scopes: tuple[str, ...] | None
     acl_topology_hash_before: str | None
     acl_topology_hash_after: str | None
     permission_snapshot_hash_before: str | None
@@ -148,6 +154,12 @@ class DiscoveryRun:
     detail_ok_count: int | None
     detail_temporarily_unavailable_count: int | None
     detail_error_count: int | None
+    failed_detail_scopes: tuple[str, ...] | None
+    completion_source_config_revision: int | None
+    completion_endpoint_id: str | None
+    completion_canonical_transport_locator: str | None
+    completion_canonicalization_contract_version: int | None
+    completion_transport_trust_revision: int | None
 
 
 @dataclass(frozen=True, slots=True)
