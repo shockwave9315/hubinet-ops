@@ -78,6 +78,21 @@ class AttestationOutcome(StrEnum):
     REJECTED = "rejected"
 
 
+class TierTwoEvaluationStatus(StrEnum):
+    """Explicit, structural tier-2 result distinct from a free-form reason.
+
+    ``NOT_EVALUATED`` covers both "no reader capable of tier-2 verification"
+    and "tier-1-only read, tier 2 never attempted" -- it is never conflated
+    with ``FAILED`` (a genuine chain-verification attempt that did not
+    validate). A failed or not-evaluated tier-2 result never erases an
+    independently valid tier-1 observation (ADR 0003 §10a).
+    """
+
+    NOT_EVALUATED = "not_evaluated"
+    FAILED = "failed"
+    VERIFIED = "verified"
+
+
 class AuthorityError(RuntimeError):
     """Base class for durable authority failures."""
 
@@ -217,6 +232,7 @@ class SourceAttestationState:
     anchor_kind: str | None
     anchor_value: str | None
     evidence_tier: AttestationEvidenceTier | None
+    tier2_evaluation: TierTwoEvaluationStatus | None
     accepted_at: str | None
     accepted_by: str | None
     evaluated_endpoint_id: str | None
@@ -244,6 +260,7 @@ class SourceAttestationEvent:
     expected_source_attestation_epoch: int
     outcome: AttestationOutcome
     evidence_tier: AttestationEvidenceTier | None
+    tier2_evaluation: TierTwoEvaluationStatus | None
     asserted_anchor_kind: str | None
     asserted_anchor_value: str | None
     endpoint_lifecycle_at_check: str | None
@@ -267,6 +284,7 @@ class CandidateAttestationBinding:
     endpoint_id: str
     source_attestation_epoch: int
     evidence_tier: AttestationEvidenceTier
+    tier2_evaluation: TierTwoEvaluationStatus
     endpoint_lifecycle_at_check: str
     canonical_transport_locator: str
     canonicalization_contract_version: int

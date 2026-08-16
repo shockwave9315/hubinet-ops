@@ -170,6 +170,7 @@ class InventoryAuthority:
                     "inventory source must have exactly one active endpoint"
                 )
             endpoint = endpoint_rows[0]
+            attestation = self._require_attestation_row(connection, source_id)
             old_sequence = int(source["last_issued_run_sequence"])
             new_sequence = old_sequence + 1
             updated = connection.execute(
@@ -186,10 +187,11 @@ class InventoryAuthority:
                 "expected_source_config_revision, expected_endpoint_id, "
                 "expected_canonical_transport_locator, "
                 "expected_canonicalization_contract_version, "
-                "expected_transport_trust_revision, provider_contract_version, lifecycle, "
+                "expected_transport_trust_revision, expected_source_attestation_epoch, "
+                "provider_contract_version, lifecycle, "
                 "terminalized_at, terminal_reason, completed_at, provider_outcome, "
                 "observed_at, normalized_snapshot_hash) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'issued', "
                 "NULL, NULL, NULL, NULL, NULL, NULL)",
                 (
                     run_id,
@@ -201,6 +203,7 @@ class InventoryAuthority:
                     str(endpoint["canonical_transport_locator"]),
                     int(endpoint["canonicalization_contract_version"]),
                     int(endpoint["transport_trust_revision"]),
+                    int(attestation["source_attestation_epoch"]),
                     contract_version,
                 ),
             )
@@ -1016,9 +1019,9 @@ class InventoryAuthority:
         connection.execute(
             "INSERT INTO source_attestation_state("
             "inventory_source_id, attestation_status, source_attestation_epoch, "
-            "anchor_kind, anchor_value, evidence_tier, accepted_at, accepted_by, "
-            "evaluated_endpoint_id) "
-            "VALUES(?, 'not_yet_attested', 0, NULL, NULL, NULL, NULL, NULL, NULL)",
+            "anchor_kind, anchor_value, evidence_tier, tier2_evaluation, accepted_at, "
+            "accepted_by, evaluated_endpoint_id) "
+            "VALUES(?, 'not_yet_attested', 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
             (source_id,),
         )
 
@@ -1088,6 +1091,20 @@ class InventoryAuthority:
         ).fetchone()
         if row is None:
             raise AuthorityNotFound("inventory source does not exist")
+        return row
+
+    @staticmethod
+    def _require_attestation_row(
+        connection: sqlite3.Connection, source_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM source_attestation_state WHERE inventory_source_id=?",
+            (source_id,),
+        ).fetchone()
+        if row is None:
+            raise AuthorityInvariantError(
+                "inventory source must have a source attestation state record"
+            )
         return row
 
     @staticmethod

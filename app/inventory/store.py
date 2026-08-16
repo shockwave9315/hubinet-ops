@@ -31,6 +31,7 @@ from .models import (
     SourceAttestationEvent,
     SourceAttestationState,
     SourceAttestationStatus,
+    TierTwoEvaluationStatus,
     SourceEndpoint,
     SourceRuntimeHealth,
     ResourceIncarnation,
@@ -77,8 +78,12 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "binding_identity_immutable",
         "source_attestation_state_identity_immutable",
         "source_attestation_epoch_monotonic",
+        "source_attestation_state_no_delete",
         "source_attestation_events_immutable",
+        "source_attestation_events_no_delete",
         "candidate_attestation_binding_immutable",
+        "candidate_attestation_binding_no_delete",
+        "candidate_attestation_binding_requires_matching_accepted_candidate_event",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -431,7 +436,8 @@ class InventoryAuthorityStore:
             )
         if objects != _REQUIRED_SCHEMA_OBJECTS:
             raise AuthorityDatabaseRejected(
-                "authority database schema objects do not match version 3"
+                "authority database schema objects do not match version "
+                f"{AUTHORITY_SCHEMA_VERSION}"
             )
         if len(backend_rows) != 1 or not _is_canonical_uuid(
             backend_rows[0]["backend_instance_id"]
@@ -797,6 +803,7 @@ def _resource_locator_binding(row: sqlite3.Row) -> ResourceLocatorBinding:
 
 def _source_attestation_state(row: sqlite3.Row) -> SourceAttestationState:
     evidence_tier = row["evidence_tier"]
+    tier2_evaluation = row["tier2_evaluation"]
     return SourceAttestationState(
         inventory_source_id=str(row["inventory_source_id"]),
         attestation_status=SourceAttestationStatus(str(row["attestation_status"])),
@@ -806,6 +813,11 @@ def _source_attestation_state(row: sqlite3.Row) -> SourceAttestationState:
         evidence_tier=(
             AttestationEvidenceTier(str(evidence_tier))
             if evidence_tier is not None
+            else None
+        ),
+        tier2_evaluation=(
+            TierTwoEvaluationStatus(str(tier2_evaluation))
+            if tier2_evaluation is not None
             else None
         ),
         accepted_at=row["accepted_at"],
@@ -843,6 +855,11 @@ def _source_attestation_event(row: sqlite3.Row) -> SourceAttestationEvent:
             if evidence_tier is not None
             else None
         ),
+        tier2_evaluation=(
+            TierTwoEvaluationStatus(str(row["tier2_evaluation"]))
+            if row["tier2_evaluation"] is not None
+            else None
+        ),
         asserted_anchor_kind=row["asserted_anchor_kind"],
         asserted_anchor_value=row["asserted_anchor_value"],
         endpoint_lifecycle_at_check=row["endpoint_lifecycle_at_check"],
@@ -861,6 +878,7 @@ def _candidate_attestation_binding(row: sqlite3.Row) -> CandidateAttestationBind
         endpoint_id=str(row["endpoint_id"]),
         source_attestation_epoch=int(row["source_attestation_epoch"]),
         evidence_tier=AttestationEvidenceTier(str(row["evidence_tier"])),
+        tier2_evaluation=TierTwoEvaluationStatus(str(row["tier2_evaluation"])),
         endpoint_lifecycle_at_check=str(row["endpoint_lifecycle_at_check"]),
         canonical_transport_locator=str(row["canonical_transport_locator"]),
         canonicalization_contract_version=int(
@@ -1253,6 +1271,8 @@ _SCHEMA_STATEMENTS = (
         anchor_kind TEXT CHECK(anchor_kind IS NULL OR anchor_kind = 'pve_root_ca_sha256_fingerprint'),
         anchor_value TEXT,
         evidence_tier TEXT CHECK(evidence_tier IS NULL OR evidence_tier IN ('tier_1', 'tier_2')),
+        tier2_evaluation TEXT CHECK(tier2_evaluation IS NULL OR tier2_evaluation IN (
+            'not_evaluated', 'failed', 'verified')),
         accepted_at TEXT,
         accepted_by TEXT,
         evaluated_endpoint_id TEXT,
@@ -1261,14 +1281,16 @@ _SCHEMA_STATEMENTS = (
             REFERENCES source_endpoints(inventory_source_id, endpoint_id),
         CHECK(
             (attestation_status = 'not_yet_attested' AND anchor_kind IS NULL AND
-             anchor_value IS NULL AND evidence_tier IS NULL AND accepted_at IS NULL AND
-             accepted_by IS NULL AND evaluated_endpoint_id IS NULL)
+             anchor_value IS NULL AND evidence_tier IS NULL AND tier2_evaluation IS NULL AND
+             accepted_at IS NULL AND accepted_by IS NULL AND evaluated_endpoint_id IS NULL)
             OR
             (attestation_status = 'attested' AND source_attestation_epoch >= 1 AND
              anchor_kind IS NOT NULL AND anchor_value IS NOT NULL AND
-             evidence_tier IS NOT NULL AND accepted_at IS NOT NULL AND
+             evidence_tier IS NOT NULL AND tier2_evaluation IS NOT NULL AND
+             accepted_at IS NOT NULL AND
              accepted_by IS NOT NULL AND evaluated_endpoint_id IS NOT NULL)
-        )
+        ),
+        CHECK(tier2_evaluation != 'verified' OR evidence_tier = 'tier_2')
     )
     """,
     """
@@ -1297,6 +1319,8 @@ _SCHEMA_STATEMENTS = (
         outcome TEXT NOT NULL CHECK(outcome IN (
             'match', 'mismatch', 'unavailable', 'malformed', 'stale_cas', 'accepted', 'rejected')),
         evidence_tier TEXT CHECK(evidence_tier IS NULL OR evidence_tier IN ('tier_1', 'tier_2')),
+        tier2_evaluation TEXT CHECK(tier2_evaluation IS NULL OR tier2_evaluation IN (
+            'not_evaluated', 'failed', 'verified')),
         asserted_anchor_kind TEXT,
         asserted_anchor_value TEXT,
         endpoint_lifecycle_at_check TEXT,
@@ -1310,7 +1334,8 @@ _SCHEMA_STATEMENTS = (
         FOREIGN KEY(inventory_source_id, target_endpoint_id)
             REFERENCES source_endpoints(inventory_source_id, endpoint_id),
         FOREIGN KEY(inventory_source_id, expected_endpoint_id)
-            REFERENCES source_endpoints(inventory_source_id, endpoint_id)
+            REFERENCES source_endpoints(inventory_source_id, endpoint_id),
+        CHECK(tier2_evaluation != 'verified' OR evidence_tier = 'tier_2')
     )
     """,
     """
@@ -1321,6 +1346,8 @@ _SCHEMA_STATEMENTS = (
         source_attestation_epoch INTEGER NOT NULL
             CHECK(typeof(source_attestation_epoch) = 'integer' AND source_attestation_epoch >= 1),
         evidence_tier TEXT NOT NULL CHECK(evidence_tier IN ('tier_1', 'tier_2')),
+        tier2_evaluation TEXT NOT NULL CHECK(tier2_evaluation IN (
+            'not_evaluated', 'failed', 'verified')),
         endpoint_lifecycle_at_check TEXT NOT NULL
             CHECK(length(trim(endpoint_lifecycle_at_check)) > 0),
         canonical_transport_locator TEXT NOT NULL,
@@ -1335,7 +1362,8 @@ _SCHEMA_STATEMENTS = (
         FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
         FOREIGN KEY(inventory_source_id, endpoint_id)
             REFERENCES source_endpoints(inventory_source_id, endpoint_id),
-        FOREIGN KEY(event_id) REFERENCES source_attestation_events(event_id)
+        FOREIGN KEY(event_id) REFERENCES source_attestation_events(event_id),
+        CHECK(tier2_evaluation != 'verified' OR evidence_tier = 'tier_2')
     )
     """,
     """
@@ -1439,5 +1467,36 @@ _SCHEMA_STATEMENTS = (
     CREATE TRIGGER candidate_attestation_binding_immutable
     BEFORE UPDATE ON candidate_attestation_bindings
     BEGIN SELECT RAISE(ABORT, 'candidate attestation bindings are immutable audit records'); END
+    """,
+    """
+    CREATE TRIGGER source_attestation_state_no_delete
+    BEFORE DELETE ON source_attestation_state
+    BEGIN SELECT RAISE(ABORT, 'source attestation state is mandatory and cannot be deleted'); END
+    """,
+    """
+    CREATE TRIGGER source_attestation_events_no_delete
+    BEFORE DELETE ON source_attestation_events
+    BEGIN SELECT RAISE(ABORT, 'source attestation events are immutable audit records'); END
+    """,
+    """
+    CREATE TRIGGER candidate_attestation_binding_no_delete
+    BEFORE DELETE ON candidate_attestation_bindings
+    BEGIN SELECT RAISE(ABORT, 'candidate attestation bindings are immutable audit records'); END
+    """,
+    """
+    CREATE TRIGGER candidate_attestation_binding_requires_matching_accepted_candidate_event
+    BEFORE INSERT ON candidate_attestation_bindings
+    WHEN NOT EXISTS (
+        SELECT 1 FROM source_attestation_events e
+        WHERE e.event_id = NEW.event_id
+          AND e.inventory_source_id = NEW.inventory_source_id
+          AND e.target_endpoint_id = NEW.endpoint_id
+          AND e.operation = 'candidate_check'
+          AND e.outcome = 'accepted'
+          AND e.expected_source_attestation_epoch = NEW.source_attestation_epoch
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'candidate attestation binding must originate from a matching accepted candidate_check event'
+    ); END
     """,
 )

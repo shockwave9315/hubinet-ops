@@ -38,6 +38,7 @@ from .models import (
     SourceRuntimeHealth,
     ResourceIncarnation,
     ResourceLocatorBinding,
+    TierTwoEvaluationStatus,
 )
 from .discovery import (
     BaselineCompleteness,
@@ -118,6 +119,7 @@ __all__ = [
     "SourceAvailability",
     "SourceEndpoint",
     "SourceRuntimeHealth",
+    "TierTwoEvaluationStatus",
     "canonicalize_transport_locator",
     "classify_boundary",
     "classify_provider_failure",
