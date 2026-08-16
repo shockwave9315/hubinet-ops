@@ -193,7 +193,7 @@ def test_display_rename_preserves_identity_config_endpoint_and_active_context(
         credential_reference="secret://inventory/primary",
         transport_locator="https://pve.example:8006",
     )
-    run = authority.issue_discovery_run(initial.source.inventory_source_id, 7)
+    run = authority.issue_discovery_run(initial.source.inventory_source_id, 1)
     before_revision = store.backend_instance()
 
     renamed = authority.rename_inventory_source(

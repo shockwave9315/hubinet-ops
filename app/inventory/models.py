@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
+from collections.abc import Mapping
 
 
 class EndpointLifecycle(StrEnum):
@@ -67,6 +69,7 @@ class BackendInstance:
     created_at: str
     inventory_revision: int
     published_state_revision: int
+    published_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +84,9 @@ class InventorySource:
     last_issued_run_sequence: int
     last_committed_run_sequence: int | None
     active_discovery_run_id: str | None
+    provider_contract_version: int
+    freshness_duration_seconds: int
+    facts: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +140,26 @@ class DiscoveryRun:
     provider_outcome: str | None
     observed_at: str | None
     normalized_snapshot_hash: str | None
+    baseline_completeness: str | None
+    source_availability: str | None
+    baseline_mode: str | None
+    permission_coverage_complete: bool | None
+    boundary_consistent: bool | None
+    covered_nodes: tuple[str, ...] | None
+    failed_baseline_scopes: tuple[str, ...] | None
+    acl_topology_hash_before: str | None
+    acl_topology_hash_after: str | None
+    permission_snapshot_hash_before: str | None
+    permission_snapshot_hash_after: str | None
+    detail_ok_count: int | None
+    detail_temporarily_unavailable_count: int | None
+    detail_error_count: int | None
+    failed_detail_scopes: tuple[str, ...] | None
+    completion_source_config_revision: int | None
+    completion_endpoint_id: str | None
+    completion_canonical_transport_locator: str | None
+    completion_canonicalization_contract_version: int | None
+    completion_transport_trust_revision: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,3 +167,50 @@ class InventorySourceState:
     source: InventorySource
     active_endpoint: SourceEndpoint
     runtime_health: SourceRuntimeHealth
+
+
+@dataclass(frozen=True, slots=True)
+class InventoryNode:
+    node_id: str
+    inventory_source_id: str
+    external_node_name: str
+    status: str
+    available: bool
+    facts: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceIncarnation:
+    resource_id: str
+    inventory_source_id: str
+    resource_type: str
+    vmid: int
+    resource_continuity_revision: int
+    name: str
+    status: str
+    current_node_id: str | None
+    last_known_node_id: str | None
+    presence: str
+    lifecycle: str
+    observational_continuity: str
+    security_continuity: str
+    detail_status: str
+    node_availability: str
+    state_level: str
+    active_binding_id: str | None
+    locator_generation: int
+    facts: Mapping[str, Any]
+    termination_reason: str | None
+    successor_resource_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceLocatorBinding:
+    binding_id: str
+    inventory_source_id: str
+    vmid: int
+    locator_generation: int
+    resource_id: str
+    valid_from_run_sequence: int
+    valid_to_run_sequence: int | None
+    closure_reason: str | None
