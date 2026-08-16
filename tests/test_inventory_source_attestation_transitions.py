@@ -137,6 +137,7 @@ def complete_snapshot(
         canonicalization_contract_version=run.expected_canonicalization_contract_version,
         expected_transport_trust_revision=run.expected_transport_trust_revision,
         provider_contract_version=run.provider_contract_version,
+        expected_source_attestation_epoch=run.expected_source_attestation_epoch,
         observed_at=FIXED_NOW.isoformat(),
         source_facts={"release": "9.0"},
         source_availability=SourceAvailability.AVAILABLE,

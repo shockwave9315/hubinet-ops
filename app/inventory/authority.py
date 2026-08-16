@@ -337,8 +337,9 @@ class InventoryAuthority:
             self._require_nonterminal_run(run)
             self._validate_snapshot_issuance(snapshot, run)
             endpoint = self._require_active_endpoint_row(connection, source_id)
+            attestation = self._require_attestation_row(connection, source_id)
 
-            if not self._run_context_is_current(source, endpoint, run):
+            if not self._run_context_is_current(source, endpoint, attestation, run):
                 self._release_run(connection, source_id, canonical_run_id)
                 self._complete_run(
                     connection,
@@ -485,8 +486,9 @@ class InventoryAuthority:
             self._require_exact_run_owner(source, run, source_id, canonical_run_id)
             self._require_nonterminal_run(run)
             endpoint = self._require_active_endpoint_row(connection, source_id)
+            attestation = self._require_attestation_row(connection, source_id)
             sequence = int(run["discovery_run_sequence"])
-            applicable = self._run_context_is_current(source, endpoint, run)
+            applicable = self._run_context_is_current(source, endpoint, attestation, run)
             self._release_run(connection, source_id, canonical_run_id)
             self._complete_run(
                 connection,
@@ -1108,6 +1110,7 @@ class InventoryAuthority:
             )
             source = self._require_source_row(connection, source_id)
             endpoint = self._require_active_endpoint_row(connection, source_id)
+            attestation = self._require_attestation_row(connection, source_id)
             health = connection.execute(
                 "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
                 (source_id,),
@@ -1119,7 +1122,7 @@ class InventoryAuthority:
             return (
                 health["health"] == "healthy"
                 and health["freshness"] == "fresh"
-                and self._committed_context_is_current(source, endpoint, health)
+                and self._committed_context_is_current(source, endpoint, attestation, health)
             )
 
     def _authority_decision_time(self) -> datetime:
@@ -1140,6 +1143,7 @@ class InventoryAuthority:
             (source_id,),
         ).fetchone()
         endpoint = self._require_active_endpoint_row(connection, source_id)
+        attestation = self._require_attestation_row(connection, source_id)
         if health is None or health["freshness"] != "fresh":
             return False
         if (
@@ -1152,7 +1156,7 @@ class InventoryAuthority:
             and health["freshness_valid_until"] != expected_deadline
         ):
             return False
-        if not self._committed_context_is_current(source, endpoint, health):
+        if not self._committed_context_is_current(source, endpoint, attestation, health):
             return False
         reference_value = health["freshness_reference_at"]
         deadline_value = health["freshness_valid_until"]
@@ -1257,8 +1261,17 @@ class InventoryAuthority:
 
     @staticmethod
     def _run_context_is_current(
-        source: sqlite3.Row, endpoint: sqlite3.Row, run: sqlite3.Row
+        source: sqlite3.Row,
+        endpoint: sqlite3.Row,
+        attestation: sqlite3.Row,
+        run: sqlite3.Row,
     ) -> bool:
+        """ADR 0003 §21: source_attestation_epoch is a peer of every other
+        expected-context field here, checked against the exact durable
+        current attestation row -- never against audit history, and never
+        gated by attestation_status/relationship_gate (ordinary read-only
+        discovery is not attestation-gated)."""
+
         return (
             int(source["source_config_revision"]) == int(run["expected_source_config_revision"])
             and str(endpoint["endpoint_id"]) == str(run["expected_endpoint_id"])
@@ -1266,18 +1279,28 @@ class InventoryAuthority:
             and int(endpoint["canonicalization_contract_version"]) == int(run["expected_canonicalization_contract_version"])
             and int(endpoint["transport_trust_revision"]) == int(run["expected_transport_trust_revision"])
             and int(source["provider_contract_version"]) == int(run["provider_contract_version"])
+            and int(attestation["source_attestation_epoch"]) == int(run["expected_source_attestation_epoch"])
         )
 
     @staticmethod
     def _committed_context_is_current(
-        source: sqlite3.Row, endpoint: sqlite3.Row, health: sqlite3.Row
+        source: sqlite3.Row,
+        endpoint: sqlite3.Row,
+        attestation: sqlite3.Row,
+        health: sqlite3.Row,
     ) -> bool:
+        """ADR 0003 §20 Freshness-context participation: committed
+        provenance requires exact equality with current
+        source_attestation_epoch, exactly like every other committed
+        context field -- never gated by relationship_gate."""
+
         return (
             health["committed_source_config_revision"] == source["source_config_revision"]
             and health["committed_endpoint_id"] == endpoint["endpoint_id"]
             and health["committed_canonical_transport_locator"] == endpoint["canonical_transport_locator"]
             and health["committed_canonicalization_contract_version"] == endpoint["canonicalization_contract_version"]
             and health["committed_transport_trust_revision"] == endpoint["transport_trust_revision"]
+            and health["committed_source_attestation_epoch"] == attestation["source_attestation_epoch"]
         )
 
     @staticmethod
@@ -1294,6 +1317,7 @@ class InventoryAuthority:
             snapshot.canonicalization_contract_version,
             snapshot.expected_transport_trust_revision,
             snapshot.provider_contract_version,
+            snapshot.expected_source_attestation_epoch,
         )
         actual = (
             str(run["run_id"]),
@@ -1305,6 +1329,7 @@ class InventoryAuthority:
             int(run["expected_canonicalization_contract_version"]),
             int(run["expected_transport_trust_revision"]),
             int(run["provider_contract_version"]),
+            int(run["expected_source_attestation_epoch"]),
         )
         if expected != actual:
             raise AuthorityConflict("normalized snapshot does not match immutable run issuance context")
