@@ -7,6 +7,7 @@ freshness CAS, one atomic terminal transition. No remote I/O.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -611,3 +612,196 @@ def _fresh_uuid() -> str:
     import uuid
 
     return str(uuid.uuid4())
+
+
+# ---------------------------------------------------------------------------
+# decided_at boundary (corrective pass -- P2 #3)
+# ---------------------------------------------------------------------------
+
+
+def test_decided_at_is_captured_inside_transaction_after_cas(tmp_path: Path, monkeypatch) -> None:
+    """ADR 0004 §19 step 3: `decided_at` must be this transaction's own
+    decision timestamp -- captured only after every CAS precondition has
+    already held inside the authoritative transaction, never before
+    `BEGIN IMMEDIATE` even opened it.
+
+    Deterministic proof, no sleeps: an incrementing sequence clock makes
+    every `self._now()` call return a strictly later tick than the one
+    before it. `_authority_decision_time()` (the freshness-evaluation
+    clock read, §15) is always the *first* clock call inside the
+    transaction; if `decided_at` were still captured before the
+    transaction opens (the pre-corrective-pass bug), its tick would be
+    strictly *older* than the recorded decision_time. This test fails
+    against that old ordering and passes only when `decided_at` is
+    strictly newer.
+    """
+
+    from datetime import timedelta
+
+    ticks = {"n": 0}
+    base = NOW
+
+    def clock() -> datetime:
+        ticks["n"] += 1
+        return base + timedelta(seconds=ticks["n"])
+
+    store = InventoryAuthorityStore(tmp_path / "authority.db", now=clock)
+    authority = InventoryAuthority(store, now=clock)
+    state = authority.create_inventory_source(
+        provider_kind="proxmox",
+        display_name="Primary",
+        credential_reference="secret://inventory/primary",
+        transport_locator="https://pve.example:8006",
+    )
+    source_id = state.source.inventory_source_id
+    resource, witness_run = make_eligible_missing_resource(store, authority, source_id)
+
+    recorded: dict[str, datetime] = {}
+    real_decision_time = authority._authority_decision_time
+
+    def wrapped() -> datetime:
+        value = real_decision_time()
+        recorded.setdefault("decision_time", value)
+        return value
+
+    monkeypatch.setattr(authority, "_authority_decision_time", wrapped)
+
+    result = confirm(authority, source_id, resource, witness_run)
+
+    assert "decision_time" in recorded
+    persisted_decided_at = datetime.fromisoformat(result.removal_authority.decided_at)
+    assert persisted_decided_at > recorded["decision_time"], (
+        "decided_at must be captured strictly after the in-transaction "
+        "freshness clock read, never before BEGIN IMMEDIATE opened"
+    )
+    # Both evidence records carry the identical formal decision timestamp.
+    assert result.absence_attestation.decided_at == result.removal_authority.decided_at
+
+
+# ---------------------------------------------------------------------------
+# Explicit intermediate atomicity injection points (corrective pass -- P3 #1)
+# ---------------------------------------------------------------------------
+#
+# The existing test_injected_failure_before_commit_leaves_no_partial_state
+# (above) already proves the general atomicity guarantee by failing at the
+# very last statement in the transaction. These two tests additionally prove
+# the identical guarantee holds at two named intermediate points the
+# original mission called out explicitly, using a real (non-temp) SQLite
+# trigger installed ad hoc on the test's own database file -- never a
+# production failure-injection API.
+
+
+def _install_raising_trigger(db_path: Path, *, name: str, table: str, event: str, when: str = "") -> None:
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            f"CREATE TRIGGER {name} BEFORE {event} ON {table} {when} "
+            f"BEGIN SELECT RAISE(ABORT, 'test-injected failure at {name}'); END"
+        )
+
+
+def test_injected_failure_after_evidence_before_resource_update(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    resource, witness_run = make_eligible_missing_resource(store, authority, source_id)
+    before = store.list_resources(source_id)[0]
+    before_backend = store.backend_instance()
+
+    _install_raising_trigger(
+        tmp_path / "authority.db",
+        name="test_fail_before_resource_update",
+        table="resource_incarnations",
+        event="UPDATE OF presence",
+        when="WHEN NEW.presence='confirmed_removed'",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="test_fail_before_resource_update"):
+        confirm(authority, source_id, resource, witness_run)
+
+    after = store.list_resources(source_id)[0]
+    after_backend = store.backend_instance()
+    assert after == before
+    assert after_backend == before_backend
+    assert store.resource_termination(resource.resource_id) is None
+    assert store.resource_absence_pointer(resource.resource_id) is not None
+    binding = [b for b in store.list_bindings(source_id) if b.binding_id == resource.active_binding_id][0]
+    assert binding.valid_to_run_sequence is None
+    with store._read_connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM resource_removal_authorities").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM resource_absence_attestations").fetchone()[0] == 0
+
+
+def test_injected_failure_after_binding_closure_before_tombstone(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    resource, witness_run = make_eligible_missing_resource(store, authority, source_id)
+    before = store.list_resources(source_id)[0]
+    before_backend = store.backend_instance()
+
+    _install_raising_trigger(
+        tmp_path / "authority.db",
+        name="test_fail_before_tombstone",
+        table="resource_terminations",
+        event="INSERT",
+        when="WHEN NEW.reason='confirmed_removed'",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="test_fail_before_tombstone"):
+        confirm(authority, source_id, resource, witness_run)
+
+    after = store.list_resources(source_id)[0]
+    after_backend = store.backend_instance()
+    assert after == before
+    assert after_backend == before_backend
+    assert store.resource_termination(resource.resource_id) is None
+    assert store.resource_absence_pointer(resource.resource_id) is not None
+    binding = [b for b in store.list_bindings(source_id) if b.binding_id == resource.active_binding_id][0]
+    assert binding.valid_to_run_sequence is None
+    with store._read_connection() as connection:
+        # Both evidence rows were inserted earlier in this same transaction,
+        # but the later failure still rolls them back too -- one atomic
+        # write, no partial acceptance regardless of how far it progressed.
+        assert connection.execute("SELECT COUNT(*) FROM resource_removal_authorities").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM resource_absence_attestations").fetchone()[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# In-flight pointer cannot authorize removal (corrective pass -- P3 #3)
+# ---------------------------------------------------------------------------
+
+
+def test_dangling_abandoned_run_pointer_cannot_authorize_removal(tmp_path: Path) -> None:
+    """Raw SQL can attach a sampled-absence pointer to a still-active
+    issued/running run (the one legitimate in-flight shape Commit 2's own
+    reconciliation write produces inside its own transaction); that run can
+    then be abandoned, leaving a dangling reference. This must never be
+    usable to authorize Class-C removal -- the authority method's own CAS
+    independently re-validates the witness run's actual final state."""
+
+    store, authority, source_id = make_authority(tmp_path)
+    resource, witness_run = make_eligible_missing_resource(store, authority, source_id)
+    # Re-present, then go missing again with no witness pointer this time,
+    # by directly attaching a raw pointer to a run that never completes.
+    complete_snapshot(store, authority, source_id, resources=(guest(),))
+    complete_snapshot(store, authority, source_id, resources=())
+    resource = store.list_resources(source_id)[0]
+
+    stray_run = authority.issue_discovery_run(source_id, 1)
+    authority.mark_discovery_run_running(source_id, stray_run.run_id)
+    with store._transaction() as connection:
+        connection.execute(
+            "INSERT INTO resource_absence_pointers("
+            "resource_id, inventory_source_id, witness_run_id, "
+            "witness_discovery_run_sequence, updated_at) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(resource_id) DO UPDATE SET witness_run_id=excluded.witness_run_id, "
+            "witness_discovery_run_sequence=excluded.witness_discovery_run_sequence, "
+            "updated_at=excluded.updated_at",
+            (resource.resource_id, source_id, stray_run.run_id, stray_run.discovery_run_sequence, NOW.isoformat()),
+        )
+    authority.abandon_discovery_run(source_id, stray_run.run_id, reason="dangling_witness_test")
+
+    with pytest.raises(AuthorityConflict):
+        confirm(authority, source_id, resource, stray_run)
+
+    # Nothing was authorized; the resource remains exactly as before.
+    unchanged = store.list_resources(source_id)[0]
+    assert unchanged.presence == "missing"
+    assert unchanged.lifecycle == "quarantined"
+    assert store.resource_termination(resource.resource_id) is None

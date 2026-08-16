@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from app.inventory import (
+    AuthorityConflict,
     BaselineCompleteness,
     BaselineMode,
     DetailReadStatus,
@@ -231,7 +232,7 @@ def test_stale_abandoned_worker_cannot_touch_pointer(tmp_path: Path) -> None:
     # A late/fenced worker attempting to finalize successfully is rejected
     # by the exact-ownership check before reconciliation ever runs again.
     stale_snapshot = normalized_snapshot_for(stale_run, source_id, resources=())
-    with pytest.raises(Exception):
+    with pytest.raises(AuthorityConflict, match="not the active source owner"):
         authority.finalize_successful_discovery_run(source_id, stale_run.run_id, stale_snapshot)
 
     pointer_after = store.resource_absence_pointer(resource.resource_id)

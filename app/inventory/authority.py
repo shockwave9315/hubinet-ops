@@ -957,7 +957,6 @@ class InventoryAuthority:
             )
 
         decision_id = _new_uuid()
-        decided_at = _timestamp(self._now())
 
         with self._store._transaction() as connection:
             decision_time = self._authority_decision_time()
@@ -1106,6 +1105,14 @@ class InventoryAuthority:
                 )
 
             # ---- ALL CAS PASSED: one atomic terminal transition (§19) ----
+            # ADR 0004 §19 step 3: the formal decision timestamp is captured
+            # here, only once every precondition has held inside this exact
+            # authoritative transaction -- never before BEGIN IMMEDIATE
+            # actually acquired ownership. Deliberately a separate clock
+            # read from `decision_time` above (which is only the freshness-
+            # evaluation instant, §15); this is the audit closure time, not
+            # a CAS token and never compared for concurrency authority.
+            decided_at = _timestamp(self._now())
             shared_fields = (
                 source_id, res_id, binding_id, vmid, generation, revision,
                 witness_run_id, sequence,

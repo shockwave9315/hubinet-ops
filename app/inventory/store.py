@@ -105,6 +105,10 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "resource_absence_attestation_no_delete",
         "resource_absence_attestation_requires_matching_removal_authority",
         "resource_termination_confirmed_removed_requires_matching_evidence",
+        "resource_termination_immutable",
+        "resource_termination_no_delete",
+        "resource_removal_authority_requires_matching_binding_provenance",
+        "resource_removal_authority_requires_matching_witness_provenance",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -1962,6 +1966,48 @@ _SCHEMA_STATEMENTS = (
     )
     BEGIN SELECT RAISE(ABORT,
         'confirmed_removed termination must match its Class-C decision evidence'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_termination_immutable
+    BEFORE UPDATE ON resource_terminations
+    BEGIN SELECT RAISE(ABORT,
+        'resource terminations are immutable retained terminal/tombstone records'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_termination_no_delete
+    BEFORE DELETE ON resource_terminations
+    BEGIN SELECT RAISE(ABORT,
+        'resource terminations are immutable retained terminal/tombstone records'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_removal_authority_requires_matching_binding_provenance
+    BEFORE INSERT ON resource_removal_authorities
+    WHEN NOT EXISTS (
+        SELECT 1 FROM resource_locator_bindings b
+        WHERE b.binding_id = NEW.binding_id
+          AND b.inventory_source_id = NEW.inventory_source_id
+          AND b.resource_id = NEW.resource_id
+          AND b.vmid = NEW.vmid
+          AND b.locator_generation = NEW.locator_generation
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'removal authority binding provenance does not match one real binding tuple'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_removal_authority_requires_matching_witness_provenance
+    BEFORE INSERT ON resource_removal_authorities
+    WHEN NOT EXISTS (
+        SELECT 1 FROM discovery_runs r
+        WHERE r.run_id = NEW.witness_run_id
+          AND r.inventory_source_id = NEW.inventory_source_id
+          AND r.discovery_run_sequence = NEW.witness_discovery_run_sequence
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'removal authority witness provenance does not match one real discovery run'
     ); END
     """,
 )

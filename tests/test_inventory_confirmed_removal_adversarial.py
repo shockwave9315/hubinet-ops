@@ -530,6 +530,150 @@ def test_absence_attestation_epoch_mismatch_rejected(tmp_path: Path) -> None:
                     decision_id=decision_id, **mismatched)
 
 
+# ---------------------------------------------------------------------------
+# Same-source relational provenance (corrective pass -- P2 #2)
+# ---------------------------------------------------------------------------
+
+
+def _make_two_eligible_missing_resources(store, authority, source_id):
+    enroll(store, authority, source_id)
+    complete_snapshot(store, authority, source_id, resources=(guest(vmid=101), guest(vmid=102)))
+    witness_run = complete_snapshot(store, authority, source_id, resources=())
+    resources = store.list_resources(source_id)
+    r1 = next(r for r in resources if r.vmid == 101)
+    r2 = next(r for r in resources if r.vmid == 102)
+    return r1, r2, witness_run
+
+
+def test_same_source_resource_paired_with_unrelated_binding_rejected(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    r1, r2, witness_run = _make_two_eligible_missing_resources(store, authority, source_id)
+    attestation = store.attestation_state(source_id)
+    fields = _decision_fields(r1, witness_run, attestation, source_id)
+    fields["binding_id"] = r2.active_binding_id  # a real binding, but R2's, not R1's
+    with pytest.raises(sqlite3.IntegrityError, match="binding provenance"):
+        with store._transaction() as connection:
+            _insert(connection, "resource_removal_authorities", evidence_id=_fresh_uuid(),
+                    decision_id=_fresh_uuid(), **fields)
+
+
+def test_correct_resource_binding_wrong_vmid_rejected(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    r1, r2, witness_run = _make_two_eligible_missing_resources(store, authority, source_id)
+    attestation = store.attestation_state(source_id)
+    fields = _decision_fields(r1, witness_run, attestation, source_id)
+    fields["vmid"] = r2.vmid  # a real vmid on this source, but not R1's
+    with pytest.raises(sqlite3.IntegrityError, match="binding provenance"):
+        with store._transaction() as connection:
+            _insert(connection, "resource_removal_authorities", evidence_id=_fresh_uuid(),
+                    decision_id=_fresh_uuid(), **fields)
+
+
+def test_correct_resource_binding_wrong_locator_generation_rejected(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    r1, r2, witness_run = _make_two_eligible_missing_resources(store, authority, source_id)
+    attestation = store.attestation_state(source_id)
+    fields = _decision_fields(r1, witness_run, attestation, source_id)
+    fields["locator_generation"] = r1.locator_generation + 1  # never actually assigned
+    with pytest.raises(sqlite3.IntegrityError, match="binding provenance"):
+        with store._transaction() as connection:
+            _insert(connection, "resource_removal_authorities", evidence_id=_fresh_uuid(),
+                    decision_id=_fresh_uuid(), **fields)
+
+
+def test_real_witness_run_wrong_sequence_rejected(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    resource, witness_run = make_eligible_missing_resource(store, authority, source_id)
+    attestation = store.attestation_state(source_id)
+    fields = _decision_fields(resource, witness_run, attestation, source_id)
+    fields["witness_discovery_run_sequence"] = witness_run.discovery_run_sequence + 1000
+    with pytest.raises(sqlite3.IntegrityError, match="witness provenance"):
+        with store._transaction() as connection:
+            _insert(connection, "resource_removal_authorities", evidence_id=_fresh_uuid(),
+                    decision_id=_fresh_uuid(), **fields)
+
+
+def test_exact_matching_provenance_accepted(tmp_path: Path) -> None:
+    """Positive control: fully consistent resource/binding/witness/context
+    provenance -- both evidence rows and the linked tombstone remain legal."""
+
+    store, authority, source_id = make_authority(tmp_path)
+    resource, witness_run = make_eligible_missing_resource(store, authority, source_id)
+    attestation = store.attestation_state(source_id)
+    fields = _decision_fields(resource, witness_run, attestation, source_id)
+    decision_id = _fresh_uuid()
+    with store._transaction() as connection:
+        _insert(connection, "resource_removal_authorities", evidence_id=_fresh_uuid(),
+                decision_id=decision_id, **fields)
+        _insert(connection, "resource_absence_attestations", evidence_id=_fresh_uuid(),
+                decision_id=decision_id, **fields)
+        connection.execute(
+            "UPDATE resource_locator_bindings SET valid_to_run_sequence=?, "
+            "closure_reason='confirmed_removed' WHERE binding_id=? AND valid_to_run_sequence IS NULL",
+            (witness_run.discovery_run_sequence, resource.active_binding_id),
+        )
+        connection.execute(
+            "INSERT INTO resource_terminations("
+            "resource_id, inventory_source_id, binding_id, locator_generation, reason, "
+            "successor_resource_id, run_sequence, class_c_decision_id, created_at) "
+            "VALUES(?, ?, ?, ?, 'confirmed_removed', NULL, ?, ?, ?)",
+            (resource.resource_id, source_id, resource.active_binding_id,
+             resource.locator_generation, witness_run.discovery_run_sequence, decision_id, NOW.isoformat()),
+        )
+    termination = store.resource_termination(resource.resource_id)
+    assert termination is not None
+    assert termination.class_c_decision_id == decision_id
+
+
+def test_resource_termination_immutable_after_commit(tmp_path: Path) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    resource, witness_run = make_eligible_missing_resource(store, authority, source_id)
+    result = confirm(authority, source_id, resource, witness_run)
+    assert result.termination.reason == "confirmed_removed"
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE resource_terminations SET run_sequence=999999 WHERE resource_id=?",
+                (resource.resource_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with store._transaction() as connection:
+            connection.execute(
+                "DELETE FROM resource_terminations WHERE resource_id=?", (resource.resource_id,)
+            )
+    unchanged = store.resource_termination(resource.resource_id)
+    assert unchanged == result.termination
+
+
+def test_replaced_termination_also_immutable(tmp_path: Path) -> None:
+    """The immutability protection applies to BOTH terminal shapes, not
+    only the new confirmed_removed path -- direct replacement's existing
+    'replaced' tombstones are equally protected."""
+
+    store, authority, source_id = make_authority(tmp_path)
+    complete_snapshot(store, authority, source_id, resources=(guest(kind="lxc"),))
+    old = store.list_resources(source_id)[0]
+    complete_snapshot(store, authority, source_id, resources=(guest(kind="qemu"),))
+    termination = store.resource_termination(old.resource_id)
+    assert termination is not None
+    assert termination.reason == "replaced"
+
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE resource_terminations SET run_sequence=999999 WHERE resource_id=?",
+                (old.resource_id,),
+            )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        with store._transaction() as connection:
+            connection.execute(
+                "DELETE FROM resource_terminations WHERE resource_id=?", (old.resource_id,)
+            )
+    unchanged = store.resource_termination(old.resource_id)
+    assert unchanged == termination
+
+
 def test_current_pointer_remains_updateable_no_append_only_growth(tmp_path: Path) -> None:
     store, authority, source_id = make_authority(tmp_path)
     enroll(store, authority, source_id)
