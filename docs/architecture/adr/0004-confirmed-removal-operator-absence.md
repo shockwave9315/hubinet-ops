@@ -29,8 +29,8 @@ stockowego PVE polling. Dlatego polling-only automatic confirmed_removed
 pozostaje niedostępne.
 ```
 
-This ADR is the "separately accepted" decision ADR 0002's Class C row
-anticipates:
+This ADR proposes the decision ADR 0002's Class C row anticipates as needing
+to be, in its own words, "separately accepted":
 
 ```text
 C: operator confirmation | explicit audited operator decision |
@@ -40,8 +40,10 @@ C: operator confirmation | explicit audited operator decision |
 
 It closes exactly one path — the Class-C explicit-operator path — leaving
 Class A (backend-mediated removal) and Class B (trusted event/cursor proof)
-exactly as unresolved as ADR 0002 left them (§6, §7 below). It is Blocker A's
-architecture closure, in the same sense ADR 0003 was Blocker C's.
+exactly as unresolved as ADR 0002 left them (§6, §7 below). It proposes
+Blocker A's architecture closure, in the same sense ADR 0003 proposed (and
+was later separately accepted as) Blocker C's — this ADR's own acceptance
+is a distinct, not-yet-made decision (Status above).
 
 ## 2. Scope and non-goals
 
@@ -149,8 +151,9 @@ following is re-litigated, weakened, or reinterpreted:
     and is explicitly stated not to substitute for `replaced`
     (`0.5-inventory-model.md`: "`closure_reason=confirmed_removed` jest
     zarezerwowane dla ścieżki z authoritative absence proof i nie zastępuje
-    `replaced`"). This ADR is the accepted proof contract that value has
-    been waiting for since that document was accepted.
+    `replaced`"). This ADR proposes the proof contract that value has been
+    waiting for since that document was accepted; it does not, by its own
+    drafting, supply that proof contract until this ADR is itself accepted.
 20. `resource_terminations` (already implemented on `main`,
     `app/inventory/store.py`) already carries `reason`, `successor_
     resource_id`, `run_sequence`, and is written exactly once per
@@ -394,7 +397,7 @@ machine) and "I am administratively closing this on that basis" (§10,
 human) — must remain structurally separate throughout the implementation,
 never merged into a single derived boolean.
 
-## 12. Witness provenance requirement — retained per-resource/per-run record
+## 12. Witness provenance requirement — two retention shapes, not one
 
 Current resource state `presence=missing` alone is **not** sufficient
 historical provenance for §11's witness, for a concrete, already-observable
@@ -411,29 +414,72 @@ need a security-relevant transition on every poll — but it means the
 resource's own row cannot, by itself, answer "which exact currently-
 committed run re-observed this slot absent," because a later run might
 have committed for entirely unrelated reasons (a different resource
-changed) without ever re-confirming *this* resource's absence at all.
+changed) without ever re-confirming *this* resource's absence at all. §13's
+exact-current-run rule needs an answer to that question at every Class-C
+attempt; this section requires the minimum durable representation that
+actually answers it, no more.
 
-This ADR therefore requires the future implementation package (WAVE A1) to
-retain an **immutable, append-only, per-observation absence-witness
-artifact**, produced by ordinary complete-baseline reconciliation itself
-(not by the Class-C operation), every time a complete-baseline run
-observes a known slot/resource absent — whether that observation is the
-resource's *first* transition into `missing`, or a *reconfirmation* of an
-already-`missing` resource under a later complete baseline. This is a
-narrow, additive extension to existing accepted reconciliation provenance
-capture (ADR 0002 already requires `discovery_run_sequence` and boundary/
-completeness classification to exist per run; this ADR requires that
-provenance to also be durably linked to the specific resource it observed
-absent), not a new removal/absence *decision* — reconciliation continues to
-make no removal decision of its own (§3 item 4/5/6/7 unchanged). See §31
-for the exact WAVE A1 checklist item.
+This ADR distinguishes two structurally different retention needs, and
+requires WAVE A1 to satisfy only what each actually needs — not a single
+undifferentiated append-only log:
 
-After restart, it must be possible to answer, without reconstructing
-anything from mutable current state or wall-clock: "which exact committed
-run, under which exact source context, established the sampled absence
-this operator decision is about to consume?" — by reading this retained
-artifact, never by re-deriving it from `presence=missing` plus the
-source's current `last_committed_run_sequence` alone.
+**A. Current eligible sampled-absence provenance (bounded, mutable-current).**
+For each currently-`missing` resource, the backend must durably know the
+exact most recent successful, complete-baseline committed run that sampled
+that exact slot absent. This provenance must survive restart and must be
+updated **atomically with** the successful reconciliation commit that
+establishes or reconfirms that current absence (an additive, narrow
+extension to existing accepted reconciliation provenance capture — ADR
+0002 already requires `discovery_run_sequence` and boundary/completeness
+classification per run; this requires that provenance to also be durably
+linked to the specific resource it observed absent). It may be represented
+as a single **bounded current pointer/record per resource** — updated in
+place on each reconfirming run, not appended to indefinitely — rather than
+an immutable log growing once per poll for every resource that happens to
+stay ambiguously missing for a long time. It is **not** authority by
+itself (§11), and reconciliation making no removal decision of its own
+remains unchanged (§3 item 4/5/6/7). Required update semantics:
+
+```text
+complete successful run observes a known slot absent:
+  current sampled-absence pointer for that resource -> this exact run
+
+another later complete successful run again observes the same slot absent:
+  current pointer -> the later exact run (overwrites, does not append)
+
+slot becomes present:
+  current sampled-absence eligibility is cleared / marked not eligible
+
+source/context/epoch transition (§15/§16):
+  the retained pointer value may remain for history/diagnostic display, but
+  §13/§15/§16's exact-context/freshness/epoch CAS makes it
+  authority-ineligible until a new eligible witness exists under the new
+  context — this does not weaken §13's rule; it is the same rule applied
+  to a differently-shaped retention record
+```
+
+**B. Immutable consumed terminal evidence.** Only when a Class-C decision
+actually commits (§19) does the exact witness consumed by that decision
+become permanently frozen: §19 step 3 copies/links the exact witness run
+identity and exact source/epoch context into the immutable Class-C
+evidence records, and §19 step 11 links the same into the terminal
+`resource_terminations` record. This is the only place an unbounded,
+permanently-retained, one-row-per-terminal-decision artifact is required —
+identical in retention cost to every other terminal/audit record this
+repository already accepts (§27).
+
+After restart, it must always be possible to answer, without
+reconstructing anything from mutable current state or wall-clock: (1) for
+a still-`missing`, not-yet-decided resource — "which exact currently
+eligible run last sampled this slot absent?" (retention shape A); and (2)
+for an already-`confirmed_removed` resource — "which exact discovery run
+supplied the sampled absence, under which exact source context and
+`source_attestation_epoch`, and which exact Class-C decision consumed it?"
+(retention shape B, permanently). Neither answer may ever be re-derived
+from `presence=missing` plus the source's current `last_committed_run_
+sequence` alone. §13's exact-current-run CAS rule is unweakened by this
+distinction — it is satisfied by shape A's bounded pointer exactly as it
+would have been by an unbounded log, at a fraction of the retention cost.
 
 ## 13. Current-witness fencing — exact CAS rule
 
@@ -651,7 +697,8 @@ Class-C entry point:
 One atomic backend authority transaction, for WAVE A1 to implement exactly,
 with no security-policy decision left open for that future package to
 invent. It must, inside one transaction, first re-validate every expected
-context captured in §13/§15/§16/§17 by exact CAS, and only then atomically:
+context captured in §13/§14/§15/§16/§17 by exact CAS, and only then
+atomically:
 
 ```text
 1.  persist an immutable Class-C positive-removal-authority record (§9)
@@ -662,19 +709,34 @@ context captured in §13/§15/§16/§17 by exact CAS, and only then atomically:
       - exact active binding_id
       - exact locator_generation
       - exact pre-transition resource_continuity_revision
-      - exact witness discovery_run_sequence / witness artifact (§12)
+      - exact witness discovery_run_sequence / witness artifact (§12) —
+        this is the **sampled-absence observation** provenance only (§20);
+        it is not, and must never be treated as, the timing of the closure
+        itself
       - exact source context (§15)
       - exact source_attestation_epoch (§16)
-      - exact actor / decision provenance (operator identity, timestamp,
-        audited reason text)
-4.  close the exact active locator binding: valid_to_run_sequence = the
-    witness run's discovery_run_sequence, closure_reason='confirmed_removed'
-    (the value already reserved for this exact path in
-    0.5-inventory-model.md, §3 item 19 — never 'replaced')
-5.  use the witness run's discovery_run_sequence as the observation/closure
-    provenance wherever the existing binding/termination model already
-    requires a run_sequence (mirrors the existing direct-replacement
-    pattern exactly, app/inventory/reconciliation.py::_replace_resource)
+      - exact actor / decision provenance: operator identity, **this
+        transaction's own decision timestamp**, and audited reason text —
+        this is the **formal authority-closure** provenance (§20); it is
+        the only durable record of when and by whom the binding actually
+        closed
+4.  close the exact active locator binding: `closure_reason=
+    'confirmed_removed'` (the value already reserved for this exact path
+    in 0.5-inventory-model.md, §3 item 19 — never 'replaced'); the schema's
+    existing `valid_to_run_sequence` column is populated with the witness
+    run's `discovery_run_sequence` as **retained observation provenance
+    only** (§20) — this column must never be read, described, or
+    implemented as recording when the binding was formally closed, only as
+    recording which exact machine observation the later closure decision
+    was based on
+5.  the witness run's `discovery_run_sequence` (step 4) is never treated as
+    a stand-in for this transaction's own identity: the discovery-run
+    namespace is never written to, incremented, or fabricated by this
+    transaction (step 14), and any other place the existing binding/
+    termination model already requires a run_sequence-shaped value is
+    populated with the same witness value under the identical "observation
+    provenance only" caveat as step 4 — never described as "this
+    transaction's own sequence," because this transaction has none
 6.  advance resource_continuity_revision exactly once for this one accepted
     terminal security/continuity decision (ADR 0001's existing rule: one
     atomic decision changing several fields advances the token once, never
@@ -698,14 +760,20 @@ context captured in §13/§15/§16/§17 by exact CAS, and only then atomically:
     this ADR adds no new security_continuity value, exactly as ADR 0003
     §20's own "Representation boundary" already forbids doing for its own
     epoch-bump transition)
-11. persist retained termination/tombstone provenance by writing (or
-    extending, if implementation reuses the existing single-row-per-
-    resource_id resource_terminations table) a terminal record with
-    reason='confirmed_removed', successor_resource_id=NULL, and links to
-    the two new evidence records from steps 1-2 and the witness artifact
-    from step 12/§12 — mirroring the shape resource_terminations already
-    uses for the existing 'replaced' path, never inventing a second,
-    parallel tombstone concept
+11. persist retained termination/tombstone provenance by writing the
+    existing single-row-per-resource_id `resource_terminations` record
+    (extended as needed for step 3's linkage fields — exact column shape
+    is a WAVE A1 implementation detail, §30 item 1) with
+    reason='confirmed_removed', successor_resource_id=NULL,
+    run_sequence=the witness run's `discovery_run_sequence` (observation
+    provenance only, identical caveat as step 4), and durable links to the
+    two new evidence records from steps 1-2 — which themselves carry this
+    transaction's own actor/timestamp per step 3, i.e. the actual
+    authority-closure provenance. `resource_terminations` is the single,
+    normative terminal/tombstone owner for this path, exactly as it
+    already is for the existing 'replaced' path (§3 item 20); this ADR
+    requires WAVE A1 to reuse it and forbids inventing a second, parallel
+    tombstone concept
 12. make every effective mutation/policy/maintenance capability ineligible
     according to the already-accepted resource terminal contract (ADR
     0001's existing "stored policy = retained, effective/applicable
@@ -738,18 +806,64 @@ mechanism, not a new one.
 
 ## 20. Binding closure semantics
 
-The active `resource_locator_bindings` row is closed exactly once, using
-the witness run's `discovery_run_sequence` as `valid_to_run_sequence` (§19
-step 4/5) — never the wall-clock decision time, and never a synthetic
-sequence value invented for the occasion; the closure is provenance-linked
-to the same accepted, currently-committed run the absence witness (§11) was
-drawn from, keeping "when the slot was last observed absent" and "when the
-binding formally closed" as the same, single, auditable point rather than
-two independently-drifting timestamps. `closure_reason='confirmed_removed'`
-is structurally distinct from `closure_reason='replaced'` (§3 item 19); a
-validator/contract test must reject a `confirmed_removed` closure that
-coexists with a `successor_resource_id` on the same terminal record (§18),
-exactly as the existing model already separates the two paths.
+**Two distinct provenance moments must never be conflated, and this section
+is the ADR's own normative closure decision for how they are represented:**
+
+**A. Sampled-absence observation** — the exact discovery run `N` (§11) that
+observed the slot absent. This is machine observation provenance only.
+
+**B. Formal authority closure** — the later, separate, atomic Class-C
+operator authority transaction (§19) that actually closes the binding and
+actually sets `presence=confirmed_removed`. This is when the closure
+*happens*, and who/what authorized it.
+
+These are not the same moment, and — unlike ADR 0002's existing direct-
+replacement path, where the binding closure is written by the *same*
+reconciliation transaction that owns run `N`'s own `discovery_run_sequence`
+(`app/inventory/reconciliation.py::_replace_resource`, a genuinely
+contemporaneous write) — this ADR's Class-C path does **not** mirror that
+pattern: the closing transaction here is a separate, later, non-discovery-
+run transaction with no `discovery_run_sequence` of its own (§19 step 14
+forbids fabricating one), reaching back to reuse witness run `N`'s
+already-committed, historical sequence value purely as retained
+observation provenance.
+
+**Normative representation decision:** the active `resource_locator_
+bindings` row is closed exactly once; its existing `valid_to_run_sequence`
+column is populated with the witness run's `discovery_run_sequence` (§19
+step 4), but that value means **only** "the sampled-absence observation
+this closure was based on," never "the run whose own reconciliation
+transaction performed this closure." Between run `N`'s commit and the
+later Class-C authority commit, the binding remains genuinely open/live in
+durable backend state — ADR 0002's already-accepted rule that `missing`/
+`quarantined` never itself closes the binding is not violated or
+reinterpreted by this ADR; the binding is closed only when, and exactly
+when, the Class-C transaction (§19) commits.
+
+Because `valid_to_run_sequence` alone cannot distinguish these two moments
+after the fact, WAVE A1 must retain the actual authority-decision
+provenance separately and durably: §19 step 3 already requires this
+transaction's own actor identity, decision timestamp, and audited reason
+to be recorded on the two new evidence records (§9, §10), and §19 step 11
+requires `resource_terminations` to durably link to those same records.
+No new global sequence and no new `resource_locator_bindings` column are
+required for this — the existing evidence/termination records already
+carry the actual closure identity/timestamp/actor once §19's requirements
+are implemented — but WAVE A1 must not omit that linkage, because without
+it, `valid_to_run_sequence=N` alone would let a future reader incorrectly
+conclude "binding was formally closed by discovery run `N`" when the true
+history is "run `N` observed absence; a later, separate operator decision
+`D` closed the binding." After restart, audit must be able to answer both
+"which run supplied the sampled absence" (via `valid_to_run_sequence`/the
+witness artifact, §12) **and** "which exact decision, by whom, at what
+time, actually closed this binding" (via the linked evidence records) as
+two separate, non-conflated answers.
+
+`closure_reason='confirmed_removed'` is structurally distinct from
+`closure_reason='replaced'` (§3 item 19); a validator/contract test must
+reject a `confirmed_removed` closure that coexists with a
+`successor_resource_id` on the same terminal record (§18), exactly as the
+existing model already separates the two paths.
 
 ## 21. Revision semantics
 
@@ -781,13 +895,14 @@ potentially different state — the exact TOCTOU class ADR 0002's
 pattern already exist specifically to close for every other controlled
 transition in this repository.
 
-The accepted design for WAVE A1: the Class-C positive-removal-authority
-record (§9), the operator absence-attestation record (§10), and the
-terminal transition (§19) are **one atomic authority decision** — a single
-backend authority-commit transaction that re-validates every precondition
-(§13, §14, §15, §16, §17) immediately before writing anything, and either
-commits the complete decision or writes nothing at all. There is no
-accepted "staged token" alternative for this initial path; if a future
+The design this ADR proposes for WAVE A1, if accepted: the Class-C
+positive-removal-authority record (§9), the operator absence-attestation
+record (§10), and the terminal transition (§19) are **one atomic authority
+decision** — a single backend authority-commit transaction that re-validates
+every precondition (§13, §14, §15, §16, §17) immediately before writing
+anything, and either commits the complete decision or writes nothing at
+all. This ADR does not propose a "staged token" alternative for this
+initial path; if a future
 package genuinely needs a longer-running, multi-step variant, it must
 follow ADR 0003 §19a's exact discipline (context captured before any
 remote/slow step, re-validated by CAS immediately before the write, no
@@ -971,6 +1086,7 @@ whether `presence` becomes `confirmed_removed` in that scenario.
 | P | Newer successful discovery committed before click/commit | rejected | §13, §24 row 4 — exact-equality CAS fails | none | unchanged | unchanged | No |
 | Q | Active discovery in flight for the source at commit time | rejected/retry | §14, §24 row 5 | none | unchanged | unchanged | No |
 | R | Source freshness expires before commit | rejected | §15, §24 row 12 | none | unchanged | unchanged | No |
+| R2 | Sampled absence witness `N` exists, no newer *successful* inventory commit occurs, but a newer applicable failed/partial/source_unavailable/invalid discovery outcome makes current source health non-fresh/degraded before the Class-C decision | rejected | §15's current-freshness prerequisite fails even though `last_committed_run_sequence` still equals `N` (§24 row 13) — a non-committing outcome does not advance `last_committed_run_sequence` so §13's exact-equality check alone would not catch it; §15's independent freshness requirement does | none | unchanged | unchanged | No |
 | S | Source config/transport-trust/canonicalization changes before commit | rejected | §15, §24 rows 6-9 | none | unchanged | unchanged | No |
 | T | Source attestation epoch changes before commit | rejected | §16 item 3, §24 row 10 | none | unchanged | unchanged | No |
 | U | Source attestation `mismatch_pending_reattestation` gate pending | rejected | §16 item 2, §24 row 11 | none | unchanged | unchanged | No |
@@ -1072,22 +1188,36 @@ decisions below so that package has none left to invent:
   0.5 remains entirely dormant; old `v4` databases may be rejected fail-
   closed by WAVE A1 exactly as `v1`/`v2`/`v3` already are; production 0.4
   data must never be touched or auto-migrated by any part of this work);
-- an immutable, append-only sampled-absence-witness artifact, produced by
-  ordinary complete-baseline reconciliation itself (extending, not
-  replacing, the existing accepted `missing` transition — §12), retained
-  per resource/per confirming run, queryable after restart without
-  reconstructing anything from mutable current state;
+- a bounded, current, per-resource sampled-absence provenance pointer,
+  produced/updated by ordinary complete-baseline reconciliation itself
+  (extending, not replacing, the existing accepted `missing` transition —
+  §12 retention shape A), overwritten on each reconfirming run rather than
+  appended to indefinitely, queryable after restart without reconstructing
+  anything from mutable current state;
 - an immutable Class-C positive-removal-authority record (§9), structurally
-  separate from the below;
+  separate from the below, carrying this transaction's own actor/decision
+  timestamp/reason (§19 step 3, §20);
 - an immutable operator absence-attestation record (§10), structurally
   separate from the above — this ADR requires two separate durable record
   concepts, never one merged "operator confirmed removal" row (§4, §28 rows
   H/I);
-- retained linkage from both new records, and from the absence-witness
-  artifact, to the existing `resource_terminations`/tombstone record,
-  reusing its existing shape (`reason`, `successor_resource_id`,
-  `run_sequence`) rather than inventing a parallel tombstone concept (§19
-  step 11, §3 items 19-20);
+- at Class-C commit time only, the exact witness consumed (run identity,
+  source/epoch context) becomes permanently frozen/linked into those two
+  immutable evidence records (§12 retention shape B) — this permanent,
+  one-row-per-terminal-decision linkage is the only unbounded retention
+  this ADR requires;
+- retained linkage from both new evidence records to the existing
+  `resource_terminations`/tombstone record, which this ADR **normatively
+  requires** WAVE A1 to reuse (not merely permits it to reuse) as the
+  single terminal/tombstone owner for this path, extending its existing
+  shape (`reason`, `successor_resource_id`, `run_sequence`) as needed for
+  the new linkage fields rather than inventing a parallel tombstone concept
+  (§19 step 11, §20, §3 items 19-20); `resource_terminations.run_sequence`
+  is populated with the witness run's sequence under the identical
+  "observation provenance only, never closure-timing" caveat as the
+  binding's own `valid_to_run_sequence` (§20) — the actual closure identity/
+  timestamp/actor lives on the linked evidence records, never implied by
+  `run_sequence` alone;
 - an explicit `InventoryAuthority` Class-C confirmation operation, taking
   the operator's targeting/reason input and performing the exact atomic
   transition of §19 in one `BEGIN IMMEDIATE` transaction, following the
@@ -1104,10 +1234,14 @@ decisions below so that package has none left to invent:
   does the right thing once the old binding is closed and the old resource
   is terminal; WAVE A1 only needs contract tests proving this, not new
   reconciliation code);
-- restart/retention/immutability tests for all three new record concepts,
+- restart/retention/immutability tests for both new immutable evidence
+  record concepts (§9, §10) and the `resource_terminations` linkage,
   mirroring the existing `source_attestation_events`/`candidate_
   attestation_bindings` test discipline WAVE C1 already established
-  (immutable, delete-blocked, retained across reopen);
+  (immutable, delete-blocked, retained across reopen), plus separate
+  restart-survival (not immutability) tests for the bounded current
+  sampled-absence pointer, which is durable but intentionally mutable
+  (§12 retention shape A);
 - the full adversarial matrix of §28, translated into concrete negative-
   witness tests, plus the sixteen normative decisions of §29 as positive/
   negative contract tests;
