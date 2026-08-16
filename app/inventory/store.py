@@ -1857,13 +1857,20 @@ _SCHEMA_STATEMENTS = (
     CREATE TRIGGER resource_absence_pointer_requires_successful_witness_run
     BEFORE INSERT ON resource_absence_pointers
     WHEN NOT EXISTS (
-        SELECT 1 FROM discovery_runs
-        WHERE run_id = NEW.witness_run_id
-          AND inventory_source_id = NEW.inventory_source_id
-          AND discovery_run_sequence = NEW.witness_discovery_run_sequence
-          AND lifecycle = 'completed'
-          AND provider_outcome = 'success'
-          AND baseline_completeness = 'complete'
+        SELECT 1 FROM discovery_runs r
+        WHERE r.run_id = NEW.witness_run_id
+          AND r.inventory_source_id = NEW.inventory_source_id
+          AND r.discovery_run_sequence = NEW.witness_discovery_run_sequence
+          AND (
+            (r.lifecycle = 'completed' AND r.provider_outcome = 'success'
+             AND r.baseline_completeness = 'complete')
+            OR
+            (r.lifecycle IN ('issued', 'running') AND EXISTS (
+                SELECT 1 FROM inventory_sources s
+                WHERE s.inventory_source_id = r.inventory_source_id
+                  AND s.active_discovery_run_id = r.run_id
+            ))
+          )
     )
     BEGIN SELECT RAISE(ABORT,
         'sampled-absence pointer must reference a successful complete witness run'
@@ -1873,13 +1880,20 @@ _SCHEMA_STATEMENTS = (
     CREATE TRIGGER resource_absence_pointer_requires_successful_witness_run_update
     BEFORE UPDATE OF witness_run_id, witness_discovery_run_sequence ON resource_absence_pointers
     WHEN NOT EXISTS (
-        SELECT 1 FROM discovery_runs
-        WHERE run_id = NEW.witness_run_id
-          AND inventory_source_id = NEW.inventory_source_id
-          AND discovery_run_sequence = NEW.witness_discovery_run_sequence
-          AND lifecycle = 'completed'
-          AND provider_outcome = 'success'
-          AND baseline_completeness = 'complete'
+        SELECT 1 FROM discovery_runs r
+        WHERE r.run_id = NEW.witness_run_id
+          AND r.inventory_source_id = NEW.inventory_source_id
+          AND r.discovery_run_sequence = NEW.witness_discovery_run_sequence
+          AND (
+            (r.lifecycle = 'completed' AND r.provider_outcome = 'success'
+             AND r.baseline_completeness = 'complete')
+            OR
+            (r.lifecycle IN ('issued', 'running') AND EXISTS (
+                SELECT 1 FROM inventory_sources s
+                WHERE s.inventory_source_id = r.inventory_source_id
+                  AND s.active_discovery_run_id = r.run_id
+            ))
+          )
     )
     BEGIN SELECT RAISE(ABORT,
         'sampled-absence pointer must reference a successful complete witness run'

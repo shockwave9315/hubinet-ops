@@ -314,12 +314,53 @@ def test_pointer_requires_matching_source_run(tmp_path: Path) -> None:
 
 
 def test_pointer_requires_successful_witness_run(tmp_path: Path) -> None:
+    """A run that completed WITHOUT success is never an eligible witness.
+
+    (A merely issued/running run that is the exact current active owner IS
+    schema-accepted -- that is the one legitimate in-flight case Commit 2's
+    reconciliation write uses, atomically inside the same transaction that
+    is about to mark it successful; Commit 3's own CAS is the real
+    authority-time re-validation against whatever the run's *final* state
+    turns out to be.)
+    """
+
+    from app.inventory import DiscoveryRunCompletionEvidence, BaselineCompleteness as _BC
+
     store, authority, source_id = create_authority(tmp_path)
     enroll(store, authority, source_id)
     complete_snapshot(store, authority, source_id, resources=(guest(),))
     resource = store.list_resources(source_id)[0]
-    # Issue but never complete a second run -- not a successful witness.
     run = authority.issue_discovery_run(source_id, 1)
+    authority.finalize_failed_discovery_run(
+        source_id,
+        run.run_id,
+        completion_evidence=DiscoveryRunCompletionEvidence(
+            baseline_completeness=_BC.SOURCE_UNAVAILABLE
+        ),
+        reason="source_unreachable",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with store._transaction() as connection:
+            insert_pointer(
+                connection,
+                resource_id=resource.resource_id,
+                inventory_source_id=source_id,
+                witness_run_id=run.run_id,
+                witness_discovery_run_sequence=run.discovery_run_sequence,
+            )
+
+
+def test_pointer_rejects_run_not_owned_or_completed(tmp_path: Path) -> None:
+    """An issued run that is NOT the exact current active owner (already
+    fenced/abandoned) is never an eligible witness, successful or not."""
+
+    store, authority, source_id = create_authority(tmp_path)
+    enroll(store, authority, source_id)
+    complete_snapshot(store, authority, source_id, resources=(guest(),))
+    resource = store.list_resources(source_id)[0]
+    run = authority.issue_discovery_run(source_id, 1)
+    authority.abandon_discovery_run(source_id, run.run_id, reason="test_abandon")
 
     with pytest.raises(sqlite3.IntegrityError):
         with store._transaction() as connection:
@@ -397,8 +438,10 @@ def test_removal_authority_and_absence_attestation_persist_and_round_trip(tmp_pa
     with store._transaction() as connection:
         decision_id = insert_matching_decision(connection, fields)
 
-    # never touched by schema-level fixtures in this test
-    assert store.resource_absence_pointer(resource.resource_id) is None
+    # make_missing_resource's own successful reconciliation run already
+    # created a current sampled-absence pointer (Commit 2); inserting the
+    # schema-level evidence fixture here does not itself touch it.
+    assert store.resource_absence_pointer(resource.resource_id) is not None
 
     removal_rows = [
         row for row in _fetch_all(store, "resource_removal_authorities") if row["decision_id"] == decision_id
