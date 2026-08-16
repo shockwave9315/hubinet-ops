@@ -26,6 +26,7 @@ from .models import (
     AuthorityConflict,
     AuthorityInvariantError,
     AuthorityNotFound,
+    ConfirmedRemovalResult,
     DiscoveryRun,
     DiscoveryRunLifecycle,
     InventorySourceState,
@@ -891,6 +892,300 @@ class InventoryAuthority:
             )
         return self._store.attestation_event(event_id)
 
+    def confirm_class_c_resource_removal(
+        self,
+        inventory_source_id: str,
+        resource_id: str,
+        *,
+        expected_binding_id: str,
+        expected_vmid: int,
+        expected_locator_generation: int,
+        expected_resource_continuity_revision: int,
+        expected_witness_run_id: str,
+        expected_witness_discovery_run_sequence: int,
+        actor: str,
+        confirms_removal: bool,
+        attests_absence: bool,
+        reason: str,
+    ) -> ConfirmedRemovalResult:
+        """Implement ADR 0004's Class-C confirmed-removal atomic decision.
+
+        Requires TWO explicit, separately-typed operator assertions
+        (``confirms_removal`` -- §9 positive removal authority --
+        and ``attests_absence`` -- §10 operator authoritative-absence
+        attestation); neither is ever inferred from the other, and both
+        must be exactly ``True`` (a truthy string/int never counts). The
+        caller must target the exact incarnation by
+        ``resource_id``/``expected_binding_id``/``expected_vmid``/
+        ``expected_locator_generation``/
+        ``expected_resource_continuity_revision`` -- VMID alone is never a
+        sufficient target (§9, §18). No remote I/O occurs.
+
+        One local ``BEGIN IMMEDIATE`` authority transaction re-validates,
+        by exact CAS, every source/source-attestation/resource/binding/
+        witness precondition ADR 0004 §14-§17 requires before writing
+        anything (§19). Any mismatch rejects the operation and writes
+        nothing -- the operator must re-review current state and retry
+        (§13, §22); there is no partial acceptance and no staged token.
+        """
+
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        res_id = _require_uuid(resource_id, "resource_id")
+        binding_id = _require_uuid(expected_binding_id, "expected_binding_id")
+        witness_run_id = _require_uuid(expected_witness_run_id, "expected_witness_run_id")
+        vmid = _require_positive_integer(expected_vmid, "expected_vmid")
+        generation = _require_positive_integer(
+            expected_locator_generation, "expected_locator_generation"
+        )
+        revision = _require_positive_integer(
+            expected_resource_continuity_revision, "expected_resource_continuity_revision"
+        )
+        sequence = _require_positive_integer(
+            expected_witness_discovery_run_sequence, "expected_witness_discovery_run_sequence"
+        )
+        actor_text = _require_text(actor, "actor", max_length=200)
+        reason_text = _require_text(reason, "reason", max_length=500)
+        if type(confirms_removal) is not bool or confirms_removal is not True:
+            raise ValueError(
+                "confirms_removal must be an explicit boolean True -- Class-C positive "
+                "removal authority is never inferred"
+            )
+        if type(attests_absence) is not bool or attests_absence is not True:
+            raise ValueError(
+                "attests_absence must be an explicit boolean True -- the operator "
+                "authoritative-absence attestation is never inferred"
+            )
+
+        decision_id = _new_uuid()
+        decided_at = _timestamp(self._now())
+
+        with self._store._transaction() as connection:
+            decision_time = self._authority_decision_time()
+            self._materialize_due_expiry_in_transaction(connection, source_id, now=decision_time)
+            source = self._require_source_row(connection, source_id)
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+            attestation = self._require_attestation_row(connection, source_id)
+
+            # ---- SOURCE CAS: no active discovery owner (§14) ----
+            if source["active_discovery_run_id"] is not None:
+                raise AuthorityConflict(
+                    "confirmed removal requires no active discovery owner for this source"
+                )
+
+            # ---- SOURCE ATTESTATION CAS (§16) ----
+            if str(attestation["attestation_status"]) != "attested":
+                raise AuthorityConflict(
+                    "confirmed removal requires the source to be currently attested"
+                )
+            if str(attestation["relationship_gate"]) != "clear":
+                raise AuthorityConflict(
+                    "confirmed removal requires a clear attestation relationship gate"
+                )
+
+            # ---- RESOURCE CAS (§17) ----
+            resource = self._require_resource_row(connection, source_id, res_id)
+            if str(resource["presence"]) != "missing":
+                raise AuthorityConflict("resource is not currently missing")
+            if str(resource["lifecycle"]) != "quarantined":
+                raise AuthorityConflict("resource is not currently quarantined")
+            if int(resource["vmid"]) != vmid:
+                raise AuthorityConflict("expected VMID does not match the current resource")
+            if int(resource["resource_continuity_revision"]) != revision:
+                raise AuthorityConflict(
+                    "expected resource_continuity_revision is stale"
+                )
+            if connection.execute(
+                "SELECT 1 FROM resource_terminations WHERE resource_id=?", (res_id,)
+            ).fetchone() is not None:
+                raise AuthorityConflict("resource already has a terminal decision")
+
+            binding = connection.execute(
+                "SELECT * FROM resource_locator_bindings WHERE resource_id=? "
+                "AND inventory_source_id=? AND valid_to_run_sequence IS NULL",
+                (res_id, source_id),
+            ).fetchone()
+            if binding is None:
+                raise AuthorityConflict("resource has no open active binding")
+            if str(binding["binding_id"]) != binding_id:
+                raise AuthorityConflict("expected binding_id is stale")
+            if int(binding["locator_generation"]) != generation:
+                raise AuthorityConflict("expected locator_generation is stale")
+            if int(binding["vmid"]) != vmid:
+                raise AuthorityInvariantError(
+                    "active binding vmid does not match its resource's vmid"
+                )
+            foreign_occupant = connection.execute(
+                "SELECT 1 FROM resource_locator_bindings WHERE inventory_source_id=? "
+                "AND vmid=? AND valid_to_run_sequence IS NULL AND resource_id != ?",
+                (source_id, vmid, res_id),
+            ).fetchone()
+            if foreign_occupant is not None:
+                raise AuthorityInvariantError(
+                    "slot has another active occupant; violates locator uniqueness"
+                )
+
+            # ---- WITNESS CAS (§11-§13) ----
+            pointer = connection.execute(
+                "SELECT * FROM resource_absence_pointers WHERE resource_id=? "
+                "AND inventory_source_id=?",
+                (res_id, source_id),
+            ).fetchone()
+            if pointer is None:
+                raise AuthorityConflict(
+                    "resource has no current eligible sampled-absence witness"
+                )
+            if str(pointer["witness_run_id"]) != witness_run_id:
+                raise AuthorityConflict("expected sampled-absence witness run is stale")
+            if int(pointer["witness_discovery_run_sequence"]) != sequence:
+                raise AuthorityInvariantError(
+                    "sampled-absence pointer sequence does not match its witness run"
+                )
+            witness_run = connection.execute(
+                "SELECT * FROM discovery_runs WHERE run_id=? AND inventory_source_id=?",
+                (witness_run_id, source_id),
+            ).fetchone()
+            if witness_run is None:
+                raise AuthorityInvariantError(
+                    "sampled-absence witness run does not exist for this source"
+                )
+            if (
+                str(witness_run["lifecycle"]) != "completed"
+                or str(witness_run["provider_outcome"]) != "success"
+                or str(witness_run["baseline_completeness"]) != "complete"
+                or str(witness_run["source_availability"]) != "available"
+                or int(witness_run["permission_coverage_complete"]) != 1
+                or int(witness_run["boundary_consistent"]) != 1
+            ):
+                raise AuthorityConflict(
+                    "sampled-absence witness is not a successful, complete, "
+                    "boundary-consistent baseline run"
+                )
+            if (
+                source["last_committed_run_sequence"] is None
+                or int(source["last_committed_run_sequence"]) != sequence
+            ):
+                raise AuthorityConflict(
+                    "sampled-absence witness is not the exact currently committed run"
+                )
+            if int(witness_run["completion_source_attestation_epoch"]) != int(
+                attestation["source_attestation_epoch"]
+            ):
+                raise AuthorityConflict(
+                    "sampled-absence witness was not committed under the exact "
+                    "current source_attestation_epoch"
+                )
+
+            # ---- CURRENT FRESHNESS CAS (§15) ----
+            health = connection.execute(
+                "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+                (source_id,),
+            ).fetchone()
+            if health is None:
+                raise AuthorityInvariantError("source runtime health is missing")
+            if health["health"] != "healthy" or health["freshness"] != "fresh":
+                raise AuthorityConflict(
+                    "source is not currently fresh for a mutation-eligible decision"
+                )
+            if not self._committed_context_is_current(source, endpoint, attestation, health):
+                raise AuthorityConflict(
+                    "committed source context has changed since the witness was established"
+                )
+            if (
+                int(witness_run["completion_source_config_revision"]) != int(source["source_config_revision"])
+                or str(witness_run["completion_endpoint_id"]) != str(endpoint["endpoint_id"])
+                or str(witness_run["completion_canonical_transport_locator"])
+                != str(endpoint["canonical_transport_locator"])
+                or int(witness_run["completion_canonicalization_contract_version"])
+                != int(endpoint["canonicalization_contract_version"])
+                or int(witness_run["completion_transport_trust_revision"])
+                != int(endpoint["transport_trust_revision"])
+            ):
+                raise AuthorityConflict(
+                    "sampled-absence witness completion context no longer matches "
+                    "the current source context"
+                )
+
+            # ---- ALL CAS PASSED: one atomic terminal transition (§19) ----
+            shared_fields = (
+                source_id, res_id, binding_id, vmid, generation, revision,
+                witness_run_id, sequence,
+                int(source["source_config_revision"]), str(endpoint["endpoint_id"]),
+                str(endpoint["canonical_transport_locator"]),
+                int(endpoint["canonicalization_contract_version"]),
+                int(endpoint["transport_trust_revision"]),
+                int(attestation["source_attestation_epoch"]),
+                actor_text, decided_at, reason_text,
+            )
+            evidence_id_authority = _new_uuid()
+            evidence_id_attestation = _new_uuid()
+            connection.execute(
+                "INSERT INTO resource_removal_authorities("
+                "evidence_id, decision_id, inventory_source_id, resource_id, binding_id, "
+                "vmid, locator_generation, resource_continuity_revision, witness_run_id, "
+                "witness_discovery_run_sequence, source_config_revision, endpoint_id, "
+                "canonical_transport_locator, canonicalization_contract_version, "
+                "transport_trust_revision, source_attestation_epoch, actor, decided_at, "
+                "reason) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (evidence_id_authority, decision_id, *shared_fields),
+            )
+            connection.execute(
+                "INSERT INTO resource_absence_attestations("
+                "evidence_id, decision_id, inventory_source_id, resource_id, binding_id, "
+                "vmid, locator_generation, resource_continuity_revision, witness_run_id, "
+                "witness_discovery_run_sequence, source_config_revision, endpoint_id, "
+                "canonical_transport_locator, canonicalization_contract_version, "
+                "transport_trust_revision, source_attestation_epoch, actor, decided_at, "
+                "reason) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (evidence_id_attestation, decision_id, *shared_fields),
+            )
+
+            closed = connection.execute(
+                "UPDATE resource_locator_bindings SET valid_to_run_sequence=?, "
+                "closure_reason='confirmed_removed' "
+                "WHERE binding_id=? AND valid_to_run_sequence IS NULL",
+                (sequence, binding_id),
+            )
+            if closed.rowcount != 1:
+                raise AuthorityConflict("active binding could not be closed")
+
+            old_observational_continuity = str(resource["observational_continuity"])
+            if old_observational_continuity not in ("consistent", "uncertain"):
+                raise AuthorityInvariantError(
+                    "resource observational continuity is not a valid pre-terminal value"
+                )
+            old_security = str(resource["security_continuity"])
+            new_security = "revoked" if old_security == "trusted" else old_security
+            connection.execute(
+                "UPDATE resource_incarnations SET presence='confirmed_removed', "
+                "lifecycle='retired', detail_status='not_applicable', "
+                "node_availability='not_applicable', current_node_id=NULL, "
+                "security_continuity=?, termination_reason='confirmed_removed', "
+                "successor_resource_id=NULL, "
+                "resource_continuity_revision=resource_continuity_revision+1, "
+                "updated_at=? WHERE resource_id=?",
+                (new_security, decided_at, res_id),
+            )
+
+            connection.execute(
+                "INSERT INTO resource_terminations("
+                "resource_id, inventory_source_id, binding_id, locator_generation, "
+                "reason, successor_resource_id, run_sequence, class_c_decision_id, "
+                "created_at) VALUES(?, ?, ?, ?, 'confirmed_removed', NULL, ?, ?, ?)",
+                (res_id, source_id, binding_id, generation, sequence, decision_id, decided_at),
+            )
+
+            # Consumed: freeze into the immutable evidence above, and stop
+            # being current-eligible provenance (ADR 0004 §12 shape A/B).
+            connection.execute(
+                "DELETE FROM resource_absence_pointers WHERE resource_id=?", (res_id,)
+            )
+
+            self._bump_global_revisions(
+                connection, inventory_changed=True, published_changed=True
+            )
+
+        return self._store.confirmed_removal_result(decision_id)
+
     def rotate_credential_reference(
         self, inventory_source_id: str, credential_reference: str
     ) -> InventorySourceState:
@@ -1472,6 +1767,19 @@ class InventoryAuthority:
         if len(rows) != 1:
             raise AuthorityInvariantError("inventory source must have exactly one active endpoint")
         return rows[0]
+
+    @staticmethod
+    def _require_resource_row(
+        connection: sqlite3.Connection, source_id: str, resource_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM resource_incarnations WHERE resource_id=? "
+            "AND inventory_source_id=?",
+            (resource_id, source_id),
+        ).fetchone()
+        if row is None:
+            raise AuthorityNotFound("resource does not exist for this inventory source")
+        return row
 
     @staticmethod
     def _require_endpoint_row(
