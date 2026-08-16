@@ -33,6 +33,7 @@ from app.inventory import (
     NormalizedDiscoverySnapshot,
     SourceAttestationEvidenceReading,
     SourceAttestationReadOutcome,
+    SourceAttestationRelationshipGate,
     SourceAttestationStatus,
     SourceAvailability,
     TierTwoEvaluationStatus,
@@ -901,3 +902,352 @@ def test_no_credential_reference_copied_into_attestation_audit(tmp_path: Path) -
     state = store.attestation_state(source_id)
     for value in (state.anchor_kind, state.anchor_value, state.accepted_by):
         assert value is None or credential_reference not in value
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass Finding 1: durable mismatch relationship gate (ADR 0003 §17)
+# ---------------------------------------------------------------------------
+
+
+def test_successful_initial_enrollment_gate_clear(tmp_path: Path) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    endpoint_id = active_endpoint_id(store, source_id)
+
+    authority.enroll_source_attestation(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:test",
+        evidence_reader=FakeEvidenceReader(reading=observed("deadbeef")),
+    )
+
+    assert store.attestation_state(source_id).relationship_gate is (
+        SourceAttestationRelationshipGate.CLEAR
+    )
+
+
+def test_reattestation_mismatch_sets_pending_gate_without_touching_anchor_or_epoch(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    _enroll(store, authority, source_id, "deadbeef")
+    endpoint_id = active_endpoint_id(store, source_id)
+
+    event = authority.reattest_source(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:reattest",
+        evidence_reader=FakeEvidenceReader(reading=observed("cafef00d")),
+    )
+
+    assert event.resulting_relationship_gate is (
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION
+    )
+    state = store.attestation_state(source_id)
+    assert state.relationship_gate is (
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION
+    )
+    assert state.attestation_status is SourceAttestationStatus.ATTESTED
+    assert state.source_attestation_epoch == 1
+    assert state.anchor_value == "deadbeef"
+
+    # Ordinary read-only discovery remains allowed while a mismatch is
+    # pending -- attestation never gates base discovery (ADR 0003 §3/§13).
+    complete_snapshot(store, authority, source_id)
+    assert len(store.list_resources(source_id)) == 1
+
+
+def test_same_anchor_reconfirm_does_not_erase_pending_mismatch(tmp_path: Path) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    _enroll(store, authority, source_id, "deadbeef")
+    endpoint_id = active_endpoint_id(store, source_id)
+    authority.reattest_source(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:reattest",
+        evidence_reader=FakeEvidenceReader(reading=observed("cafef00d")),
+    )
+    assert store.attestation_state(source_id).relationship_gate is (
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION
+    )
+
+    # A later read confirming the STILL-enrolled anchor is an ordinary
+    # reconfirmation -- it must not silently resolve the pending mismatch.
+    event = authority.reattest_source(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:reattest2",
+        evidence_reader=FakeEvidenceReader(reading=observed("deadbeef")),
+    )
+
+    assert event.outcome is AttestationOutcome.MATCH
+    assert event.resulting_relationship_gate is None
+    assert store.attestation_state(source_id).relationship_gate is (
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION
+    )
+
+
+def test_accepted_anchor_change_clears_pending_mismatch(tmp_path: Path) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    _enroll(store, authority, source_id, "deadbeef")
+    endpoint_id = active_endpoint_id(store, source_id)
+    authority.reattest_source(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:reattest",
+        evidence_reader=FakeEvidenceReader(reading=observed("cafef00d")),
+    )
+    assert store.attestation_state(source_id).relationship_gate is (
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION
+    )
+
+    event = authority.accept_source_attestation_anchor_change(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:accept",
+        evidence_reader=FakeEvidenceReader(reading=observed("cafef00d")),
+    )
+
+    assert event.resulting_relationship_gate is SourceAttestationRelationshipGate.CLEAR
+    state = store.attestation_state(source_id)
+    assert state.relationship_gate is SourceAttestationRelationshipGate.CLEAR
+    assert state.source_attestation_epoch == 2
+    assert state.anchor_value == "cafef00d"
+
+
+def test_revocation_clears_pending_mismatch_while_moving_epoch(tmp_path: Path) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    _enroll(store, authority, source_id, "deadbeef")
+    endpoint_id = active_endpoint_id(store, source_id)
+    authority.reattest_source(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:reattest",
+        evidence_reader=FakeEvidenceReader(reading=observed("cafef00d")),
+    )
+    assert store.attestation_state(source_id).relationship_gate is (
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION
+    )
+
+    event = authority.revoke_source_attestation(
+        source_id, actor="operator:revoke", reason="reset"
+    )
+
+    assert event.resulting_relationship_gate is SourceAttestationRelationshipGate.CLEAR
+    state = store.attestation_state(source_id)
+    assert state.relationship_gate is SourceAttestationRelationshipGate.CLEAR
+    assert state.attestation_status is SourceAttestationStatus.NOT_YET_ATTESTED
+    assert state.source_attestation_epoch == 2
+
+
+def test_reenrollment_after_revocation_establishes_clean_relationship_gate(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    _enroll(store, authority, source_id, "deadbeef")
+    endpoint_id = active_endpoint_id(store, source_id)
+    authority.reattest_source(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:reattest",
+        evidence_reader=FakeEvidenceReader(reading=observed("cafef00d")),
+    )
+    authority.revoke_source_attestation(source_id, actor="operator:revoke", reason="reset")
+
+    authority.enroll_source_attestation(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:enroll-again",
+        evidence_reader=FakeEvidenceReader(reading=observed("newanchor")),
+    )
+
+    assert store.attestation_state(source_id).relationship_gate is (
+        SourceAttestationRelationshipGate.CLEAR
+    )
+
+
+def test_relationship_gate_persists_across_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "authority.db"
+    store = InventoryAuthorityStore(path, now=fixed_now)
+    authority = InventoryAuthority(store, now=fixed_now)
+    state = authority.create_inventory_source(
+        provider_kind="proxmox",
+        display_name="Primary",
+        credential_reference="secret://inventory/primary",
+        transport_locator="https://pve.example:8006",
+    )
+    source_id = state.source.inventory_source_id
+    endpoint_id = state.active_endpoint.endpoint_id
+    _enroll(store, authority, source_id, "deadbeef")
+    authority.reattest_source(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:reattest",
+        evidence_reader=FakeEvidenceReader(reading=observed("cafef00d")),
+    )
+    store.close()
+
+    reopened = InventoryAuthorityStore(path, now=fixed_now)
+    assert reopened.attestation_state(source_id).relationship_gate is (
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION
+    )
+
+
+def test_relationship_gate_included_in_cas_rejects_stale_older_operation(
+    tmp_path: Path,
+) -> None:
+    """Read A starts; a concurrent mismatch operation commits the pending
+    gate; A's older, now-stale attempt must be rejected as stale_cas -- not
+    only because of epoch (which a bare mismatch never changes), but
+    because relationship_gate itself is part of the CAS context."""
+
+    store, authority, source_id = create_authority(tmp_path)
+    _enroll(store, authority, source_id, "deadbeef")
+    endpoint_id = active_endpoint_id(store, source_id)
+
+    def concurrent_mismatch() -> None:
+        InventoryAuthority(store, now=fixed_now).reattest_source(
+            source_id,
+            endpoint_id=endpoint_id,
+            actor="operator:racer",
+            evidence_reader=FakeEvidenceReader(reading=observed("cafef00d")),
+        )
+
+    # A itself is an ordinary same-anchor reconfirmation attempt (which, by
+    # itself, would never touch epoch/anchor) -- yet it must still be
+    # rejected because the gate changed underneath it mid-read.
+    reader_a = FakeEvidenceReader(reading=observed("deadbeef"), mutate=concurrent_mismatch)
+
+    with pytest.raises(AuthorityConflict, match="context changed"):
+        authority.reattest_source(
+            source_id, endpoint_id=endpoint_id, actor="operator:A", evidence_reader=reader_a
+        )
+
+    state = store.attestation_state(source_id)
+    assert state.relationship_gate is (
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION
+    )
+    stale_events = [
+        e
+        for e in store.list_attestation_events(source_id)
+        if e.outcome is AttestationOutcome.STALE_CAS
+    ]
+    assert len(stale_events) == 1
+    assert stale_events[0].actor == "operator:A"
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass Finding 2: malformed/failed reads always audited
+# ---------------------------------------------------------------------------
+
+
+def test_observed_unsupported_anchor_kind_is_audited_malformed_no_transition(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    endpoint_id = active_endpoint_id(store, source_id)
+    bad_reading = SourceAttestationEvidenceReading(
+        outcome=SourceAttestationReadOutcome.OBSERVED,
+        anchor_kind="some_other_unsupported_kind",
+        anchor_value="deadbeef",
+    )
+
+    event = authority.enroll_source_attestation(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:test",
+        evidence_reader=FakeEvidenceReader(reading=bad_reading),
+    )
+
+    assert event.outcome is AttestationOutcome.MALFORMED
+    assert event.resulting_epoch is None
+    state = store.attestation_state(source_id)
+    assert state.attestation_status is SourceAttestationStatus.NOT_YET_ATTESTED
+    assert state.source_attestation_epoch == 0
+    assert len(store.list_attestation_events(source_id)) == 1
+
+
+def test_observed_structurally_invalid_anchor_value_is_audited_malformed_no_transition(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    endpoint_id = active_endpoint_id(store, source_id)
+    # Passes SourceAttestationEvidenceReading's own non-empty check but is
+    # too long to be a plausible fingerprint -- must still reach an audited
+    # outcome at the authority boundary rather than raising.
+    bad_reading = SourceAttestationEvidenceReading(
+        outcome=SourceAttestationReadOutcome.OBSERVED,
+        anchor_kind=ANCHOR_KIND_PVE_ROOT_CA_SHA256_FINGERPRINT,
+        anchor_value="a" * 500,
+    )
+
+    event = authority.enroll_source_attestation(
+        source_id,
+        endpoint_id=endpoint_id,
+        actor="operator:test",
+        evidence_reader=FakeEvidenceReader(reading=bad_reading),
+    )
+
+    assert event.outcome is AttestationOutcome.MALFORMED
+    assert event.resulting_epoch is None
+    state = store.attestation_state(source_id)
+    assert state.attestation_status is SourceAttestationStatus.NOT_YET_ATTESTED
+    assert state.source_attestation_epoch == 0
+
+
+def test_reader_raised_exception_is_audited_unavailable_with_sanitized_reason(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = create_authority(tmp_path)
+    endpoint_id = active_endpoint_id(store, source_id)
+
+    class RaisingReader:
+        def read(self, **kwargs) -> SourceAttestationEvidenceReading:
+            raise RuntimeError(
+                "connection refused to https://pve.example:8006 token=SUPER-SECRET-123"
+            )
+
+    event = authority.enroll_source_attestation(
+        source_id, endpoint_id=endpoint_id, actor="operator:test", evidence_reader=RaisingReader()
+    )
+
+    assert event.outcome is AttestationOutcome.UNAVAILABLE
+    assert event.reason == "attestation_evidence_reader_raised_exception"
+    assert "SUPER-SECRET-123" not in event.reason
+    assert "pve.example" not in event.reason
+    for value in store.list_attestation_events(source_id):
+        assert "SUPER-SECRET-123" not in value.reason
+    state = store.attestation_state(source_id)
+    assert state.attestation_status is SourceAttestationStatus.NOT_YET_ATTESTED
+    assert state.source_attestation_epoch == 0
+    assert store.list_attestation_events(source_id)[0].resulting_epoch is None
+
+
+def test_reader_raised_exception_does_not_bypass_stale_cas_priority(tmp_path: Path) -> None:
+    """A concurrent context change plus a reader crash must still classify
+    as stale_cas, since the CAS check runs before evidence classification
+    -- the exception path is not a special-cased bypass of it."""
+
+    store, authority, source_id = create_authority(tmp_path)
+    endpoint_id = active_endpoint_id(store, source_id)
+
+    class RaisingReaderWithMutation:
+        def read(self, **kwargs) -> SourceAttestationEvidenceReading:
+            InventoryAuthority(store, now=fixed_now).rotate_credential_reference(
+                source_id, "secret://inventory/rotated-mid-read"
+            )
+            raise RuntimeError("boom")
+
+    with pytest.raises(AuthorityConflict, match="context changed"):
+        authority.enroll_source_attestation(
+            source_id,
+            endpoint_id=endpoint_id,
+            actor="operator:test",
+            evidence_reader=RaisingReaderWithMutation(),
+        )
+
+    events = store.list_attestation_events(source_id)
+    assert len(events) == 1
+    assert events[0].outcome is AttestationOutcome.STALE_CAS
+    assert store.attestation_state(source_id).attestation_status is (
+        SourceAttestationStatus.NOT_YET_ATTESTED
+    )

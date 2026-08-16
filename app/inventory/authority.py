@@ -30,6 +30,7 @@ from .models import (
     DiscoveryRunLifecycle,
     InventorySourceState,
     SourceAttestationEvent,
+    SourceAttestationRelationshipGate,
     TierTwoEvaluationStatus,
 )
 from .discovery import (
@@ -50,7 +51,10 @@ class _AttestationContext:
     or anchor change in this module also bumps ``source_attestation_epoch``
     in the same atomic transaction, so epoch equality is already a strict
     proxy for "nothing security-relevant changed concurrently" -- exactly
-    like the existing discovery-run CAS context.
+    like the existing discovery-run CAS context. ``relationship_gate`` (ADR
+    0003 §17) IS included: a concurrent operation that commits a durable
+    mismatch between this read and this write must fence out the older,
+    now-stale attempt exactly like every other context field.
     """
 
     source_config_revision: int
@@ -59,6 +63,7 @@ class _AttestationContext:
     canonicalization_contract_version: int
     transport_trust_revision: int
     source_attestation_epoch: int
+    relationship_gate: SourceAttestationRelationshipGate
 
 
 class InventoryAuthority:
@@ -636,8 +641,8 @@ class InventoryAuthority:
             connection.execute(
                 "UPDATE source_attestation_state SET attestation_status='not_yet_attested', "
                 "source_attestation_epoch=?, anchor_kind=NULL, anchor_value=NULL, "
-                "evidence_tier=NULL, tier2_evaluation=NULL, accepted_at=NULL, "
-                "accepted_by=NULL, evaluated_endpoint_id=NULL "
+                "evidence_tier=NULL, tier2_evaluation=NULL, relationship_gate='clear', "
+                "accepted_at=NULL, accepted_by=NULL, evaluated_endpoint_id=NULL "
                 "WHERE inventory_source_id=?",
                 (new_epoch, source_id),
             )
@@ -658,6 +663,7 @@ class InventoryAuthority:
                 endpoint_lifecycle_at_check=None,
                 previous_epoch=previous_epoch,
                 resulting_epoch=new_epoch,
+                resulting_relationship_gate=SourceAttestationRelationshipGate.CLEAR,
                 reason=revoke_reason,
             )
             self._after_attestation_transition(connection, event_id=event_id)
@@ -832,17 +838,31 @@ class InventoryAuthority:
 
         # ---- PHASE 2: remote evidence read, OUTSIDE any write transaction ----
         attempted_at = _timestamp(self._now())
-        reading = evidence_reader.read(
-            inventory_source_id=source_id,
-            endpoint_id=expected.endpoint_id,
-            canonical_transport_locator=expected.canonical_transport_locator,
-            enrolled_anchor_kind=enrolled_anchor_kind,
-            enrolled_anchor_value=enrolled_anchor_value,
-        )
-        if not isinstance(reading, SourceAttestationEvidenceReading):
-            raise TypeError(
-                "evidence reader must return a typed SourceAttestationEvidenceReading"
+        try:
+            reading = evidence_reader.read(
+                inventory_source_id=source_id,
+                endpoint_id=expected.endpoint_id,
+                canonical_transport_locator=expected.canonical_transport_locator,
+                enrolled_anchor_kind=enrolled_anchor_kind,
+                enrolled_anchor_value=enrolled_anchor_value,
             )
+        except Exception:
+            # ADR 0003 §18: a failed remote read is its own audited outcome,
+            # never a silent bypass of the attestation audit contract. Never
+            # persist the raised exception's own text -- it may contain
+            # transport errors carrying URLs, credentials, or other private
+            # material; only a fixed, deterministic, sanitized reason is
+            # ever written (Finding 2).
+            reading = SourceAttestationEvidenceReading(
+                outcome=SourceAttestationReadOutcome.UNAVAILABLE
+            )
+            reader_raised = True
+        else:
+            reader_raised = False
+            if not isinstance(reading, SourceAttestationEvidenceReading):
+                raise TypeError(
+                    "evidence reader must return a typed SourceAttestationEvidenceReading"
+                )
 
         event_id = _new_uuid()
         context_rejected = False
@@ -872,6 +892,7 @@ class InventoryAuthority:
                     endpoint_lifecycle_at_check=None,
                     previous_epoch=previous_epoch,
                     resulting_epoch=None,
+                    resulting_relationship_gate=None,
                     reason="attestation_context_changed_between_read_and_write",
                 )
                 context_rejected = True
@@ -883,6 +904,7 @@ class InventoryAuthority:
                     tier2_evaluation,
                     asserted_kind,
                     asserted_value,
+                    resulting_relationship_gate,
                     audit_reason,
                 ) = _classify_attestation_reading(
                     reading,
@@ -892,6 +914,8 @@ class InventoryAuthority:
                     enrolled_anchor_value=enrolled_anchor_value,
                     previous_epoch=previous_epoch,
                 )
+                if reader_raised:
+                    audit_reason = "attestation_evidence_reader_raised_exception"
                 self._insert_attestation_event(
                     connection,
                     event_id=event_id,
@@ -909,6 +933,7 @@ class InventoryAuthority:
                     endpoint_lifecycle_at_check=None,
                     previous_epoch=previous_epoch,
                     resulting_epoch=resulting_epoch,
+                    resulting_relationship_gate=resulting_relationship_gate,
                     reason=audit_reason,
                 )
                 if resulting_epoch is not None:
@@ -918,14 +943,16 @@ class InventoryAuthority:
                     connection.execute(
                         "UPDATE source_attestation_state SET attestation_status='attested', "
                         "source_attestation_epoch=?, anchor_kind=?, anchor_value=?, "
-                        "evidence_tier=?, tier2_evaluation=?, accepted_at=?, accepted_by=?, "
-                        "evaluated_endpoint_id=? WHERE inventory_source_id=?",
+                        "evidence_tier=?, tier2_evaluation=?, relationship_gate=?, "
+                        "accepted_at=?, accepted_by=?, evaluated_endpoint_id=? "
+                        "WHERE inventory_source_id=?",
                         (
                             resulting_epoch,
                             asserted_kind,
                             asserted_value,
                             evidence_tier.value,
                             tier2_evaluation.value,
+                            resulting_relationship_gate.value,
                             attempted_at,
                             actor_text,
                             target_endpoint_id,
@@ -944,6 +971,16 @@ class InventoryAuthority:
                     self._bump_global_revisions(
                         connection, inventory_changed=False, published_changed=True
                     )
+                elif outcome is AttestationOutcome.MISMATCH:
+                    # ADR 0003 §17: durably gate every future attestation-
+                    # gated action without touching epoch/anchor/health/
+                    # revisions -- ordinary discovery remains unaffected.
+                    connection.execute(
+                        "UPDATE source_attestation_state SET relationship_gate=? "
+                        "WHERE inventory_source_id=?",
+                        (resulting_relationship_gate.value, source_id),
+                    )
+                    self._after_attestation_transition(connection, event_id=event_id)
 
         if context_rejected:
             raise AuthorityConflict(
@@ -996,6 +1033,7 @@ class InventoryAuthority:
         endpoint_lifecycle_at_check: str | None,
         previous_epoch: int,
         resulting_epoch: int | None,
+        resulting_relationship_gate: SourceAttestationRelationshipGate | None,
         reason: str,
     ) -> None:
         connection.execute(
@@ -1005,10 +1043,11 @@ class InventoryAuthority:
             "expected_canonical_transport_locator, "
             "expected_canonicalization_contract_version, "
             "expected_transport_trust_revision, expected_source_attestation_epoch, "
+            "expected_relationship_gate, "
             "outcome, evidence_tier, tier2_evaluation, asserted_anchor_kind, "
             "asserted_anchor_value, endpoint_lifecycle_at_check, previous_epoch, "
-            "resulting_epoch, reason) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "resulting_epoch, resulting_relationship_gate, reason) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 event_id,
                 source_id,
@@ -1022,6 +1061,7 @@ class InventoryAuthority:
                 expected.canonicalization_contract_version,
                 expected.transport_trust_revision,
                 expected.source_attestation_epoch,
+                expected.relationship_gate.value,
                 outcome.value,
                 evidence_tier.value if evidence_tier is not None else None,
                 tier2_evaluation.value if tier2_evaluation is not None else None,
@@ -1030,6 +1070,11 @@ class InventoryAuthority:
                 endpoint_lifecycle_at_check,
                 previous_epoch,
                 resulting_epoch,
+                (
+                    resulting_relationship_gate.value
+                    if resulting_relationship_gate is not None
+                    else None
+                ),
                 reason,
             ),
         )
@@ -1576,6 +1621,9 @@ def _capture_attestation_context(
         ),
         transport_trust_revision=int(endpoint["transport_trust_revision"]),
         source_attestation_epoch=int(attestation["source_attestation_epoch"]),
+        relationship_gate=SourceAttestationRelationshipGate(
+            str(attestation["relationship_gate"])
+        ),
     )
 
 
@@ -1594,20 +1642,31 @@ def _classify_attestation_reading(
     TierTwoEvaluationStatus | None,
     str | None,
     str | None,
+    SourceAttestationRelationshipGate | None,
     str,
 ]:
     """Turn one evidence reading into an audited outcome plus, if accepted,
-    the resulting epoch and durable anchor/tier fields to persist.
+    the resulting epoch/gate and durable anchor/tier fields to persist.
 
     Returns ``(outcome, resulting_epoch, evidence_tier, tier2_evaluation,
-    asserted_anchor_kind, asserted_anchor_value, reason)``.
-    ``resulting_epoch`` is non-``None`` only for an accepted security
-    transition (ADR 0003 §20's fixed epoch rule -- never a caller choice).
+    asserted_anchor_kind, asserted_anchor_value, resulting_relationship_gate,
+    reason)``. ``resulting_epoch`` is non-``None`` only for an accepted
+    security transition (ADR 0003 §20's fixed epoch rule -- never a caller
+    choice). ``resulting_relationship_gate`` is non-``None`` only when this
+    outcome has a defined effect on the ADR 0003 §17 gate (mismatch sets
+    it, an accepted transition clears it); ``None`` means "leave whatever
+    the gate currently is untouched" -- in particular a same-anchor
+    reconfirmation never clears an already-pending mismatch.
+
+    Never raises for evidence that is merely unsupported/malformed --
+    ADR 0003 §18 requires every such read to reach an audited outcome, not
+    an exception that would bypass the audit write entirely (Finding 2).
     """
 
     if reading.outcome is SourceAttestationReadOutcome.UNAVAILABLE:
         return (
             AttestationOutcome.UNAVAILABLE,
+            None,
             None,
             None,
             None,
@@ -1623,15 +1682,30 @@ def _classify_attestation_reading(
             None,
             None,
             None,
+            None,
             "attestation_evidence_malformed",
         )
 
     # OBSERVED: a genuine self-reported (tier 1) anchor was read, optionally
     # corroborated by the trusted reader's own tier-2 chain verification.
-    if reading.anchor_kind != ANCHOR_KIND_PVE_ROOT_CA_SHA256_FINGERPRINT:
-        raise ValueError("observed anchor kind is unsupported")
-    asserted_kind = _require_text(reading.anchor_kind, "anchor_kind", max_length=200)
-    asserted_value = _require_text(reading.anchor_value, "anchor_value", max_length=200)
+    # An unsupported anchor kind or structurally invalid anchor value is
+    # fail-closed evidence, not a programming error -- classify it exactly
+    # like a reader-signaled MALFORMED outcome instead of raising.
+    if reading.anchor_kind != ANCHOR_KIND_PVE_ROOT_CA_SHA256_FINGERPRINT or not (
+        _is_bounded_text(reading.anchor_value, max_length=200)
+    ):
+        return (
+            AttestationOutcome.MALFORMED,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "observed_anchor_evidence_is_structurally_invalid",
+        )
+    asserted_kind = reading.anchor_kind
+    asserted_value = reading.anchor_value
     evidence_tier, tier2_evaluation = _classify_tier(reading)
 
     if operation is AttestationOperation.ENROLLMENT:
@@ -1646,6 +1720,7 @@ def _classify_attestation_reading(
             tier2_evaluation,
             asserted_kind,
             asserted_value,
+            SourceAttestationRelationshipGate.CLEAR,
             "initial_enrollment_accepted",
         )
 
@@ -1653,6 +1728,10 @@ def _classify_attestation_reading(
         asserted_kind == enrolled_anchor_kind and asserted_value == enrolled_anchor_value
     )
     if same_anchor:
+        # ADR 0003 §16: audit-only. A same-anchor reconfirmation never
+        # touches the epoch, the anchor, or an already-pending mismatch
+        # gate -- resolving a pending mismatch requires an explicit
+        # accepted transition (ACCEPTED/REVOCATION below), never a match.
         return (
             AttestationOutcome.MATCH,
             None,
@@ -1660,6 +1739,7 @@ def _classify_attestation_reading(
             tier2_evaluation,
             asserted_kind,
             asserted_value,
+            None,
             "reattestation_same_anchor_reconfirmed",
         )
     if accept_new_anchor:
@@ -1670,6 +1750,7 @@ def _classify_attestation_reading(
             tier2_evaluation,
             asserted_kind,
             asserted_value,
+            SourceAttestationRelationshipGate.CLEAR,
             "attestation_anchor_change_accepted_by_operator",
         )
     return (
@@ -1679,7 +1760,20 @@ def _classify_attestation_reading(
         tier2_evaluation,
         asserted_kind,
         asserted_value,
+        SourceAttestationRelationshipGate.MISMATCH_PENDING_REATTESTATION,
         "reattestation_anchor_mismatch_not_accepted",
+    )
+
+
+def _is_bounded_text(value: object, *, max_length: int) -> bool:
+    """Non-raising sibling of ``_require_text`` for classification paths
+    that must never raise on untrusted/malformed evidence content."""
+
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= max_length
+        and all(ord(character) >= 0x20 and ord(character) != 0x7F for character in value)
     )
 
 

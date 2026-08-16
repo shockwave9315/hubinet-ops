@@ -29,6 +29,7 @@ from .models import (
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
     SourceAttestationEvent,
+    SourceAttestationRelationshipGate,
     SourceAttestationState,
     SourceAttestationStatus,
     TierTwoEvaluationStatus,
@@ -820,6 +821,9 @@ def _source_attestation_state(row: sqlite3.Row) -> SourceAttestationState:
             if tier2_evaluation is not None
             else None
         ),
+        relationship_gate=SourceAttestationRelationshipGate(
+            str(row["relationship_gate"])
+        ),
         accepted_at=row["accepted_at"],
         accepted_by=row["accepted_by"],
         evaluated_endpoint_id=row["evaluated_endpoint_id"],
@@ -849,6 +853,9 @@ def _source_attestation_event(row: sqlite3.Row) -> SourceAttestationEvent:
         expected_source_attestation_epoch=int(
             row["expected_source_attestation_epoch"]
         ),
+        expected_relationship_gate=SourceAttestationRelationshipGate(
+            str(row["expected_relationship_gate"])
+        ),
         outcome=AttestationOutcome(str(row["outcome"])),
         evidence_tier=(
             AttestationEvidenceTier(str(evidence_tier))
@@ -866,6 +873,11 @@ def _source_attestation_event(row: sqlite3.Row) -> SourceAttestationEvent:
         previous_epoch=int(row["previous_epoch"]),
         resulting_epoch=(
             int(row["resulting_epoch"]) if row["resulting_epoch"] is not None else None
+        ),
+        resulting_relationship_gate=(
+            SourceAttestationRelationshipGate(str(row["resulting_relationship_gate"]))
+            if row["resulting_relationship_gate"] is not None
+            else None
         ),
         reason=str(row["reason"]),
     )
@@ -1273,6 +1285,8 @@ _SCHEMA_STATEMENTS = (
         evidence_tier TEXT CHECK(evidence_tier IS NULL OR evidence_tier IN ('tier_1', 'tier_2')),
         tier2_evaluation TEXT CHECK(tier2_evaluation IS NULL OR tier2_evaluation IN (
             'not_evaluated', 'failed', 'verified')),
+        relationship_gate TEXT NOT NULL DEFAULT 'clear' CHECK(relationship_gate IN (
+            'clear', 'mismatch_pending_reattestation')),
         accepted_at TEXT,
         accepted_by TEXT,
         evaluated_endpoint_id TEXT,
@@ -1282,6 +1296,7 @@ _SCHEMA_STATEMENTS = (
         CHECK(
             (attestation_status = 'not_yet_attested' AND anchor_kind IS NULL AND
              anchor_value IS NULL AND evidence_tier IS NULL AND tier2_evaluation IS NULL AND
+             relationship_gate = 'clear' AND
              accepted_at IS NULL AND accepted_by IS NULL AND evaluated_endpoint_id IS NULL)
             OR
             (attestation_status = 'attested' AND source_attestation_epoch >= 1 AND
@@ -1316,6 +1331,8 @@ _SCHEMA_STATEMENTS = (
         expected_source_attestation_epoch INTEGER NOT NULL
             CHECK(typeof(expected_source_attestation_epoch) = 'integer' AND
                   expected_source_attestation_epoch >= 0),
+        expected_relationship_gate TEXT NOT NULL CHECK(expected_relationship_gate IN (
+            'clear', 'mismatch_pending_reattestation')),
         outcome TEXT NOT NULL CHECK(outcome IN (
             'match', 'mismatch', 'unavailable', 'malformed', 'stale_cas', 'accepted', 'rejected')),
         evidence_tier TEXT CHECK(evidence_tier IS NULL OR evidence_tier IN ('tier_1', 'tier_2')),
@@ -1329,6 +1346,9 @@ _SCHEMA_STATEMENTS = (
         resulting_epoch INTEGER
             CHECK(resulting_epoch IS NULL OR
                   (typeof(resulting_epoch) = 'integer' AND resulting_epoch >= previous_epoch)),
+        resulting_relationship_gate TEXT
+            CHECK(resulting_relationship_gate IS NULL OR resulting_relationship_gate IN (
+                'clear', 'mismatch_pending_reattestation')),
         reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
         FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
         FOREIGN KEY(inventory_source_id, target_endpoint_id)

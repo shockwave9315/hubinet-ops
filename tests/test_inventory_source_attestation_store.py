@@ -86,10 +86,12 @@ def _insert_event(
     operation: str = "candidate_check",
     outcome: str = "accepted",
     expected_source_attestation_epoch: int = 1,
+    expected_relationship_gate: str = "clear",
     evidence_tier: str = "tier_1",
     tier2_evaluation: str = "not_evaluated",
     previous_epoch: int = 1,
     resulting_epoch: str | None = None,
+    resulting_relationship_gate: str | None = None,
 ) -> None:
     connection.execute(
         "INSERT INTO source_attestation_events("
@@ -98,12 +100,13 @@ def _insert_event(
         "expected_canonical_transport_locator, "
         "expected_canonicalization_contract_version, "
         "expected_transport_trust_revision, expected_source_attestation_epoch, "
+        "expected_relationship_gate, "
         "outcome, evidence_tier, tier2_evaluation, asserted_anchor_kind, "
         "asserted_anchor_value, endpoint_lifecycle_at_check, previous_epoch, "
-        "resulting_epoch, reason) "
+        "resulting_epoch, resulting_relationship_gate, reason) "
         "VALUES(?, ?, ?, ?, 'operator:test', ?, 1, ?, "
-        "'https://pve.example:8006', 1, 1, ?, ?, ?, ?, "
-        "'pve_root_ca_sha256_fingerprint', 'deadbeef', 'candidate', ?, ?, "
+        "'https://pve.example:8006', 1, 1, ?, ?, ?, ?, ?, "
+        "'pve_root_ca_sha256_fingerprint', 'deadbeef', 'candidate', ?, ?, ?, "
         "'test event')",
         (
             event_id,
@@ -113,11 +116,13 @@ def _insert_event(
             FIXED_NOW.isoformat(),
             expected_endpoint_id,
             expected_source_attestation_epoch,
+            expected_relationship_gate,
             outcome,
             evidence_tier,
             tier2_evaluation,
             previous_epoch,
             resulting_epoch,
+            resulting_relationship_gate,
         ),
     )
 

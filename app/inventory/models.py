@@ -50,6 +50,22 @@ class SourceAttestationStatus(StrEnum):
     ATTESTED = "attested"
 
 
+class SourceAttestationRelationshipGate(StrEnum):
+    """ADR 0003 §17 durable relationship gate.
+
+    Deliberately separate from :class:`SourceAttestationStatus`: a mismatch
+    is evidence that continuity is unproven, not a change to the enrolled
+    anchor or epoch, so it must never be conflated with enrollment state.
+    A ``mismatch_pending_reattestation`` source remains ``attested`` at its
+    prior epoch/anchor -- this gate exists purely so a future attestation-
+    gated action (e.g. Commit 4's candidate check) can fail closed on it
+    without deriving current authority from audit history.
+    """
+
+    CLEAR = "clear"
+    MISMATCH_PENDING_REATTESTATION = "mismatch_pending_reattestation"
+
+
 class AttestationEvidenceTier(StrEnum):
     """ADR 0003 §4/§7 evidence tiers. Tier 3 does not exist and is never modeled."""
 
@@ -233,6 +249,7 @@ class SourceAttestationState:
     anchor_value: str | None
     evidence_tier: AttestationEvidenceTier | None
     tier2_evaluation: TierTwoEvaluationStatus | None
+    relationship_gate: SourceAttestationRelationshipGate
     accepted_at: str | None
     accepted_by: str | None
     evaluated_endpoint_id: str | None
@@ -258,6 +275,7 @@ class SourceAttestationEvent:
     expected_canonicalization_contract_version: int
     expected_transport_trust_revision: int
     expected_source_attestation_epoch: int
+    expected_relationship_gate: SourceAttestationRelationshipGate
     outcome: AttestationOutcome
     evidence_tier: AttestationEvidenceTier | None
     tier2_evaluation: TierTwoEvaluationStatus | None
@@ -266,6 +284,7 @@ class SourceAttestationEvent:
     endpoint_lifecycle_at_check: str | None
     previous_epoch: int
     resulting_epoch: int | None
+    resulting_relationship_gate: SourceAttestationRelationshipGate | None
     reason: str
 
 
