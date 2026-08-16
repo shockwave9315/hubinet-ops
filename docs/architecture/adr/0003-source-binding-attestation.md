@@ -1,14 +1,18 @@
 # ADR 0003: source binding / attestation for Proxmox inventory sources
 
-Status: **PROPOSED / DRAFT — READY FOR OPERATOR ACCEPTANCE**
+Status: **ACCEPTED**
 
 Date: 2026-08-16
 
-This ADR is **not accepted**. It does not authorize implementation of any new
-persistent schema, runtime behavior, endpoint activation, or failover. It is
-architecture for a future implementation package (referred to below as "the
-next package"), gated on explicit operator/reviewer acceptance exactly like
-ADR 0001 and ADR 0002 were before they became `ACCEPTED`.
+This ADR is accepted architecture, exactly as ADR 0001 and ADR 0002 are.
+Acceptance authorizes the architecture in this document as the normative
+source-binding/attestation contract; it does **not**, by itself, authorize
+implementation of any new persistent schema, runtime behavior, endpoint
+activation, or failover. Those remain gated on a separate future
+implementation package (referred to below as "the next package") — see §2
+(Scope and non-goals) and §31 (Implementation consequences) — and, for
+endpoint activation/candidate promotion/failover specifically, on a further,
+separately accepted activation/failover ADR (§15).
 
 ## 1. Context / problem
 
@@ -1543,5 +1547,7 @@ package would need to add, at minimum:
   into root-CA-possession or physical-uniqueness proof by implementation
   detail alone either.
 
-This wave (WAVE C0) implements none of the above. It only records this
-architecture as `PROPOSED`, awaiting explicit operator acceptance.
+WAVE C0 implemented none of the above; it recorded, and the operator has
+since accepted, this architecture as `ACCEPTED`. Everything listed above
+remains the next implementation package's (WAVE C1's) work, not done by
+this ADR or by its acceptance.
