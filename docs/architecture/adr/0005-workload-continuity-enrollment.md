@@ -1,12 +1,25 @@
 # ADR 0005: workload continuity enrollment and trust
 
-Status: **PROPOSED**
+Status: **ACCEPTED**
 
-This ADR is not yet accepted architecture. It does not authorize any schema,
-persistence, or runtime implementation by itself. It does not amend ADR 0001,
-ADR 0002, ADR 0003, or ADR 0004; where it depends on their invariants it cites
-them and adds a new, narrower normative layer on top, exactly as ADR 0003 and
-ADR 0004 each added their own layer without changing the others.
+Acceptance authorizes exactly, and only, the negative stock-PVE workload-
+continuity trust boundary and R0 safety decision defined below: stock
+PVE/read-only evidence provides no generic sufficient workload continuity
+proof for `security_continuity=trusted`; the administrative correlation
+marker (§9) remains permanently non-authoritative for that axis; Blocker B
+remains **OPEN** for mutation authority; WAVE B1 remains **DEFERRED / NOT
+AUTHORIZED**; and R0 may proceed strictly read-only, independent of
+Blocker B's eventual resolution (§24, §25, §26, §27). Acceptance does
+**not** mean Blocker B is closed for mutation, does **not** authorize
+WAVE B1, and does **not** provide any mechanism that grants
+`security_continuity=trusted` — a future, separately reviewed and
+separately accepted stronger-proof ADR is required before that transition
+may ever be implemented (§13, §14). This ADR does not authorize any
+schema, persistence, or runtime implementation by itself. It does not
+amend ADR 0001, ADR 0002, ADR 0003, or ADR 0004; where it depends on their
+invariants it cites them and adds a new, narrower normative layer on top,
+exactly as ADR 0003 and ADR 0004 each added their own layer without
+changing the others.
 
 **Corrective revision note.** An earlier draft of this ADR selected a
 backend-issued marker stored in ordinary PVE guest configuration as a
@@ -785,7 +798,7 @@ negative result — that uniformity is the finding, not an omission.
 | D | Ordinary description/tag text, not a Hubinet-issued marker | `unverified` | Fails exact-value/format check; not evidence of anything (§9). |
 | E | Correct backend-issued administrative marker, freshly read | `unverified` (unchanged) | Administrative correlation only, never sufficient for `trusted` (§9, §10). |
 | F | Copied marker observed on a second, distinct resource | both resources: `unverified`/unchanged | Duplication is an audited ambiguity, not evidence for either resource (§11, §16). |
-| G | Copied marker after invisible same-slot recreate (no observable gap) | `unverified` (new occupant), and the prior resource's own history remains whatever it already was | This is §9's controlling witness: marker equality cannot distinguish the replacement; nothing in this ADR treats it as sufficient. |
+| G | Copied marker after invisible same-slot recreate (no observable gap) | `unverified` — the physical/logical occupant may have changed, but ADR 0001 row 10 permits Hubinet's read-only `resource_id`/binding to remain the same because the replacement was observationally indistinguishable; `security_continuity` stays non-`trusted` either way under the current baseline | This is §9's controlling witness: marker equality cannot distinguish the replacement; nothing in this ADR treats it as sufficient, and nothing here asserts or requires a new `resource_id`. |
 | H | Cloned resource with copied marker | new resource: `unverified` | Clone produces a new `resource_id`; marker copied along with config proves nothing about the new incarnation (§11). |
 | I | Same-resource snapshot rollback | if a future mechanism ever grants `trusted`: `trusted -> revoked` mandatory (§17); under the current baseline: `unverified`/`revoked`, unaffected either way since nothing here reaches `trusted` | ADR 0001 row 5's mandatory revalidation requirement (§17). |
 | J | Backup restore (same resource) | same as I | Same fail-closed default as rollback unless a future mechanism proves otherwise (§17). |
