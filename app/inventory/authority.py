@@ -107,6 +107,7 @@ class InventoryAuthority:
                 created_at=created_at,
             )
             self._insert_initial_health(connection, source_id=source_id)
+            self._insert_initial_attestation_state(connection, source_id=source_id)
             self._bump_global_revisions(
                 connection, inventory_changed=True, published_changed=True
             )
@@ -372,7 +373,8 @@ class InventoryAuthority:
                     "committed_source_config_revision=?, committed_endpoint_id=?, "
                     "committed_canonical_transport_locator=?, "
                     "committed_canonicalization_contract_version=?, "
-                    "committed_transport_trust_revision=? WHERE inventory_source_id=?",
+                    "committed_transport_trust_revision=?, "
+                    "committed_source_attestation_epoch=? WHERE inventory_source_id=?",
                     (
                         freshness,
                         origin,
@@ -387,6 +389,7 @@ class InventoryAuthority:
                         str(endpoint["canonical_transport_locator"]),
                         int(endpoint["canonicalization_contract_version"]),
                         int(endpoint["transport_trust_revision"]),
+                        int(run["expected_source_attestation_epoch"]),
                         source_id,
                     ),
                 )
@@ -865,7 +868,7 @@ class InventoryAuthority:
             "failed_detail_scopes_json=?, completion_source_config_revision=?, "
             "completion_endpoint_id=?, completion_canonical_transport_locator=?, "
             "completion_canonicalization_contract_version=?, "
-            "completion_transport_trust_revision=? "
+            "completion_transport_trust_revision=?, completion_source_attestation_epoch=? "
             "WHERE run_id=? AND lifecycle IN ('issued', 'running')",
             (
                 completed_at,
@@ -916,6 +919,11 @@ class InventoryAuthority:
                 (
                     int(completion_endpoint["transport_trust_revision"])
                     if completion_endpoint is not None
+                    else None
+                ),
+                (
+                    int(run["expected_source_attestation_epoch"])
+                    if completion_source is not None
                     else None
                 ),
                 str(run["run_id"]),
@@ -993,6 +1001,24 @@ class InventoryAuthority:
             "committed_transport_trust_revision) "
             "VALUES(?, 'not_yet_observed', 'not_yet_observed', 'initial', '', "
             "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+            (source_id,),
+        )
+
+    def _insert_initial_attestation_state(
+        self, connection: sqlite3.Connection, *, source_id: str
+    ) -> None:
+        """Every source starts explicitly not-yet-attested at epoch 0 (ADR 0003 §12).
+
+        This grants no trust; it only records the fixed initial sentinel so
+        every later CAS/fencing check has a durable row to compare against.
+        """
+
+        connection.execute(
+            "INSERT INTO source_attestation_state("
+            "inventory_source_id, attestation_status, source_attestation_epoch, "
+            "anchor_kind, anchor_value, evidence_tier, accepted_at, accepted_by, "
+            "evaluated_endpoint_id) "
+            "VALUES(?, 'not_yet_attested', 0, NULL, NULL, NULL, NULL, NULL, NULL)",
             (source_id,),
         )
 

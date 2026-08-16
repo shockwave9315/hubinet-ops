@@ -11,10 +11,14 @@ import sqlite3
 import uuid
 
 from .models import (
+    AttestationEvidenceTier,
+    AttestationOperation,
+    AttestationOutcome,
     AuthorityDatabaseRejected,
     AuthorityInvariantError,
     AuthorityNotFound,
     BackendInstance,
+    CandidateAttestationBinding,
     DiscoveryRun,
     DiscoveryRunLifecycle,
     EndpointLifecycle,
@@ -24,6 +28,9 @@ from .models import (
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
+    SourceAttestationEvent,
+    SourceAttestationState,
+    SourceAttestationStatus,
     SourceEndpoint,
     SourceRuntimeHealth,
     ResourceIncarnation,
@@ -32,7 +39,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 3
+AUTHORITY_SCHEMA_VERSION = 4
 BUSY_TIMEOUT_MS = 5_000
 
 _REQUIRED_TABLES = frozenset(
@@ -48,6 +55,9 @@ _REQUIRED_TABLES = frozenset(
         "resource_locator_bindings",
         "resource_terminations",
         "canonicalization_migrations",
+        "source_attestation_state",
+        "source_attestation_events",
+        "candidate_attestation_bindings",
     }
 )
 _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
@@ -65,6 +75,10 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "one_active_binding_per_resource",
         "resource_identity_immutable",
         "binding_identity_immutable",
+        "source_attestation_state_identity_immutable",
+        "source_attestation_epoch_monotonic",
+        "source_attestation_events_immutable",
+        "candidate_attestation_binding_immutable",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -199,6 +213,65 @@ class InventoryAuthorityStore:
                     (inventory_source_id,),
                 ).fetchall()
         return tuple(_resource_locator_binding(row) for row in rows)
+
+    def attestation_state(self, inventory_source_id: str) -> SourceAttestationState:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM source_attestation_state WHERE inventory_source_id=?",
+                (inventory_source_id,),
+            ).fetchone()
+        if row is None:
+            raise AuthorityNotFound("inventory source does not exist")
+        return _source_attestation_state(row)
+
+    def attestation_event(self, event_id: str) -> SourceAttestationEvent:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM source_attestation_events WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            raise AuthorityNotFound("source attestation event does not exist")
+        return _source_attestation_event(row)
+
+    def list_attestation_events(
+        self, inventory_source_id: str | None = None
+    ) -> tuple[SourceAttestationEvent, ...]:
+        with self._read_connection() as connection:
+            if inventory_source_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM source_attestation_events "
+                    "ORDER BY inventory_source_id, attempted_at, event_id"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM source_attestation_events WHERE inventory_source_id=? "
+                    "ORDER BY attempted_at, event_id",
+                    (inventory_source_id,),
+                ).fetchall()
+        return tuple(_source_attestation_event(row) for row in rows)
+
+    def list_candidate_attestation_bindings(
+        self,
+        inventory_source_id: str | None = None,
+        *,
+        endpoint_id: str | None = None,
+    ) -> tuple[CandidateAttestationBinding, ...]:
+        with self._read_connection() as connection:
+            clauses: list[str] = []
+            params: list[object] = []
+            if inventory_source_id is not None:
+                clauses.append("inventory_source_id=?")
+                params.append(inventory_source_id)
+            if endpoint_id is not None:
+                clauses.append("endpoint_id=?")
+                params.append(endpoint_id)
+            query = "SELECT * FROM candidate_attestation_bindings"
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            query += " ORDER BY inventory_source_id, endpoint_id, matched_at, binding_id"
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return tuple(_candidate_attestation_binding(row) for row in rows)
 
     def record_counts(self) -> dict[str, int]:
         """Return bounded schema diagnostics without exposing SQL execution."""
@@ -517,6 +590,7 @@ def _source_runtime_health(row: sqlite3.Row) -> SourceRuntimeHealth:
             "committed_source_config_revision",
             "committed_canonicalization_contract_version",
             "committed_transport_trust_revision",
+            "committed_source_attestation_epoch",
         )
     }
     return SourceRuntimeHealth(
@@ -547,6 +621,9 @@ def _source_runtime_health(row: sqlite3.Row) -> SourceRuntimeHealth:
         committed_transport_trust_revision=optional_ints[
             "committed_transport_trust_revision"
         ],
+        committed_source_attestation_epoch=optional_ints[
+            "committed_source_attestation_epoch"
+        ],
     )
 
 
@@ -566,6 +643,9 @@ def _discovery_run(row: sqlite3.Row) -> DiscoveryRun:
         ),
         expected_transport_trust_revision=int(
             row["expected_transport_trust_revision"]
+        ),
+        expected_source_attestation_epoch=int(
+            row["expected_source_attestation_epoch"]
         ),
         provider_contract_version=int(row["provider_contract_version"]),
         lifecycle=DiscoveryRunLifecycle(str(row["lifecycle"])),
@@ -615,6 +695,11 @@ def _discovery_run(row: sqlite3.Row) -> DiscoveryRun:
         completion_transport_trust_revision=(
             int(row["completion_transport_trust_revision"])
             if row["completion_transport_trust_revision"] is not None
+            else None
+        ),
+        completion_source_attestation_epoch=(
+            int(row["completion_source_attestation_epoch"])
+            if row["completion_source_attestation_epoch"] is not None
             else None
         ),
     )
@@ -710,12 +795,90 @@ def _resource_locator_binding(row: sqlite3.Row) -> ResourceLocatorBinding:
     )
 
 
+def _source_attestation_state(row: sqlite3.Row) -> SourceAttestationState:
+    evidence_tier = row["evidence_tier"]
+    return SourceAttestationState(
+        inventory_source_id=str(row["inventory_source_id"]),
+        attestation_status=SourceAttestationStatus(str(row["attestation_status"])),
+        source_attestation_epoch=int(row["source_attestation_epoch"]),
+        anchor_kind=row["anchor_kind"],
+        anchor_value=row["anchor_value"],
+        evidence_tier=(
+            AttestationEvidenceTier(str(evidence_tier))
+            if evidence_tier is not None
+            else None
+        ),
+        accepted_at=row["accepted_at"],
+        accepted_by=row["accepted_by"],
+        evaluated_endpoint_id=row["evaluated_endpoint_id"],
+    )
+
+
+def _source_attestation_event(row: sqlite3.Row) -> SourceAttestationEvent:
+    evidence_tier = row["evidence_tier"]
+    return SourceAttestationEvent(
+        event_id=str(row["event_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        target_endpoint_id=str(row["target_endpoint_id"]),
+        operation=AttestationOperation(str(row["operation"])),
+        actor=str(row["actor"]),
+        attempted_at=str(row["attempted_at"]),
+        expected_source_config_revision=int(row["expected_source_config_revision"]),
+        expected_endpoint_id=str(row["expected_endpoint_id"]),
+        expected_canonical_transport_locator=str(
+            row["expected_canonical_transport_locator"]
+        ),
+        expected_canonicalization_contract_version=int(
+            row["expected_canonicalization_contract_version"]
+        ),
+        expected_transport_trust_revision=int(
+            row["expected_transport_trust_revision"]
+        ),
+        expected_source_attestation_epoch=int(
+            row["expected_source_attestation_epoch"]
+        ),
+        outcome=AttestationOutcome(str(row["outcome"])),
+        evidence_tier=(
+            AttestationEvidenceTier(str(evidence_tier))
+            if evidence_tier is not None
+            else None
+        ),
+        asserted_anchor_kind=row["asserted_anchor_kind"],
+        asserted_anchor_value=row["asserted_anchor_value"],
+        endpoint_lifecycle_at_check=row["endpoint_lifecycle_at_check"],
+        previous_epoch=int(row["previous_epoch"]),
+        resulting_epoch=(
+            int(row["resulting_epoch"]) if row["resulting_epoch"] is not None else None
+        ),
+        reason=str(row["reason"]),
+    )
+
+
+def _candidate_attestation_binding(row: sqlite3.Row) -> CandidateAttestationBinding:
+    return CandidateAttestationBinding(
+        binding_id=str(row["binding_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        endpoint_id=str(row["endpoint_id"]),
+        source_attestation_epoch=int(row["source_attestation_epoch"]),
+        evidence_tier=AttestationEvidenceTier(str(row["evidence_tier"])),
+        endpoint_lifecycle_at_check=str(row["endpoint_lifecycle_at_check"]),
+        canonical_transport_locator=str(row["canonical_transport_locator"]),
+        canonicalization_contract_version=int(
+            row["canonicalization_contract_version"]
+        ),
+        transport_trust_revision=int(row["transport_trust_revision"]),
+        matched_at=str(row["matched_at"]),
+        created_by=str(row["created_by"]),
+        event_id=str(row["event_id"]),
+    )
+
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 3)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 4)
     )
     """,
     """
@@ -800,6 +963,10 @@ _SCHEMA_STATEMENTS = (
         committed_canonical_transport_locator TEXT,
         committed_canonicalization_contract_version INTEGER,
         committed_transport_trust_revision INTEGER,
+        committed_source_attestation_epoch INTEGER CHECK(
+            committed_source_attestation_epoch IS NULL OR
+            (typeof(committed_source_attestation_epoch) = 'integer' AND
+             committed_source_attestation_epoch >= 0)),
         FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
         FOREIGN KEY(inventory_source_id, committed_endpoint_id)
             REFERENCES source_endpoints(inventory_source_id, endpoint_id),
@@ -812,16 +979,19 @@ _SCHEMA_STATEMENTS = (
             freshness_valid_until IS NULL AND committed_source_config_revision IS NULL AND
             committed_endpoint_id IS NULL AND committed_canonical_transport_locator IS NULL AND
             committed_canonicalization_contract_version IS NULL AND
-            committed_transport_trust_revision IS NULL
+            committed_transport_trust_revision IS NULL AND
+            committed_source_attestation_epoch IS NULL
         )),
         CHECK((committed_source_config_revision IS NULL AND committed_endpoint_id IS NULL AND
                committed_canonical_transport_locator IS NULL AND
                committed_canonicalization_contract_version IS NULL AND
-               committed_transport_trust_revision IS NULL) OR
+               committed_transport_trust_revision IS NULL AND
+               committed_source_attestation_epoch IS NULL) OR
               (committed_source_config_revision > 0 AND committed_endpoint_id IS NOT NULL AND
                committed_canonical_transport_locator IS NOT NULL AND
                committed_canonicalization_contract_version > 0 AND
-               committed_transport_trust_revision > 0))
+               committed_transport_trust_revision > 0 AND
+               committed_source_attestation_epoch >= 0))
     )
     """,
     """
@@ -842,6 +1012,9 @@ _SCHEMA_STATEMENTS = (
         expected_transport_trust_revision INTEGER NOT NULL
             CHECK(typeof(expected_transport_trust_revision) = 'integer' AND
                   expected_transport_trust_revision > 0),
+        expected_source_attestation_epoch INTEGER NOT NULL DEFAULT 0
+            CHECK(typeof(expected_source_attestation_epoch) = 'integer' AND
+                  expected_source_attestation_epoch >= 0),
         provider_contract_version INTEGER NOT NULL
             CHECK(typeof(provider_contract_version) = 'integer' AND provider_contract_version > 0),
         lifecycle TEXT NOT NULL CHECK(lifecycle IN ('issued', 'running', 'completed', 'abandoned')),
@@ -900,6 +1073,10 @@ _SCHEMA_STATEMENTS = (
             completion_transport_trust_revision IS NULL OR
             (typeof(completion_transport_trust_revision) = 'integer' AND
              completion_transport_trust_revision > 0)),
+        completion_source_attestation_epoch INTEGER CHECK(
+            completion_source_attestation_epoch IS NULL OR
+            (typeof(completion_source_attestation_epoch) = 'integer' AND
+             completion_source_attestation_epoch >= 0)),
         FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
         FOREIGN KEY(inventory_source_id, expected_endpoint_id)
             REFERENCES source_endpoints(inventory_source_id, endpoint_id),
@@ -925,7 +1102,8 @@ _SCHEMA_STATEMENTS = (
             completion_source_config_revision IS NULL AND completion_endpoint_id IS NULL AND
             completion_canonical_transport_locator IS NULL AND
             completion_canonicalization_contract_version IS NULL AND
-            completion_transport_trust_revision IS NULL)),
+            completion_transport_trust_revision IS NULL AND
+            completion_source_attestation_epoch IS NULL)),
         CHECK((detail_ok_count IS NULL AND detail_temporarily_unavailable_count IS NULL AND
                detail_error_count IS NULL) OR
               (detail_ok_count IS NOT NULL AND
@@ -934,12 +1112,14 @@ _SCHEMA_STATEMENTS = (
         CHECK((completion_source_config_revision IS NULL AND completion_endpoint_id IS NULL AND
                completion_canonical_transport_locator IS NULL AND
                completion_canonicalization_contract_version IS NULL AND
-               completion_transport_trust_revision IS NULL) OR
+               completion_transport_trust_revision IS NULL AND
+               completion_source_attestation_epoch IS NULL) OR
               (completion_source_config_revision IS NOT NULL AND
                length(trim(completion_endpoint_id)) > 0 AND
                length(trim(completion_canonical_transport_locator)) > 0 AND
                completion_canonicalization_contract_version IS NOT NULL AND
-               completion_transport_trust_revision IS NOT NULL)),
+               completion_transport_trust_revision IS NOT NULL AND
+               completion_source_attestation_epoch IS NOT NULL)),
         CHECK(lifecycle != 'completed' OR baseline_completeness IS NOT NULL),
         CHECK(lifecycle != 'completed' OR provider_outcome = 'success' OR
               length(trim(terminal_reason)) > 0),
@@ -1064,6 +1244,101 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE source_attestation_state (
+        inventory_source_id TEXT PRIMARY KEY,
+        attestation_status TEXT NOT NULL
+            CHECK(attestation_status IN ('not_yet_attested', 'attested')),
+        source_attestation_epoch INTEGER NOT NULL DEFAULT 0
+            CHECK(typeof(source_attestation_epoch) = 'integer' AND source_attestation_epoch >= 0),
+        anchor_kind TEXT CHECK(anchor_kind IS NULL OR anchor_kind = 'pve_root_ca_sha256_fingerprint'),
+        anchor_value TEXT,
+        evidence_tier TEXT CHECK(evidence_tier IS NULL OR evidence_tier IN ('tier_1', 'tier_2')),
+        accepted_at TEXT,
+        accepted_by TEXT,
+        evaluated_endpoint_id TEXT,
+        FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
+        FOREIGN KEY(inventory_source_id, evaluated_endpoint_id)
+            REFERENCES source_endpoints(inventory_source_id, endpoint_id),
+        CHECK(
+            (attestation_status = 'not_yet_attested' AND anchor_kind IS NULL AND
+             anchor_value IS NULL AND evidence_tier IS NULL AND accepted_at IS NULL AND
+             accepted_by IS NULL AND evaluated_endpoint_id IS NULL)
+            OR
+            (attestation_status = 'attested' AND source_attestation_epoch >= 1 AND
+             anchor_kind IS NOT NULL AND anchor_value IS NOT NULL AND
+             evidence_tier IS NOT NULL AND accepted_at IS NOT NULL AND
+             accepted_by IS NOT NULL AND evaluated_endpoint_id IS NOT NULL)
+        )
+    )
+    """,
+    """
+    CREATE TABLE source_attestation_events (
+        event_id TEXT PRIMARY KEY,
+        inventory_source_id TEXT NOT NULL,
+        target_endpoint_id TEXT NOT NULL,
+        operation TEXT NOT NULL CHECK(operation IN (
+            'enrollment', 'reattestation', 'revocation', 'candidate_check')),
+        actor TEXT NOT NULL CHECK(length(trim(actor)) > 0),
+        attempted_at TEXT NOT NULL,
+        expected_source_config_revision INTEGER NOT NULL
+            CHECK(typeof(expected_source_config_revision) = 'integer' AND
+                  expected_source_config_revision > 0),
+        expected_endpoint_id TEXT NOT NULL,
+        expected_canonical_transport_locator TEXT NOT NULL,
+        expected_canonicalization_contract_version INTEGER NOT NULL
+            CHECK(typeof(expected_canonicalization_contract_version) = 'integer' AND
+                  expected_canonicalization_contract_version > 0),
+        expected_transport_trust_revision INTEGER NOT NULL
+            CHECK(typeof(expected_transport_trust_revision) = 'integer' AND
+                  expected_transport_trust_revision > 0),
+        expected_source_attestation_epoch INTEGER NOT NULL
+            CHECK(typeof(expected_source_attestation_epoch) = 'integer' AND
+                  expected_source_attestation_epoch >= 0),
+        outcome TEXT NOT NULL CHECK(outcome IN (
+            'match', 'mismatch', 'unavailable', 'malformed', 'stale_cas', 'accepted', 'rejected')),
+        evidence_tier TEXT CHECK(evidence_tier IS NULL OR evidence_tier IN ('tier_1', 'tier_2')),
+        asserted_anchor_kind TEXT,
+        asserted_anchor_value TEXT,
+        endpoint_lifecycle_at_check TEXT,
+        previous_epoch INTEGER NOT NULL
+            CHECK(typeof(previous_epoch) = 'integer' AND previous_epoch >= 0),
+        resulting_epoch INTEGER
+            CHECK(resulting_epoch IS NULL OR
+                  (typeof(resulting_epoch) = 'integer' AND resulting_epoch >= previous_epoch)),
+        reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+        FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
+        FOREIGN KEY(inventory_source_id, target_endpoint_id)
+            REFERENCES source_endpoints(inventory_source_id, endpoint_id),
+        FOREIGN KEY(inventory_source_id, expected_endpoint_id)
+            REFERENCES source_endpoints(inventory_source_id, endpoint_id)
+    )
+    """,
+    """
+    CREATE TABLE candidate_attestation_bindings (
+        binding_id TEXT PRIMARY KEY,
+        inventory_source_id TEXT NOT NULL,
+        endpoint_id TEXT NOT NULL,
+        source_attestation_epoch INTEGER NOT NULL
+            CHECK(typeof(source_attestation_epoch) = 'integer' AND source_attestation_epoch >= 1),
+        evidence_tier TEXT NOT NULL CHECK(evidence_tier IN ('tier_1', 'tier_2')),
+        endpoint_lifecycle_at_check TEXT NOT NULL
+            CHECK(length(trim(endpoint_lifecycle_at_check)) > 0),
+        canonical_transport_locator TEXT NOT NULL,
+        canonicalization_contract_version INTEGER NOT NULL
+            CHECK(typeof(canonicalization_contract_version) = 'integer' AND
+                  canonicalization_contract_version > 0),
+        transport_trust_revision INTEGER NOT NULL
+            CHECK(typeof(transport_trust_revision) = 'integer' AND transport_trust_revision > 0),
+        matched_at TEXT NOT NULL,
+        created_by TEXT NOT NULL CHECK(length(trim(created_by)) > 0),
+        event_id TEXT NOT NULL,
+        FOREIGN KEY(inventory_source_id) REFERENCES inventory_sources(inventory_source_id),
+        FOREIGN KEY(inventory_source_id, endpoint_id)
+            REFERENCES source_endpoints(inventory_source_id, endpoint_id),
+        FOREIGN KEY(event_id) REFERENCES source_attestation_events(event_id)
+    )
+    """,
+    """
     CREATE TRIGGER backend_instance_identity_immutable
     BEFORE UPDATE OF backend_instance_id, created_at ON backend_instance
     BEGIN SELECT RAISE(ABORT, 'backend instance identity is immutable'); END
@@ -1125,7 +1400,8 @@ _SCHEMA_STATEMENTS = (
                      expected_source_config_revision, expected_endpoint_id,
                      expected_canonical_transport_locator,
                      expected_canonicalization_contract_version,
-                     expected_transport_trust_revision, provider_contract_version
+                     expected_transport_trust_revision, expected_source_attestation_epoch,
+                     provider_contract_version
     ON discovery_runs
     BEGIN SELECT RAISE(ABORT, 'discovery run issuance fields are immutable'); END
     """,
@@ -1142,5 +1418,26 @@ _SCHEMA_STATEMENTS = (
         SELECT 1 FROM inventory_sources WHERE active_discovery_run_id = OLD.run_id
     )
     BEGIN SELECT RAISE(ABORT, 'active ownership must be released in the terminal transaction'); END
+    """,
+    """
+    CREATE TRIGGER source_attestation_state_identity_immutable
+    BEFORE UPDATE OF inventory_source_id ON source_attestation_state
+    BEGIN SELECT RAISE(ABORT, 'source attestation state identity is immutable'); END
+    """,
+    """
+    CREATE TRIGGER source_attestation_epoch_monotonic
+    BEFORE UPDATE OF source_attestation_epoch ON source_attestation_state
+    WHEN NEW.source_attestation_epoch < OLD.source_attestation_epoch
+    BEGIN SELECT RAISE(ABORT, 'source attestation epoch must never decrease'); END
+    """,
+    """
+    CREATE TRIGGER source_attestation_events_immutable
+    BEFORE UPDATE ON source_attestation_events
+    BEGIN SELECT RAISE(ABORT, 'source attestation events are immutable audit records'); END
+    """,
+    """
+    CREATE TRIGGER candidate_attestation_binding_immutable
+    BEFORE UPDATE ON candidate_attestation_bindings
+    BEGIN SELECT RAISE(ABORT, 'candidate attestation bindings are immutable audit records'); END
     """,
 )

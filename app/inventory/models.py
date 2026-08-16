@@ -43,6 +43,41 @@ class PersistentSourceHealthOrigin(StrEnum):
     INITIAL = "initial"
 
 
+class SourceAttestationStatus(StrEnum):
+    """Current accepted source-level trust-domain attestation state (ADR 0003)."""
+
+    NOT_YET_ATTESTED = "not_yet_attested"
+    ATTESTED = "attested"
+
+
+class AttestationEvidenceTier(StrEnum):
+    """ADR 0003 §4/§7 evidence tiers. Tier 3 does not exist and is never modeled."""
+
+    TIER_1 = "tier_1"
+    TIER_2 = "tier_2"
+
+
+class AttestationOperation(StrEnum):
+    """The kind of explicit, operator-driven attestation action attempted."""
+
+    ENROLLMENT = "enrollment"
+    REATTESTATION = "reattestation"
+    REVOCATION = "revocation"
+    CANDIDATE_CHECK = "candidate_check"
+
+
+class AttestationOutcome(StrEnum):
+    """Audited result of one attestation attempt (ADR 0003 §17/§18/§19a)."""
+
+    MATCH = "match"
+    MISMATCH = "mismatch"
+    UNAVAILABLE = "unavailable"
+    MALFORMED = "malformed"
+    STALE_CAS = "stale_cas"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
 class AuthorityError(RuntimeError):
     """Base class for durable authority failures."""
 
@@ -119,6 +154,7 @@ class SourceRuntimeHealth:
     committed_canonical_transport_locator: str | None
     committed_canonicalization_contract_version: int | None
     committed_transport_trust_revision: int | None
+    committed_source_attestation_epoch: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +168,7 @@ class DiscoveryRun:
     expected_canonical_transport_locator: str
     expected_canonicalization_contract_version: int
     expected_transport_trust_revision: int
+    expected_source_attestation_epoch: int
     provider_contract_version: int
     lifecycle: DiscoveryRunLifecycle
     terminalized_at: str | None
@@ -160,6 +197,83 @@ class DiscoveryRun:
     completion_canonical_transport_locator: str | None
     completion_canonicalization_contract_version: int | None
     completion_transport_trust_revision: int | None
+    completion_source_attestation_epoch: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceAttestationState:
+    """Current accepted source-level trust-domain attestation (ADR 0003).
+
+    Grants no resource/workload trust and no mutation authority by itself
+    (ADR 0003 §28). ``source_attestation_epoch`` starts at 0 and is a
+    backend-owned monotonic authority token, independent of
+    ``source_config_revision``, ``transport_trust_revision``, and
+    ``resource_continuity_revision``.
+    """
+
+    inventory_source_id: str
+    attestation_status: SourceAttestationStatus
+    source_attestation_epoch: int
+    anchor_kind: str | None
+    anchor_value: str | None
+    evidence_tier: AttestationEvidenceTier | None
+    accepted_at: str | None
+    accepted_by: str | None
+    evaluated_endpoint_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceAttestationEvent:
+    """One immutable, retained audit record of an attestation attempt/outcome.
+
+    Retained regardless of the resulting decision; never overwritten by a
+    later attempt (ADR 0003 §19, §29).
+    """
+
+    event_id: str
+    inventory_source_id: str
+    target_endpoint_id: str
+    operation: AttestationOperation
+    actor: str
+    attempted_at: str
+    expected_source_config_revision: int
+    expected_endpoint_id: str
+    expected_canonical_transport_locator: str
+    expected_canonicalization_contract_version: int
+    expected_transport_trust_revision: int
+    expected_source_attestation_epoch: int
+    outcome: AttestationOutcome
+    evidence_tier: AttestationEvidenceTier | None
+    asserted_anchor_kind: str | None
+    asserted_anchor_value: str | None
+    endpoint_lifecycle_at_check: str | None
+    previous_epoch: int
+    resulting_epoch: int | None
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateAttestationBinding:
+    """One epoch-scoped candidate endpoint attestation binding (ADR 0003 §14).
+
+    A prerequisite record only. It never activates the endpoint, never
+    changes ``EndpointLifecycle``, and becomes unusable once
+    ``source_attestation_epoch`` advances past ``source_attestation_epoch``
+    recorded here.
+    """
+
+    binding_id: str
+    inventory_source_id: str
+    endpoint_id: str
+    source_attestation_epoch: int
+    evidence_tier: AttestationEvidenceTier
+    endpoint_lifecycle_at_check: str
+    canonical_transport_locator: str
+    canonicalization_contract_version: int
+    transport_trust_revision: int
+    matched_at: str
+    created_by: str
+    event_id: str
 
 
 @dataclass(frozen=True, slots=True)
