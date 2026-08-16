@@ -42,6 +42,7 @@ def normalized_snapshot_for(
     *,
     resources,
     nodes=None,
+    mode=BaselineMode.CLUSTER,
     provider_node_names=None,
     provider_guest_locators=None,
     source_availability=SourceAvailability.AVAILABLE,
@@ -75,7 +76,7 @@ def normalized_snapshot_for(
         source_facts={"release": "9.0"},
         source_availability=source_availability,
         baseline_completeness=BaselineCompleteness.COMPLETE,
-        baseline_mode=BaselineMode.CLUSTER,
+        baseline_mode=mode,
         acl_topology_hash_before="acl",
         acl_topology_hash_after="acl",
         permission_snapshot_hash_before="perms",
@@ -106,17 +107,17 @@ def normalized_snapshot_for(
             for vmid, kind, name, status, node_name, detail, facts in resources
         ),
         provider_node_scope=ProviderNodeScope._from_provider(
-            BaselineMode.CLUSTER, tuple(sorted(provider_node_names))
+            mode, tuple(sorted(provider_node_names))
         ),
         provider_guest_locators=provider_guest_locators,
     )
 
 
-def complete_snapshot(store, authority, source_id, *, resources, nodes=None):
+def complete_snapshot(store, authority, source_id, *, resources, nodes=None, mode=BaselineMode.CLUSTER):
     run = authority.issue_discovery_run(source_id, 1)
     authority.mark_discovery_run_running(source_id, run.run_id)
     normalized = normalized_snapshot_for(
-        run, source_id, resources=resources, nodes=nodes
+        run, source_id, resources=resources, nodes=nodes, mode=mode
     )
     authority.finalize_successful_discovery_run(source_id, run.run_id, normalized)
     return run, normalized
@@ -572,3 +573,133 @@ def test_direct_replacement_handoff_rolls_back_at_internal_midpoint(
     assert store.list_resources(source_id) == (old_resource,)
     assert store.list_bindings(source_id) == (old_binding,)
     assert store.source_state(source_id).source.active_discovery_run_id is not None
+
+
+# --- G8: standalone <-> cluster baseline_mode transition -------------------
+#
+# `baseline_mode` is per-run observed provenance recorded on each completed
+# `discovery_runs` record (see ADR 0002's `ClusterStatusResult`/provider-v1
+# contract and 0.5-inventory-model.md: "mutable presentation/observed:
+# display name oraz cluster/standalone facts"). It is not part of
+# `inventory_source_id`, `InventorySource` has no durable mode field, and a
+# newly observed mode is not a controlled source configuration change.
+# These tests lock that a legitimate standalone<->cluster transition never
+# by itself triggers identity replacement, quarantine/missing, or a
+# `source_config_revision` bump.
+
+
+@pytest.mark.parametrize(
+    "first_mode,second_mode",
+    (
+        (BaselineMode.STANDALONE, BaselineMode.CLUSTER),
+        (BaselineMode.CLUSTER, BaselineMode.STANDALONE),
+    ),
+)
+def test_standalone_cluster_mode_transition_preserves_identity_and_source_revision(
+    tmp_path: Path, first_mode: BaselineMode, second_mode: BaselineMode
+) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    node_a = (DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),)
+
+    run1, _ = complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(vmid=100, kind="qemu", node="pve-a"),),
+        nodes=node_a,
+        mode=first_mode,
+    )
+    before = store.list_resources(source_id)[0]
+    before_binding = store.list_bindings(source_id)[0]
+    before_source = store.source_state(source_id).source
+
+    run2, _ = complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(vmid=100, kind="qemu", node="pve-a"),),
+        nodes=node_a,
+        mode=second_mode,
+    )
+    after = store.list_resources(source_id)[0]
+    after_binding = store.list_bindings(source_id)[0]
+    after_source = store.source_state(source_id).source
+
+    # Same backend source identity throughout the transition.
+    assert after_source.inventory_source_id == before_source.inventory_source_id == source_id
+
+    # baseline_mode is per-run observed provenance, not source identity: each
+    # completed run records the mode actually observed on that run.
+    assert store.discovery_run(run1.run_id).baseline_mode == first_mode.value
+    assert store.discovery_run(run2.run_id).baseline_mode == second_mode.value
+
+    # Recording a new observed mode alone is not a controlled source
+    # configuration change and must not bump source_config_revision.
+    assert after_source.source_config_revision == before_source.source_config_revision
+
+    # The same source-local VMID with the same resource_type remains the
+    # same incarnation: no replacement, no generation bump.
+    assert after.resource_id == before.resource_id
+    assert after.active_binding_id == before.active_binding_id == before_binding.binding_id
+    assert after_binding.binding_id == before_binding.binding_id
+    assert after.locator_generation == before.locator_generation == 1
+    assert after.successor_resource_id is None
+
+    # No quarantine/missing transition occurs solely because mode changed.
+    assert after.presence == "present"
+    assert after.lifecycle == "active"
+    assert after.observational_continuity == "consistent"
+    assert after.security_continuity == before.security_continuity == "unverified"
+
+
+def test_cluster_to_standalone_mode_transition_with_topology_change_updates_node_facts_not_identity(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    cluster_nodes = (
+        DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),
+        DiscoveredNode("pve-b", "online", True, NOW.isoformat(), {}),
+    )
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(vmid=100, kind="qemu", node="pve-a"),),
+        nodes=cluster_nodes,
+        mode=BaselineMode.CLUSTER,
+    )
+    before = store.list_resources(source_id)[0]
+    before_source = store.source_state(source_id).source
+    pve_b_before = next(
+        node for node in store.list_nodes(source_id) if node.external_node_name == "pve-b"
+    )
+    assert pve_b_before.available is True
+
+    standalone_nodes = (DiscoveredNode("pve-a", "online", True, NOW.isoformat(), {}),)
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(vmid=100, kind="qemu", node="pve-a"),),
+        nodes=standalone_nodes,
+        mode=BaselineMode.STANDALONE,
+    )
+    after = store.list_resources(source_id)[0]
+    after_source = store.source_state(source_id).source
+
+    # Legitimate topology change: pve-b's departure from the observed scope
+    # is a node fact, not an identity or source-revision effect.
+    pve_b_after = next(
+        node for node in store.list_nodes(source_id) if node.external_node_name == "pve-b"
+    )
+    assert pve_b_after.available is False
+
+    # Resource identity, binding, and generation are unaffected by the mode
+    # transition itself.
+    assert after.resource_id == before.resource_id
+    assert after.active_binding_id == before.active_binding_id
+    assert after.locator_generation == before.locator_generation
+    assert after.presence == "present"
+    assert after.lifecycle == "active"
+    assert after.successor_resource_id is None
+    assert after_source.source_config_revision == before_source.source_config_revision

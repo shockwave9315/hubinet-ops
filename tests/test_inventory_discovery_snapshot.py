@@ -299,6 +299,26 @@ def test_complete_baseline_accepts_valid_mode_specific_node_coverage() -> None:
     assert set(cluster.covered_nodes) == {"pve-a", "pve-b"}
 
 
+def test_provider_node_scope_mode_mismatch_fails_closed() -> None:
+    """A malformed/incomplete boundary must still fail closed (G8).
+
+    ``baseline_mode`` is a snapshot-level observed fact; it must exactly
+    agree with the provider-established node-scope mode it was derived
+    from. A caller cannot silently pair a STANDALONE snapshot with a
+    CLUSTER-mode provider node-scope proof (or vice versa).
+    """
+
+    with pytest.raises(ValueError, match="provider node scope mode disagrees"):
+        snapshot(
+            baseline_mode=BaselineMode.STANDALONE,
+            nodes=(node("pve-a"),),
+            covered_nodes=("pve-a",),
+            provider_node_scope=ProviderNodeScope._from_provider(
+                BaselineMode.CLUSTER, ("pve-a",)
+            ),
+        )
+
+
 def test_complete_baseline_rejects_two_truncated_snapshot_collections_against_provider_scope() -> None:
     with pytest.raises(ValueError, match="provider-established covered node scope"):
         snapshot(
