@@ -18,7 +18,7 @@ from app.inventory import (
     NormalizedDiscoverySnapshot,
     SourceAvailability,
 )
-from app.inventory.discovery import ProviderNodeScope
+from app.inventory.discovery import ProviderGuestLocatorSet, ProviderNodeScope
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CUSTOM_COMPONENTS_PATH = REPOSITORY_ROOT / "custom_components"
@@ -134,7 +134,9 @@ def reconcile(
     resource_type="qemu",
     current_node_name="pve-a",
     node_names=("pve-a",),
+    provider_node_name=None,
 ):
+    provider_node_name = provider_node_name or current_node_name or node_names[0]
     run = authority.issue_discovery_run(source_id, 1)
     snapshot = NormalizedDiscoverySnapshot(
         run_id=run.run_id,
@@ -180,6 +182,9 @@ def reconcile(
         ),
         provider_node_scope=ProviderNodeScope._from_provider(
             BaselineMode.CLUSTER, tuple(sorted(node_names))
+        ),
+        provider_guest_locators=ProviderGuestLocatorSet._from_provider(
+            ({"vmid": 100, "type": resource_type, "node": provider_node_name},)
         ),
     )
     authority.finalize_successful_discovery_run(source_id, run.run_id, snapshot)

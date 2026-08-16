@@ -350,6 +350,28 @@ def test_boundary_window_orders_security_evidence_around_cluster_baseline() -> N
     )
 
 
+def test_normalization_rejects_provider_observed_guest_omitted_from_resources() -> None:
+    # provider_baseline.guest_rows observed VM 100; the caller supplies no
+    # normalized resources for it. Normalization must fail closed instead of
+    # silently producing a COMPLETE snapshot that could later be reconciled
+    # as VM 100 being missing.
+    transport = BoundaryTransport(
+        cluster_guests=({"vmid": 100, "type": "qemu", "node": "pve-a"},)
+    )
+    result = ProxmoxProviderV1.collect_boundary_baseline(transport)
+    assert result.guest_rows == ({"vmid": 100, "type": "qemu", "node": "pve-a"},)
+    with pytest.raises(ValueError, match="exactly match"):
+        normalized_from_provider_result(
+            result,
+            nodes=(
+                DiscoveredNode(
+                    "pve-a", "online", True, "2026-08-14T12:00:00+00:00", {}
+                ),
+            ),
+            resources=(),
+        )
+
+
 def test_boundary_checks_each_cluster_node_at_both_boundaries() -> None:
     node_names = ("pve-b", "pve-a")
     transport = BoundaryTransport(

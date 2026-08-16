@@ -18,7 +18,7 @@ from app.inventory import (
     SourceAvailability,
     evaluate_permission_coverage,
 )
-from app.inventory.discovery import ProviderNodeScope
+from app.inventory.discovery import ProviderGuestLocatorSet, ProviderNodeScope
 
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
@@ -43,6 +43,7 @@ def normalized_snapshot_for(
     resources,
     nodes=None,
     provider_node_names=None,
+    provider_guest_locators=None,
     source_availability=SourceAvailability.AVAILABLE,
     failed_baseline_scopes=(),
 ):
@@ -53,6 +54,13 @@ def normalized_snapshot_for(
     provider_node_names = provider_node_names or tuple(
         node.external_node_name for node in nodes
     )
+    if provider_guest_locators is None:
+        provider_guest_locators = ProviderGuestLocatorSet._from_provider(
+            tuple(
+                {"vmid": vmid, "type": kind, "node": node_name}
+                for vmid, kind, name, status, node_name, detail, facts in resources
+            )
+        )
     return NormalizedDiscoverySnapshot(
         run_id=run.run_id,
         discovery_run_sequence=run.discovery_run_sequence,
@@ -100,6 +108,7 @@ def normalized_snapshot_for(
         provider_node_scope=ProviderNodeScope._from_provider(
             BaselineMode.CLUSTER, tuple(sorted(provider_node_names))
         ),
+        provider_guest_locators=provider_guest_locators,
     )
 
 
@@ -285,6 +294,53 @@ def test_invalid_complete_node_coverage_cannot_mark_retained_resource_missing(
     assert store.backend_instance() == before_backend
     assert store.discovery_run(run.run_id).lifecycle.value == "running"
     assert store.source_state(source_id).source.active_discovery_run_id == run.run_id
+    with store._transaction() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM resource_terminations WHERE inventory_source_id=?",
+            (source_id,),
+        ).fetchone()[0] == 0
+
+
+def test_provider_observed_guest_omission_cannot_mark_retained_resource_missing(
+    tmp_path: Path,
+) -> None:
+    store, authority, source_id = make_authority(tmp_path)
+    complete_snapshot(
+        store,
+        authority,
+        source_id,
+        resources=(guest(vmid=100, node="pve-a"),),
+    )
+    retained = store.list_resources(source_id)[0]
+    retained_binding = store.list_bindings(source_id)[0]
+    before_inventory_revision = store.backend_instance().inventory_revision
+
+    run = authority.issue_discovery_run(source_id, 1)
+    authority.mark_discovery_run_running(source_id, run.run_id)
+    # The provider baseline still observed VM 100; the caller-supplied
+    # normalized resources omit it. This must be rejected fail-closed at
+    # construction, before it can ever reach reconciliation.
+    with pytest.raises(
+        ValueError, match="normalized resources to exactly match"
+    ):
+        normalized_snapshot_for(
+            run,
+            source_id,
+            resources=(),
+            provider_guest_locators=ProviderGuestLocatorSet._from_provider(
+                ({"vmid": 100, "type": "qemu", "node": "pve-a"},)
+            ),
+        )
+
+    current = store.list_resources(source_id)[0]
+    assert current.resource_id == retained.resource_id
+    assert current.presence == "present"
+    assert current.active_binding_id == retained.active_binding_id
+    assert current.locator_generation == retained.locator_generation
+    assert current.successor_resource_id is None
+    assert store.list_bindings(source_id)[0] == retained_binding
+    assert store.backend_instance().inventory_revision == before_inventory_revision
+    assert store.discovery_run(run.run_id).lifecycle.value == "running"
     with store._transaction() as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM resource_terminations WHERE inventory_source_id=?",

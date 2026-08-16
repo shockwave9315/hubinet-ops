@@ -83,6 +83,54 @@ class ProviderNodeScope:
         return cls(mode, tuple(node_names), _PROVIDER_NODE_SCOPE_TOKEN)
 
 
+_PROVIDER_GUEST_LOCATOR_SET_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderGuestLocatorSet:
+    """Opaque canonical guest-locator proof produced by the provider boundary.
+
+    Derived directly from ``BoundaryBaselineResult.guest_rows`` — never from
+    caller-supplied normalized resources — so a COMPLETE baseline snapshot
+    cannot silently drop, invent, retype, or relocate a provider-observed
+    guest during normalization.
+    """
+
+    locators: frozenset[tuple[int, str, str]]
+    _token: object = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._token is not _PROVIDER_GUEST_LOCATOR_SET_TOKEN:
+            raise TypeError(
+                "provider guest locator set must originate from provider evidence"
+            )
+        if not isinstance(self.locators, frozenset):
+            raise ValueError("provider guest locator set must be canonical")
+        for item in self.locators:
+            if (
+                not isinstance(item, tuple)
+                or len(item) != 3
+                or type(item[0]) is not int
+                or item[0] <= 0
+                or item[1] not in {"qemu", "lxc"}
+                or not isinstance(item[2], str)
+                or not _EXTERNAL_NODE_NAME.fullmatch(item[2])
+            ):
+                raise ValueError("provider guest locator set entries must be canonical")
+
+    @classmethod
+    def _from_provider(
+        cls, guest_rows: tuple[Mapping[str, Any], ...]
+    ) -> ProviderGuestLocatorSet:
+        locators = frozenset(
+            (int(row["vmid"]), str(row["type"]), str(row["node"]))
+            for row in guest_rows
+        )
+        if len(locators) != len(guest_rows):
+            raise ValueError("provider guest baseline contains a duplicate locator")
+        return cls(locators, _PROVIDER_GUEST_LOCATOR_SET_TOKEN)
+
+
 class ContinuityEvidenceKind(StrEnum):
     RESOURCE_TYPE_CHANGE = "resource_type_change"
     CONTINUITY_ANCHOR_MISMATCH = "continuity_anchor_mismatch"
@@ -217,6 +265,7 @@ class NormalizedDiscoverySnapshot:
     nodes: tuple[DiscoveredNode, ...]
     resources: tuple[DiscoveredResource, ...]
     provider_node_scope: ProviderNodeScope | None = None
+    provider_guest_locators: ProviderGuestLocatorSet | None = None
 
     @classmethod
     def from_provider_baseline(
@@ -241,7 +290,8 @@ class NormalizedDiscoverySnapshot:
         nodes: tuple[DiscoveredNode, ...],
         resources: tuple[DiscoveredResource, ...],
     ) -> NormalizedDiscoverySnapshot:
-        """Normalize provider evidence without accepting a substitute node scope."""
+        """Normalize provider evidence without accepting a substitute node scope
+        or guest locator set."""
 
         from .provider import BoundaryBaselineResult
 
@@ -282,6 +332,9 @@ class NormalizedDiscoverySnapshot:
             nodes=nodes,
             resources=resources,
             provider_node_scope=provider_baseline.node_scope,
+            provider_guest_locators=ProviderGuestLocatorSet._from_provider(
+                provider_baseline.guest_rows
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -356,6 +409,11 @@ class NormalizedDiscoverySnapshot:
                 raise ValueError("provider_node_scope must be provider evidence")
             if self.provider_node_scope.mode is not self.baseline_mode:
                 raise ValueError("provider node scope mode disagrees with baseline mode")
+        if (
+            self.provider_guest_locators is not None
+            and not isinstance(self.provider_guest_locators, ProviderGuestLocatorSet)
+        ):
+            raise ValueError("provider_guest_locators must be provider evidence")
         if len(set(node_names)) != len(node_names):
             raise ValueError("normalized snapshot contains duplicate external node name")
         if any(
@@ -397,6 +455,35 @@ class NormalizedDiscoverySnapshot:
                 )
             if self.baseline_mode is BaselineMode.STANDALONE and len(node_names) != 1:
                 raise ValueError("complete standalone baseline requires exactly one covered node")
+            if self.provider_guest_locators is None:
+                raise ValueError(
+                    "complete baseline requires provider guest-locator provenance"
+                )
+            provider_identity = frozenset(
+                (vmid, kind) for vmid, kind, _ in self.provider_guest_locators.locators
+            )
+            provider_node_by_identity = {
+                (vmid, kind): node
+                for vmid, kind, node in self.provider_guest_locators.locators
+            }
+            normalized_identity = frozenset(
+                (resource.vmid, resource.resource_type) for resource in self.resources
+            )
+            if normalized_identity != provider_identity:
+                raise ValueError(
+                    "complete baseline requires normalized resources to exactly match "
+                    "the provider guest locator baseline"
+                )
+            for resource in self.resources:
+                if (
+                    resource.current_node_name is not None
+                    and resource.current_node_name
+                    != provider_node_by_identity[(resource.vmid, resource.resource_type)]
+                ):
+                    raise ValueError(
+                        "complete baseline requires normalized resources to exactly match "
+                        "the provider guest locator baseline"
+                    )
             hashes = (
                 self.acl_topology_hash_before,
                 self.acl_topology_hash_after,

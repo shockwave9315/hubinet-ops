@@ -20,7 +20,7 @@ from app.inventory import (
     NormalizedDiscoverySnapshot,
     SourceAvailability,
 )
-from app.inventory.discovery import ProviderNodeScope
+from app.inventory.discovery import ProviderGuestLocatorSet, ProviderNodeScope
 
 
 START = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
@@ -70,6 +70,10 @@ def snapshot_for(
     if len(statuses) != len(resource_times):
         raise ValueError("detail status fixture must match resource observations")
     node_names = tuple(f"pve-{chr(ord('a') + index)}" for index in range(len(node_times)))
+    resource_nodes = tuple(
+        node_names[index % len(node_names)] if node_names else None
+        for index in range(len(resource_times))
+    )
     return NormalizedDiscoverySnapshot(
         run_id=run.run_id,
         discovery_run_sequence=run.discovery_run_sequence,
@@ -115,7 +119,7 @@ def snapshot_for(
                 "qemu",
                 f"guest-{index}",
                 "running",
-                node_names[index % len(node_names)] if node_names else None,
+                resource_nodes[index],
                 resource_time,
                 statuses[index],
                 {"memory": 1024},
@@ -124,6 +128,12 @@ def snapshot_for(
         ),
         provider_node_scope=ProviderNodeScope._from_provider(
             BaselineMode.CLUSTER, tuple(sorted(node_names))
+        ),
+        provider_guest_locators=ProviderGuestLocatorSet._from_provider(
+            tuple(
+                {"vmid": 100 + index, "type": "qemu", "node": resource_nodes[index]}
+                for index in range(len(resource_times))
+            )
         ),
     )
 

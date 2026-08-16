@@ -14,7 +14,7 @@ from app.inventory import (
     NormalizedDiscoverySnapshot,
     SourceAvailability,
 )
-from app.inventory.discovery import ProviderNodeScope
+from app.inventory.discovery import ProviderGuestLocatorSet, ProviderNodeScope
 
 
 SOURCE_ID = str(uuid.uuid4())
@@ -63,7 +63,26 @@ def snapshot(*, resources=(), nodes=None, source_id: str = SOURCE_ID, **changes)
         values["provider_node_scope"] = ProviderNodeScope._from_provider(
             values["baseline_mode"], provider_names
         )
+    if "provider_guest_locators" not in values:
+        values["provider_guest_locators"] = guest_locators(values["resources"])
     return NormalizedDiscoverySnapshot(**values)
+
+
+def guest_locators(resources) -> ProviderGuestLocatorSet:
+    """Build provider guest-locator provenance matching the given resources.
+
+    Tests that need a mismatch between the provider baseline and the
+    normalized resources must pass an explicit ``provider_guest_locators``
+    (or build one from a different resource set via this helper) rather than
+    relying on this default self-consistent derivation.
+    """
+
+    return ProviderGuestLocatorSet._from_provider(
+        tuple(
+            {"vmid": item.vmid, "type": item.resource_type, "node": item.current_node_name}
+            for item in resources
+        )
+    )
 
 
 def node(name="pve-a", observed_at="2026-08-14T12:00:00+00:00"):
@@ -289,6 +308,113 @@ def test_complete_baseline_rejects_two_truncated_snapshot_collections_against_pr
                 BaselineMode.CLUSTER, ("pve-a", "pve-b")
             ),
         )
+
+
+def provider_guest_locators(*rows) -> ProviderGuestLocatorSet:
+    return ProviderGuestLocatorSet._from_provider(
+        tuple({"vmid": vmid, "type": kind, "node": node_name} for vmid, kind, node_name in rows)
+    )
+
+
+def test_complete_baseline_requires_provider_guest_locator_provenance() -> None:
+    with pytest.raises(ValueError, match="provider guest-locator provenance"):
+        snapshot(
+            resources=(resource(),),
+            provider_guest_locators=None,
+        )
+
+
+def test_complete_baseline_rejects_omitted_provider_observed_guest() -> None:
+    # The provider baseline observed VM 100, but the caller-supplied
+    # normalized resources omit it entirely — this must never silently
+    # produce a COMPLETE snapshot (a retained VM 100 could otherwise be
+    # reconciled as missing even though the provider still observed it).
+    with pytest.raises(ValueError, match="exactly match"):
+        snapshot(
+            resources=(),
+            provider_guest_locators=provider_guest_locators((100, "qemu", "pve-a")),
+        )
+
+
+def test_complete_baseline_rejects_invented_guest_absent_from_provider_baseline() -> None:
+    with pytest.raises(ValueError, match="exactly match"):
+        snapshot(
+            resources=(resource(100),),
+            provider_guest_locators=provider_guest_locators(),
+        )
+
+
+def test_complete_baseline_rejects_same_vmid_with_wrong_type() -> None:
+    with pytest.raises(ValueError, match="exactly match"):
+        snapshot(
+            resources=(resource(100, "lxc"),),
+            provider_guest_locators=provider_guest_locators((100, "qemu", "pve-a")),
+        )
+
+
+def test_complete_baseline_rejects_same_vmid_type_with_wrong_node() -> None:
+    with pytest.raises(ValueError, match="exactly match"):
+        snapshot(
+            nodes=(node("pve-a"), node("pve-b")),
+            covered_nodes=("pve-a", "pve-b"),
+            resources=(resource(100, node_name="pve-b"),),
+            provider_guest_locators=provider_guest_locators((100, "qemu", "pve-a")),
+        )
+
+
+def test_complete_baseline_accepts_exact_cluster_guest_locator_match() -> None:
+    current = snapshot(
+        nodes=(node("pve-a"), node("pve-b")),
+        covered_nodes=("pve-a", "pve-b"),
+        resources=(resource(100, node_name="pve-a"), resource(101, "lxc", node_name="pve-b")),
+        provider_guest_locators=provider_guest_locators(
+            (100, "qemu", "pve-a"), (101, "lxc", "pve-b")
+        ),
+    )
+    assert {(item.vmid, item.resource_type) for item in current.resources} == {
+        (100, "qemu"),
+        (101, "lxc"),
+    }
+
+
+def test_complete_baseline_accepts_exact_standalone_guest_locator_match() -> None:
+    current = snapshot(
+        baseline_mode=BaselineMode.STANDALONE,
+        nodes=(node("pve-a"),),
+        covered_nodes=("pve-a",),
+        resources=(resource(100), resource(101, "lxc")),
+        provider_guest_locators=provider_guest_locators(
+            (100, "qemu", "pve-a"), (101, "lxc", "pve-a")
+        ),
+    )
+    assert len(current.resources) == 2
+
+
+def test_complete_baseline_accepts_guest_locators_regardless_of_ordering() -> None:
+    # The comparison is a set comparison: neither the order guest_rows arrive
+    # from the provider nor the order normalized resources are supplied in
+    # may affect acceptance.
+    resources = (resource(100, node_name="pve-a"), resource(101, "lxc", node_name="pve-b"))
+    nodes = (node("pve-a"), node("pve-b"))
+    forward = snapshot(
+        nodes=nodes,
+        covered_nodes=("pve-a", "pve-b"),
+        resources=resources,
+        provider_guest_locators=provider_guest_locators(
+            (100, "qemu", "pve-a"), (101, "lxc", "pve-b")
+        ),
+    )
+    reversed_order = snapshot(
+        nodes=tuple(reversed(nodes)),
+        covered_nodes=("pve-a", "pve-b"),
+        resources=tuple(reversed(resources)),
+        provider_guest_locators=provider_guest_locators(
+            (101, "lxc", "pve-b"), (100, "qemu", "pve-a")
+        ),
+    )
+    assert {(item.vmid, item.resource_type) for item in forward.resources} == {
+        (item.vmid, item.resource_type) for item in reversed_order.resources
+    }
 
 
 def test_snapshot_hash_covers_security_and_issuance_provenance() -> None:
