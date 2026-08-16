@@ -1514,6 +1514,13 @@ _SCHEMA_STATEMENTS = (
           AND e.operation = 'candidate_check'
           AND e.outcome = 'accepted'
           AND e.expected_source_attestation_epoch = NEW.source_attestation_epoch
+          AND e.expected_relationship_gate = 'clear'
+          AND e.evidence_tier = NEW.evidence_tier
+          AND e.tier2_evaluation = NEW.tier2_evaluation
+          AND e.endpoint_lifecycle_at_check = NEW.endpoint_lifecycle_at_check
+          AND e.expected_canonical_transport_locator = NEW.canonical_transport_locator
+          AND e.expected_canonicalization_contract_version = NEW.canonicalization_contract_version
+          AND e.expected_transport_trust_revision = NEW.transport_trust_revision
     )
     BEGIN SELECT RAISE(ABORT,
         'candidate attestation binding must originate from a matching accepted candidate_check event'
