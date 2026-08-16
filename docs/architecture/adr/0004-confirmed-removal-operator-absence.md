@@ -1,12 +1,16 @@
 # ADR 0004: confirmed removal — Class-C operator removal authority plus authoritative absence attestation
 
-Status: **PROPOSED**
+Status: **ACCEPTED**
 
-This ADR is not yet accepted architecture. It does not authorize any schema,
-persistence, or runtime implementation by itself. It does not amend ADR 0001,
-ADR 0002, or ADR 0003; where it depends on their invariants it cites them and
-adds a new, narrower normative layer on top, exactly as ADR 0003 added the
-source-attestation layer on top of ADR 0001/0002 without changing either.
+This ADR is accepted architecture, exactly as ADR 0001, ADR 0002, and ADR
+0003 are. Acceptance authorizes the architecture in this document as the
+normative Class-C confirmed-removal contract; it does **not**, by itself,
+authorize any schema, persistence, or runtime implementation — that remains
+gated on a separate future implementation package (WAVE A1). It does not
+amend ADR 0001, ADR 0002, or ADR 0003; where it depends on their invariants
+it cites them and adds a new, narrower normative layer on top, exactly as
+ADR 0003 added the source-attestation layer on top of ADR 0001/0002 without
+changing either.
 
 ## 1. Context / problem
 
