@@ -20,6 +20,7 @@ import pytest
 from app.inventory import (
     AttestationEvidenceTier,
     AuthorityDatabaseRejected,
+    AuthorityNotFound,
     InventoryAuthority,
     InventoryAuthorityStore,
     SourceAttestationStatus,
@@ -255,7 +256,7 @@ def test_issuance_captures_exact_nonzero_current_epoch_not_schema_default(
 
 def test_attestation_state_not_found_for_unknown_source(tmp_path: Path) -> None:
     store = InventoryAuthorityStore(tmp_path / "authority.db", now=fixed_now)
-    with pytest.raises(Exception):
+    with pytest.raises(AuthorityNotFound, match="inventory source does not exist"):
         store.attestation_state(str(uuid.uuid4()))
 
 
@@ -517,6 +518,9 @@ def test_candidate_binding_rejects_event_from_wrong_source(tmp_path: Path) -> No
             target_endpoint_id=endpoint_b,
             expected_endpoint_id=endpoint_b,
         )
+        # source_a must itself be live-eligible so the *only* violated
+        # precondition is "event belongs to another source".
+        _force_attested(connection, source_a, epoch=1)
 
     with pytest.raises(
         sqlite3.IntegrityError, match="matching accepted candidate_check event"
@@ -554,6 +558,7 @@ def test_candidate_binding_rejects_event_for_wrong_endpoint(tmp_path: Path) -> N
             target_endpoint_id=active_endpoint,
             expected_endpoint_id=active_endpoint,
         )
+        _force_attested(connection, source_id, epoch=1)
 
     with pytest.raises(
         sqlite3.IntegrityError, match="matching accepted candidate_check event"
@@ -575,6 +580,12 @@ def test_candidate_binding_rejects_non_candidate_check_event(tmp_path: Path) -> 
     event_id = str(uuid.uuid4())
 
     with store._transaction() as connection:
+        # A re-enrollment-style event captured at expected epoch 1 (e.g.
+        # after a prior revocation) so a candidate binding at epoch 1 is
+        # schema-legal (candidate_attestation_bindings.source_attestation_
+        # epoch requires >= 1) and the source can be made live-eligible at
+        # that same epoch -- isolating this test to exactly the "operation
+        # != candidate_check" precondition.
         _insert_event(
             connection,
             event_id=event_id,
@@ -583,10 +594,11 @@ def test_candidate_binding_rejects_non_candidate_check_event(tmp_path: Path) -> 
             expected_endpoint_id=endpoint_id,
             operation="enrollment",
             outcome="accepted",
-            expected_source_attestation_epoch=0,
-            previous_epoch=0,
-            resulting_epoch=1,
+            expected_source_attestation_epoch=1,
+            previous_epoch=1,
+            resulting_epoch=2,
         )
+        _force_attested(connection, source_id, epoch=1)
 
     with pytest.raises(
         sqlite3.IntegrityError, match="matching accepted candidate_check event"
@@ -598,7 +610,7 @@ def test_candidate_binding_rejects_non_candidate_check_event(tmp_path: Path) -> 
                 source_id=source_id,
                 endpoint_id=endpoint_id,
                 event_id=event_id,
-                epoch=0,
+                epoch=1,
             )
 
 
@@ -620,6 +632,7 @@ def test_candidate_binding_rejects_non_accepted_candidate_event(tmp_path: Path) 
             evidence_tier=None,
             tier2_evaluation=None,
         )
+        _force_attested(connection, source_id, epoch=1)
 
     with pytest.raises(
         sqlite3.IntegrityError, match="matching accepted candidate_check event"
@@ -649,6 +662,10 @@ def test_candidate_binding_rejects_incompatible_epoch(tmp_path: Path) -> None:
             expected_endpoint_id=endpoint_id,
             expected_source_attestation_epoch=1,
         )
+        # Live-eligible at epoch 2 (matching the attempted binding's own
+        # epoch), so only the event/binding epoch mismatch (1 vs. 2) is
+        # under test here.
+        _force_attested(connection, source_id, epoch=2)
 
     with pytest.raises(
         sqlite3.IntegrityError, match="matching accepted candidate_check event"
@@ -719,6 +736,7 @@ def test_candidate_attestation_binding_grants_no_activation_and_is_immutable(
     binding_id = str(uuid.uuid4())
 
     with store._transaction() as connection:
+        _force_attested(connection, source_id, epoch=1)
         _insert_event(
             connection,
             event_id=event_id,

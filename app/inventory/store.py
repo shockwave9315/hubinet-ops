@@ -85,6 +85,8 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "candidate_attestation_binding_immutable",
         "candidate_attestation_binding_no_delete",
         "candidate_attestation_binding_requires_matching_accepted_candidate_event",
+        "candidate_attestation_binding_requires_live_eligible_source",
+        "source_attestation_security_context_requires_epoch_bump",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -1511,19 +1513,53 @@ _SCHEMA_STATEMENTS = (
         WHERE e.event_id = NEW.event_id
           AND e.inventory_source_id = NEW.inventory_source_id
           AND e.target_endpoint_id = NEW.endpoint_id
+          AND e.expected_endpoint_id = NEW.endpoint_id
           AND e.operation = 'candidate_check'
           AND e.outcome = 'accepted'
           AND e.expected_source_attestation_epoch = NEW.source_attestation_epoch
+          AND e.previous_epoch = NEW.source_attestation_epoch
+          AND e.resulting_epoch IS NULL
           AND e.expected_relationship_gate = 'clear'
+          AND e.resulting_relationship_gate IS NULL
           AND e.evidence_tier = NEW.evidence_tier
           AND e.tier2_evaluation = NEW.tier2_evaluation
           AND e.endpoint_lifecycle_at_check = NEW.endpoint_lifecycle_at_check
           AND e.expected_canonical_transport_locator = NEW.canonical_transport_locator
           AND e.expected_canonicalization_contract_version = NEW.canonicalization_contract_version
           AND e.expected_transport_trust_revision = NEW.transport_trust_revision
+          AND e.actor = NEW.created_by
+          AND e.attempted_at = NEW.matched_at
     )
     BEGIN SELECT RAISE(ABORT,
         'candidate attestation binding must originate from a matching accepted candidate_check event'
+    ); END
+    """,
+    """
+    CREATE TRIGGER candidate_attestation_binding_requires_live_eligible_source
+    BEFORE INSERT ON candidate_attestation_bindings
+    WHEN NOT EXISTS (
+        SELECT 1 FROM source_attestation_state s
+        JOIN source_attestation_events e ON e.event_id = NEW.event_id
+        WHERE s.inventory_source_id = NEW.inventory_source_id
+          AND s.attestation_status = 'attested'
+          AND s.source_attestation_epoch = NEW.source_attestation_epoch
+          AND s.relationship_gate = 'clear'
+          AND s.anchor_kind = e.asserted_anchor_kind
+          AND s.anchor_value = e.asserted_anchor_value
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'candidate attestation binding requires the source to be currently eligible under the exact binding epoch'
+    ); END
+    """,
+    """
+    CREATE TRIGGER source_attestation_security_context_requires_epoch_bump
+    BEFORE UPDATE OF attestation_status, anchor_kind, anchor_value ON source_attestation_state
+    WHEN NEW.source_attestation_epoch = OLD.source_attestation_epoch
+      AND (NEW.attestation_status IS NOT OLD.attestation_status
+           OR NEW.anchor_kind IS NOT OLD.anchor_kind
+           OR NEW.anchor_value IS NOT OLD.anchor_value)
+    BEGIN SELECT RAISE(ABORT,
+        'source attestation security-context change requires an epoch bump'
     ); END
     """,
 )

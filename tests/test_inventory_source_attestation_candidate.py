@@ -30,6 +30,7 @@ from app.inventory import (
     AttestationOperation,
     AttestationOutcome,
     AuthorityConflict,
+    AuthorityNotFound,
     InventoryAuthority,
     InventoryAuthorityStore,
     SourceAttestationEvidenceReading,
@@ -209,13 +210,12 @@ def test_active_endpoint_cannot_be_used_as_candidate(tmp_path: Path) -> None:
 def test_endpoint_belonging_to_another_source_rejected(tmp_path: Path) -> None:
     store, authority, source_a = create_authority(tmp_path, name="A", locator="https://a.example:8006")
     _, _, source_b = create_authority(tmp_path, name="B", locator="https://b.example:8006")
-    authority_b = InventoryAuthority(store, now=fixed_now)
     enroll(store, authority, source_a, "deadbeef")
     other_source_candidate = insert_endpoint(
         store, source_b, locator="https://b-candidate.example:8006"
     )
 
-    with pytest.raises(Exception):
+    with pytest.raises(AuthorityNotFound, match="does not exist for this inventory source"):
         authority.check_candidate_attestation(
             source_a,
             endpoint_id=other_source_candidate,
