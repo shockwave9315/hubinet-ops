@@ -173,12 +173,14 @@ Required minimum analysis, one row per case from the wave brief. Per Finding
 1 of the corrective review, this table strictly separates **ground truth**
 (what the scenario description stipulates is actually true — known to the
 ADR author writing the scenario, never something Hubinet Ops can observe)
-from **what anchor evidence can establish** (bounded by §9/§10: at most an
-*asserted* identifier match read as API data over an authenticated session
-— never cryptographic proof-of-possession, never physical-machine proof).
-Conflating these two was the defect this revision corrects: a row's ground
+from **what anchor evidence can establish** (bounded by §9/§10 for tier 1 —
+at most an *asserted* identifier match read as API data over an
+authenticated session, never cryptographic proof-of-possession, never
+physical-machine proof — and by §10a for the optional, cryptographically
+stronger tier 2, where a row notes it is available). Conflating ground
+truth with evidence was the defect this revision corrects: a row's ground
 truth being "same physical machine" (because the scenario says so) must
-never be read as something the evidence proves.
+never be read as something either evidence tier proves.
 
 | Case | Scenario | Ground truth: same trust domain | Ground truth: same physical machine | What anchor evidence can establish | Required Hubinet Ops handling |
 | --- | --- | --- | --- | --- | --- |
@@ -186,12 +188,12 @@ never be read as something the evidence proves.
 | B | Cluster created from an existing standalone node | **unknown** — official contract for CA preservation across `pvecm create` is not verified here | yes, by construction | an asserted match or mismatch, whichever is actually returned | Not assumed preserved; whichever the read shows is handled by ordinary re-attestation (§16). |
 | C | Standalone node joins an existing foreign cluster | no — node adopts the foreign cluster's CA | yes (box unchanged) | an asserted mismatch, if genuine PVE software honestly reports it (§9) | Mismatch handling (§17) even though the physical box never changed — the sharpest same-peer/different-domain case. |
 | D | Adding/removing cluster nodes (existing members) | yes — surviving members keep the existing CA | n/a (concerns other members) | an asserted match, if checked | No anchor effect; ordinary operational event; no check is required. |
-| E | Node certificate (leaf) renewal, CA-signed | yes — CA unchanged | yes | an asserted match (root-CA API data unaffected by leaf rotation) | `transport_trust_revision`-relevant only (ADR 0002); no re-attestation. |
-| F | ACME/custom pveproxy certificate replacement | yes — internal root CA unaffected | yes | an asserted match, still returned as API data independent of which leaf negotiated the session — the case that most sharply shows the evidence is a self-report, not a TLS-handshake proof (§9) | Transport-trust-policy change only (§23); no re-attestation of the anchor required. |
+| E | Node certificate (leaf) renewal, CA-signed | yes — CA unchanged | yes | tier 1: an asserted match (root-CA API data unaffected by leaf rotation); **tier 2 also available and matches** — the renewed leaf still chain-verifies against the enrolled root CA (§10a) | `transport_trust_revision`-relevant only (ADR 0002); no re-attestation. |
+| F | ACME/custom pveproxy certificate replacement | yes — internal root CA unaffected | yes | tier 1: an asserted match, still returned as API data independent of which leaf negotiated the session — the case that most sharply shows the evidence is a self-report, not a TLS-handshake proof (§9); **tier 2 is unavailable** — the ACME/custom leaf does not chain to the enrolled root CA, and a matching tier-1 read does not repair that gap (§10a) | Transport-trust-policy change only (§23); no re-attestation of the anchor required; this configuration permanently operates at tier-1-only strength unless the operator adds out-of-band verification or a future tier-3 primitive (§10a). |
 | G | PVE root CA lifetime/deliberate regeneration | no — deliberate anchor change | yes | an asserted mismatch | Explicit re-attestation accepting the new anchor (§16). |
 | H | Endpoint DNS/IP/port change | depends on target; not knowable in advance | unknown | an asserted match or mismatch, depending on target | New `endpoint_id` (ADR 0002); candidate check (§14) supports but never alone authorizes activation. |
-| I | Switching to another node of the same cluster | yes — same cluster CA | no — different box, same cluster | an asserted match, expected | Still requires explicit candidate-enrollment action (§14/§15) to activate; match alone is insufficient. |
-| J | Same URL silently repoints to a different PVE environment | no | no | an asserted mismatch, **only if a check is ever explicitly performed** — ordinary discovery does not perform one (§13) | The one gap this ADR's evidence class could detect, but only when explicitly triggered; see corrected §17/Case O. |
+| I | Switching to another node of the same cluster | yes — same cluster CA | no — different box, same cluster | tier 1: an asserted match, expected; **tier 2 also expected** — every cluster-member node's default leaf chains to the same replicated cluster root CA (§10a), giving stronger corroboration | Still requires explicit candidate-enrollment action (§14/§15) to activate; match alone (either tier) is insufficient — the later activation ADR decides what tier(s) any future promotion requires. |
+| J | Same URL silently repoints to a different PVE environment | no | no | tier 1: an asserted mismatch, **only if a check is ever explicitly performed** — ordinary discovery does not perform one (§13); **tier 2, if checked, is meaningfully harder for the foreign environment to pass** — chain-verification requires the foreign leaf to actually be signed by the enrolled root CA, not merely a copied string (§10a) | The one gap this ADR's evidence class could detect, but only when explicitly triggered; see corrected §17/Case O. Tier 2, where available, hardens this detection without eliminating the trigger gap in §30.1. |
 | K | Restore/recovery of `pmxcfs` data to replacement hardware | yes — CA material genuinely restored, not fabricated | **no** | an asserted match that happens to be genuine (real key material was restored) | §11 — genuine match is still never physical proof. |
 | L | Full cloned PVE environment carrying copied `pmxcfs`/root CA | yes, on both clones, genuinely | **no**, and not unique — two live copies | an asserted match on either/both | Operator decision required; never auto-resolve which is "real" (§11). |
 | M | Snapshot/backup cloning leaving the same CA live in two environments | yes (both), genuinely | **no** | an asserted match on either/both | Same conclusion as L; both may be transiently live (DR test). |
@@ -199,7 +201,7 @@ never be read as something the evidence proves.
 | O | Backend DB restore independently of PVE restore | unknown — the restored enrolled value may be stale relative to current PVE state | n/a | **none, until an attestation-gated action explicitly triggers a fresh read** — ordinary discovery does not (§13) | Ordinary read-only inventory continues unaffected (accepted limitation); stale attestation state is not auto-revalidated. See corrected §13/§17. |
 | P | Backend DB clone and PVE clone together | yes (paired clone) | no | an asserted match, independently on each paired clone | Each clone considers itself attested to its own paired PVE clone; flagged unresolved (§30; see also `0.5-foundation.md` on `backend_instance_id` reinstall semantics). |
 | Q | Loss of current endpoint, only an unattested new endpoint reachable | unknown until checked | unknown | none obtained (no check performed by default) | Stays `source_unavailable`; no automatic promotion regardless of any evidence (§29 negative witness 1). |
-| R | Pre-attested candidate endpoint before primary failure | yes, as of the epoch it was checked against | unknown | an asserted match recorded at a specific epoch (§14) | Necessary but declared **not sufficient** for automatic promotion; left to a future activation ADR (§15, §30.4). |
+| R | Pre-attested candidate endpoint before primary failure | yes, as of the epoch it was checked against | unknown | tier 1: an asserted match recorded at a specific epoch (§14); **tier 2, where available, could be recorded alongside it** as stronger prerequisite corroboration (§10a) | Necessary but declared **not sufficient** for automatic promotion, regardless of tier; left to a future activation ADR to decide what tier(s) it requires (§15, §30.4). |
 | S | Standalone↔cluster transition, anchor unchanged / anchor changed | per sub-case, entirely independent of the mode transition | unaffected by the mode transition | independent of `baseline_mode` entirely (§25, G8) | Mode transition itself never triggers, and is never triggered by, attestation logic. |
 | T | Trust-domain mismatch during an in-flight discovery run | no, by definition | n/a | n/a to reconciliation, only to the fencing check | Run classified invalid/stale via CAS (§21, §19a). |
 | U | Restart while an attestation/re-attestation operation is incomplete | prior committed value only | n/a | none accepted from the incomplete attempt | Atomic commit-or-nothing; no partial state (§19). |
@@ -247,26 +249,62 @@ must fail closed (a `configuration_error`-class outcome, §18) if a future
 PVE release changes this contract or if the deployed release's support
 cannot be confirmed.
 
+**A second, stronger stock capability (Finding C of this revision).**
+`pveproxy` normally serves `/etc/pve/local/pve-ssl.pem` /
+`/etc/pve/local/pve-ssl.key` as its TLS leaf certificate/key — the node's
+default certificate, which PVE generates and signs *using*
+`pve-root-ca.pem`/`pve-root-ca.key` as the signing CA. If an operator has
+instead configured a custom `pveproxy-ssl.pem`/`pveproxy-ssl.key` pair
+(including via ACME), `pveproxy` serves that certificate instead, and it is
+not, in general, signed by `pve-root-ca.pem` at all.
+
+This means the certificate actually presented during the TLS handshake for
+a given connection is, in the default (non-custom, non-ACME) configuration,
+cryptographically chainable to `pve-root-ca.pem` using ordinary X.509 chain
+verification — a check Hubinet Ops can perform itself against the already-
+enrolled root CA material, not merely a value the peer asserts. §10a
+develops this into a second, stronger evidence tier, complementing (not
+replacing) the asserted-identifier evidence class above.
+
 ## 7. Candidate options considered
 
-1. **PVE root CA fingerprint as an operator-accepted asserted trust-domain
-   anchor identifier**, bound via explicit enrollment (recommended, §9).
-   This is option (a) from §4 — it is explicitly **not** cryptographic
-   proof-of-possession.
-2. No new primitive; keep endpoint replacement/failover permanently
-   unavailable. Rejected as a permanent answer — it leaves operators with no
-   accepted path to ever add a second endpoint or recover from an endpoint
-   change, which the existing architecture already flags as a real gap
-   (ADR 0002 §"Nierozstrzygnięte kwestie" #6). Still the correct default
-   *until* this ADR (or a successor) is accepted.
-3. A future, stronger **cryptographic** host/endpoint membership attestation
-   — option (b) from §4 — e.g. a dedicated Hubinet-issued enrollment secret
-   provisioned out-of-band on the PVE host, or another mechanism that
-   actually proves possession rather than merely asserting a value. Stock
-   read-only PVE API provides no such primitive today (§9). Not rejected —
-   flagged as the necessary complement to option 1's limitation, and as a
-   possible *additional* evidence class in §30.5, complementary to, not a
-   replacement for, option 1. Not designed here.
+This ADR's recommended decision (§9) is not a single evidence primitive but
+a **three-tier evidence model** (Finding C of this revision, §10a):
+
+1. **Tier 1 — asserted PVE root-CA identifier evidence**: the
+   `certificates/info` fingerprint read as ordinary API data (§6, §9).
+   Operator-accepted asserted anchor identity, option (a) from §4 —
+   explicitly **not** cryptographic proof-of-possession. Always obtainable
+   whenever the endpoint answers authenticated requests at all. Recommended
+   as the baseline mechanism (§9).
+2. **Tier 2 — cryptographic TLS-peer-chain-to-enrolled-PVE-CA evidence**:
+   whether the certificate actually presented in the already-completed TLS
+   handshake chain-verifies against the enrolled root CA (§6, §10a).
+   Cryptographically stronger than tier 1 — Hubinet Ops verifies this
+   itself rather than trusting a self-report — but only available when the
+   endpoint's leaf is signed by the internal PVE root CA (i.e., not under
+   ACME/custom certificates, §10a case F). Recommended as an additional,
+   optional corroborating check where available, never as a tier-1
+   replacement.
+3. **Tier 3 — a future, stronger cryptographic host/endpoint membership
+   attestation** — option (b) from §4 — e.g. a dedicated Hubinet-issued
+   enrollment secret provisioned out-of-band on the PVE host, or another
+   mechanism that actually proves possession of PVE CA private key material
+   itself, which neither tier 1 nor tier 2 provides (§9, §10a). Stock
+   read-only PVE API provides no such primitive today. Not rejected —
+   flagged as the necessary complement to tiers 1/2's limitations, and as a
+   possible *additional* evidence class in §30.5. Not designed here.
+
+No new primitive at all — keeping endpoint replacement/failover permanently
+unavailable — remains rejected as a permanent answer: it leaves operators
+with no accepted path to ever add a second endpoint or recover from an
+endpoint change, which the existing architecture already flags as a real
+gap (ADR 0002 §"Nierozstrzygnięte kwestie" #6). Still the correct default
+*until* this ADR (or a successor) is accepted.
+
+A later activation/failover ADR decides which tier(s) are required for
+which transition (§10a, §15) — this ADR fixes the tier definitions and
+their honest strength, not an activation policy over them.
 
 ## 8. Rejected alternatives and why
 
@@ -398,6 +436,102 @@ What a matching anchor read explicitly does **not** establish:
   *current* epoch says nothing about the validity of evidence recorded under
   a *prior* epoch (§20, §26, §27).
 
+Everything in this section describes **tier 1** evidence only (§7). §10a
+describes a second, cryptographically stronger evidence tier and is
+explicit about where its strength stops.
+
+## 10a. Stronger optional evidence: TLS-peer-chain-to-enrolled-CA (tier 2)
+
+**NEW ARCHITECTURAL DECISION, Finding C of this revision.** §9/§10 correctly
+establish that the `certificates/info` fingerprint alone is not
+cryptographic proof of anything. That does not mean stock PVE offers no
+stronger endpoint evidence at all — it means the stronger evidence lives
+elsewhere: in the TLS handshake itself, not in a self-reported API field.
+
+**The mechanism.** As established in §6: `pveproxy` normally presents
+`/etc/pve/local/pve-ssl.pem`, a leaf certificate PVE itself generates and
+signs using `pve-root-ca.pem`/`pve-root-ca.key`, unless the operator has
+configured a custom `pveproxy-ssl.pem`/`.key` pair (including ACME). When
+the certificate actually presented during the *current* TLS handshake for a
+connection can be cryptographically chain-verified (ordinary X.509 chain
+validation, performed by Hubinet Ops itself) against the enrolled PVE root
+CA, that constitutes **tier 2 evidence**:
+
+```text
+tier 1 (§9/§10): peer ASSERTS a fingerprint value as API response data
+                  — Hubinet Ops trusts the assertion, or does not
+
+tier 2 (this section): Hubinet Ops CRYPTOGRAPHICALLY VERIFIES the peer's
+                  already-negotiated leaf certificate chains to the
+                  enrolled root CA — a check Hubinet Ops performs itself,
+                  not a value the peer merely states
+```
+
+The TLS handshake proves possession of the *leaf* certificate's private key
+(ordinary TLS security). Chain-verifying that leaf against the enrolled
+root CA is a stronger, independently-computed claim than tier 1: it is not
+defeated by an endpoint that can merely echo a copied or fabricated string
+in a JSON payload (§5, §9's fabrication threat), because producing a leaf
+that chain-verifies against a specific CA requires that CA to have actually
+signed it.
+
+**What tier 2 still does NOT prove — precise limitations, as required:**
+
+- it does **not** prove the responding endpoint possesses
+  `pve-root-ca.key` itself — only that *some* certificate it presents was
+  signed by whoever *did* possess it at signing time; the endpoint is
+  proving possession of the leaf's key, not the root's;
+- it does **not** prove physical-machine uniqueness — a full clone that
+  carries both `pve-root-ca.pem`/`.key` *and* `pve-ssl.pem`/`.key` (§11)
+  satisfies tier 2 identically to the original, for the same reason tier 1
+  does not distinguish clones;
+- **CA compromise defeats it**: an attacker who has copied
+  `pve-root-ca.key` (§5) can mint an arbitrary number of leaves that chain-
+  verify correctly — tier 2 raises the bar from "copy a string" to "possess
+  or derive from the CA key," but does not eliminate the key-compromise
+  threat class;
+- **leaf-key compromise alone can impersonate that one node**: an attacker
+  who has only stolen `pve-ssl.key` (without the root CA key) can still
+  complete a chain-verifying handshake for that specific leaf, until it is
+  revoked/rotated — tier 2 evidence is peer-specific, not source-domain-
+  proof independent of the specific node compromised;
+- it does **not** replace, substitute for, or grant workload/node `hostd`
+  trust (ADR 0001's node attestation, §28) — it remains scoped to the
+  source-attestation question this ADR designs, nothing else.
+
+**ACME/custom pveproxy certificates (case F) — tier 2 is simply
+unavailable.** When the current TLS peer certificate does **not**
+cryptographically chain to the enrolled PVE root CA — because the operator
+has configured ACME or a custom `pveproxy-ssl.pem`/`.key` pair — tier 2
+evidence cannot be produced for that connection, period. Critically: **a
+`certificates/info` payload independently claiming the same enrolled root
+CA fingerprint does NOT repair this cryptographic gap.** Tier 1 and tier 2
+are not substitutable — a tier-1 match in the presence of an ACME/custom
+leaf proves exactly what §9/§10 already say a tier-1 match proves (an
+asserted identifier match, nothing cryptographic), never a chain proof by
+association. In that configuration the system has, and only ever has: tier
+1 asserted-anchor evidence, explicit out-of-band operator verification, or
+a future tier 3 primitive (§7).
+
+**This does not authorize activation/failover, and does not reinterpret
+`transport_trust_revision`.** Tier 2 availability is strictly more evidence
+than tier 1 alone, but this ADR does **not** decide that tier 2 alone is
+sufficient for any endpoint-identity state change — exactly as tier 1 alone
+is declared insufficient in §9. The later, separately accepted
+activation/failover ADR (§15) decides which tier(s), if any, are required
+for candidate promotion or failover; this ADR only defines what each tier
+honestly proves. `transport_trust_revision` (§23) is unchanged and is not
+reinterpreted by this section: it continues to mean the TLS trust *policy*
+that governs whether a connection is authenticated/accepted at all (which
+CA roots are trusted, pinning, verification policy). Source attestation may
+*additionally* consume the already-observed peer certificate from an
+already-successful connection as evidence and independently chain-verify it
+against the enrolled PVE CA — a related but architecturally separate check,
+performed after transport authentication has already succeeded, asking a
+different question ("does this already-trusted peer's certificate chain to
+the environment I enrolled?" rather than "should this connection be allowed
+to proceed at all?").
+
 ## 11. Explicit clone/restore limitation
 
 `pmxcfs`'s persistent database is `/var/lib/pve-cluster/config.db`; `/etc/pve`
@@ -459,6 +593,20 @@ which mirrors the existing controlled source/endpoint/transport transitions
 trust transition") and must serialize with active discovery-run ownership
 exactly like those transitions do (§21).
 
+Initial enrollment's `0 -> 1` transition is, precisely because it is an
+epoch bump, one instance of the controlled source security-context
+transition defined in §20's "Freshness-context participation" — even though
+it is the *first* attestation event for this source. Concretely: if a
+discovery run already committed successfully while the source was still
+`not_yet_attested` (epoch `0`) and the source is currently `healthy/fresh`,
+the same enrollment write transaction that bumps the epoch to `1` must
+atomically mark current health `stale`, with
+`current_health_origin=controlled_context_transition`, invalidate mutation
+freshness, and advance `published_state_revision` — exactly as it would for
+any later re-attestation epoch bump. It must not remain possible to treat
+inventory committed under epoch `0` as fresh under epoch `1` merely because
+epoch `0` predates attestation existing at all (§20).
+
 ## 13. Existing endpoint reconnect behavior
 
 Ordinary reconnects to the same already-active `endpoint_id` (transient
@@ -494,7 +642,10 @@ source's current enrolled anchor at the source's *current*
 The read (against the candidate) and the write (recording the binding) are
 two separate steps, following the same concurrency pattern as enrollment —
 see §19a, which this operation must use identically ("equivalent fencing to
-candidate endpoint attestation").
+candidate endpoint attestation"), **including** §19a's candidate-specific
+requirement that the candidate's exact lifecycle/admissibility state is
+captured before the read and re-validated inside the write transaction, so a
+candidate retired mid-flight cannot still receive a binding.
 
 A match records an **epoch-scoped candidate attestation binding**:
 `(endpoint_id, source_attestation_epoch, matched_at)`. This binding is valid
@@ -557,7 +708,14 @@ implementation choice: reconfirming an unchanged value must never bump the
 epoch (doing so would needlessly invalidate every candidate binding and, per
 §26/§27, cut off all Blocker A/B authority evidence for no security reason),
 while accepting a genuinely changed value, or an explicit revocation/reset,
-always must.
+always must — and, whenever it does, that same write additionally performs
+the controlled source security-context transition defined in §20's
+"Freshness-context participation": current health becomes stale, mutation
+freshness is invalidated, and `published_state_revision` advances, exactly
+mirroring the already-accepted controlled source/endpoint/transport-trust
+transition pattern. A same-value reconfirmation, having no epoch bump,
+correspondingly triggers none of that — it is audit-only, and current
+health/freshness is left completely untouched.
 
 Re-attestation must serialize with active discovery-run ownership exactly
 like other controlled context transitions (ADR 0002 pattern): at an active
@@ -675,6 +833,24 @@ context. This pattern applies identically to candidate endpoint attestation
 (§14) — "equivalent fencing," as required — with the candidate's own
 `endpoint_id`/transport substituted for the active endpoint's.
 
+**For candidate endpoint attestation specifically (§14)**, step 1's captured
+expected context must additionally include the candidate endpoint's exact
+lifecycle/admissibility state (e.g. `candidate`) at the moment the check
+starts, and step 4's revalidation must confirm that state still holds before
+accepting the binding. A candidate that is retired, or otherwise made
+ineligible, while the remote evidence read is in flight must not receive a
+newly accepted candidate-attestation binding merely because `endpoint_id`,
+canonical locator, and `transport_trust_revision` happened not to change —
+lifecycle eligibility is an independent axis from those and must be
+independently fenced. This ADR does not prescribe a specific mechanism
+(no SQL column is decided here); the next implementation package may satisfy
+this with an exact lifecycle/status CAS, an endpoint-local monotonic control
+revision, or any equivalent authoritative transaction check, as long as it
+is checked inside the same write transaction as step 4, not merely before
+it. This requirement is bounded to candidate-attestation admissibility and
+does not design, and must not be read as designing, endpoint activation
+itself (§15).
+
 ## 20. Source-attestation epoch/revision semantics
 
 `source_attestation_epoch` is a new, source-owned, monotonic token, a peer
@@ -756,12 +932,127 @@ cannot authorize anything once the epoch has moved to 8 — re-enrollment of
 workload trust is required, exactly as if the resource had never been
 trusted under the new epoch.
 
-The exact state representation (new enum value, additional column, or
-otherwise) for "trusted-but-epoch-stale" is Blocker B's own design decision,
-not this ADR's; **this ADR's normative contribution is only the authority
-rule itself** — old-epoch evidence is not authority-eligible in a new epoch
-— which Blocker A's and Blocker B's future ADRs must satisfy, not
-re-litigate (§26, §27, §29 negative witness 10, §30 item 7).
+**Representation boundary (Finding B of this revision — narrower than an
+earlier draft of this ADR, which left this too open).** This ADR does not,
+and cannot, change ADR 0001 (§2 non-goal); ADR 0001 remains the sole owner
+of the canonical `security_continuity` vocabulary (`unverified`, `trusted`,
+`revoked`) and of `resource_continuity_revision`'s transition rules. It
+follows directly that:
+
+- this ADR does **not** invent, and no future Blocker B implementation may
+  invent, a new canonical `security_continuity` value (e.g. no
+  "epoch-stale" enum member) to represent this situation;
+- any future Blocker B implementation must obey the *then-current* ACCEPTED
+  ADR 0001 state matrix and `resource_continuity_revision` rules exactly as
+  they exist at that time — this ADR grants it no exception;
+- if a future Blocker B design genuinely needs a state ADR 0001's existing
+  three-value vocabulary cannot express, that requires its own separate,
+  explicit amendment to ADR 0001, reviewed and accepted on its own merits,
+  **before** such an implementation — not something this ADR pre-authorizes
+  or that Blocker B may introduce unilaterally;
+- what this ADR does fix, within ADR 0001's existing vocabulary, is the
+  *authority-eligibility* rule above: epoch-stale evidence must never be
+  presented, derived, or relied upon as if it conferred an effective
+  `trusted` capability for any mutation-eligibility decision. A future
+  Blocker B design remains free to express "epoch-stale" either as an
+  ordinary ADR 0001 `trusted -> revoked` transition (with its own
+  `resource_continuity_revision` bump, following ADR 0001's existing
+  revocation rules exactly) or as an epoch-derived *effective* value
+  computed at decision time without mutating the stored field — this ADR
+  does not choose between those two mechanics, and leaves that choice to
+  Blocker B's own future design; the one thing neither mechanic may ever do
+  is let epoch-stale evidence continue authorizing anything as if it were
+  still `trusted`;
+- a source-attestation epoch bump still does not, by itself, manufacture a
+  new `resource_id` or constitute positive replacement evidence (§20 above,
+  §29 negative witness 11) — the identity/lifecycle facts owned by ADR
+  0001/0002 remain entirely theirs.
+
+**This ADR's normative contribution remains only the authority rule itself**
+— old-epoch evidence is not authority-eligible in a new epoch — expressed
+strictly inside ADR 0001's existing vocabulary and revision rules, which
+Blocker A's and Blocker B's future ADRs must satisfy, not re-litigate (§26,
+§27, §29 negative witnesses 10 and 16, §30 item 7).
+
+### Freshness-context participation (normative; Finding A of this revision)
+
+`source_attestation_epoch` is part of the exact security-sensitive source
+context for discovery/freshness provenance, a peer of
+`source_config_revision`, `endpoint_id`, canonical locator/version, and
+`transport_trust_revision` in every place ADR 0002 already tracks that
+context. Concretely, and mirroring `0.5-inventory-model.md`'s existing
+`committed_source_config_revision`/`committed_endpoint_id`/
+`committed_transport_trust_revision` provenance exactly:
+
+```text
+source_runtime_health (conceptual) additionally records:
+  committed_source_attestation_epoch
+    — the exact source_attestation_epoch under which the last successful,
+      applicable discovery commit was made (§21)
+
+current health/freshness derivation additionally requires:
+  committed_source_attestation_epoch == current source_attestation_epoch
+
+  (exact equality, not merely >=, exactly like the existing
+  committed_endpoint_id == current active endpoint_id requirement — any
+  divergence means a context transition happened since the last commit)
+```
+
+**Every epoch bump — initial enrollment `0 -> 1` (§12), an accepted
+anchor-value change, or an explicit revocation/reset (§16, §20) — is a
+controlled source security-context transition**, of the same architectural
+kind ADR 0002/`0.5-inventory-model.md` already define for a controlled
+source-config/active-route/canonicalization/TLS-trust context transition.
+In one atomic transaction, it must:
+
+```text
+1. serialize with active discovery-run ownership exactly like every other
+   controlled context transition (ADR 0002 pattern, §21): either wait for
+   the active run's terminal finalization/release, or atomically
+   terminalize/fence it with a real reason and release ownership, before
+   the transition proceeds — no new provider I/O may begin concurrently
+   with the transition
+2. update source_attestation_epoch (and, where applicable, the enrolled
+   anchor value/evidence kind)
+3. mark current source health stale, with
+   current_health_origin=controlled_context_transition and an explicit
+   reason identifying an attestation-context transition
+4. invalidate mutation freshness
+5. advance published_state_revision
+6. leave inventory_revision UNCHANGED — the context change alone is not an
+   inventory commit
+7. leave every current resource fact/identity exactly as last reconciled —
+   this transition performs no reconciliation, invents nothing, and
+   removes nothing (ADR 0001/0002 remain the sole owners of resource
+   presence/lifecycle/identity)
+8. commit all of the above together, or none of it
+```
+
+Only a subsequent successful, authoritative discovery commit — issued under
+`expected_source_attestation_epoch` equal to the new epoch, and finalized
+without a context mismatch (§21) — may restore
+`committed_source_attestation_epoch == current source_attestation_epoch`
+and therefore fresh health, exactly as a normal successful commit restores
+freshness after any other controlled context transition today.
+
+A **same-anchor reconfirmation** (§16) never bumps the epoch and therefore
+never performs this transition: an audit-only reconfirmation leaves
+`source_attestation_epoch`, current health, `committed_source_attestation_
+epoch`, and every revision token completely untouched, exactly as it must
+per §16's deterministic scheme.
+
+Concrete witness this closes: a discovery run commits successfully while
+`source_attestation_epoch=0` (`not_yet_attested`) and the source is
+`healthy/fresh`. An operator then performs initial enrollment, bumping the
+epoch to `1`, with no new discovery run yet issued or completed. Before this
+revision, nothing in this ADR prevented mutation/security logic from
+continuing to treat that epoch-`0`-committed inventory as fresh under the
+now-current epoch `1`. The rule above closes that gap: the enrollment
+transaction itself, being an epoch bump, atomically marks health stale with
+`current_health_origin=controlled_context_transition` — the inventory
+remains retained and presented as last-known data, but is not mutation-fresh
+again until a new successful commit is issued and finalized under exactly
+`source_attestation_epoch=1`.
 
 ## 21. Discovery-run fencing interaction
 
@@ -777,6 +1068,21 @@ invalid/stale, exactly like an in-flight `source_config_revision` or
 imposes no additional constraint on ordinary single-endpoint discovery
 (§3, §13) — this is how the "does not block base read-only inventory"
 invariant survives the addition of this new token.
+
+A **successful, applicable** commit does not merely check
+`expected_source_attestation_epoch` against current — in the same atomic
+reconciliation transaction that already records
+`committed_source_config_revision`/`committed_endpoint_id`/
+`committed_canonical_transport_locator`/
+`committed_canonicalization_contract_version`/
+`committed_transport_trust_revision` (ADR 0002), it must additionally record
+`committed_source_attestation_epoch = expected_source_attestation_epoch`
+(the exact epoch the run was issued and finalized under). This is the
+provenance §20's "Freshness-context participation" compares against current
+`source_attestation_epoch` to decide fresh-eligibility — recording only the
+CAS check without this committed provenance would leave §20's freshness rule
+unenforceable, since there would be nothing durable to compare a later
+epoch bump against.
 
 ## 22. Relationship to existing `source_config_revision`
 
@@ -802,6 +1108,13 @@ fingerprint (a `transport_trust_revision` bump, case E/F) does not by itself
 imply an anchor change, and an anchor change (case C, G, J) does not by
 itself imply a `transport_trust_revision` bump. Both must independently hold
 for any future attestation-gated action to proceed.
+
+This includes tier-2 evidence (§10a): consuming the already-negotiated peer
+certificate to chain-verify against the enrolled root CA is a *use* of data
+that already passed transport authentication under the current
+`transport_trust_revision` policy, asked as a separate question after the
+fact — it is not a redefinition of what `transport_trust_revision` itself
+governs (whether the connection is authenticated/accepted at all).
 
 ## 24. Relationship to canonicalization migration
 
@@ -865,12 +1178,22 @@ Blocker B exists: the §20 authority-eligibility rule requires that
 `trusted` continuity established under one `source_attestation_epoch` is
 **not authority-eligible** once the source's current epoch has advanced past
 it (§5's worked witness, §20's worked witness). This is the normative
-authority rule fixed by this ADR now; the exact representation of
-"trusted-but-epoch-stale" resource state, and any future carry-forward/
-re-validation procedure across an epoch boundary, is Blocker B's own design
-decision, not decided here. Absent such a future carry-forward procedure,
-the safe default is that old-epoch trust simply does not authorize anything
-under a new epoch.
+authority rule fixed by this ADR now.
+
+**Boundary with ADR 0001 (Finding B of this revision).** §20's
+"Representation boundary" is the exact, binding statement of this
+interaction and is not restated in full here to avoid drift; in summary,
+because this ADR does not and cannot change ADR 0001 (§2 non-goal): this
+ADR invents no new canonical `security_continuity` value; any future
+Blocker B implementation must obey the then-current ACCEPTED ADR 0001
+state matrix and `resource_continuity_revision` rules exactly; a genuinely
+new state beyond ADR 0001's existing vocabulary requires its own separate,
+explicit ADR 0001 amendment before implementation, not something Blocker B
+introduces unilaterally; and whichever mechanic Blocker B chooses to
+represent "epoch-stale" — an ordinary `trusted -> revoked` transition or an
+epoch-derived effective value computed at decision time — it may never let
+epoch-stale evidence continue to authorize anything as if it were still
+`trusted`.
 
 ## 28. Source attestation grants no workload/mutation authority
 
@@ -905,6 +1228,23 @@ Fail-closed defaults:
   `source_attestation_epoch` has advanced past the epoch it was recorded
   under (§20, §26, §27); it is retained as historical audit, never deleted,
   but never cited as current authority.
+- Every epoch bump — including initial enrollment `0 -> 1` — is a
+  controlled source security-context transition that marks current health
+  stale and invalidates mutation freshness in the same atomic transaction as
+  the epoch change; inventory committed under an old epoch is never treated
+  as fresh under a newer one, even though a same-anchor reconfirmation
+  performs none of this (§20 "Freshness-context participation").
+- No future Blocker B implementation may represent "trusted-but-epoch-stale"
+  as a new canonical `security_continuity` value; it must be expressed
+  entirely within ADR 0001's existing `unverified`/`trusted`/`revoked`
+  vocabulary and `resource_continuity_revision` rules, or else requires its
+  own separate ADR 0001 amendment before implementation (§20 "Representation
+  boundary", §27).
+- A candidate endpoint's lifecycle/admissibility state is captured before
+  its remote evidence read and re-validated inside the same write
+  transaction that would accept a candidate-attestation binding; a
+  candidate retired mid-flight must never receive a binding merely because
+  its `endpoint_id`/locator/transport-trust context did not change (§19a).
 
 Required negative witnesses for the next implementation package:
 
@@ -939,7 +1279,29 @@ Required negative witnesses for the next implementation package:
 12. a matching anchor read must never be described or implemented as proof
     that the responding endpoint possesses PVE CA private key material —
     it is, at most, an asserted identifier match an operator chooses to
-    trust (§9, §10).
+    trust (§9, §10);
+13. a discovery run that commits successfully while
+    `source_attestation_epoch=N` must never be presented as mutation-fresh
+    once the source's current epoch has advanced past `N`, absent a newer
+    successful commit issued and finalized under the new epoch (§20, §21);
+14. a tier-1 asserted-anchor match must never be described, implemented, or
+    logged as if it were tier-2 cryptographic chain evidence, or vice versa
+    — the two tiers are recorded and reasoned about separately (§10a);
+15. a `certificates/info` payload asserting the enrolled root-CA fingerprint
+    must never be treated as substituting for, or repairing the absence of,
+    tier-2 TLS-peer-chain evidence when the current leaf does not
+    cryptographically chain to the enrolled root CA (§10a, case F);
+16. no future Blocker B implementation may introduce a new canonical
+    `security_continuity` enum value to represent epoch-stale trust; it
+    must be expressed inside ADR 0001's existing three-value vocabulary and
+    `resource_continuity_revision` rules, or else requires its own separate,
+    explicit ADR 0001 amendment before implementation (§20 "Representation
+    boundary", §27);
+17. a candidate endpoint made ineligible (e.g. retired) after its remote
+    evidence read began, but before the write transaction commits, must
+    never receive an accepted candidate-attestation binding, even if its
+    `endpoint_id`/locator/`transport_trust_revision` never changed (§14,
+    §19a).
 
 ## 30. What remains unresolved after this ADR
 
@@ -962,11 +1324,12 @@ Required negative witnesses for the next implementation package:
    endpoint in its matrix, and failing closed if it cannot be confirmed.
 4. Whether, and under exactly what procedure, a pre-attested candidate
    endpoint (threat case R) may ever be promoted — automatically or only
-   operator-triggered — on loss of the primary active endpoint. Not decided
+   operator-triggered — on loss of the primary active endpoint, and which
+   evidence tier(s) (§7, §10a) such a procedure would require. Not decided
    here; requires a separate, later activation/failover ADR.
-5. Whether additional independent evidence classes (e.g., an out-of-band
-   Hubinet-provisioned enrollment secret) should ever supplement or replace
-   the PVE root CA fingerprint as anchor evidence.
+5. Whether additional independent evidence classes (tier 3, e.g. an
+   out-of-band Hubinet-provisioned enrollment secret) should ever
+   supplement tiers 1/2 as anchor evidence (§7, §10a).
 6. Long-term retention/purge policy for superseded attestation epochs'
    evidence.
 7. The **authority rule** for Blocker A/B evidence crossing an attestation
@@ -1001,28 +1364,55 @@ package would need to add, at minimum:
   expected-context field (in-flight change invalidates commit; stale worker
   rejected; restart-safe; etc.), mirroring ADR 0002's existing test
   discipline;
+- extension of `source_runtime_health`'s committed-context provenance to
+  include `committed_source_attestation_epoch`, recorded by every
+  successful applicable commit alongside the existing committed
+  source-config/endpoint/canonicalization/transport-trust fields (§21);
+- the controlled source security-context transition for every epoch bump
+  (§20 "Freshness-context participation"), including initial enrollment
+  `0 -> 1`: fences active discovery-run ownership, marks current health
+  stale with `current_health_origin=controlled_context_transition`,
+  invalidates mutation freshness, advances `published_state_revision`,
+  leaves `inventory_revision` and all resource facts/identities untouched,
+  and the positive/negative contract-test family this repository already
+  requires for that pattern (successful run under old epoch does not read
+  as fresh after a later epoch bump; same-anchor reconfirmation performs no
+  invalidation; only a new commit under the new epoch restores fresh; etc.);
 - epoch-scoped candidate attestation bindings (§14) as their own audited,
-  retained record, invalidated on re-attestation;
+  retained record, invalidated on re-attestation, and further invalidated
+  if the candidate's lifecycle/admissibility state changed between read and
+  write (§19a, §29 negative witness 17);
 - the §19a read-then-write concurrency pattern implemented literally: every
   attestation-gated remote evidence read happens outside any DB write
   transaction, with expected context (including
-  `source_attestation_epoch`) captured before the read and re-validated by
-  CAS inside the write transaction that follows it; positive/negative
+  `source_attestation_epoch`, and, for candidate checks, the candidate's
+  lifecycle/admissibility state) captured before the read and re-validated
+  by CAS inside the write transaction that follows it; positive/negative
   contract tests for this pattern (concurrent context change between read
   and write is classified stale, never partially applied);
 - when Blocker A's and Blocker B's own future implementation packages are
   designed, they must each record the exact `source_attestation_epoch`
   their evidence was established under and enforce the §20
   authority-eligibility rule (old-epoch evidence is not authority-eligible
-  under a newer epoch) — this package does not implement Blocker A/B
-  evidence itself, but any future package that does must satisfy this rule
-  from day one, not retrofit it;
+  under a newer epoch) **strictly within ADR 0001's existing
+  `security_continuity` vocabulary and `resource_continuity_revision`
+  rules** — this package does not implement Blocker A/B evidence itself,
+  and does not authorize either of those future packages to introduce a new
+  ADR 0001 canonical state without ADR 0001's own separate amendment
+  (§20 "Representation boundary", §27, §29 negative witness 16);
+- optional capture of tier-2 TLS-peer-chain-to-enrolled-CA evidence (§10a)
+  alongside tier-1 asserted-anchor evidence, recorded and reasoned about as
+  a distinct evidence class, never conflated with or substituted for tier 1
+  (§29 negative witnesses 14/15); this remains additional corroborating
+  evidence only — the next package does not decide, and must not decide by
+  implementation-detail default, that tier 2 alone authorizes any
+  activation-gated action;
 - explicit non-goal restated: this next package still does not implement
   endpoint activation, candidate promotion, or failover. Attestation is a
   prerequisite gate only. A separate, later ADR must define the exact
-  activation/failover procedure before any such runtime behavior may be
-  turned on, and that ADR must itself satisfy the same
-  architecture-change process as this one.
+  activation/failover procedure — including which evidence tier(s) it
+  requires — before any such runtime behavior may be turned on, and that
+  ADR must itself satisfy the same architecture-change process as this one.
 - explicit non-goal restated: this next package still does not deliver
   cryptographic endpoint membership proof (§4, §9 option (b)). If stronger
   proof-of-possession assurance is ever required, it needs its own
