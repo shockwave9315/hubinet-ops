@@ -251,7 +251,10 @@ class InventoryReconciler:
              successor_id, snapshot.discovery_run_sequence),
         )
         connection.execute(
-            "INSERT INTO resource_terminations VALUES(?, ?, ?, ?, 'replaced', ?, ?, ?)",
+            "INSERT INTO resource_terminations("
+            "resource_id, inventory_source_id, binding_id, locator_generation, reason, "
+            "successor_resource_id, run_sequence, class_c_decision_id, created_at) "
+            "VALUES(?, ?, ?, ?, 'replaced', ?, ?, NULL, ?)",
             (old_resource_id, snapshot.inventory_source_id, old_binding_id, old_generation,
              successor_id, snapshot.discovery_run_sequence, committed_at),
         )
