@@ -3,22 +3,34 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 import uuid
 
+from .attestation import (
+    ANCHOR_KIND_PVE_ROOT_CA_SHA256_FINGERPRINT,
+    SourceAttestationEvidenceReader,
+    SourceAttestationEvidenceReading,
+    SourceAttestationReadOutcome,
+)
 from .canonicalization import (
     CANONICALIZATION_CONTRACT_VERSION,
     canonicalize_transport_locator,
 )
 from .models import (
+    AttestationEvidenceTier,
+    AttestationOperation,
+    AttestationOutcome,
     AuthorityConflict,
     AuthorityInvariantError,
     AuthorityNotFound,
     DiscoveryRun,
     DiscoveryRunLifecycle,
     InventorySourceState,
+    SourceAttestationEvent,
+    TierTwoEvaluationStatus,
 )
 from .discovery import (
     BaselineCompleteness,
@@ -28,6 +40,25 @@ from .discovery import (
 from .provider import PROVIDER_CONTRACT_VERSION
 from .reconciliation import InventoryReconciler, ReconciliationSummary
 from .store import InventoryAuthorityStore
+
+
+@dataclass(frozen=True, slots=True)
+class _AttestationContext:
+    """Exact expected/current context compared across the ADR 0003 §19a gap.
+
+    Deliberately excludes ``attestation_status``/anchor value: every status
+    or anchor change in this module also bumps ``source_attestation_epoch``
+    in the same atomic transaction, so epoch equality is already a strict
+    proxy for "nothing security-relevant changed concurrently" -- exactly
+    like the existing discovery-run CAS context.
+    """
+
+    source_config_revision: int
+    endpoint_id: str
+    canonical_transport_locator: str
+    canonicalization_contract_version: int
+    transport_trust_revision: int
+    source_attestation_epoch: int
 
 
 class InventoryAuthority:
@@ -494,6 +525,150 @@ class InventoryAuthority:
             )
         return self._store.discovery_run(canonical_run_id)
 
+    def enroll_source_attestation(
+        self,
+        inventory_source_id: str,
+        *,
+        endpoint_id: str,
+        actor: str,
+        evidence_reader: SourceAttestationEvidenceReader,
+    ) -> SourceAttestationEvent:
+        """Explicit initial enrollment: not_yet_attested -> attested (ADR 0003 §12).
+
+        Never invoked by discovery. Requires the source's exact current
+        active endpoint as ``endpoint_id`` -- candidate endpoint attestation
+        remains a separate operation (Commit 4), not this one.
+        """
+
+        return self._perform_attestation_read_and_transition(
+            inventory_source_id,
+            endpoint_id=endpoint_id,
+            actor=actor,
+            evidence_reader=evidence_reader,
+            operation=AttestationOperation.ENROLLMENT,
+            accept_new_anchor=True,
+        )
+
+    def reattest_source(
+        self,
+        inventory_source_id: str,
+        *,
+        endpoint_id: str,
+        actor: str,
+        evidence_reader: SourceAttestationEvidenceReader,
+    ) -> SourceAttestationEvent:
+        """Explicit re-attestation of an already-attested source (ADR 0003 §16).
+
+        A same-anchor read is a reconfirmation (audit only, epoch
+        unchanged). A different anchor is recorded as a mismatch and never
+        silently accepted -- accepting a new anchor requires the operator to
+        separately call :meth:`accept_source_attestation_anchor_change`.
+        """
+
+        return self._perform_attestation_read_and_transition(
+            inventory_source_id,
+            endpoint_id=endpoint_id,
+            actor=actor,
+            evidence_reader=evidence_reader,
+            operation=AttestationOperation.REATTESTATION,
+            accept_new_anchor=False,
+        )
+
+    def accept_source_attestation_anchor_change(
+        self,
+        inventory_source_id: str,
+        *,
+        endpoint_id: str,
+        actor: str,
+        evidence_reader: SourceAttestationEvidenceReader,
+    ) -> SourceAttestationEvent:
+        """Explicit operator decision accepting a freshly read, different
+        anchor as a deliberate environment change (ADR 0003 §16, case G).
+
+        This never happens automatically merely because :meth:`reattest_source`
+        observed a mismatch -- the operator must call this method separately.
+        If the fresh read happens to match the currently enrolled anchor
+        after all, this degrades to an ordinary reconfirmation (ADR 0003
+        §20's deterministic epoch rule is not a caller choice).
+        """
+
+        return self._perform_attestation_read_and_transition(
+            inventory_source_id,
+            endpoint_id=endpoint_id,
+            actor=actor,
+            evidence_reader=evidence_reader,
+            operation=AttestationOperation.REATTESTATION,
+            accept_new_anchor=True,
+        )
+
+    def revoke_source_attestation(
+        self, inventory_source_id: str, *, actor: str, reason: str
+    ) -> SourceAttestationEvent:
+        """Explicit operator-driven revocation/reset (ADR 0003 §20).
+
+        A pure local decision: no remote evidence read, since there is
+        nothing to corroborate -- the operator is withdrawing trust, not
+        asserting a new anchor. Transitions attested/N -> not_yet_attested/
+        N+1 (never yet_attested/0 -- the epoch token never decreases or
+        resets) so the source is fail-closed for every attestation-gated
+        operation until an explicit new enrollment.
+        """
+
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        actor_text = _require_text(actor, "actor", max_length=200)
+        revoke_reason = _require_text(reason, "reason", max_length=500)
+        attempted_at = _timestamp(self._now())
+        event_id = _new_uuid()
+
+        with self._store._transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+            attestation = self._require_attestation_row(connection, source_id)
+            if attestation["attestation_status"] != "attested":
+                raise AuthorityConflict("source is not currently attested")
+            previous_epoch = int(attestation["source_attestation_epoch"])
+            new_epoch = previous_epoch + 1
+            expected = _capture_attestation_context(source, endpoint, attestation)
+
+            self._fence_active_run_for_attestation_transition(
+                connection, source, reason="attestation_epoch_transition"
+            )
+            connection.execute(
+                "UPDATE source_attestation_state SET attestation_status='not_yet_attested', "
+                "source_attestation_epoch=?, anchor_kind=NULL, anchor_value=NULL, "
+                "evidence_tier=NULL, tier2_evaluation=NULL, accepted_at=NULL, "
+                "accepted_by=NULL, evaluated_endpoint_id=NULL "
+                "WHERE inventory_source_id=?",
+                (new_epoch, source_id),
+            )
+            self._insert_attestation_event(
+                connection,
+                event_id=event_id,
+                source_id=source_id,
+                target_endpoint_id=str(endpoint["endpoint_id"]),
+                operation=AttestationOperation.REVOCATION,
+                actor=actor_text,
+                attempted_at=attempted_at,
+                expected=expected,
+                outcome=AttestationOutcome.ACCEPTED,
+                evidence_tier=None,
+                tier2_evaluation=None,
+                asserted_anchor_kind=None,
+                asserted_anchor_value=None,
+                endpoint_lifecycle_at_check=None,
+                previous_epoch=previous_epoch,
+                resulting_epoch=new_epoch,
+                reason=revoke_reason,
+            )
+            self._after_attestation_transition(connection, event_id=event_id)
+            self._mark_controlled_context_transition(
+                connection, source_id, "source_attestation_revoked"
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+        return self._store.attestation_event(event_id)
+
     def rotate_credential_reference(
         self, inventory_source_id: str, credential_reference: str
     ) -> InventorySourceState:
@@ -600,6 +775,264 @@ class InventoryAuthority:
                 connection, inventory_changed=False, published_changed=True
             )
         return self._store.source_state(source_id)
+
+    def _perform_attestation_read_and_transition(
+        self,
+        inventory_source_id: str,
+        *,
+        endpoint_id: str,
+        actor: str,
+        evidence_reader: SourceAttestationEvidenceReader,
+        operation: AttestationOperation,
+        accept_new_anchor: bool,
+    ) -> SourceAttestationEvent:
+        """Implement the ADR 0003 §19a three-phase pattern for one explicit,
+        operator-driven attestation read (enrollment or re-attestation).
+
+        Phase 1 captures one consistent expected context from a short
+        read-only transaction. Phase 2 calls the trusted evidence reader
+        entirely outside any write transaction. Phase 3 opens one
+        authoritative write transaction, revalidates the captured context by
+        CAS, and only then may accept a security transition -- atomically
+        with its audit event and, if an epoch bump is accepted, the
+        controlled source security-context transition (ADR 0003 §20).
+        """
+
+        source_id = _require_uuid(inventory_source_id, "inventory_source_id")
+        target_endpoint_id = _require_uuid(endpoint_id, "endpoint_id")
+        actor_text = _require_text(actor, "actor", max_length=200)
+
+        # ---- PHASE 1: authoritative pre-read (no held write transaction) ----
+        with self._store._read_transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+            attestation = self._require_attestation_row(connection, source_id)
+
+        if str(endpoint["endpoint_id"]) != target_endpoint_id:
+            raise ValueError(
+                "endpoint_id must be the source's current active endpoint; "
+                "candidate endpoint attestation is a separate operation"
+            )
+        current_status = str(attestation["attestation_status"])
+        if operation is AttestationOperation.ENROLLMENT:
+            if current_status != "not_yet_attested":
+                raise AuthorityConflict(
+                    "source is already attested; use reattest_source or "
+                    "accept_source_attestation_anchor_change"
+                )
+        elif current_status != "attested":
+            raise AuthorityConflict(
+                "source has not yet been enrolled; use enroll_source_attestation"
+            )
+
+        expected = _capture_attestation_context(source, endpoint, attestation)
+        enrolled_anchor_kind = attestation["anchor_kind"]
+        enrolled_anchor_value = attestation["anchor_value"]
+        previous_epoch = expected.source_attestation_epoch
+
+        # ---- PHASE 2: remote evidence read, OUTSIDE any write transaction ----
+        attempted_at = _timestamp(self._now())
+        reading = evidence_reader.read(
+            inventory_source_id=source_id,
+            endpoint_id=expected.endpoint_id,
+            canonical_transport_locator=expected.canonical_transport_locator,
+            enrolled_anchor_kind=enrolled_anchor_kind,
+            enrolled_anchor_value=enrolled_anchor_value,
+        )
+        if not isinstance(reading, SourceAttestationEvidenceReading):
+            raise TypeError(
+                "evidence reader must return a typed SourceAttestationEvidenceReading"
+            )
+
+        event_id = _new_uuid()
+        context_rejected = False
+
+        # ---- PHASE 3: authoritative write transaction; CAS-revalidate ----
+        with self._store._transaction() as connection:
+            source = self._require_source_row(connection, source_id)
+            endpoint = self._require_active_endpoint_row(connection, source_id)
+            attestation = self._require_attestation_row(connection, source_id)
+            current = _capture_attestation_context(source, endpoint, attestation)
+
+            if current != expected:
+                self._insert_attestation_event(
+                    connection,
+                    event_id=event_id,
+                    source_id=source_id,
+                    target_endpoint_id=target_endpoint_id,
+                    operation=operation,
+                    actor=actor_text,
+                    attempted_at=attempted_at,
+                    expected=expected,
+                    outcome=AttestationOutcome.STALE_CAS,
+                    evidence_tier=None,
+                    tier2_evaluation=None,
+                    asserted_anchor_kind=None,
+                    asserted_anchor_value=None,
+                    endpoint_lifecycle_at_check=None,
+                    previous_epoch=previous_epoch,
+                    resulting_epoch=None,
+                    reason="attestation_context_changed_between_read_and_write",
+                )
+                context_rejected = True
+            else:
+                (
+                    outcome,
+                    resulting_epoch,
+                    evidence_tier,
+                    tier2_evaluation,
+                    asserted_kind,
+                    asserted_value,
+                    audit_reason,
+                ) = _classify_attestation_reading(
+                    reading,
+                    operation=operation,
+                    accept_new_anchor=accept_new_anchor,
+                    enrolled_anchor_kind=enrolled_anchor_kind,
+                    enrolled_anchor_value=enrolled_anchor_value,
+                    previous_epoch=previous_epoch,
+                )
+                self._insert_attestation_event(
+                    connection,
+                    event_id=event_id,
+                    source_id=source_id,
+                    target_endpoint_id=target_endpoint_id,
+                    operation=operation,
+                    actor=actor_text,
+                    attempted_at=attempted_at,
+                    expected=expected,
+                    outcome=outcome,
+                    evidence_tier=evidence_tier,
+                    tier2_evaluation=tier2_evaluation,
+                    asserted_anchor_kind=asserted_kind,
+                    asserted_anchor_value=asserted_value,
+                    endpoint_lifecycle_at_check=None,
+                    previous_epoch=previous_epoch,
+                    resulting_epoch=resulting_epoch,
+                    reason=audit_reason,
+                )
+                if resulting_epoch is not None:
+                    self._fence_active_run_for_attestation_transition(
+                        connection, source, reason="attestation_epoch_transition"
+                    )
+                    connection.execute(
+                        "UPDATE source_attestation_state SET attestation_status='attested', "
+                        "source_attestation_epoch=?, anchor_kind=?, anchor_value=?, "
+                        "evidence_tier=?, tier2_evaluation=?, accepted_at=?, accepted_by=?, "
+                        "evaluated_endpoint_id=? WHERE inventory_source_id=?",
+                        (
+                            resulting_epoch,
+                            asserted_kind,
+                            asserted_value,
+                            evidence_tier.value,
+                            tier2_evaluation.value,
+                            attempted_at,
+                            actor_text,
+                            target_endpoint_id,
+                            source_id,
+                        ),
+                    )
+                    self._after_attestation_transition(connection, event_id=event_id)
+                    transition_reason = (
+                        "source_attestation_enrolled"
+                        if operation is AttestationOperation.ENROLLMENT
+                        else "source_attestation_anchor_changed"
+                    )
+                    self._mark_controlled_context_transition(
+                        connection, source_id, transition_reason
+                    )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
+
+        if context_rejected:
+            raise AuthorityConflict(
+                "attestation evidence context changed; audited without a state transition"
+            )
+        return self._store.attestation_event(event_id)
+
+    def _fence_active_run_for_attestation_transition(
+        self, connection: sqlite3.Connection, source: sqlite3.Row, *, reason: str
+    ) -> None:
+        """Reuse the existing abandon/release pattern (ADR 0002) so an active
+        run never remains a valid owner across an accepted epoch transition."""
+
+        run_id = source["active_discovery_run_id"]
+        if run_id is None:
+            return
+        terminalized_at = _timestamp(self._now())
+        released = connection.execute(
+            "UPDATE inventory_sources SET active_discovery_run_id=NULL "
+            "WHERE inventory_source_id=? AND active_discovery_run_id=?",
+            (str(source["inventory_source_id"]), run_id),
+        )
+        if released.rowcount != 1:
+            raise AuthorityConflict("discovery run no longer owns the source")
+        self._terminalize_abandoned_run(
+            connection, run_id=run_id, terminalized_at=terminalized_at, reason=reason
+        )
+
+    def _after_attestation_transition(
+        self, connection: sqlite3.Connection, *, event_id: str
+    ) -> None:
+        """Test injection seam inside an accepted attestation transition."""
+
+    @staticmethod
+    def _insert_attestation_event(
+        connection: sqlite3.Connection,
+        *,
+        event_id: str,
+        source_id: str,
+        target_endpoint_id: str,
+        operation: AttestationOperation,
+        actor: str,
+        attempted_at: str,
+        expected: _AttestationContext,
+        outcome: AttestationOutcome,
+        evidence_tier: AttestationEvidenceTier | None,
+        tier2_evaluation: TierTwoEvaluationStatus | None,
+        asserted_anchor_kind: str | None,
+        asserted_anchor_value: str | None,
+        endpoint_lifecycle_at_check: str | None,
+        previous_epoch: int,
+        resulting_epoch: int | None,
+        reason: str,
+    ) -> None:
+        connection.execute(
+            "INSERT INTO source_attestation_events("
+            "event_id, inventory_source_id, target_endpoint_id, operation, actor, "
+            "attempted_at, expected_source_config_revision, expected_endpoint_id, "
+            "expected_canonical_transport_locator, "
+            "expected_canonicalization_contract_version, "
+            "expected_transport_trust_revision, expected_source_attestation_epoch, "
+            "outcome, evidence_tier, tier2_evaluation, asserted_anchor_kind, "
+            "asserted_anchor_value, endpoint_lifecycle_at_check, previous_epoch, "
+            "resulting_epoch, reason) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_id,
+                source_id,
+                target_endpoint_id,
+                operation.value,
+                actor,
+                attempted_at,
+                expected.source_config_revision,
+                expected.endpoint_id,
+                expected.canonical_transport_locator,
+                expected.canonicalization_contract_version,
+                expected.transport_trust_revision,
+                expected.source_attestation_epoch,
+                outcome.value,
+                evidence_tier.value if evidence_tier is not None else None,
+                tier2_evaluation.value if tier2_evaluation is not None else None,
+                asserted_anchor_kind,
+                asserted_anchor_value,
+                endpoint_lifecycle_at_check,
+                previous_epoch,
+                resulting_epoch,
+                reason,
+            ),
+        )
 
     def materialize_due_expiry(
         self,
@@ -1129,6 +1562,135 @@ class InventoryAuthority:
             raise AuthorityConflict("discovery run belongs to another source")
         if source["active_discovery_run_id"] != run_id:
             raise AuthorityConflict("discovery run is not the active source owner")
+
+
+def _capture_attestation_context(
+    source: sqlite3.Row, endpoint: sqlite3.Row, attestation: sqlite3.Row
+) -> _AttestationContext:
+    return _AttestationContext(
+        source_config_revision=int(source["source_config_revision"]),
+        endpoint_id=str(endpoint["endpoint_id"]),
+        canonical_transport_locator=str(endpoint["canonical_transport_locator"]),
+        canonicalization_contract_version=int(
+            endpoint["canonicalization_contract_version"]
+        ),
+        transport_trust_revision=int(endpoint["transport_trust_revision"]),
+        source_attestation_epoch=int(attestation["source_attestation_epoch"]),
+    )
+
+
+def _classify_attestation_reading(
+    reading: SourceAttestationEvidenceReading,
+    *,
+    operation: AttestationOperation,
+    accept_new_anchor: bool,
+    enrolled_anchor_kind: str | None,
+    enrolled_anchor_value: str | None,
+    previous_epoch: int,
+) -> tuple[
+    AttestationOutcome,
+    int | None,
+    AttestationEvidenceTier | None,
+    TierTwoEvaluationStatus | None,
+    str | None,
+    str | None,
+    str,
+]:
+    """Turn one evidence reading into an audited outcome plus, if accepted,
+    the resulting epoch and durable anchor/tier fields to persist.
+
+    Returns ``(outcome, resulting_epoch, evidence_tier, tier2_evaluation,
+    asserted_anchor_kind, asserted_anchor_value, reason)``.
+    ``resulting_epoch`` is non-``None`` only for an accepted security
+    transition (ADR 0003 §20's fixed epoch rule -- never a caller choice).
+    """
+
+    if reading.outcome is SourceAttestationReadOutcome.UNAVAILABLE:
+        return (
+            AttestationOutcome.UNAVAILABLE,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "attestation_evidence_unavailable",
+        )
+    if reading.outcome is SourceAttestationReadOutcome.MALFORMED:
+        return (
+            AttestationOutcome.MALFORMED,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "attestation_evidence_malformed",
+        )
+
+    # OBSERVED: a genuine self-reported (tier 1) anchor was read, optionally
+    # corroborated by the trusted reader's own tier-2 chain verification.
+    if reading.anchor_kind != ANCHOR_KIND_PVE_ROOT_CA_SHA256_FINGERPRINT:
+        raise ValueError("observed anchor kind is unsupported")
+    asserted_kind = _require_text(reading.anchor_kind, "anchor_kind", max_length=200)
+    asserted_value = _require_text(reading.anchor_value, "anchor_value", max_length=200)
+    evidence_tier, tier2_evaluation = _classify_tier(reading)
+
+    if operation is AttestationOperation.ENROLLMENT:
+        # Nothing enrolled yet: the first observation defines the anchor.
+        # previous_epoch is normally 0 (the pristine sentinel), but a source
+        # re-enrolling after an explicit revocation/reset carries its epoch
+        # forward (ADR 0003 §20: the token never decreases or resets).
+        return (
+            AttestationOutcome.ACCEPTED,
+            previous_epoch + 1,
+            evidence_tier,
+            tier2_evaluation,
+            asserted_kind,
+            asserted_value,
+            "initial_enrollment_accepted",
+        )
+
+    same_anchor = (
+        asserted_kind == enrolled_anchor_kind and asserted_value == enrolled_anchor_value
+    )
+    if same_anchor:
+        return (
+            AttestationOutcome.MATCH,
+            None,
+            evidence_tier,
+            tier2_evaluation,
+            asserted_kind,
+            asserted_value,
+            "reattestation_same_anchor_reconfirmed",
+        )
+    if accept_new_anchor:
+        return (
+            AttestationOutcome.ACCEPTED,
+            previous_epoch + 1,
+            evidence_tier,
+            tier2_evaluation,
+            asserted_kind,
+            asserted_value,
+            "attestation_anchor_change_accepted_by_operator",
+        )
+    return (
+        AttestationOutcome.MISMATCH,
+        None,
+        evidence_tier,
+        tier2_evaluation,
+        asserted_kind,
+        asserted_value,
+        "reattestation_anchor_mismatch_not_accepted",
+    )
+
+
+def _classify_tier(
+    reading: SourceAttestationEvidenceReading,
+) -> tuple[AttestationEvidenceTier, TierTwoEvaluationStatus]:
+    if reading.tier2_verified is True:
+        return AttestationEvidenceTier.TIER_2, TierTwoEvaluationStatus.VERIFIED
+    if reading.tier2_verified is False:
+        return AttestationEvidenceTier.TIER_1, TierTwoEvaluationStatus.FAILED
+    return AttestationEvidenceTier.TIER_1, TierTwoEvaluationStatus.NOT_EVALUATED
 
 
 def _new_uuid() -> str:
