@@ -171,7 +171,7 @@ record:
 | --- | --- | --- | --- |
 | **Class-C positive removal authority** | "I am confirming removal of this exact retained resource incarnation" — an operator decision bound to exact identity/binding/generation/revision | explicit, audited, human operator act (§9) | No |
 | **Operator authoritative-absence attestation** | "the exact old incarnation is no longer the current occupant of this exact slot, and I am explicitly authorizing terminal closure on that administrative basis" | explicit, audited, human operator act, separate from the above (§10) | No |
-| **Sampled absence witness** | "a specific, exact, boundary-complete, fresh, currently-committed discovery run observed this exact slot absent" | machine-produced, by ordinary reconciliation, never by the operator (§11, §12) | No — a consistency check, not proof (ADR 0002 §8) |
+| **Sampled absence witness** | "a specific, exact, boundary-complete, fresh, currently-committed discovery run observed this exact slot absent" — retained in two shapes: current provenance while still `missing` (mutable-current, overwritten on reconfirmation), and consumed evidence once actually cited by a Class-C decision (immutable thereafter) — see §12/§27 | machine-produced, by ordinary reconciliation, never by the operator (§11, §12) | No — a consistency check, not proof (ADR 0002 §8) |
 | **Terminal transition** | the atomic backend authority decision that actually sets `presence=confirmed_removed` | one atomic backend transaction consuming all three of the above together (§19) | — |
 
 This ADR does not introduce a fourth term for the already-accepted `resource_
@@ -457,6 +457,17 @@ source/context/epoch transition (§15/§16):
   context — this does not weaken §13's rule; it is the same rule applied
   to a differently-shaped retention record
 ```
+
+Updating, overwriting, or clearing the current sampled-absence pointer —
+for any of the reasons above — is explicitly a side-effect-free, routine
+reconciliation write. It does **not**: increment `resource_continuity_
+revision`; close the active locator binding; change `resource_id`; change
+`locator_generation`; itself grant Class-C positive removal authority
+(§9); itself grant the operator authoritative-absence attestation (§10);
+or make `confirmed_removed` possible in any way short of the complete,
+separately-authorized Class-C atomic decision (§19). It is retention-shape
+A's bounded, mutable-current pointer (§27 item 1) — never itself an
+authority artifact, and never itself a step toward one.
 
 **B. Immutable consumed terminal evidence.** Only when a Class-C decision
 actually commits (§19) does the exact witness consumed by that decision
@@ -1044,18 +1055,61 @@ ADR's acceptance.
 
 ## 27. Retention / audit semantics
 
-All three artifacts introduced by this ADR — the sampled absence witness
-(§11/§12), the Class-C positive-removal-authority record (§9), and the
-operator absence-attestation record (§10) — are immutable once written and
-retained indefinitely, exactly like every other accepted audit/evidence
-class in this repository (ADR 0001's terminal/tombstone retention, ADR
-0002's `discovery_runs` completion audit, ADR 0003's `source_attestation_
-events`). No purge/retention policy is designed or authorized by this ADR;
-`0.5-inventory-model.md`'s existing statement that "Purge source, tombstone
-albo HA device nie jest automatycznym skutkiem discovery" applies
-identically to these new artifacts. Credentials, secrets, and raw
-authentication headers must never be copied into any of these evidence
-records, mirroring the existing repository-wide rule (`AGENTS.md`).
+Retention is **not** uniform across every artifact this ADR introduces —
+§12's two retention shapes have deliberately different retention rules, and
+this section is the ADR's own normative statement of both, so it must never
+be read as a blanket "everything is immutable" rule:
+
+**1. Current sampled-absence provenance (§12 retention shape A) — durable,
+but intentionally mutable-current, never an immutable audit artifact.**
+The bounded, per-currently-`missing`-resource pointer required by §12 is
+not one of the immutable artifacts below. It survives restart, but it is
+explicitly designed to be overwritten (never appended) each time a later
+complete, successful, committed run reconfirms the same slot absent, and
+to be cleared when the slot becomes present again (§12's exact update
+semantics). It is retained only for as long as it remains current-eligible
+provenance for a still-`missing`, not-yet-decided resource — it is **not**
+retained indefinitely merely because every polling observation that ever
+updated it once existed, and it is **not**, by itself, an audit record of
+"every time this resource was ever observed absent." Overwriting or
+clearing it is a routine, non-security-relevant side effect of ordinary
+reconciliation (§12), never itself an authority decision (§11).
+
+**2. Consumed sampled-absence witness (§12 retention shape B) — immutable
+once consumed, retained indefinitely.** Only when an actual Class-C
+terminal decision commits (§19) does the exact witness run/context
+consumed by that decision become frozen: its linkage into the Class-C
+evidence records (§19 step 3) and into `resource_terminations` (§19
+step 11) is immutable once written and retained indefinitely, exactly like
+every other accepted terminal/audit record in this repository.
+
+**3. Class-C positive-removal-authority record (§9)** — immutable once
+committed, retained indefinitely.
+
+**4. Operator authoritative-absence-attestation record (§10)** — immutable
+once committed, retained indefinitely.
+
+**5. `resource_terminations`** remains the single retained terminal/
+tombstone owner for this path (§3 item 20, §19 step 11, §20, §31); the
+terminal evidence linked into it is immutable exactly as items 2–4 above.
+This ADR does not introduce, and forbids, a second history table whose
+purpose would be to preserve every value the current sampled-absence
+pointer (item 1) was ever overwritten with — that provenance is exactly
+what item 1 does *not* need to retain, per §12.
+
+Items 2, 3, 4, and the linked terminal evidence in item 5 are retained
+exactly like every other accepted audit/evidence class in this repository
+(ADR 0001's terminal/tombstone retention, ADR 0002's `discovery_runs`
+completion audit, ADR 0003's `source_attestation_events`). No purge/
+retention policy for those immutable items is designed or authorized by
+this ADR; `0.5-inventory-model.md`'s existing statement that "Purge source,
+tombstone albo HA device nie jest automatycznym skutkiem discovery" applies
+identically to them. Item 1's routine overwrite/clear (§12) is not a purge
+and is not governed by that no-purge statement — it is ordinary current-
+state maintenance, not audit-record deletion. Credentials, secrets, and raw
+authentication headers must never be copied into any of these records,
+mutable or immutable, mirroring the existing repository-wide rule
+(`AGENTS.md`).
 
 ## 28. Adversarial matrix
 
