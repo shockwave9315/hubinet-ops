@@ -161,15 +161,18 @@ def _insert_candidate_binding(
 
 
 def test_fresh_database_declares_schema_version_4(tmp_path: Path) -> None:
-    assert AUTHORITY_SCHEMA_VERSION == 4
+    # WAVE A1 bumped the dormant authority schema to v5 (ADR 0004); this
+    # test's name is retained verbatim from WAVE C1 to avoid unrelated
+    # churn, but it now exercises the current AUTHORITY_SCHEMA_VERSION.
+    assert AUTHORITY_SCHEMA_VERSION == 5
     path = tmp_path / "authority.db"
     InventoryAuthorityStore(path, now=fixed_now)
     with sqlite3.connect(path) as connection:
         marker = connection.execute(
             "SELECT marker, schema_version FROM authority_schema"
         ).fetchone()
-        assert marker == (AUTHORITY_SCHEMA_MARKER, 4)
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert marker == (AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == AUTHORITY_SCHEMA_VERSION
         tables = {
             row[0]
             for row in connection.execute(
@@ -311,7 +314,7 @@ def test_stale_schema_object_mismatch_names_current_version(tmp_path: Path) -> N
     InventoryAuthorityStore(path, now=fixed_now)
     with sqlite3.connect(path) as connection:
         connection.execute("DROP TRIGGER source_attestation_epoch_monotonic")
-    with pytest.raises(AuthorityDatabaseRejected, match="version 4"):
+    with pytest.raises(AuthorityDatabaseRejected, match=f"version {AUTHORITY_SCHEMA_VERSION}"):
         InventoryAuthorityStore(path, now=fixed_now)
 
 

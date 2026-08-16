@@ -365,3 +365,123 @@ class ResourceLocatorBinding:
     valid_from_run_sequence: int
     valid_to_run_sequence: int | None
     closure_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceAbsencePointer:
+    """Current sampled-absence provenance (ADR 0004 §12 retention shape A).
+
+    Durable, bounded, mutable-current: exactly one row per resource
+    currently eligible as a sampled-absence witness. Overwritten (never
+    appended) each time a later complete successful run reconfirms the
+    same slot absent, and deleted once the slot becomes present again or
+    once its witness is consumed by an accepted Class-C decision. This is
+    never itself authority (ADR 0004 §11) -- it is machine consistency
+    evidence only, and its update carries no identity/binding/revision
+    side effects of any kind.
+    """
+
+    resource_id: str
+    inventory_source_id: str
+    witness_run_id: str
+    witness_discovery_run_sequence: int
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceRemovalAuthority:
+    """Immutable Class-C positive removal authority evidence (ADR 0004 §9).
+
+    "I am confirming removal of this exact retained resource incarnation."
+    Not, by itself, absence evidence -- see :class:`ResourceAbsenceAttestation`,
+    the structurally separate second artifact sharing the same
+    ``decision_id``.
+    """
+
+    evidence_id: str
+    decision_id: str
+    inventory_source_id: str
+    resource_id: str
+    binding_id: str
+    vmid: int
+    locator_generation: int
+    resource_continuity_revision: int
+    witness_run_id: str
+    witness_discovery_run_sequence: int
+    source_config_revision: int
+    endpoint_id: str
+    canonical_transport_locator: str
+    canonicalization_contract_version: int
+    transport_trust_revision: int
+    source_attestation_epoch: int
+    actor: str
+    decided_at: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceAbsenceAttestation:
+    """Immutable operator authoritative-absence attestation (ADR 0004 §10).
+
+    "The exact old incarnation is no longer the current occupant of this
+    exact slot, and I am explicitly authorizing terminal closure on that
+    administrative basis." A second, structurally separate artifact from
+    :class:`ResourceRemovalAuthority`, sharing the same ``decision_id`` and
+    identical provenance -- schema-enforced to match field-for-field.
+    """
+
+    evidence_id: str
+    decision_id: str
+    inventory_source_id: str
+    resource_id: str
+    binding_id: str
+    vmid: int
+    locator_generation: int
+    resource_continuity_revision: int
+    witness_run_id: str
+    witness_discovery_run_sequence: int
+    source_config_revision: int
+    endpoint_id: str
+    canonical_transport_locator: str
+    canonicalization_contract_version: int
+    transport_trust_revision: int
+    source_attestation_epoch: int
+    actor: str
+    decided_at: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceTermination:
+    """Retained terminal/tombstone record (ADR 0001; ADR 0004 §19 step 11).
+
+    The single terminal/tombstone owner for both direct replacement
+    (``reason='replaced'``) and Class-C confirmed removal
+    (``reason='confirmed_removed'``). ``run_sequence`` is always the
+    exact discovery run that supplied the observation provenance for the
+    closure -- for ``confirmed_removed`` this is the sampled-absence
+    witness run, and it is never the timing of the Class-C decision
+    itself (ADR 0004 §20); that provenance instead lives on the linked
+    ``class_c_decision_id`` evidence records.
+    """
+
+    resource_id: str
+    inventory_source_id: str
+    binding_id: str
+    locator_generation: int
+    reason: str
+    successor_resource_id: str | None
+    run_sequence: int
+    class_c_decision_id: str | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedRemovalResult:
+    """Result of one accepted Class-C confirmed-removal decision."""
+
+    decision_id: str
+    resource_id: str
+    removal_authority: ResourceRemovalAuthority
+    absence_attestation: ResourceAbsenceAttestation
+    termination: ResourceTermination

@@ -19,6 +19,7 @@ from .models import (
     AuthorityNotFound,
     BackendInstance,
     CandidateAttestationBinding,
+    ConfirmedRemovalResult,
     DiscoveryRun,
     DiscoveryRunLifecycle,
     EndpointLifecycle,
@@ -28,6 +29,10 @@ from .models import (
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
+    ResourceAbsenceAttestation,
+    ResourceAbsencePointer,
+    ResourceRemovalAuthority,
+    ResourceTermination,
     SourceAttestationEvent,
     SourceAttestationRelationshipGate,
     SourceAttestationState,
@@ -41,7 +46,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 4
+AUTHORITY_SCHEMA_VERSION = 5
 BUSY_TIMEOUT_MS = 5_000
 
 _REQUIRED_TABLES = frozenset(
@@ -60,6 +65,9 @@ _REQUIRED_TABLES = frozenset(
         "source_attestation_state",
         "source_attestation_events",
         "candidate_attestation_bindings",
+        "resource_absence_pointers",
+        "resource_removal_authorities",
+        "resource_absence_attestations",
     }
 )
 _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
@@ -73,6 +81,7 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "discovery_run_issuance_immutable",
         "discovery_run_terminalization_once",
         "discovery_run_release_before_terminalization",
+        "discovery_run_identity_per_source",
         "one_active_binding_per_locator",
         "one_active_binding_per_resource",
         "resource_identity_immutable",
@@ -87,6 +96,19 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "candidate_attestation_binding_requires_matching_accepted_candidate_event",
         "candidate_attestation_binding_requires_live_eligible_source",
         "source_attestation_security_context_requires_epoch_bump",
+        "resource_absence_pointer_identity_immutable",
+        "resource_absence_pointer_requires_successful_witness_run",
+        "resource_absence_pointer_requires_successful_witness_run_update",
+        "resource_removal_authority_immutable",
+        "resource_removal_authority_no_delete",
+        "resource_absence_attestation_immutable",
+        "resource_absence_attestation_no_delete",
+        "resource_absence_attestation_requires_matching_removal_authority",
+        "resource_termination_confirmed_removed_requires_matching_evidence",
+        "resource_termination_immutable",
+        "resource_termination_no_delete",
+        "resource_removal_authority_requires_matching_binding_provenance",
+        "resource_removal_authority_requires_matching_witness_provenance",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -280,6 +302,83 @@ class InventoryAuthorityStore:
             query += " ORDER BY inventory_source_id, endpoint_id, matched_at, binding_id"
             rows = connection.execute(query, tuple(params)).fetchall()
         return tuple(_candidate_attestation_binding(row) for row in rows)
+
+    def resource_absence_pointer(self, resource_id: str) -> ResourceAbsencePointer | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM resource_absence_pointers WHERE resource_id=?",
+                (resource_id,),
+            ).fetchone()
+        return _resource_absence_pointer(row) if row is not None else None
+
+    def list_resource_absence_pointers(
+        self, inventory_source_id: str | None = None
+    ) -> tuple[ResourceAbsencePointer, ...]:
+        with self._read_connection() as connection:
+            if inventory_source_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM resource_absence_pointers ORDER BY inventory_source_id, resource_id"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM resource_absence_pointers WHERE inventory_source_id=? "
+                    "ORDER BY resource_id",
+                    (inventory_source_id,),
+                ).fetchall()
+        return tuple(_resource_absence_pointer(row) for row in rows)
+
+    def resource_removal_authority(self, evidence_id: str) -> ResourceRemovalAuthority:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM resource_removal_authorities WHERE evidence_id=?",
+                (evidence_id,),
+            ).fetchone()
+        if row is None:
+            raise AuthorityNotFound("Class-C removal authority evidence does not exist")
+        return _resource_removal_authority(row)
+
+    def resource_absence_attestation(self, evidence_id: str) -> ResourceAbsenceAttestation:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM resource_absence_attestations WHERE evidence_id=?",
+                (evidence_id,),
+            ).fetchone()
+        if row is None:
+            raise AuthorityNotFound("operator absence-attestation evidence does not exist")
+        return _resource_absence_attestation(row)
+
+    def resource_termination(self, resource_id: str) -> ResourceTermination | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM resource_terminations WHERE resource_id=?",
+                (resource_id,),
+            ).fetchone()
+        return _resource_termination(row) if row is not None else None
+
+    def confirmed_removal_result(self, decision_id: str) -> ConfirmedRemovalResult:
+        with self._read_connection() as connection:
+            authority_row = connection.execute(
+                "SELECT * FROM resource_removal_authorities WHERE decision_id=?",
+                (decision_id,),
+            ).fetchone()
+            attestation_row = connection.execute(
+                "SELECT * FROM resource_absence_attestations WHERE decision_id=?",
+                (decision_id,),
+            ).fetchone()
+        if authority_row is None or attestation_row is None:
+            raise AuthorityNotFound("Class-C decision does not exist")
+        termination = self.resource_termination(str(authority_row["resource_id"]))
+        if termination is None:
+            raise AuthorityInvariantError(
+                "accepted Class-C decision must have a linked termination record"
+            )
+        return ConfirmedRemovalResult(
+            decision_id=decision_id,
+            resource_id=str(authority_row["resource_id"]),
+            removal_authority=_resource_removal_authority(authority_row),
+            absence_attestation=_resource_absence_attestation(attestation_row),
+            termination=termination,
+        )
 
     def record_counts(self) -> dict[str, int]:
         """Return bounded schema diagnostics without exposing SQL execution."""
@@ -804,6 +903,86 @@ def _resource_locator_binding(row: sqlite3.Row) -> ResourceLocatorBinding:
     )
 
 
+def _resource_absence_pointer(row: sqlite3.Row) -> ResourceAbsencePointer:
+    return ResourceAbsencePointer(
+        resource_id=str(row["resource_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        witness_run_id=str(row["witness_run_id"]),
+        witness_discovery_run_sequence=int(row["witness_discovery_run_sequence"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _resource_removal_authority(row: sqlite3.Row) -> ResourceRemovalAuthority:
+    return ResourceRemovalAuthority(
+        evidence_id=str(row["evidence_id"]),
+        decision_id=str(row["decision_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        resource_id=str(row["resource_id"]),
+        binding_id=str(row["binding_id"]),
+        vmid=int(row["vmid"]),
+        locator_generation=int(row["locator_generation"]),
+        resource_continuity_revision=int(row["resource_continuity_revision"]),
+        witness_run_id=str(row["witness_run_id"]),
+        witness_discovery_run_sequence=int(row["witness_discovery_run_sequence"]),
+        source_config_revision=int(row["source_config_revision"]),
+        endpoint_id=str(row["endpoint_id"]),
+        canonical_transport_locator=str(row["canonical_transport_locator"]),
+        canonicalization_contract_version=int(row["canonicalization_contract_version"]),
+        transport_trust_revision=int(row["transport_trust_revision"]),
+        source_attestation_epoch=int(row["source_attestation_epoch"]),
+        actor=str(row["actor"]),
+        decided_at=str(row["decided_at"]),
+        reason=str(row["reason"]),
+    )
+
+
+def _resource_absence_attestation(row: sqlite3.Row) -> ResourceAbsenceAttestation:
+    return ResourceAbsenceAttestation(
+        evidence_id=str(row["evidence_id"]),
+        decision_id=str(row["decision_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        resource_id=str(row["resource_id"]),
+        binding_id=str(row["binding_id"]),
+        vmid=int(row["vmid"]),
+        locator_generation=int(row["locator_generation"]),
+        resource_continuity_revision=int(row["resource_continuity_revision"]),
+        witness_run_id=str(row["witness_run_id"]),
+        witness_discovery_run_sequence=int(row["witness_discovery_run_sequence"]),
+        source_config_revision=int(row["source_config_revision"]),
+        endpoint_id=str(row["endpoint_id"]),
+        canonical_transport_locator=str(row["canonical_transport_locator"]),
+        canonicalization_contract_version=int(row["canonicalization_contract_version"]),
+        transport_trust_revision=int(row["transport_trust_revision"]),
+        source_attestation_epoch=int(row["source_attestation_epoch"]),
+        actor=str(row["actor"]),
+        decided_at=str(row["decided_at"]),
+        reason=str(row["reason"]),
+    )
+
+
+def _resource_termination(row: sqlite3.Row) -> ResourceTermination:
+    return ResourceTermination(
+        resource_id=str(row["resource_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        binding_id=str(row["binding_id"]),
+        locator_generation=int(row["locator_generation"]),
+        reason=str(row["reason"]),
+        successor_resource_id=(
+            str(row["successor_resource_id"])
+            if row["successor_resource_id"] is not None
+            else None
+        ),
+        run_sequence=int(row["run_sequence"]),
+        class_c_decision_id=(
+            str(row["class_c_decision_id"])
+            if row["class_c_decision_id"] is not None
+            else None
+        ),
+        created_at=str(row["created_at"]),
+    )
+
+
 def _source_attestation_state(row: sqlite3.Row) -> SourceAttestationState:
     evidence_tier = row["evidence_tier"]
     tier2_evaluation = row["tier2_evaluation"]
@@ -910,7 +1089,7 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 4)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 5)
     )
     """,
     """
@@ -1170,6 +1349,10 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE UNIQUE INDEX discovery_run_identity_per_source
+    ON discovery_runs(inventory_source_id, run_id)
+    """,
+    """
     CREATE TABLE inventory_nodes (
         node_id TEXT PRIMARY KEY,
         inventory_source_id TEXT NOT NULL,
@@ -1251,14 +1434,23 @@ _SCHEMA_STATEMENTS = (
         inventory_source_id TEXT NOT NULL,
         binding_id TEXT NOT NULL,
         locator_generation INTEGER NOT NULL,
-        reason TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(reason IN ('replaced', 'confirmed_removed')),
         successor_resource_id TEXT,
-        run_sequence INTEGER NOT NULL,
+        run_sequence INTEGER NOT NULL CHECK(typeof(run_sequence) = 'integer' AND run_sequence > 0),
+        class_c_decision_id TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id),
         FOREIGN KEY(binding_id) REFERENCES resource_locator_bindings(binding_id),
         FOREIGN KEY(successor_resource_id) REFERENCES resource_incarnations(resource_id)
-            DEFERRABLE INITIALLY DEFERRED
+            DEFERRABLE INITIALLY DEFERRED,
+        FOREIGN KEY(class_c_decision_id) REFERENCES resource_removal_authorities(decision_id),
+        CHECK(
+            (reason = 'confirmed_removed' AND successor_resource_id IS NULL
+             AND class_c_decision_id IS NOT NULL)
+            OR
+            (reason = 'replaced' AND successor_resource_id IS NOT NULL
+             AND class_c_decision_id IS NULL)
+        )
     )
     """,
     """
@@ -1386,6 +1578,104 @@ _SCHEMA_STATEMENTS = (
             REFERENCES source_endpoints(inventory_source_id, endpoint_id),
         FOREIGN KEY(event_id) REFERENCES source_attestation_events(event_id),
         CHECK(tier2_evaluation != 'verified' OR evidence_tier = 'tier_2')
+    )
+    """,
+    """
+    CREATE TABLE resource_absence_pointers (
+        resource_id TEXT PRIMARY KEY,
+        inventory_source_id TEXT NOT NULL,
+        witness_run_id TEXT NOT NULL,
+        witness_discovery_run_sequence INTEGER NOT NULL
+            CHECK(typeof(witness_discovery_run_sequence) = 'integer' AND
+                  witness_discovery_run_sequence > 0),
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(inventory_source_id, resource_id)
+            REFERENCES resource_incarnations(inventory_source_id, resource_id),
+        FOREIGN KEY(inventory_source_id, witness_run_id)
+            REFERENCES discovery_runs(inventory_source_id, run_id)
+    )
+    """,
+    """
+    CREATE TABLE resource_removal_authorities (
+        evidence_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL UNIQUE,
+        inventory_source_id TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        vmid INTEGER NOT NULL CHECK(typeof(vmid) = 'integer' AND vmid > 0),
+        locator_generation INTEGER NOT NULL
+            CHECK(typeof(locator_generation) = 'integer' AND locator_generation > 0),
+        resource_continuity_revision INTEGER NOT NULL
+            CHECK(typeof(resource_continuity_revision) = 'integer' AND
+                  resource_continuity_revision > 0),
+        witness_run_id TEXT NOT NULL,
+        witness_discovery_run_sequence INTEGER NOT NULL
+            CHECK(typeof(witness_discovery_run_sequence) = 'integer' AND
+                  witness_discovery_run_sequence > 0),
+        source_config_revision INTEGER NOT NULL
+            CHECK(typeof(source_config_revision) = 'integer' AND source_config_revision > 0),
+        endpoint_id TEXT NOT NULL,
+        canonical_transport_locator TEXT NOT NULL,
+        canonicalization_contract_version INTEGER NOT NULL
+            CHECK(typeof(canonicalization_contract_version) = 'integer' AND
+                  canonicalization_contract_version > 0),
+        transport_trust_revision INTEGER NOT NULL
+            CHECK(typeof(transport_trust_revision) = 'integer' AND transport_trust_revision > 0),
+        source_attestation_epoch INTEGER NOT NULL
+            CHECK(typeof(source_attestation_epoch) = 'integer' AND source_attestation_epoch >= 1),
+        actor TEXT NOT NULL CHECK(length(trim(actor)) > 0),
+        decided_at TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+        FOREIGN KEY(inventory_source_id, resource_id)
+            REFERENCES resource_incarnations(inventory_source_id, resource_id),
+        FOREIGN KEY(inventory_source_id, binding_id)
+            REFERENCES resource_locator_bindings(inventory_source_id, binding_id),
+        FOREIGN KEY(inventory_source_id, witness_run_id)
+            REFERENCES discovery_runs(inventory_source_id, run_id),
+        FOREIGN KEY(inventory_source_id, endpoint_id)
+            REFERENCES source_endpoints(inventory_source_id, endpoint_id)
+    )
+    """,
+    """
+    CREATE TABLE resource_absence_attestations (
+        evidence_id TEXT PRIMARY KEY,
+        decision_id TEXT NOT NULL UNIQUE,
+        inventory_source_id TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        binding_id TEXT NOT NULL,
+        vmid INTEGER NOT NULL CHECK(typeof(vmid) = 'integer' AND vmid > 0),
+        locator_generation INTEGER NOT NULL
+            CHECK(typeof(locator_generation) = 'integer' AND locator_generation > 0),
+        resource_continuity_revision INTEGER NOT NULL
+            CHECK(typeof(resource_continuity_revision) = 'integer' AND
+                  resource_continuity_revision > 0),
+        witness_run_id TEXT NOT NULL,
+        witness_discovery_run_sequence INTEGER NOT NULL
+            CHECK(typeof(witness_discovery_run_sequence) = 'integer' AND
+                  witness_discovery_run_sequence > 0),
+        source_config_revision INTEGER NOT NULL
+            CHECK(typeof(source_config_revision) = 'integer' AND source_config_revision > 0),
+        endpoint_id TEXT NOT NULL,
+        canonical_transport_locator TEXT NOT NULL,
+        canonicalization_contract_version INTEGER NOT NULL
+            CHECK(typeof(canonicalization_contract_version) = 'integer' AND
+                  canonicalization_contract_version > 0),
+        transport_trust_revision INTEGER NOT NULL
+            CHECK(typeof(transport_trust_revision) = 'integer' AND transport_trust_revision > 0),
+        source_attestation_epoch INTEGER NOT NULL
+            CHECK(typeof(source_attestation_epoch) = 'integer' AND source_attestation_epoch >= 1),
+        actor TEXT NOT NULL CHECK(length(trim(actor)) > 0),
+        decided_at TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
+        FOREIGN KEY(decision_id) REFERENCES resource_removal_authorities(decision_id),
+        FOREIGN KEY(inventory_source_id, resource_id)
+            REFERENCES resource_incarnations(inventory_source_id, resource_id),
+        FOREIGN KEY(inventory_source_id, binding_id)
+            REFERENCES resource_locator_bindings(inventory_source_id, binding_id),
+        FOREIGN KEY(inventory_source_id, witness_run_id)
+            REFERENCES discovery_runs(inventory_source_id, run_id),
+        FOREIGN KEY(inventory_source_id, endpoint_id)
+            REFERENCES source_endpoints(inventory_source_id, endpoint_id)
     )
     """,
     """
@@ -1560,6 +1850,164 @@ _SCHEMA_STATEMENTS = (
            OR NEW.anchor_value IS NOT OLD.anchor_value)
     BEGIN SELECT RAISE(ABORT,
         'source attestation security-context change requires an epoch bump'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_absence_pointer_identity_immutable
+    BEFORE UPDATE OF resource_id, inventory_source_id ON resource_absence_pointers
+    BEGIN SELECT RAISE(ABORT, 'sampled-absence pointer identity is immutable'); END
+    """,
+    """
+    CREATE TRIGGER resource_absence_pointer_requires_successful_witness_run
+    BEFORE INSERT ON resource_absence_pointers
+    WHEN NOT EXISTS (
+        SELECT 1 FROM discovery_runs r
+        WHERE r.run_id = NEW.witness_run_id
+          AND r.inventory_source_id = NEW.inventory_source_id
+          AND r.discovery_run_sequence = NEW.witness_discovery_run_sequence
+          AND (
+            (r.lifecycle = 'completed' AND r.provider_outcome = 'success'
+             AND r.baseline_completeness = 'complete')
+            OR
+            (r.lifecycle IN ('issued', 'running') AND EXISTS (
+                SELECT 1 FROM inventory_sources s
+                WHERE s.inventory_source_id = r.inventory_source_id
+                  AND s.active_discovery_run_id = r.run_id
+            ))
+          )
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'sampled-absence pointer must reference a successful complete witness run'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_absence_pointer_requires_successful_witness_run_update
+    BEFORE UPDATE OF witness_run_id, witness_discovery_run_sequence ON resource_absence_pointers
+    WHEN NOT EXISTS (
+        SELECT 1 FROM discovery_runs r
+        WHERE r.run_id = NEW.witness_run_id
+          AND r.inventory_source_id = NEW.inventory_source_id
+          AND r.discovery_run_sequence = NEW.witness_discovery_run_sequence
+          AND (
+            (r.lifecycle = 'completed' AND r.provider_outcome = 'success'
+             AND r.baseline_completeness = 'complete')
+            OR
+            (r.lifecycle IN ('issued', 'running') AND EXISTS (
+                SELECT 1 FROM inventory_sources s
+                WHERE s.inventory_source_id = r.inventory_source_id
+                  AND s.active_discovery_run_id = r.run_id
+            ))
+          )
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'sampled-absence pointer must reference a successful complete witness run'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_removal_authority_immutable
+    BEFORE UPDATE ON resource_removal_authorities
+    BEGIN SELECT RAISE(ABORT, 'Class-C removal authority evidence is immutable'); END
+    """,
+    """
+    CREATE TRIGGER resource_removal_authority_no_delete
+    BEFORE DELETE ON resource_removal_authorities
+    BEGIN SELECT RAISE(ABORT, 'Class-C removal authority evidence cannot be deleted'); END
+    """,
+    """
+    CREATE TRIGGER resource_absence_attestation_immutable
+    BEFORE UPDATE ON resource_absence_attestations
+    BEGIN SELECT RAISE(ABORT, 'operator absence-attestation evidence is immutable'); END
+    """,
+    """
+    CREATE TRIGGER resource_absence_attestation_no_delete
+    BEFORE DELETE ON resource_absence_attestations
+    BEGIN SELECT RAISE(ABORT, 'operator absence-attestation evidence cannot be deleted'); END
+    """,
+    """
+    CREATE TRIGGER resource_absence_attestation_requires_matching_removal_authority
+    BEFORE INSERT ON resource_absence_attestations
+    WHEN NOT EXISTS (
+        SELECT 1 FROM resource_removal_authorities a
+        WHERE a.decision_id = NEW.decision_id
+          AND a.inventory_source_id = NEW.inventory_source_id
+          AND a.resource_id = NEW.resource_id
+          AND a.binding_id = NEW.binding_id
+          AND a.vmid = NEW.vmid
+          AND a.locator_generation = NEW.locator_generation
+          AND a.resource_continuity_revision = NEW.resource_continuity_revision
+          AND a.witness_run_id = NEW.witness_run_id
+          AND a.witness_discovery_run_sequence = NEW.witness_discovery_run_sequence
+          AND a.source_config_revision = NEW.source_config_revision
+          AND a.endpoint_id = NEW.endpoint_id
+          AND a.canonical_transport_locator = NEW.canonical_transport_locator
+          AND a.canonicalization_contract_version = NEW.canonicalization_contract_version
+          AND a.transport_trust_revision = NEW.transport_trust_revision
+          AND a.source_attestation_epoch = NEW.source_attestation_epoch
+          AND a.actor = NEW.actor
+          AND a.decided_at = NEW.decided_at
+          AND a.reason = NEW.reason
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'absence attestation must match its removal-authority decision field-for-field'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_termination_confirmed_removed_requires_matching_evidence
+    BEFORE INSERT ON resource_terminations
+    WHEN NEW.reason = 'confirmed_removed' AND NOT EXISTS (
+        SELECT 1 FROM resource_removal_authorities a
+        JOIN resource_absence_attestations b ON b.decision_id = a.decision_id
+        WHERE a.decision_id = NEW.class_c_decision_id
+          AND a.inventory_source_id = NEW.inventory_source_id
+          AND a.resource_id = NEW.resource_id
+          AND a.binding_id = NEW.binding_id
+          AND a.locator_generation = NEW.locator_generation
+          AND a.witness_discovery_run_sequence = NEW.run_sequence
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'confirmed_removed termination must match its Class-C decision evidence'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_termination_immutable
+    BEFORE UPDATE ON resource_terminations
+    BEGIN SELECT RAISE(ABORT,
+        'resource terminations are immutable retained terminal/tombstone records'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_termination_no_delete
+    BEFORE DELETE ON resource_terminations
+    BEGIN SELECT RAISE(ABORT,
+        'resource terminations are immutable retained terminal/tombstone records'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_removal_authority_requires_matching_binding_provenance
+    BEFORE INSERT ON resource_removal_authorities
+    WHEN NOT EXISTS (
+        SELECT 1 FROM resource_locator_bindings b
+        WHERE b.binding_id = NEW.binding_id
+          AND b.inventory_source_id = NEW.inventory_source_id
+          AND b.resource_id = NEW.resource_id
+          AND b.vmid = NEW.vmid
+          AND b.locator_generation = NEW.locator_generation
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'removal authority binding provenance does not match one real binding tuple'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_removal_authority_requires_matching_witness_provenance
+    BEFORE INSERT ON resource_removal_authorities
+    WHEN NOT EXISTS (
+        SELECT 1 FROM discovery_runs r
+        WHERE r.run_id = NEW.witness_run_id
+          AND r.inventory_source_id = NEW.inventory_source_id
+          AND r.discovery_run_sequence = NEW.witness_discovery_run_sequence
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'removal authority witness provenance does not match one real discovery run'
     ); END
     """,
 )
