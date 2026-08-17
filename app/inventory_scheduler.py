@@ -11,10 +11,14 @@ It has a narrow, closed call surface by construction: the only
 ``InventoryAuthority`` methods this module ever calls are
 ``issue_discovery_run``, ``mark_discovery_run_running``,
 ``finalize_successful_discovery_run``, ``finalize_failed_discovery_run``,
-and (startup recovery only) ``abandon_discovery_run``. It never calls any
-attestation-shaped, candidate-activation-shaped, or confirmed-removal-
-shaped authority method -- there is no code path here that could, by
-construction, not merely by convention.
+and ``abandon_discovery_run`` -- used both for startup crash/abandoned-run
+recovery (:func:`perform_startup_recovery`, §13) and as the uniform
+post-issuance safety net inside :func:`run_discovery_cycle` that fences a
+run on an unexpected or unclassifiable failure rather than leaving it
+stranded (§12). It never calls any attestation-shaped, candidate-
+activation-shaped, or confirmed-removal-shaped authority method -- there
+is no code path here that could, by construction, not merely by
+convention.
 """
 
 from __future__ import annotations
