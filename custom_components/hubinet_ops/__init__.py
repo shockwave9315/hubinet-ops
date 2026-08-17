@@ -13,7 +13,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
-from .api import HubinetOpsApi, HubinetOpsApiFactory, phase_zero_api_factory
+from .api import HubinetOpsApi, HubinetOpsApiFactory
 from .const import (
     CONF_API_TOKEN,
     CONF_BASE_URL,
@@ -22,6 +22,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import HubinetOpsConfigEntry, HubinetOpsCoordinator
+from .transport_http import http_api_factory
 
 PLATFORMS = [Platform.SENSOR]
 
@@ -29,11 +30,17 @@ PLATFORMS = [Platform.SENSOR]
 def create_api_client(
     hass: HomeAssistant, data: Mapping[str, Any]
 ) -> HubinetOpsApi:
-    """Create a backend-only client through the configured transport factory."""
+    """Create a backend-only client through the configured transport factory.
+
+    Defaults to the real R0 HTTP transport (``http_api_factory``, bound to
+    this ``hass`` instance) -- the injection seam at
+    ``hass.data[DOMAIN][DATA_API_FACTORY]`` remains exactly as before for
+    tests/fakes to override explicitly.
+    """
 
     domain_data = hass.data.setdefault(DOMAIN, {})
-    factory: HubinetOpsApiFactory = domain_data.get(
-        DATA_API_FACTORY, phase_zero_api_factory
+    factory: HubinetOpsApiFactory = domain_data.get(DATA_API_FACTORY) or http_api_factory(
+        hass
     )
     return factory(
         base_url=str(data[CONF_BASE_URL]),
