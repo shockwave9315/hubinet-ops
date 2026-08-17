@@ -20,8 +20,8 @@ from fastapi.testclient import TestClient
 
 from app.inventory import AuthorityDatabaseRejected
 from app.inventory_pve_transport import ProxmoxHttpTransport, _PVE_API_PREFIX
-from app.inventory_runtime import create_read_only_app
-from app.inventory_runtime_config import parse_r0_runtime_config
+from app.inventory_runtime import create_app_from_env, create_read_only_app
+from app.inventory_runtime_config import R0ConfigError, parse_r0_runtime_config
 import app.inventory_scheduler as sched
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -421,6 +421,48 @@ def test_35_freshness_expiry_is_materialized_by_the_backend_on_get(
 # ---------------------------------------------------------------------------
 # §28 test #40 (runtime/composition portion) -- never touches an unrelated DB
 # ---------------------------------------------------------------------------
+
+
+def test_create_app_from_env_has_no_import_time_side_effect_and_reads_env_at_call(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Importing app.inventory_runtime must never itself construct an app
+    # (test #1's own premise); create_app_from_env only reads its
+    # configured path when actually called.
+    monkeypatch.setenv("HUBINET_OPS_R0_CONFIG", str(tmp_path / "does-not-exist.yaml"))
+    with pytest.raises(R0ConfigError):
+        create_app_from_env()
+
+    config_path = tmp_path / "inventory.yaml"
+    import yaml
+
+    config_path.write_text(
+        yaml.safe_dump(_raw(db_path=str(tmp_path / "authority.db"))), encoding="utf-8"
+    )
+    monkeypatch.setenv("HUBINET_OPS_R0_CONFIG", str(config_path))
+    monkeypatch.setenv("HUBINET_OPS_R0_PVE_TOKEN", VALID_ENV["HUBINET_OPS_R0_PVE_TOKEN"])
+    monkeypatch.setenv("HUBINET_OPS_R0_API_TOKEN", VALID_ENV["HUBINET_OPS_R0_API_TOKEN"])
+
+    # Intercept the actual app construction so this test never starts a
+    # real scheduler thread or attempts real network I/O against the
+    # configured (unreachable, fictitious) PVE endpoint -- it only proves
+    # create_app_from_env reads the env-configured path/secrets correctly
+    # and hands off to create_read_only_app.
+    import app.inventory_runtime as runtime_module
+
+    captured: dict[str, object] = {}
+
+    def fake_create_read_only_app(config, **kwargs):
+        captured["config"] = config
+        captured["kwargs"] = kwargs
+        return "sentinel-app"
+
+    monkeypatch.setattr(runtime_module, "create_read_only_app", fake_create_read_only_app)
+
+    result = create_app_from_env()
+
+    assert result == "sentinel-app"
+    assert captured["config"].source.display_name == "Home Proxmox"
 
 
 def test_40_composition_root_never_touches_an_unrelated_legacy_db_on_disk(

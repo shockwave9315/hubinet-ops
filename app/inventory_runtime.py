@@ -36,18 +36,21 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import hmac
 import logging
+import os
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app.inventory import InventoryAuthority, InventoryAuthorityStore, InventoryPublication
-from app.inventory_runtime_config import R0RuntimeConfig
+from app.inventory_runtime_config import R0RuntimeConfig, load_r0_runtime_config
 from app.inventory_scheduler import R0Scheduler, bootstrap_and_start_r0_runtime
 
 _LOGGER = logging.getLogger(__name__)
 
 API_PREFIX = "/r0/v1"
+DEFAULT_R0_CONFIG_PATH = "/etc/hubinet-ops/inventory.yaml"
 
 
 def _thaw(value: Any) -> Any:
@@ -178,3 +181,22 @@ def create_read_only_app(
         }
 
     return app
+
+
+def create_app_from_env() -> FastAPI:
+    """Zero-argument production factory for ``uvicorn --factory`` (§25).
+
+    ``ExecStart=... uvicorn app.inventory_runtime:create_app_from_env
+    --factory --host 0.0.0.0 --port 8787`` -- deliberately a separate
+    function from :func:`create_read_only_app`, and never called at module
+    import time, so that importing ``app.inventory_runtime`` itself (test
+    #1's import-graph check, any tool inspection) never has a side effect
+    of its own: no file I/O, no environment read, no authority DB open, no
+    scheduler start. Config/secret loading and app construction only
+    happen when uvicorn's factory mode actually calls this function once
+    at process startup.
+    """
+
+    config_path = Path(os.environ.get("HUBINET_OPS_R0_CONFIG", DEFAULT_R0_CONFIG_PATH))
+    config = load_r0_runtime_config(config_path)
+    return create_read_only_app(config)
