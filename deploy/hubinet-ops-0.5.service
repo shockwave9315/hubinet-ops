@@ -1,0 +1,38 @@
+[Unit]
+Description=Hubinet Ops Agent (0.5, read-only inventory)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hubinetops
+Group=hubinetops
+EnvironmentFile=/etc/hubinet-ops/agent.env
+WorkingDirectory=/opt/hubinet-ops
+ExecStart=/opt/hubinet-ops/.venv/bin/uvicorn app.inventory_runtime:create_app_from_env --factory --host 0.0.0.0 --port 8787
+Restart=on-failure
+RestartSec=5
+
+# 0027 on a plain-file create request (0666) yields 0640, and on a
+# directory create request (0777) yields 0750 -- exactly the accepted
+# §4 authority.db/-wal/-shm and /var/lib/hubinet-ops modes, guaranteed
+# regardless of the installer's own umask or a distribution default.
+UMask=0027
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hubinet-ops
+ReadOnlyPaths=/etc/hubinet-ops /opt/hubinet-ops
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+PrivateNetwork=no
+
+[Install]
+WantedBy=multi-user.target
