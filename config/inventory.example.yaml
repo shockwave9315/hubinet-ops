@@ -1,0 +1,67 @@
+# Hubinet Ops 0.5 R0 source-bootstrap configuration (example).
+#
+# This file configures exactly one Proxmox *source* -- never individual
+# workloads. There is no VMID list, LXC/QEMU list, node membership, or
+# per-resource field anywhere in this file: every node/LXC/QEMU is
+# discovered dynamically through the Proxmox API after bootstrap (see
+# docs/architecture/0.5-r0-read-only-runtime-activation.md, section 5).
+# Adding or removing a guest in Proxmox requires zero changes here.
+#
+# Secrets (the PVE API token, the R0 API bearer token) are never written to
+# this file. They are read once at process startup from the environment
+# file named by *_token_env below -- see .env.r0.example.
+
+source:
+  # Human-readable label for this source, shown to operators. Not identity.
+  display_name: "Home Proxmox"
+
+  # Fixed literal for R0-B's only supported provider. Do not change.
+  provider_kind: proxmox_ve
+
+  # The Proxmox VE API endpoint. HTTPS only; canonicalized and durably
+  # bound as the source's one active endpoint on first bootstrap. Changing
+  # this after bootstrap is a fail-closed configuration-drift error, never
+  # silent endpoint failover (section 6) -- rotate PVE endpoints via an
+  # explicit, separately-authorized operator procedure, not by editing
+  # this file.
+  pve_endpoint: "https://pve.example.internal:8006"
+
+  # How long a successful discovery run's evidence remains "fresh" before
+  # the backend independently marks the source stale. Required explicit
+  # value -- no silent library default.
+  freshness_duration_seconds: 300
+
+  # Opaque, non-secret label identifying *which* credential is currently in
+  # effect (e.g. a rotation version tag). Never the PVE token itself.
+  # Change this value, together with the actual secret in the environment
+  # file, whenever you rotate the underlying PVE API token; R0 applies the
+  # rotation automatically on the next restart (section 7).
+  credential_reference: "secret://pve-token-v1"
+
+  # Name of the environment variable (in the R0 EnvironmentFile) holding
+  # the actual PVE API token value, e.g.:
+  #   PVEAPIToken=user@realm!tokenid=<secret>
+  # in the exact shape:
+  #   user@realm!tokenid=secret
+  pve_token_env: HUBINET_OPS_R0_PVE_TOKEN
+
+  tls:
+    # Mandatory strict certificate verification against the system trust
+    # store (or ca_bundle_path below). There is no "skip verification"
+    # option for the production PVE transport.
+    verify: true
+    # Optional path to a trusted CA bundle file, if the PVE endpoint's
+    # certificate is not already covered by the system trust store.
+    ca_bundle_path: null
+
+runtime:
+  # Canonical clean-install path for the fresh 0.5 authority database.
+  # Never point this at a legacy 0.4 ops.db path -- the store independently
+  # detects and fails closed against any non-matching database content
+  # regardless of this setting.
+  authority_db_path: /var/lib/hubinet-ops/authority.db
+
+  # Name of the environment variable (in the R0 EnvironmentFile) holding
+  # the R0 read-only HTTP API's own bearer token -- entirely independent
+  # from, and never derived from or shared with, the PVE token above.
+  api_token_env: HUBINET_OPS_R0_API_TOKEN
