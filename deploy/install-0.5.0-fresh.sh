@@ -45,7 +45,11 @@ apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv ca-certificates
 
 id hubinetops >/dev/null 2>&1 || useradd --system --home /opt/hubinet-ops --shell /usr/sbin/nologin hubinetops
-install -d -o hubinetops -g hubinetops /opt/hubinet-ops /var/lib/hubinet-ops
+install -d -o hubinetops -g hubinetops /opt/hubinet-ops
+# The authority directory holds the R0 SQLite database; §4 requires an
+# explicit restrictive mode rather than relying on the process umask or
+# a distribution default.
+install -d -m 0750 -o hubinetops -g hubinetops /var/lib/hubinet-ops
 install -d -m 0750 -o root -g hubinetops /etc/hubinet-ops
 
 rm -rf /opt/hubinet-ops/app /opt/hubinet-ops/requirements.txt
@@ -77,11 +81,17 @@ fi
 
 install -m 0644 "${SOURCE_DIR}/deploy/hubinet-ops-0.5.service" /etc/systemd/system/hubinet-ops.service
 systemctl daemon-reload
-systemctl enable hubinet-ops.service
+
+# Deliberately does NOT enable or start the unit here. The mandatory
+# firewall policy (deploy/README-0.5-firewall.md) must be applied and
+# verified first -- an enabled-but-not-started unit would still
+# auto-start unprotected on the next reboot, which is exactly the
+# 0.0.0.0:8787-without-firewall exposure this installer must not create.
 
 cat <<INFO
 
-Hubinet Ops 0.5 (R0 read-only runtime) installed, but not yet started.
+Hubinet Ops 0.5 (R0 read-only runtime) installed, but NOT started or
+enabled for boot.
 
 Before starting the service:
 
@@ -95,12 +105,13 @@ Before starting the service:
    HUBINET_OPS_R0_API_TOKEN has already been generated for you; this is
    the bearer token Home Assistant must use to reach this backend.
 
-3. Apply the required firewall policy BEFORE starting the service --
-   see deploy/README-0.5-firewall.md. This service binds 0.0.0.0:8787
-   and is only safe to run once that policy is in place.
+3. Apply and verify the required firewall policy -- see
+   deploy/README-0.5-firewall.md. This service binds 0.0.0.0:8787 and is
+   only safe to enable once that policy is active and verified. Do not
+   run step 4 before this step.
 
-4. Start the service:
-     systemctl start hubinet-ops
+4. Only after step 3, enable and start the service together:
+     systemctl enable --now hubinet-ops
      systemctl status hubinet-ops --no-pager
 
 The R0 API bearer token is in /etc/hubinet-ops/agent.env -- do not paste
