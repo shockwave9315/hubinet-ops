@@ -336,3 +336,44 @@ def test_tls_verify_false_fails_closed() -> None:
             _raw(**{"source__tls": {"verify": False, "ca_bundle_path": None}}),
             env=VALID_ENV,
         )
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass, P2 Finding 1 part A -- CA bundle validated at config load
+# ---------------------------------------------------------------------------
+
+
+def test_finding1_missing_ca_bundle_path_fails_closed_at_startup() -> None:
+    with pytest.raises(R0ConfigError, match="ca_bundle_path"):
+        parse_r0_runtime_config(
+            _raw(
+                **{
+                    "source__tls": {
+                        "verify": True,
+                        "ca_bundle_path": "/does/not/exist/ca.pem",
+                    }
+                }
+            ),
+            env=VALID_ENV,
+        )
+
+
+def test_finding1_unreadable_ca_bundle_path_fails_closed_at_startup(tmp_path: Path) -> None:
+    # A directory is not a regular readable CA bundle file.
+    bad_path = tmp_path / "ca-bundle-dir"
+    bad_path.mkdir()
+    with pytest.raises(R0ConfigError, match="ca_bundle_path"):
+        parse_r0_runtime_config(
+            _raw(**{"source__tls": {"verify": True, "ca_bundle_path": str(bad_path)}}),
+            env=VALID_ENV,
+        )
+
+
+def test_finding1_valid_ca_bundle_path_is_accepted_at_startup(tmp_path: Path) -> None:
+    ca_path = tmp_path / "ca-bundle.pem"
+    ca_path.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n", encoding="utf-8")
+    config = parse_r0_runtime_config(
+        _raw(**{"source__tls": {"verify": True, "ca_bundle_path": str(ca_path)}}),
+        env=VALID_ENV,
+    )
+    assert config.source.tls.ca_bundle_path == str(ca_path)

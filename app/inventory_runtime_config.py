@@ -219,6 +219,27 @@ def parse_r0_runtime_config(
     ca_bundle_path = tls_raw.get("ca_bundle_path")
     if ca_bundle_path is not None:
         _require_text(ca_bundle_path, "source.tls.ca_bundle_path")
+        # Fail closed at startup rather than at first discovery-run
+        # transport construction (§9/§12): a missing/unreadable CA bundle
+        # must never be discovered only after a durable run has already
+        # been issued. This does not eliminate the runtime race (the file
+        # can still disappear between startup and a later cycle) -- that
+        # remaining window is closed separately by the production
+        # transport's own construction-time exception classification.
+        ca_path = Path(ca_bundle_path)
+        if not ca_path.is_file():
+            raise R0ConfigError(
+                f"source.tls.ca_bundle_path {ca_bundle_path!r} does not "
+                "exist or is not a regular file"
+            )
+        try:
+            with ca_path.open("rb") as handle:
+                handle.read(1)
+        except OSError as exc:
+            raise R0ConfigError(
+                f"source.tls.ca_bundle_path {ca_bundle_path!r} is not "
+                f"readable: {exc}"
+            ) from exc
 
     authority_db_path = Path(
         _require_text(runtime_raw.get("authority_db_path"), "runtime.authority_db_path")

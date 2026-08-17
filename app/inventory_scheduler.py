@@ -69,7 +69,7 @@ _MIN_INTERVAL_SECONDS = 30
 _MAX_INTERVAL_SECONDS = 3600
 
 
-DiscoveryCycleStatus = Literal["success", "failed", "conflict", "skipped"]
+DiscoveryCycleStatus = Literal["success", "failed", "conflict", "skipped", "error"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,25 +279,80 @@ def run_discovery_cycle(
     and finalization are exactly the four ``InventoryAuthority`` calls
     listed in this module's docstring, in that order, with no direct table
     access at any point.
+
+    Post-issuance safety invariant (§12): once ``issue_discovery_run`` has
+    successfully claimed ownership, this function never lets an exception
+    (classifiable or not) leave ``active_discovery_run_id`` durably
+    stranded. Classifiable transport/provider failures finalize as a
+    failed run with real evidence, exactly as before; anything else --
+    an authority ownership/context conflict, or a genuinely unexpected
+    error this function cannot honestly classify without fabricating
+    provider evidence -- falls through to a single, uniform safety net
+    that fences the run with the existing, already-tested
+    ``abandon_discovery_run`` mechanism (§13) rather than leaving it
+    active until the next process restart.
     """
 
     try:
         run = authority.issue_discovery_run(inventory_source_id, PROVIDER_CONTRACT_VERSION)
     except AuthorityConflict as exc:
-        # Per-source single-flight is already durably enforced by the
-        # authority's own CAS (§1 item 11); a second concurrent issuance
-        # attempt (this scheduler racing itself, or a future manual
-        # trigger) must cleanly lose, exactly like two scheduler ticks
-        # would -- log and skip, never crash the process.
+        # No run was issued at all -- nothing to strand. Per-source
+        # single-flight is already durably enforced by the authority's
+        # own CAS (§1 item 11); a second concurrent issuance attempt (this
+        # scheduler racing itself, or a future manual trigger) must
+        # cleanly lose, exactly like two scheduler ticks would -- log and
+        # skip, never crash the process.
         _LOGGER.info("R0 discovery run issuance skipped: %s", exc)
         return DiscoveryCycleOutcome("conflict", str(exc))
 
     observed_at = now().isoformat()
 
     try:
+        return _execute_issued_run(authority, inventory_source_id, run, config, observed_at)
+    except Exception as exc:  # noqa: BLE001 -- last-resort post-issuance safety net
+        is_conflict = isinstance(exc, AuthorityConflict)
+        if is_conflict:
+            _LOGGER.warning(
+                "R0 discovery run %s ownership/context conflict: %s", run.run_id, exc
+            )
+        else:
+            _LOGGER.exception(
+                "R0 discovery run %s hit an unexpected error; fencing the run", run.run_id
+            )
+        try:
+            authority.abandon_discovery_run(
+                inventory_source_id,
+                run.run_id,
+                reason=("post_issuance_failure: " + str(exc))[:500],
+            )
+        except AuthorityConflict:
+            # Already released/terminalized -- e.g. finalize_successful_
+            # discovery_run's own completion-context-changed path already
+            # audits an "invalid" completion and releases ownership before
+            # raising (§11); a mark_discovery_run_running conflict that
+            # never touched ownership is the other case this call
+            # actually fences. Either way, active_discovery_run_id is
+            # guaranteed clear by the time we return.
+            pass
+        return DiscoveryCycleOutcome("conflict" if is_conflict else "error", str(exc))
+
+
+def _execute_issued_run(
+    authority: InventoryAuthority,
+    inventory_source_id: str,
+    run: DiscoveryRun,
+    config: R0RuntimeConfig,
+    observed_at: str,
+) -> DiscoveryCycleOutcome:
+    """Run the classifiable portion of one issued run's transport I/O and
+    finalization. Any exception raised here propagates to the caller's
+    uniform post-issuance safety net."""
+
+    try:
         authority.mark_discovery_run_running(inventory_source_id, run.run_id)
         with _build_transport(run, config) as transport:
             result = ProxmoxProviderV1.collect_boundary_baseline(transport)
+        snapshot = _normalize_result(result, run, observed_at=observed_at)
     except (PveTransportError, ProviderContractError) as exc:
         completeness, _kind, availability = _classify_exception(exc)
         failure_snapshot = _failure_snapshot(
@@ -315,27 +370,9 @@ def run_discovery_cycle(
         )
         _LOGGER.warning("R0 discovery run %s failed: %s", run.run_id, exc)
         return DiscoveryCycleOutcome("failed", str(exc))
-    except AuthorityConflict as exc:
-        # mark_discovery_run_running lost ownership between issuance and
-        # this call -- structurally shouldn't happen under single-source
-        # ownership, but must not crash the scheduler if it somehow does.
-        _LOGGER.error("R0 discovery run %s lost ownership before running: %s", run.run_id, exc)
-        return DiscoveryCycleOutcome("conflict", str(exc))
-
-    snapshot = _normalize_result(result, run, observed_at=observed_at)
 
     if snapshot.baseline_completeness is BaselineCompleteness.COMPLETE:
-        try:
-            authority.finalize_successful_discovery_run(inventory_source_id, run.run_id, snapshot)
-        except AuthorityConflict as exc:
-            # The run's captured context changed between issuance and
-            # completion; the authority has already audited this as an
-            # "invalid" completion with no reconciliation (§11) -- nothing
-            # further for the scheduler to do except log it.
-            _LOGGER.warning(
-                "R0 discovery run %s completion context changed: %s", run.run_id, exc
-            )
-            return DiscoveryCycleOutcome("conflict", str(exc))
+        authority.finalize_successful_discovery_run(inventory_source_id, run.run_id, snapshot)
         return DiscoveryCycleOutcome("success", f"run {run.run_id} reconciled")
 
     authority.finalize_failed_discovery_run(

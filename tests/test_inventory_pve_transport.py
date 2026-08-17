@@ -409,3 +409,98 @@ def test_19_standalone_baseline_completes_end_to_end() -> None:
         )
     finally:
         transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass, P2 Finding 2 -- genuinely streaming, bounded response read
+# ---------------------------------------------------------------------------
+
+
+def test_finding2_oversized_chunked_body_aborts_without_full_consumption() -> None:
+    consumed_chunk_count = {"value": 0}
+    total_chunks = 1000
+    chunk_size = 1024  # 1000 * 1024 bytes >> the configured cap below
+
+    def body_chunks():
+        for _ in range(total_chunks):
+            consumed_chunk_count["value"] += 1
+            yield b"x" * chunk_size
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # No Content-Length -- httpx does not set one for iterable/streamed
+        # content, exactly the "chunked response without a trustworthy
+        # Content-Length" case the finding describes.
+        return httpx.Response(200, content=body_chunks())
+
+    transport = _transport(handler, max_response_bytes=4096)
+    try:
+        with pytest.raises(PveTransportError, match="maximum allowed response size") as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.SCHEMA
+    finally:
+        transport.close()
+
+    # The whole point: the adapter must abort as soon as the cap is
+    # crossed, never drain the full 1000-chunk (~1 MiB) oversized stream.
+    assert 0 < consumed_chunk_count["value"] < total_chunks
+    assert consumed_chunk_count["value"] <= 10
+
+
+def test_finding2_content_length_over_cap_rejected_before_any_body_read() -> None:
+    body_read = {"value": False}
+
+    def body_chunks():
+        body_read["value"] = True
+        yield b"x" * 100
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=body_chunks(),
+            headers={"content-length": str(10 * 1024 * 1024)},
+        )
+
+    transport = _transport(handler, max_response_bytes=4096)
+    try:
+        with pytest.raises(PveTransportError, match="maximum allowed response size"):
+            transport.get("/version")
+    finally:
+        transport.close()
+    assert body_read["value"] is False
+
+
+def test_finding2_bounded_body_within_cap_still_succeeds() -> None:
+    payload = {"data": {"release": "9.0"}}
+    transport = _transport(
+        lambda request: httpx.Response(200, json=payload), max_response_bytes=4096
+    )
+    try:
+        assert transport.get("/version") == payload
+    finally:
+        transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass, P2 Finding 3 -- PVE 401/403 classify as SECURITY_PROOF
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status_code", (401, 403))
+def test_finding3_401_403_classify_as_security_proof(status_code: int) -> None:
+    transport = _transport(lambda request: httpx.Response(status_code, json={"data": None}))
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.SECURITY_PROOF
+    finally:
+        transport.close()
+
+
+def test_finding3_500_still_classifies_as_transport() -> None:
+    transport = _transport(lambda request: httpx.Response(500, json={"data": None}))
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.TRANSPORT
+    finally:
+        transport.close()

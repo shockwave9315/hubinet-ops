@@ -33,7 +33,7 @@ VALID_ENV = {
 }
 
 
-def _raw():
+def _raw(*, ca_bundle_path: str | None = None):
     return {
         "source": {
             "display_name": "Home Proxmox",
@@ -42,7 +42,7 @@ def _raw():
             "freshness_duration_seconds": 300,
             "credential_reference": "secret://v1",
             "pve_token_env": "HUBINET_OPS_R0_PVE_TOKEN",
-            "tls": {"verify": True, "ca_bundle_path": None},
+            "tls": {"verify": True, "ca_bundle_path": ca_bundle_path},
         },
         "runtime": {
             "authority_db_path": "/var/lib/hubinet-ops/authority.db",
@@ -51,8 +51,8 @@ def _raw():
     }
 
 
-def _config():
-    return parse_r0_runtime_config(_raw(), env=VALID_ENV)
+def _config(*, ca_bundle_path: str | None = None):
+    return parse_r0_runtime_config(_raw(ca_bundle_path=ca_bundle_path), env=VALID_ENV)
 
 
 def _store(tmp_path: Path) -> InventoryAuthorityStore:
@@ -399,3 +399,163 @@ def test_42_recovery_precedes_config_drift_precedes_scheduling(
 
     assert order == ["recovery", "config", "scheduler_constructed"]
     assert isinstance(scheduler, sched.R0Scheduler)
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass, P2 Finding 1 -- post-issuance exception must never
+# strand the active run
+# ---------------------------------------------------------------------------
+
+
+def test_finding1_ca_bundle_removed_after_startup_does_not_strand_the_run(
+    tmp_path: Path,
+) -> None:
+    ca_path = tmp_path / "ca-bundle.pem"
+    ca_path.write_text(
+        "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n", encoding="utf-8"
+    )
+    store = _store(tmp_path)
+    authority = InventoryAuthority(store)
+    config = _config(ca_bundle_path=str(ca_path))
+    state = bootstrap_or_reconcile_source(authority, store, config)
+    source_id = state.source.inventory_source_id
+
+    # Valid at config-parse time; removed before the discovery cycle runs
+    # -- simulates the exact runtime race Finding 1 part B describes. No
+    # transport is patched here: this exercises the real _build_transport
+    # -> real ProxmoxHttpTransport construction path, which must fail
+    # closed at construction (before any network I/O) rather than escape
+    # unclassified.
+    ca_path.unlink()
+
+    outcome = sched.run_discovery_cycle(authority, source_id, config)
+
+    assert outcome.status == "failed"
+    state_after = store.source_state(source_id)
+    assert state_after.source.active_discovery_run_id is None
+    view = InventoryPublication(store, authority).read()
+    assert view.sources[0]["health"] == "configuration_error"
+    assert view.resources == ()  # nothing fabricated
+
+    # A subsequent, correctly-configured cycle must be able to issue
+    # normally -- the source must not be wedged.
+    ca_path.write_text(
+        "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n", encoding="utf-8"
+    )
+    second_run = authority.issue_discovery_run(source_id, PROVIDER_CONTRACT_VERSION)
+    assert second_run.discovery_run_sequence == 2
+    authority.abandon_discovery_run(source_id, second_run.run_id, reason="test cleanup")
+
+
+def test_finding1_unexpected_exception_after_issuance_fences_the_run(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, authority, config, source_id = _bootstrap(tmp_path)
+    _patch_transport(monkeypatch, _pve_handler())
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("injected unexpected programming error")
+
+    monkeypatch.setattr(sched, "_normalize_result", boom)
+
+    outcome = sched.run_discovery_cycle(authority, source_id, config)
+
+    assert outcome.status == "error"
+    assert "injected unexpected programming error" in outcome.detail
+
+    # Not stranded: the run was fenced via abandon_discovery_run, not left
+    # active.
+    state_after = store.source_state(source_id)
+    assert state_after.source.active_discovery_run_id is None
+    run = store.list_discovery_runs(source_id)[-1]
+    assert run.lifecycle is sched.DiscoveryRunLifecycle.ABANDONED
+
+    # No fabricated observation or absence: health/resources are exactly
+    # the pre-existing not_yet_observed/empty state, untouched by the
+    # failure path.
+    view = InventoryPublication(store, authority).read()
+    assert view.sources[0]["health"] == "not_yet_observed"
+    assert view.resources == ()
+
+    # A subsequent cycle (bug fixed / transient condition gone) issues and
+    # succeeds normally.
+    monkeypatch.undo()
+    _patch_transport(monkeypatch, _pve_handler(guests=({"vmid": 100, "type": "qemu", "name": "vm1", "status": "running"},)))
+    recovered = sched.run_discovery_cycle(authority, source_id, config)
+    assert recovered.status == "success"
+
+
+def test_finding1_authority_conflict_from_mark_running_is_also_fenced(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, authority, config, source_id = _bootstrap(tmp_path)
+    _patch_transport(monkeypatch, _pve_handler())
+
+    original_mark_running = authority.mark_discovery_run_running
+
+    def flaky_mark_running(*args, **kwargs):
+        raise AuthorityConflict("simulated ownership race")
+
+    monkeypatch.setattr(authority, "mark_discovery_run_running", flaky_mark_running)
+
+    outcome = sched.run_discovery_cycle(authority, source_id, config)
+
+    assert outcome.status == "conflict"
+    state_after = store.source_state(source_id)
+    assert state_after.source.active_discovery_run_id is None
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass, P2 Finding 3 -- PVE auth/ACL failures classify as
+# configuration_error, never source_unavailable
+# ---------------------------------------------------------------------------
+
+
+def _unauthorized_handler(status_code: int):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"data": None})
+
+    return handler
+
+
+@pytest.mark.parametrize("status_code", (401, 403))
+def test_finding3_auth_failure_classifies_as_configuration_error_end_to_end(
+    tmp_path: Path, monkeypatch, status_code: int
+) -> None:
+    store, authority, config, source_id = _bootstrap(tmp_path)
+    # First, a successful run so we have prior inventory to prove is
+    # retained.
+    _patch_transport(
+        monkeypatch,
+        _pve_handler(guests=({"vmid": 100, "type": "qemu", "name": "vm1", "status": "running"},)),
+    )
+    first = sched.run_discovery_cycle(authority, source_id, config)
+    assert first.status == "success"
+    before = InventoryPublication(store, authority).read()
+
+    _patch_transport(monkeypatch, _unauthorized_handler(status_code))
+    outcome = sched.run_discovery_cycle(authority, source_id, config)
+
+    assert outcome.status == "failed"
+    after = InventoryPublication(store, authority).read()
+    assert after.sources[0]["health"] == "configuration_error"
+    assert after.sources[0]["health"] != "source_unavailable"
+    # Prior inventory is completely retained -- a configuration_error
+    # discovery must never reconcile absence.
+    assert after.resources == before.resources
+
+
+def test_finding3_connect_failure_still_takes_source_unavailable_path(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, authority, config, source_id = _bootstrap(tmp_path)
+
+    def down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _patch_transport(monkeypatch, down)
+    outcome = sched.run_discovery_cycle(authority, source_id, config)
+
+    assert outcome.status == "failed"
+    view = InventoryPublication(store, authority).read()
+    assert view.sources[0]["health"] == "source_unavailable"

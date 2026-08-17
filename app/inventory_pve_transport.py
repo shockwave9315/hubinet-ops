@@ -19,6 +19,7 @@ transport that exposes one.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
 from types import TracebackType
 from typing import Any
 
@@ -139,15 +140,28 @@ class ProxmoxHttpTransport:
             pool=pool_timeout_seconds,
         )
         self._max_response_bytes = max_response_bytes
-        self._client = httpx.Client(
-            base_url=locator.rstrip("/") + _PVE_API_PREFIX,
-            headers={"Authorization": f"PVEAPIToken={token}"},
-            timeout=timeout,
-            verify=trust,
-            follow_redirects=False,
-            trust_env=False,
-            transport=_transport,
-        )
+        try:
+            self._client = httpx.Client(
+                base_url=locator.rstrip("/") + _PVE_API_PREFIX,
+                headers={"Authorization": f"PVEAPIToken={token}"},
+                timeout=timeout,
+                verify=trust,
+                follow_redirects=False,
+                trust_env=False,
+                transport=_transport,
+            )
+        except (OSError, ValueError) as exc:
+            # A configured CA bundle path that is missing/unreadable/
+            # malformed raises here (e.g. FileNotFoundError, ssl.SSLError,
+            # which is an OSError subclass) -- this is a security/TLS
+            # configuration problem, never a plain network outage, and it
+            # must be classifiable through the same PveTransportError
+            # boundary as every other transport failure rather than an
+            # uncaught construction-time exception (§9, §12).
+            raise PveTransportError(
+                f"PVE transport TLS/client configuration is invalid: {exc}",
+                kind=ProviderFailureKind.SECURITY_PROOF,
+            ) from exc
 
     def close(self) -> None:
         self._client.close()
@@ -164,10 +178,72 @@ class ProxmoxHttpTransport:
         self.close()
 
     def get(self, path: str, *, params: Mapping[str, str] | None = None) -> Any:
-        """Issue exactly one GET request and return the parsed JSON body."""
+        """Issue exactly one GET request and return the parsed JSON body.
+
+        Streams the response body incrementally and aborts as soon as the
+        accumulated size exceeds ``max_response_bytes`` -- a chunked
+        response with no trustworthy ``Content-Length`` is never fully
+        buffered in memory before the cap is enforced (§9). Status/
+        redirect/size checks are evaluated from the response headers
+        before any body bytes are read, so an oversized or rejected
+        response never pays the cost of a full body read at all.
+        """
 
         try:
-            response = self._client.get(path, params=params)
+            with self._client.stream("GET", path, params=params) as response:
+                if response.is_redirect:
+                    raise PveTransportError(
+                        "PVE endpoint returned a redirect; automatic redirect "
+                        "following is disabled by construction",
+                        kind=ProviderFailureKind.TRANSPORT,
+                    )
+
+                content_length = response.headers.get("content-length")
+                if content_length is not None:
+                    try:
+                        declared_length = int(content_length)
+                    except ValueError:
+                        declared_length = None
+                    if (
+                        declared_length is not None
+                        and declared_length > self._max_response_bytes
+                    ):
+                        raise PveTransportError(
+                            "PVE response declares a size exceeding the "
+                            "maximum allowed response size",
+                            kind=ProviderFailureKind.SCHEMA,
+                        )
+
+                if response.status_code in (401, 403):
+                    # A stock-PVE authentication/authorization rejection is
+                    # a security/configuration proof failure, never a plain
+                    # transport outage (ADR 0002: token/effective-ACL/
+                    # provider-configuration problems classify as
+                    # configuration_error, not source_unavailable).
+                    raise PveTransportError(
+                        "PVE endpoint rejected the configured credentials "
+                        f"(HTTP {response.status_code})",
+                        kind=ProviderFailureKind.SECURITY_PROOF,
+                    )
+                if response.status_code != 200:
+                    raise PveTransportError(
+                        f"PVE endpoint returned HTTP {response.status_code}",
+                        kind=ProviderFailureKind.TRANSPORT,
+                    )
+
+                buffer = bytearray()
+                for chunk in response.iter_bytes():
+                    buffer.extend(chunk)
+                    if len(buffer) > self._max_response_bytes:
+                        # Raising here, still inside the stream context
+                        # manager, closes/aborts the connection instead of
+                        # continuing to consume the remainder of an
+                        # oversized body.
+                        raise PveTransportError(
+                            "PVE response exceeds the maximum allowed "
+                            "response size",
+                            kind=ProviderFailureKind.SCHEMA,
+                        )
         except httpx.TimeoutException as exc:
             raise PveTransportError(
                 f"PVE request timed out: {exc}", kind=ProviderFailureKind.TRANSPORT
@@ -177,39 +253,8 @@ class ProxmoxHttpTransport:
                 f"PVE request failed: {exc}", kind=ProviderFailureKind.TRANSPORT
             ) from exc
 
-        if response.is_redirect:
-            raise PveTransportError(
-                "PVE endpoint returned a redirect; automatic redirect "
-                "following is disabled by construction",
-                kind=ProviderFailureKind.TRANSPORT,
-            )
-
-        content_length = response.headers.get("content-length")
-        if content_length is not None:
-            try:
-                declared_length = int(content_length)
-            except ValueError:
-                declared_length = None
-            if declared_length is not None and declared_length > self._max_response_bytes:
-                raise PveTransportError(
-                    "PVE response declares a size exceeding the maximum "
-                    "allowed response size",
-                    kind=ProviderFailureKind.SCHEMA,
-                )
-        if len(response.content) > self._max_response_bytes:
-            raise PveTransportError(
-                "PVE response exceeds the maximum allowed response size",
-                kind=ProviderFailureKind.SCHEMA,
-            )
-
-        if response.status_code != 200:
-            raise PveTransportError(
-                f"PVE endpoint returned HTTP {response.status_code}",
-                kind=ProviderFailureKind.TRANSPORT,
-            )
-
         try:
-            return response.json()
+            return json.loads(bytes(buffer))
         except ValueError as exc:
             raise PveTransportError(
                 "PVE response body is not valid JSON", kind=ProviderFailureKind.SCHEMA
