@@ -328,3 +328,11 @@ def test_8_credential_drift_is_rejected_while_a_run_is_active(tmp_path: Path) ->
 
     with pytest.raises(AuthorityConflict):
         bootstrap_or_reconcile_source(authority, store, rotated_config)
+
+
+def test_tls_verify_false_fails_closed() -> None:
+    with pytest.raises(R0ConfigError, match="tls.verify"):
+        parse_r0_runtime_config(
+            _raw(**{"source__tls": {"verify": False, "ca_bundle_path": None}}),
+            env=VALID_ENV,
+        )

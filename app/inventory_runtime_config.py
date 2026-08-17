@@ -207,6 +207,15 @@ def parse_r0_runtime_config(
     if not isinstance(tls_raw, Mapping):
         raise R0ConfigError("source.tls must be a mapping")
     tls_verify = _require_bool(tls_raw.get("verify"), "source.tls.verify", default=True)
+    if not tls_verify:
+        # §9/§10: mandatory strict TLS verification, no operator-facing
+        # "skip verification" flag. The field is accepted (and must default
+        # True) only so a future explicit CA-bundle-only shape has a stable
+        # place to live; it must never be used to disable verification.
+        raise R0ConfigError(
+            "source.tls.verify must not be false; R0 does not support "
+            "disabling PVE endpoint certificate verification"
+        )
     ca_bundle_path = tls_raw.get("ca_bundle_path")
     if ca_bundle_path is not None:
         _require_text(ca_bundle_path, "source.tls.ca_bundle_path")
