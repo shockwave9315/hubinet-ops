@@ -34,17 +34,20 @@ If the user or task specifies an expected head SHA and the remote moved, stop wr
 
 ## Required repository validation
 
-For runtime/code changes, expect the applicable repository gates defined by `AGENTS.md` and CI, including:
+For runtime/code changes, expect the applicable repository gates defined by `AGENTS.md` and current CI (`.github/workflows/ci.yml`), including:
 
-- Python compilation;
+- Python compilation (`app`, `custom_components`, `tests`, `scripts`);
 - relevant targeted pytest;
 - full repository pytest when publishing/merging runtime changes;
 - shell syntax validation;
-- managed executor compilation;
 - YAML parsing;
 - tracked-runtime-file validation;
-- deployment smoke sandbox gate where the workflow owns it;
 - `git diff --check` or equivalent whitespace validation.
+
+Do not require a gate that no longer exists in the current tree/CI (e.g. the
+retired managed-executor compilation or Docker deployment-smoke-sandbox
+steps) merely because it was once mandatory — confirm the current gate list
+against CI directly rather than from memory.
 
 Do not weaken, skip, or rewrite tests merely to obtain green CI.
 
