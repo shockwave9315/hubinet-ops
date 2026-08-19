@@ -1,9 +1,0 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-CONTROL_IMPL="${HUBINET_OPS_HOST_CONTROL_IMPL:-/usr/local/lib/hubinet-ops/hubinet_ops_host_control.py}"
-[[ -f "$CONTROL_IMPL" ]] || {
-  printf '{"ok":false,"error":"Hubinet Ops host control is not installed"}\n'
-  exit 1
-}
-exec python3 "$CONTROL_IMPL" --forced-command "${SSH_ORIGINAL_COMMAND:-$*}"

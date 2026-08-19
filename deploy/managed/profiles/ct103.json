@@ -1,1 +1,0 @@
-{"services":["mosquitto.service"],"health_urls":[],"min_free_mb":512,"ignore_failed_units":[],"repair_actions":[],"docker":{"enabled":false}}

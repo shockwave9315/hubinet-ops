@@ -1,1 +1,0 @@
-{"services":["containerd.service","docker.service"],"health_urls":[],"min_free_mb":3072,"ignore_failed_units":[],"repair_actions":["restart_services","restart_required_containers"],"docker":{"enabled":true,"require_health":true,"required_containers":["weatherhub-weather-api-1","weatherhub-weather-worker-1","weatherhub-redis-1"]}}
