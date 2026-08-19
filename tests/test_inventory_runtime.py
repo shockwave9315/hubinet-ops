@@ -198,41 +198,17 @@ def test_2_only_get_head_options_routes_exist(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 # §28 test #3 -- app.main import/behavior unchanged (narrow regression guard)
 # ---------------------------------------------------------------------------
-
-
-def test_3_legacy_app_main_is_untouched_by_this_wave(tmp_path: Path, monkeypatch) -> None:
-    import importlib
-
-    from app.config import Settings
-    from app.database import Database
-
-    class FakeExecutor:
-        def run(self, action, vmid, argument=None, timeout=None, on_event=None):
-            return {"ok": True, "data": {}}
-
-    config_path = tmp_path / "legacy-config.yaml"
-    config_path.write_text(
-        "scheduler:\n  enabled: false\ncontainers:\n  106:\n    enabled: true\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HUBINET_OPS_CONFIG", str(config_path))
-    monkeypatch.setenv("HUBINET_OPS_DB", str(tmp_path / "legacy-import.db"))
-    monkeypatch.setenv("HUBINET_OPS_API_TOKEN", "l" * 64)
-    main = importlib.import_module("app.main")
-
-    cfg = Settings(
-        raw={"scheduler": {"enabled": False}, "mqtt": {"enabled": False}, "home_assistant": {}, "containers": {106: {"enabled": True}}},
-        config_path=tmp_path / "legacy-config.yaml",
-        db_path=tmp_path / "legacy.db",
-        api_token="t" * 64,
-    )
-    db = Database(cfg.db_path)
-    client = TestClient(main.create_app(cfg, database=db, executor=FakeExecutor()))
-
-    # These legacy routes must remain exactly as before this wave -- R0-B
-    # never edits app/main.py.
-    assert client.get("/health").status_code == 200
-    assert client.get("/api/v1/resources", headers={"Authorization": "Bearer " + cfg.api_token}).status_code == 200
+#
+# The legacy 0.2.x-0.4.x runtime (app/main.py, app/service.py, app/database.py,
+# etc.) has been retired from the current tree as part of the 0.5-only
+# repository cleanup; its historical source remains available through Git
+# history/tags. The invariant this test protected -- "R0-B never edits the
+# legacy composition root" -- is now vacuously true (the file no longer
+# exists) and is superseded by the AST-based forbidden-legacy-import guard
+# below (`test_r0_production_modules_import_no_forbidden_legacy_symbol` in
+# tests/test_r0_architecture_regression.py and this file's own denylist
+# checks), which does not require the legacy modules to exist to be
+# meaningful.
 
 
 # ---------------------------------------------------------------------------

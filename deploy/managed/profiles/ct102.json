@@ -1,1 +1,0 @@
-{"services":["apache2.service","mariadb.service"],"health_urls":[],"min_free_mb":1024,"ignore_failed_units":[],"repair_actions":[],"docker":{"enabled":false}}

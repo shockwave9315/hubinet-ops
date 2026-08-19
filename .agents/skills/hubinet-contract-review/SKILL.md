@@ -101,7 +101,16 @@ Use `references/finding-checklist.md` as a reminder of common sibling dimensions
 
 ## Phase boundary while reviewing
 
-Current status after PR #20 says Phase 0 contract/HA presentation are implemented, while persistent Phase 1 owners are not. Respect that boundary.
+Read `docs/architecture/0.5-implementation-status.md` fresh for current
+implementation state; do not anchor review assumptions to a remembered PR
+number. The R0 read-only runtime already gives the backend durable ownership
+of inventory reconciliation, discovery-run issuance/scheduling, and
+published-snapshot/revision authority — this is implemented, not merely a
+Phase 0 contract layer. Source attestation (ADR 0003) and confirmed removal
+(ADR 0004) are also durably implemented but dormant (R0's own call surface
+never invokes either). Policy/plans/jobs/locks/mutation authority remains
+genuinely unimplemented. See the `hubinet-phase-boundary` skill for the full
+current-ownership/deferred split.
 
 HA may validate canonical values, one-view consistency, observable successor contradictions, and permanent facts already observed.
 
@@ -115,7 +124,13 @@ Do not make HA a durable owner of:
 - scheduler-independent freshness expiry;
 - plans/jobs/locks/audit or mutation authorization.
 
-If the finding needs one of these, report the Phase 1 requirement instead of adding hidden HA state.
+These remain true regardless of whether the backend owner is already
+implemented (most inventory/discovery mechanisms) or still deferred
+(policy/jobs/mutation) — HA never reimplements either kind locally. Do not
+reject a current backend-owned inventory/discovery mechanism merely because
+it superficially resembles "Phase 1" work; if it needs durable backend
+history/transactions/authority, classify it `BACKEND OWNED (R0)` when that
+authority already exists, or `DEFERRED / DORMANT BACKEND OWNER` when it does not.
 
 ## Review writes
 
@@ -125,7 +140,7 @@ For an explicitly authorized fix:
 
 - change only the accepted family invariant and necessary tests;
 - preserve legal polling-gap semantics;
-- do not combine a finding fix with the known structural `api.py` refactor;
+- do not combine a finding fix with an unrelated structural refactor;
 - do not merge, deploy, resolve review threads, or change Draft/Ready unless explicitly authorized;
 - after the fix, review the exact diff/family rather than restarting a full audit.
 

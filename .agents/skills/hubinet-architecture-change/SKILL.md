@@ -90,9 +90,13 @@ HA -> Hubinet Ops API -> backend policy/plans/jobs/locks/audit
 
 A structural refactor is not automatically an architecture change.
 
-For the known post-PR #20 `api.py` debt, the current status explicitly calls for a semantic-preserving split before Phase 1.
+Before starting one, check `docs/architecture/0.5-implementation-status.md`
+for whether the specific debt is still current — the previously tracked
+`custom_components/hubinet_ops/api.py` split (thin API/client/transport
+compatibility facade over `contract/`) has since been completed and is
+listed under "COMPLETE"; do not re-plan it or anchor new work to it.
 
-During that refactor:
+For a genuine current structural refactor:
 
 - preserve public behavior/imports where required;
 - move existing rules without strengthening/weakening them;

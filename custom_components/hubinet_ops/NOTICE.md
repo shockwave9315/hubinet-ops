@@ -10,6 +10,7 @@ integration:
 - upstream path: `homeassistant/components/proxmoxve/`
 - license: Apache License 2.0
 
-The pinned upstream source and full license text are available at
-`vendor/home-assistant-core/`. The Hubinet Ops integration communicates only
-with the Hubinet Ops backend and does not include upstream Proxmox mutations.
+The pinned upstream source is not vendored in this repository; retrieve it at
+the exact tag/commit above from `home-assistant/core` if needed. The Hubinet
+Ops integration communicates only with the Hubinet Ops backend and does not
+include upstream Proxmox mutations.

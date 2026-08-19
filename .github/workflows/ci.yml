@@ -23,14 +23,8 @@ jobs:
         run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: Compile agent
         run: python -m compileall app custom_components/hubinet_ops
-      - name: Verify deployment smoke sandbox support
-        run: |
-          docker version
-          docker info --format '{{json .SecurityOptions}}'
       - name: Test
         shell: bash
-        env:
-          HUBINET_OPS_EPHEMERAL_CI: "1"
         run: |
           set -o pipefail
           PYTHONPATH="$GITHUB_WORKSPACE" python -m pytest -q --tb=short 2>&1 | tee pytest.log
@@ -43,11 +37,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
       - name: Validate shell syntax
-        run: |
-          find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
-          bash -n deploy/pve/hubinet-ops-host
-      - name: Validate managed executor
-        run: python -m py_compile deploy/managed/hubinet-maint
+        run: find . -type f -name '*.sh' -print0 | xargs -0 -n1 bash -n
       - name: Parse YAML
         run: python scripts/validate_yaml.py
       - name: Reject tracked runtime files
