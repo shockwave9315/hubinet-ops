@@ -29,7 +29,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO_ROOT / "deploy" / "install-0.5.0-fresh.sh"
 SERVICE_UNIT = REPO_ROOT / "deploy" / "hubinet-ops-0.5.service"
 FIREWALL_DOC = REPO_ROOT / "deploy" / "README-0.5-firewall.md"
-LEGACY_SERVICE_UNIT = REPO_ROOT / "deploy" / "hubinet-ops.service"
 
 
 def test_install_script_syntax_is_valid() -> None:
@@ -93,13 +92,15 @@ def test_40_install_script_uses_the_r0_config_and_env_paths() -> None:
     assert "HUBINET_OPS_DB" not in text  # legacy 0.4 env var name
 
 
-def test_40_legacy_04_installer_and_service_are_unedited() -> None:
-    legacy_installer = REPO_ROOT / "deploy" / "install-agent.sh"
-    assert legacy_installer.exists()
-    assert LEGACY_SERVICE_UNIT.exists()
-    legacy_unit_text = LEGACY_SERVICE_UNIT.read_text(encoding="utf-8")
-    assert "app.main:app" in legacy_unit_text
-    assert "app.inventory_runtime" not in legacy_unit_text
+# The legacy 0.4 installer (`deploy/install-agent.sh`) and service unit
+# (`deploy/hubinet-ops.service`) that WAVE R0-B confirmed it never edited
+# have since been retired from the current 0.5-only tree by the repository
+# cleanup; the invariant "R0-B's fresh installer never touches the legacy
+# 0.4 installer/service source" is now vacuously true (neither file exists)
+# and is superseded by the positive checks above, which verify the current
+# 0.5 installer's own text/behavior without depending on the legacy files'
+# continued existence. Historical source remains available through Git
+# history/tags.
 
 
 # ---------------------------------------------------------------------------
