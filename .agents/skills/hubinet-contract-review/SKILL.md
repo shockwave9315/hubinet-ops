@@ -130,7 +130,7 @@ implemented (most inventory/discovery mechanisms) or still deferred
 reject a current backend-owned inventory/discovery mechanism merely because
 it superficially resembles "Phase 1" work; if it needs durable backend
 history/transactions/authority, classify it `BACKEND OWNED (R0)` when that
-authority already exists, or `DEFERRED / DORMANT` when it does not.
+authority already exists, or `DEFERRED / DORMANT BACKEND OWNER` when it does not.
 
 ## Review writes
 

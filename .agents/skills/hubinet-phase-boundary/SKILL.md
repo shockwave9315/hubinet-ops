@@ -1,6 +1,6 @@
 ---
 name: hubinet-phase-boundary
-description: Decide whether Hubinet Ops work belongs in Phase 0 Home Assistant validation/presentation or deferred Phase 1+ backend persistence. Use for polling gaps, reconciliation, run history, CAS/fencing, freshness, enrollment, trust, policy, bindings, SQLite ownership, or authority questions.
+description: Decide whether Hubinet Ops work belongs in Home Assistant validation/presentation, current R0 backend authority, deferred/dormant backend authority, or requires a new architectural decision. Use for polling gaps, reconciliation, run history, CAS/fencing, freshness, enrollment, trust, policy, bindings, SQLite ownership, or authority questions.
 ---
 
 # Hubinet Ops phase boundary

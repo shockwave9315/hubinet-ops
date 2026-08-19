@@ -59,11 +59,20 @@ _PROHIBITED_EXACT_PATHS = (
     ".env.example",
     "deploy/hubinet-ops.service",
     "scripts/generate_ha_dashboard.py",
+    # Non-versioned/irregularly-named legacy deploy scripts -- these don't
+    # match any _PROHIBITED_PATH_PREFIXES entry (deploy/install-ha-from-
+    # pve.sh has no version number at all; deploy/install-ha-dashboard-
+    # 0.2.3-from-pve.sh breaks the "deploy/install-ha-0." prefix because of
+    # the inserted "dashboard-" segment), so they are listed exactly.
+    "deploy/install-agent.sh",
+    "deploy/install-ha-from-pve.sh",
+    "deploy/install-ha-dashboard-0.2.3-from-pve.sh",
 )
 
 _PROHIBITED_PATH_PREFIXES = (
     "deploy/managed/",
     "deploy/pve/",
+    "deploy/agent/",
     "home-assistant/",
     "deploy/install-ha-0.",
     "deploy/upgrade-0.",
@@ -74,6 +83,28 @@ _PROHIBITED_PATH_PREFIXES = (
     "scripts/validate_pve_snapshot_policy",
     "scripts/validate_hermetic_shell_boundary",
 )
+
+# Deliberately narrow prefixes only: "deploy/install-ha-0." and
+# "deploy/agent/" name the exact retired 0.x surface, not a whole semantic
+# namespace. A future, explicitly-designed 0.5 HA-side deploy artifact
+# (e.g. "deploy/install-ha-0.5....") must not be accidentally forbidden
+# merely for living under "deploy/" or sharing a name fragment -- do not
+# widen these to a generic "deploy/install-ha" or "deploy/agent" ban.
+
+
+def _is_prohibited_legacy_path(path: str) -> bool:
+    """Return True if `path` names a retired legacy path this guard forbids.
+
+    Single source of truth for both the exact-path and prefix-family
+    matching rules, so the matching *behavior* itself is directly testable
+    (see test_guard_classifies_known_legacy_deploy_paths_as_prohibited and
+    test_guard_does_not_classify_current_0_5_deploy_paths_as_prohibited)
+    independently of whether any matching file happens to be tracked right
+    now.
+    """
+    if path in _PROHIBITED_EXACT_PATHS:
+        return True
+    return any(path.startswith(prefix) for prefix in _PROHIBITED_PATH_PREFIXES)
 
 
 def test_prohibited_legacy_exact_paths_are_not_tracked() -> None:
@@ -87,14 +118,46 @@ def test_prohibited_legacy_exact_paths_are_not_tracked() -> None:
 
 def test_prohibited_legacy_path_prefixes_are_not_tracked() -> None:
     tracked = _tracked_files()
-    reintroduced = sorted(
-        path
-        for path in tracked
-        if any(path.startswith(prefix) for prefix in _PROHIBITED_PATH_PREFIXES)
-    )
+    reintroduced = sorted(path for path in tracked if _is_prohibited_legacy_path(path))
     assert not reintroduced, (
-        "Legacy deploy/managed, deploy/pve, home-assistant, or versioned "
-        f"0.4.x tooling paths were reintroduced: {reintroduced}"
+        "Legacy deploy/managed, deploy/pve, deploy/agent, home-assistant, or "
+        f"versioned 0.4.x tooling paths were reintroduced: {reintroduced}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Direct behavioral proof of the matching rule itself -- independent of
+# whether any matching file is currently tracked. This is what catches a
+# *future* narrowing/widening mistake in the constants above, not just a
+# literal reintroduction of a file that happens to be tracked today.
+# ---------------------------------------------------------------------------
+
+_KNOWN_LEGACY_DEPLOY_PATHS = (
+    "deploy/install-ha-from-pve.sh",
+    "deploy/install-ha-dashboard-0.2.3-from-pve.sh",
+    "deploy/install-agent.sh",
+    "deploy/agent/backup-0.3.0.sh",
+    "deploy/agent/restore-0.3.0.sh",
+)
+
+_CURRENT_0_5_DEPLOY_PATHS = (
+    "deploy/install-0.5.0-fresh.sh",
+    "deploy/hubinet-ops-0.5.service",
+    "deploy/README-0.5-firewall.md",
+)
+
+
+@pytest.mark.parametrize("path", _KNOWN_LEGACY_DEPLOY_PATHS)
+def test_guard_classifies_known_legacy_deploy_paths_as_prohibited(path: str) -> None:
+    assert _is_prohibited_legacy_path(path), (
+        f"guard must classify retired legacy deploy path {path!r} as prohibited"
+    )
+
+
+@pytest.mark.parametrize("path", _CURRENT_0_5_DEPLOY_PATHS)
+def test_guard_does_not_classify_current_0_5_deploy_paths_as_prohibited(path: str) -> None:
+    assert not _is_prohibited_legacy_path(path), (
+        f"guard must not classify current 0.5 deploy path {path!r} as prohibited"
     )
 
 
@@ -138,11 +201,21 @@ _CURRENT_0_5_PRODUCTION_MODULES = (
     "custom_components/hubinet_ops/__init__.py",
     "custom_components/hubinet_ops/api.py",
     "custom_components/hubinet_ops/config_flow.py",
+    "custom_components/hubinet_ops/const.py",
     "custom_components/hubinet_ops/coordinator.py",
     "custom_components/hubinet_ops/diagnostics.py",
     "custom_components/hubinet_ops/entity.py",
     "custom_components/hubinet_ops/sensor.py",
     "custom_components/hubinet_ops/transport_http.py",
+    "custom_components/hubinet_ops/contract/__init__.py",
+    "custom_components/hubinet_ops/contract/enums.py",
+    "custom_components/hubinet_ops/contract/models.py",
+    "custom_components/hubinet_ops/contract/primitives.py",
+    "custom_components/hubinet_ops/contract/projections.py",
+    "custom_components/hubinet_ops/contract/resource_validation.py",
+    "custom_components/hubinet_ops/contract/snapshot_validation.py",
+    "custom_components/hubinet_ops/contract/source_validation.py",
+    "custom_components/hubinet_ops/contract/transition_validation.py",
 )
 
 

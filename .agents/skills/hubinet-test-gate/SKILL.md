@@ -36,7 +36,11 @@ If the user or task specifies an expected head SHA and the remote moved, stop wr
 
 For runtime/code changes, expect the applicable repository gates defined by `AGENTS.md` and current CI (`.github/workflows/ci.yml`), including:
 
-- Python compilation (`app`, `custom_components`, `tests`, `scripts`);
+- Python compilation — current CI's own gate compiles production `app` +
+  `custom_components/hubinet_ops` only; the broader complete local
+  repository validation (`AGENTS.md`/`CLAUDE.md`) may additionally compile
+  `tests` + `scripts`, but that broader command is a local check, not what
+  CI enforces;
 - relevant targeted pytest;
 - full repository pytest when publishing/merging runtime changes;
 - shell syntax validation;
