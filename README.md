@@ -43,8 +43,13 @@ step (`docs/operations/0.5-r0-operational-activation.md`).
 - `config/inventory.example.yaml`, `.env.r0.example`: the source-centric R0 bootstrap
   config and paired secrets template — no static resource inventory.
 - `deploy/hubinet-ops-0.5.service`, `deploy/install-0.5.0-fresh.sh`,
-  `deploy/README-0.5-firewall.md`: the sole current deployment path (clean install only;
-  there is no 0.4→0.5 upgrade path).
+  `deploy/README-0.5-firewall.md`: the in-CT install path (clean install only; there
+  is no 0.4→0.5 upgrade path).
+- `deploy/bootstrap-proxmox-0.5.sh`, `deploy/lib/bootstrap-*.sh`,
+  `deploy/README-bootstrap-proxmox-0.5.md`: the primary, product-facing PVE-host
+  entrypoint — automates fresh CT creation, least-privilege PVE identity, TLS trust,
+  the in-CT install above, source-centric config, and the mandatory firewall
+  boundary, ending with CT boot enabled only after acceptance passes.
 - `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
   the authority order). `docs/operations/`: the R0 operational activation runbook and the
   Home Assistant clean-break/purge plan for a real deployed instance.
@@ -55,6 +60,7 @@ step (`docs/operations/0.5-r0-operational-activation.md`).
 python -m compileall -q app custom_components tests scripts
 pytest -q
 bash -n deploy/install-0.5.0-fresh.sh
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/lib/*.sh; do bash -n "$f"; done
 python scripts/validate_yaml.py
 python scripts/check_tracked_files.py
 ```

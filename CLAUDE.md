@@ -71,6 +71,7 @@ iterative work.
 python -m compileall -q app custom_components tests scripts
 pytest -q
 bash -n deploy/install-0.5.0-fresh.sh
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/lib/*.sh; do bash -n "$f"; done
 python scripts/validate_yaml.py
 python scripts/check_tracked_files.py
 ```
@@ -283,11 +284,23 @@ capability into any current module without an explicit activation/cutover review
 - `config/inventory.example.yaml` — source-centric R0 bootstrap config (no static
   resource/VMID inventory); `.env.r0.example` — the paired secrets template.
 - `deploy/hubinet-ops-0.5.service`, `deploy/install-0.5.0-fresh.sh`,
-  `deploy/README-0.5-firewall.md` — the sole current deployment path: a fresh,
+  `deploy/README-0.5-firewall.md` — the in-CT deployment path: a fresh,
   clean-install-only unit/installer bound to `0.0.0.0:8787`, paired with mandatory
   firewall-policy documentation. Never execute the installer against a real host from an
   agent session; it is validated with `bash -n` only, plus
   `tests/test_deploy_0_5_fresh_install.py`'s text-level checks.
+- `deploy/bootstrap-proxmox-0.5.sh` + `deploy/lib/bootstrap-*.sh`,
+  `deploy/README-bootstrap-proxmox-0.5.md` — the primary product-facing PVE-host
+  entrypoint: automates fresh unprivileged Debian 13 LXC creation, least-privilege
+  PVE identity provisioning (verified, never mutation-shaped), PVE TLS trust,
+  invoking `install-0.5.0-fresh.sh` unmodified inside the new CT, source-centric
+  config generation, and the mandatory nftables firewall boundary, in a fixed
+  fail-closed phase order (CT `onboot` enabled only after acceptance passes).
+  Never execute it against a real host from an agent session; it is validated
+  with `bash -n` plus `tests/test_bootstrap_proxmox_0_5.py`'s hermetic
+  fake-command-layer tests (`tests/_bootstrap_fake_pve.py`) — a fake `pct`/
+  `pveum`/`pveam`/`pvesh`/`pvesm`/`nft` command layer on a temporary `PATH`, no
+  Docker sandbox involved.
 - `docs/architecture/` — 0.5 ADRs and status (authority for 0.5 work; see above).
   `docs/operations/` — the R0 operational activation runbook and HA clean-break/purge
   plan for a real deployed instance.
