@@ -4,18 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repository is
 
-Hubinet Ops is a policy-controlled Proxmox inventory, telemetry, lifecycle, snapshot, and
-manually-approved APT maintenance service, with a Home Assistant frontend. Two tracks live
-in this repo at once:
+Hubinet Ops is a policy-controlled Proxmox inventory service with a native Home Assistant
+frontend. This repository is **0.5-only**: the obsolete 0.2.x/0.3.x/0.4.x implementation,
+deployment, and Home Assistant presentation surfaces have been retired from `main` as a
+deliberate clean-break repository boundary — see `docs/architecture/0.5-foundation.md`
+("Git history and old tags are the archive. `main` is not an archive of obsolete runtime
+implementations."). Their historical source remains recoverable only through Git
+history/tags; do not resurrect any of it into the current tree.
 
-- **Legacy 0.4.x (production, `app/*` top-level modules)** — the stable, shipped service
-  documented in `README.md` and `docs/architecture.md`. Production inventory is exactly
-  VM/CT 100–110.
-- **0.5 clean-break rewrite (`app/inventory/`, `custom_components/hubinet_ops/`)** —
-  a from-scratch inventory/identity model under active development. It is **implemented but
-  dormant**: nothing in production startup, HTTP, scheduling, or mutation authority uses it
-  yet. Do not wire it into runtime without an explicit activation/cutover review. Current
-  status is tracked in `docs/architecture/0.5-implementation-status.md`.
+The current, single-track implementation lives in:
+
+- **`app/inventory/`** — the durable 0.5 authority subsystem (identity, discovery,
+  reconciliation, publication).
+- **`app/inventory_runtime.py`, `app/inventory_runtime_config.py`,
+  `app/inventory_scheduler.py`, `app/inventory_pve_transport.py`** — the R0 read-only
+  runtime composition root, config loader, discovery scheduler, and production Proxmox
+  transport. This is the current production entrypoint (`uvicorn
+  app.inventory_runtime:app`) — **read-only**: no policy, jobs, mutation, endpoint
+  activation/failover, or attestation enrollment automation exists or is authorized yet.
+  Current status is tracked in `docs/architecture/0.5-implementation-status.md`.
+- **`custom_components/hubinet_ops/`** — the native Home Assistant integration consuming
+  the R0 backend over HTTP.
 
 **Before any architecture or implementation work, read `AGENTS.md` in full.** It is the
 binding rules file for every coding agent in this repo (identity model, mutation trust
@@ -26,10 +35,20 @@ below are the actual authority and take precedence over anything here.
 Normative 0.5 architecture, in order of authority:
 1. `docs/architecture/adr/0001-resource-identity-incarnation.md` (ACCEPTED)
 2. `docs/architecture/adr/0002-proxmox-discovery-reconciliation.md` (ACCEPTED)
-3. `docs/architecture/0.5-foundation.md` (ACCEPTED — Phase 0 decisions; partly in Polish)
-4. `docs/architecture/0.5-inventory-model.md` (ACCEPTED — materializes the two ADRs)
-5. `docs/architecture/0.5-implementation-status.md` — current status, NOT an authority; if
-   it conflicts with an ACCEPTED ADR, the ADR wins and the status doc must be corrected.
+3. `docs/architecture/adr/0003-source-binding-attestation.md` (ACCEPTED)
+4. `docs/architecture/adr/0004-confirmed-removal-operator-absence.md` (ACCEPTED)
+5. `docs/architecture/adr/0005-workload-continuity-enrollment.md` (ACCEPTED — negative
+   stock-PVE trust boundary and R0 safety decision only; does not authorize mutation)
+6. `docs/architecture/0.5-foundation.md` (ACCEPTED — Phase 0 decisions; partly in Polish)
+7. `docs/architecture/0.5-inventory-model.md` (ACCEPTED — materializes ADR 0001/0002)
+8. `docs/architecture/0.5-r0-read-only-runtime-activation.md` — the R0 read-only runtime
+   activation design (19-item Phase 1 gate audit, composition-root/deployment decisions)
+9. `docs/operations/0.5-r0-operational-activation.md`,
+   `docs/operations/0.5-ha-clean-break.md` — the operational activation runbook and the
+   Home Assistant 0.4→0.5 clean-break/purge plan for a real deployed instance
+10. `docs/architecture/0.5-implementation-status.md` — current status, NOT an authority;
+    if it conflicts with an ACCEPTED ADR, the ADR wins and the status doc must be
+    corrected.
 
 Skills under `.agents/skills/` encode repo-specific procedures on top of these rules:
 `hubinet-contract-review` (review procedure), `hubinet-phase-boundary` (Phase 0 HA vs.
@@ -49,15 +68,10 @@ release/final integration gate. It is **not** the default command to run after e
 or bounded edit; see "Agent working discipline" below for proportional validation during
 iterative work.
 ```bash
-python -m compileall -q app tests
+python -m compileall -q app custom_components tests scripts
 pytest -q
-python -m py_compile deploy/managed/hubinet-maint deploy/pve/hubinet_ops_host_control.py deploy/pve/hubinet_ops_hostd.py
-python scripts/validate_managed_profiles.py
+bash -n deploy/install-0.5.0-fresh.sh
 python scripts/validate_yaml.py
-python scripts/generate_ha_dashboard.py --check
-bash -n deploy/upgrade-0.4.2-from-pve.sh
-bash -n deploy/install-ha-0.4.2-from-pve.sh
-bash -n deploy/pve/hubinet-ops-host
 python scripts/check_tracked_files.py
 ```
 
@@ -78,15 +92,10 @@ This suite requires exact `homeassistant==2026.8.1` on Python `>=3.14.2` (Linux)
 time — that is a known, accepted harness limit; never patch Home Assistant/Python or fake
 `fcntl` to work around it. Treat Linux CI as the real HA compatibility gate.
 
-The deployment "runtime smoke" (`tests/shell/run_runtime_smoke_sandbox.sh` /
-`runtime_smoke_0_4_1.sh`) is **CI-only**: it runs a real deployment script inside a
-Docker sandbox that only exists on an ephemeral GitHub-hosted runner carrying the
-workflow-owned `HUBINET_OPS_EPHEMERAL_CI=1` marker. Never invoke it directly or run
-deployment scripts against a real host from this environment.
-
-Tests never contact real Proxmox, LXC/QEMU guests, Home Assistant, MQTT, or any
-private-network endpoint — they use fake executors, fake clocks, temporary SQLite
-databases, and stubbed commands.
+Tests never contact real Proxmox, Home Assistant, or any private-network endpoint — they
+use a fake `ReadOnlyProviderTransport`, fake clocks, and temporary SQLite authority
+databases. Never invoke a deployment script directly or run it against a real host from
+this environment.
 
 ## Agent working discipline
 
@@ -203,50 +212,11 @@ persistence/restart behavior retained where relevant; transaction/atomicity reta
 relevant; security/source-of-truth boundaries retained; no scope leakage into dormant/
 runtime/legacy areas. If any row in that family isn't closed, don't claim completion.
 
-## Architecture (legacy 0.4.x, currently production)
+## Architecture (0.5, current)
 
-Request/data flow: telemetry loop and `monitoring_scheduler` call into `ResourceExecutor`,
-which selects a validated adapter (LXC/APT, QEMU/HAOS read-only, or CT110
-self-inspection). SQLite (`app/database.py`) is authoritative for plans, jobs, events, and
-normalized resource state; MQTT (`app/mqtt.py`) and Home Assistant are projections only.
-
-Manually-approved update lifecycle for CT101–CT109:
-```
-scan → waiting approval → preflight → snapshot (policy) → update → stabilization → verification → terminal result
-```
-VM100 (`haos`) and CT110 (`agent_self`, the backend-hosting container) never enter this
-lifecycle; VM100 is observation-only plus typed Hubinet-owned QEMU snapshot create/
-list/delete. CT110 self-inspection never recursively calls its own API/SSH.
-
-Full mutation trust path (never shortcut this — see `AGENTS.md` for exact gates):
-```
-Home Assistant → Hubinet Ops API → backend policy/plans/jobs/locks/audit
-→ typed host-control → hostd/forced-command → Proxmox
-```
-`deploy/pve/hubinet_ops_host_control.py` (forced-command wrapper) and
-`deploy/pve/hubinet_ops_hostd.py` (durable hostd daemon) share one host-control
-implementation that revalidates action, VMID, resource type, and every capability
-(observation/managed/maintenance/lifecycle/host-control/snapshot-name) independently
-of the backend. The PVE SSH key is scoped to that implementation only — no shell or
-free-form command text is ever accepted anywhere in this path.
-
-There is one narrow legacy break-glass exception: offline recovery for CT110 (the
-backend-hosting container), which can bypass the backend only through a dedicated
-recovery credential and only for typed offline force-stop/snapshot-restore ops. See
-`docs/recovery.md` and the "Transitional legacy 0.4 break-glass exception" section of
-`AGENTS.md` before touching this path.
-
-Key legacy modules in `app/`: `service.py` (orchestration), `executor.py` +
-`resource_adapters.py` (per-resource-type operations), `host_control.py` (typed PVE
-client), `state.py` (normalized resource state), `database.py` (SQLite), `mqtt.py` +
-`mqtt_budget.py` (telemetry/discovery, bounded churn), `ha_entities.py` (entity
-generation), `security.py` (bearer auth), `config.py` (`config.yaml` loading/validation).
-
-## Architecture (0.5 rewrite, dormant)
-
-`app/inventory/` is an independently instantiable subsystem — a separate SQLite
-"authority" database (schema v3, marker `hubinet_ops_0_5_authority`), not the legacy
-`Database`/`OpsService`. It has its own identity model, summarized from ADR 0001/0002:
+`app/inventory/` is an independently instantiable subsystem — its own SQLite "authority"
+database (schema v5, marker `hubinet_ops_0_5_authority`). It has its own identity model,
+summarized from ADR 0001/0002:
 
 - A Proxmox VMID is only a reusable **slot locator** `(inventory_source_id, vmid)`, never
   durable identity. Durable identity is an opaque backend-generated `resource_id` (UUID)
@@ -266,58 +236,76 @@ generation), `security.py` (bearer auth), `config.py` (`config.yaml` loading/val
   side of the contract validated in `custom_components/hubinet_ops/contract/`.
 - `app/inventory/store.py` / `authority.py` own the durable schema, CAS/fencing for
   discovery-run ownership, and the backend/source/global-revision bookkeeping.
+- `app/inventory/attestation.py` (source-binding/attestation authority, ADR 0003) and the
+  confirmed-removal authority (ADR 0004) are durably implemented but **dormant**: no
+  production caller invokes them yet (see `docs/architecture/0.5-implementation-status.md`).
+
+`app/inventory_runtime.py` is the current production composition root
+(`create_read_only_app`/`create_app_from_env`, `uvicorn app.inventory_runtime:app`). It
+constructs the authority store/authority/publication objects, a production
+`ProxmoxHttpTransport` (GET-only, mandatory TLS verification, no mutation-verb escape
+hatch), the `R0Scheduler` discovery orchestrator, and the read-only `GET /r0/v1/health`,
+`/backend`, `/snapshot` HTTP API (bearer auth, no mutation route of any kind). It has a
+documented, test-enforced legacy-import denylist — see
+`tests/test_r0_architecture_regression.py` and `tests/test_no_legacy_runtime_surface.py`
+— and opens its own fresh/separate authority database with no legacy migration path.
+There is no static resource/VMID configuration anywhere in this path: `app/
+inventory_runtime_config.py` configures only how to identify and reach a Proxmox
+*source*; every node/LXC/QEMU resource is discovered dynamically.
 
 `custom_components/hubinet_ops/` is the Home Assistant custom integration consuming that
-snapshot: `coordinator.py` (one `DataUpdateCoordinator`, one snapshot fetch per refresh),
-`contract/` (structural validation — enums/models/primitives/source/resource/snapshot/
-transition — the "Phase 0 snapshot oracle"), `api.py` (thin transport facade),
-`config_flow.py`, `sensor.py`, `entity.py`, `diagnostics.py` (redacts secrets recursively).
-The coordinator is explicitly **not** a reconciler: it never infers `missing` from a diff
-between two polls, and it never assumes revision `N -> N+1` implies backend transaction
-adjacency (publications can skip arbitrary intermediate states — see the "polling-gap
-test" in `.agents/skills/hubinet-phase-boundary/SKILL.md` before adding any HA-side
-invariant).
+snapshot over HTTP (`transport_http.py`): `coordinator.py` (one `DataUpdateCoordinator`,
+one snapshot fetch per refresh), `contract/` (structural validation — enums/models/
+primitives/source/resource/snapshot/transition — the "Phase 0 snapshot oracle"), `api.py`
+(thin transport facade), `config_flow.py`, `sensor.py`, `entity.py`, `diagnostics.py`
+(redacts secrets recursively). The coordinator is explicitly **not** a reconciler: it
+never infers `missing` from a diff between two polls, and it never assumes revision
+`N -> N+1` implies backend transaction adjacency (publications can skip arbitrary
+intermediate states — see the "polling-gap test" in
+`.agents/skills/hubinet-phase-boundary/SKILL.md` before adding any HA-side invariant).
 
-Whether new work belongs in the dormant Phase 1 backend (`app/inventory/`) or in Phase 0
-HA-side validation/presentation (`custom_components/hubinet_ops/`) is a real design
+Whether new work belongs in the backend (`app/inventory/`) or in the HA-side
+validation/presentation layer (`custom_components/hubinet_ops/`) is a real design
 question — use the `hubinet-phase-boundary` skill rather than guessing, especially for
 anything touching freshness, reconciliation, run history, CAS/fencing, or authority.
+Mutation/policy/jobs/locks authority (Phase 1C) remains unimplemented and blocked on
+Blocker B (workload continuity) plus every other mutation gate — do not wire mutation
+capability into any current module without an explicit activation/cutover review.
 
 ## Repository map
 
-- `app/` — legacy 0.4.x service (API, policy/service, adapters, SQLite, MQTT, state) plus
-  the dormant `app/inventory/` 0.5 subsystem.
+- `app/` — the 0.5 inventory/runtime subsystem only: `app/inventory/` (durable authority),
+  `app/inventory_runtime.py` / `inventory_runtime_config.py` / `inventory_scheduler.py` /
+  `inventory_pve_transport.py` (R0 read-only composition root, config, scheduler, and PVE
+  transport).
 - `custom_components/hubinet_ops/` — Home Assistant custom integration (0.5 contract +
-  coordinator + presentation); `vendor/home-assistant-core/` holds the reference
-  `proxmoxve` integration these patterns were derived from (not imported at runtime).
-- `config/config.example.yaml` — production-shaped resource inventory, no credentials.
-- `deploy/pve/` — shared typed host control, forced-command wrapper, durable hostd,
-  systemd unit, versioned allowlists (`*-vmids`, `resource-types`).
-- `deploy/managed/` — fixed LXC executor (`hubinet-maint`), transactional installer,
-  CT101–109 profiles.
-- `deploy/upgrade-*.sh` / `deploy/install-ha-*.sh` — versioned transactional
-  upgrade/install scripts, one pair per shipped release; each is validated with `bash -n`
-  only (the real deployment smoke runs exclusively in the CI sandbox, see Commands).
-  Never execute these against a real host from an agent session.
-  `deploy/pve/hubinet-ops-self-update` handles CT110 self-update.
-  `deploy/pve/hubinet_ops_release.py` builds release bundles.
-- `home-assistant/` — legacy package/dashboard YAML and secret examples for the 0.4.x
-  MQTT-based integration (distinct from `custom_components/hubinet_ops/`).
+  coordinator + presentation over HTTP).
+- `config/inventory.example.yaml` — source-centric R0 bootstrap config (no static
+  resource/VMID inventory); `.env.r0.example` — the paired secrets template.
+- `deploy/hubinet-ops-0.5.service`, `deploy/install-0.5.0-fresh.sh`,
+  `deploy/README-0.5-firewall.md` — the sole current deployment path: a fresh,
+  clean-install-only unit/installer bound to `0.0.0.0:8787`, paired with mandatory
+  firewall-policy documentation. Never execute the installer against a real host from an
+  agent session; it is validated with `bash -n` only, plus
+  `tests/test_deploy_0_5_fresh_install.py`'s text-level checks.
 - `docs/architecture/` — 0.5 ADRs and status (authority for 0.5 work; see above).
-  `docs/*.md` (non-`architecture/`) — 0.4.x design/API/security/deployment docs and
-  per-version upgrade notes.
-- `scripts/` — `generate_ha_dashboard.py` (deterministic Lovelace generator, `--check`
-  mode), `migrate_config_0_4_*.py`, `validate_*.py` (YAML, managed profiles, HA secrets,
-  rollout state, hermetic shell boundary, PVE snapshot policy), `check_tracked_files.py`
-  (fails CI if `.env`/`config.yaml`/secrets/DBs/keys/logs are tracked in git).
-- `tests/` — pytest suite (fake executors/clocks/SQLite only); `tests/fixtures/`,
-  `tests/shell/` (shell-script test harness incl. the CI-only sandbox smoke runner).
-  Test file naming: most are `test_<subsystem>.py`; version-scoped regression suites are
-  `test_v0XY_<topic>.py` — check for one of those before adding a new file for a
-  version-specific fix.
+  `docs/operations/` — the R0 operational activation runbook and HA clean-break/purge
+  plan for a real deployed instance.
+- `scripts/` — `validate_yaml.py` (repository-wide YAML parse check),
+  `check_tracked_files.py` (fails CI if `.env`/`config.yaml`/secrets/DBs/keys/logs are
+  tracked in git).
+- `tests/` — pytest suite (fake `ReadOnlyProviderTransport`/clocks/SQLite only). Test file
+  naming is `test_<subsystem>.py`.
 - `.agents/skills/` — repo-specific agent procedures (contract review, phase boundary,
   architecture change, test/evidence gate). Procedures never override `AGENTS.md` or an
   ACCEPTED ADR.
+
+Obsolete 0.2.x/0.3.x/0.4.x implementation, deployment, and Home Assistant presentation
+surfaces (the legacy `app/main.py`/`OpsService`/`Database`/MQTT composition root, static
+VMID config/deploy/`home-assistant/` package-dashboard surfaces, and their version-scoped
+tests) have been retired from this tree; do not recreate them here — see
+`tests/test_no_legacy_runtime_surface.py` for the enforced boundary and Git history/tags
+for the historical source.
 
 ## Working conventions specific to this repo
 
@@ -325,9 +313,11 @@ anything touching freshness, reconciliation, run history, CAS/fencing, or author
   runtime databases, or logs — `scripts/check_tracked_files.py` enforces this in CI, and
   the working tree already has many local test-artifact directories (`.pytest-tmp-*`,
   `.tmp-pytest-*`, `*.log`) that must stay untracked.
-- Every `/api/v1` endpoint requires bearer auth; never add one that doesn't.
+- Every `/r0/v1` endpoint requires bearer auth; never add one that doesn't.
 - Never add an API, MQTT topic, SSH path, or host-control operation that accepts
-  arbitrary command text — host-control stays typed and allowlisted.
+  arbitrary command text — a future mutation path must stay typed and allowlisted.
+- Never add a static resource/VMID configuration concept anywhere in the current 0.5
+  path — adding/removing a PVE guest must never require a repository or config change.
 - Treat green tests as evidence, not proof — see `hubinet-test-gate` before declaring
   something done, ready, or merge-safe, and don't weaken an existing test or fail-closed
   invariant just to make a change pass.

@@ -101,8 +101,12 @@ Home Assistant
 - Never add an API, MQTT topic, SSH path, host-control operation, or wrapper action
   that accepts arbitrary command text. Keep host-control operations typed and
   allowlisted.
-- Keep the Proxmox SSH account behind `deploy/pve/hubinet-ops-host`; do not provide
-  a general-purpose shell. Validate every typed action and all identity, binding,
+- Keep the Proxmox SSH account behind a typed, allowlisted forced-command wrapper; do
+  not provide a general-purpose shell. (The retired legacy 0.4 tree's
+  `deploy/pve/hubinet-ops-host` was this wrapper; that path no longer exists in the
+  current 0.5-only tree, and its historical source is available through Git
+  history/tags. A future Phase 1C mutation path requires an equivalent typed wrapper,
+  not a reuse of the deleted file.) Validate every typed action and all identity, binding,
   revision, VMID, and optional snapshot arguments at the backend and independent
   hostd/forced-command boundary.
 - Keep bearer authentication on every `/api/v1` endpoint. Never commit API tokens,
