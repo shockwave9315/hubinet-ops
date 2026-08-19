@@ -74,8 +74,20 @@ _PROHIBITED_PATH_PREFIXES = (
     "deploy/pve/",
     "deploy/agent/",
     "home-assistant/",
-    "deploy/install-ha-0.",
-    "deploy/upgrade-0.",
+    # Explicit retired release-line prefixes only -- 0.2.x/0.3.x/0.4.x are
+    # the exact retired lines. Deliberately NOT a broad "deploy/install-
+    # ha-0." / "deploy/upgrade-0." family prefix: that would also match a
+    # future, explicitly-designed 0.5.x installer/upgrader (e.g.
+    # "deploy/install-ha-0.5.0-from-pve.sh"), which must not be forbidden
+    # merely for sharing the "0." version-namespace fragment. Extend this
+    # list one retired line at a time if a future 0.5.x release is itself
+    # later retired -- never widen it back to a generic family prefix.
+    "deploy/install-ha-0.2.",
+    "deploy/install-ha-0.3.",
+    "deploy/install-ha-0.4.",
+    "deploy/upgrade-0.2.",
+    "deploy/upgrade-0.3.",
+    "deploy/upgrade-0.4.",
     "scripts/migrate_config_0_4_",
     "scripts/validate_ha_secrets_0_4_",
     "scripts/validate_rollout_state_0_4_",
@@ -84,12 +96,12 @@ _PROHIBITED_PATH_PREFIXES = (
     "scripts/validate_hermetic_shell_boundary",
 )
 
-# Deliberately narrow prefixes only: "deploy/install-ha-0." and
-# "deploy/agent/" name the exact retired 0.x surface, not a whole semantic
-# namespace. A future, explicitly-designed 0.5 HA-side deploy artifact
-# (e.g. "deploy/install-ha-0.5....") must not be accidentally forbidden
-# merely for living under "deploy/" or sharing a name fragment -- do not
-# widen these to a generic "deploy/install-ha" or "deploy/agent" ban.
+# Deliberately narrow prefixes only: each names the exact retired 0.x
+# surface, not a whole semantic namespace. A future, explicitly-designed
+# 0.5 HA-side deploy artifact (e.g. "deploy/install-ha-0.5.0-from-pve.sh")
+# must not be accidentally forbidden merely for living under "deploy/" or
+# sharing a version-namespace fragment -- do not widen these to a generic
+# "deploy/install-ha", "deploy/upgrade", or "deploy/agent" ban.
 
 
 def _is_prohibited_legacy_path(path: str) -> bool:
@@ -121,7 +133,8 @@ def test_prohibited_legacy_path_prefixes_are_not_tracked() -> None:
     reintroduced = sorted(path for path in tracked if _is_prohibited_legacy_path(path))
     assert not reintroduced, (
         "Legacy deploy/managed, deploy/pve, deploy/agent, home-assistant, or "
-        f"versioned 0.4.x tooling paths were reintroduced: {reintroduced}"
+        "retired 0.2.x/0.3.x/0.4.x install/upgrade/tooling paths were "
+        f"reintroduced: {reintroduced}"
     )
 
 
@@ -138,12 +151,33 @@ _KNOWN_LEGACY_DEPLOY_PATHS = (
     "deploy/install-agent.sh",
     "deploy/agent/backup-0.3.0.sh",
     "deploy/agent/restore-0.3.0.sh",
+    # Retired 0.2.x/0.3.x/0.4.x release-line installers/upgraders -- these
+    # must remain prohibited by the explicit per-line prefixes above.
+    "deploy/install-ha-0.2.4-from-pve.sh",
+    "deploy/install-ha-0.3.2-from-pve.sh",
+    "deploy/install-ha-0.4.2-from-pve.sh",
+    "deploy/upgrade-0.2.4-from-pve.sh",
+    "deploy/upgrade-0.3.2-from-pve.sh",
+    "deploy/upgrade-0.4.2-from-pve.sh",
 )
 
 _CURRENT_0_5_DEPLOY_PATHS = (
     "deploy/install-0.5.0-fresh.sh",
     "deploy/hubinet-ops-0.5.service",
     "deploy/README-0.5-firewall.md",
+)
+
+# Purely hypothetical future-0.5.x-shaped deploy paths -- neither of these
+# installers currently exists in this repository, and their existence is
+# not architecturally authorized by this test. They exist only to prove
+# the guard's explicit-retired-release-line prefixes do not accidentally
+# reserve the entire "0." version namespace forever: a real future 0.5.x
+# installer/upgrader, if one is ever designed and added, must not be
+# rejected by this guard merely for sharing an "install-ha-0."/
+# "upgrade-0." name shape with the retired 0.2/0.3/0.4 lines.
+_HYPOTHETICAL_FUTURE_0_5_DEPLOY_PATHS = (
+    "deploy/install-ha-0.5.0-from-pve.sh",
+    "deploy/upgrade-0.5.0-from-pve.sh",
 )
 
 
@@ -158,6 +192,15 @@ def test_guard_classifies_known_legacy_deploy_paths_as_prohibited(path: str) -> 
 def test_guard_does_not_classify_current_0_5_deploy_paths_as_prohibited(path: str) -> None:
     assert not _is_prohibited_legacy_path(path), (
         f"guard must not classify current 0.5 deploy path {path!r} as prohibited"
+    )
+
+
+@pytest.mark.parametrize("path", _HYPOTHETICAL_FUTURE_0_5_DEPLOY_PATHS)
+def test_guard_does_not_reserve_the_0_5_version_namespace_forever(path: str) -> None:
+    assert not _is_prohibited_legacy_path(path), (
+        f"guard must not reject a hypothetical future 0.5.x-shaped deploy path "
+        f"{path!r} merely for sharing a name shape with the retired 0.2/0.3/0.4 "
+        "release lines"
     )
 
 
