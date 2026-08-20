@@ -320,6 +320,58 @@ sys.exit(0)
 ' "${file}" "${field}" 2>/dev/null
 }
 
+# _json_list_schema_diagnosis <file> <required-field>: a short,
+# STRUCTURAL (never payload-dumping) diagnosis of why
+# _json_list_has_string_field_schema rejected <file> -- for diagnostics
+# only, never to change the schema decision itself (that call is always
+# made separately, by _json_list_has_string_field_schema alone).
+#
+# Real-PVE corrective note (sixth pass): a real rollback run logged
+# "the PVE user list did not match the expected JSON shape", but a manual
+# read of the same list immediately afterward showed a genuinely
+# well-formed, schema-valid array -- meaning SOMETHING about that one
+# read (a transient command hiccup, a truncated response, or some other
+# still-unproven cause) produced a rejection this log line alone could
+# not distinguish from a genuinely malformed response. Rather than
+# guessing at that one incident's cause or loosening the schema, this
+# gives a FUTURE occurrence enough structure to actually diagnose:
+# exactly one of "command-output-missing-or-empty", "malformed-json",
+# "top-level-not-an-array", or "element-not-object-or-missing-<field>-
+# string" (this last one covers both "some element isn't even a JSON
+# object" and "an element is an object but lacks <field> as a string" --
+# indistinguishable without printing the actual element, which this
+# function deliberately does not do: user/token list metadata is not
+# secret, but a structural diagnosis is preferred over a payload dump).
+_json_list_schema_diagnosis() {
+  local file="$1" field="$2"
+  [[ -s "${file}" ]] || { printf 'command-output-missing-or-empty'; return 0; }
+  if command -v jq >/dev/null 2>&1; then
+    if ! jq -e 'true' "${file}" >/dev/null 2>&1; then
+      printf 'malformed-json'
+      return 0
+    fi
+    if ! jq -e 'type == "array"' "${file}" >/dev/null 2>&1; then
+      printf 'top-level-not-an-array'
+      return 0
+    fi
+    printf 'element-not-object-or-missing-%s-string' "${field}"
+    return 0
+  fi
+  python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+    print("malformed-json", end="")
+    sys.exit(0)
+if not isinstance(data, list):
+    print("top-level-not-an-array", end="")
+    sys.exit(0)
+print("element-not-object-or-missing-%s-string" % sys.argv[2], end="")
+' "${file}" "${field}" 2>/dev/null
+}
+
 # _json_object_is_valid <file>: true if `file` parses as a valid JSON
 # object (a flat map), never an array/string/number/null/absent. Used
 # wherever a security-relevant read expects a JSON *object* shape (e.g.

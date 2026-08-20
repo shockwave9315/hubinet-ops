@@ -40,6 +40,16 @@ from typing import Any
 
 FAKE_PVE_TOKEN_SECRET = "00000000-0000-0000-0000-000000000000"
 FAKE_HA_SOURCE_CIDR = "192.0.2.50/32"
+# Real-PVE corrective note (sixth pass): the canonical `ip saddr`
+# expression text real nftables reports for FAKE_HA_SOURCE_CIDR -- since
+# it's a /32, that's the bare address with no prefix suffix (see
+# deploy/lib/bootstrap-firewall.sh::_nft_canonical_ha_source_expr).
+# Production generation now writes this canonical form directly (not the
+# operator's literal --ha-source text), so tests asserting against
+# GENERATED ruleset content (the pushed file, not only the simulated
+# `nft list ruleset` round trip) must expect this, not FAKE_HA_SOURCE_CIDR
+# itself.
+FAKE_HA_SOURCE_CANONICAL = "192.0.2.50"
 FAKE_PVE_ENDPOINT_HOST = "192.0.2.10"
 FAKE_PVE_ENDPOINT = f"https://{FAKE_PVE_ENDPOINT_HOST}:8006"
 FAKE_CT_IP = "192.0.2.200"
@@ -51,10 +61,21 @@ FAKE_TEMPLATE_VOLID = f"{FAKE_TEMPLATE_STORAGE}:vztmpl/{FAKE_TEMPLATE_FILENAME}"
 FAKE_NEXT_VMID = "110"
 FAKE_R0_API_TOKEN = "f" * 64
 FAKE_DISPLAY_NAME = "Home Proxmox"
+# Real-PVE corrective note (sixth pass): the deterministic UID this
+# fake's simulated `hubinetops` account holds -- `id -u hubinetops`
+# reports it, and the simulated `nft list ruleset` round trip reports it
+# in place of the symbolic `meta skuid "hubinetops"` name, matching what
+# a real dogfood run observed. Kept in this outer module too (not only in
+# the embedded dispatcher source, which cannot see this module's own
+# names) so default_scenario() and tests can both reference it by name
+# instead of a repeated magic literal.
+FAKE_HUBINETOPS_UID = "999"
 
 _DISPATCHER_SOURCE = r'''
+import ipaddress
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -65,6 +86,7 @@ FAKE_TEMPLATE_FILENAME = "debian-13-standard_13.6-1_amd64.tar.zst"
 FAKE_TEMPLATE_VOLID = f"{FAKE_TEMPLATE_STORAGE}:vztmpl/{FAKE_TEMPLATE_FILENAME}"
 FAKE_BRIDGE = "vmbr0"
 FAKE_NEXT_VMID = "110"
+FAKE_HUBINETOPS_UID_DEFAULT = "999"
 
 LOG = Path(os.environ["HUBINET_FAKE_LOG"])
 SCENARIO = json.loads(Path(os.environ["HUBINET_FAKE_SCENARIO"]).read_text())
@@ -362,6 +384,24 @@ def _exec_inner(vmid, inner, state):
             return 0
         return 1
 
+    if inner[0] == "id" and inner[1:] == ["-u", "hubinetops"]:
+        # Real-PVE corrective note (sixth pass): bootstrap-firewall.sh's
+        # _hubinetops_uid derives this exact command's output as the
+        # numeric UID real nftables reports back for `meta skuid
+        # "hubinetops"` on the active-ruleset round trip (see
+        # _canonicalize_active_nft_text below) -- never hardcoded, always
+        # read back from the target container. "id_u_hubinetops" in the
+        # "fail" list simulates the command itself failing (e.g. the user
+        # somehow doesn't exist yet); "hubinetops_uid_malformed" simulates
+        # a genuinely unparseable result.
+        if _fail("id_u_hubinetops"):
+            return 1
+        if SCENARIO.get("hubinetops_uid_malformed"):
+            sys.stdout.write("not-a-uid\n")
+            return 0
+        sys.stdout.write(SCENARIO.get("hubinetops_uid", FAKE_HUBINETOPS_UID_DEFAULT) + "\n")
+        return 0
+
     if inner[0] == "apt-get":
         return _exec_apt_get(inner[1:], state)
 
@@ -600,6 +640,50 @@ def _exec_ss(vmid, args, state):
     return 0
 
 
+_CIDR_PATTERN = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})\b')
+
+
+def _canonicalize_cidr_match(match):
+    addr, prefix = match.group(1), match.group(2)
+    try:
+        net = ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
+    except ValueError:
+        return match.group(0)
+    if net.prefixlen == 32:
+        return str(net.network_address)
+    return str(net)
+
+
+def _canonicalize_active_nft_text(text):
+    """Simulates real nftables' load-time canonicalization of the ACTIVE
+    ruleset text `nft list ruleset` reports back -- confirmed against a
+    real dogfood run on Proxmox VE 9.2.3 / nftables 1.1.3 (see
+    deploy/lib/bootstrap-firewall.sh's _nft_canonical_ha_source_expr and
+    _hubinetops_uid for the production-side counterpart). Independent of
+    whatever the pushed ruleset FILE actually contains -- this bootstrap's
+    own generation already writes the canonical HA-source form directly,
+    so this is a no-op for that specific rule in real use, but simulating
+    the transform independently (via the real ipaddress module, the same
+    semantics the production helper uses) is a more honest, robust fake
+    than merely mirroring whatever production happens to already emit.
+    Two transforms only, matching the exact two canonicalization classes
+    a real host proved -- never a full nftables emulator:
+      - any IPv4 CIDR address expression is rewritten to its canonical
+        form (a /32 host address displayed bare, any other prefix
+        displayed as the network address for that prefix);
+      - `meta skuid "hubinetops"` is displayed as the simulated numeric
+        UID (SCENARIO["nft_reported_skuid"] if explicitly set -- letting
+        a test simulate a real-world mismatch against what `id -u
+        hubinetops` itself reports -- otherwise SCENARIO["hubinetops_uid"]).
+    """
+    reported_uid = SCENARIO.get("nft_reported_skuid")
+    if not reported_uid:
+        reported_uid = SCENARIO.get("hubinetops_uid", FAKE_HUBINETOPS_UID_DEFAULT)
+    text = _CIDR_PATTERN.sub(_canonicalize_cidr_match, text)
+    text = text.replace('meta skuid "hubinetops"', f"meta skuid {reported_uid}")
+    return text
+
+
 def _exec_nft(vmid, args):
     if args[:2] == ["-c", "-f"]:
         if _fail("nft_syntax"):
@@ -608,7 +692,7 @@ def _exec_nft(vmid, args):
     if args == ["list", "ruleset"]:
         path = _ct_path(vmid, "/etc/nftables.conf")
         if path.exists():
-            sys.stdout.write(path.read_text())
+            sys.stdout.write(_canonicalize_active_nft_text(path.read_text()))
         return 0
     return 2
 
@@ -1140,6 +1224,12 @@ def default_scenario() -> dict[str, Any]:
         "pveum_user_list_malformed_after_calls": None,
         "pveum_user_list_override_after_calls": None,
         "ct_actual_resolv_conf": None,
+        # Sixth-pass corrective additions (real-PVE nft canonicalization)
+        # -- see _exec_inner's "id -u hubinetops" handler and
+        # _canonicalize_active_nft_text.
+        "hubinetops_uid": FAKE_HUBINETOPS_UID,
+        "hubinetops_uid_malformed": False,
+        "nft_reported_skuid": None,
     }
 
 

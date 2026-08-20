@@ -61,6 +61,23 @@
 # and hard-stops on any mismatch -- the firewall's permitted DNS
 # destination and the resolver the container will actually use are
 # structurally proven to be the same address, not merely asserted to be.
+#
+# Real-PVE canonicalization (sixth corrective pass, first real dogfood on
+# Proxmox VE 9.2.3 / nftables 1.1.3): the SAME class of load-time
+# canonicalization already handled above for hostname PVE endpoints turns
+# out to apply to two more address expressions this bootstrap generates.
+# A real bootstrap run reached this phase and failed exact-content
+# verification: (1) a /32 host HA_SOURCE_CIDR round-trips through
+# `nft list ruleset` WITHOUT its /32 suffix (bare address); any other
+# prefix round-trips as the canonical NETWORK address for that prefix,
+# never the operator's literal address+prefix text -- see
+# _nft_canonical_ha_source_expr. (2) `meta skuid "hubinetops"` round-trips
+# as the numeric UID nftables resolved it to at load time, never the
+# symbolic name -- see _hubinetops_uid. Both are computed once per
+# verification call (generation additionally uses the canonical HA
+# expression, so the file on disk and the active ruleset always agree)
+# and are re-derived independently by both the phase10 self-check and the
+# phase12 recheck, exactly like pve_host/pve_port already were.
 
 CT_NFT_CONF_PATH="/etc/nftables.conf"
 CT_RESOLVE_SCRIPT_CT="/tmp/hubinet-ops-bootstrap-resolve-dns.py"
@@ -131,23 +148,99 @@ _resolve_pve_endpoint_ips() {
   printf '%s\n' "${output}"
 }
 
-# _expected_dns_rule_lines: prints the exact, non-indented expected DNS
-# egress rule line(s) if the PVE endpoint is a hostname (requiring a
-# scoped resolver rule), or nothing if it's a literal IP. Both UDP and TCP
-# port 53 to the exact configured resolver are required (legitimate DNS
-# responses may need TCP fallback, e.g. for larger responses) -- never a
-# broader/public resolver. Dies if a hostname endpoint has no
-# --dns-resolver configured.
+# _expected_dns_rule_lines <pve_host> <skuid_repr>: prints the exact,
+# non-indented expected DNS egress rule line(s) if the PVE endpoint is a
+# hostname (requiring a scoped resolver rule), or nothing if it's a
+# literal IP. <skuid_repr> is the exact `meta skuid` operand text to
+# embed -- callers pass the quoted symbolic name (e.g. '"hubinetops"')
+# for ruleset GENERATION, or the bare numeric UID (e.g. 999) for ACTIVE-
+# ruleset verification, since real nftables resolves a symbolic skuid to
+# its numeric UID at rule-load time and never reports the name back (see
+# _hubinetops_uid below). Both UDP and TCP port 53 to the exact configured
+# resolver are required (legitimate DNS responses may need TCP fallback,
+# e.g. for larger responses) -- never a broader/public resolver. Dies if a
+# hostname endpoint has no --dns-resolver configured.
 _expected_dns_rule_lines() {
-  local pve_host="$1"
+  local pve_host="$1" skuid_repr="$2"
   if is_valid_ipv4 "${pve_host}"; then
     return 0
   fi
   [[ -n "${DNS_RESOLVER_IP}" ]] \
     || die "source.pve_endpoint ('${PVE_ENDPOINT}') uses a hostname, not a literal IP -- pass --dns-resolver <your-internal-resolver-ip> so egress can be scoped narrowly, or reconfigure --pve-endpoint with a literal IP and omit --dns-resolver entirely"
   is_valid_ipv4 "${DNS_RESOLVER_IP}" || die "--dns-resolver '${DNS_RESOLVER_IP}' is not a valid IPv4 address"
-  printf 'meta skuid "hubinetops" ip daddr %s udp dport 53 accept\n' "${DNS_RESOLVER_IP}"
-  printf 'meta skuid "hubinetops" ip daddr %s tcp dport 53 accept\n' "${DNS_RESOLVER_IP}"
+  printf 'meta skuid %s ip daddr %s udp dport 53 accept\n' "${skuid_repr}" "${DNS_RESOLVER_IP}"
+  printf 'meta skuid %s ip daddr %s tcp dport 53 accept\n' "${skuid_repr}" "${DNS_RESOLVER_IP}"
+}
+
+# _nft_canonical_ha_source_expr <cidr>: prints the exact `ip saddr`
+# address-expression text real nftables reports in `nft list ruleset`
+# for a given IPv4 CIDR, after its own load-time canonicalization.
+#
+# Real-PVE corrective note: a real dogfood run against Proxmox VE 9.2.3 /
+# nftables 1.1.3 proved nftables canonicalizes address expressions on the
+# active-ruleset round trip -- a /32 host CIDR is displayed WITHOUT its
+# /32 suffix (bare address: e.g. `203.0.113.50/32` -> `203.0.113.50`), and
+# any other prefix is displayed as the CANONICAL NETWORK address for that
+# prefix (host bits zeroed), never the literal address+prefix text the
+# operator configured (e.g. `203.0.113.50/24` -> `203.0.113.0/24`). An
+# exact-text verifier comparing against the operator's literal
+# HA_SOURCE_CIDR value would then fail closed against an otherwise-
+# correct, semantically-equivalent configuration -- exactly the same
+# class of canonicalization already handled for hostname PVE endpoints
+# (_resolve_pve_endpoint_ips) and DNS-resolved skuid (_hubinetops_uid,
+# below). Uses python3's stdlib `ipaddress` module (a real IPv4 parser,
+# never a brittle sed/regex approximation) -- python3 is already a hard
+# phase1 preflight requirement. `strict=False` deliberately accepts a
+# host address with a shorter prefix (exactly what an operator's literal
+# --ha-source may legitimately be) and computes the network nftables
+# itself would resolve it to; this bootstrap's own generated ruleset
+# writes this SAME canonical form (see phase10_firewall), so the file on
+# disk and the active round-tripped ruleset always agree.
+_nft_canonical_ha_source_expr() {
+  local cidr="$1"
+  local expr status
+  expr="$(python3 -c '
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+if net.prefixlen == 32:
+    print(net.network_address)
+else:
+    print(net)
+' "${cidr}" 2>/dev/null)" && status=0 || status=$?
+  (( status == 0 && ${#expr} > 0 )) \
+    || die "could not compute the canonical nftables address expression for --ha-source '${cidr}' -- refusing to generate/verify a firewall rule from an unparseable CIDR (this should have already been rejected by --ha-source's own IPv4 CIDR validation; this is an internal-consistency check)"
+  printf '%s' "${expr}"
+}
+
+# _hubinetops_uid: the numeric UID of the `hubinetops` service user
+# inside the target CT, right now.
+#
+# Real-PVE corrective note: the same real dogfood run proved real
+# nftables ALSO resolves a symbolic `meta skuid "hubinetops"` match
+# expression to hubinetops' numeric UID at rule-load time, and
+# `nft list ruleset` afterward reports ONLY that numeric UID, never the
+# original symbolic username (observed literally as `meta skuid 999` on
+# that host) -- the exact same class of canonicalization already handled
+# for hostname PVE endpoints (_resolve_pve_endpoint_ips) and the HA
+# source CIDR (_nft_canonical_ha_source_expr, above). Ruleset GENERATION
+# may keep writing the symbolic name (more readable in the source file,
+# and nft accepts it as valid input); ACTIVE-ruleset verification must
+# expect the numeric UID nftables itself will report -- never hardcoded
+# (a real UID is host-allocation-dependent, not a fixed constant this
+# bootstrap could safely assume), always read back from the real target
+# container via `pct exec <vmid> -- id -u hubinetops`. Strictly validated
+# as a bare non-negative integer; a command failure, empty result, or any
+# non-numeric output is a hard stop -- never silently treated as "no
+# skuid restriction" or compared loosely.
+_hubinetops_uid() {
+  local uid status
+  uid="$(pct exec "${VMID}" -- id -u hubinetops 2>/dev/null)" && status=0 || status=$?
+  uid="$(printf '%s' "${uid}" | tr -d '[:space:]')"
+  (( status == 0 )) \
+    || die "could not determine the numeric UID of the 'hubinetops' user inside container ${VMID} ('pct exec ${VMID} -- id -u hubinetops' failed) -- this user is expected to already exist (created by deploy/install-0.5.0-fresh.sh); refusing to verify the firewall's skuid-scoped rules without a confirmed numeric UID"
+  [[ "${uid}" =~ ^[0-9]+$ ]] \
+    || die "unexpected output from 'pct exec ${VMID} -- id -u hubinetops' (expected a bare numeric UID, got '${uid}') -- refusing to verify the firewall's skuid-scoped rules without a confirmed numeric UID"
+  printf '%s' "${uid}"
 }
 
 # _verify_ct_dns_resolver_matches_declared: third-pass corrective fix
@@ -225,6 +318,16 @@ phase10_firewall() {
   pve_host="$(_endpoint_host "${PVE_ENDPOINT}")"
   pve_port="$(_endpoint_port "${PVE_ENDPOINT}")"
 
+  # The exact address-expression text real nftables will report for the
+  # configured HA source on the active-ruleset round trip -- see
+  # _nft_canonical_ha_source_expr above. Computed once here and reused
+  # for the GENERATED ruleset text itself (not merely for later
+  # verification), so the file on disk and the active ruleset always
+  # agree; HA_SOURCE_CIDR itself (the operator's original --ha-source
+  # value) is left untouched for logging/display.
+  local ha_source_expr
+  ha_source_expr="$(_nft_canonical_ha_source_expr "${HA_SOURCE_CIDR}")"
+
   # Must hold BEFORE any resolution is attempted or any firewall rule is
   # generated -- see _verify_ct_dns_resolver_matches_declared above.
   _verify_ct_dns_resolver_matches_declared
@@ -235,9 +338,13 @@ phase10_firewall() {
   # resolution would otherwise have succeeded (the resolver IP is also
   # needed for the DNS allow-rule itself, not only as a resolution
   # prerequisite) -- fail on that first, with the specific actionable
-  # message, rather than a generic resolution failure.
+  # message, rather than a generic resolution failure. Generation always
+  # writes the symbolic skuid name here -- real nftables accepts it as
+  # valid input and it stays human-readable in the source file; only
+  # ACTIVE-ruleset verification (_verify_firewall_active) needs the
+  # numeric UID.
   local dns_rule_lines
-  dns_rule_lines="$(_expected_dns_rule_lines "${pve_host}")"
+  dns_rule_lines="$(_expected_dns_rule_lines "${pve_host}" '"hubinetops"')"
   if [[ -n "${dns_rule_lines}" ]]; then
     log_info "PVE endpoint uses a hostname -- adding DNS egress rules (UDP+TCP 53) scoped to resolver ${DNS_RESOLVER_IP} only"
   fi
@@ -280,7 +387,7 @@ phase10_firewall() {
     # real firewall reference (including nftables' own documented base
     # ruleset) grants explicitly and unconditionally.
     printf '    iifname "lo" accept\n'
-    printf '    ip saddr %s tcp dport 8787 accept\n' "${HA_SOURCE_CIDR}"
+    printf '    ip saddr %s tcp dport 8787 accept\n' "${ha_source_expr}"
     printf '    tcp dport 8787 drop\n'
     printf '  }\n'
     printf '  chain output {\n'
@@ -365,12 +472,24 @@ _verify_firewall_active() {
     [[ -n "${ip}" ]] && resolved_ips+=("${ip}")
   done <<<"${RESOLVED_PVE_IPS_LIST}"
 
+  # Real-PVE corrective note: both re-derived fresh here rather than
+  # trusted from generation-time state, matching this function's existing
+  # policy for every other static config value (HA_SOURCE_CIDR, pve_port,
+  # DNS resolver) -- these are NOT time-varying the way DNS resolution is
+  # (RESOLVED_PVE_IPS_LIST is deliberately cached instead, see above), so
+  # re-deriving independently is both safe and correct: it would also
+  # catch the (never expected in practice) case of hubinetops' UID
+  # somehow differing between the phase10 check and the phase12 recheck.
+  local ha_source_expr hubinetops_uid
+  ha_source_expr="$(_nft_canonical_ha_source_expr "${HA_SOURCE_CIDR}")"
+  hubinetops_uid="$(_hubinetops_uid)"
+
   local dns_rule_lines
-  dns_rule_lines="$(_expected_dns_rule_lines "${pve_host}")"
+  dns_rule_lines="$(_expected_dns_rule_lines "${pve_host}" "${hubinetops_uid}")"
 
   local -a expected_input=(
     'iifname "lo" accept'
-    "ip saddr ${HA_SOURCE_CIDR} tcp dport 8787 accept"
+    "ip saddr ${ha_source_expr} tcp dport 8787 accept"
     "tcp dport 8787 drop"
   )
   local -a expected_output=(
@@ -378,7 +497,7 @@ _verify_firewall_active() {
   )
   local ip
   for ip in "${resolved_ips[@]}"; do
-    expected_output+=("meta skuid \"hubinetops\" ip daddr ${ip} tcp dport ${pve_port} accept")
+    expected_output+=("meta skuid ${hubinetops_uid} ip daddr ${ip} tcp dport ${pve_port} accept")
   done
   if [[ -n "${dns_rule_lines}" ]]; then
     local dns_line
@@ -386,7 +505,7 @@ _verify_firewall_active() {
       [[ -n "${dns_line}" ]] && expected_output+=("${dns_line}")
     done <<<"${dns_rule_lines}"
   fi
-  expected_output+=('meta skuid "hubinetops" drop')
+  expected_output+=("meta skuid ${hubinetops_uid} drop")
 
   _verify_chain_rules_exact "${ruleset}" "input" expected_input \
     || die "firewall verification failed: 'input' chain rules do not exactly match the expected content/order"

@@ -311,7 +311,20 @@ rollback_on_failure() {
     if _user_object_owned_by_this_run; then
       user_owned=1
     else
-      log_warn "PRESERVING PVE user '${PVE_USER}': this run cannot prove it created it (no ledger success record, and no comment carrying run=${BOOTSTRAP_RUN_ID} was found on the existing object) -- it may belong to a concurrent bootstrap run or another creator racing for the same fixed name. Manual remediation: inspect 'pveum user list --output-format json' for '${PVE_USER}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user delete ${PVE_USER}"
+      # Sixth-pass corrective note: this generic message deliberately no
+      # longer asserts a SPECIFIC reason ("no ledger record, and no
+      # matching comment") -- _user_object_owned_by_this_run can return
+      # "not owned" for several structurally different reasons (a
+      # read-back command failure, malformed JSON, an unrecognized list
+      # shape, a missing object, or a genuinely non-matching comment),
+      # and it has ALREADY logged the specific one via its own log_warn
+      # immediately above this. A real rollback run once logged a schema-
+      # mismatch reason here while a manual read of the same list
+      # immediately afterward showed a well-formed, valid array -- an
+      # assertion here that duplicated (and could contradict) the
+      # specific reason already logged would have been actively
+      # misleading in exactly that situation.
+      log_warn "PRESERVING PVE user '${PVE_USER}': this run could not prove live ownership of the current object (see the specific reason already logged above) -- it may belong to a concurrent bootstrap run or another creator racing for the same fixed name. Manual remediation: inspect 'pveum user list --output-format json' for '${PVE_USER}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user delete ${PVE_USER}"
     fi
 
     if _role_object_owned_by_this_run; then
@@ -328,7 +341,11 @@ rollback_on_failure() {
       if _token_object_owned_by_this_run; then
         token_owned=1
       else
-        log_warn "PRESERVING PVE token '${PVE_FULL_TOKEN_ID}': this run cannot prove it created it (no ledger success record, and no comment carrying run=${BOOTSTRAP_RUN_ID} was found on the existing object) -- manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}"
+        # Same reasoning as the user-preserve message above -- the
+        # specific reason is already logged by _token_object_owned_by_this_run
+        # itself; this generic message must not assert (and potentially
+        # contradict) a specific cause on top of it.
+        log_warn "PRESERVING PVE token '${PVE_FULL_TOKEN_ID}': this run could not prove live ownership of the current object (see the specific reason already logged above) -- manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}"
       fi
     fi
 

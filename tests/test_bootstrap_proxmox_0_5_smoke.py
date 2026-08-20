@@ -33,7 +33,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bootstrap_fake_pve import (  # noqa: E402
     FAKE_DISPLAY_NAME,
+    FAKE_HA_SOURCE_CANONICAL,
     FAKE_HA_SOURCE_CIDR,
+    FAKE_HUBINETOPS_UID,
     FAKE_PVE_ENDPOINT,
     FAKE_PVE_ENDPOINT_HOST,
     build_fake_pve_environment,
@@ -1022,6 +1024,16 @@ class TestPveIdentityOwnership:
         assert result.returncode != 0
         assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
         assert "PRESERVING PVE user" in result.stderr
+        # Sixth-pass corrective note: this scenario is exactly the real
+        # witness -- a clean ledger success (phase6 succeeded; apt_get
+        # fails only afterward) followed by a schema-invalid live
+        # read-back. The specific structural diagnosis must be present...
+        assert "diagnosis: element-not-object-or-missing-userid-string" in result.stderr
+        # ...and the generic preserve message must NOT assert a false
+        # "no ledger record" claim -- this run's ledger genuinely DID
+        # record a clean success.
+        assert "no ledger success record" not in result.stderr
+        assert "this run could not prove live ownership of the current object" in result.stderr
 
     def test_token_ownership_readback_schema_invalid_preserves(self, tmp_path, source_checkout):
         # `pveum user token list` is only ever called from the rollback
@@ -1038,6 +1050,9 @@ class TestPveIdentityOwnership:
         log = fake_env_obj.log_lines()
         assert not any(line.startswith("pveum user token remove") for line in log)
         assert "PRESERVING PVE token" in result.stderr
+        assert "diagnosis: element-not-object-or-missing-tokenid-string" in result.stderr
+        assert "no ledger success record" not in result.stderr
+        assert "this run could not prove live ownership of the current object" in result.stderr
         # The user's own ownership check is independent (normal schema)
         # and still succeeds.
         assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
@@ -1349,8 +1364,12 @@ class TestFirewall:
         result, fake_env_obj = _run_full(tmp_path, source_checkout)
         assert result.returncode == 0, result.stderr
         ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
-        assert f"ip saddr {FAKE_HA_SOURCE_CIDR} tcp dport 8787 accept" in ruleset
-        assert ruleset.index(f"ip saddr {FAKE_HA_SOURCE_CIDR}") < ruleset.index("tcp dport 8787 drop")
+        # Real-PVE corrective note (sixth pass): generation now writes the
+        # CANONICAL nft address expression directly (FAKE_HA_SOURCE_CIDR
+        # is a /32, so its canonical form is the bare address with no
+        # suffix) -- not the operator's literal --ha-source text.
+        assert f"ip saddr {FAKE_HA_SOURCE_CANONICAL} tcp dport 8787 accept" in ruleset
+        assert ruleset.index(f"ip saddr {FAKE_HA_SOURCE_CANONICAL}") < ruleset.index("tcp dport 8787 drop")
 
     def test_egress_port_derived_from_configured_endpoint_not_hardcoded(self, tmp_path, source_checkout):
         custom_endpoint = f"https://{FAKE_PVE_ENDPOINT_HOST}:9006"
@@ -1413,7 +1432,7 @@ class TestFirewall:
         assert result.returncode == 0, result.stderr
         ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
         assert 'iifname "lo" accept' in ruleset
-        assert ruleset.index('iifname "lo" accept') < ruleset.index(f"ip saddr {FAKE_HA_SOURCE_CIDR}")
+        assert ruleset.index('iifname "lo" accept') < ruleset.index(f"ip saddr {FAKE_HA_SOURCE_CANONICAL}")
 
     def test_established_related_accept_is_first_output_rule(self, tmp_path, source_checkout):
         result, fake_env_obj = _run_full(tmp_path, source_checkout)
@@ -1423,6 +1442,59 @@ class TestFirewall:
         pve_rule_idx = ruleset.index('meta skuid "hubinetops" ip daddr')
         assert ruleset.index("ct state established,related accept") < pve_rule_idx
         assert pve_rule_idx < ruleset.rindex('meta skuid "hubinetops" drop')
+
+    # -----------------------------------------------------------------
+    # Real-PVE canonicalization (sixth pass, first real dogfood on
+    # Proxmox VE 9.2.3 / nftables 1.1.3): the real active-ruleset round
+    # trip canonicalizes a /32 HA source to a bare address and a symbolic
+    # `meta skuid "hubinetops"` to hubinetops' numeric UID -- these run
+    # the REAL, corrected bootstrap script end to end (never a hand-
+    # constructed fixture) to prove both the generated file and the
+    # simulated active round trip agree with what a real host reported.
+    # -----------------------------------------------------------------
+
+    def test_ha_32_source_end_to_end_matches_real_dogfood_witness(self, tmp_path, source_checkout):
+        # The exact --ha-source value from the real first dogfood run.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--ha-source", "192.168.4.168/32"],
+        )
+        assert result.returncode == 0, result.stderr
+        # Generation already writes the canonical (bare) form directly --
+        # not the operator's literal /32 text -- so the file on disk and
+        # the active ruleset always agree.
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert "ip saddr 192.168.4.168 tcp dport 8787 accept" in ruleset
+        assert "192.168.4.168/32" not in ruleset
+
+    def test_non_32_ha_source_end_to_end_canonicalizes_to_network_form(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--ha-source", "192.168.4.168/24"],
+        )
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert "ip saddr 192.168.4.0/24 tcp dport 8787 accept" in ruleset
+        assert "192.168.4.168/24" not in ruleset
+
+    def test_symbolic_generation_and_numeric_uid_active_representation(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        # GENERATED file (pushed to the CT, pre-canonicalization) keeps
+        # the symbolic name -- more readable, and real nft accepts it as
+        # valid input.
+        generated = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert 'meta skuid "hubinetops"' in generated
+        # The ACTIVE ruleset (the simulated `nft list ruleset` round
+        # trip) shows the numeric UID instead -- exactly what a real host
+        # reported, and exactly what Phase 10/12's own verification
+        # (already proven to pass above) requires.
+        active = subprocess.run(
+            ["bash", "-c", "pct exec 110 -- nft list ruleset"],
+            env=fake_env_obj.env, capture_output=True, text=True, timeout=15,
+        ).stdout
+        assert f"meta skuid {FAKE_HUBINETOPS_UID}" in active
+        assert 'meta skuid "hubinetops"' not in active
 
 
 # ---------------------------------------------------------------------------
@@ -1573,7 +1645,7 @@ class TestFirewallStatefulSemantics:
         result, fake_env_obj = _run_full(tmp_path, source_checkout)
         assert result.returncode == 0, result.stderr
         ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
-        assert f"ip saddr {FAKE_HA_SOURCE_CIDR} tcp dport 8787 accept" in ruleset
+        assert f"ip saddr {FAKE_HA_SOURCE_CANONICAL} tcp dport 8787 accept" in ruleset
 
     # 6. The final hubinetops drop remains, exactly once, still last.
     def test_final_hubinetops_drop_remains_exactly_once_and_last(self, tmp_path, source_checkout):

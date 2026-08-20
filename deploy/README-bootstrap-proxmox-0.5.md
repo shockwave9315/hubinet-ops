@@ -403,29 +403,37 @@ full manual verification procedure this script automates.
   `docs/operations/0.5-r0-operational-activation.md` section 7 for the
   required multi-day observation window before declaring R0 operationally
   accepted.
-- It has **not** been exercised against a real Proxmox host. All
-  verification to date is against the hermetic fake-command test harness
-  in `tests/_bootstrap_fake_pve.py` (`tests/test_bootstrap_proxmox_0_5.py`,
-  local-safe) and `tests/test_bootstrap_proxmox_0_5_smoke.py` (the only
-  file that executes the real script, and only inside
-  `tests/shell/run_bootstrap_smoke_sandbox.sh`'s ephemeral-CI-only Docker
-  sandbox). Real PVE-specific behavior this cannot exercise (exact `nft
-  list ruleset` textual formatting, real `pveam`/`pvesh` output shapes,
-  real DNS resolution behavior inside a fresh Debian 13 CT, etc.) is a
-  known residual risk before a first real run — see the REAL-HOST
-  PRECHECK block in this branch's corrective-pass reports for read-only
-  commands to sanity-check these assumptions manually before a first real
-  run.
+- **First real dogfood** (after this bootstrap merged to `main`): the
+  operator performed the first real, manual bootstrap execution against
+  Proxmox VE 9.2.3 / nftables 1.1.3 / a Debian 13 LXC (VMID 110). The run
+  reached Phase 10 and stopped there — **this is not yet a real
+  bootstrap PASS**. Everything through Phase 9 succeeded (VMID
+  auto-detection, storage, template, CT creation, PVE identity with the
+  exact `Sys.Audit,VM.Audit` proof, PVE CA deployment, exact source-SHA
+  deployment, the installer, CT tooling, config generation); Phase 10
+  loaded the generated ruleset successfully but then failed the
+  exact-content active-ruleset verification, closed exactly as designed
+  — the service was never started, and CT `onboot` remained `0`. The
+  cause: real nftables canonicalizes both a `/32` HA-source address and
+  the symbolic `hubinetops` skuid on the active-ruleset round trip (see
+  `deploy/lib/bootstrap-firewall.sh`'s `_nft_canonical_ha_source_expr`
+  and `_hubinetops_uid`) — fixed in a corrective pass; the first real
+  dogfood run through Phase 13 with that fix remains outstanding. Real
+  PVE-specific behavior this repository's hermetic tests still cannot
+  independently exercise beyond what this one dogfood run has already
+  confirmed (real `pveam`/`pvesh` output shapes, real DNS resolution
+  behavior inside a fresh Debian 13 CT, etc.) remains a residual risk —
+  see the REAL-HOST PRECHECK block below for read-only commands to
+  sanity-check these assumptions manually.
 - `.github/workflows/bootstrap-smoke.yml` wires the compliant sandbox
   (`tests/shell/run_bootstrap_smoke_sandbox.sh`) into GitHub Actions,
   narrowly path-filtered to bootstrap/sandbox-related changes and
   triggered on `pull_request` (plus manual `workflow_dispatch`) — the
   workflow itself sets only the `HUBINET_OPS_EPHEMERAL_CI=1` marker the
   launcher requires and invokes the launcher unmodified; it never sets
-  `HUBINET_OPS_SYSTEM_SANDBOX` directly. As of this writing the workflow
-  is wired but has not yet actually executed in a real GitHub Actions run
-  (no PR has been opened) — treat that CI gate as **pending**, not passed,
-  until it has.
+  `HUBINET_OPS_SYSTEM_SANDBOX` directly. It has since run successfully at
+  least once (PR #38); treat each individual PR's own sandbox run result
+  as the merge-readiness evidence for that PR, not a standing guarantee.
 
 ## After a successful run
 
