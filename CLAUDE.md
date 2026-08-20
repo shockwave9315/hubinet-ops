@@ -71,9 +71,16 @@ iterative work.
 python -m compileall -q app custom_components tests scripts
 pytest -q
 bash -n deploy/install-0.5.0-fresh.sh
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/lib/*.sh; do bash -n "$f"; done
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/lib/*.sh; do python scripts/validate_hermetic_shell_boundary.py "$f"; done
 python scripts/validate_yaml.py
 python scripts/check_tracked_files.py
 ```
+
+`tests/test_bootstrap_proxmox_0_5_smoke.py` (the only file that executes
+`deploy/bootstrap-proxmox-0.5.sh` for real) is excluded from ordinary local/CI
+`pytest -q` runs by its own sandbox-marker skip — it only ever runs for real inside
+`tests/shell/run_bootstrap_smoke_sandbox.sh`'s ephemeral-CI-only Docker sandbox.
 
 Single test file / single test — the default during iterative bounded work:
 ```bash
@@ -283,11 +290,48 @@ capability into any current module without an explicit activation/cutover review
 - `config/inventory.example.yaml` — source-centric R0 bootstrap config (no static
   resource/VMID inventory); `.env.r0.example` — the paired secrets template.
 - `deploy/hubinet-ops-0.5.service`, `deploy/install-0.5.0-fresh.sh`,
-  `deploy/README-0.5-firewall.md` — the sole current deployment path: a fresh,
+  `deploy/README-0.5-firewall.md` — the in-CT deployment path: a fresh,
   clean-install-only unit/installer bound to `0.0.0.0:8787`, paired with mandatory
   firewall-policy documentation. Never execute the installer against a real host from an
   agent session; it is validated with `bash -n` only, plus
   `tests/test_deploy_0_5_fresh_install.py`'s text-level checks.
+- `deploy/bootstrap-proxmox-0.5.sh` + `deploy/lib/bootstrap-*.sh`,
+  `deploy/README-bootstrap-proxmox-0.5.md` — the primary product-facing PVE-host
+  entrypoint: automates next-free-VMID-auto-detected, fresh unprivileged Debian 13
+  LXC creation, least-privilege PVE identity provisioning (effective permissions
+  verified as an exact set — `{Sys.Audit, VM.Audit}` and nothing else, never a
+  blacklist), PVE TLS trust (system-trust fallback only via explicit operator
+  opt-in, never implicit), git-commit-provenance-gated source deployment invoking
+  `install-0.5.0-fresh.sh` unmodified inside the new CT, source-centric config
+  generation, and the mandatory nftables firewall boundary (exact rule
+  content/order verified against resolved numeric addresses -- a hostname
+  `--pve-endpoint` is resolved inside the CT before the ruleset is generated),
+  in a fixed fail-closed phase order with no host mutation before a single upfront
+  operator confirmation of the full plan; CT `onboot` is enabled only after a real,
+  contract-grounded discovery-acceptance check (`deploy/lib/hubinet-ops-bootstrap-accept.py`,
+  proving a committed/fresh/current result, not merely `health == "healthy"`) succeeds.
+  PVE-identity rollback deletes only what a run can prove it owns (a random
+  per-run ID embedded in PVE object comments), never merely an object matching
+  the fixed name, closing a cluster-wide TOCTOU ownership race. Secrets (the PVE
+  token, the R0 API bearer token) are never passed as a literal command-line
+  argument anywhere in this path. `.github/workflows/bootstrap-smoke.yml` wires
+  the compliant Docker sandbox into GitHub Actions (path-filtered, PR-triggered).
+  Never execute it against a real host from an agent session. Two disjoint test
+  files exist per AGENTS.md's deployment-script sandbox boundary:
+  `tests/test_bootstrap_proxmox_0_5.py` (local-safe: `bash -n`, the restored
+  `scripts/validate_hermetic_shell_boundary.py` lexical validator, and static
+  content checks — never executes the real script, proven by an AST-based
+  self-guard) and `tests/test_bootstrap_proxmox_0_5_smoke.py` (the only file that
+  executes the real script, against the hermetic fake-command layer in
+  `tests/_bootstrap_fake_pve.py` — fake `pct`/`pveum`/`pveam`/`pvesh`/`pvesm`/
+  `nft`/tooling-provisioning/discovery-acceptance commands on a temporary `PATH`;
+  every test hard-skips unless `HUBINET_OPS_SYSTEM_SANDBOX=1`, set only by
+  `tests/shell/run_bootstrap_smoke_sandbox.sh`'s Docker-isolated, ephemeral-CI-only
+  sandbox — see that script and `tests/shell/Dockerfile.bootstrap-smoke`/
+  `bootstrap_smoke_sandbox_entrypoint.sh`). Do not run
+  `test_bootstrap_proxmox_0_5_smoke.py` locally with the marker forced on and
+  report it as merge-safety evidence — only a real run through the sandbox
+  counts.
 - `docs/architecture/` — 0.5 ADRs and status (authority for 0.5 work; see above).
   `docs/operations/` — the R0 operational activation runbook and HA clean-break/purge
   plan for a real deployed instance.

@@ -1,0 +1,24 @@
+FROM python:3.13-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --no-cache-dir pytest==9.1.1 \
+    && python -c "import pytest; assert pytest.__version__ == '9.1.1'"
+
+ENV PYTHONPYCACHEPREFIX=/tmp/pycache
+
+# A fixed, sandbox-local git identity so tests/_bootstrap_fake_pve.py's
+# build_minimal_source_checkout (and any test that git-inits its own
+# temporary fixture repo) can commit without depending on any real
+# developer/CI-runner git configuration. `safe.directory '*'` is required
+# because the repository is bind-mounted read-only at /repo and owned by a
+# different uid than the sandbox's unprivileged user.
+RUN git config --system user.email "sandbox@hubinet-ops.invalid" \
+    && git config --system user.name "Hubinet Ops Bootstrap Sandbox" \
+    && git config --system --add safe.directory '*' \
+    && git config --system init.defaultBranch main
+
+USER 65534:65534
+WORKDIR /workspace

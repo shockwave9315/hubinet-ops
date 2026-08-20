@@ -29,6 +29,32 @@ or any direct guest connection -- it has no dependency on any of those at
 all (see `docs/architecture/0.5-r0-read-only-runtime-activation.md`
 section 2's import denylist and section 26).
 
+This policy must ALSO account for two things a naive "only the explicit
+rules above" reading misses:
+
+- **Loopback.** Any local process on the R0 host itself (a health check,
+  a one-shot diagnostic curl, this repository's own bootstrap acceptance
+  checks) reaches the service over `127.0.0.1`, which is not part of the
+  HA host/subnet -- an ingress rule scoped only to the HA CIDR, with no
+  loopback exemption, silently blocks every local caller too. Loopback
+  traffic must always be permitted, independent of the HA-scoped rule.
+- **Replies.** The R0 process itself runs as the dedicated `hubinetops`
+  user (see `deploy/hubinet-ops-0.5.service`'s `User=hubinetops`). Its
+  own HTTP *replies* to an already-accepted inbound connection -- from
+  the HA host, or from a local loopback client -- are themselves
+  `hubinetops`-owned outbound packets. An `output` policy that only
+  allows `hubinetops` to reach the configured PVE endpoint/DNS resolver
+  and drops everything else would drop those replies too: the inbound
+  SYN gets accepted, but every response silently vanishes, and the
+  connection hangs until the client times out. The fix is the standard
+  stateful-firewall shape -- explicitly allow reply traffic on
+  connections this firewall already decided to accept
+  (`ct state established,related`), which is **not** the same as opening
+  outbound access: it only ever matches packets belonging to a flow this
+  firewall itself already let in, so it grants `hubinetops` no ability to
+  originate any *new* outbound connection beyond the explicit PVE/DNS
+  allow-list below.
+
 ## Example: `nftables`
 
 Adjust interface names, the PVE endpoint address, and the HA host/subnet
@@ -44,6 +70,13 @@ table inet hubinet_ops_r0 {
   chain input {
     type filter hook input priority 0; policy accept;
 
+    # Loopback is always reachable -- local health checks/diagnostics
+    # (127.0.0.1) never match the HA-scoped rule below and must not be
+    # silently dropped by the fallthrough deny. Interface-based, not
+    # address-based: loopback traffic can only ever originate from
+    # within this host's own network namespace, so this is not a
+    # spoofable widening of trust.
+    iifname "lo" accept
     # Inbound: only the Home Assistant host/subnet may reach the R0 API.
     ip saddr 192.0.2.50/32 tcp dport 8787 accept
     tcp dport 8787 drop
@@ -52,6 +85,14 @@ table inet hubinet_ops_r0 {
   chain output {
     type filter hook output priority 0; policy accept;
 
+    # Reply traffic on a connection this firewall already accepted
+    # (the R0 process's own HTTP responses to HA or to a local loopback
+    # client) must always be allowed back out, or every accepted inbound
+    # connection above will hang -- see "Replies" above. This does NOT
+    # permit hubinetops to originate any NEW outbound connection; a new
+    # connection attempt is still evaluated only against the explicit
+    # allow-list immediately below.
+    ct state established,related accept
     # Outbound, scoped to the R0 process only: PVE HTTPS, nothing else.
     meta skuid "hubinetops" ip daddr 192.0.2.10 tcp dport 8006 accept
     # If source.pve_endpoint in inventory.yaml uses a hostname rather
@@ -77,6 +118,14 @@ add explicit allow rules for that separately; this policy only covers
 what R0 itself needs, and it is your responsibility to extend it for
 anything beyond R0 you choose to run on the same host.
 
+Unlike the raw `nftables` example above, `ufw` does not need an explicit
+loopback/established-related rule added here: `ufw`'s own default
+`/etc/ufw/before.rules` (applied automatically on `ufw enable`,
+independent of any rule shown below) already unconditionally accepts
+loopback interface traffic and `state RELATED,ESTABLISHED` traffic in
+both directions. This is standard `ufw` behavior, not something this
+policy adds.
+
 ```bash
 ufw default deny outgoing
 ufw allow out to 192.0.2.10 port 8006 proto tcp comment "R0 -> PVE"
@@ -101,7 +150,10 @@ Apply the firewall before the service is ever started or enabled:
 3. Confirm the policy is active (`nft list ruleset` / `ufw status verbose`)
    and genuinely restrictive -- for the nftables example, `nft list
    ruleset` should show `meta skuid "hubinetops" drop` as the effective
-   fallthrough for the `hubinetops` user's own traffic; for `ufw`,
+   fallthrough for the `hubinetops` user's own traffic, `iifname "lo"
+   accept` as the first `input` rule, and `ct state established,related
+   accept` as the first `output` rule (without it, HA's own requests will
+   be accepted but every reply from R0 will silently hang); for `ufw`,
    `ufw status verbose` should report `Default: deny (outgoing)`.
 4. Only then enable and start the service together:
    `systemctl enable --now hubinet-ops`.
