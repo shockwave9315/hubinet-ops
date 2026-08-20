@@ -45,11 +45,19 @@ separate, later step (`docs/operations/0.5-r0-operational-activation.md`); see
 
 ## Installation
 
-The Proxmox backend and the Home Assistant integration are two independent deployment
-halves that share no credentials: the backend is provisioned on the Proxmox host via
+The Proxmox backend and the Home Assistant integration are two independently deployed
+and independently distributed halves: the backend is provisioned on the Proxmox host via
 `deploy/bootstrap-proxmox-0.5.sh` (see "Repository map" below), and the Home Assistant
 integration (`custom_components/hubinet_ops/`) is distributed separately through
-[HACS](https://hacs.xyz/).
+[HACS](https://hacs.xyz/). Their credential boundary:
+
+- HA never receives, stores, or handles the Proxmox API credential — the integration has
+  no PVE-facing code path at all.
+- HA authenticates only to the Hubinet Ops backend, using the backend's own dedicated
+  `HUBINET_OPS_R0_API_TOKEN` read-only bearer token, entered through the config flow
+  described below.
+- HACS itself distributes integration **code only** and transfers no credential of any
+  kind.
 
 ### Home Assistant integration (via HACS)
 
