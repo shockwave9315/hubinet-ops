@@ -508,8 +508,22 @@ def _run_json_schema_helper(tmp_path, call_expr, *, json_content):
         f'{call_expr.format(json_file=json_file.as_posix())}\n'
         "exit $?\n"
     )
+    import os as _os
+
+    env = dict(_os.environ)
+    # Windows Git-Bash only: MSYS auto-converts a bare "/"-shaped argument
+    # (e.g. the PVE ACL root path "/", used by
+    # _json_truthy_keys_sorted_at_path's callers) into a Windows path
+    # (observed: the Git installation root) when it crosses into a native
+    # (non-MSYS) executable such as python3.exe -- corrupting the literal
+    # single-character argument the underlying helper actually needs.
+    # This has no effect on Linux, where MSYS doesn't exist and this
+    # variable is meaningless; existing file-path arguments constructed
+    # via `.as_posix()` already carry a drive letter and are unaffected
+    # either way.
+    env["MSYS2_ARG_CONV_EXCL"] = "*"
     return subprocess.run(
-        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15, env=env,
     )
 
 
@@ -614,6 +628,74 @@ class TestJsonSchemaHelpers:
         result = _run_json_schema_helper(
             tmp_path, '_json_object_is_valid "{json_file}"', json_content=json_content,
         )
+        assert result.returncode != 0
+
+
+class TestPathKeyedPermissionHelper:
+    """Real-PVE corrective fix: `pveum user token permissions <user>
+    <token> --path / --output-format json` was assumed to return a flat
+    object of privilege names directly at the top level
+    ({"Sys.Audit": 1, ...}). A real-host read-only precheck against
+    Proxmox VE 9.2.3 disproved that -- the real command returns a
+    PATH-KEYED object instead ({"/": {"Sys.Audit": 1, ...}}), observed
+    literally as `{"/":{}}` for an empty grant (see
+    docs/architecture/0.5-implementation-status.md's real-PVE precheck
+    notes). These tests pin _json_truthy_keys_sorted_at_path's exact
+    accept/reject behavior directly, independent of the full bootstrap
+    script -- including explicitly proving the OLD flat-object shape is
+    now rejected rather than silently misinterpreted as "zero
+    privileges."
+    """
+
+    def _extract(self, tmp_path, json_content):
+        return _run_json_schema_helper(
+            tmp_path, '_json_truthy_keys_sorted_at_path "{json_file}" "/"',
+            json_content=json_content,
+        )
+
+    def test_real_observed_empty_grant_is_a_valid_shape(self, tmp_path):
+        # The literal real-PVE-9.2.3 observation for a token with no
+        # privileges yet granted at "/": {"/":{}}
+        result = self._extract(tmp_path, '{"/":{}}')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == ""
+
+    @pytest.mark.parametrize(
+        "json_content",
+        ['{"/":{"Sys.Audit":1,"VM.Audit":1}}', '{"/":{"VM.Audit":1,"Sys.Audit":1}}'],
+    )
+    def test_exact_grant_accepted_regardless_of_key_order(self, tmp_path, json_content):
+        result = self._extract(tmp_path, json_content)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().splitlines() == ["Sys.Audit", "VM.Audit"]
+
+    def test_missing_required_privilege_extracted_as_the_smaller_set(self, tmp_path):
+        # The helper itself only extracts what is truly granted at "/" --
+        # the "missing required privilege" STOP is enforced by the
+        # caller's own exact-set comparison (see the end-to-end smoke
+        # test), not by this extraction helper.
+        result = self._extract(tmp_path, '{"/":{"Sys.Audit":1}}')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().splitlines() == ["Sys.Audit"]
+
+    def test_extra_privilege_included_verbatim(self, tmp_path):
+        result = self._extract(tmp_path, '{"/":{"Sys.Audit":1,"VM.Audit":1,"VM.PowerMgmt":1}}')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().splitlines() == ["Sys.Audit", "VM.Audit", "VM.PowerMgmt"]
+
+    @pytest.mark.parametrize(
+        "json_content",
+        [
+            '{"/vms":{"Sys.Audit":1,"VM.Audit":1}}',  # wrong path key
+            "[]",  # wrong root shape
+            '{"/":[]}',  # "/" present but not an object
+            '{"Sys.Audit":1,"VM.Audit":1}',  # the OLD, now-invalid flat assumption
+            "not-valid-json{{{",  # malformed JSON
+            "",  # empty file
+        ],
+    )
+    def test_unexpected_shapes_rejected(self, tmp_path, json_content):
+        result = self._extract(tmp_path, json_content)
         assert result.returncode != 0
 
 

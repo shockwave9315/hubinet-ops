@@ -929,17 +929,32 @@ def cmd_pveum(args):
         print(json.dumps(entries))
         return 0
     if args[:3] == ["user", "token", "permissions"]:
-        # args shape: user token permissions <user> <tokenid> --path / ...
+        # args shape: user token permissions <user> <tokenid> --path <path> ...
+        #
+        # Real-PVE corrective note: this used to emit a flat object of
+        # privilege names directly at the top level ({"Sys.Audit": 1,
+        # ...}). A real-host read-only precheck against Proxmox VE 9.2.3
+        # disproved that assumption -- the real command returns a
+        # path-keyed object instead ({"<path>": {"Sys.Audit": 1, ...}}),
+        # observed literally as `{"/":{}}` for an empty grant at path "/".
+        # See docs/architecture/0.5-implementation-status.md's real-PVE
+        # precheck notes. The requested --path value is read back from
+        # argv (defaulting to "/", the only value this bootstrap ever
+        # requests) rather than hardcoded, so a test could in principle
+        # exercise a different path too.
+        if _fail("pveum_token_permissions"):
+            return 1
         override = _output_override("token_permissions")
         if override is not None:
             sys.stdout.write(override)
             return 0
+        requested_path = args[args.index("--path") + 1] if "--path" in args else "/"
         full_token_id = f"{args[3]}!{args[4]}"
         privs = set()
         for grant in state["acl_grants"]:
             if grant["target"] == f"token:{full_token_id}":
                 privs.update(state["pve_roles"].get(grant["role"], []))
-        print(json.dumps({p: 1 for p in sorted(privs)}))
+        print(json.dumps({requested_path: {p: 1 for p in sorted(privs)}}))
         return 0
     if args[:3] == ["user", "token", "remove"]:
         # args shape: user token remove <user> <tokenid>

@@ -215,10 +215,22 @@ _assert_pve_object_absent() {
 
 # _verify_effective_permissions: exact-set proof, not a blacklist. Reads
 # back the token's own effective permissions and asserts the sorted set of
-# truthy privilege keys equals PVE_REQUIRED_PRIVS exactly -- catches ANY
-# unexpected privilege (a missing required one, or any extra one, whatever
-# its name) rather than only the specific mutation-shaped privilege names
-# a fixed pattern happens to enumerate.
+# truthy privilege keys at the requested path equals PVE_REQUIRED_PRIVS
+# exactly -- catches ANY unexpected privilege (a missing required one, or
+# any extra one, whatever its name) rather than only the specific
+# mutation-shaped privilege names a fixed pattern happens to enumerate.
+#
+# Real-PVE corrective note: `pveum user token permissions <user> <token>
+# --path / --output-format json` was assumed to return a flat object of
+# privilege names directly at the top level. A real-host read-only
+# precheck against Proxmox VE 9.2.3 disproved that -- the real command
+# returns a path-keyed object instead ({"/": {"Sys.Audit": 1, ...}}, an
+# empty grant observed literally as `{"/":{}}`). See
+# docs/architecture/0.5-implementation-status.md's real-PVE precheck
+# notes for the exact observed command/output. Privilege names are now
+# read only from the object at the exact requested path "/" via
+# _json_truthy_keys_sorted_at_path (bootstrap-common.sh) -- never
+# flattened in from any other path PVE might also report.
 _verify_effective_permissions() {
   local perms_file
   perms_file="$(mktemp /tmp/hubinet-ops-bootstrap-perms.XXXXXX.json)"
@@ -228,14 +240,11 @@ _verify_effective_permissions() {
     die "could not read back effective permissions for ${PVE_FULL_TOKEN_ID}"
   fi
 
-  # Fourth-pass corrective note: explicitly requiring a JSON *object*
-  # here, rather than feeding the file straight into
-  # _json_truthy_keys_sorted, makes an unexpected top-level shape (e.g. a
-  # JSON array) an explicit, clearly-labeled STOP -- not merely an
-  # incidental one that happens to occur because the resulting empty/
-  # wrong key set doesn't equal PVE_REQUIRED_PRIVS. Never accidentally
-  # interpret an unrecognized structure as the exact expected privilege
-  # set.
+  # An unexpected top-level shape (e.g. a JSON array) is an explicit,
+  # clearly-labeled STOP here -- not merely an incidental one that happens
+  # to occur because the resulting empty/wrong key set doesn't equal
+  # PVE_REQUIRED_PRIVS. Never accidentally interpret an unrecognized
+  # structure as the exact expected privilege set.
   if ! _json_object_is_valid "${perms_file}"; then
     rm -f "${perms_file}"
     die "could not verify effective permissions for ${PVE_FULL_TOKEN_ID}: 'pveum user token permissions' did not produce a valid JSON object -- refusing to continue with an unverifiable privilege set"
@@ -247,10 +256,10 @@ _verify_effective_permissions() {
   # and aborting the script right here -- before parse_status could ever
   # be inspected or the die() message below could run.
   local actual_keys parse_status
-  actual_keys="$(_json_truthy_keys_sorted "${perms_file}")" && parse_status=0 || parse_status=$?
+  actual_keys="$(_json_truthy_keys_sorted_at_path "${perms_file}" "/")" && parse_status=0 || parse_status=$?
   rm -f "${perms_file}"
   (( parse_status == 0 )) \
-    || die "could not parse effective-permission JSON for ${PVE_FULL_TOKEN_ID} (requires jq or python3 on the PVE host -- checked in phase1)"
+    || die "could not verify effective permissions for ${PVE_FULL_TOKEN_ID}: 'pveum user token permissions --path /' did not produce the expected path-keyed JSON shape {\"/\": {<privilege>: 1, ...}} (confirmed against a real PVE 9.2.3 host -- see docs/architecture/0.5-implementation-status.md's real-PVE precheck notes) -- refusing to continue with an unverifiable privilege set"
 
   local expected_keys
   expected_keys="$(printf '%s\n' "${PVE_REQUIRED_PRIVS//,/$'\n'}" | LC_ALL=C sort)"
@@ -258,7 +267,7 @@ _verify_effective_permissions() {
   if [[ "${actual_keys}" != "${expected_keys}" ]]; then
     local actual_csv
     actual_csv="$(printf '%s' "${actual_keys}" | tr '\n' ',' | sed 's/,$//')"
-    die "verification failed: token ${PVE_FULL_TOKEN_ID} effective privileges are exactly {${actual_csv:-<none>}} but must be exactly {${PVE_REQUIRED_PRIVS}} -- refusing to continue with a credential whose privilege set is not provably read-only (this is an exact-set check: any missing required privilege OR any unexpected extra privilege fails it)"
+    die "verification failed: token ${PVE_FULL_TOKEN_ID} effective privileges at path / are exactly {${actual_csv:-<none>}} but must be exactly {${PVE_REQUIRED_PRIVS}} -- refusing to continue with a credential whose privilege set is not provably read-only (this is an exact-set check: any missing required privilege OR any unexpected extra privilege fails it)"
   fi
 }
 

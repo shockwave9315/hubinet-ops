@@ -204,6 +204,79 @@ for key in keys:
 ' "${file}" 2>/dev/null | tr -d '\r' | LC_ALL=C sort
 }
 
+# _json_truthy_keys_sorted_at_path <file> <path>: sorted, newline-
+# separated list of every key whose value is truthy (1/true) in the
+# object found at top-level key <path> of a path-keyed PVE permissions
+# response -- used for the exact-set PVE effective-permission proof.
+#
+# Real-PVE corrective note: `pveum user token permissions <user> <token>
+# --path / --output-format json` was assumed to return a flat object of
+# privilege names directly ({"Sys.Audit": 1, "VM.Audit": 1}). A real-host
+# read-only precheck against Proxmox VE 9.2.3 disproved that assumption --
+# the real command returns a path-keyed object instead
+# ({"/": {"Sys.Audit": 1, "VM.Audit": 1}}), confirmed by the literal
+# observed output `{"/":{}}` for a freshly-created token with the
+# requested path granted but (at the moment of that observation) no
+# privileges yet. Feeding that shape into a flat-top-level-key extractor
+# makes the top-level "/" key's value an OBJECT, never truthy (1/true),
+# so the actual privilege set always comes back empty regardless of what
+# privileges the token truly has -- fail-safe (an empty set never equals
+# the required nonempty PVE_REQUIRED_PRIVS set), but it makes the
+# supported real deployment path deterministically fail during phase 6
+# even when correctly configured. See
+# docs/architecture/0.5-implementation-status.md's real-PVE precheck
+# notes for the exact observed command/output this was corrected against.
+#
+# Requires: the top level is an object; the exact <path> key exists;
+# its value is itself an object. Any other shape (missing path, non-
+# object value at path, non-object top level, malformed JSON) is a hard
+# failure (empty output, nonzero exit) -- never silently treated as "zero
+# privileges," which would only coincidentally still fail the caller's
+# own exact-set comparison rather than failing for the RIGHT, clearly-
+# diagnosable reason. Privilege names are read ONLY from the object at
+# <path> -- privileges granted at any other path are never flattened in.
+_json_truthy_keys_sorted_at_path() {
+  local file="$1" path="$2"
+  # Deliberately does NOT pipe the jq/python3 extraction call directly
+  # into `| tr -d '\r' | LC_ALL=C sort` the way the flat
+  # _json_truthy_keys_sorted above does -- without `pipefail` active in
+  # the calling shell (this codebase's entrypoint always sets
+  # `set -Eeuo pipefail`, but this function's own correctness should not
+  # be contingent on an ambient caller option, especially for a
+  # security-relevant exact-set permission proof), a pipeline's exit
+  # status is that of its LAST command, and `tr`/`sort` succeed even when
+  # fed nothing -- silently masking a jq/python3 parse/schema failure as
+  # success with empty output. Capturing the raw extraction result and
+  # its own exit status FIRST, via a plain (non-piped) command
+  # substitution, then piping only the already-captured text through
+  # tr/sort as a separate, always-succeeding final step, makes this
+  # function's own return status correct regardless of caller shell
+  # options.
+  local raw status
+  if command -v jq >/dev/null 2>&1; then
+    jq -e --arg p "${path}" \
+      'type == "object" and has($p) and (.[$p] | type == "object")' \
+      "${file}" >/dev/null 2>&1 || return 1
+    raw="$(jq -r --arg p "${path}" \
+      '.[$p] | to_entries | map(select(.value == true or .value == 1)) | .[].key' \
+      "${file}" 2>/dev/null)" && status=0 || status=$?
+  else
+    raw="$(python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+path = sys.argv[2]
+if not isinstance(data, dict) or path not in data or not isinstance(data[path], dict):
+    sys.exit(1)
+keys = sorted(k for k, v in data[path].items() if v in (1, True, "1"))
+for key in keys:
+    print(key)
+' "${file}" "${path}" 2>/dev/null)" && status=0 || status=$?
+  fi
+  (( status == 0 )) || return 1
+  printf '%s' "${raw}" | tr -d '\r' | LC_ALL=C sort
+}
+
 # _json_list_has_string_field_schema <file> <required-field>: true only if
 # `file` is a JSON array where EVERY element is a JSON object containing
 # `required-field` as a non-null JSON string. An empty array `[]` always

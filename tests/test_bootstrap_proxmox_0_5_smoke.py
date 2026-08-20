@@ -511,6 +511,109 @@ class TestPveIdentity:
 
 
 # ---------------------------------------------------------------------------
+# Real-PVE corrective fix: `pveum user token permissions <user> <token>
+# --path / --output-format json` was assumed to return a flat object of
+# privilege names directly at the top level. A real-host read-only
+# precheck against Proxmox VE 9.2.3 disproved that -- the real command
+# returns a PATH-KEYED object instead ({"/": {"Sys.Audit": 1, ...}}),
+# observed literally as `{"/":{}}` for an empty grant (see
+# docs/architecture/0.5-implementation-status.md's real-PVE precheck
+# notes). These tests exercise _verify_effective_permissions' full
+# exact-set STOP/proceed outcome end to end via the fake's
+# "pveum_output_override": {"token_permissions": ...} hook (which now
+# emits whatever raw JSON text a test supplies, in place of the fake's
+# own normally-computed path-keyed response) -- including explicitly
+# proving the OLD flat-object shape this bootstrap used to (wrongly)
+# assume is now rejected rather than silently misread as "zero
+# privileges."
+# ---------------------------------------------------------------------------
+
+
+class TestPathKeyedEffectivePermissions:
+    def _run_with_permissions_json(self, tmp_path, source_checkout, raw_json):
+        return _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"pveum_output_override": {"token_permissions": raw_json}},
+        )
+
+    @pytest.mark.parametrize(
+        "raw_json",
+        ['{"/":{"Sys.Audit":1,"VM.Audit":1}}', '{"/":{"VM.Audit":1,"Sys.Audit":1}}'],
+    )
+    def test_exact_path_keyed_grant_passes_regardless_of_key_order(self, tmp_path, source_checkout, raw_json):
+        result, _ = self._run_with_permissions_json(tmp_path, source_checkout, raw_json)
+        assert result.returncode == 0, result.stderr
+        assert "PASS: PVE identity" in result.stderr
+
+    def test_missing_required_privilege_stops(self, tmp_path, source_checkout):
+        result, _ = self._run_with_permissions_json(tmp_path, source_checkout, '{"/":{"Sys.Audit":1}}')
+        assert result.returncode != 0
+        assert "verification failed" in result.stderr
+
+    def test_unexpected_extra_privilege_stops(self, tmp_path, source_checkout):
+        result, _ = self._run_with_permissions_json(
+            tmp_path, source_checkout, '{"/":{"Sys.Audit":1,"VM.Audit":1,"VM.PowerMgmt":1}}',
+        )
+        assert result.returncode != 0
+        assert "verification failed" in result.stderr
+        assert "VM.PowerMgmt" in result.stderr
+
+    def test_requested_path_missing_stops(self, tmp_path, source_checkout):
+        result, _ = self._run_with_permissions_json(
+            tmp_path, source_checkout, '{"/vms":{"Sys.Audit":1,"VM.Audit":1}}',
+        )
+        assert result.returncode != 0
+        assert "did not produce the expected path-keyed JSON shape" in result.stderr
+
+    def test_wrong_root_shape_stops(self, tmp_path, source_checkout):
+        result, _ = self._run_with_permissions_json(tmp_path, source_checkout, "[]")
+        assert result.returncode != 0
+        assert "did not produce a valid JSON object" in result.stderr
+
+    def test_slash_wrong_shape_stops(self, tmp_path, source_checkout):
+        result, _ = self._run_with_permissions_json(tmp_path, source_checkout, '{"/":[]}')
+        assert result.returncode != 0
+        assert "did not produce the expected path-keyed JSON shape" in result.stderr
+
+    def test_old_flat_object_shape_now_explicitly_rejected(self, tmp_path, source_checkout):
+        # This is the exact shape the fake/production code WRONGLY
+        # assumed before the real-PVE-9.2.3 precheck -- proving it can
+        # never silently regress back to the invented flat contract
+        # (which would otherwise be misread as "zero privileges granted
+        # at /" -- still fail-closed by accident, but for the wrong
+        # reason and with a confusing message).
+        result, _ = self._run_with_permissions_json(
+            tmp_path, source_checkout, '{"Sys.Audit":1,"VM.Audit":1}',
+        )
+        assert result.returncode != 0
+        assert "did not produce the expected path-keyed JSON shape" in result.stderr
+
+    def test_command_failure_stops(self, tmp_path, source_checkout):
+        result, _ = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"fail": ["pveum_token_permissions"]},
+        )
+        assert result.returncode != 0
+        assert "could not read back effective permissions" in result.stderr
+
+    def test_malformed_json_stops(self, tmp_path, source_checkout):
+        result, _ = self._run_with_permissions_json(tmp_path, source_checkout, "not-valid-json{{{")
+        assert result.returncode != 0
+        assert "did not produce a valid JSON object" in result.stderr
+
+    def test_real_observed_empty_grant_is_schema_valid_but_still_fails_exact_set(self, tmp_path, source_checkout):
+        # The literal real-PVE-9.2.3 observation {"/":{}} is schema-VALID
+        # (a genuine path-keyed object, just with nothing granted yet) --
+        # it must reach the exact-set comparison (and fail there, on a
+        # correctness basis: zero privileges != {Sys.Audit, VM.Audit}),
+        # never be rejected as an unrecognized shape.
+        result, _ = self._run_with_permissions_json(tmp_path, source_checkout, '{"/":{}}')
+        assert result.returncode != 0
+        assert "verification failed" in result.stderr
+        assert "did not produce" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
 # Secrets: no argv exposure anywhere (Mandatory Fix 5)
 # ---------------------------------------------------------------------------
 

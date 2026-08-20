@@ -488,6 +488,14 @@ pveum role list --output-format json
 pveum user token list <existing-user> --output-format json
 pveum user token permissions <existing-user> <existing-token> \
   --path / --output-format json
+# CONFIRMED against a real PVE 9.2.3 host: this returns a PATH-KEYED
+# object -- {"/": {"Sys.Audit": 1, "VM.Audit": 1}} for a token holding
+# those privileges at "/", observed literally as {"/":{}} for an empty
+# grant -- never a flat object of privilege names directly at the top
+# level. deploy/lib/bootstrap-identity.sh::_verify_effective_permissions
+# reads privilege names only from the object at the exact requested path.
+# If your PVE version's actual output differs from this, confirm the
+# shape here BEFORE trusting phase 6's exact-set verification.
 
 # Storage capacity reporting -- CONFIRM these Total/Used/Available values
 # are in KiB on your PVE version, matching what
