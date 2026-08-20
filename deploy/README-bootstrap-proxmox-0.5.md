@@ -25,8 +25,9 @@ Hubinet Ops's own GET-only production PVE transport
 > subsequent read-only forensic replay on the same preserved container
 > proved the exact production provider and Phase-12 acceptance checker
 > both PASS once that CA is corrected, but that replay was not itself a
-> dogfood PASS. **Dogfood #3, run fresh and clean from this repository's
-> merged `main`, completed Phase 1 through Phase 13 PASS with no manual
+> dogfood PASS. **Dogfood #3, run fresh and clean from commit
+> `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2` (merged into `main` at the
+> time), completed Phase 1 through Phase 13 PASS with no manual
 > repair mid-run** -- the first dogfood to reach a full bootstrap PASS.
 > This proves the automated bootstrap completes successfully end to end
 > on a real host; it does **not** by itself mean full operational
@@ -470,9 +471,10 @@ full manual verification procedure this script automates.
   through Phase 13 with the CA corrected has since occurred and
   achieved that PASS -- see the "third real dogfood" entry in the same
   document.
-- **Third real dogfood** (fresh run from this repository's merged
-  `main`, `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2`, on the SAME
-  physical PVE host as the first two dogfoods, with the CA-classification
+- **Third real dogfood** (fresh run from commit
+  `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2`, merged into `main` at the
+  time, on the SAME physical PVE host as the first two dogfoods, with
+  the CA-classification
   fix from the second dogfood in place): **completed Phase 1 through
   Phase 13 PASS with no manual repair mid-run — the first dogfood run to
   reach a full bootstrap PASS.** Verified final facts: backend

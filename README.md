@@ -15,8 +15,9 @@ genuinely exercised in a real container (CT110) via three explicitly-authorized 
 dogfood runs of the automated Proxmox bootstrap, all against the same physical PVE host
 (dogfood #1 stopped at Phase 10; dogfood #2 reached Phase 12, and a later read-only
 forensic replay proved the production provider and the exact Phase-12 acceptance path
-both succeed once an environmental PVE root CA issue was corrected). **Dogfood #3, from
-this exact merged `main` commit, completed the full bootstrap through Phase 13**: backend
+both succeed once an environmental PVE root CA issue was corrected). **Dogfood #3, run
+from commit `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2` (merged into `main` at the time),
+completed the full bootstrap through Phase 13**: backend
 `source_health=healthy`/`source_freshness=fresh`, `last_committed_run_sequence=1`,
 `node_count=1`, `resource_count=11`, firewall verification PASS, mutation authority
 confirmed NONE, and CT `onboot` enabled. This repository's own automated tests/CI remain
@@ -108,8 +109,9 @@ method — use HACS for real deployments.
   after a real discovery-acceptance check passes. Exercised three times against a
   real Proxmox host (the same host all three times; dogfood #1 stopped at Phase 10,
   dogfood #2 reached Phase 12 but was not itself a full bootstrap PASS, and
-  **dogfood #3, from this repository's merged `main`, achieved a fresh, clean
-  Phase 1-13 PASS with no manual repair mid-run**). This proves the automated
+  **dogfood #3, run from commit `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2`
+  (merged into `main` at the time), achieved a fresh, clean Phase 1-13 PASS
+  with no manual repair mid-run**). This proves the automated
   bootstrap completes successfully on the real host; it does not by itself mean
   operational activation (HA acceptance, the multi-day observation window) is
   complete. See `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script
