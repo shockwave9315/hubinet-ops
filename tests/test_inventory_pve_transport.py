@@ -685,15 +685,23 @@ def _build_duplicate_heavy_chain(total_nodes: int, cert_index: int) -> BaseExcep
 
 
 def test_findingA_duplicate_edges_do_not_prevent_finding_a_cert_error_within_the_bound() -> None:
-    # Ninth-pass corrective note (P2/P3 finding, independent review): the
-    # unique-node bound must not be starved by duplicate queue entries --
-    # a cert error only 10 unique hops away from the outer exception must
-    # still be found, even though every hop along the way duplicates its
-    # reference (cause == context), which would have exhausted a
-    # pops-based budget before ever reaching it.
+    # Independent-review corrective note (P2 finding, tenth pass): a cert
+    # error 15 unique hops from the outer exception must still be found,
+    # even though every hop along the way duplicates its reference (cause
+    # == context). The distance matters: this exact duplicate-heavy
+    # construction lets the previously-rejected pops-bounded design (which
+    # counted total queue pops instead of unique nodes visited) still
+    # reach ~11 unique nodes before its 20-pop budget exhausts, so a
+    # distance of 10 (an earlier version of this test) would ALSO have
+    # been found under that rejected design -- proving nothing about
+    # which of the two designs is in use. Direct mutation testing
+    # (swapping in the rejected pops-bounded implementation and re-running
+    # this exact body) confirms distance 15 genuinely discriminates: found
+    # under the current unique-node-bounded implementation, NOT found
+    # under the rejected pops-bounded one.
     from app.inventory_pve_transport import _find_certificate_verification_error
 
-    outer = _build_duplicate_heavy_chain(total_nodes=31, cert_index=31 - 1 - 10)
+    outer = _build_duplicate_heavy_chain(total_nodes=31, cert_index=31 - 1 - 15)
     found = _find_certificate_verification_error(outer)
     assert found is not None
     assert isinstance(found, ssl.SSLCertVerificationError)

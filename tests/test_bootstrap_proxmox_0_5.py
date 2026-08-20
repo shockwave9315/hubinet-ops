@@ -35,6 +35,7 @@ target script.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -47,6 +48,7 @@ from _bootstrap_fake_pve import (  # noqa: E402
     FAKE_DISPLAY_NAME,
     FAKE_HA_SOURCE_CIDR,
     FAKE_PVE_ENDPOINT,
+    build_fake_pve_environment,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1273,6 +1275,88 @@ class TestTokenOwnershipState:
             result = _run_token_ownership_state_helper(tmp_path, list_cmd_body=body)
             assert result.returncode == 0, result.stderr
             assert result.stdout in ("owned", "absent", "unproven")
+
+
+def _run_fake_pveum(fake_env, *args):
+    """Invoke the fake `pveum` shim directly (never the real bootstrap
+    script, never `_run_full`'s full orchestration) -- a local-safe,
+    non-sandbox-gated way to exercise one fake PVE command in isolation.
+    Explicit `bash <shim>` rather than executing the shim path directly:
+    the shim is a `#!/usr/bin/env bash` script, and direct execution of a
+    shebang script by path is not reliably supported by Python's
+    subprocess module on a Windows dev machine.
+    """
+    return subprocess.run(
+        ["bash", str(fake_env.bin_dir / "pveum"), *args],
+        capture_output=True, text=True, timeout=15, env=fake_env.env,
+    )
+
+
+class TestFakeUserDeleteCascade:
+    """Tenth-pass corrective addition (P3 finding, independent review):
+    the fake PVE dispatcher's `pveum user delete <user>` handler must
+    model real Proxmox's cascade -- deleting the owning user also
+    removes every token registered under it -- so a test asserting a
+    token survived rollback is genuine proof against the exact hazard
+    this repository's rollback_on_failure logic exists to prevent, not
+    merely proof that the fake's own `pve_users`/`pve_tokens` dicts
+    happen to be unlinked. Exercises the fake directly (bypassing the
+    real bootstrap script and rollback logic entirely) to isolate the
+    fake's own cascade behavior from the production decision logic
+    already covered by TestTokenOwnershipState and the sandbox-gated
+    smoke tests.
+    """
+
+    def _seed_two_users_each_with_a_token(self, fake_env):
+        state = fake_env.state()
+        state["pve_users"] = {
+            "hubinetops@pve": {"comment": "run=some-run-id"},
+            "other@pve": {"comment": "unrelated"},
+        }
+        state["pve_tokens"] = {
+            "hubinetops@pve!r0-readonly": {"comment": "run=some-run-id"},
+            "other@pve!sometoken": {"comment": "unrelated"},
+        }
+        fake_env.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_user_delete_cascades_to_that_users_own_tokens(self, tmp_path):
+        fake_env = build_fake_pve_environment(tmp_path)
+        self._seed_two_users_each_with_a_token(fake_env)
+
+        result = _run_fake_pveum(fake_env, "user", "delete", "hubinetops@pve")
+        assert result.returncode == 0, result.stderr
+
+        state = fake_env.state()
+        assert "hubinetops@pve" not in state["pve_users"]
+        assert "hubinetops@pve!r0-readonly" not in state["pve_tokens"]
+
+    def test_user_delete_cascade_does_not_touch_a_different_users_token(self, tmp_path):
+        # Scoping check: the cascade must match on the exact "<user>!"
+        # prefix, never delete tokens belonging to an unrelated user.
+        fake_env = build_fake_pve_environment(tmp_path)
+        self._seed_two_users_each_with_a_token(fake_env)
+
+        result = _run_fake_pveum(fake_env, "user", "delete", "hubinetops@pve")
+        assert result.returncode == 0, result.stderr
+
+        state = fake_env.state()
+        assert "other@pve" in state["pve_users"]
+        assert "other@pve!sometoken" in state["pve_tokens"]
+
+    def test_user_delete_of_a_user_with_no_tokens_is_a_no_op_on_pve_tokens(self, tmp_path):
+        # Positive control: the cascade logic must not raise/misbehave
+        # when the deleted user happens to have no tokens registered.
+        fake_env = build_fake_pve_environment(tmp_path)
+        state = fake_env.state()
+        state["pve_users"] = {"hubinetops@pve": {"comment": "run=some-run-id"}}
+        fake_env.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = _run_fake_pveum(fake_env, "user", "delete", "hubinetops@pve")
+        assert result.returncode == 0, result.stderr
+
+        state = fake_env.state()
+        assert "hubinetops@pve" not in state["pve_users"]
+        assert state["pve_tokens"] == {}
 
 
 class TestSecurityStatic:

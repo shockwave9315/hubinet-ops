@@ -1088,9 +1088,25 @@ def cmd_pveum(args):
         _save_state(state)
         return 0
     if args[:2] == ["user", "delete"]:
+        # Tenth-pass corrective addition (P3 finding, independent review):
+        # a successful deletion of the owning user also removes every
+        # token registered under it (tokenid prefix "<user>!") -- this is
+        # the exact real Proxmox hazard rollback_on_failure's
+        # parent_user_cleanup_safe gate exists to prevent for an unproven
+        # token. An earlier version of this handler only removed the user
+        # entry, leaving that user's tokens in state["pve_tokens"]
+        # untouched regardless of whether the delete call was safe or
+        # not -- materially less faithful than real Proxmox for the exact
+        # hazard this repository's rollback logic is built around, so a
+        # test asserting a token survived could pass even if the
+        # (unsafe) `pveum user delete` call had actually been made.
         user = args[2]
         if user in state["pve_users"]:
             state["pve_users"].pop(user, None)
+            prefix = f"{user}!"
+            for full_token_id in list(state["pve_tokens"].keys()):
+                if full_token_id.startswith(prefix):
+                    state["pve_tokens"].pop(full_token_id, None)
             _save_state(state)
         return 0
     _log("pveum", "UNHANDLED", *args)
