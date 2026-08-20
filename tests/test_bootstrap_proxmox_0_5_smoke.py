@@ -1054,10 +1054,10 @@ class TestPveIdentityOwnership:
         acl_targets = {grant["target"] for grant in state["acl_grants"]}
         assert "user:hubinetops@pve" in acl_targets
         assert "hubinetops@pve" in state["pve_users"]
-        # The token object itself DID get removed from PVE's state by
-        # the fake's own "remove" handler failing before mutating state
-        # -- i.e. the fake never actually pops it when it reports
-        # failure -- confirming the token, too, is genuinely still there.
+        # The token object itself did NOT get removed from PVE's state --
+        # the fake's own "remove" handler reports failure BEFORE mutating
+        # state (it never pops the token when simulating a failure),
+        # confirming the token, too, is genuinely still there.
         assert "hubinetops@pve!r0-readonly" in state["pve_tokens"]
 
     def test_user_ownership_readback_command_failure_preserves(self, tmp_path, source_checkout):

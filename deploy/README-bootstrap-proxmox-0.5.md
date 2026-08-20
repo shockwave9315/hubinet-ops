@@ -17,10 +17,21 @@ Hubinet Ops's own GET-only production PVE transport
 (`app/inventory_pve_transport.py`).
 
 > **Status**: implemented and unit/smoke-tested against a hermetic fake
-> command layer only. It has **not** been run against a real Proxmox host.
-> Before a first real run, review the "What this script proves, and what
-> it does not" section below and the REAL-HOST PRECHECK commands in this
-> branch's corrective-pass report.
+> command layer, AND exercised in two real, manual, operator-authorized
+> dogfood runs against the same real Proxmox host. **Neither dogfood is a
+> full bootstrap PASS**: dogfood #1 stopped at Phase 10 (nftables active-
+> ruleset canonicalization, since fixed); dogfood #2 reached Phase 12
+> (source acceptance) before failing on a legacy PVE root CA missing the
+> X509v3 Key Usage extension -- a subsequent read-only forensic replay on
+> the same preserved container proved the exact production provider and
+> Phase-12 acceptance checker both PASS once that CA is corrected, but
+> that replay is not itself a dogfood PASS either. A fresh, clean dogfood
+> #3 run through Phase 13 remains required before this bootstrap can be
+> considered operationally validated. Do not treat this as evidence of
+> operational readiness. Before running it yourself, review the "What
+> this script proves, and what it does not" section below and the
+> REAL-HOST PRECHECK commands (including the PVE root CA Key Usage
+> precheck) further down this document.
 
 ## Prerequisites
 
