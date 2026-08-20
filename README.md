@@ -11,15 +11,19 @@ API consumed by the native Home Assistant integration. It has no policy, jobs, m
 endpoint activation/failover, or attestation enrollment automation, and no code path in
 this release can grant `security_continuity=trusted`. R0 has been merged into `main` and
 is implemented and constructible in this repository. It has since been installed and
-genuinely exercised in a real container (CT110) via two explicitly-authorized manual
-dogfood runs of the automated Proxmox bootstrap, both against the same physical PVE host
+genuinely exercised in a real container (CT110) via three explicitly-authorized manual
+dogfood runs of the automated Proxmox bootstrap, all against the same physical PVE host
 (dogfood #1 stopped at Phase 10; dogfood #2 reached Phase 12, and a later read-only
 forensic replay proved the production provider and the exact Phase-12 acceptance path
-both succeed once an environmental PVE root CA issue was corrected — that replay is not
-itself a bootstrap PASS). No fresh, clean run has yet completed Phase 13, and this
-repository's own automated tests/CI remain fully hermetic throughout. Real-host
-**operational activation** is not yet accepted and remains a separate, later,
-explicitly-authorized step (`docs/operations/0.5-r0-operational-activation.md`); see
+both succeed once an environmental PVE root CA issue was corrected). **Dogfood #3, from
+this exact merged `main` commit, completed the full bootstrap through Phase 13**: backend
+`source_health=healthy`/`source_freshness=fresh`, `last_committed_run_sequence=1`,
+`node_count=1`, `resource_count=11`, firewall verification PASS, mutation authority
+confirmed NONE, and CT `onboot` enabled. This repository's own automated tests/CI remain
+fully hermetic throughout — none of the above was exercised by CI, only by a real,
+manual, explicitly-authorized operator run. Real-host **operational activation**
+(the multi-day observation window and Home Assistant acceptance checklist) is a
+separate, later step (`docs/operations/0.5-r0-operational-activation.md`); see
 `docs/architecture/0.5-implementation-status.md` for the full dogfood record.
 
 ## Safety model
@@ -38,6 +42,47 @@ explicitly-authorized step (`docs/operations/0.5-r0-operational-activation.md`);
   grants management, trust, or destructive capability.
 - The production PVE transport (`app/inventory_pve_transport.py`) is GET-only, with
   mandatory TLS verification and no mutation-verb escape hatch.
+
+## Installation
+
+The Proxmox backend and the Home Assistant integration are two independently deployed
+and independently distributed halves: the backend is provisioned on the Proxmox host via
+`deploy/bootstrap-proxmox-0.5.sh` (see "Repository map" below), and the Home Assistant
+integration (`custom_components/hubinet_ops/`) is distributed separately through
+[HACS](https://hacs.xyz/). Their credential boundary:
+
+- HA never receives, stores, or handles the Proxmox API credential — the integration has
+  no PVE-facing code path at all.
+- HA authenticates only to the Hubinet Ops backend, using the backend's own dedicated
+  `HUBINET_OPS_R0_API_TOKEN` read-only bearer token, entered through the config flow
+  described below.
+- HACS itself distributes integration **code only** and transfers no credential of any
+  kind.
+
+### Home Assistant integration (via HACS)
+
+1. Open HACS.
+2. Go to **Custom repositories**.
+3. Add `https://github.com/shockwave9315/hubinet-ops`, category **Integration**.
+4. Download **Hubinet Ops**.
+5. Restart Home Assistant if required.
+6. Go to **Settings → Devices & services → Add Integration → Hubinet Ops**.
+7. Enter the backend's **Base URL** (e.g. `http://<hubinet-backend>:8787`) and its
+   **Bearer token** — the backend's `HUBINET_OPS_R0_API_TOKEN` value, generated during
+   backend deployment. **This is not the Proxmox API token**; the integration never
+   sees, stores, or handles Proxmox credentials, only the backend's own read-only R0
+   bearer token, via the existing config flow described in
+   `docs/operations/0.5-ha-clean-break.md` section 5.
+
+This HACS flow is the supported, normal installation path — there is no manual-copy step
+in ordinary operation.
+
+### Developer / local-testing fallback
+
+For local integration development only, `custom_components/hubinet_ops/` can be
+symlinked or copied directly into a Home Assistant `config/custom_components/` directory
+instead of installing through HACS. This is not a supported end-user installation
+method — use HACS for real deployments.
 
 ## Repository map
 
@@ -60,12 +105,15 @@ explicitly-authorized step (`docs/operations/0.5-r0-operational-activation.md`);
   for system-trust fallback), git-commit-provenance-gated source deployment via
   the in-CT install above, source-centric config, and the mandatory firewall
   boundary (exact rule content/order verified), ending with CT boot enabled only
-  after a real discovery-acceptance check passes. Exercised twice against a real
-  Proxmox host (the same host both times; dogfood #1 stopped at Phase 10, dogfood #2
-  reached Phase 12) — neither run is a full bootstrap PASS, and a fresh, clean
-  Phase-13 PASS remains outstanding. See
-  `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script proves, and what it
-  does not" section for the exact current status.
+  after a real discovery-acceptance check passes. Exercised three times against a
+  real Proxmox host (the same host all three times; dogfood #1 stopped at Phase 10,
+  dogfood #2 reached Phase 12 but was not itself a full bootstrap PASS, and
+  **dogfood #3, from this repository's merged `main`, achieved a fresh, clean
+  Phase 1-13 PASS with no manual repair mid-run**). This proves the automated
+  bootstrap completes successfully on the real host; it does not by itself mean
+  operational activation (HA acceptance, the multi-day observation window) is
+  complete. See `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script
+  proves, and what it does not" section for the exact current status.
 - `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
   the authority order). `docs/operations/`: the R0 operational activation runbook and the
   Home Assistant clean-break/purge plan for a real deployed instance.
