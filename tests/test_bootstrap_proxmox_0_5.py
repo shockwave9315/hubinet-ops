@@ -1358,6 +1358,37 @@ class TestFakeUserDeleteCascade:
         assert "hubinetops@pve" not in state["pve_users"]
         assert state["pve_tokens"] == {}
 
+    def test_user_delete_cascades_to_all_of_that_users_multiple_tokens(self, tmp_path):
+        # Closure-review addition: the real bootstrap only ever creates
+        # exactly one token per run, but the cascade implementation itself
+        # is a generic loop over every "<user>!"-prefixed entry -- this
+        # proves it genuinely removes ALL matches (not merely the first),
+        # while still leaving a different user's token untouched.
+        fake_env = build_fake_pve_environment(tmp_path)
+        state = fake_env.state()
+        state["pve_users"] = {
+            "userA@pve": {"comment": "run=some-run-id"},
+            "userB@pve": {"comment": "unrelated"},
+        }
+        state["pve_tokens"] = {
+            "userA@pve!token1": {"comment": "run=some-run-id"},
+            "userA@pve!token2": {"comment": "run=some-run-id"},
+            "userB@pve!tokenB": {"comment": "unrelated"},
+        }
+        fake_env.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = _run_fake_pveum(fake_env, "user", "delete", "userA@pve")
+        assert result.returncode == 0, result.stderr
+
+        state = fake_env.state()
+        assert "userA@pve" not in state["pve_users"]
+        assert "userA@pve!token1" not in state["pve_tokens"]
+        assert "userA@pve!token2" not in state["pve_tokens"]
+        # A different user's own token, and that user's own object, both
+        # survive -- the cascade is scoped exactly to the deleted user.
+        assert "userB@pve" in state["pve_users"]
+        assert "userB@pve!tokenB" in state["pve_tokens"]
+
 
 class TestSecurityStatic:
     _ALL_SCRIPTS = ALL_SCRIPTS
