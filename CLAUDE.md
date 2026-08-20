@@ -304,12 +304,18 @@ capability into any current module without an explicit activation/cutover review
   opt-in, never implicit), git-commit-provenance-gated source deployment invoking
   `install-0.5.0-fresh.sh` unmodified inside the new CT, source-centric config
   generation, and the mandatory nftables firewall boundary (exact rule
-  content/order verified), in a fixed fail-closed phase order with no host
-  mutation before an upfront operator confirmation of the full plan; CT `onboot`
-  is enabled only after a real, contract-grounded discovery-acceptance check
-  (`deploy/lib/hubinet-ops-bootstrap-accept.py`) succeeds. Secrets (the PVE token,
-  the R0 API bearer token) are never passed as a literal command-line argument
-  anywhere in this path.
+  content/order verified against resolved numeric addresses -- a hostname
+  `--pve-endpoint` is resolved inside the CT before the ruleset is generated),
+  in a fixed fail-closed phase order with no host mutation before a single upfront
+  operator confirmation of the full plan; CT `onboot` is enabled only after a real,
+  contract-grounded discovery-acceptance check (`deploy/lib/hubinet-ops-bootstrap-accept.py`,
+  proving a committed/fresh/current result, not merely `health == "healthy"`) succeeds.
+  PVE-identity rollback deletes only what a run can prove it owns (a random
+  per-run ID embedded in PVE object comments), never merely an object matching
+  the fixed name, closing a cluster-wide TOCTOU ownership race. Secrets (the PVE
+  token, the R0 API bearer token) are never passed as a literal command-line
+  argument anywhere in this path. `.github/workflows/bootstrap-smoke.yml` wires
+  the compliant Docker sandbox into GitHub Actions (path-filtered, PR-triggered).
   Never execute it against a real host from an agent session. Two disjoint test
   files exist per AGENTS.md's deployment-script sandbox boundary:
   `tests/test_bootstrap_proxmox_0_5.py` (local-safe: `bash -n`, the restored

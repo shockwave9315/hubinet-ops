@@ -5,14 +5,41 @@
 # configured HA host/subnet on TCP 8787 only. Egress destination port is
 # always derived from the actual configured PVE endpoint (--pve-endpoint),
 # never hardcoded independently of it.
+#
+# Hostname PVE endpoints: nftables resolves a bare hostname in an address
+# expression to numeric address(es) at rule-LOAD time, and `nft list
+# ruleset` afterward reports the resolved numeric address, never the
+# original hostname text -- an exact-text verifier expecting the literal
+# hostname back would then fail closed against an otherwise-correct
+# configuration. The fix: `--pve-endpoint` hostnames are resolved to
+# concrete IPv4 addresses ONCE, here, inside the CT's own network/resolver
+# context (via deploy/lib/hubinet-ops-bootstrap-resolve-dns.py, python3,
+# already guaranteed present by install-0.5.0-fresh.sh) -- BEFORE the
+# ruleset is ever generated -- and one exact egress-allow rule is written
+# per resolved address, so verification compares literal numeric IPs on
+# both sides. RESOLVED_PVE_IPS (global, set once by phase10_firewall) is
+# reused by the later phase12 recheck rather than re-resolved, since DNS
+# is inherently time-varying, unlike the rest of this bootstrap's
+# configuration -- see docs/README-bootstrap-proxmox-0.5.md: if internal
+# DNS later moves the hostname to a new address, the firewall must be
+# regenerated (re-run this bootstrap) before the service can reach it;
+# this bootstrap never silently re-resolves and re-opens egress on its own
+# after the fact.
 
 CT_NFT_CONF_PATH="/etc/nftables.conf"
+CT_RESOLVE_SCRIPT_CT="/tmp/hubinet-ops-bootstrap-resolve-dns.py"
+
+# Set once by phase10_firewall, reused (never re-resolved) by the phase12
+# recheck within the same bootstrap invocation. Newline-joined string
+# (not a bash array) so it survives being read by helper functions without
+# needing `declare -g` array plumbing.
+RESOLVED_PVE_IPS_LIST=""
 
 # _endpoint_host / _endpoint_port: pure functions of PVE_ENDPOINT
-# (https://host[:port]). Both the ruleset generator and the verifier call
-# these independently rather than sharing mutable state, so verification
-# never merely re-checks what generation assumed -- it re-derives the
-# expected values from the same single source of truth (PVE_ENDPOINT).
+# (https://host[:port]). Deterministic string parsing of a fixed config
+# value -- safe to call independently from both generation and
+# verification. DNS resolution (below) is NOT re-derived the same way,
+# because it is inherently time-varying.
 _endpoint_host() {
   local url="$1"
   local rest="${url#https://}"
@@ -33,11 +60,49 @@ _endpoint_port() {
   fi
 }
 
-# _expected_dns_rule_line: prints the exact, non-indented expected DNS
-# egress rule line if the PVE endpoint is a hostname (requiring a scoped
-# resolver rule), or nothing if it's a literal IP. Dies if a hostname
-# endpoint has no --dns-resolver configured.
-_expected_dns_rule_line() {
+# _resolve_pve_endpoint_ips <host>: prints one IPv4 address per line. If
+# `host` is already a literal IPv4 address, prints it directly (no
+# resolution needed, no DNS rule required later). Otherwise pushes and
+# runs hubinet-ops-bootstrap-resolve-dns.py INSIDE the CT and requires at
+# least one resolved address -- zero usable addresses, or a resolution
+# failure, is always a hard stop (die), never an empty-but-accepted
+# firewall rule set.
+_resolve_pve_endpoint_ips() {
+  local host="$1"
+  if is_valid_ipv4 "${host}"; then
+    printf '%s\n' "${host}"
+    return 0
+  fi
+
+  run_logged pct push "${VMID}" "${BOOTSTRAP_SCRIPT_DIR}/lib/hubinet-ops-bootstrap-resolve-dns.py" "${CT_RESOLVE_SCRIPT_CT}" \
+    || die "failed to push DNS resolution script into container ${VMID}"
+
+  local output status
+  output="$(pct exec "${VMID}" -- python3 "${CT_RESOLVE_SCRIPT_CT}" "${host}" 2>&1)" && status=0 || status=$?
+  # `tr -d '\r'` defensively strips any stray carriage return (see
+  # bootstrap-common.sh's _json_truthy_keys_sorted for the same class of
+  # fix and why) -- harmless on a normal POSIX PVE host/CT, but
+  # load-bearing for the exact-address parsing/comparison below wherever
+  # a CT's own python3 might emit CRLF line endings.
+  output="$(printf '%s' "${output}" | tr -d '\r')"
+
+  pct exec "${VMID}" -- rm -f "${CT_RESOLVE_SCRIPT_CT}" >/dev/null 2>&1 \
+    || log_warn "could not remove ${CT_RESOLVE_SCRIPT_CT} inside the container (non-fatal)"
+
+  (( status == 0 )) \
+    || die "could not resolve PVE endpoint hostname '${host}' to any usable IPv4 address inside container ${VMID} (resolution is performed inside the CT's own network/resolver context): ${output:-no output}"
+
+  printf '%s\n' "${output}"
+}
+
+# _expected_dns_rule_lines: prints the exact, non-indented expected DNS
+# egress rule line(s) if the PVE endpoint is a hostname (requiring a
+# scoped resolver rule), or nothing if it's a literal IP. Both UDP and TCP
+# port 53 to the exact configured resolver are required (legitimate DNS
+# responses may need TCP fallback, e.g. for larger responses) -- never a
+# broader/public resolver. Dies if a hostname endpoint has no
+# --dns-resolver configured.
+_expected_dns_rule_lines() {
   local pve_host="$1"
   if is_valid_ipv4 "${pve_host}"; then
     return 0
@@ -45,18 +110,39 @@ _expected_dns_rule_line() {
   [[ -n "${DNS_RESOLVER_IP}" ]] \
     || die "source.pve_endpoint ('${PVE_ENDPOINT}') uses a hostname, not a literal IP -- pass --dns-resolver <your-internal-resolver-ip> so egress can be scoped narrowly, or reconfigure --pve-endpoint with a literal IP and omit --dns-resolver entirely"
   is_valid_ipv4 "${DNS_RESOLVER_IP}" || die "--dns-resolver '${DNS_RESOLVER_IP}' is not a valid IPv4 address"
-  printf 'meta skuid "hubinetops" ip daddr %s udp dport 53 accept' "${DNS_RESOLVER_IP}"
+  printf 'meta skuid "hubinetops" ip daddr %s udp dport 53 accept\n' "${DNS_RESOLVER_IP}"
+  printf 'meta skuid "hubinetops" ip daddr %s tcp dport 53 accept\n' "${DNS_RESOLVER_IP}"
 }
 
 phase10_firewall() {
   log_phase "Phase 10: firewall"
 
-  local pve_host pve_port dns_rule_line
+  local pve_host pve_port
   pve_host="$(_endpoint_host "${PVE_ENDPOINT}")"
   pve_port="$(_endpoint_port "${PVE_ENDPOINT}")"
-  dns_rule_line="$(_expected_dns_rule_line "${pve_host}")"
-  if [[ -n "${dns_rule_line}" ]]; then
-    log_info "PVE endpoint uses a hostname -- adding a DNS egress rule scoped to resolver ${DNS_RESOLVER_IP} only"
+
+  # Validate the DNS-resolver *configuration* before attempting any actual
+  # resolution: a hostname endpoint with no --dns-resolver is a
+  # configuration problem the operator needs to fix regardless of whether
+  # resolution would otherwise have succeeded (the resolver IP is also
+  # needed for the DNS allow-rule itself, not only as a resolution
+  # prerequisite) -- fail on that first, with the specific actionable
+  # message, rather than a generic resolution failure.
+  local dns_rule_lines
+  dns_rule_lines="$(_expected_dns_rule_lines "${pve_host}")"
+  if [[ -n "${dns_rule_lines}" ]]; then
+    log_info "PVE endpoint uses a hostname -- adding DNS egress rules (UDP+TCP 53) scoped to resolver ${DNS_RESOLVER_IP} only"
+  fi
+
+  RESOLVED_PVE_IPS_LIST="$(_resolve_pve_endpoint_ips "${pve_host}")"
+  local -a resolved_ips=()
+  while IFS= read -r ip; do
+    [[ -n "${ip}" ]] && resolved_ips+=("${ip}")
+  done <<<"${RESOLVED_PVE_IPS_LIST}"
+  [[ ${#resolved_ips[@]} -gt 0 ]] \
+    || die "PVE endpoint host '${pve_host}' resolved to zero usable IPv4 addresses -- refusing to generate a firewall rule set with no destination"
+  if ! is_valid_ipv4 "${pve_host}"; then
+    log_info "resolved PVE endpoint host '${pve_host}' to: ${resolved_ips[*]} (this exact set is what the firewall permits for the lifetime of this CT -- re-run this bootstrap if internal DNS later moves the hostname)"
   fi
 
   local ruleset_tmp
@@ -77,9 +163,19 @@ phase10_firewall() {
     printf '  }\n'
     printf '  chain output {\n'
     printf '    type filter hook output priority 0; policy accept;\n'
-    printf '    meta skuid "hubinetops" ip daddr %s tcp dport %s accept\n' "${pve_host}" "${pve_port}"
-    if [[ -n "${dns_rule_line}" ]]; then
-      printf '    %s\n' "${dns_rule_line}"
+    local ip
+    for ip in "${resolved_ips[@]}"; do
+      printf '    meta skuid "hubinetops" ip daddr %s tcp dport %s accept\n' "${ip}" "${pve_port}"
+    done
+    if [[ -n "${dns_rule_lines}" ]]; then
+      # Here-string (<<<), not a pipe: a pipe fed via `printf '%s'` (no
+      # trailing newline) makes `read`'s last iteration fail and silently
+      # drop the final line (a real bug this exact form previously hit --
+      # the TCP DNS rule went missing from the generated ruleset). A
+      # here-string always appends its own trailing newline.
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] && printf '    %s\n' "${line}"
+      done <<<"${dns_rule_lines}"
     fi
     printf '    meta skuid "hubinetops" drop\n'
     printf '  }\n'
@@ -101,7 +197,7 @@ phase10_firewall() {
 
   _verify_firewall_active
 
-  log_pass "firewall: HA ${HA_SOURCE_CIDR} -> 8787 allowed, all other 8787 ingress denied, hubinetops egress confined to ${pve_host}:${pve_port}$( [[ -n "${dns_rule_line}" ]] && printf ' + resolver %s:53' "${DNS_RESOLVER_IP}" )"
+  log_pass "firewall: HA ${HA_SOURCE_CIDR} -> 8787 allowed, all other 8787 ingress denied, hubinetops egress confined to {${resolved_ips[*]}}:${pve_port}$( [[ -n "${dns_rule_lines}" ]] && printf ' + resolver %s:53 (udp+tcp)' "${DNS_RESOLVER_IP}" )"
 }
 
 # _verify_firewall_active: exact rule content AND order within each
@@ -109,26 +205,43 @@ phase10_firewall() {
 # Extracts the non-boilerplate rule lines of each chain (stripped of
 # leading whitespace, skipping the `type filter hook ...` declaration
 # line) and compares them element-by-element against the exact expected
-# sequence.
+# sequence. Egress IPs come from RESOLVED_PVE_IPS_LIST (set once by
+# phase10_firewall, never re-resolved here) -- everything else
+# (HA_SOURCE_CIDR, pve_port, DNS resolver) is a static config value, safe
+# to re-derive independently of what generation assumed.
 _verify_firewall_active() {
   local ruleset
   ruleset="$(pct exec "${VMID}" -- nft list ruleset 2>/dev/null)" \
     || die "acceptance failed: could not read the active nftables ruleset from container ${VMID}"
 
-  local pve_host pve_port dns_rule_line
+  local pve_host pve_port
   pve_host="$(_endpoint_host "${PVE_ENDPOINT}")"
   pve_port="$(_endpoint_port "${PVE_ENDPOINT}")"
-  dns_rule_line="$(_expected_dns_rule_line "${pve_host}")"
+
+  [[ -n "${RESOLVED_PVE_IPS_LIST}" ]] \
+    || die "internal error: RESOLVED_PVE_IPS_LIST was not set by phase10_firewall before firewall verification"
+  local -a resolved_ips=()
+  while IFS= read -r ip; do
+    [[ -n "${ip}" ]] && resolved_ips+=("${ip}")
+  done <<<"${RESOLVED_PVE_IPS_LIST}"
+
+  local dns_rule_lines
+  dns_rule_lines="$(_expected_dns_rule_lines "${pve_host}")"
 
   local -a expected_input=(
     "ip saddr ${HA_SOURCE_CIDR} tcp dport 8787 accept"
     "tcp dport 8787 drop"
   )
-  local -a expected_output=(
-    "meta skuid \"hubinetops\" ip daddr ${pve_host} tcp dport ${pve_port} accept"
-  )
-  if [[ -n "${dns_rule_line}" ]]; then
-    expected_output+=("${dns_rule_line}")
+  local -a expected_output=()
+  local ip
+  for ip in "${resolved_ips[@]}"; do
+    expected_output+=("meta skuid \"hubinetops\" ip daddr ${ip} tcp dport ${pve_port} accept")
+  done
+  if [[ -n "${dns_rule_lines}" ]]; then
+    local dns_line
+    while IFS= read -r dns_line; do
+      [[ -n "${dns_line}" ]] && expected_output+=("${dns_line}")
+    done <<<"${dns_rule_lines}"
   fi
   expected_output+=('meta skuid "hubinetops" drop')
 

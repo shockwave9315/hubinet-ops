@@ -23,8 +23,20 @@ SOURCE_HEAD_SHA=""
 # _plan_source_commit: read-only. Validates the git checkout, the clean
 # worktree requirement, and (if given) --expected-sha; determines the
 # exact commit that WILL be deployed and records it in SOURCE_HEAD_SHA so
-# it can be shown in the pre-confirmation plan. No mutation. Must run
-# before confirm_or_abort.
+# it can be shown in the pre-confirmation plan. No mutation, no prompt of
+# its own. Must run before confirm_or_abort.
+#
+# UX Hardening 6: this function no longer asks its own separate "Deploy
+# exactly this commit?" confirmation. The detected SHA is validated here
+# and then surfaced in the single upfront plan
+# (bootstrap-proxmox-0.5.sh's "Plan: ..." line) alongside the VMID,
+# template, storage, network, PVE endpoint, TLS strategy, and HA source
+# CIDR -- one "Proceed with this plan?" confirmation authorizes all of it
+# together, rather than two separate prompts in a row. --yes may skip
+# that one remaining prompt (interactive invocations only), but never
+# bypasses the validation above: a dirty tree, a non-git SOURCE_DIR, or an
+# --expected-sha mismatch is unconditionally fatal regardless of --yes,
+# and --non-interactive still unconditionally requires --expected-sha.
 _plan_source_commit() {
   git -C "${SOURCE_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "SOURCE_DIR (${SOURCE_DIR}) is not a git checkout -- this bootstrap only deploys from a real git checkout so the exact deployed commit can be verified via 'git archive <confirmed-sha>'. A non-git tarball fallback is not supported."
@@ -43,19 +55,10 @@ _plan_source_commit() {
       || die "SOURCE_DIR HEAD (${head_sha}) does not match --expected-sha (${EXPECTED_SOURCE_SHA}) -- refusing to deploy an unconfirmed commit"
   elif [[ "${BOOTSTRAP_NON_INTERACTIVE}" == "1" ]]; then
     die "--non-interactive requires --expected-sha <full-40-character-sha> so the deployed source commit is explicitly authorized rather than merely whatever HEAD happens to be at run time"
-  else
-    [[ -t 0 ]] || die "no --expected-sha given and no controlling terminal to confirm the detected source commit interactively"
-    log_info "Detected source commit: ${head_sha}"
-    local reply
-    read -r -p "Deploy exactly this commit (${head_sha})? [y/N] " reply
-    case "${reply}" in
-      y|Y|yes|YES) : ;;
-      *) die "aborted by operator -- detected source commit ${head_sha} was not confirmed" ;;
-    esac
   fi
 
   SOURCE_HEAD_SHA="${head_sha}"
-  log_info "Deploying source commit: ${SOURCE_HEAD_SHA}"
+  log_info "Detected source commit: ${SOURCE_HEAD_SHA}"
 }
 
 CT_SRC_TARBALL_HOST=""

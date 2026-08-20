@@ -46,9 +46,12 @@ Hubinet Ops's own GET-only production PVE transport
 ## Usage
 
 Interactive (asks for the Home Assistant source CIDR, static network
-details if you choose static networking, and confirmation of the detected
-source commit; every other value has a sensible auto-detected or
-documented default, including the container's VMID):
+details if you choose static networking, and exactly **one** upfront
+confirmation of the complete plan -- VMID, template, storage, network, PVE
+endpoint, TLS strategy, the detected source commit, and the HA source CIDR
+all together, not a separate prompt per item; every other value has a
+sensible auto-detected or documented default, including the container's
+VMID):
 
 ```bash
 sudo bash deploy/bootstrap-proxmox-0.5.sh
@@ -123,6 +126,15 @@ On the Proxmox host:
   privilege keys is **exactly** `{Sys.Audit, VM.Audit}` — an exact-set
   equality proof, not a check against a fixed list of privileges to
   avoid, so any unexpected privilege of any name fails the run closed.
+  A random per-run identifier is embedded in the user's and token's own
+  `--comment` — see "Ownership and rollback" below for why.
+- Preflight's storage free-space check compares `pvesm status`'s
+  Total/Used/Available columns correctly as **KiB** (PVE's actual unit for
+  those columns) against the requested rootfs size — an earlier version of
+  this check compared them as bytes, understating available space by
+  roughly 1024x and falsely rejecting ordinary real storage. An
+  unparseable Available value is a hard stop, never a silently-skipped
+  check.
 - Inside the CT: `nftables`, `curl`, and `iproute2` are explicitly
   installed and their presence verified (never assumed present on the
   base template) before the firewall and acceptance phases depend on
@@ -140,10 +152,30 @@ On the Proxmox host:
   configured with (never an independently hardcoded `8006` — derived from
   `--pve-endpoint`; defaults to `8006` only when the endpoint itself
   omits a port), plus, only if the endpoint is configured as a hostname
-  rather than a literal IP, a narrowly-scoped DNS-resolver allow rule —
-  the same model documented in `deploy/README-0.5-firewall.md`. Post-
-  activation verification checks the exact rule content **and order**
+  rather than a literal IP, a narrowly-scoped DNS-resolver allow rule (both
+  UDP and TCP port 53, since a legitimate DNS response can require TCP
+  fallback) — the same model documented in `deploy/README-0.5-firewall.md`.
+  Post-activation verification checks the exact rule content **and order**
   within each chain, not a loose substring match.
+
+  **Hostname PVE endpoints** are resolved to concrete IPv4 addresses
+  *inside the CT's own network/resolver context* (via
+  `deploy/lib/hubinet-ops-bootstrap-resolve-dns.py`) *before* the firewall
+  ruleset is generated, and one exact egress-allow rule is written per
+  resolved address — nftables itself resolves a bare hostname in an
+  address expression to numeric addresses at rule-load time, and
+  `nft list ruleset` afterward reports only the numeric address, never the
+  hostname text, so an exact-text verifier comparing against the literal
+  hostname would otherwise fail closed against an entirely valid
+  configuration. Zero resolved addresses, or a resolution failure, is
+  always a hard stop. **This resolved address set is fixed for the
+  lifetime of the CT** — if internal DNS later moves the hostname to a new
+  address, re-run this bootstrap to regenerate the firewall before the
+  service can reach the new address; it is never silently re-resolved
+  after the fact. The R0 runtime's own configured `pve_endpoint` (used for
+  TLS certificate hostname verification) always stays the original
+  hostname — only the firewall's permitted destination addresses are
+  affected by this resolution step.
 
 ## Source provenance
 
@@ -151,10 +183,15 @@ This bootstrap deploys **only** from a real git checkout with a **clean**
 working tree, at an exact commit you have explicitly confirmed:
 
 - The script computes the full 40-character HEAD SHA of `--source-dir`.
-- **Interactive mode**: the detected SHA is printed and you must confirm
-  it explicitly before anything is created.
+- **Interactive mode**: the detected SHA is validated and printed as part
+  of the single upfront plan; confirming that one plan (see "Usage" above)
+  is what authorizes deploying exactly that commit -- there is no separate
+  second "deploy this commit?" prompt.
 - **Non-interactive mode**: you must pass `--expected-sha <full-sha>`; the
-  script fails closed if it does not match HEAD exactly.
+  script fails closed if it does not match HEAD exactly. `--yes` never
+  substitutes for this -- an interactive run with `--yes` still validates
+  the detected commit (clean tree, real git checkout) exactly the same
+  way, it only skips the one remaining confirmation prompt.
 - A dirty working tree (any uncommitted change) is always a hard stop.
 - The transfer itself uses `git archive <the-confirmed-sha>` (never a
   moving `HEAD` reference, and never a non-git tarball fallback — an
@@ -225,7 +262,11 @@ script from a real, trusted git checkout of this repository.
 
 The final gate before CT `onboot=1` is enabled runs
 `deploy/lib/hubinet-ops-bootstrap-accept.py` **inside** the new container
-(python3, already guaranteed present by `install-0.5.0-fresh.sh`). It:
+(python3, already guaranteed present by `install-0.5.0-fresh.sh`). It
+proves a genuinely **committed, fresh, current** discovery success — not
+merely `health == "healthy"` in isolation, which alone cannot distinguish
+a committed/fresh/current result from a stale or partially-updated
+combination of independently-updated fields:
 
 1. Calls the authenticated `GET /r0/v1/backend` endpoint and validates a
    real, non-empty `backend_instance_id`.
@@ -235,33 +276,83 @@ The final gate before CT `onboot=1` is enabled runs
    `app/inventory/publication.py` and
    `custom_components/hubinet_ops/contract/enums.py` in this repository —
    never a substring match against raw HTTP output.
-3. Requires the configured source to report `SourceHealth.HEALTHY` with a
-   matching display name. `SourceHealth.SOURCE_UNAVAILABLE` and
-   `SourceHealth.CONFIGURATION_ERROR` are terminal failures (never
-   retried); `NOT_YET_OBSERVED` and `DEGRADED` are treated as legitimate
-   transient states worth polling through, up to the timeout.
-4. For every resource the backend reports (zero is a legitimate result on
-   a fresh install), validates `state_level == "discovered"`,
-   `security_continuity != "trusted"`, and that `effective_capabilities`
-   is empty.
+3. Requires the configured source to report `SourceHealth.HEALTHY` and
+   `SourceFreshness.FRESH` with a matching display name.
+   `SourceHealth.SOURCE_UNAVAILABLE` and `SourceHealth.CONFIGURATION_ERROR`
+   are terminal failures (never retried); `NOT_YET_OBSERVED`, `DEGRADED`,
+   and healthy-but-stale are all treated as legitimate transient states
+   worth polling through, up to the timeout.
+4. Requires `latest_completed_outcome == "success"` (the literal value
+   only a genuine committed success sets — never `"invalid"`/`"partial"`/
+   `"configuration_error"`/`"source_unavailable"` from a degraded or
+   rejected completion path), a real positive `last_committed_run_sequence`,
+   a non-null `last_successful_observed_at`, and a non-null
+   `committed_context` that matches `current_context` field-for-field
+   (`source_config_revision`, `endpoint_id`, `canonical_transport_locator`,
+   `canonicalization_contract_version`, `transport_trust_revision`) —
+   proving the committed state corresponds to the currently active
+   configuration, not a stale prior commit.
+5. Requires `nodes` to be a non-empty list — a real PVE source necessarily
+   has at least its own node; an empty `nodes[]` after an otherwise-healthy
+   commit is suspicious and withheld from PASS. `resources[]` is
+   deliberately **not** required to be non-empty (a fresh install may
+   legitimately have zero guests yet).
+6. For every resource the backend reports, validates
+   `state_level == "discovered"`, `security_continuity != "trusted"`,
+   `presence != "confirmed_removed"`, and that `effective_capabilities` is
+   empty.
 
 An unauthenticated `GET /r0/v1/health` response alone (checked earlier,
 as a fast liveness probe) is **not** sufficient for a pass. A source stuck
-in `not_yet_observed`, a terminal failure health state, an authentication
-failure, or a TLS failure never yields `Discovery: PASS`, and CT `onboot`
-is never enabled unless this check actually returns success.
+in `not_yet_observed`, stale, an unsuccessful completion outcome, a
+missing or mismatched committed context, zero nodes, a terminal failure
+health state, an authentication failure, or a TLS failure never yields
+`Discovery: PASS`, and CT `onboot` is never enabled unless this check
+actually returns success. This script only ever reads the already-
+published snapshot (`app/inventory/publication.py`'s read side) — it does
+not activate attestation and does not change runtime architecture.
+
+## Ownership and rollback (PVE identity)
+
+The fixed-name PVE user/role/token this bootstrap creates live in a
+**cluster-wide** identity namespace — two concurrent bootstrap runs (same
+or different node), or any other creator, can race for that same name.
+PVE itself resolves the race (only one `pveum user add` can win), but the
+*losing* run's own call then fails with the object now existing regardless
+— and rollback must never assume "an object matching our fixed name
+exists" means "this run created it."
+
+The fix: a random per-invocation `BOOTSTRAP_RUN_ID` is embedded in every
+PVE object comment this bootstrap creates that supports one (the user, the
+token — PVE roles have no comment/description field at all). On any
+failure, rollback deletes an object only if this run can **prove**
+ownership:
+
+- a clean success already recorded in this run's own internal ledger, or
+- for an ambiguous mutate-then-error result (this run's own call reported
+  failure, but the object now exists), a read-back comment carrying this
+  exact run's `BOOTSTRAP_RUN_ID` — which only this run's own successful
+  create call could have written.
+
+An object that cannot be proven owned this way is **preserved**, never
+deleted, with a loud log message giving the exact manual-remediation
+command to inspect and remove it yourself if you confirm it is safe. PVE
+roles, having no provenance field at all, can only ever be proven owned
+via the ledger — an ambiguous role-creation failure is always preserved.
 
 ## Failure and rollback behavior
 
 - **Before the service ever goes live** (any failure through the end of
   phase 10), nothing is exposed: the service is never started, and CT
   `onboot` is never enabled until phase 13, the very last step.
-- **PVE identity objects this run may have touched are always rolled back
-  automatically** on any failure, gated on an "attempted" marker recorded
-  *before* the first mutating call in that phase (not a success-only
-  marker recorded after) — so a `pveum` command that mutates state but
-  still reports a nonzero exit for an unrelated reason is still cleaned
-  up. Every rollback action is idempotent.
+- **PVE identity objects this run can prove it owns are rolled back
+  automatically** on any failure (see "Ownership and rollback" above),
+  gated on an "attempted" marker recorded *before* the first mutating call
+  in that phase (not a success-only marker recorded after) — so a `pveum`
+  command that mutates state but still reports a nonzero exit for an
+  unrelated reason is still evaluated for cleanup. Every rollback action
+  is idempotent. An object this run cannot prove it owns is always
+  preserved, never deleted.
 - **The container itself is preserved by default** on failure, for
   forensic diagnosis (its Hubinet Ops service, if it was ever touched, is
   stopped and disabled; its `onboot` is forced back to `0`). Pass
@@ -320,7 +411,21 @@ full manual verification procedure this script automates.
   `tests/shell/run_bootstrap_smoke_sandbox.sh`'s ephemeral-CI-only Docker
   sandbox). Real PVE-specific behavior this cannot exercise (exact `nft
   list ruleset` textual formatting, real `pveam`/`pvesh` output shapes,
-  etc.) is a known residual risk before a first real run.
+  real DNS resolution behavior inside a fresh Debian 13 CT, etc.) is a
+  known residual risk before a first real run — see the REAL-HOST
+  PRECHECK block in this branch's corrective-pass reports for read-only
+  commands to sanity-check these assumptions manually before a first real
+  run.
+- `.github/workflows/bootstrap-smoke.yml` wires the compliant sandbox
+  (`tests/shell/run_bootstrap_smoke_sandbox.sh`) into GitHub Actions,
+  narrowly path-filtered to bootstrap/sandbox-related changes and
+  triggered on `pull_request` (plus manual `workflow_dispatch`) — the
+  workflow itself sets only the `HUBINET_OPS_EPHEMERAL_CI=1` marker the
+  launcher requires and invokes the launcher unmodified; it never sets
+  `HUBINET_OPS_SYSTEM_SANDBOX` directly. As of this writing the workflow
+  is wired but has not yet actually executed in a real GitHub Actions run
+  (no PR has been opened) — treat that CI gate as **pending**, not passed,
+  until it has.
 
 ## After a successful run
 
@@ -351,3 +456,56 @@ Assistant instance still has the legacy 0.4 package/dashboard installed).
 - A signed-release / `curl | bash` one-line distribution path — deferred
   as future packaging work; run this script from a real, trusted git
   checkout of this repository for now.
+
+## REAL-HOST PRECHECK
+
+Read-only, non-mutating commands to run **manually, yourself**, on a real
+lab Proxmox host before a first real bootstrap run — to sanity-check the
+assumptions this bootstrap's hermetic test harness cannot exercise (real
+`pveum`/`pveam`/`pvesh`/`pvesm` output shapes, real DNS resolution
+behavior, etc.). None of these mutate anything. An agent session must
+never run these against a real host itself — this list is for your own
+manual use.
+
+```bash
+# Next-free VMID mechanism (Blocker: removed the hardcoded VMID=110 default)
+pvesh get /cluster/nextid --output-format json
+
+# pveum JSON output support, and the exact shape of user/token listings
+# (including the `comment` field the ownership-proof mechanism reads back)
+pveum user list --output-format json
+pveum role list --output-format json
+pveum user token permissions <existing-user> <existing-token> \
+  --path / --output-format json
+
+# Storage capacity reporting -- CONFIRM these Total/Used/Available values
+# are in KiB on your PVE version, matching what
+# deploy/lib/bootstrap-preflight.sh::_storage_has_free_space now assumes
+# (Blocker 1: an earlier version of this parser incorrectly treated this
+# column as bytes)
+pvesm status --content rootdir
+pvesm status --content vztmpl
+pvesm status --storage <your-target-storage>
+
+# Template listing/naming convention
+pveam list local
+pveam available --section system | grep -i debian-13
+
+# PVE CA trust material
+ls -la /etc/pve/pve-root-ca.pem
+
+# jq/python3 availability (required by phase 1 preflight on the PVE host
+# itself, for the effective-permission exact-set check)
+command -v jq; command -v python3; python3 --version
+
+# nftables availability (required inside the CT, provisioned by phase 8b)
+nft --version
+
+# Hostname PVE endpoint resolution sanity check (Blocker 4) -- if you plan
+# to use a hostname --pve-endpoint, confirm it resolves the way
+# deploy/lib/hubinet-ops-bootstrap-resolve-dns.py will resolve it INSIDE a
+# fresh CT (i.e. using that CT's own resolver configuration, which may
+# differ from the PVE host's own resolver):
+#   pct exec <a-test-ct> -- python3 -c \
+#     "import socket; print(sorted({i[4][0] for i in socket.getaddrinfo('<your-pve-hostname>', 443, socket.AF_INET, socket.SOCK_STREAM)}))"
+```

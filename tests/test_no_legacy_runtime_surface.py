@@ -93,7 +93,16 @@ _PROHIBITED_PATH_PREFIXES = (
     "scripts/validate_rollout_state_0_4_",
     "scripts/validate_managed_profiles",
     "scripts/validate_pve_snapshot_policy",
-    "scripts/validate_hermetic_shell_boundary",
+    # NOT "scripts/validate_hermetic_shell_boundary" -- deliberately
+    # removed from this list. It was correctly prohibited when it was
+    # purely legacy 0.4 shell-smoke tooling; it has since been
+    # deliberately restored (verified generic, script-path-argument-only,
+    # no hardcoded legacy file list, no 0.4-specific behavior) as current
+    # 0.5 tooling backing the R0 Proxmox bootstrap's deployment-script
+    # sandbox boundary (deploy/bootstrap-proxmox-0.5.sh,
+    # tests/test_bootstrap_proxmox_0_5_smoke.py). This is a reviewed
+    # architectural exception, not a silent regression -- do not re-add it
+    # here without an equally deliberate reason.
 )
 
 # Deliberately narrow prefixes only: each names the exact retired 0.x

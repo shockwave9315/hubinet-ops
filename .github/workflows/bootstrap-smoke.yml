@@ -1,0 +1,52 @@
+name: Bootstrap Smoke (Sandbox)
+
+# Runs tests/test_bootstrap_proxmox_0_5_smoke.py -- the only test file that
+# executes deploy/bootstrap-proxmox-0.5.sh for real -- through the
+# AGENTS.md-mandated Docker sandbox (tests/shell/run_bootstrap_smoke_sandbox.sh).
+# That launcher is the single system-enforced entry boundary: this workflow
+# invokes it and nothing else, and never sets HUBINET_OPS_SYSTEM_SANDBOX
+# directly (only the launcher, running inside its own Docker container, is
+# permitted to do that).
+#
+# Narrowly path-filtered and pull_request-only (never on every push, never
+# on unrelated app-only/documentation-only changes) so this expensive
+# Docker job only runs when it could actually be affected.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/bootstrap-proxmox-0.5.sh"
+      - "deploy/lib/bootstrap-*.sh"
+      - "deploy/lib/hubinet-ops-bootstrap-accept.py"
+      - "tests/_bootstrap_fake_pve.py"
+      - "tests/test_bootstrap_proxmox_0_5_smoke.py"
+      - "tests/shell/**"
+      - "scripts/validate_hermetic_shell_boundary.py"
+      - "AGENTS.md"
+      - ".github/workflows/bootstrap-smoke.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bootstrap-smoke-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap-smoke:
+    # Must be GitHub-hosted: tests/shell/run_bootstrap_smoke_sandbox.sh
+    # itself checks RUNNER_ENVIRONMENT == github-hosted and fails closed
+    # otherwise -- GitHub Actions sets that (and GITHUB_ACTIONS,
+    # GITHUB_RUN_ID) automatically on every run, so this workflow only
+    # needs to add the one workflow-owned marker the launcher additionally
+    # requires: HUBINET_OPS_EPHEMERAL_CI=1.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      HUBINET_OPS_EPHEMERAL_CI: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the one whole bootstrap smoke matrix through the compliant sandbox
+        run: bash tests/shell/run_bootstrap_smoke_sandbox.sh

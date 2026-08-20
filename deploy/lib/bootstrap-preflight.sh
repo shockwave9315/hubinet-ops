@@ -142,14 +142,25 @@ _storage_supports_rootdir() {
     | awk -v want="${storage}" 'NR>1 && $1==want {found=1} END {exit found ? 0 : 1}'
 }
 
+# _storage_has_free_space: `pvesm status`'s Total/Used/Available columns
+# are reported in KiB (1024-byte units) by PVE, NOT bytes -- confirmed
+# against real `pvesm status` output. A prior version of this function
+# compared a byte-scaled requirement against this KiB-scaled value
+# directly, which understated available space by a factor of ~1024 (an
+# 8 GiB request was effectively compared as if it needed ~8 TiB free) and
+# would have falsely rejected ordinary real Proxmox storage. Fail closed
+# (never silently skip the check) if the reported value cannot be
+# reliably parsed as an integer -- a preflight capacity check that can be
+# silently bypassed by an unexpected output shape is not a real gate.
 _storage_has_free_space() {
   local storage="$1" required_gib="$2"
-  local required_bytes=$(( required_gib * 1024 * 1024 * 1024 ))
+  local required_kib=$(( required_gib * 1024 * 1024 ))
   # pvesm status columns: Name Type Status Total Used Available %
-  local avail_bytes
-  avail_bytes="$(pvesm status --storage "${storage}" 2>/dev/null | awk 'NR==2 {print $6}')"
-  [[ "${avail_bytes}" =~ ^[0-9]+$ ]] || { log_warn "could not parse free space for storage '${storage}' -- skipping this check"; return 0; }
-  (( avail_bytes >= required_bytes ))
+  local avail_kib
+  avail_kib="$(pvesm status --storage "${storage}" 2>/dev/null | awk 'NR==2 {print $6}')"
+  [[ "${avail_kib}" =~ ^[0-9]+$ ]] \
+    || die "could not reliably parse available free space for storage '${storage}' from 'pvesm status --storage ${storage}' (expected an integer KiB value in column 6) -- refusing to guess; verify the storage and PVE version manually, or pass a different --storage"
+  (( avail_kib >= required_kib ))
 }
 
 _bridge_exists() {

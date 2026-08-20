@@ -1,20 +1,32 @@
 """Local-safe tests for deploy/bootstrap-proxmox-0.5.sh.
 
 Per AGENTS.md's deployment-script sandbox boundary, NO test in this file
-ever executes deploy/bootstrap-proxmox-0.5.sh (or sources any deploy/lib/
-bootstrap-*.sh phase module) as a real subprocess -- not even against the
-hermetic fake-command PATH in tests/_bootstrap_fake_pve.py. That category
-of test (the actual functional matrix: preflight, container creation, PVE
-identity, TLS, config generation, firewall, rollback, acceptance) lives in
+ever executes deploy/bootstrap-proxmox-0.5.sh itself, or invokes any
+`phase*`/orchestration function from a deploy/lib/bootstrap-*.sh module,
+as a real subprocess -- not even against the hermetic fake-command PATH in
+tests/_bootstrap_fake_pve.py. That category of test (the actual functional
+matrix: preflight orchestration, container creation, PVE identity, TLS,
+config generation, firewall, rollback, acceptance) lives in
 tests/test_bootstrap_proxmox_0_5_smoke.py instead, which only ever runs
 inside the Docker-based ephemeral-CI sandbox (see
 tests/shell/run_bootstrap_smoke_sandbox.sh) and is a hard pytest skip
 everywhere else -- see test_smoke_suite_is_sandbox_gated below, which
 proves that structurally rather than by convention.
 
-Everything in this file is either: a pure syntax check (`bash -n`, never
-executes script content), a lexical/static text scan of the script source,
-or a check that the sandbox infrastructure itself is present and
+Narrow, deliberate exception: a handful of tests in this file (see
+TestStorageFreeSpaceHelper) source ONLY bootstrap-common.sh plus a single
+named, non-mutating, pure validation/arithmetic function from a lib module
+(e.g. `_storage_has_free_space`) in a bash subshell, then call that one
+function directly against a minimal single-purpose fake `pvesm` on an
+isolated PATH -- never `phase1_preflight` itself, never any orchestration,
+never a mutating pct/pveum/pveam call. This tests the exact unit-parsing
+logic AGENTS.md's sandbox boundary is not concerned with (it targets real
+privileged/deployment command execution, not bash arithmetic on a string),
+while remaining strictly local-safe.
+
+Everything else in this file is either: a pure syntax check (`bash -n`,
+never executes script content), a lexical/static text scan of the script
+source, or a check that the sandbox infrastructure itself is present and
 consistent. tests/_bootstrap_fake_pve.py (the fake command layer used by
 the sandboxed smoke suite) is imported here only for its constants/scenario
 builders where useful for static assertions -- never to actually run the
@@ -47,6 +59,7 @@ VALIDATOR = REPO_ROOT / "scripts" / "validate_hermetic_shell_boundary.py"
 SANDBOX_DOCKERFILE = REPO_ROOT / "tests" / "shell" / "Dockerfile.bootstrap-smoke"
 SANDBOX_RUNNER = REPO_ROOT / "tests" / "shell" / "run_bootstrap_smoke_sandbox.sh"
 SANDBOX_ENTRYPOINT = REPO_ROOT / "tests" / "shell" / "bootstrap_smoke_sandbox_entrypoint.sh"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "bootstrap-smoke.yml"
 
 pytestmark = pytest.mark.skipif(
     __import__("shutil").which("bash") is None, reason="bash is not available in this environment"
@@ -140,6 +153,80 @@ def test_smoke_suite_is_sandbox_gated():
 def test_sandbox_infrastructure_files_exist():
     for path in (SANDBOX_DOCKERFILE, SANDBOX_RUNNER, SANDBOX_ENTRYPOINT):
         assert path.exists(), f"missing sandbox infrastructure file: {path}"
+
+
+# ---------------------------------------------------------------------------
+# CI wiring: the real Docker sandbox must actually be invoked from a GitHub
+# Actions workflow (merge-safety gate), narrowly path-scoped, and must
+# never bypass the launcher by setting HUBINET_OPS_SYSTEM_SANDBOX directly.
+# ---------------------------------------------------------------------------
+
+
+def test_ci_workflow_exists_and_is_valid_yaml():
+    assert CI_WORKFLOW.exists(), "bootstrap-smoke CI workflow is missing"
+    import yaml
+
+    with CI_WORKFLOW.open(encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    assert isinstance(doc, dict)
+
+
+def test_ci_workflow_invokes_the_launcher_and_nothing_else():
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    assert "run_bootstrap_smoke_sandbox.sh" in text
+    # The launcher must remain the single system-enforced entry boundary --
+    # this workflow must never set HUBINET_OPS_SYSTEM_SANDBOX itself (only
+    # the launcher, from inside its own Docker container, may do that).
+    # Comment-only lines are stripped first so this doesn't false-positive
+    # on this file's own explanatory prose naming that exact anti-pattern.
+    code_text = "\n".join(
+        line for line in text.splitlines() if not line.strip().startswith("#")
+    )
+    assert "HUBINET_OPS_SYSTEM_SANDBOX" not in code_text
+
+
+def test_ci_workflow_sets_the_required_ephemeral_ci_marker():
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    assert "HUBINET_OPS_EPHEMERAL_CI" in text
+    assert "runs-on: ubuntu-latest" in text or "runs-on: ubuntu-" in text
+
+
+def test_ci_workflow_is_narrowly_path_scoped():
+    import yaml
+
+    with CI_WORKFLOW.open(encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    # YAML parses the bare `on:` key as the boolean True key under Python's
+    # yaml.safe_load (YAML 1.1 boolean-like scalar) -- look it up either way.
+    triggers = doc.get("on", doc.get(True))
+    assert "pull_request" in triggers, "workflow must trigger on pull_request"
+    paths = triggers["pull_request"].get("paths", [])
+    expected_substrings = (
+        "deploy/bootstrap-proxmox-0.5.sh",
+        "deploy/lib/bootstrap-*.sh",
+        "hubinet-ops-bootstrap-accept.py",
+        "tests/_bootstrap_fake_pve.py",
+        "tests/test_bootstrap_proxmox_0_5_smoke.py",
+        "tests/shell/",
+        "scripts/validate_hermetic_shell_boundary.py",
+        "AGENTS.md",
+    )
+    joined = " ".join(paths)
+    for expected in expected_substrings:
+        assert expected in joined, f"CI workflow path filter is missing coverage for: {expected}"
+    # Not triggered on every push -- this is a narrowly-scoped, PR-only,
+    # expensive Docker job, never a blanket "every branch push" trigger.
+    assert "push" not in triggers or "branches" in triggers.get("push", {})
+
+
+def test_ci_workflow_has_concurrency_cancellation():
+    import yaml
+
+    with CI_WORKFLOW.open(encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    concurrency = doc.get("concurrency")
+    assert concurrency is not None, "workflow should cancel superseded runs to avoid burning CI minutes"
+    assert concurrency.get("cancel-in-progress") is True
 
 
 def test_sandbox_runner_fails_closed_outside_ephemeral_ci():
@@ -237,8 +324,100 @@ def test_accept_script_syntax_is_valid():
 
 
 # ---------------------------------------------------------------------------
-# Static security/content checks
+# Pure-helper unit tests -- source ONLY bootstrap-common.sh + the single
+# named function under test, never a phase/orchestration entrypoint. See
+# this file's module docstring for why this stays local-safe.
 # ---------------------------------------------------------------------------
+
+
+def _run_pure_helper(tmp_path, call_expr, *, pvesm_output=None, pvesm_exit=0):
+    """Source bootstrap-common.sh + bootstrap-preflight.sh (function
+    definitions only -- inert to source), install a minimal single-purpose
+    fake `pvesm` on an isolated PATH, then evaluate `call_expr` (expected
+    to be exactly one call to a named pure helper function) and return the
+    completed subprocess. No phase function, no orchestration, no other
+    privileged command is ever invoked.
+    """
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    pvesm_shim = bin_dir / "pvesm"
+    if pvesm_output is None:
+        body = f'exit {pvesm_exit}\n'
+    else:
+        body = f"cat <<'PVESM_EOF'\n{pvesm_output}\nPVESM_EOF\nexit {pvesm_exit}\n"
+    pvesm_shim.write_text(f"#!/usr/bin/env bash\n{body}", encoding="utf-8")
+    pvesm_shim.chmod(0o755)
+
+    # Deliberately not named `script` -- that identifier is reserved by
+    # test_this_file_never_spawns_the_real_bootstrap_script's AST guard
+    # below to mean "a bootstrap script path/variable"; this is a small,
+    # inline, function-only bash snippet with no relation to the real
+    # production script and must not trip that guard.
+    bash_snippet = (
+        f'source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"\n'
+        f'source "{(LIB_DIR / "bootstrap-preflight.sh").as_posix()}"\n'
+        f"{call_expr}\n"
+        "exit $?\n"
+    )
+    import os as _os
+
+    env = dict(_os.environ)
+    env["PATH"] = f"{bin_dir}{_os.pathsep}{env.get('PATH', '')}"
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15, env=env,
+    )
+
+
+class TestStorageFreeSpaceHelper:
+    """Mandatory storage-KiB fix: `pvesm status` reports Total/Used/
+    Available in KiB, not bytes. A prior version of `_storage_has_free_space`
+    compared a byte-scaled requirement against the raw KiB value directly,
+    understating available space by ~1024x (an 8 GiB request was effectively
+    compared as if it needed ~8 TiB free) -- these tests pin the corrected
+    KiB-to-KiB comparison and the fail-closed-on-unparseable behavior using
+    only this one pure function, never the full bootstrap script.
+    """
+
+    _HEADER = "Name Type Status Total Used Available %"
+
+    def test_realistic_kib_available_passes(self, tmp_path):
+        # 100 GiB available (in KiB) satisfies an 8 GiB request.
+        avail_kib = 100 * 1024 * 1024
+        output = f"{self._HEADER}\nfakestorage dir active 200000000 100000000 {avail_kib} 1.00"
+        result = _run_pure_helper(
+            tmp_path, '_storage_has_free_space "fakestorage" 8', pvesm_output=output,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_insufficient_kib_available_fails(self, tmp_path):
+        # 7 GiB available (in KiB), 8 GiB requested.
+        avail_kib = 7 * 1024 * 1024
+        output = f"{self._HEADER}\nfakestorage dir active 200000000 193000000 {avail_kib} 96.5"
+        result = _run_pure_helper(
+            tmp_path, '_storage_has_free_space "fakestorage" 8', pvesm_output=output,
+        )
+        assert result.returncode != 0
+
+    def test_malformed_available_value_fails_closed(self, tmp_path):
+        # A prior version logged a warning and returned success (silently
+        # SKIPPING the check) on an unparseable value -- that false-pass
+        # must never happen again.
+        output = f"{self._HEADER}\nfakestorage dir active 200000000 N/A N/A N/A"
+        result = _run_pure_helper(
+            tmp_path, '_storage_has_free_space "fakestorage" 8', pvesm_output=output,
+        )
+        assert result.returncode != 0
+        assert "could not reliably parse available free space" in result.stderr
+
+    def test_borderline_kib_available_is_a_pass_at_exact_equality(self, tmp_path):
+        # 8 GiB available (in KiB) for an 8 GiB request -- the boundary
+        # condition of the ">=" comparison.
+        avail_kib = 8 * 1024 * 1024
+        output = f"{self._HEADER}\nfakestorage dir active 200000000 192000000 {avail_kib} 96.0"
+        result = _run_pure_helper(
+            tmp_path, '_storage_has_free_space "fakestorage" 8', pvesm_output=output,
+        )
+        assert result.returncode == 0, result.stderr
 
 
 class TestSecurityStatic:

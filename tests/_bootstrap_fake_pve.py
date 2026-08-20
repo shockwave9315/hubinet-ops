@@ -75,9 +75,9 @@ STATE_PATH = Path(os.environ["HUBINET_FAKE_STATE"])
 def _default_state():
     return {
         "vmids": {},
-        "pve_users": [],
+        "pve_users": {},  # userid -> {"comment": str}
         "pve_roles": {},  # rolename -> [privs...]
-        "pve_tokens": [],
+        "pve_tokens": {},  # "user!tokenid" -> {"comment": str}
         "acl_grants": [],  # [{"target": "user:X"|"token:Y", "role": rolename}]
         "nextid_call_count": 0,
     }
@@ -339,8 +339,28 @@ def _exec_inner(vmid, inner, state):
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-accept.py"):
         return _exec_discovery_accept(inner[2:])
 
+    if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-resolve-dns.py"):
+        return _exec_resolve_dns(inner[2:])
+
     _log("pct", "exec", "UNHANDLED", *inner)
     return 2
+
+
+def _exec_resolve_dns(args):
+    # Simulates deploy/lib/hubinet-ops-bootstrap-resolve-dns.py's own
+    # observable contract without performing a real DNS lookup -- driven
+    # by the "dns_resolution" scenario key: {hostname: [ip, ...]}. A
+    # hostname absent from that mapping, or mapped to an empty list,
+    # simulates zero usable A records.
+    host = args[0] if args else ""
+    mapping = SCENARIO.get("dns_resolution", {})
+    addresses = mapping.get(host)
+    if not addresses:
+        print(f"FAIL no-ipv4-addresses-resolved host={host!r}")
+        return 1
+    for ip in sorted(set(addresses)):
+        print(ip)
+    return 0
 
 
 def _exec_apt_get(args):
@@ -366,14 +386,18 @@ def _exec_discovery_accept(args):
     # running it against a real HTTP server -- there is no real
     # /etc/hubinet-ops/agent.env or listening backend inside this
     # simulated container filesystem. Driven by the "discovery_*" scenario
-    # keys; see default_scenario() for the default (immediate healthy
-    # PASS with zero resources, matching the real script's own field
-    # vocabulary).
+    # keys; see default_scenario() for the default (immediate healthy,
+    # fresh, committed PASS with one node and zero resources, matching the
+    # real script's own field vocabulary -- including the strengthened
+    # committed-success proof: latest_completed_outcome, last_committed_
+    # run_sequence, last_successful_observed_at, committed_context ==
+    # current_context, and a non-empty nodes[]).
     expected_name = args[0] if len(args) > 0 else ""
     result = SCENARIO.get("discovery_result", "healthy")
     backend_id = SCENARIO.get("discovery_backend_instance_id", "fake-backend-instance-id")
     source_name = SCENARIO.get("discovery_source_name", expected_name)
     resource_count = SCENARIO.get("discovery_resource_count", 0)
+    node_count = SCENARIO.get("discovery_node_count", 1)
 
     if result == "backend_unreachable":
         print("FAIL backend-endpoint-unreachable simulated")
@@ -399,6 +423,21 @@ def _exec_discovery_accept(args):
     if result == "timeout":
         print("FAIL discovery-timeout last_health=not_yet_observed")
         return 1
+    if result == "healthy_but_stale":
+        print("FAIL discovery-timeout last_health=healthy/stale")
+        return 1
+    if result == "unsuccessful_outcome":
+        print("FAIL latest-completed-outcome-not-success got='partial'")
+        return 1
+    if result == "missing_committed_context":
+        print("FAIL committed-context-missing")
+        return 1
+    if result == "context_mismatch":
+        print("FAIL committed-current-context-mismatch field=source_config_revision committed=1 current=2")
+        return 1
+    if result == "zero_nodes":
+        print("FAIL zero-nodes-after-healthy-commit got=[]")
+        return 1
     if result == "resource_state_level_violation":
         print("FAIL resource-state-level-not-discovered got=managed")
         return 1
@@ -410,7 +449,9 @@ def _exec_discovery_accept(args):
         return 1
     print(
         f"PASS backend_instance_id={backend_id} "
-        f"source_health=healthy resource_count={resource_count}"
+        f"source_health=healthy source_freshness=fresh "
+        f"last_committed_run_sequence=1 "
+        f"node_count={node_count} resource_count={resource_count}"
     )
     return 0
 
@@ -495,25 +536,50 @@ def _exec_curl(vmid, args):
     return 7
 
 
+def _ambiguous_mode(op_key):
+    """None if this op isn't configured for the ownership-race fake path;
+    otherwise "self" (mutate using the REAL argv comment this call
+    received, simulating THIS run's own call silently succeeding server-
+    side despite reporting failure) or a literal replacement comment
+    string (simulating a DIFFERENT/foreign creator -- e.g. a concurrent
+    bootstrap run that won a race for the same fixed name -- having
+    already created the object under a comment that does NOT carry this
+    run's own BOOTSTRAP_RUN_ID). Either way, the op still returns exit 1,
+    matching the real "ambiguous mutate-then-error" PVE behavior this
+    fake exists to simulate. See default_scenario()'s docstring-level
+    comment and tests/test_bootstrap_proxmox_0_5_smoke.py's
+    TestPveIdentityOwnership for how tests use this.
+    """
+    return SCENARIO.get("ambiguous_pveum_ops", {}).get(op_key)
+
+
 def cmd_pveum(args):
     _log("pveum", *args)
     state = _load_state()
 
     if args[:2] == ["user", "list"]:
-        print(json.dumps([{"userid": u} for u in state["pve_users"]]))
+        print(json.dumps([
+            {"userid": u, "comment": info.get("comment", "")}
+            for u, info in state["pve_users"].items()
+        ]))
         return 0
     if args[:2] == ["role", "list"]:
         print(json.dumps([{"roleid": r} for r in state["pve_roles"].keys()]))
         return 0
     if args[:2] == ["user", "add"]:
+        comment = args[args.index("--comment") + 1] if "--comment" in args else ""
+        ambiguous = _ambiguous_mode("user_add")
+        if ambiguous is not None:
+            stored_comment = comment if ambiguous == "self" else ambiguous
+            state["pve_users"][args[2]] = {"comment": stored_comment}
+            _save_state(state)
+            return 1
         if _fail("pveum_user_add"):
             return 1
-        state["pve_users"].append(args[2])
+        state["pve_users"][args[2]] = {"comment": comment}
         _save_state(state)
         return 0
     if args[:2] == ["role", "add"]:
-        if _fail("pveum_role_add"):
-            return 1
         rolename = args[2]
         privs_csv = args[args.index("--privs") + 1] if "--privs" in args else ""
         privs = [p for p in privs_csv.split(",") if p]
@@ -526,6 +592,18 @@ def cmd_pveum(args):
         overrides = SCENARIO.get("role_privs_override", {})
         if rolename in overrides:
             privs = overrides[rolename]
+        ambiguous = _ambiguous_mode("role_add")
+        if ambiguous is not None:
+            # PVE roles have no comment field -- "self" and "foreign" are
+            # indistinguishable for this object type; either way the
+            # mutation still happens (an object now exists) but is
+            # reported as a failure, and ownership can only ever be
+            # decided via this run's own ledger (never proven here).
+            state["pve_roles"][rolename] = privs
+            _save_state(state)
+            return 1
+        if _fail("pveum_role_add"):
+            return 1
         state["pve_roles"][rolename] = privs
         _save_state(state)
         return 0
@@ -557,16 +635,36 @@ def cmd_pveum(args):
             _save_state(state)
         return 0
     if args[:3] == ["user", "token", "add"]:
+        # args shape: user token add <user> <tokenid> --privsep 1 ...
+        user, token_id = args[3], args[4]
+        comment = args[args.index("--comment") + 1] if "--comment" in args else ""
+        full = f"{user}!{token_id}"
+        ambiguous = _ambiguous_mode("token_add")
+        if ambiguous is not None:
+            stored_comment = comment if ambiguous == "self" else ambiguous
+            state["pve_tokens"][full] = {"comment": stored_comment}
+            _save_state(state)
+            return 1
         if _fail("pveum_token_add"):
             return 1
-        token_id = args[3]
-        state["pve_tokens"].append(f"{args[2]}!{token_id}")
+        state["pve_tokens"][full] = {"comment": comment}
         _save_state(state)
         print(json.dumps({
-            "full-tokenid": f"{args[2]}!{token_id}",
+            "full-tokenid": full,
             "info": {"privsep": "1"},
             "value": SCENARIO.get("pve_token_secret", "00000000-0000-0000-0000-000000000000"),
         }))
+        return 0
+    if args[:3] == ["user", "token", "list"]:
+        # args shape: user token list <user> --output-format json
+        user = args[3]
+        prefix = f"{user}!"
+        entries = [
+            {"tokenid": full[len(prefix):], "comment": info.get("comment", "")}
+            for full, info in state["pve_tokens"].items()
+            if full.startswith(prefix)
+        ]
+        print(json.dumps(entries))
         return 0
     if args[:3] == ["user", "token", "permissions"]:
         # args shape: user token permissions <user> <tokenid> --path / ...
@@ -578,6 +676,10 @@ def cmd_pveum(args):
         print(json.dumps({p: 1 for p in sorted(privs)}))
         return 0
     if args[:3] == ["user", "token", "remove"]:
+        # args shape: user token remove <user> <tokenid>
+        full = f"{args[3]}!{args[4]}"
+        state["pve_tokens"].pop(full, None)
+        _save_state(state)
         return 0
     if args[:2] == ["role", "delete"]:
         rolename = args[2]
@@ -587,7 +689,7 @@ def cmd_pveum(args):
     if args[:2] == ["user", "delete"]:
         user = args[2]
         if user in state["pve_users"]:
-            state["pve_users"].remove(user)
+            state["pve_users"].pop(user, None)
             _save_state(state)
         return 0
     _log("pveum", "UNHANDLED", *args)
@@ -650,9 +752,18 @@ def cmd_pvesm(args):
     if args[:1] == ["status"]:
         if "--storage" in args:
             name = args[args.index("--storage") + 1]
-            avail = SCENARIO.get("storage_available_bytes", 100 * 1024 * 1024 * 1024)
+            # Real `pvesm status` reports Total/Used/Available in KiB, not
+            # bytes -- this fake's default and every scenario override
+            # must stay KiB-scaled to actually exercise the production
+            # parser's real unit assumption (a prior version of this fake
+            # used bytes, which never would have caught the KiB unit bug
+            # the production code had).
+            avail_kib = SCENARIO.get("storage_available_kib", 100 * 1024 * 1024)
+            avail_field = str(avail_kib) if avail_kib is not None else SCENARIO.get("storage_available_raw", "not-a-number")
+            total_kib = 200 * 1024 * 1024
+            used_kib = max(total_kib - (avail_kib or 0), 0)
             print("Name Type Status Total Used Available %")
-            print(f"{name} dir active 200000000000 1000000000 {avail} 1.00")
+            print(f"{name} dir active {total_kib} {used_kib} {avail_field} 1.00")
             return 0
         content = args[args.index("--content") + 1] if "--content" in args else "rootdir"
         storages = SCENARIO.get("storages", {}).get(content, [FAKE_STORAGE])
@@ -723,7 +834,8 @@ def default_scenario() -> dict[str, Any]:
         "available_templates": [f"system {FAKE_TEMPLATE_FILENAME}"],
         "bridges": [FAKE_BRIDGE],
         "storages": {"rootdir": [FAKE_STORAGE], "vztmpl": [FAKE_TEMPLATE_STORAGE]},
-        "storage_available_bytes": 100 * 1024 * 1024 * 1024,
+        # KiB, matching real `pvesm status` output -- 100 GiB.
+        "storage_available_kib": 100 * 1024 * 1024,
         "role_privs_override": {},
         "pve_token_secret": FAKE_PVE_TOKEN_SECRET,
         "r0_api_token": FAKE_R0_API_TOKEN,
@@ -813,7 +925,7 @@ def build_fake_pve_environment(tmp_path: Path, scenario: dict[str, Any] | None =
 
     scenario_path.write_text(json.dumps(scenario))
     state_path.write_text(json.dumps({
-        "vmids": {}, "pve_users": [], "pve_roles": {}, "pve_tokens": [],
+        "vmids": {}, "pve_users": {}, "pve_roles": {}, "pve_tokens": {},
         "acl_grants": [], "nextid_call_count": 0,
     }))
     dispatcher_path.write_text(_DISPATCHER_SOURCE, encoding="utf-8")

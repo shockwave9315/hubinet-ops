@@ -88,6 +88,16 @@ BOOTSTRAP_CA_SOURCE_PATH=""
 PVE_TOKEN_SECRET_FILE=""
 DISCOVERY_ACCEPTANCE_SUMMARY=""
 
+# A random per-invocation identifier, embedded into every PVE object
+# comment this bootstrap creates that supports one (user, token) -- the
+# ownership-proof mechanism bootstrap-identity.sh's rollback functions use
+# to distinguish "this run created it" from "an object matching our fixed
+# name merely exists" after an ambiguous mutate-then-error PVE result
+# (e.g. a concurrent bootstrap run racing for the same fixed name). See
+# bootstrap-identity.sh's top-of-file comment and
+# bootstrap-common.sh::_generate_run_id.
+BOOTSTRAP_RUN_ID="$(_generate_run_id)"
+
 usage() {
   cat <<'USAGE'
 Usage: bootstrap-proxmox-0.5.sh [options]
@@ -278,26 +288,70 @@ rollback_on_failure() {
     pct set "${VMID}" --onboot 0 >/dev/null 2>&1 || true
   fi
 
-  # PVE identity objects created in THIS run are always rolled back
-  # automatically: they are cheap to recreate, carry no material forensic
-  # value, and (per the fresh-install-only conflict policy) would block
-  # every future retry if left behind. Gated on the single
-  # "pve-identity-attempted" marker recorded at the top of phase6 (not on
-  # each sub-step's own success-only ledger entry) so a partial success on
-  # the PVE side is still cleaned up; every delete below is already
-  # idempotent (`|| log_warn`, never fatal) since some of these objects
-  # may never have actually been created. Reverse creation order.
+  # PVE identity objects created in THIS run are rolled back automatically
+  # -- but ONLY what this run can PROVE it owns, never merely "whatever
+  # currently exists at our fixed name." A cluster-wide identity namespace
+  # means an ambiguous mutate-then-error result (this run's own `pveum`
+  # call reported failure, but the object now exists) cannot be assumed to
+  # be this run's doing -- it could belong to a concurrent bootstrap run
+  # (or any other creator) that won a race for the same fixed name. See
+  # bootstrap-identity.sh's _user_object_owned_by_this_run /
+  # _token_object_owned_by_this_run / _role_object_owned_by_this_run for
+  # the exact proof each object type supports (comment-embedded
+  # BOOTSTRAP_RUN_ID for user/token; ledger-only for role, which PVE gives
+  # no comment field to prove anything about). Gated on the single
+  # "pve-identity-attempted" marker recorded in phase6 (after its own
+  # pre-existing-conflict checks, before its first mutation) so a partial
+  # success is still evaluated for cleanup; every delete below remains
+  # idempotent (`|| log_warn`) since an OWNED object may still never have
+  # actually been created. Reverse creation order.
   if ledger_has pve-identity-attempted "${PVE_USER:-hubinetops@pve}"; then
-    pveum acl delete / --tokens "${PVE_FULL_TOKEN_ID}" --roles "${PVE_ROLE}" >/dev/null 2>&1 \
-      || log_warn "could not remove ACL grant for token ${PVE_FULL_TOKEN_ID} (may never have existed)"
-    pveum user token remove "${PVE_USER}" "${PVE_TOKEN_ID}" >/dev/null 2>&1 \
-      || log_warn "could not remove token ${PVE_FULL_TOKEN_ID} (may never have existed)"
-    pveum acl delete / --users "${PVE_USER}" --roles "${PVE_ROLE}" >/dev/null 2>&1 \
-      || log_warn "could not remove ACL grant for user ${PVE_USER} (may never have existed)"
-    pveum role delete "${PVE_ROLE}" >/dev/null 2>&1 \
-      || log_warn "could not remove role ${PVE_ROLE} (may never have existed)"
-    pveum user delete "${PVE_USER}" >/dev/null 2>&1 \
-      || log_warn "could not remove user ${PVE_USER} (may never have existed)"
+    local user_owned=0 role_owned=0 token_owned=0
+
+    if _user_object_owned_by_this_run; then
+      user_owned=1
+    else
+      log_warn "PRESERVING PVE user '${PVE_USER}': this run cannot prove it created it (no ledger success record, and no comment carrying run=${BOOTSTRAP_RUN_ID} was found on the existing object) -- it may belong to a concurrent bootstrap run or another creator racing for the same fixed name. Manual remediation: inspect 'pveum user list --output-format json' for '${PVE_USER}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user delete ${PVE_USER}"
+    fi
+
+    if _role_object_owned_by_this_run; then
+      role_owned=1
+    else
+      log_warn "PRESERVING PVE role '${PVE_ROLE}': this run cannot prove it created it (PVE roles carry no comment/provenance field, so ownership can only be proven via this run's own clean success record, which is absent) -- it may belong to a concurrent bootstrap run or another creator. Manual remediation: inspect 'pveum role list' and 'pveum acl list' for '${PVE_ROLE}', confirm provenance yourself, then remove it only if you are certain it is safe: pveum role delete ${PVE_ROLE}"
+    fi
+
+    # Token ownership is checked independently too (not merely inherited
+    # from user_owned) -- only queried once the user itself is proven
+    # ours, since a token can only ever meaningfully exist under a user
+    # this bootstrap itself created.
+    if (( user_owned )); then
+      if _token_object_owned_by_this_run; then
+        token_owned=1
+      else
+        log_warn "PRESERVING PVE token '${PVE_FULL_TOKEN_ID}': this run cannot prove it created it (no ledger success record, and no comment carrying run=${BOOTSTRAP_RUN_ID} was found on the existing object) -- manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}"
+      fi
+    fi
+
+    if (( token_owned )); then
+      pveum acl delete / --tokens "${PVE_FULL_TOKEN_ID}" --roles "${PVE_ROLE}" >/dev/null 2>&1 \
+        || log_warn "could not remove ACL grant for token ${PVE_FULL_TOKEN_ID} (may never have existed)"
+      pveum user token remove "${PVE_USER}" "${PVE_TOKEN_ID}" >/dev/null 2>&1 \
+        || log_warn "could not remove token ${PVE_FULL_TOKEN_ID} (may never have existed)"
+    fi
+    if (( user_owned )); then
+      pveum acl delete / --users "${PVE_USER}" --roles "${PVE_ROLE}" >/dev/null 2>&1 \
+        || log_warn "could not remove ACL grant for user ${PVE_USER} (may never have existed)"
+    fi
+
+    if (( role_owned )); then
+      pveum role delete "${PVE_ROLE}" >/dev/null 2>&1 \
+        || log_warn "could not remove role ${PVE_ROLE} (may never have existed)"
+    fi
+
+    if (( user_owned )); then
+      pveum user delete "${PVE_USER}" >/dev/null 2>&1 \
+        || log_warn "could not remove user ${PVE_USER} (may never have existed)"
+    fi
   fi
 
   # The CT itself is preserved by default for forensic diagnosis --

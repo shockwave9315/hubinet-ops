@@ -221,6 +221,55 @@ sys.exit(0 if any(row.get(field) == value for row in data) else 1)
 ' "${file}" "${field}" "${value}" 2>/dev/null
 }
 
+# _json_list_field_value <file> <match_field> <match_value> <target_field>:
+# prints `target_field` of the first array element whose `match_field`
+# equals `match_value`; empty (and a nonzero exit) if no such element
+# exists or `target_field` is null/absent. Used for PVE ownership-
+# provenance checks (bootstrap-identity.sh) -- e.g. reading back an
+# existing user's/token's own `comment` field to check whether it carries
+# THIS run's random run-id marker.
+_json_list_field_value() {
+  local file="$1" match_field="$2" match_value="$3" target_field="$4"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg mf "${match_field}" --arg mv "${match_value}" --arg tf "${target_field}" \
+      'map(select(.[$mf] == $mv)) | .[0][$tf] // empty' "${file}" 2>/dev/null | tr -d '\r'
+    return
+  fi
+  python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+match_field, match_value, target_field = sys.argv[2], sys.argv[3], sys.argv[4]
+for row in data:
+    if row.get(match_field) == match_value:
+        value = row.get(target_field)
+        if value is not None:
+            print(value)
+        break
+' "${file}" "${match_field}" "${match_value}" "${target_field}" 2>/dev/null | tr -d '\r'
+}
+
+# _generate_run_id: a per-invocation random identifier embedded into PVE
+# object comments (where PVE supports a comment field) so a later rollback
+# can PROVE, via read-only inspection, that a given object was actually
+# created by THIS run -- rather than assuming ownership merely because the
+# object's name matches this bootstrap's fixed naming scheme. See
+# bootstrap-identity.sh's ownership-proof functions and
+# bootstrap-proxmox-0.5.sh's rollback_on_failure for how this closes a
+# real TOCTOU race between two concurrent bootstrap runs (or an unrelated
+# concurrent creator) contending for the same fixed PVE user/role/token
+# name. 16 random bytes hex-encoded via /dev/urandom (always present on a
+# real Linux PVE host); a defensive, still-unpredictable-enough fallback
+# if /dev/urandom is somehow unavailable (never expected in practice).
+_generate_run_id() {
+  local id
+  id="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  if [[ -z "${id}" ]]; then
+    id="$(date +%s%N 2>/dev/null || date +%s)-$$-${RANDOM}${RANDOM}"
+  fi
+  printf '%s' "${id}"
+}
+
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------

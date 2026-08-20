@@ -64,15 +64,28 @@ def _run(env, args, *, source_dir=None, timeout=30, input_text=None):
     argv = ["bash", str(BOOTSTRAP_SCRIPT), *args]
     if source_dir is not None:
         argv += ["--source-dir", str(source_dir)]
-    return subprocess.run(
+    # Bytes mode throughout, decoded manually below -- NOT
+    # subprocess.run(text=True, input=...): on Windows, Python's text-mode
+    # stdin pipe wrapper translates a plain "\n" in `input` to the
+    # platform line separator ("\r\n") when WRITING to the child process,
+    # so a fed answer like "y\n" would actually arrive at bash's `read -r`
+    # as "y\r" -- which fails to match a `y|Y|yes|YES` case pattern (a
+    # real bug this exact form hit once already). Real Linux CI never has
+    # this problem (a POSIX pipe never translates bytes), but this
+    # harness must still behave correctly when developed/run locally on
+    # Windows.
+    encoded_input = input_text.encode("utf-8") if input_text is not None else None
+    result = subprocess.run(
         argv,
         cwd=str(REPO_ROOT),
         env=env,
         capture_output=True,
-        text=True,
         timeout=timeout,
-        input=input_text,
+        input=encoded_input,
     )
+    result.stdout = result.stdout.decode("utf-8", errors="replace")
+    result.stderr = result.stderr.decode("utf-8", errors="replace")
+    return result
 
 
 def _base_args(source_dir, **overrides):
@@ -129,6 +142,49 @@ def _run_full(tmp_path, source_checkout, *, args=(), scenario_overrides=None, ba
     full_args = _base_args(source_checkout, **(base_overrides or {})) + list(args)
     return _run(fake_env_obj.env, full_args, source_dir=source_checkout), fake_env_obj
 
+
+# ---------------------------------------------------------------------------
+# Storage free-space preflight: `pvesm status` reports Total/Used/Available
+# in KiB, not bytes -- realistic scenarios below are always expressed in
+# KiB, matching what the production parser actually sees.
+# ---------------------------------------------------------------------------
+
+
+class TestStorageFreeSpace:
+    def test_realistic_kib_available_passes(self, tmp_path, source_checkout):
+        result, _ = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"storage_available_kib": 100 * 1024 * 1024},  # 100 GiB
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_insufficient_kib_available_fails(self, tmp_path, source_checkout):
+        # 7 GiB available, 8 GiB (default --rootfs-size) requested.
+        result, _ = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"storage_available_kib": 7 * 1024 * 1024},
+        )
+        assert result.returncode != 0
+        assert "does not report enough free space" in result.stderr
+
+    def test_exactly_enough_kib_available_passes(self, tmp_path, source_checkout):
+        result, _ = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"storage_available_kib": 8 * 1024 * 1024},
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_malformed_available_value_fails_closed(self, tmp_path, source_checkout):
+        # A prior version of this check logged a warning and silently
+        # SKIPPED (returned success) on an unparseable Available column --
+        # that is exactly the false-pass this preflight gate must never
+        # produce. An unparseable capacity value must stop the run.
+        result, _ = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"storage_available_kib": None, "storage_available_raw": "N/A"},
+        )
+        assert result.returncode != 0
+        assert "could not reliably parse available free space" in result.stderr
 
 # ---------------------------------------------------------------------------
 # VMID: auto-detect, explicit override, race, never-destroy
@@ -233,6 +289,68 @@ class TestPlanOrdering:
         assert "Plan: create VMID" in result.stderr
         assert "source commit" in result.stderr
         assert git_head_sha(source_checkout) in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# UX Hardening 6: exactly one interactive confirmation, not two. The
+# detected source SHA is validated and surfaced in the single upfront
+# plan; a separate "Deploy exactly this commit?" prompt no longer exists.
+# ---------------------------------------------------------------------------
+
+
+class TestSingleConfirmationUx:
+    def test_interactive_mode_without_expected_sha_asks_exactly_one_confirmation(self, tmp_path, source_checkout):
+        # If a second, separate source-commit prompt still existed, a
+        # single "y\n" would only satisfy the FIRST prompt, the second
+        # `read` would hit EOF (empty reply -> treated as "no"), and the
+        # run would abort. Succeeding on exactly one "y\n" proves only one
+        # prompt exists.
+        fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+        args = _base_args(source_checkout, **{"--non-interactive": False, "--yes": False, "--expected-sha": False})
+        result = _run(fake_env_obj.env, args, source_dir=source_checkout, input_text="y\n")
+        assert result.returncode == 0, result.stderr
+        assert "Detected source commit:" in result.stderr
+        assert "Discovery:            PASS" in result.stdout
+
+    def test_interactive_mode_declining_the_single_prompt_aborts_before_any_mutation(self, tmp_path, source_checkout):
+        fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+        args = _base_args(source_checkout, **{"--non-interactive": False, "--yes": False, "--expected-sha": False})
+        result = _run(fake_env_obj.env, args, source_dir=source_checkout, input_text="n\n")
+        assert result.returncode != 0
+        assert "aborted by operator" in result.stderr
+        for line in fake_env_obj.log_lines():
+            assert not line.startswith("pct create")
+            assert not line.startswith("pveum user add")
+
+    def test_yes_flag_skips_the_prompt_but_still_requires_clean_tree(self, tmp_path, source_checkout):
+        # Interactive (--non-interactive: False) + --yes: the ONE
+        # remaining plan-confirmation prompt is skipped, but --yes must
+        # never make an unconfirmed/dirty source acceptable.
+        dirty_file = source_checkout / "requirements.txt"
+        original = dirty_file.read_text(encoding="utf-8")
+        dirty_file.write_text(original + "# dirty\n", encoding="utf-8")
+        try:
+            fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+            args = _base_args(source_checkout, **{"--non-interactive": False, "--expected-sha": False})
+            result = _run(fake_env_obj.env, args, source_dir=source_checkout)
+            assert result.returncode != 0
+            assert "dirty working tree" in result.stderr
+        finally:
+            dirty_file.write_text(original, encoding="utf-8")
+
+    def test_yes_flag_never_accepts_a_mismatched_expected_sha(self, tmp_path, source_checkout):
+        fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+        args = _base_args(source_checkout, **{"--expected-sha": "0" * 40})
+        result = _run(fake_env_obj.env, args, source_dir=source_checkout)
+        assert result.returncode != 0
+        assert "does not match --expected-sha" in result.stderr
+
+    def test_non_interactive_still_unconditionally_requires_expected_sha(self, tmp_path, source_checkout):
+        fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+        args = _base_args(source_checkout, **{"--expected-sha": False})  # --non-interactive/--yes stay in base args
+        result = _run(fake_env_obj.env, args, source_dir=source_checkout)
+        assert result.returncode != 0
+        assert "--non-interactive requires --expected-sha" in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +493,7 @@ class TestPveIdentity:
         scenario = default_scenario()
         fake_env_obj = build_fake_pve_environment(tmp_path, scenario)
         state = json.loads(fake_env_obj.state_path.read_text())
-        state["pve_users"].append("hubinetops@pve")
+        state["pve_users"]["hubinetops@pve"] = {"comment": "pre-existing operator user"}
         fake_env_obj.state_path.write_text(json.dumps(state))
         result = _run(fake_env_obj.env, _base_args(source_checkout), source_dir=source_checkout)
         assert result.returncode != 0
@@ -520,6 +638,133 @@ class TestRollback:
 
 
 # ---------------------------------------------------------------------------
+# PVE identity ownership (Blocker 3): rollback must delete only what THIS
+# run can PROVE it owns, never merely "whatever exists at our fixed name."
+# Uses the fake's `ambiguous_pveum_ops` scenario key: "self" simulates
+# this run's own mutating call silently succeeding server-side despite
+# reporting failure to us; a literal string simulates a foreign/concurrent
+# creator having already populated the object under a DIFFERENT comment.
+# ---------------------------------------------------------------------------
+
+
+class TestPveIdentityOwnership:
+    _FOREIGN_COMMENT = (
+        "Hubinet Ops 0.5 R0 read-only discovery "
+        "(created by bootstrap-proxmox-0.5.sh; run=SOME-OTHER-CONCURRENT-RUN-ID)"
+    )
+
+    def test_concurrent_owner_race_user_add_never_deletes_the_winners_user(self, tmp_path, source_checkout):
+        # The exact scenario from the mission: A and B both observe the
+        # user absent; A creates it first; B's own `pveum user add` fails
+        # because it now exists (simulated here directly via the fake
+        # rather than real concurrency -- B never gets to see a comment
+        # carrying B's own BOOTSTRAP_RUN_ID, only A's foreign one).
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"ambiguous_pveum_ops": {"user_add": self._FOREIGN_COMMENT}},
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+        assert state["pve_users"]["hubinetops@pve"]["comment"] == self._FOREIGN_COMMENT
+
+    def test_concurrent_owner_race_never_touches_role_token_or_acl_either(self, tmp_path, source_checkout):
+        # B dies at the user-add step (never reaches role/token/ACL
+        # creation at all) -- confirms nothing downstream of the race is
+        # even attempted, let alone deleted.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"ambiguous_pveum_ops": {"user_add": self._FOREIGN_COMMENT}},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum role add") for line in log)
+        assert not any(line.startswith("pveum role delete") for line in log)
+        assert not any("token" in line for line in log if line.startswith("pveum"))
+
+    def test_ambiguous_self_success_user_is_proven_and_cleaned_up(self, tmp_path, source_checkout):
+        # This run's OWN user-add call actually succeeded server-side
+        # (the fake stores the real argv comment, which carries this
+        # run's real BOOTSTRAP_RUN_ID) despite reporting failure --
+        # rollback must be able to prove ownership from that comment and
+        # clean it up rather than leaving an orphan behind.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"ambiguous_pveum_ops": {"user_add": "self"}},
+        )
+        assert result.returncode != 0
+        assert any(line.startswith("pveum user delete hubinetops@pve") for line in fake_env_obj.log_lines())
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" not in state["pve_users"]
+
+    def test_ambiguous_role_creation_is_never_blindly_deleted(self, tmp_path, source_checkout):
+        # PVE roles carry no comment/provenance field -- an ambiguous
+        # role-add failure can NEVER be proven either way and must always
+        # be preserved, regardless of whether it was actually this run's
+        # own doing or a concurrent creator's.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"ambiguous_pveum_ops": {"role_add": "self"}},
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum role delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE role" in result.stderr
+        state = fake_env_obj.state()
+        assert "HubinetOpsR0Auditor" in state["pve_roles"]
+
+    def test_ambiguous_role_creation_preserves_manual_remediation_message(self, tmp_path, source_checkout):
+        result, _ = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"ambiguous_pveum_ops": {"role_add": "self"}},
+        )
+        assert result.returncode != 0
+        assert "pveum role delete HubinetOpsR0Auditor" in result.stderr
+
+    def test_ambiguous_token_creation_under_an_owned_user_is_never_blindly_deleted(self, tmp_path, source_checkout):
+        # The user is genuinely ours (clean success); the token-add call
+        # is ambiguous and cannot be attributed to this run (no matching
+        # run-id comment) -- the token must be preserved even though its
+        # parent user is legitimately cleaned up.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"ambiguous_pveum_ops": {"token_add": self._FOREIGN_COMMENT}},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert "PRESERVING PVE token" in result.stderr
+        # The user itself is still legitimately owned/cleaned up.
+        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+
+    def test_ambiguous_token_self_success_is_proven_and_cleaned_up(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"ambiguous_pveum_ops": {"token_add": "self"}},
+        )
+        assert result.returncode != 0
+        assert any(
+            line.startswith("pveum user token remove hubinetops@pve r0-readonly")
+            for line in fake_env_obj.log_lines()
+        )
+
+    def test_run_id_is_embedded_in_user_and_token_comments_on_success(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        state = fake_env_obj.state()
+        user_comment = state["pve_users"]["hubinetops@pve"]["comment"]
+        token_comment = state["pve_tokens"]["hubinetops@pve!r0-readonly"]["comment"]
+        assert "run=" in user_comment
+        assert "run=" in token_comment
+        # Same run-id in both (one bootstrap invocation, one run-id).
+        user_run_id = user_comment.split("run=", 1)[1].rstrip(")")
+        token_run_id = token_comment.split("run=", 1)[1].rstrip(")")
+        assert user_run_id == token_run_id
+        assert len(user_run_id) >= 8  # not a trivially-guessable/empty marker
+
+
+# ---------------------------------------------------------------------------
 # TLS trust (Additional C): explicit opt-in only, never implicit
 # ---------------------------------------------------------------------------
 
@@ -652,10 +897,12 @@ class TestFirewall:
         result, fake_env_obj = _run_full(
             tmp_path, source_checkout,
             args=["--pve-endpoint", "https://pve.example.invalid:8006", "--dns-resolver", "198.51.100.53"],
+            scenario_overrides={"dns_resolution": {"pve.example.invalid": ["203.0.113.10"]}},
         )
         assert result.returncode == 0, result.stderr
         ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
         assert 'ip daddr 198.51.100.53 udp dport 53 accept' in ruleset
+        assert 'ip daddr 198.51.100.53 tcp dport 53 accept' in ruleset
 
     def test_default_deny_egress_and_ingress_present_and_last(self, tmp_path, source_checkout):
         result, fake_env_obj = _run_full(tmp_path, source_checkout)
@@ -676,6 +923,126 @@ class TestFirewall:
         result, _ = _run_full(tmp_path, source_checkout, scenario_overrides={"fail": ["nft_syntax"]})
         assert result.returncode != 0
         assert "syntax validation" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Hostname PVE endpoint firewall resolution (Blocker 4): nftables reports
+# resolved numeric addresses in `nft list ruleset`, never the original
+# hostname text -- the bootstrap must resolve the hostname to concrete
+# IPv4 addresses INSIDE the CT before generating the ruleset, and verify
+# against those literal numeric addresses, never the hostname itself.
+# ---------------------------------------------------------------------------
+
+
+class TestHostnameFirewallResolution:
+    _HOSTNAME_ENDPOINT = "https://pve.example.invalid:8006"
+
+    def test_single_a_record_resolves_to_one_exact_rule(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", "198.51.100.53"],
+            scenario_overrides={"dns_resolution": {"pve.example.invalid": ["203.0.113.10"]}},
+        )
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert 'meta skuid "hubinetops" ip daddr 203.0.113.10 tcp dport 8006 accept' in ruleset
+        # Never the literal hostname text anywhere in the generated rules.
+        assert "pve.example.invalid" not in ruleset
+
+    def test_multiple_a_records_each_get_their_own_exact_rule(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", "198.51.100.53"],
+            scenario_overrides={
+                "dns_resolution": {"pve.example.invalid": ["203.0.113.10", "203.0.113.11"]},
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert 'meta skuid "hubinetops" ip daddr 203.0.113.10 tcp dport 8006 accept' in ruleset
+        assert 'meta skuid "hubinetops" ip daddr 203.0.113.11 tcp dport 8006 accept' in ruleset
+
+    def test_duplicate_a_records_are_deduplicated(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", "198.51.100.53"],
+            scenario_overrides={
+                "dns_resolution": {"pve.example.invalid": ["203.0.113.10", "203.0.113.10"]},
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert ruleset.count("ip daddr 203.0.113.10 tcp dport 8006 accept") == 1
+
+    def test_zero_a_records_is_a_hard_stop(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", "198.51.100.53"],
+            scenario_overrides={"dns_resolution": {"pve.example.invalid": []}},
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pct push") and "nftables.conf" in line for line in fake_env_obj.log_lines())
+
+    def test_resolution_failure_is_a_hard_stop(self, tmp_path, source_checkout):
+        # Host not present in the fake's dns_resolution mapping at all --
+        # simulates a genuine resolution failure (NXDOMAIN/unreachable
+        # resolver).
+        result, _ = _run_full(
+            tmp_path, source_checkout,
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", "198.51.100.53"],
+        )
+        assert result.returncode != 0
+        assert "could not resolve PVE endpoint hostname" in result.stderr
+
+    def test_resolver_gets_exact_udp_and_tcp_53_rules(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", "198.51.100.53"],
+            scenario_overrides={"dns_resolution": {"pve.example.invalid": ["203.0.113.10"]}},
+        )
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert 'meta skuid "hubinetops" ip daddr 198.51.100.53 udp dport 53 accept' in ruleset
+        assert 'meta skuid "hubinetops" ip daddr 198.51.100.53 tcp dport 53 accept' in ruleset
+
+    def test_literal_ip_endpoint_gets_no_dns_rule_and_no_resolution_call(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)  # default endpoint is a literal IP
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert "udp dport 53" not in ruleset
+        assert "tcp dport 53" not in ruleset
+        assert not any(
+            "hubinet-ops-bootstrap-resolve-dns.py" in line for line in fake_env_obj.log_lines()
+        )
+
+    def test_exact_numeric_readback_verifies_even_though_endpoint_is_a_hostname(self, tmp_path, source_checkout):
+        # The whole point: exact-content/order firewall verification
+        # (phase 10's own recheck, plus phase 12's later recheck) must
+        # succeed against the resolved numeric address, never fail
+        # closed merely because the configured endpoint was a hostname.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", "198.51.100.53"],
+            scenario_overrides={"dns_resolution": {"pve.example.invalid": ["203.0.113.10"]}},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Discovery:            PASS" in result.stdout
+        state = fake_env_obj.state()
+        assert state["vmids"]["110"]["onboot"] == "1"
+
+    def test_tls_hostname_verification_is_unaffected_endpoint_stays_the_hostname(self, tmp_path, source_checkout):
+        # The firewall permits the resolved numeric IP(s), but the R0
+        # runtime's OWN configured pve_endpoint (used for TLS certificate
+        # hostname verification) must remain the original hostname --
+        # never rewritten to the resolved IP.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", "198.51.100.53"],
+            scenario_overrides={"dns_resolution": {"pve.example.invalid": ["203.0.113.10"]}},
+        )
+        assert result.returncode == 0, result.stderr
+        inventory = fake_env_obj.ct_file_text("110", "/etc/hubinet-ops/inventory.yaml")
+        assert f'pve_endpoint: "{self._HOSTNAME_ENDPOINT}"' in inventory
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +1129,77 @@ class TestDiscoveryAcceptance:
             scenario_overrides={"discovery_resource_count": 0},
         )
         assert result.returncode == 0, result.stderr
+
+    # -- Hardening 5: PASS proves a genuinely committed, fresh, current
+    #    discovery success -- not merely health == "healthy" in isolation.
+
+    def test_healthy_but_stale_never_passes(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"discovery_result": "healthy_but_stale"},
+        )
+        assert result.returncode != 0
+        state = fake_env_obj.state()
+        assert state["vmids"]["110"]["onboot"] == "0"
+
+    def test_unsuccessful_completed_outcome_never_passes(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"discovery_result": "unsuccessful_outcome"},
+        )
+        assert result.returncode != 0
+        assert "latest-completed-outcome-not-success" in result.stderr
+        state = fake_env_obj.state()
+        assert state["vmids"]["110"]["onboot"] == "0"
+
+    def test_missing_committed_context_never_passes(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"discovery_result": "missing_committed_context"},
+        )
+        assert result.returncode != 0
+        assert "committed-context-missing" in result.stderr
+        state = fake_env_obj.state()
+        assert state["vmids"]["110"]["onboot"] == "0"
+
+    def test_committed_current_context_mismatch_never_passes(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"discovery_result": "context_mismatch"},
+        )
+        assert result.returncode != 0
+        assert "committed-current-context-mismatch" in result.stderr
+        state = fake_env_obj.state()
+        assert state["vmids"]["110"]["onboot"] == "0"
+
+    def test_zero_nodes_after_healthy_commit_never_passes(self, tmp_path, source_checkout):
+        # A real PVE source necessarily has at least its own node --
+        # empty nodes[] after an otherwise-healthy commit is suspicious
+        # and must never produce the final PASS.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"discovery_result": "zero_nodes"},
+        )
+        assert result.returncode != 0
+        assert "zero-nodes-after-healthy-commit" in result.stderr
+        state = fake_env_obj.state()
+        assert state["vmids"]["110"]["onboot"] == "0"
+
+    def test_zero_resources_with_one_real_node_and_valid_committed_source_passes(self, tmp_path, source_checkout):
+        # The positive control for the two checks above: zero resources
+        # is legitimate (already covered by
+        # test_zero_resources_on_healthy_source_is_legitimate), but this
+        # pins it specifically alongside a real, non-empty nodes[] and a
+        # fully valid committed/current context (the default simulated
+        # scenario), i.e. exactly the PASS shape Hardening 5 requires.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"discovery_resource_count": 0, "discovery_node_count": 1},
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Discovery:            PASS" in result.stdout
+        state = fake_env_obj.state()
+        assert state["vmids"]["110"]["onboot"] == "1"
 
     def test_custom_discovery_timeout_flag_is_honored(self, tmp_path, source_checkout):
         result, fake_env_obj = _run_full(
