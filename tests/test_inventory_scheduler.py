@@ -9,6 +9,7 @@ by ``httpx.MockTransport``.
 from __future__ import annotations
 
 from pathlib import Path
+import ssl
 import threading
 import time
 
@@ -559,3 +560,51 @@ def test_finding3_connect_failure_still_takes_source_unavailable_path(
     assert outcome.status == "failed"
     view = InventoryPublication(store, authority).read()
     assert view.sources[0]["health"] == "source_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Real dogfood #2, Finding A -- a TLS certificate verification failure must
+# publish as configuration_error, never source_unavailable, end to end
+# through the real scheduler/authority/publication path -- not merely at
+# the transport-unit level (see test_inventory_pve_transport.py).
+# ---------------------------------------------------------------------------
+
+
+def test_findingA_cert_verification_failure_classifies_as_configuration_error_end_to_end(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store, authority, config, source_id = _bootstrap(tmp_path)
+    # First, a successful run so we have prior inventory to prove is
+    # retained (same shape as the Finding 3 auth-failure test above).
+    _patch_transport(
+        monkeypatch,
+        _pve_handler(guests=({"vmid": 100, "type": "qemu", "name": "vm1", "status": "running"},)),
+    )
+    first = sched.run_discovery_cycle(authority, source_id, config)
+    assert first.status == "success"
+    before = InventoryPublication(store, authority).read()
+
+    def cert_failure_handler(request: httpx.Request) -> httpx.Response:
+        # Real dogfood #2 wrapping shape: the typed
+        # ssl.SSLCertVerificationError is reachable only via __cause__.
+        try:
+            raise ssl.SSLCertVerificationError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "CA cert does not include key usage extension"
+            )
+        except ssl.SSLCertVerificationError as ssl_exc:
+            raise httpx.ConnectError(
+                "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+                "CA cert does not include key usage extension"
+            ) from ssl_exc
+
+    _patch_transport(monkeypatch, cert_failure_handler)
+    outcome = sched.run_discovery_cycle(authority, source_id, config)
+
+    assert outcome.status == "failed"
+    after = InventoryPublication(store, authority).read()
+    assert after.sources[0]["health"] == "configuration_error"
+    assert after.sources[0]["health"] != "source_unavailable"
+    # Prior inventory is completely retained -- a configuration_error
+    # discovery must never reconcile absence.
+    assert after.resources == before.resources

@@ -864,10 +864,26 @@ def cmd_pveum(args):
         _save_state(state)
         fail_after = SCENARIO.get("pveum_user_list_fail_after_calls")
         malformed_after = SCENARIO.get("pveum_user_list_malformed_after_calls")
-        if _fail("pveum_user_list") or (fail_after is not None and call_num > fail_after):
+        # Seventh-pass corrective addition: the "_after_calls" thresholds
+        # above apply to every call from that number ONWARD, which cannot
+        # express "call #2 is malformed but call #3 (a later, distinct
+        # diagnostic-only re-read) is normal again" -- exactly the real
+        # dogfood #2 shape (a schema-invalid rollback read followed
+        # immediately by a schema-valid manual read). These "_at_call"
+        # variants target exactly one call number and leave every other
+        # call's behavior untouched.
+        fail_at = SCENARIO.get("pveum_user_list_fail_at_call")
+        malformed_at = SCENARIO.get("pveum_user_list_malformed_at_call")
+        if (
+            _fail("pveum_user_list")
+            or (fail_after is not None and call_num > fail_after)
+            or (fail_at is not None and call_num == fail_at)
+        ):
             return 1
-        if SCENARIO.get("malformed_pveum_output", {}).get("user_list") or (
-            malformed_after is not None and call_num > malformed_after
+        if (
+            SCENARIO.get("malformed_pveum_output", {}).get("user_list")
+            or (malformed_after is not None and call_num > malformed_after)
+            or (malformed_at is not None and call_num == malformed_at)
         ):
             sys.stdout.write("not-valid-json{{{\n")
             return 0
@@ -989,14 +1005,25 @@ def cmd_pveum(args):
         return 0
     if args[:3] == ["user", "token", "list"]:
         # args shape: user token list <user> --output-format json. Unlike
-        # "user list" above, this is called ONLY from
+        # "user list" above, this used to be called ONLY from
         # _token_object_owned_by_this_run's rollback read-back -- no
-        # earlier successful-path code calls it -- so a plain scenario
-        # flag (no call-count threshold needed) is sufficient to simulate
-        # a read-back failure/malformed result there.
-        if _fail("pveum_token_list"):
+        # earlier successful-path code calls it. Seventh-pass corrective
+        # addition: the diagnostic-only re-read (bootstrap-common.sh's
+        # _diagnostic_ownership_reread) can now call it a SECOND time in
+        # the same rollback, so a call counter and "_at_call" hooks are
+        # needed here too, mirroring "user list" above -- to let a test
+        # target the first (authoritative) read and the second
+        # (diagnostic-only) read independently.
+        state["pveum_token_list_calls"] = state.get("pveum_token_list_calls", 0) + 1
+        call_num = state["pveum_token_list_calls"]
+        _save_state(state)
+        fail_at = SCENARIO.get("pveum_token_list_fail_at_call")
+        malformed_at = SCENARIO.get("pveum_token_list_malformed_at_call")
+        if _fail("pveum_token_list") or (fail_at is not None and call_num == fail_at):
             return 1
-        if SCENARIO.get("malformed_pveum_output", {}).get("token_list"):
+        if SCENARIO.get("malformed_pveum_output", {}).get("token_list") or (
+            malformed_at is not None and call_num == malformed_at
+        ):
             sys.stdout.write("not-valid-json{{{\n")
             return 0
         override = _output_override("token_list")
@@ -1223,6 +1250,12 @@ def default_scenario() -> dict[str, Any]:
         "pveum_user_list_fail_after_calls": None,
         "pveum_user_list_malformed_after_calls": None,
         "pveum_user_list_override_after_calls": None,
+        # Seventh-pass corrective additions -- see the "_at_call" handling
+        # notes at each cmd_pveum call site above.
+        "pveum_user_list_fail_at_call": None,
+        "pveum_user_list_malformed_at_call": None,
+        "pveum_token_list_fail_at_call": None,
+        "pveum_token_list_malformed_at_call": None,
         "ct_actual_resolv_conf": None,
         # Sixth-pass corrective additions (real-PVE nft canonicalization)
         # -- see _exec_inner's "id -u hubinetops" handler and

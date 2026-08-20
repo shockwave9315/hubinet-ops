@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import ssl
 from types import TracebackType
 from typing import Any
 
@@ -86,6 +87,56 @@ def _require_pve_api_token(pve_api_token: str) -> str:
             kind=ProviderFailureKind.SCHEMA,
         )
     return pve_api_token
+
+
+# Real dogfood #2 finding (docs/architecture/0.5-implementation-status.md):
+# a real legacy PVE root CA missing the X509v3 Key Usage extension made
+# Python 3.13's strict certificate-chain validation reject the leaf with
+# ``ssl.SSLCertVerificationError``. httpx/httpcore wrap that underlying ssl
+# exception inside their own ``httpx.ConnectError`` (or similar) before it
+# reaches this module -- the real exception is only reachable by walking
+# ``__cause__``/``__context__``, not by matching on the outer exception's
+# type or its rendered message text.
+_EXCEPTION_CHAIN_MAX_DEPTH = 20
+
+
+def _exception_chain(exc: BaseException):
+    """Yield ``exc`` then each ``__cause__``/``__context__`` ancestor.
+
+    Bounded by ``_EXCEPTION_CHAIN_MAX_DEPTH`` and cycle-safe (tracks visited
+    exception identities) -- this walks whatever chain httpx/httpcore/ssl
+    happen to construct, which this module does not control, so it must
+    never be able to loop or recurse without bound.
+    """
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    depth = 0
+    while current is not None and depth < _EXCEPTION_CHAIN_MAX_DEPTH:
+        if id(current) in seen:
+            return
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+        depth += 1
+
+
+def _find_certificate_verification_error(
+    exc: BaseException,
+) -> ssl.SSLCertVerificationError | None:
+    """Find a real ``ssl.SSLCertVerificationError`` anywhere in ``exc``'s
+    cause/context chain, or ``None`` if there isn't one.
+
+    Structural/typed exception inspection only -- this is deliberately not
+    a substring/regex match against any exception's rendered message text,
+    which would be a brittle proxy for the real, typed failure the ssl
+    module already distinguishes for us.
+    """
+
+    for candidate in _exception_chain(exc):
+        if isinstance(candidate, ssl.SSLCertVerificationError):
+            return candidate
+    return None
 
 
 class ProxmoxHttpTransport:
@@ -245,10 +296,26 @@ class ProxmoxHttpTransport:
                             kind=ProviderFailureKind.SCHEMA,
                         )
         except httpx.TimeoutException as exc:
+            # Caught ahead of the broader httpx.HTTPError branch below so a
+            # timeout is never reclassified as a certificate failure, even
+            # if a timeout happened to occur mid-TLS-handshake (Finding A
+            # item 6: timeout always remains TRANSPORT).
             raise PveTransportError(
                 f"PVE request timed out: {exc}", kind=ProviderFailureKind.TRANSPORT
             ) from exc
         except httpx.HTTPError as exc:
+            # Finding A: a TLS certificate verification failure is a
+            # security/trust/configuration proof failure, never a plain
+            # network-layer outage -- detected structurally (never by
+            # parsing the rendered message) by walking the real, typed
+            # ssl.SSLCertVerificationError httpx/httpcore wrap inside this
+            # exception's cause/context chain.
+            cert_error = _find_certificate_verification_error(exc)
+            if cert_error is not None:
+                raise PveTransportError(
+                    f"PVE TLS certificate verification failed: {cert_error}",
+                    kind=ProviderFailureKind.SECURITY_PROOF,
+                ) from exc
             raise PveTransportError(
                 f"PVE request failed: {exc}", kind=ProviderFailureKind.TRANSPORT
             ) from exc

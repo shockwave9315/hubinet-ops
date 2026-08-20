@@ -1027,8 +1027,12 @@ class TestPveIdentityOwnership:
         # Sixth-pass corrective note: this scenario is exactly the real
         # witness -- a clean ledger success (phase6 succeeded; apt_get
         # fails only afterward) followed by a schema-invalid live
-        # read-back. The specific structural diagnosis must be present...
-        assert "diagnosis: element-not-object-or-missing-userid-string" in result.stderr
+        # read-back. The specific structural diagnosis must be present.
+        # Seventh-pass corrective note: `{"user": ...}` is an object
+        # missing the required "userid" field -- refined diagnosis is now
+        # the more precise "required-field-missing", not the old coarse
+        # catch-all.
+        assert "diagnosis: required-field-missing" in result.stderr
         # ...and the generic preserve message must NOT assert a false
         # "no ledger record" claim -- this run's ledger genuinely DID
         # record a clean success.
@@ -1050,9 +1054,112 @@ class TestPveIdentityOwnership:
         log = fake_env_obj.log_lines()
         assert not any(line.startswith("pveum user token remove") for line in log)
         assert "PRESERVING PVE token" in result.stderr
-        assert "diagnosis: element-not-object-or-missing-tokenid-string" in result.stderr
+        # Seventh-pass corrective note: a bare-string array element (no
+        # object at all) is now diagnosed as the more precise
+        # "element-not-object", not the old coarse catch-all.
+        assert "diagnosis: element-not-object" in result.stderr
         assert "no ledger success record" not in result.stderr
         assert "this run could not prove live ownership of the current object" in result.stderr
+
+    # -----------------------------------------------------------------
+    # Real dogfood #2, Finding B: the diagnostic-only re-read
+    # (bootstrap-common.sh::_diagnostic_ownership_reread) can NEVER
+    # authorize ownership/deletion, no matter what the second read finds
+    # -- the authoritative first read already failed, and that decision
+    # is final. These reproduce the real dogfood #2 shape exactly: call
+    # #1 (phase6's own pre-existing-conflict check) succeeds normally;
+    # call #2 (rollback's authoritative read) is schema-invalid; call #3
+    # (the new diagnostic-only re-read) varies per test.
+    # -----------------------------------------------------------------
+
+    def test_diagnostic_reread_valid_with_matching_run_marker_still_preserves(
+        self, tmp_path, source_checkout,
+    ):
+        # Call #3 gets NO override at all -- it falls through to the
+        # fake's real, current state, which genuinely does carry this
+        # run's own comment (the user really was created earlier in this
+        # same run) -- exactly the real dogfood #2 shape: a perfectly
+        # valid, run-marker-matching second read that must still NOT
+        # rescue the object from the already-failed authoritative read.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_user_list_malformed_at_call": 2,
+            },
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+        assert "diagnostic reread" in result.stderr
+        assert "target_present=true" in result.stderr
+        assert "run_marker_match=true" in result.stderr
+        # The strong invariant: preserved regardless of the diagnostic
+        # reread's own result.
+        assert "remains UNPROVEN and PRESERVED" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+
+    def test_diagnostic_reread_also_malformed_still_preserves(self, tmp_path, source_checkout):
+        # Both the authoritative read (call #2) and the diagnostic-only
+        # re-read (call #3) are schema-invalid.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_user_list_malformed_after_calls": 1,
+            },
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+        assert "diagnostic reread" in result.stderr
+        assert "still schema-invalid" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+
+    def test_diagnostic_reread_command_failure_still_preserves(self, tmp_path, source_checkout):
+        # The authoritative read (call #2) is schema-invalid; the
+        # diagnostic-only re-read (call #3) fails outright (a second
+        # `pveum` command error) rather than merely being malformed again.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_user_list_malformed_at_call": 2,
+                "pveum_user_list_fail_at_call": 3,
+            },
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+        assert "diagnostic reread" in result.stderr
+        assert "also failed (exit 1)" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+
+    def test_diagnostic_reread_wired_for_token_ownership_too(self, tmp_path, source_checkout):
+        # Same conservative pattern applied to the token ownership path
+        # (Finding B item 6): the authoritative token-list read (call #1
+        # -- token list has no earlier successful-path caller) is
+        # schema-invalid; the diagnostic-only re-read (call #2) also
+        # fails outright.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_output_override": {"token_list": '["hubinetops@pve!r0-readonly"]'},
+                "pveum_token_list_fail_at_call": 2,
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert "PRESERVING PVE token" in result.stderr
+        assert "diagnostic reread" in result.stderr
+        assert "also failed (exit 1)" in result.stderr
+        state = fake_env_obj.state()
+        assert any(full.startswith("hubinetops@pve!") for full in state["pve_tokens"])
         # The user's own ownership check is independent (normal schema)
         # and still succeeds.
         assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)

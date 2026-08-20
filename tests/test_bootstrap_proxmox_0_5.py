@@ -1012,10 +1012,50 @@ class TestJsonListSchemaDiagnosis:
         assert result.returncode == 0, result.stderr
         assert result.stdout == "top-level-not-an-array"
 
-    def test_element_wrong_shape_diagnosed(self, tmp_path):
+    # -----------------------------------------------------------------
+    # Seventh-pass corrective refinement: dogfood #2 hit this exact code
+    # path a SECOND time -- the old single "element-not-object-or-
+    # missing-<field>-string" catch-all was still too coarse to tell
+    # apart three structurally distinct causes. Each is now its own
+    # diagnosis string.
+    # -----------------------------------------------------------------
+
+    def test_element_not_object_diagnosed(self, tmp_path):
+        # A bare-string array element -- not a JSON object at all.
+        result = _run_schema_diagnosis_helper(tmp_path, '["hubinetops@pve"]')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "element-not-object"
+
+    def test_required_field_missing_diagnosed(self, tmp_path):
+        # An object element, but the required field is simply absent
+        # (wrong field name used instead) -- the real dogfood #2 witness.
         result = _run_schema_diagnosis_helper(tmp_path, '[{"user":"hubinetops@pve"}]')
         assert result.returncode == 0, result.stderr
-        assert result.stdout == "element-not-object-or-missing-userid-string"
+        assert result.stdout == "required-field-missing"
+
+    def test_required_field_null_is_also_diagnosed_as_missing(self, tmp_path):
+        # An explicit JSON null is treated the same as "absent," not as
+        # "present but not a string" -- null carries no provenance value
+        # either way.
+        result = _run_schema_diagnosis_helper(tmp_path, '[{"userid":null}]')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "required-field-missing"
+
+    def test_required_field_not_string_diagnosed(self, tmp_path):
+        # The field is present but holds a non-string value.
+        result = _run_schema_diagnosis_helper(tmp_path, '[{"userid":12345}]')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "required-field-not-string"
+
+    def test_first_failing_element_determines_diagnosis(self, tmp_path):
+        # A valid element followed by an invalid one -- the diagnosis
+        # reflects the first element that actually fails, not merely
+        # "any" element in the array.
+        result = _run_schema_diagnosis_helper(
+            tmp_path, '[{"userid":"hubinetops@pve"},{"user":"someone-else"}]',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "required-field-missing"
 
     def test_diagnosis_never_dumps_the_actual_payload(self, tmp_path):
         # Structural diagnosis only -- the field's own (non-secret, but
@@ -1027,6 +1067,119 @@ class TestJsonListSchemaDiagnosis:
         )
         assert result.returncode == 0, result.stderr
         assert secret_looking_value not in result.stdout
+
+    def test_diagnosis_never_dumps_the_payload_for_each_refined_branch(self, tmp_path):
+        # Same guarantee, exercised against each of the three refined
+        # branches specifically (not just the pre-existing generic case
+        # above), since each now inspects element/field content it did
+        # not before.
+        secret_looking_value = "totally-not-a-real-secret-marker-xyz"
+        for payload in (
+            f'["{secret_looking_value}"]',
+            f'[{{"user":"{secret_looking_value}"}}]',
+            f'[{{"userid":{{"nested":"{secret_looking_value}"}}}}]',
+        ):
+            result = _run_schema_diagnosis_helper(tmp_path, payload)
+            assert result.returncode == 0, result.stderr
+            assert secret_looking_value not in result.stdout
+
+
+def _run_diagnostic_reread_helper(tmp_path, *, list_cmd_body, run_id="test-run-id"):
+    """Source ONLY bootstrap-common.sh, define a fake listing command as a
+    bash function, then call _diagnostic_ownership_reread directly and
+    return the completed subprocess (stderr carries the log_warn output;
+    _diagnostic_ownership_reread itself always returns 0). No PVE command,
+    no phase function, no orchestration, no real rollback path is ever
+    invoked -- this is a pure unit test of the diagnostic-only re-read
+    helper in isolation.
+    """
+    bash_snippet = f'''
+source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"
+BOOTSTRAP_RUN_ID="{run_id}"
+
+fake_list_cmd() {{
+{list_cmd_body}
+}}
+
+_diagnostic_ownership_reread "userid" "hubinetops@pve" "PVE user 'hubinetops@pve'" fake_list_cmd
+exit $?
+'''
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestDiagnosticOwnershipReread:
+    """Rollback diagnostics fix (seventh pass, Finding B): at most ONE
+    additional diagnostic-only re-read of the same listing command after
+    an authoritative ownership read was rejected as schema-invalid.
+    _diagnostic_ownership_reread itself has NO return-value contract a
+    caller could use to authorize deletion -- it only logs structural,
+    non-secret facts. These tests exercise it directly, in isolation from
+    the full rollback/ownership functions (which are covered end to end
+    by the sandbox-only smoke suite).
+    """
+
+    def test_always_returns_zero_regardless_of_what_it_finds(self, tmp_path):
+        # No return-code contract exists for the caller to misuse as an
+        # ownership signal -- exit 0 always, whether the second read
+        # succeeds, fails, or is schema-invalid.
+        for body in ("return 7", "echo 'not-json{{{'", 'echo \'[{"userid":"hubinetops@pve","comment":"run=test-run-id"}]\''):
+            result = _run_diagnostic_reread_helper(tmp_path, list_cmd_body=body)
+            assert result.returncode == 0, result.stderr
+
+    def test_second_command_failure_logged_structurally(self, tmp_path):
+        result = _run_diagnostic_reread_helper(tmp_path, list_cmd_body="return 9")
+        assert "also failed (exit 9)" in result.stderr
+        assert "does not change the preserve decision" in result.stderr
+
+    def test_second_schema_invalid_logged_with_diagnosis(self, tmp_path):
+        result = _run_diagnostic_reread_helper(
+            tmp_path, list_cmd_body="echo '[{\"user\":\"hubinetops@pve\"}]'",
+        )
+        assert "still schema-invalid" in result.stderr
+        assert "diagnosis: required-field-missing" in result.stderr
+        assert "does not change the preserve decision" in result.stderr
+
+    def test_second_valid_with_matching_run_marker_logs_true_true(self, tmp_path):
+        result = _run_diagnostic_reread_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"userid":"hubinetops@pve","comment":"run=test-run-id"}]\'',
+        )
+        assert "target_present=true" in result.stderr
+        assert "run_marker_match=true" in result.stderr
+        assert "remains UNPROVEN and PRESERVED" in result.stderr
+
+    def test_second_valid_with_non_matching_run_marker_logs_false(self, tmp_path):
+        result = _run_diagnostic_reread_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"userid":"hubinetops@pve","comment":"run=some-other-run-id"}]\'',
+        )
+        assert "target_present=true" in result.stderr
+        assert "run_marker_match=false" in result.stderr
+
+    def test_second_valid_but_target_absent_logs_false_false(self, tmp_path):
+        result = _run_diagnostic_reread_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"userid":"someone-else@pve","comment":"run=test-run-id"}]\'',
+        )
+        assert "target_present=false" in result.stderr
+        assert "run_marker_match=false" in result.stderr
+
+    def test_never_dumps_the_actual_comment_text(self, tmp_path):
+        # The comment carries a distinctive marker beyond the plain
+        # run=<id> substring the helper checks for -- it must never be
+        # echoed into the log, even though it does carry the run marker.
+        secret_looking_value = "totally-not-a-real-secret-marker-xyz"
+        result = _run_diagnostic_reread_helper(
+            tmp_path,
+            list_cmd_body=(
+                'echo \'[{"userid":"hubinetops@pve",'
+                f'"comment":"run=test-run-id extra={secret_looking_value}"}}]\''
+            ),
+        )
+        assert secret_looking_value not in result.stderr
+        assert "run_marker_match=true" in result.stderr
 
 
 class TestSecurityStatic:

@@ -316,6 +316,12 @@ _user_object_owned_by_this_run() {
     diagnosis="$(_json_list_schema_diagnosis "${list_file}" "userid")"
     rm -f "${list_file}"
     log_warn "could not verify ownership of '${PVE_USER}': the PVE user list did not match the expected JSON shape (an array of objects each carrying a string 'userid' field) -- diagnosis: ${diagnosis:-unknown} -- treating ownership as unproven regardless of this run's own ledger history"
+    # Seventh-pass corrective note: at most ONE additional diagnostic-only
+    # re-read, for a future occurrence's forensics -- this can never
+    # authorize ownership; the decision above (not owned, return 1) is
+    # already final.
+    _diagnostic_ownership_reread "userid" "${PVE_USER}" "PVE user '${PVE_USER}'" \
+      pveum user list --output-format json
     return 1
   fi
 
@@ -366,6 +372,12 @@ _token_object_owned_by_this_run() {
     diagnosis="$(_json_list_schema_diagnosis "${list_file}" "tokenid")"
     rm -f "${list_file}"
     log_warn "could not verify ownership of token '${PVE_TOKEN_ID}': the PVE token list did not match the expected JSON shape (an array of objects each carrying a string 'tokenid' field) -- diagnosis: ${diagnosis:-unknown} -- treating ownership as unproven regardless of this run's own ledger history"
+    # Seventh-pass corrective note: at most ONE additional diagnostic-only
+    # re-read, for a future occurrence's forensics -- this can never
+    # authorize ownership; the decision above (not owned, return 1) is
+    # already final.
+    _diagnostic_ownership_reread "tokenid" "${PVE_TOKEN_ID}" "PVE token '${PVE_TOKEN_ID}'" \
+      pveum user token list "${PVE_USER}" --output-format json
     return 1
   fi
 
