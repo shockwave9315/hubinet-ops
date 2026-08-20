@@ -1277,6 +1277,98 @@ class TestTokenOwnershipState:
             assert result.stdout in ("owned", "absent", "unproven")
 
 
+def _run_parent_user_child_token_state_helper(tmp_path, *, list_cmd_body):
+    """Source ONLY bootstrap-common.sh + bootstrap-identity.sh, define a
+    fake `pveum` bash function, then call _parent_user_child_token_state
+    directly and return the completed subprocess (stdout carries exactly
+    one of "empty"/"nonempty"/"unproven"). No PVE command, no phase
+    function, no orchestration, no real rollback path is ever invoked.
+    """
+    bash_snippet = f'''
+source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"
+source "{(LIB_DIR / "bootstrap-identity.sh").as_posix()}"
+PVE_USER="hubinetops@pve"
+
+pveum() {{
+{list_cmd_body}
+}}
+
+_parent_user_child_token_state
+exit $?
+'''
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestParentUserChildTokenState:
+    """P1 fix (tenth pass, independent review -- Codex): "check every
+    child token before deleting its parent user." Proving only the
+    expected token safe is not sufficient authorization to delete the
+    parent user -- a different administrator or a concurrent process
+    could have registered an entirely different token under the same
+    fixed-name user. _parent_user_child_token_state must report an
+    explicit tri-state -- "empty" / "nonempty" / "unproven" -- over a
+    FRESH, complete read of the user's ENTIRE token list, never filtered
+    to any one expected token.
+    """
+
+    def test_genuinely_empty_list_is_empty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(tmp_path, list_cmd_body="echo '[]'")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "empty"
+
+    def test_one_residual_token_is_nonempty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"tokenid":"other-token","comment":"unrelated"}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "nonempty"
+
+    def test_multiple_residual_tokens_are_nonempty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(
+            tmp_path,
+            list_cmd_body=(
+                'echo \'[{"tokenid":"other-token","comment":"unrelated"},'
+                '{"tokenid":"r0-readonly","comment":"run=x"}]\''
+            ),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "nonempty"
+
+    def test_command_failure_is_unproven_not_empty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(tmp_path, list_cmd_body="return 7")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_schema_invalid_is_unproven_not_empty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(tmp_path, list_cmd_body="echo '[1,2,3]'")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_never_dumps_tokenid_or_comment_into_the_log(self, tmp_path):
+        secret_looking_value = "totally-not-a-real-secret-marker-xyz"
+        result = _run_parent_user_child_token_state_helper(
+            tmp_path,
+            list_cmd_body=f'echo \'[{{"tokenid":"{secret_looking_value}","comment":"{secret_looking_value}"}}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "nonempty"
+        assert secret_looking_value not in result.stderr
+
+    def test_output_is_always_exactly_one_of_the_three_states(self, tmp_path):
+        for body in (
+            "echo '[]'",
+            'echo \'[{"tokenid":"other-token"}]\'',
+            "return 9",
+            "echo 'not-json{{{'",
+        ):
+            result = _run_parent_user_child_token_state_helper(tmp_path, list_cmd_body=body)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout in ("empty", "nonempty", "unproven")
+
+
 def _run_fake_pveum(fake_env, *args):
     """Invoke the fake `pveum` shim directly (never the real bootstrap
     script, never `_run_full`'s full orchestration) -- a local-safe,

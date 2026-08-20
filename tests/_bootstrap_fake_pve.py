@@ -477,6 +477,22 @@ def _maybe_replace_identity_before_failure(trigger, state):
         full = plan.get("token", "hubinetops@pve!r0-readonly")
         if full in state["pve_tokens"]:
             state["pve_tokens"][full]["comment"] = token_comment
+    # Tenth-pass corrective additions (P1 finding, independent review --
+    # Codex): the "check every child token before deleting its parent
+    # user" regression witness needs a REALISTIC way to have a token
+    # OTHER than the expected r0-readonly genuinely present under
+    # hubinetops@pve at rollback time (simulating a different
+    # administrator or concurrent process registering it after this
+    # run's own phase6 succeeded), and/or to have the expected token
+    # itself genuinely gone already -- both via real state mutation, not
+    # merely an output override that only fakes the listing command's
+    # text.
+    if plan.get("remove_expected_token"):
+        state["pve_tokens"].pop(plan.get("expected_token", "hubinetops@pve!r0-readonly"), None)
+    foreign_token = plan.get("add_foreign_token")
+    if foreign_token:
+        full = foreign_token.get("token", "hubinetops@pve!other-token")
+        state["pve_tokens"][full] = {"comment": foreign_token.get("comment", "unrelated")}
     _save_state(state)
 
 

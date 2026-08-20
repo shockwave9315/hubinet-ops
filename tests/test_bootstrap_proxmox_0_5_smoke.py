@@ -993,6 +993,154 @@ class TestPveIdentityOwnership:
         assert any(line.startswith("pveum acl delete / --users hubinetops@pve") for line in log)
 
     # -----------------------------------------------------------------
+    # Tenth-pass corrective fix, P1 (independent review -- Codex):
+    # "check every child token before deleting its parent user." Proving
+    # only the EXPECTED token (r0-readonly) safe -- absent, or owned and
+    # successfully removed -- is not sufficient authorization to touch
+    # the parent user: a different administrator or a concurrent process
+    # could have registered an entirely different token under this same
+    # fixed-name user at any point after this bootstrap created it.
+    # Parent cleanup now additionally requires a FRESH, complete read of
+    # the user's ENTIRE token list, proving it empty.
+    # -----------------------------------------------------------------
+
+    def test_codex_p1_owned_expected_token_with_foreign_extra_child_token_blocks_parent(
+        self, tmp_path, source_checkout,
+    ):
+        # The direct Codex P1 regression witness: our own expected token
+        # is genuinely proven owned and safely removed, but a foreign
+        # token also registered under the same user (simulating a
+        # different administrator or a concurrent process) must still
+        # block the parent user and its ACL from being touched at all.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "replace_identity_before_failure": {
+                    "apt_get": {
+                        "add_foreign_token": {
+                            "token": "hubinetops@pve!other-token",
+                            "comment": "unrelated",
+                        },
+                    },
+                },
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        # Our own expected token IS safely removed -- this is not merely
+        # "preserve everything," it correctly distinguishes the two.
+        assert any(line.startswith("pveum acl delete / --tokens hubinetops@pve!r0-readonly") for line in log)
+        assert any(line.startswith("pveum user token remove hubinetops@pve r0-readonly") for line in log)
+        # But the parent user and its OWN ACL grant are never touched,
+        # because a residual (foreign, unproven) token remains.
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+        assert "hubinetops@pve!r0-readonly" not in state["pve_tokens"]
+        assert "hubinetops@pve!other-token" in state["pve_tokens"]
+
+    def test_expected_token_absent_with_residual_foreign_token_blocks_parent(
+        self, tmp_path, source_checkout,
+    ):
+        # The expected token is genuinely absent (nothing to protect for
+        # IT specifically), but a residual foreign token under the same
+        # user must still block parent cleanup entirely.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "replace_identity_before_failure": {
+                    "apt_get": {
+                        "remove_expected_token": True,
+                        "add_foreign_token": {
+                            "token": "hubinetops@pve!other-token",
+                            "comment": "unrelated",
+                        },
+                    },
+                },
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+        assert "hubinetops@pve!other-token" in state["pve_tokens"]
+
+    def test_final_child_token_list_command_failure_blocks_parent_even_after_expected_token_removed(
+        self, tmp_path, source_checkout,
+    ):
+        # The expected token is proven owned and safely removed (call #1
+        # succeeds normally) -- but the FRESH, complete re-read that must
+        # follow (call #2) fails outright. Fail closed: parent user and
+        # its ACL are still preserved, even though the expected token's
+        # own cleanup genuinely completed.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_token_list_fail_at_call": 2,
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert any(line.startswith("pveum user token remove hubinetops@pve r0-readonly") for line in log)
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        assert "could not read back the current full PVE token list" in result.stderr
+
+    def test_final_child_token_list_schema_invalid_blocks_parent_even_after_expected_token_removed(
+        self, tmp_path, source_checkout,
+    ):
+        # Same shape as above, but the fresh re-read (call #2) succeeds
+        # yet is schema-invalid rather than failing outright -- same
+        # fail-closed result.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_token_list_malformed_at_call": 2,
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert any(line.startswith("pveum user token remove hubinetops@pve r0-readonly") for line in log)
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        assert "could not confirm no residual child tokens remain" in result.stderr
+
+    def test_owned_expected_token_and_empty_child_list_allows_full_parent_cleanup(
+        self, tmp_path, source_checkout,
+    ):
+        # Positive control: the expected token is proven owned and safely
+        # removed, and the fresh, complete re-read genuinely proves the
+        # user now has zero tokens -- parent cleanup proceeds normally.
+        # (test_current_user_with_correct_run_id_may_still_be_removed and
+        # test_current_token_with_correct_run_id_may_still_be_removed
+        # already cover this exact ordinary-success shape end to end;
+        # this test exists to make the fresh-empty-list precondition
+        # explicit and independently named.)
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, scenario_overrides={"fail": ["apt_get"]},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert any(line.startswith("pveum user token remove hubinetops@pve r0-readonly") for line in log)
+        assert any(line.startswith("pveum acl delete / --users hubinetops@pve") for line in log)
+        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" not in state["pve_users"]
+        assert state["pve_tokens"] == {}
+
+    # -----------------------------------------------------------------
     # Ninth-pass corrective fix, P1/P2 (independent review): an unproven
     # token must block mutation of the WHOLE identity dependency chain
     # (token, token ACL, parent user, parent user ACL) -- not merely the

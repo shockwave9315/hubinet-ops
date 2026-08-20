@@ -431,6 +431,74 @@ _token_ownership_state() {
   printf 'unproven'
 }
 
+# _parent_user_child_token_state: a FRESH, COMPLETE, authoritative read
+# of EVERY token currently registered under ${PVE_USER} -- never
+# filtered to the expected ${PVE_TOKEN_ID} -- prints exactly one of
+# "empty" / "nonempty" / "unproven" via stdout.
+#
+# Tenth-pass corrective note (P1 finding, independent review -- Codex):
+# proving only the EXPECTED token (r0-readonly) safe -- proven absent,
+# or proven owned and successfully removed -- is NOT sufficient
+# authorization to delete the parent user or even just its ACL grant.
+# `pveum user token list <user>` scopes to exactly that user's own
+# tokens; a real administrator, or a concurrent process, could have
+# registered a DIFFERENT token under this same fixed-name user at any
+# point after this bootstrap created it. Real Proxmox's `pveum user
+# delete` would destroy that other token too, and even just removing
+# the parent user's own ACL grant can functionally disable it (a
+# privsep=1 token's effective permissions are the intersection of the
+# owning user's permissions and the token's own). This performs a FRESH
+# read here -- deliberately never reusing the earlier expected-token
+# ownership read, since a child token could appear in the window
+# between the two -- of the user's COMPLETE token list, and requires it
+# to be authoritatively, schema-valid EMPTY before parent cleanup is
+# ever considered safe. This run has live-read provenance only for its
+# own expected token; it never attempts to classify, remove, or
+# otherwise act on any OTHER token found here -- a residual token of
+# ANY kind, known or unknown, simply blocks parent cleanup and is left
+# for the operator. Logs only structural/non-secret facts, exactly like
+# _token_ownership_state above -- never a tokenid, comment, or other
+# payload value.
+#
+# Same residual TOCTOU as every other live-read-then-mutate check in
+# this file: there is no PVE-exposed compare-and-delete primitive, so a
+# token could in principle still be added in the narrow window between
+# this read and the subsequent `pveum acl delete`/`pveum user delete`
+# calls. This function does not close that window (nothing in this
+# bootstrap can); it closes the SEPARATE, larger gap that existed before
+# it: previously there was no complete-child-set proof of any kind.
+_parent_user_child_token_state() {
+  local list_file
+  list_file="$(mktemp /tmp/hubinet-ops-bootstrap-childtokens-rb.XXXXXX.json)" || { printf 'unproven'; return 0; }
+  chmod 0600 "${list_file}"
+  local cmd_status
+  pveum user token list "${PVE_USER}" --output-format json >"${list_file}" 2>/dev/null && cmd_status=0 || cmd_status=$?
+  if (( cmd_status != 0 )); then
+    rm -f "${list_file}"
+    log_warn "could not read back the current full PVE token list for '${PVE_USER}' to confirm no residual child tokens remain (pveum exited ${cmd_status}) -- treating the child-token set as UNPROVEN; parent user cleanup requires an authoritative empty result"
+    printf 'unproven'
+    return 0
+  fi
+  if ! _json_list_has_string_field_schema "${list_file}" "tokenid"; then
+    local diagnosis
+    diagnosis="$(_json_list_schema_diagnosis "${list_file}" "tokenid")"
+    rm -f "${list_file}"
+    log_warn "could not confirm no residual child tokens remain for '${PVE_USER}': the PVE token list did not match the expected JSON shape (an array of objects each carrying a string 'tokenid' field) -- diagnosis: ${diagnosis:-unknown} -- treating the child-token set as UNPROVEN; parent user cleanup requires an authoritative empty result"
+    printf 'unproven'
+    return 0
+  fi
+
+  local count
+  count="$(_json_list_length "${list_file}")"
+  rm -f "${list_file}"
+  if [[ "${count}" =~ ^[0-9]+$ ]] && (( count == 0 )); then
+    printf 'empty'
+    return 0
+  fi
+  log_warn "PVE user '${PVE_USER}' still has one or more tokens registered under it -- residual child-token state blocks automatic parent cleanup regardless of that token's own identity or provenance"
+  printf 'nonempty'
+}
+
 # _role_object_owned_by_this_run: PVE roles carry no comment/description
 # field this bootstrap could use as a provenance marker, so -- unlike user
 # and token above -- there is no PVE-supported mechanism to re-verify at

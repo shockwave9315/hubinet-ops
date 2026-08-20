@@ -549,6 +549,28 @@ for row in data:
 ' "${file}" "${match_field}" "${match_value}" "${target_field}" 2>/dev/null | tr -d '\r'
 }
 
+# _json_list_length <file>: prints the number of elements in the JSON
+# array at `file`. Callers must already have confirmed schema validity
+# separately (e.g. via _json_list_has_string_field_schema) -- this only
+# distinguishes "zero elements" from "one or more," never validates
+# shape. Tenth-pass corrective addition (P1 finding, independent
+# review): used by bootstrap-identity.sh's
+# _parent_user_child_token_state to decide whether a FRESH, complete
+# read of a user's token list is authoritatively empty.
+_json_list_length() {
+  local file="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq 'length' "${file}" 2>/dev/null
+    return
+  fi
+  python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+print(len(data))
+' "${file}" 2>/dev/null
+}
+
 # _generate_run_id: a per-invocation random identifier embedded into PVE
 # object comments (where PVE supports a comment field) so a later rollback
 # can PROVE, via read-only inspection, that a given object was actually
