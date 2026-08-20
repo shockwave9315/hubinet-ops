@@ -32,15 +32,53 @@
 # every PVE object comment this bootstrap creates that supports one (user,
 # token). Rollback (bootstrap-proxmox-0.5.sh::rollback_on_failure) never
 # deletes an object merely because it exists and matches our fixed name --
-# it deletes only what this run can PROVE it owns: either a clean success
-# already recorded in this run's own ledger, or (for an ambiguous
-# mutate-then-error result) a read-back comment carrying this exact
-# run-id, which only our own successful create call could have written.
-# PVE roles have no comment/description field at all -- for that object
-# type, ownership can only ever be proven via this run's own ledger; an
-# ambiguous role-creation failure is never blindly deleted, only
-# preserved with a loud, exact manual-remediation message. See
-# _user_object_owned_by_this_run / _role_object_owned_by_this_run below.
+# it deletes only what this run can PROVE, via a live read-back performed
+# immediately before deletion, still carries this exact run-id in its
+# comment field RIGHT NOW.
+#
+# Third-pass corrective note: an earlier version of
+# _user_object_owned_by_this_run / _token_object_owned_by_this_run treated
+# `ledger_has` (this run's OWN record that its create call once succeeded)
+# as sufficient proof by itself, returning immediately without any live
+# re-query. That proves only "this run created an object with this name
+# AT SOME EARLIER POINT," not "the CURRENT object is still that same
+# object" -- if the object was deleted and replaced by another actor
+# between this run's own successful creation and a later phase failing
+# and triggering rollback, the ledger-only fast path would still report
+# "owned" and delete the replacement. Both functions now ALWAYS perform a
+# live read-back of the CURRENT object's comment and require it to carry
+# `run=${BOOTSTRAP_RUN_ID}` before returning true; `ledger_has` is
+# consulted only as diagnostic context (to log a specific "replaced since
+# creation" warning), never as an independent deletion authorization. A
+# read-back command failure, malformed JSON, a missing object, or a
+# comment that does not match are all treated identically: NOT owned,
+# preserve, log actionable remediation.
+#
+# PVE roles have no comment/description field at all, so this same live-
+# provenance check is structurally impossible for them -- a role's
+# ownership can never be re-verified at delete-time, only inferred from
+# this run's own ledger, which (per the reasoning above) is not
+# sufficient proof that the CURRENT role is still this run's role. The
+# conservative policy adopted here: PVE-identity rollback NEVER deletes
+# HubinetOpsR0Auditor automatically, regardless of ledger state. A failed
+# run that got as far as creating the role always leaves it in place, with
+# a loud manual-remediation message; a retried bootstrap will then hit the
+# pre-existing-conflict check in this phase and fail closed until an
+# operator has inspected and removed it. This is a deliberate
+# completeness/safety tradeoff: an automatic rollback that could delete
+# someone else's role is a worse outcome than an orphaned role from a
+# failed run that requires one manual `pveum role delete` before retrying.
+#
+# Residual, structurally unavoidable race: even with the live read-back
+# above, there is no PVE-exposed atomic "verify-then-delete"
+# (compare-and-delete) primitive for users or tokens -- an external actor
+# could, in principle, replace the object in the narrow window between
+# this run's read-back check and its subsequent `pveum ... delete` call.
+# This bootstrap does not attempt to close that residual window with
+# retries or additional locking (PVE gives no cluster-wide primitive that
+# would make a retry any safer, only more complex); it is documented here
+# accurately as an accepted, external-administrator-only residual risk,
+# not claimed as fully solved.
 
 PVE_USER="hubinetops@pve"
 PVE_ROLE="HubinetOpsR0Auditor"
@@ -57,25 +95,10 @@ PVE_REQUIRED_PRIVS="Sys.Audit,VM.Audit"
 phase6_pve_identity() {
   log_phase "Phase 6: dedicated read-only PVE identity"
 
-  local user_list_file
-  user_list_file="$(mktemp /tmp/hubinet-ops-bootstrap-userlist.XXXXXX.json)"
-  chmod 0600 "${user_list_file}"
-  pveum user list --output-format json >"${user_list_file}" 2>/dev/null || true
-  if _json_list_field_equals "${user_list_file}" "userid" "${PVE_USER}"; then
-    rm -f "${user_list_file}"
-    die "PVE user '${PVE_USER}' already exists -- this bootstrap only performs a fresh install and will not reuse an existing identity of unknown provenance. Remove it yourself (pveum user delete ${PVE_USER}) after confirming it is not depended on elsewhere, then retry."
-  fi
-  rm -f "${user_list_file}"
-
-  local role_list_file
-  role_list_file="$(mktemp /tmp/hubinet-ops-bootstrap-rolelist.XXXXXX.json)"
-  chmod 0600 "${role_list_file}"
-  pveum role list --output-format json >"${role_list_file}" 2>/dev/null || true
-  if _json_list_field_equals "${role_list_file}" "roleid" "${PVE_ROLE}"; then
-    rm -f "${role_list_file}"
-    die "PVE role '${PVE_ROLE}' already exists -- refusing to reuse it (unknown provenance/privilege history). Remove it yourself (pveum role delete ${PVE_ROLE}) after confirming it is not depended on elsewhere, then retry."
-  fi
-  rm -f "${role_list_file}"
+  _assert_pve_object_absent "userid" "${PVE_USER}" "PVE user '${PVE_USER}'" \
+    "pveum user delete ${PVE_USER}" pveum user list --output-format json
+  _assert_pve_object_absent "roleid" "${PVE_ROLE}" "PVE role '${PVE_ROLE}'" \
+    "pveum role delete ${PVE_ROLE}" pveum role list --output-format json
 
   # Recorded only NOW -- after both pre-existing-conflict checks above,
   # immediately before the first real mutation -- never before them. If
@@ -137,6 +160,49 @@ phase6_pve_identity() {
   log_pass "PVE identity: ${PVE_USER}, role ${PVE_ROLE} (exactly ${PVE_REQUIRED_PRIVS}), token ${PVE_TOKEN_ID} (privsep=1)"
 }
 
+# _assert_pve_object_absent <id-field> <id-value> <label> <delete-hint> <list-cmd...>
+# Fail-closed pre-existing-conflict check. Third-pass corrective note: an
+# earlier version ran the listing command with `... || true` and then
+# checked _json_list_field_equals on whatever (possibly empty/garbage)
+# file resulted -- a transient `pveum` error, a rejected --output-format
+# flag, an unreachable pmxcfs, or truncated output would then be
+# indistinguishable from "the object genuinely does not exist," and the
+# run would proceed to create a PVE identity anyway. This helper
+# distinguishes four outcomes and only ever proceeds on the fourth:
+#   - the listing command itself fails                       -> STOP
+#   - it succeeds but the output is not valid JSON             -> STOP
+#   - a valid JSON array is read and the target id IS present  -> STOP
+#     (a real pre-existing-object conflict)
+#   - a valid JSON array is read and the target id is absent   -> proceed
+_assert_pve_object_absent() {
+  local id_field="$1" id_value="$2" label="$3" delete_hint="$4"
+  shift 4
+  local -a list_cmd=("$@")
+
+  local list_file
+  list_file="$(mktemp /tmp/hubinet-ops-bootstrap-conflictcheck.XXXXXX.json)" \
+    || die "could not create a temp file to inspect pre-existing PVE identity state for ${label}"
+  chmod 0600 "${list_file}"
+
+  local cmd_status
+  "${list_cmd[@]}" >"${list_file}" 2>/dev/null && cmd_status=0 || cmd_status=$?
+  if (( cmd_status != 0 )); then
+    rm -f "${list_file}"
+    die "could not verify whether ${label} already exists ('${list_cmd[*]}' failed with exit ${cmd_status}) -- refusing to proceed without a reliable read of existing PVE identity state. This is a fail-closed pre-existing-conflict check, not a transient warning; retry once the PVE API is reliably reachable."
+  fi
+
+  if ! _json_list_is_valid "${list_file}"; then
+    rm -f "${list_file}"
+    die "could not verify whether ${label} already exists ('${list_cmd[*]}' did not produce a valid JSON array) -- refusing to proceed without a reliable read of existing PVE identity state."
+  fi
+
+  if _json_list_field_equals "${list_file}" "${id_field}" "${id_value}"; then
+    rm -f "${list_file}"
+    die "${label} already exists -- this bootstrap only performs a fresh install and will not reuse an existing identity of unknown provenance. Remove it yourself (${delete_hint}) after confirming it is not depended on elsewhere, then retry."
+  fi
+  rm -f "${list_file}"
+}
+
 # _verify_effective_permissions: exact-set proof, not a blacklist. Reads
 # back the token's own effective permissions and asserts the sorted set of
 # truthy privilege keys equals PVE_REQUIRED_PRIVS exactly -- catches ANY
@@ -185,51 +251,113 @@ _verify_effective_permissions() {
 # object it cannot prove it owns.
 # ---------------------------------------------------------------------------
 
-# _user_object_owned_by_this_run: true if this run's own ledger recorded a
-# clean, unambiguous successful creation, OR (for the ambiguous
-# mutate-then-error case) the user currently exists AND its comment field
-# carries this exact run's BOOTSTRAP_RUN_ID -- which only this run's own
-# `pveum user add` call could have written, so its presence is conclusive
-# proof of ownership even if that call itself reported failure.
+# _user_object_owned_by_this_run: true only if a LIVE read-back, performed
+# right now, shows the CURRENT user object's comment field carries this
+# exact run's BOOTSTRAP_RUN_ID -- which only this run's own `pveum user
+# add` call could have written. `ledger_has` (this run's own record that
+# its create call once succeeded) is consulted only to produce a more
+# specific diagnostic message when the live check disagrees with it; it
+# never authorizes deletion by itself. A read-back command failure,
+# invalid JSON, a missing object, or a non-matching/absent comment are all
+# treated identically: not owned.
 _user_object_owned_by_this_run() {
-  ledger_has pve-user "${PVE_USER}" && return 0
+  local had_ledger_record=0
+  ledger_has pve-user "${PVE_USER}" && had_ledger_record=1
 
   local list_file
   list_file="$(mktemp /tmp/hubinet-ops-bootstrap-userlist-rb.XXXXXX.json)" || return 1
   chmod 0600 "${list_file}"
-  pveum user list --output-format json >"${list_file}" 2>/dev/null || { rm -f "${list_file}"; return 1; }
+  local cmd_status
+  pveum user list --output-format json >"${list_file}" 2>/dev/null && cmd_status=0 || cmd_status=$?
+  if (( cmd_status != 0 )); then
+    rm -f "${list_file}"
+    log_warn "could not read back the current PVE user list to verify ownership of '${PVE_USER}' (pveum exited ${cmd_status}) -- treating ownership as unproven regardless of this run's own ledger history"
+    return 1
+  fi
+  if ! _json_list_is_valid "${list_file}"; then
+    rm -f "${list_file}"
+    log_warn "could not verify ownership of '${PVE_USER}': the PVE user list did not parse as a valid JSON array -- treating ownership as unproven regardless of this run's own ledger history"
+    return 1
+  fi
+
   local comment
   comment="$(_json_list_field_value "${list_file}" "userid" "${PVE_USER}" "comment")"
   rm -f "${list_file}"
-  [[ -n "${comment}" && "${comment}" == *"run=${BOOTSTRAP_RUN_ID}"* ]]
+
+  if [[ -z "${comment}" ]]; then
+    (( had_ledger_record )) && log_warn "this run's ledger recorded creating '${PVE_USER}', but it no longer exists at rollback time -- nothing to clean up"
+    return 1
+  fi
+  if [[ "${comment}" == *"run=${BOOTSTRAP_RUN_ID}"* ]]; then
+    return 0
+  fi
+  if (( had_ledger_record )); then
+    log_warn "this run's ledger recorded creating '${PVE_USER}', but the CURRENT object's comment does not carry this run's id (run=${BOOTSTRAP_RUN_ID}) -- it appears to have been replaced by another actor since creation; preserving it rather than deleting an object this run can no longer prove is its own"
+  fi
+  return 1
 }
 
-# _token_object_owned_by_this_run: same reasoning as the user check above,
-# via `pveum user token list <user> --output-format json`'s own `comment`
-# field for the matching `tokenid`. Only reachable/meaningful once the
-# owning user itself is proven ours (see rollback_on_failure) -- a token
-# can only ever exist under a user this bootstrap itself just created.
+# _token_object_owned_by_this_run: same live-read-back reasoning as the
+# user check above, via `pveum user token list <user> --output-format
+# json`'s own `comment` field for the matching `tokenid`. Only
+# reachable/meaningful once the owning user itself is proven ours (see
+# rollback_on_failure) -- a token can only ever exist under a user this
+# bootstrap itself just created.
 _token_object_owned_by_this_run() {
-  ledger_has pve-token "${PVE_FULL_TOKEN_ID}" && return 0
+  local had_ledger_record=0
+  ledger_has pve-token "${PVE_FULL_TOKEN_ID}" && had_ledger_record=1
 
   local list_file
   list_file="$(mktemp /tmp/hubinet-ops-bootstrap-tokenlist-rb.XXXXXX.json)" || return 1
   chmod 0600 "${list_file}"
-  pveum user token list "${PVE_USER}" --output-format json >"${list_file}" 2>/dev/null || { rm -f "${list_file}"; return 1; }
+  local cmd_status
+  pveum user token list "${PVE_USER}" --output-format json >"${list_file}" 2>/dev/null && cmd_status=0 || cmd_status=$?
+  if (( cmd_status != 0 )); then
+    rm -f "${list_file}"
+    log_warn "could not read back the current PVE token list for '${PVE_USER}' to verify ownership of '${PVE_TOKEN_ID}' (pveum exited ${cmd_status}) -- treating ownership as unproven regardless of this run's own ledger history"
+    return 1
+  fi
+  if ! _json_list_is_valid "${list_file}"; then
+    rm -f "${list_file}"
+    log_warn "could not verify ownership of token '${PVE_TOKEN_ID}': the PVE token list did not parse as a valid JSON array -- treating ownership as unproven regardless of this run's own ledger history"
+    return 1
+  fi
+
   local comment
   comment="$(_json_list_field_value "${list_file}" "tokenid" "${PVE_TOKEN_ID}" "comment")"
   rm -f "${list_file}"
-  [[ -n "${comment}" && "${comment}" == *"run=${BOOTSTRAP_RUN_ID}"* ]]
+
+  if [[ -z "${comment}" ]]; then
+    (( had_ledger_record )) && log_warn "this run's ledger recorded creating token '${PVE_FULL_TOKEN_ID}', but it no longer exists at rollback time -- nothing to clean up"
+    return 1
+  fi
+  if [[ "${comment}" == *"run=${BOOTSTRAP_RUN_ID}"* ]]; then
+    return 0
+  fi
+  if (( had_ledger_record )); then
+    log_warn "this run's ledger recorded creating token '${PVE_FULL_TOKEN_ID}', but the CURRENT object's comment does not carry this run's id (run=${BOOTSTRAP_RUN_ID}) -- it appears to have been replaced by another actor since creation; preserving it rather than deleting an object this run can no longer prove is its own"
+  fi
+  return 1
 }
 
 # _role_object_owned_by_this_run: PVE roles carry no comment/description
-# field this bootstrap could use as a provenance marker -- ownership can
-# ONLY ever be proven via this run's own clean ledger success record. An
-# ambiguous role-creation failure (the role now exists, but this run's own
-# `pveum role add` reported nonzero) can never be safely attributed to
-# this run or any other, and must be preserved, never blindly deleted.
+# field this bootstrap could use as a provenance marker, so -- unlike user
+# and token above -- there is no PVE-supported mechanism to re-verify at
+# rollback time that the CURRENT role is still the one this run created.
+# This run's own ledger record proves only "this run's own `pveum role
+# add` call succeeded at some earlier point," never "the role currently
+# named HubinetOpsR0Auditor is still that same object" (it could have been
+# deleted and recreated by another actor in the meantime, exactly as with
+# user/token). Since that stronger proof is structurally unavailable for
+# roles, the deliberate, conservative policy is to NEVER delete the role
+# automatically during rollback, regardless of ledger state -- always
+# return false (not owned) here. An orphaned role from a failed run is
+# left for the operator to inspect and remove by hand; the next bootstrap
+# attempt will then correctly fail closed at phase6's pre-existing-
+# conflict check until that happens, rather than risk deleting an object
+# that might belong to someone else.
 _role_object_owned_by_this_run() {
-  ledger_has pve-role "${PVE_ROLE}"
+  return 1
 }
 
 # ---------------------------------------------------------------------------

@@ -204,6 +204,34 @@ for key in keys:
 ' "${file}" 2>/dev/null | tr -d '\r' | LC_ALL=C sort
 }
 
+# _json_list_is_valid <file>: true if `file` parses as a valid JSON array
+# (regardless of whether it is empty). Third-pass corrective note: earlier
+# callers of _json_list_field_equals (phase6's pre-existing-identity-
+# conflict checks) treated "command failed" and "produced no valid JSON"
+# identically to "object legitimately absent, safe to proceed" (via a bare
+# `... || true` around the listing command) -- a transient `pveum` error,
+# a rejected --output-format flag, or truncated output would then be
+# silently read as proof nothing conflicts, and the run would proceed to
+# create a PVE identity anyway. This helper lets a caller require a
+# genuinely successful, parseable read before trusting an "absent" result
+# from _json_list_field_equals -- command failure or malformed JSON must
+# always be a hard stop for a security-relevant conflict check, never a
+# fall-through to "absent."
+_json_list_is_valid() {
+  local file="$1"
+  [[ -s "${file}" ]] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    jq -e 'type == "array"' "${file}" >/dev/null 2>&1
+    return
+  fi
+  python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+sys.exit(0 if isinstance(data, list) else 1)
+' "${file}" 2>/dev/null
+}
+
 # _json_list_field_equals <file> <field> <value>: true if the JSON array at
 # `file` contains at least one object whose `field` equals `value`.
 _json_list_field_equals() {

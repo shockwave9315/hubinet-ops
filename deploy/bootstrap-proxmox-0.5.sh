@@ -317,7 +317,7 @@ rollback_on_failure() {
     if _role_object_owned_by_this_run; then
       role_owned=1
     else
-      log_warn "PRESERVING PVE role '${PVE_ROLE}': this run cannot prove it created it (PVE roles carry no comment/provenance field, so ownership can only be proven via this run's own clean success record, which is absent) -- it may belong to a concurrent bootstrap run or another creator. Manual remediation: inspect 'pveum role list' and 'pveum acl list' for '${PVE_ROLE}', confirm provenance yourself, then remove it only if you are certain it is safe: pveum role delete ${PVE_ROLE}"
+      log_warn "PRESERVING PVE role '${PVE_ROLE}': PVE roles carry no comment/provenance field, so this run can never re-verify at rollback time that the CURRENT role is still the one it created (even if this run's own ledger recorded a clean success earlier, the role could have been deleted and replaced by another actor since then) -- role rollback is deliberately never automatic. Manual remediation: inspect 'pveum role list' and 'pveum acl list' for '${PVE_ROLE}', confirm provenance yourself, then remove it only if you are certain it is safe: pveum role delete ${PVE_ROLE}"
     fi
 
     # Token ownership is checked independently too (not merely inherited

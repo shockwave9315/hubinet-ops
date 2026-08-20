@@ -11,13 +11,38 @@ name: Bootstrap Smoke (Sandbox)
 # Narrowly path-filtered and pull_request-only (never on every push, never
 # on unrelated app-only/documentation-only changes) so this expensive
 # Docker job only runs when it could actually be affected.
-
+#
+# Path coverage rule (P2-1, third pass): every file whose change can
+# materially change the bootstrap execution the sandbox smoke matrix
+# exercises must be listed here.
+# "deploy/lib/hubinet-ops-bootstrap-*.py" is a GLOB covering the whole
+# family of python3 helpers the bootstrap pushes into and runs inside the
+# CT (hubinet-ops-bootstrap-accept.py, hubinet-ops-bootstrap-resolve-dns.py,
+# and any future addition matching this naming pattern) -- a prior version
+# of this list named only "-accept.py" individually and missed
+# "-resolve-dns.py" (added in the same corrective pass that introduced it)
+# entirely; a glob over the whole family, rather than a second
+# per-file entry to remember, closes that class of omission going forward.
+# deploy/install-0.5.0-fresh.sh and deploy/hubinet-ops-0.5.service are
+# included because phase8/phase8b/phase11/phase12 exercise them directly
+# (the installer is invoked, unmodified, inside the CT; the service unit
+# governs what the acceptance phases check is actually running) --
+# requirements.txt is included for the same reason (what the installer's
+# own pip install step brings in). tests/test_bootstrap_proxmox_0_5.py
+# ("local-safe": test_ci_workflow_*, the AST self-guard, and the
+# path-coverage-derivation test below) is intentionally NOT listed here --
+# it already runs in the ordinary, unconditional `pytest -q` CI job on
+# every PR, so gating it a second time behind this narrower workflow would
+# only slow feedback, never add coverage.
 on:
   pull_request:
     paths:
       - "deploy/bootstrap-proxmox-0.5.sh"
       - "deploy/lib/bootstrap-*.sh"
-      - "deploy/lib/hubinet-ops-bootstrap-accept.py"
+      - "deploy/lib/hubinet-ops-bootstrap-*.py"
+      - "deploy/install-0.5.0-fresh.sh"
+      - "deploy/hubinet-ops-0.5.service"
+      - "requirements.txt"
       - "tests/_bootstrap_fake_pve.py"
       - "tests/test_bootstrap_proxmox_0_5_smoke.py"
       - "tests/shell/**"

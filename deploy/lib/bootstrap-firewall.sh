@@ -25,6 +25,17 @@
 # regenerated (re-run this bootstrap) before the service can reach it;
 # this bootstrap never silently re-resolves and re-opens egress on its own
 # after the fact.
+#
+# DNS resolver authority (P2-2, third pass): --dns-resolver is now
+# authoritative for the fresh container, not merely a firewall-rule hint.
+# phase1_preflight validates it and phase3 (bootstrap-container.sh) passes
+# it to `pct create --nameserver`, so PVE itself regenerates the
+# container's /etc/resolv.conf from it at every boot. Before any hostname
+# resolution or rule generation here, _verify_ct_dns_resolver_matches_declared
+# re-reads both the container's PVE config and its live /etc/resolv.conf
+# and hard-stops on any mismatch -- the firewall's permitted DNS
+# destination and the resolver the container will actually use are
+# structurally proven to be the same address, not merely asserted to be.
 
 CT_NFT_CONF_PATH="/etc/nftables.conf"
 CT_RESOLVE_SCRIPT_CT="/tmp/hubinet-ops-bootstrap-resolve-dns.py"
@@ -114,12 +125,84 @@ _expected_dns_rule_lines() {
   printf 'meta skuid "hubinetops" ip daddr %s tcp dport 53 accept\n' "${DNS_RESOLVER_IP}"
 }
 
+# _verify_ct_dns_resolver_matches_declared: third-pass corrective fix
+# (P2-2). Structurally ties the firewall's permitted DNS destination to
+# the resolver the container will ACTUALLY use, rather than trusting
+# --dns-resolver as a mere firewall-rule hint while the container's own
+# live resolver configuration is left to whatever it happened to be
+# assigned. A mismatch here previously could not be detected until
+# discovery started failing with an opaque DNS/network symptom well after
+# the firewall had already activated. Only meaningful in hostname PVE
+# endpoint mode (DNS_RESOLVER_IP is set only then, per phase1_preflight);
+# a no-op in literal-IP mode. Verifies BOTH:
+#   - the container's own PVE configuration (`pct config <vmid>`) records
+#     the declared nameserver -- proves phase3's --nameserver was actually
+#     accepted and persisted by PVE, not merely requested;
+#   - the container's own LIVE /etc/resolv.conf (what glibc's resolver
+#     actually reads at getaddrinfo() time) names ONLY the declared
+#     resolver.
+# A command failure, a missing/mismatched PVE config entry, an unreadable
+# /etc/resolv.conf, zero nameserver entries, or any entry that is not
+# exactly the declared resolver are all a hard stop before the firewall is
+# ever generated -- never a warning that the operator "should" make them
+# match. See deploy/README-bootstrap-proxmox-0.5.md's REAL-HOST PRECHECK
+# section for the one real-environment assumption this check cannot
+# itself verify offline: whether the selected Debian 13 standard template
+# manages /etc/resolv.conf directly (PVE-injected content, verifiable
+# exactly as below) or via a stub resolver layer (e.g. systemd-resolved,
+# which would show 127.0.0.53 regardless of the real upstream) -- if the
+# template uses a stub, this check will correctly, safely refuse to
+# proceed rather than falsely claim a match it cannot prove.
+_verify_ct_dns_resolver_matches_declared() {
+  [[ -n "${DNS_RESOLVER_IP}" ]] || return 0
+
+  local pct_conf
+  pct_conf="$(pct config "${VMID}" 2>/dev/null)" \
+    || die "could not read back container ${VMID}'s configuration to verify its nameserver setting"
+  # `${DNS_RESOLVER_IP//./\\.}` (the dot literally inline in the pattern
+  # position) does NOT actually escape anything in bash -- the backslash
+  # is silently dropped, so a raw IP substitution would let stray '.'s
+  # match as regex "any character" wildcards in the grep -E pattern
+  # below. Routing the replacement text through an intermediate variable
+  # first is the only form that reliably preserves the literal backslash.
+  local dot_escape='\.'
+  local escaped_resolver_ip="${DNS_RESOLVER_IP//./${dot_escape}}"
+  printf '%s\n' "${pct_conf}" | grep -Eq "^nameserver:[[:space:]]*${escaped_resolver_ip}([[:space:]]|\$)" \
+    || die "container ${VMID}'s PVE configuration does not record 'nameserver: ${DNS_RESOLVER_IP}' (declared via --dns-resolver) -- refusing to activate a firewall that will only ever permit DNS egress to that address while the container's authoritative resolver setting is unconfirmed. Check 'pct config ${VMID}' and re-run."
+
+  local resolv_conf
+  resolv_conf="$(pct exec "${VMID}" -- cat /etc/resolv.conf 2>/dev/null)" \
+    || die "could not read /etc/resolv.conf inside container ${VMID} to verify its actual live resolver configuration"
+
+  local -a live_resolvers=()
+  local line
+  while IFS= read -r line; do
+    [[ "${line}" =~ ^nameserver[[:space:]]+([0-9.]+)[[:space:]]*$ ]] && live_resolvers+=("${BASH_REMATCH[1]}")
+  done <<<"${resolv_conf}"
+
+  [[ ${#live_resolvers[@]} -gt 0 ]] \
+    || die "container ${VMID}'s /etc/resolv.conf declares no usable nameserver entries -- cannot verify it will actually use the declared --dns-resolver ${DNS_RESOLVER_IP}. If this template manages DNS via a stub resolver (e.g. systemd-resolved), hostname PVE endpoint mode is not currently supported by this bootstrap -- reconfigure --pve-endpoint with a literal IP instead."
+
+  local ip mismatch=0
+  for ip in "${live_resolvers[@]}"; do
+    [[ "${ip}" == "${DNS_RESOLVER_IP}" ]] || mismatch=1
+  done
+  (( mismatch == 0 )) \
+    || die "container ${VMID}'s live /etc/resolv.conf resolver(s) (${live_resolvers[*]}) do not exactly match the declared --dns-resolver (${DNS_RESOLVER_IP}) -- the firewall would permit DNS egress only to the declared resolver while the container actually queries a different one, silently breaking hostname resolution once the firewall activates. Refusing to proceed; re-run with the correct --dns-resolver value, or reconfigure --pve-endpoint with a literal IP to avoid DNS resolution entirely."
+
+  log_pass "container ${VMID}'s DNS resolver configuration (PVE config + live /etc/resolv.conf) matches declared --dns-resolver ${DNS_RESOLVER_IP}"
+}
+
 phase10_firewall() {
   log_phase "Phase 10: firewall"
 
   local pve_host pve_port
   pve_host="$(_endpoint_host "${PVE_ENDPOINT}")"
   pve_port="$(_endpoint_port "${PVE_ENDPOINT}")"
+
+  # Must hold BEFORE any resolution is attempted or any firewall rule is
+  # generated -- see _verify_ct_dns_resolver_matches_declared above.
+  _verify_ct_dns_resolver_matches_declared
 
   # Validate the DNS-resolver *configuration* before attempting any actual
   # resolution: a hostname endpoint with no --dns-resolver is a

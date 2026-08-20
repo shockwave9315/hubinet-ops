@@ -471,10 +471,21 @@ manual use.
 # Next-free VMID mechanism (Blocker: removed the hardcoded VMID=110 default)
 pvesh get /cluster/nextid --output-format json
 
-# pveum JSON output support, and the exact shape of user/token listings
-# (including the `comment` field the ownership-proof mechanism reads back)
+# `pct config <vmid>` output shape -- confirm one "key: value" line per
+# config entry, including a literal "nameserver: <ip>" line after
+# `pct create --nameserver <ip>` (P2-2, third pass; read back by
+# bootstrap-firewall.sh::_verify_ct_dns_resolver_matches_declared before
+# any hostname PVE endpoint firewall is generated)
+pct config <an-existing-test-vmid>
+
+# pveum JSON output support, and the exact shape of user/token/role
+# listings (including the `comment` field the rollback ownership-proof
+# read-back requires on BOTH user and token listings -- P2-3, third pass;
+# note PVE roles have no comment field at all, so role rollback is never
+# automatic, see bootstrap-identity.sh's _role_object_owned_by_this_run)
 pveum user list --output-format json
 pveum role list --output-format json
+pveum user token list <existing-user> --output-format json
 pveum user token permissions <existing-user> <existing-token> \
   --path / --output-format json
 
@@ -508,4 +519,27 @@ nft --version
 # differ from the PVE host's own resolver):
 #   pct exec <a-test-ct> -- python3 -c \
 #     "import socket; print(sorted({i[4][0] for i in socket.getaddrinfo('<your-pve-hostname>', 443, socket.AF_INET, socket.SOCK_STREAM)}))"
+
+# DNS resolver authority (P2-2, third pass) -- if you plan to use a
+# hostname --pve-endpoint (--dns-resolver required), confirm on a real
+# test CT built from the SAME template this bootstrap will select
+# (phase 2) that `pct create --nameserver <ip>` is accepted and persisted,
+# and that PVE actually regenerates /etc/resolv.conf inside the guest from
+# it at container start -- this bootstrap's own
+# _verify_ct_dns_resolver_matches_declared (bootstrap-firewall.sh) hard-
+# stops before the firewall is ever generated if it cannot confirm this,
+# so a real-environment mismatch here is a safe failure, not a silent one,
+# but it is worth confirming ahead of time on a real host:
+#   pct create <test-vmid> <same-template> --nameserver <your-resolver-ip> ...
+#   pct start <test-vmid>
+#   pct config <test-vmid> | grep '^nameserver:'
+#   pct exec <test-vmid> -- cat /etc/resolv.conf
+# IMPORTANT: if the selected Debian 13 standard template manages DNS via a
+# stub resolver (e.g. systemd-resolved active by default), the last command
+# above will show 127.0.0.53 rather than PVE's injected value regardless of
+# the real upstream resolver -- in that case hostname PVE endpoint mode is
+# not currently supported by this bootstrap (it will correctly, safely
+# refuse to proceed rather than silently trust an unprovable resolver
+# destination); use a literal-IP --pve-endpoint instead, which needs no DNS
+# resolver at all and is unaffected by any of this.
 ```

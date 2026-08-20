@@ -166,6 +166,21 @@ phase3_create_container() {
     create_args+=(--features "${LXC_FEATURES}")
   fi
 
+  # Hostname PVE endpoint mode only (DNS_RESOLVER_IP is validated and set
+  # in phase1_preflight; empty for literal-IP endpoints). Passed to `pct
+  # create` itself, not a later `pct set`, so the declared resolver is
+  # authoritative from the container's very first boot -- PVE's own
+  # container-start machinery regenerates /etc/resolv.conf inside the
+  # guest from this config key every time the container starts, rather
+  # than this bootstrap hand-editing /etc/resolv.conf behind Proxmox's
+  # back. phase10_firewall reads this back and verifies it (both the PVE
+  # config and the CT's live /etc/resolv.conf) before the firewall -- which
+  # will only ever permit DNS egress to this exact address -- is
+  # generated.
+  if [[ -n "${DNS_RESOLVER_IP}" ]]; then
+    create_args+=(--nameserver "${DNS_RESOLVER_IP}")
+  fi
+
   local netconf="name=eth0,bridge=${BRIDGE},firewall=1"
   if [[ "${NETWORK_MODE}" == "static" ]]; then
     netconf+=",ip=${STATIC_IP_CIDR},gw=${STATIC_GATEWAY}"

@@ -191,7 +191,7 @@ def test_ci_workflow_sets_the_required_ephemeral_ci_marker():
     assert "runs-on: ubuntu-latest" in text or "runs-on: ubuntu-" in text
 
 
-def test_ci_workflow_is_narrowly_path_scoped():
+def _ci_workflow_pull_request_paths() -> list[str]:
     import yaml
 
     with CI_WORKFLOW.open(encoding="utf-8") as fh:
@@ -200,23 +200,95 @@ def test_ci_workflow_is_narrowly_path_scoped():
     # yaml.safe_load (YAML 1.1 boolean-like scalar) -- look it up either way.
     triggers = doc.get("on", doc.get(True))
     assert "pull_request" in triggers, "workflow must trigger on pull_request"
-    paths = triggers["pull_request"].get("paths", [])
-    expected_substrings = (
-        "deploy/bootstrap-proxmox-0.5.sh",
-        "deploy/lib/bootstrap-*.sh",
-        "hubinet-ops-bootstrap-accept.py",
-        "tests/_bootstrap_fake_pve.py",
-        "tests/test_bootstrap_proxmox_0_5_smoke.py",
-        "tests/shell/",
-        "scripts/validate_hermetic_shell_boundary.py",
-        "AGENTS.md",
-    )
-    joined = " ".join(paths)
-    for expected in expected_substrings:
-        assert expected in joined, f"CI workflow path filter is missing coverage for: {expected}"
+    return triggers["pull_request"].get("paths", []), triggers
+
+
+def test_ci_workflow_is_narrowly_path_scoped():
+    paths, triggers = _ci_workflow_pull_request_paths()
+    assert paths, "workflow's pull_request trigger must be path-filtered"
     # Not triggered on every push -- this is a narrowly-scoped, PR-only,
     # expensive Docker job, never a blanket "every branch push" trigger.
     assert "push" not in triggers or "branches" in triggers.get("push", {})
+
+
+def test_ci_workflow_path_filter_covers_every_bootstrap_production_dependency():
+    """Derives the required path-filter *coverage* from the actual files on
+    disk, rather than a hand-maintained list independently duplicated in
+    both this test and the workflow -- the exact class of gap that let
+    deploy/lib/hubinet-ops-bootstrap-resolve-dns.py go uncovered (P2-1,
+    third pass): a fixed expected_substrings tuple in this test happened to
+    omit the same file the workflow's own hand-maintained paths list
+    omitted, so neither caught the other, and a PR touching only that file
+    would have silently bypassed the compliant sandbox smoke gate.
+
+    This test instead globs the real, current set of files that can
+    materially change bootstrap-execution behavior exercised by the
+    sandbox smoke matrix, and asserts every one of them is covered by at
+    least one of the workflow's own `paths:` patterns (fnmatch, a
+    reasonable emulation of GitHub Actions' own glob syntax for the
+    specific single-segment-`*`/directory-`**` pattern shapes actually
+    used here -- not a full path-filter-engine reimplementation). A new
+    file matching one of these globs (e.g. a future
+    deploy/lib/hubinet-ops-bootstrap-<anything>.py helper) automatically
+    becomes a required-coverage entry -- there is no second list to
+    remember to update by hand.
+    """
+    import fnmatch
+
+    paths, _triggers = _ci_workflow_pull_request_paths()
+
+    # The real transitive production dependency set of the bootstrap smoke
+    # path: the entrypoint and every phase module; every python3 helper the
+    # bootstrap pushes into and runs inside the CT (globbed, not
+    # enumerated individually -- see the workflow file's own comment for
+    # why); deploy/install-0.5.0-fresh.sh (invoked directly, unmodified,
+    # inside the CT by phase8) and deploy/hubinet-ops-0.5.service +
+    # requirements.txt (what that installer sets up and what the
+    # acceptance phases check is actually running); the hermetic fake PVE
+    # command layer and the smoke test file itself; the sandbox
+    # launcher/entrypoint/Dockerfile; the lexical hermetic-shell-boundary
+    # validator; AGENTS.md (the sandbox contract) and the workflow file
+    # itself.
+    candidate_globs = [
+        "deploy/bootstrap-proxmox-0.5.sh",
+        "deploy/lib/bootstrap-*.sh",
+        "deploy/lib/hubinet-ops-bootstrap-*.py",
+        "deploy/install-0.5.0-fresh.sh",
+        "deploy/hubinet-ops-0.5.service",
+        "requirements.txt",
+        "tests/_bootstrap_fake_pve.py",
+        "tests/test_bootstrap_proxmox_0_5_smoke.py",
+        "tests/shell/**",
+        "scripts/validate_hermetic_shell_boundary.py",
+        "AGENTS.md",
+        ".github/workflows/bootstrap-smoke.yml",
+    ]
+
+    actual_files: set[str] = set()
+    for pattern in candidate_globs:
+        if pattern.endswith("/**"):
+            base = REPO_ROOT / pattern[:-3]
+            if base.is_dir():
+                actual_files.update(
+                    p.relative_to(REPO_ROOT).as_posix() for p in base.rglob("*") if p.is_file()
+                )
+            continue
+        actual_files.update(
+            p.relative_to(REPO_ROOT).as_posix() for p in REPO_ROOT.glob(pattern) if p.is_file()
+        )
+
+    assert actual_files, "no candidate bootstrap-smoke dependency files were found on disk -- this test is broken, not the workflow"
+
+    uncovered = sorted(
+        rel_path
+        for rel_path in actual_files
+        if not any(fnmatch.fnmatch(rel_path, wp) for wp in paths)
+    )
+    assert not uncovered, (
+        "these files can materially change bootstrap-execution behavior "
+        "exercised by the sandbox smoke matrix but are not covered by any "
+        f"pull_request.paths pattern in {CI_WORKFLOW}: {uncovered}"
+    )
 
 
 def test_ci_workflow_has_concurrency_cancellation():

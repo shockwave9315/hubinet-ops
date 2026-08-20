@@ -80,6 +80,7 @@ def _default_state():
         "pve_tokens": {},  # "user!tokenid" -> {"comment": str}
         "acl_grants": [],  # [{"target": "user:X"|"token:Y", "role": rolename}]
         "nextid_call_count": 0,
+        "pveum_user_list_calls": 0,
     }
 
 
@@ -194,8 +195,28 @@ def cmd_pct(args):
         vmid = args[1]
         if _fail("pct_create"):
             sys.exit(1)
-        state["vmids"][vmid] = {"started": False, "onboot": "0", "features": ""}
+        entry = {"started": False, "onboot": "0", "features": ""}
+        # --nameserver (P2-2 third pass): bootstrap-container.sh passes this
+        # only in hostname PVE endpoint mode, carrying --dns-resolver's
+        # value -- persisted here exactly as a real PVE host would persist
+        # it into the container's own config, so `pct config`/the
+        # simulated /etc/resolv.conf regeneration on `pct start` below can
+        # reflect it.
+        if "--nameserver" in args:
+            entry["nameserver"] = args[args.index("--nameserver") + 1]
+        state["vmids"][vmid] = entry
         _save_state(state)
+        sys.exit(0)
+
+    if sub == "config":
+        vmid = args[1]
+        if _fail("pct_config"):
+            sys.exit(1)
+        entry = state["vmids"].get(vmid, {})
+        lines = ["arch: amd64", "hostname: hubinet-ops"]
+        if entry.get("nameserver"):
+            lines.append(f"nameserver: {entry['nameserver']}")
+        sys.stdout.write("\n".join(lines) + "\n")
         sys.exit(0)
 
     if sub == "set":
@@ -213,8 +234,28 @@ def cmd_pct(args):
         vmid = args[1]
         if _fail("pct_start"):
             sys.exit(1)
-        state["vmids"].setdefault(vmid, {"started": False, "onboot": "0", "features": ""})["started"] = True
+        entry = state["vmids"].setdefault(vmid, {"started": False, "onboot": "0", "features": ""})
+        entry["started"] = True
         _save_state(state)
+        # Simulate PVE's own real container-start machinery regenerating
+        # /etc/resolv.conf inside the guest from the persisted `nameserver`
+        # config key (declared_dns_resolver, P2-2 third pass) -- read back
+        # by bootstrap-firewall.sh's _verify_ct_dns_resolver_matches_declared
+        # before the firewall is generated. "ct_actual_resolv_conf" lets a
+        # test simulate a genuine declared-vs-actual mismatch (an
+        # out-of-band operator change, a template using a stub resolver
+        # such as systemd-resolved, or simply "no nameserver at all")
+        # without having to fake PVE's real regeneration logic exactly.
+        resolv_override = SCENARIO.get("ct_actual_resolv_conf")
+        resolv_path = _ct_path(vmid, "/etc/resolv.conf")
+        if resolv_override is False:
+            pass  # simulates an unreadable/missing /etc/resolv.conf
+        elif resolv_override is not None:
+            resolv_path.parent.mkdir(parents=True, exist_ok=True)
+            resolv_path.write_text(resolv_override)
+        elif entry.get("nameserver"):
+            resolv_path.parent.mkdir(parents=True, exist_ok=True)
+            resolv_path.write_text(f"nameserver {entry['nameserver']}\n")
         sys.exit(0)
 
     if sub == "stop":
@@ -322,7 +363,7 @@ def _exec_inner(vmid, inner, state):
         return 1
 
     if inner[0] == "apt-get":
-        return _exec_apt_get(inner[1:])
+        return _exec_apt_get(inner[1:], state)
 
     if inner[0] == "env":
         # `env VAR=val [VAR2=val2 ...] <command> [args...]` -- strip the
@@ -363,10 +404,40 @@ def _exec_resolve_dns(args):
     return 0
 
 
-def _exec_apt_get(args):
+def _exec_apt_get(args, state=None):
     if _fail("apt_get"):
+        if state is not None:
+            _maybe_replace_identity_before_failure("apt_get", state)
         return 1
     return 0
+
+
+def _maybe_replace_identity_before_failure(trigger, state):
+    # P2-3 (third pass) witness: "Run A creates hubinetops@pve (ledger
+    # records success); another administrator/process deletes it and
+    # recreates a DIFFERENT hubinetops@pve; Run A later fails at some
+    # unrelated later phase; rollback must prove the CURRENT object is
+    # still Run A's own, not merely trust its own ledger." apt-get
+    # (tooling provisioning, phase8b) is a realistic later-phase failure
+    # point -- well after phase6 identity creation succeeded. Mutating
+    # state here, immediately before returning the failure that will
+    # eventually trigger rollback, simulates "the replacement already
+    # happened by the time rollback's own live read-back runs" without
+    # needing real concurrency.
+    plan = SCENARIO.get("replace_identity_before_failure", {}).get(trigger)
+    if not plan:
+        return
+    user_comment = plan.get("user_comment")
+    if user_comment is not None:
+        user = plan.get("user", "hubinetops@pve")
+        if user in state["pve_users"]:
+            state["pve_users"][user]["comment"] = user_comment
+    token_comment = plan.get("token_comment")
+    if token_comment is not None:
+        full = plan.get("token", "hubinetops@pve!r0-readonly")
+        if full in state["pve_tokens"]:
+            state["pve_tokens"][full]["comment"] = token_comment
+    _save_state(state)
 
 
 def _exec_sh_c(script):
@@ -558,12 +629,45 @@ def cmd_pveum(args):
     state = _load_state()
 
     if args[:2] == ["user", "list"]:
+        # Fail-open regression coverage (ADDITIONAL P2, third pass):
+        # "pveum_user_list" simulates the listing command itself failing
+        # on EVERY call (transient pveum error, unreachable pmxcfs, etc.);
+        # the "user_list" key of "malformed_pveum_output" simulates a
+        # successful call whose output is not valid JSON on every call.
+        # Both must be a hard stop at phase6's pre-existing-conflict
+        # check, never silently read as "absent."
+        #
+        # The call-count thresholds below (*_after_calls) instead let a
+        # single call number onward fail/malform -- needed to test P2-3's
+        # rollback ownership live-read-back specifically: phase6's own
+        # pre-existing-conflict check is always call #1 and must succeed
+        # for the run to ever create the user at all, but
+        # _user_object_owned_by_this_run's later rollback read-back is
+        # call #2 (no other code path calls `pveum user list`) -- a
+        # threshold of 1 fails/malforms starting exactly there.
+        state["pveum_user_list_calls"] = state.get("pveum_user_list_calls", 0) + 1
+        call_num = state["pveum_user_list_calls"]
+        _save_state(state)
+        fail_after = SCENARIO.get("pveum_user_list_fail_after_calls")
+        malformed_after = SCENARIO.get("pveum_user_list_malformed_after_calls")
+        if _fail("pveum_user_list") or (fail_after is not None and call_num > fail_after):
+            return 1
+        if SCENARIO.get("malformed_pveum_output", {}).get("user_list") or (
+            malformed_after is not None and call_num > malformed_after
+        ):
+            sys.stdout.write("not-valid-json{{{\n")
+            return 0
         print(json.dumps([
             {"userid": u, "comment": info.get("comment", "")}
             for u, info in state["pve_users"].items()
         ]))
         return 0
     if args[:2] == ["role", "list"]:
+        if _fail("pveum_role_list"):
+            return 1
+        if SCENARIO.get("malformed_pveum_output", {}).get("role_list"):
+            sys.stdout.write("not-valid-json{{{\n")
+            return 0
         print(json.dumps([{"roleid": r} for r in state["pve_roles"].keys()]))
         return 0
     if args[:2] == ["user", "add"]:
@@ -656,7 +760,17 @@ def cmd_pveum(args):
         }))
         return 0
     if args[:3] == ["user", "token", "list"]:
-        # args shape: user token list <user> --output-format json
+        # args shape: user token list <user> --output-format json. Unlike
+        # "user list" above, this is called ONLY from
+        # _token_object_owned_by_this_run's rollback read-back -- no
+        # earlier successful-path code calls it -- so a plain scenario
+        # flag (no call-count threshold needed) is sufficient to simulate
+        # a read-back failure/malformed result there.
+        if _fail("pveum_token_list"):
+            return 1
+        if SCENARIO.get("malformed_pveum_output", {}).get("token_list"):
+            sys.stdout.write("not-valid-json{{{\n")
+            return 0
         user = args[3]
         prefix = f"{user}!"
         entries = [
@@ -848,6 +962,15 @@ def default_scenario() -> dict[str, Any]:
         "discovery_backend_instance_id": "fake-backend-instance-id",
         "discovery_source_name": FAKE_DISPLAY_NAME,
         "discovery_resource_count": 0,
+        # Third-pass corrective additions -- see cmd_pveum/cmd_pct and
+        # _maybe_replace_identity_before_failure for how each is consumed.
+        # Left at their "no effect" defaults here; individual tests
+        # override only the key(s) they need.
+        "malformed_pveum_output": {},
+        "replace_identity_before_failure": {},
+        "pveum_user_list_fail_after_calls": None,
+        "pveum_user_list_malformed_after_calls": None,
+        "ct_actual_resolv_conf": None,
     }
 
 

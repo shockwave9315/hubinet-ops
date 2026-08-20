@@ -583,8 +583,15 @@ class TestRollback:
         )
         assert result.returncode != 0
         log = fake_env_obj.log_lines()
+        # User cleanup is still attempted -- ownership can be re-verified
+        # live (comment carries this run's id). Role cleanup is NOT (P2-3,
+        # third pass): PVE roles have no comment/provenance field, so
+        # rollback can never re-verify at delete-time that the CURRENT
+        # role is still the one this run created -- it is always
+        # preserved, regardless of how "clean" this run's own ledger looks.
         assert any(line.startswith("pveum user delete") for line in log)
-        assert any(line.startswith("pveum role delete") for line in log)
+        assert not any(line.startswith("pveum role delete") for line in log)
+        assert "PRESERVING PVE role" in result.stderr
 
     def test_onboot_never_enabled_on_failure(self, tmp_path, source_checkout):
         result, fake_env_obj = _run_full(
@@ -762,6 +769,269 @@ class TestPveIdentityOwnership:
         token_run_id = token_comment.split("run=", 1)[1].rstrip(")")
         assert user_run_id == token_run_id
         assert len(user_run_id) >= 8  # not a trivially-guessable/empty marker
+
+    # -----------------------------------------------------------------
+    # P2-3, third pass: rollback ownership must ALWAYS be a live
+    # read-back of the CURRENT object, never authorized by this run's own
+    # ledger alone. "replace_identity_before_failure" simulates an
+    # external actor deleting and recreating the fixed-name object
+    # sometime between this run's own successful creation (ledger
+    # recorded) and a later, unrelated phase failing and triggering
+    # rollback -- apt-get (tooling provisioning) is the later failure
+    # point used throughout.
+    # -----------------------------------------------------------------
+
+    def test_ledger_success_but_replaced_live_user_before_rollback_survives(self, tmp_path, source_checkout):
+        foreign = "replaced by another admin; run=SOME-OTHER-ACTOR"
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "replace_identity_before_failure": {"apt_get": {"user_comment": foreign}},
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        assert state["pve_users"]["hubinetops@pve"]["comment"] == foreign
+
+    def test_ledger_success_but_replaced_live_token_before_rollback_survives(self, tmp_path, source_checkout):
+        foreign = "replaced by another admin; run=SOME-OTHER-ACTOR"
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "replace_identity_before_failure": {"apt_get": {"token_comment": foreign}},
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert "PRESERVING PVE token" in result.stderr
+        state = fake_env_obj.state()
+        assert state["pve_tokens"]["hubinetops@pve!r0-readonly"]["comment"] == foreign
+        # The user itself was not replaced -- still legitimately cleaned up.
+        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+
+    def test_current_user_with_correct_run_id_may_still_be_removed(self, tmp_path, source_checkout):
+        # Positive control: an ordinary clean creation followed by an
+        # unrelated later-phase failure (no replacement at all) must still
+        # result in the user being cleaned up -- the always-live-read-back
+        # change must not break the ordinary rollback path.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, scenario_overrides={"fail": ["apt_get"]}
+        )
+        assert result.returncode != 0
+        assert any(
+            line.startswith("pveum user delete hubinetops@pve") for line in fake_env_obj.log_lines()
+        )
+
+    def test_current_token_with_correct_run_id_may_still_be_removed(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, scenario_overrides={"fail": ["apt_get"]}
+        )
+        assert result.returncode != 0
+        assert any(
+            line.startswith("pveum user token remove hubinetops@pve r0-readonly")
+            for line in fake_env_obj.log_lines()
+        )
+
+    def test_user_ownership_readback_command_failure_preserves(self, tmp_path, source_checkout):
+        # Call #1 (phase6's own pre-existing-conflict check) succeeds;
+        # call #2 (rollback's live read-back) fails.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"fail": ["apt_get"], "pveum_user_list_fail_after_calls": 1},
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+
+    def test_user_ownership_readback_malformed_json_preserves(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"fail": ["apt_get"], "pveum_user_list_malformed_after_calls": 1},
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+
+    def test_token_ownership_readback_command_failure_preserves(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"fail": ["apt_get", "pveum_token_list"]},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert "PRESERVING PVE token" in result.stderr
+        # The user's own ownership check is independent and still succeeds.
+        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+
+    def test_token_ownership_readback_malformed_json_preserves(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "malformed_pveum_output": {"token_list": True},
+            },
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user token remove") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE token" in result.stderr
+
+    def test_role_rollback_always_conservative_even_on_a_fully_clean_run(self, tmp_path, source_checkout):
+        # PVE roles have no comment/provenance field at all -- even in a
+        # totally unambiguous, cleanly-ledgered rollback, the role can
+        # never be re-verified live, so it must always be preserved.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, scenario_overrides={"fail": ["apt_get"]}
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum role delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE role" in result.stderr
+        state = fake_env_obj.state()
+        assert "HubinetOpsR0Auditor" in state["pve_roles"]
+
+
+# ---------------------------------------------------------------------------
+# Identity pre-existing-conflict inspection must be fail-closed (ADDITIONAL
+# P2, third pass): command failure or malformed JSON while checking whether
+# hubinetops@pve / HubinetOpsR0Auditor already exist must never be silently
+# read as "absent, safe to proceed" -- it must STOP before any mutation.
+# ---------------------------------------------------------------------------
+
+
+class TestIdentityInspectionFailClosed:
+    def test_user_list_command_error_stops_before_user_add(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, scenario_overrides={"fail": ["pveum_user_list"]}
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user add") for line in fake_env_obj.log_lines())
+        assert "could not verify whether" in result.stderr
+
+    def test_malformed_user_list_json_stops_before_user_add(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"malformed_pveum_output": {"user_list": True}},
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user add") for line in fake_env_obj.log_lines())
+        assert "could not verify whether" in result.stderr
+
+    def test_role_list_command_error_stops_before_any_mutation(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, scenario_overrides={"fail": ["pveum_role_list"]}
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user add") for line in log)
+        assert not any(line.startswith("pveum role add") for line in log)
+        assert "could not verify whether" in result.stderr
+
+    def test_malformed_role_list_json_stops_before_any_mutation(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"malformed_pveum_output": {"role_list": True}},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user add") for line in log)
+        assert not any(line.startswith("pveum role add") for line in log)
+        assert "could not verify whether" in result.stderr
+
+    def test_genuine_valid_empty_lists_still_allow_creation(self, tmp_path, source_checkout):
+        # Positive control: the ordinary fresh-install case (both lists
+        # genuinely empty, no command failure, valid JSON) must still
+        # proceed normally -- the fail-closed fix must not make an
+        # entirely healthy listing look like a conflict.
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        assert any(line.startswith("pveum user add") for line in fake_env_obj.log_lines())
+
+
+# ---------------------------------------------------------------------------
+# DNS resolver authority (P2-2, third pass): --dns-resolver is authoritative
+# for the fresh container (pct create --nameserver), and the firewall's
+# permitted DNS destination must be structurally proven -- via a live
+# read-back of both the container's PVE config and its actual
+# /etc/resolv.conf -- to match the resolver the container will really use,
+# never merely asserted to match.
+# ---------------------------------------------------------------------------
+
+
+class TestDnsResolverAuthority:
+    _HOSTNAME_ENDPOINT = "https://pve.example.invalid:8006"
+    _RESOLVER = "198.51.100.53"
+
+    def _args(self, **extra_scenario):
+        scenario = {"dns_resolution": {"pve.example.invalid": ["203.0.113.10"]}}
+        scenario.update(extra_scenario)
+        return dict(
+            args=["--pve-endpoint", self._HOSTNAME_ENDPOINT, "--dns-resolver", self._RESOLVER],
+            scenario_overrides=scenario,
+        )
+
+    def test_declared_resolver_becomes_authoritative_nameserver_at_create_time(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout, **self._args())
+        assert result.returncode == 0, result.stderr
+        assert any(
+            "pct create" in line and f"--nameserver {self._RESOLVER}" in line
+            for line in fake_env_obj.log_lines()
+        )
+
+    def test_declared_and_actual_resolver_match_hostname_mode_works(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout, **self._args())
+        assert result.returncode == 0, result.stderr
+        assert "Discovery:            PASS" in result.stdout
+
+    def test_mismatch_cannot_progress_to_service_start(self, tmp_path, source_checkout):
+        # The container's actual live resolver differs from the declared
+        # --dns-resolver (e.g. an out-of-band change, or a template
+        # defaulting to a different resolver) -- must be a hard stop
+        # before the firewall is generated, and therefore before the
+        # service is ever started.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            **self._args(ct_actual_resolv_conf="nameserver 192.168.1.1\n"),
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any("systemctl enable --now hubinet-ops" in line for line in log)
+        assert not any(line.startswith("pct push") and "nftables.conf" in line for line in log)
+        assert "do not exactly match the declared --dns-resolver" in result.stderr
+
+    def test_pct_config_missing_declared_nameserver_is_a_hard_stop(self, tmp_path, source_checkout):
+        # Simulates PVE having silently ignored/rejected --nameserver at
+        # create time (the container's own config never recorded it) --
+        # must not be papered over by trusting /etc/resolv.conf alone.
+        result, fake_env_obj = _run_full(tmp_path, source_checkout, **self._args(fail=["pct_config"]))
+        assert result.returncode != 0
+        assert "could not read back container" in result.stderr
+
+    def test_zero_live_nameserver_entries_is_a_hard_stop(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, **self._args(ct_actual_resolv_conf="")
+        )
+        assert result.returncode != 0
+        assert "declares no usable nameserver entries" in result.stderr
+
+    def test_unreadable_resolv_conf_is_a_hard_stop(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, **self._args(ct_actual_resolv_conf=False)
+        )
+        assert result.returncode != 0
+        assert "could not read /etc/resolv.conf" in result.stderr
+
+    def test_literal_ip_mode_unaffected_no_resolver_verification_needed(self, tmp_path, source_checkout):
+        # Default endpoint is a literal IP -- no --dns-resolver, no
+        # --nameserver, no resolver verification at all.
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        assert not any("--nameserver" in line for line in fake_env_obj.log_lines() if line.startswith("pct create"))
 
 
 # ---------------------------------------------------------------------------

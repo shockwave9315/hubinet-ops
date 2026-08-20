@@ -90,6 +90,29 @@ phase1_preflight() {
   is_valid_https_url "${PVE_ENDPOINT}" \
     || die "--pve-endpoint '${PVE_ENDPOINT}' is not a valid https://host[:port] URL"
 
+  # --- DNS resolver, hostname PVE endpoint mode only ---------------------
+  # Validated here (read-only planning) rather than only at
+  # firewall-generation time, because the declared resolver now also
+  # becomes an authoritative container-creation argument (phase3's
+  # --nameserver, see bootstrap-container.sh) -- this bootstrap must never
+  # create a container it already knows cannot be given a verifiable
+  # nameserver. Literal-IP endpoints need no resolver at all and ignore
+  # --dns-resolver if it was given.
+  # _endpoint_host is defined in bootstrap-firewall.sh; safe to call here
+  # because bootstrap-proxmox-0.5.sh sources every lib/bootstrap-*.sh file
+  # before any phase function is ever invoked, regardless of source order.
+  local endpoint_host_for_dns
+  endpoint_host_for_dns="$(_endpoint_host "${PVE_ENDPOINT}")"
+  if is_valid_ipv4 "${endpoint_host_for_dns}"; then
+    [[ -z "${DNS_RESOLVER_IP}" ]] \
+      || log_warn "--dns-resolver was given but --pve-endpoint uses a literal IP address -- no DNS resolution is needed inside the container, so --dns-resolver is ignored"
+    DNS_RESOLVER_IP=""
+  else
+    [[ -n "${DNS_RESOLVER_IP}" ]] \
+      || die "--pve-endpoint ('${PVE_ENDPOINT}') uses a hostname, not a literal IP -- pass --dns-resolver <your-internal-resolver-ip> so the container can be given an authoritative, verifiable nameserver, or reconfigure --pve-endpoint with a literal IP and omit --dns-resolver entirely"
+    is_valid_ipv4 "${DNS_RESOLVER_IP}" || die "--dns-resolver '${DNS_RESOLVER_IP}' is not a valid IPv4 address"
+  fi
+
   # --- static network arguments, if requested ----------------------------
   if [[ "${NETWORK_MODE}" == "static" ]]; then
     [[ -n "${STATIC_IP_CIDR}" ]] || die "--network static requires --ip <address/prefix>"
