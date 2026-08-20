@@ -312,8 +312,10 @@ _user_object_owned_by_this_run() {
   # _json_list_field_value that is indistinguishable from a genuine
   # absence/mismatch.
   if ! _json_list_has_string_field_schema "${list_file}" "userid"; then
+    local diagnosis
+    diagnosis="$(_json_list_schema_diagnosis "${list_file}" "userid")"
     rm -f "${list_file}"
-    log_warn "could not verify ownership of '${PVE_USER}': the PVE user list did not match the expected JSON shape (an array of objects each carrying a string 'userid' field) -- treating ownership as unproven regardless of this run's own ledger history"
+    log_warn "could not verify ownership of '${PVE_USER}': the PVE user list did not match the expected JSON shape (an array of objects each carrying a string 'userid' field) -- diagnosis: ${diagnosis:-unknown} -- treating ownership as unproven regardless of this run's own ledger history"
     return 1
   fi
 
@@ -360,8 +362,10 @@ _token_object_owned_by_this_run() {
   # _json_list_field_value that is indistinguishable from a genuine
   # absence/mismatch.
   if ! _json_list_has_string_field_schema "${list_file}" "tokenid"; then
+    local diagnosis
+    diagnosis="$(_json_list_schema_diagnosis "${list_file}" "tokenid")"
     rm -f "${list_file}"
-    log_warn "could not verify ownership of token '${PVE_TOKEN_ID}': the PVE token list did not match the expected JSON shape (an array of objects each carrying a string 'tokenid' field) -- treating ownership as unproven regardless of this run's own ledger history"
+    log_warn "could not verify ownership of token '${PVE_TOKEN_ID}': the PVE token list did not match the expected JSON shape (an array of objects each carrying a string 'tokenid' field) -- diagnosis: ${diagnosis:-unknown} -- treating ownership as unproven regardless of this run's own ledger history"
     return 1
   fi
 

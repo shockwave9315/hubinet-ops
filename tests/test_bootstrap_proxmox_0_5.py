@@ -699,6 +699,336 @@ class TestPathKeyedPermissionHelper:
         assert result.returncode != 0
 
 
+def _run_nft_canonical_ha_helper(tmp_path, cidr):
+    """Source ONLY bootstrap-common.sh + bootstrap-firewall.sh (function
+    definitions only -- inert to source), then evaluate exactly one call
+    to _nft_canonical_ha_source_expr against `cidr` and return the
+    completed subprocess. No PVE command, no phase function, no
+    orchestration is ever invoked -- this is a pure function of a CIDR
+    string.
+    """
+    bash_snippet = (
+        f'source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"\n'
+        f'source "{(LIB_DIR / "bootstrap-firewall.sh").as_posix()}"\n'
+        f'_nft_canonical_ha_source_expr "{cidr}"\n'
+        "exit $?\n"
+    )
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestNftCanonicalHaSourceExpr:
+    """Real-PVE corrective fix (first real dogfood, Proxmox VE 9.2.3 /
+    nftables 1.1.3): nftables canonicalizes `ip saddr` address expressions
+    on the active-ruleset round trip -- a /32 host CIDR is displayed
+    WITHOUT its /32 suffix, and any other prefix is displayed as the
+    canonical NETWORK address for that prefix, never the operator's
+    literal address+prefix text. These tests pin
+    _nft_canonical_ha_source_expr's exact output directly, independent of
+    the full bootstrap script.
+    """
+
+    @pytest.mark.parametrize(
+        "cidr,expected",
+        [
+            ("192.168.4.168/32", "192.168.4.168"),  # the exact real dogfood witness
+            ("203.0.113.50/32", "203.0.113.50"),
+            ("10.0.0.1/32", "10.0.0.1"),
+        ],
+    )
+    def test_host_32_canonicalizes_to_bare_address(self, tmp_path, cidr, expected):
+        result = _run_nft_canonical_ha_helper(tmp_path, cidr)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected
+
+    @pytest.mark.parametrize(
+        "cidr,expected",
+        [
+            ("192.168.4.168/24", "192.168.4.0/24"),  # host address, non-canonical input
+            ("192.168.4.0/24", "192.168.4.0/24"),  # already canonical
+            ("10.5.5.5/16", "10.5.0.0/16"),
+            ("10.0.0.0/8", "10.0.0.0/8"),
+        ],
+    )
+    def test_non_32_canonicalizes_to_network_form(self, tmp_path, cidr, expected):
+        result = _run_nft_canonical_ha_helper(tmp_path, cidr)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == expected
+
+
+def _run_hubinetops_uid_helper(tmp_path, *, id_output, id_exit=0):
+    """Source ONLY bootstrap-common.sh + bootstrap-firewall.sh, provide a
+    minimal fake `pct` bash function simulating `pct exec <vmid> -- id -u
+    hubinetops`, then call _hubinetops_uid directly. No real PVE host is
+    ever contacted -- "pct" here is a hand-written bash stub entirely
+    local to this one test process.
+    """
+    bash_snippet = f'''
+source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"
+source "{(LIB_DIR / "bootstrap-firewall.sh").as_posix()}"
+VMID="110"
+
+pct() {{
+  printf '%s' "{id_output}"
+  return {id_exit}
+}}
+
+_hubinetops_uid
+exit $?
+'''
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestHubinetopsUidHelper:
+    """Real-PVE corrective fix: real nftables also resolves a symbolic
+    `meta skuid "hubinetops"` match expression to hubinetops' numeric UID
+    at rule-load time, and reports only that numeric UID back on the
+    active-ruleset round trip -- never hardcoded, always read back from
+    the target container via `pct exec <vmid> -- id -u hubinetops`,
+    strictly validated as a bare numeric UID.
+    """
+
+    def test_valid_numeric_uid_accepted(self, tmp_path):
+        result = _run_hubinetops_uid_helper(tmp_path, id_output="999\n")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "999"
+
+    def test_command_failure_stops(self, tmp_path):
+        result = _run_hubinetops_uid_helper(tmp_path, id_output="", id_exit=1)
+        assert result.returncode != 0
+        assert "could not determine the numeric UID" in result.stderr
+
+    def test_malformed_output_stops(self, tmp_path):
+        result = _run_hubinetops_uid_helper(tmp_path, id_output="not-a-uid\n")
+        assert result.returncode != 0
+        assert "unexpected output from" in result.stderr
+
+    def test_empty_output_stops(self, tmp_path):
+        result = _run_hubinetops_uid_helper(tmp_path, id_output="")
+        assert result.returncode != 0
+        assert "unexpected output from" in result.stderr
+
+
+# The exact active-ruleset text a real first dogfood run (Proxmox VE
+# 9.2.3 / nftables 1.1.3) reported via `nft list ruleset` -- the literal
+# witness that exposed both canonicalization bugs. Note the real host's
+# own "priority filter" text (vs. this bootstrap's generated "priority
+# 0") -- irrelevant to verification, which always skips the "type filter
+# hook ..." line entirely regardless of its exact content.
+_REAL_HOST_FIXTURE = '''table inet hubinet_ops_r0 {
+  chain input {
+    type filter hook input priority filter; policy accept;
+    iifname "lo" accept
+    ip saddr 192.168.4.168 tcp dport 8787 accept
+    tcp dport 8787 drop
+  }
+
+  chain output {
+    type filter hook output priority filter; policy accept;
+    ct state established,related accept
+    meta skuid 999 ip daddr 192.168.4.249 tcp dport 8006 accept
+    meta skuid 999 drop
+  }
+}
+'''
+
+_REAL_HOST_CONFIG = dict(
+    ha_source_cidr="192.168.4.168/32",
+    pve_endpoint="https://192.168.4.249:8006",
+    resolved_pve_ips=["192.168.4.249"],
+    hubinetops_uid="999",
+)
+
+
+def _run_firewall_verify_helper(
+    tmp_path, *, ha_source_cidr, pve_endpoint, resolved_pve_ips, hubinetops_uid,
+    active_ruleset_text, dns_resolver_ip="",
+):
+    """Source ONLY bootstrap-common.sh + bootstrap-firewall.sh, provide a
+    minimal fake `pct` bash function returning the exact given (already
+    real-host-shaped) active ruleset text and hubinetops UID, then call
+    _verify_firewall_active directly against the given static config.
+    Proves the verifier's behavior against a hand-supplied "what a real
+    host actually reported" fixture, independent of the full bootstrap
+    script and without ever contacting a real PVE host. `tmp_path` is a
+    fresh, unique directory per test invocation (pytest fixture), so a
+    fixed filename within it is safe -- each test calls this helper at
+    most once.
+    """
+    nft_output_file = tmp_path / "nft_output.txt"
+    nft_output_file.write_text(active_ruleset_text, encoding="utf-8")
+    resolved_ips_arg = "\\n".join(resolved_pve_ips)
+
+    bash_snippet = f'''
+source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"
+source "{(LIB_DIR / "bootstrap-firewall.sh").as_posix()}"
+VMID="110"
+HA_SOURCE_CIDR="{ha_source_cidr}"
+PVE_ENDPOINT="{pve_endpoint}"
+DNS_RESOLVER_IP="{dns_resolver_ip}"
+RESOLVED_PVE_IPS_LIST=$'{resolved_ips_arg}'
+
+pct() {{
+  if [[ "$1" == "exec" && "$2" == "110" && "$3" == "--" ]]; then
+    if [[ "$4 $5" == "nft list" ]]; then
+      cat "{nft_output_file.as_posix()}"
+      return 0
+    fi
+    if [[ "$4 $5" == "id -u" ]]; then
+      printf '%s\\n' "{hubinetops_uid}"
+      return 0
+    fi
+  fi
+  return 2
+}}
+
+_verify_firewall_active
+exit $?
+'''
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestRealPveFixtureVerification:
+    """Regression fixture reproducing the EXACT active-ruleset text a
+    real first dogfood run (Proxmox VE 9.2.3 / nftables 1.1.3) observed
+    via `nft list ruleset` -- proves _verify_firewall_active now accepts
+    it (the original bug: it did not, failing exact-content verification
+    at Phase 10), and that every required negative case is still
+    correctly rejected -- no weakening into loose substring matching.
+    """
+
+    def test_exact_real_host_fixture_accepted(self, tmp_path):
+        result = _run_firewall_verify_helper(
+            tmp_path, active_ruleset_text=_REAL_HOST_FIXTURE, **_REAL_HOST_CONFIG,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_wrong_ha_source_after_canonicalization_rejected(self, tmp_path):
+        config = dict(_REAL_HOST_CONFIG, ha_source_cidr="192.168.4.169/32")
+        result = _run_firewall_verify_helper(
+            tmp_path, active_ruleset_text=_REAL_HOST_FIXTURE, **config,
+        )
+        assert result.returncode != 0
+
+    def test_wrong_numeric_uid_rejected(self, tmp_path):
+        config = dict(_REAL_HOST_CONFIG, hubinetops_uid="1000")
+        result = _run_firewall_verify_helper(
+            tmp_path, active_ruleset_text=_REAL_HOST_FIXTURE, **config,
+        )
+        assert result.returncode != 0
+
+    def test_extra_input_rule_rejected(self, tmp_path):
+        fixture = _REAL_HOST_FIXTURE.replace(
+            "    tcp dport 8787 drop\n",
+            "    tcp dport 8787 drop\n    ip saddr 10.0.0.1 tcp dport 22 accept\n",
+        )
+        result = _run_firewall_verify_helper(
+            tmp_path, active_ruleset_text=fixture, **_REAL_HOST_CONFIG,
+        )
+        assert result.returncode != 0
+
+    def test_extra_output_rule_rejected(self, tmp_path):
+        # A duplicated (structurally valid, but not supposed to be there
+        # twice) established/related line.
+        fixture = _REAL_HOST_FIXTURE.replace(
+            "    ct state established,related accept\n",
+            "    ct state established,related accept\n    ct state established,related accept\n",
+        )
+        result = _run_firewall_verify_helper(
+            tmp_path, active_ruleset_text=fixture, **_REAL_HOST_CONFIG,
+        )
+        assert result.returncode != 0
+
+    def test_missing_rule_rejected(self, tmp_path):
+        fixture = _REAL_HOST_FIXTURE.replace('    iifname "lo" accept\n', "")
+        result = _run_firewall_verify_helper(
+            tmp_path, active_ruleset_text=fixture, **_REAL_HOST_CONFIG,
+        )
+        assert result.returncode != 0
+
+    def test_wrong_ordering_rejected(self, tmp_path):
+        # established/related moved AFTER the PVE allow rule instead of
+        # before it -- same two rules, wrong order.
+        fixture = _REAL_HOST_FIXTURE.replace(
+            "    ct state established,related accept\n"
+            "    meta skuid 999 ip daddr 192.168.4.249 tcp dport 8006 accept\n",
+            "    meta skuid 999 ip daddr 192.168.4.249 tcp dport 8006 accept\n"
+            "    ct state established,related accept\n",
+        )
+        result = _run_firewall_verify_helper(
+            tmp_path, active_ruleset_text=fixture, **_REAL_HOST_CONFIG,
+        )
+        assert result.returncode != 0
+
+    def test_arbitrary_new_hubinetops_egress_rejected(self, tmp_path):
+        # A NEW skuid-scoped allow to a destination not on the PVE/DNS
+        # allow-list -- must never be silently accepted as "close enough."
+        fixture = _REAL_HOST_FIXTURE.replace(
+            "    meta skuid 999 drop\n",
+            "    meta skuid 999 ip daddr 1.2.3.4 tcp dport 443 accept\n    meta skuid 999 drop\n",
+        )
+        result = _run_firewall_verify_helper(
+            tmp_path, active_ruleset_text=fixture, **_REAL_HOST_CONFIG,
+        )
+        assert result.returncode != 0
+
+
+def _run_schema_diagnosis_helper(tmp_path, json_content, field="userid"):
+    return _run_json_schema_helper(
+        tmp_path, f'_json_list_schema_diagnosis "{{json_file}}" "{field}"',
+        json_content=json_content,
+    )
+
+
+class TestJsonListSchemaDiagnosis:
+    """Rollback diagnostics fix (sixth pass): a real rollback run logged
+    an undifferentiated "did not match the expected JSON shape" message
+    for a PVE user-list read-back that a manual read immediately
+    afterward showed was genuinely well-formed -- proving nothing about
+    THAT one incident's actual cause, since the schema check alone cannot
+    distinguish a command hiccup from malformed JSON from a genuinely
+    unexpected shape. _json_list_schema_diagnosis exists to let a FUTURE
+    occurrence be diagnosed precisely, without loosening the schema or
+    dumping the list's own payload.
+    """
+
+    def test_empty_file_diagnosed_as_missing_output(self, tmp_path):
+        result = _run_schema_diagnosis_helper(tmp_path, "")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "command-output-missing-or-empty"
+
+    def test_malformed_json_diagnosed(self, tmp_path):
+        result = _run_schema_diagnosis_helper(tmp_path, "not-valid-json{{{")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "malformed-json"
+
+    def test_non_array_top_level_diagnosed(self, tmp_path):
+        result = _run_schema_diagnosis_helper(tmp_path, "{}")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "top-level-not-an-array"
+
+    def test_element_wrong_shape_diagnosed(self, tmp_path):
+        result = _run_schema_diagnosis_helper(tmp_path, '[{"user":"hubinetops@pve"}]')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "element-not-object-or-missing-userid-string"
+
+    def test_diagnosis_never_dumps_the_actual_payload(self, tmp_path):
+        # Structural diagnosis only -- the field's own (non-secret, but
+        # still not appropriate to dump wholesale) value must never
+        # appear in the diagnosis output.
+        secret_looking_value = "totally-not-a-real-secret-marker-xyz"
+        result = _run_schema_diagnosis_helper(
+            tmp_path, f'[{{"userid":"{secret_looking_value}","extra":123}}]',
+        )
+        assert result.returncode == 0, result.stderr
+        assert secret_looking_value not in result.stdout
+
+
 class TestSecurityStatic:
     _ALL_SCRIPTS = ALL_SCRIPTS
 
