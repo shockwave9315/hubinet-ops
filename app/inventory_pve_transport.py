@@ -18,6 +18,7 @@ transport that exposes one.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 import json
 import ssl
@@ -114,28 +115,38 @@ def _exception_chain(exc: BaseException):
     ``__cause__`` is set, even though Python preserves both
     independently. A real ``ssl.SSLCertVerificationError`` reachable only
     through the discarded edge would never be found. This walks both
-    edges from every node, bounded by ``_EXCEPTION_GRAPH_MAX_NODES`` total
-    queue *pops* (not merely distinct nodes yielded) and cycle-safe
-    (tracks visited exception identities) -- this walks whatever graph
-    httpx/httpcore/ssl happen to construct, which this module does not
-    control, so it must never be able to loop or grow unbounded. Bounding
-    pops rather than only distinct visits matters for a pathological
-    diamond-shaped graph (multiple nodes each pointing to the same
-    already-seen ancestor via both edges): such a graph can enqueue many
-    duplicate references to nodes already in ``seen``, and each of those
-    is a real, if wasted, iteration -- capping only "new" visits would let
-    that duplicate work run unbounded.
+    edges from every node.
+
+    Ninth-pass corrective note (P2/P3 finding, independent review): the
+    bound below applies to UNIQUE visited nodes, not raw queue pops. An
+    intermediate version bounded total pops instead, reasoning that a
+    duplicate-heavy graph could otherwise cause unbounded work -- but
+    that reasoning was wrong: every push onto the queue happens only as
+    a direct result of visiting a genuinely NEW (not-yet-seen) node, and
+    each such node pushes at most two references (its cause and its
+    context). Capping unique visits at ``_EXCEPTION_GRAPH_MAX_NODES``
+    therefore already caps total pushes at ``2 * _EXCEPTION_GRAPH_MAX_
+    NODES``, and total pops can never exceed pushes-plus-one -- so this
+    stays strictly bounded (and cycle-safe, via the visited-identity
+    ``seen`` set) for ANY graph shape, including one built specifically
+    to maximize duplicate references. Bounding pops instead of unique
+    nodes, as the intermediate version did, is strictly worse with no
+    safety benefit: a genuinely distinct, security-relevant exception
+    (e.g. the real ``ssl.SSLCertVerificationError``) sitting within the
+    first ``_EXCEPTION_GRAPH_MAX_NODES`` unique ancestors could be missed
+    simply because earlier duplicate references exhausted a pop-based
+    budget before ever reaching it.
     """
 
     seen: set[int] = set()
-    queue: list[BaseException] = [exc]
-    iterations = 0
-    while queue and iterations < _EXCEPTION_GRAPH_MAX_NODES:
-        iterations += 1
-        current = queue.pop(0)
+    queue: deque[BaseException] = deque([exc])
+    unique_visited = 0
+    while queue and unique_visited < _EXCEPTION_GRAPH_MAX_NODES:
+        current = queue.popleft()
         if id(current) in seen:
             continue
         seen.add(id(current))
+        unique_visited += 1
         yield current
         if current.__cause__ is not None:
             queue.append(current.__cause__)

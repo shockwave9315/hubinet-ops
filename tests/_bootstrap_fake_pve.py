@@ -1069,6 +1069,15 @@ def cmd_pveum(args):
         return 0
     if args[:3] == ["user", "token", "remove"]:
         # args shape: user token remove <user> <tokenid>
+        # Ninth-pass corrective addition (P2 finding, independent
+        # review): rollback_on_failure's parent_user_cleanup_safe gate
+        # requires this command's OWN exit status, not merely "the
+        # token's ownership was proven" -- "pveum_user_token_remove" in
+        # the "fail" list simulates the removal command itself failing
+        # (e.g. a transient pveum error) even though the token was
+        # correctly proven owned.
+        if _fail("pveum_user_token_remove"):
+            return 1
         full = f"{args[3]}!{args[4]}"
         state["pve_tokens"].pop(full, None)
         _save_state(state)

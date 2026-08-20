@@ -658,34 +658,55 @@ def test_findingA_exception_chain_walk_is_bounded_and_cycle_safe() -> None:
     assert _find_certificate_verification_error(shallow_wrapper) is not None
 
 
-def test_findingA_exception_chain_bounds_total_work_not_only_distinct_visits() -> None:
-    # P3 hardening (independent review): every node's __cause__ AND
-    # __context__ point to the SAME next node, so each real hop is
-    # enqueued twice -- this must exhaust the traversal's iteration
-    # budget on the resulting duplicate pops, reaching noticeably FEWER
-    # distinct real nodes than a duplicate-free chain of the same length
-    # would. This proves the bound caps TOTAL queue pops (including
-    # wasted duplicate ones), not merely a count of genuinely-new nodes
-    # visited -- a bound that only capped new visits would still walk
-    # the full chain despite the duplication, doing unbounded extra work
-    # for a sufficiently duplicate-heavy graph.
-    from app.inventory_pve_transport import _exception_chain
+def _build_duplicate_heavy_chain(total_nodes: int, cert_index: int) -> BaseException:
+    """Build a chain of `total_nodes` exceptions where each node's
+    __cause__ AND __context__ both point to the SAME previous node
+    (duplicate edges every hop -- exactly the shape that would exhaust a
+    pops-based budget on wasted duplicate pops). `cert_index` (0 =
+    deepest/oldest) is a real ssl.SSLCertVerificationError; every other
+    node is a plain ValueError. Returns the outermost/topmost exception
+    (the one a caller would actually receive and inspect).
+    """
+    prev: BaseException | None = None
+    outer: BaseException | None = None
+    for i in range(total_nodes):
+        node: BaseException = (
+            ssl.SSLCertVerificationError(f"cert at index {i}")
+            if i == cert_index
+            else ValueError(f"node {i}")
+        )
+        if prev is not None:
+            node.__cause__ = prev
+            node.__context__ = prev
+        prev = node
+        outer = node
+    assert outer is not None
+    return outer
 
-    deepest = ValueError("deepest")
-    current: BaseException = deepest
-    for _ in range(30):
-        node = ValueError("node")
-        node.__cause__ = current
-        node.__context__ = current  # identical to __cause__ -- doubles queue entries per hop
-        current = node
 
-    visited = list(_exception_chain(current))
-    # Empirically 11 distinct nodes reached (well under the 20-node cap
-    # a duplicate-free chain would reach) -- asserted as a bound, not the
-    # exact count, so this stays robust to a future retuning of
-    # _EXCEPTION_GRAPH_MAX_NODES while still proving genuine work-capping.
-    assert len(visited) < 15
-    assert deepest not in visited
+def test_findingA_duplicate_edges_do_not_prevent_finding_a_cert_error_within_the_bound() -> None:
+    # Ninth-pass corrective note (P2/P3 finding, independent review): the
+    # unique-node bound must not be starved by duplicate queue entries --
+    # a cert error only 10 unique hops away from the outer exception must
+    # still be found, even though every hop along the way duplicates its
+    # reference (cause == context), which would have exhausted a
+    # pops-based budget before ever reaching it.
+    from app.inventory_pve_transport import _find_certificate_verification_error
+
+    outer = _build_duplicate_heavy_chain(total_nodes=31, cert_index=31 - 1 - 10)
+    found = _find_certificate_verification_error(outer)
+    assert found is not None
+    assert isinstance(found, ssl.SSLCertVerificationError)
+
+
+def test_findingA_cert_error_beyond_the_unique_node_bound_is_not_found() -> None:
+    # Same duplicate-heavy shape, but the cert error sits 25 unique hops
+    # away -- beyond _EXCEPTION_GRAPH_MAX_NODES (20) -- and must not be
+    # found. Proves the bound is real and enforced, not merely decorative.
+    from app.inventory_pve_transport import _find_certificate_verification_error
+
+    outer = _build_duplicate_heavy_chain(total_nodes=31, cert_index=31 - 1 - 25)
+    assert _find_certificate_verification_error(outer) is None
 
 
 def test_findingA_cert_error_found_via_context_even_when_a_different_cause_is_also_set() -> None:

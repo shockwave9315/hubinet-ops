@@ -313,12 +313,30 @@ rollback_on_failure() {
   # unowned/unproven and correctly skipped `pveum user token remove`, but
   # still unconditionally deleted the PARENT USER whenever the user
   # itself was proven owned -- indirectly destroying the very token this
-  # same rollback had just logged as "preserved." user_deletion_blocked_
-  # by_unproven_token below closes that: automatic user deletion now
-  # requires the token to be proven ABSENT (nothing to protect) or OWNED-
-  # AND-REMOVED, never merely "the token's ownership check said no."
+  # same rollback had just logged as "preserved."
+  #
+  # Ninth-pass corrective note (P1/P2 findings, independent review):
+  # closing that same-shaped bug a second time, two ways deeper.
+  #   (1) `pveum acl delete / --users ... --roles ...` (removing the
+  #       parent user's OWN acl grant) was still unconditional on
+  #       user_owned alone -- but a privsep=1 token's effective
+  #       permissions are the INTERSECTION of the owning user's
+  #       permissions and the token's own permissions, so stripping the
+  #       user's acl functionally disables an unproven/possibly-foreign
+  #       token even while the token OBJECT itself is left untouched.
+  #       An unproven token must block the WHOLE identity dependency
+  #       chain: token, token acl, parent user, AND parent user acl.
+  #   (2) parent user cleanup proceeded even when `pveum user token
+  #       remove` itself failed (only logged, not gated on) -- a failed
+  #       token removal must ALSO preserve the parent user and its acl,
+  #       not merely be noted and continued past.
+  # parent_user_cleanup_safe below is the single, explicit gate for BOTH
+  # the parent user's acl removal and its final deletion: true only when
+  # the token was proven ABSENT (nothing to protect), or proven OWNED
+  # AND its removal command actually succeeded -- never merely "the
+  # token's ownership check did not say no."
   if ledger_has pve-identity-attempted "${PVE_USER:-hubinetops@pve}"; then
-    local user_owned=0 role_owned=0 token_owned=0 user_deletion_blocked_by_unproven_token=0
+    local user_owned=0 role_owned=0 token_owned=0 parent_user_cleanup_safe=0
 
     if _user_object_owned_by_this_run; then
       user_owned=1
@@ -350,10 +368,12 @@ rollback_on_failure() {
     # ours, since a token can only ever meaningfully exist under a user
     # this bootstrap itself created. Tri-state, not a boolean: OWNED
     # (safe to remove) / ABSENT (nothing to protect -- also safe to let
-    # the parent user be deleted) / UNPROVEN (must block automatic
-    # deletion of BOTH the token itself AND its parent user, since
-    # `pveum user delete` below would otherwise destroy this same
-    # unproven token as a side effect of removing its parent).
+    # the parent user be cleaned up) / UNPROVEN (must block mutation of
+    # the WHOLE identity dependency chain -- token, token acl, parent
+    # user, AND parent user acl -- since even removing only the parent
+    # user's acl can functionally disable an unproven/possibly-foreign
+    # privsep=1 token, whose effective permissions are the intersection
+    # of the user's and the token's own).
     if (( user_owned )); then
       local token_state
       token_state="$(_token_ownership_state)"
@@ -362,15 +382,18 @@ rollback_on_failure() {
           token_owned=1
           ;;
         absent)
-          : # Nothing to preserve -- safe to proceed to user deletion.
+          # Nothing to preserve -- safe to proceed to parent user cleanup.
+          parent_user_cleanup_safe=1
           ;;
         *)
           # Same reasoning as the user-preserve message above -- the
           # specific reason is already logged by _token_ownership_state
           # itself; this generic message must not assert (and potentially
-          # contradict) a specific cause on top of it.
+          # contradict) a specific cause on top of it. parent_user_
+          # cleanup_safe stays 0 -- an unproven token blocks cleanup of
+          # its parent user (and that user's acl) too, not merely the
+          # token itself.
           log_warn "PRESERVING PVE token '${PVE_FULL_TOKEN_ID}': this run could not prove live ownership of the current object (see the specific reason already logged above) -- manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}"
-          user_deletion_blocked_by_unproven_token=1
           ;;
       esac
     fi
@@ -378,10 +401,22 @@ rollback_on_failure() {
     if (( token_owned )); then
       pveum acl delete / --tokens "${PVE_FULL_TOKEN_ID}" --roles "${PVE_ROLE}" >/dev/null 2>&1 \
         || log_warn "could not remove ACL grant for token ${PVE_FULL_TOKEN_ID} (may never have existed)"
+      # Ninth-pass corrective note (P2 finding, independent review): the
+      # token's own removal command's actual exit status now GATES
+      # parent_user_cleanup_safe -- a failed removal here must preserve
+      # the parent user (and its acl) too, never merely be logged and
+      # continued past as if cleanup had completed.
+      local token_remove_status
       pveum user token remove "${PVE_USER}" "${PVE_TOKEN_ID}" >/dev/null 2>&1 \
-        || log_warn "could not remove token ${PVE_FULL_TOKEN_ID} (may never have existed)"
+        && token_remove_status=0 || token_remove_status=$?
+      if (( token_remove_status == 0 )); then
+        parent_user_cleanup_safe=1
+      else
+        log_warn "could not remove token ${PVE_FULL_TOKEN_ID} (pveum exited ${token_remove_status}) -- this run's token cleanup is INCOMPLETE, not merely a cosmetic failure: PRESERVING parent user '${PVE_USER}' and its ACL grant too, since this token's removal could not be confirmed. Manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}', remove it yourself once you have confirmed the cause (pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}), then the user (pveum user delete ${PVE_USER}) only if both are safe to remove."
+      fi
     fi
-    if (( user_owned )); then
+
+    if (( user_owned )) && (( parent_user_cleanup_safe )); then
       pveum acl delete / --users "${PVE_USER}" --roles "${PVE_ROLE}" >/dev/null 2>&1 \
         || log_warn "could not remove ACL grant for user ${PVE_USER} (may never have existed)"
     fi
@@ -391,16 +426,19 @@ rollback_on_failure() {
         || log_warn "could not remove role ${PVE_ROLE} (may never have existed)"
     fi
 
-    if (( user_owned )) && (( ! user_deletion_blocked_by_unproven_token )); then
+    if (( user_owned )) && (( parent_user_cleanup_safe )); then
       pveum user delete "${PVE_USER}" >/dev/null 2>&1 \
         || log_warn "could not remove user ${PVE_USER} (may never have existed)"
     elif (( user_owned )); then
-      # P1 fix (eighth pass, independent review): do NOT delete a
-      # proven-owned user whose token could not be proven owned or
-      # absent -- 'pveum user delete' removes the user's ENTIRE
-      # configuration, which would destroy that unproven token as a side
-      # effect, defeating the token preserve decision logged just above.
-      log_warn "PRESERVING PVE user '${PVE_USER}' despite being proven owned by this run: its token '${PVE_FULL_TOKEN_ID}' could not be proven owned or absent, and 'pveum user delete' would remove the user's entire configuration -- including that unproven token -- as a side effect. Manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}', confirm provenance yourself, then remove the token first (pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}) and only then the user (pveum user delete ${PVE_USER}) if you are certain both are safe to remove."
+      # P1/P2 fix (ninth pass, independent review): do NOT delete a
+      # proven-owned user (or even just its acl grant, above) whenever
+      # its token's cleanup could not be proven safe -- either the token
+      # itself is unproven, or its removal command failed -- since
+      # 'pveum user delete' removes the user's entire configuration
+      # (destroying that token as a side effect if it still exists), and
+      # even a plain acl removal alone can functionally disable a
+      # privsep=1 token that is still present.
+      log_warn "PRESERVING PVE user '${PVE_USER}' and its ACL grant despite being proven owned by this run: this run's cleanup of its token '${PVE_FULL_TOKEN_ID}' could not be proven safely completed (see the specific reason already logged above) -- deleting the user, or even just its ACL grant, could functionally disable or destroy that token as a side effect (a privsep=1 token's effective permissions are the intersection of the user's and the token's own). Manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}', confirm provenance yourself, then remove the token first (pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}) and only then the user (pveum user delete ${PVE_USER}) if you are certain both are safe to remove."
     fi
   fi
 

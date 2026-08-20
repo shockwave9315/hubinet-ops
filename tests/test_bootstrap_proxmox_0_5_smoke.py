@@ -987,6 +987,78 @@ class TestPveIdentityOwnership:
         # The owned user is still legitimately deleted.
         assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
         assert "PRESERVING PVE user" not in result.stderr
+        # The user's own ACL grant is cleaned up normally too -- confirms
+        # the "absent" branch is not being conservative for the wrong
+        # reason (e.g. an accidental blanket ACL-skip).
+        assert any(line.startswith("pveum acl delete / --users hubinetops@pve") for line in log)
+
+    # -----------------------------------------------------------------
+    # Ninth-pass corrective fix, P1/P2 (independent review): an unproven
+    # token must block mutation of the WHOLE identity dependency chain
+    # (token, token ACL, parent user, parent user ACL) -- not merely the
+    # token object and the parent user object, leaving their ACL grants
+    # exposed to removal in between.
+    # -----------------------------------------------------------------
+
+    def test_unproven_token_preserves_both_token_acl_and_user_acl(self, tmp_path, source_checkout):
+        # A privsep=1 token's effective permissions are the INTERSECTION
+        # of the owning user's permissions and the token's own -- so even
+        # removing only the PARENT USER's own ACL grant (while leaving
+        # both the user and token objects themselves untouched) can
+        # functionally disable an unproven/possibly-foreign token.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_output_override": {"token_list": '["hubinetops@pve!r0-readonly"]'},
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        # Nothing in the whole dependency chain is mutated.
+        assert not any(line.startswith("pveum acl delete") for line in log)
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE token" in result.stderr
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        acl_targets = {grant["target"] for grant in state["acl_grants"]}
+        assert "user:hubinetops@pve" in acl_targets
+        assert "token:hubinetops@pve!r0-readonly" in acl_targets
+        assert "hubinetops@pve" in state["pve_users"]
+        assert "hubinetops@pve!r0-readonly" in state["pve_tokens"]
+
+    def test_owned_token_removal_command_failure_preserves_user_and_user_acl(self, tmp_path, source_checkout):
+        # P2 finding (independent review): the token is genuinely proven
+        # OWNED (schema-valid read, comment carries this run's marker),
+        # but the removal command itself fails -- parent_user_cleanup_
+        # safe must NOT become true merely because ownership was proven;
+        # it requires the removal command to have actually succeeded.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"fail": ["apt_get", "pveum_user_token_remove"]},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        # The token's own ACL grant IS attempted (independent step) --
+        # only the subsequent removal command fails.
+        assert any(line.startswith("pveum acl delete / --tokens") for line in log)
+        assert any(line.startswith("pveum user token remove") for line in log)
+        assert "could not remove token" in result.stderr
+        assert "token cleanup is INCOMPLETE" in result.stderr
+        # The parent user and its OWN acl grant must both be preserved.
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        acl_targets = {grant["target"] for grant in state["acl_grants"]}
+        assert "user:hubinetops@pve" in acl_targets
+        assert "hubinetops@pve" in state["pve_users"]
+        # The token object itself DID get removed from PVE's state by
+        # the fake's own "remove" handler failing before mutating state
+        # -- i.e. the fake never actually pops it when it reports
+        # failure -- confirming the token, too, is genuinely still there.
+        assert "hubinetops@pve!r0-readonly" in state["pve_tokens"]
 
     def test_user_ownership_readback_command_failure_preserves(self, tmp_path, source_checkout):
         # Call #1 (phase6's own pre-existing-conflict check) succeeds;
