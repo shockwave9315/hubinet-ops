@@ -492,6 +492,131 @@ class TestStorageFreeSpaceHelper:
         assert result.returncode == 0, result.stderr
 
 
+def _run_json_schema_helper(tmp_path, call_expr, *, json_content):
+    """Source ONLY bootstrap-common.sh (function definitions only -- inert
+    to source), write `json_content` to a temp file, then evaluate
+    `call_expr` (expected to be exactly one call to a named pure JSON
+    schema-validation helper against that file) and return the completed
+    subprocess. No PVE command, no phase function, no orchestration is
+    ever invoked -- these helpers are pure functions of a file path.
+    """
+    json_file = tmp_path / "input.json"
+    json_file.write_text(json_content, encoding="utf-8")
+
+    bash_snippet = (
+        f'source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"\n'
+        f'{call_expr.format(json_file=json_file.as_posix())}\n'
+        "exit $?\n"
+    )
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestJsonSchemaHelpers:
+    """Fourth-pass corrective fix: a JSON-array-only check (an earlier
+    _json_list_is_valid) proved only "the top-level value is an array" --
+    a syntactically valid but semantically wrong array such as [{}],
+    [{"user": "..."}] (wrong field name), ["hubinetops@pve"] (bare
+    strings), or [1] (non-object elements) would all pass that weaker
+    check, and the field-lookup helper's own "no match found" result is
+    then indistinguishable from a genuine absence -- fail-open for a
+    security-relevant pre-existing-identity conflict check or rollback
+    ownership read-back. These tests pin
+    _json_list_has_string_field_schema's and _json_object_is_valid's
+    exact accept/reject behavior directly, independent of the full
+    bootstrap script.
+    """
+
+    @pytest.mark.parametrize(
+        "json_content",
+        [
+            "[]",
+            '[{"userid":"other@pve"}]',
+            '[{"userid":"hubinetops@pve"}]',
+            '[{"userid":"a@pve"},{"userid":"b@pve","comment":"extra optional field is fine"}]',
+        ],
+    )
+    def test_valid_userid_schema_accepted(self, tmp_path, json_content):
+        result = _run_json_schema_helper(
+            tmp_path, '_json_list_has_string_field_schema "{json_file}" "userid"',
+            json_content=json_content,
+        )
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize(
+        "json_content",
+        [
+            "[{}]",
+            '[{"user":"hubinetops@pve"}]',
+            '["hubinetops@pve"]',
+            "[1]",
+            '[{"userid":123}]',
+            '[{"userid":null}]',
+            "{}",
+            '{"userid":"hubinetops@pve"}',
+            "not-valid-json{{{",
+            "",
+            '[{"userid":"a@pve"},{}]',
+        ],
+    )
+    def test_invalid_userid_schema_rejected(self, tmp_path, json_content):
+        result = _run_json_schema_helper(
+            tmp_path, '_json_list_has_string_field_schema "{json_file}" "userid"',
+            json_content=json_content,
+        )
+        assert result.returncode != 0
+
+    @pytest.mark.parametrize(
+        "json_content",
+        [
+            "[]",
+            '[{"roleid":"OtherRole"}]',
+            '[{"roleid":"HubinetOpsR0Auditor"}]',
+        ],
+    )
+    def test_valid_roleid_schema_accepted(self, tmp_path, json_content):
+        result = _run_json_schema_helper(
+            tmp_path, '_json_list_has_string_field_schema "{json_file}" "roleid"',
+            json_content=json_content,
+        )
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize(
+        "json_content",
+        [
+            '[{"role":"HubinetOpsR0Auditor"}]',
+            '[{"roleid":123}]',
+        ],
+    )
+    def test_invalid_roleid_schema_rejected(self, tmp_path, json_content):
+        result = _run_json_schema_helper(
+            tmp_path, '_json_list_has_string_field_schema "{json_file}" "roleid"',
+            json_content=json_content,
+        )
+        assert result.returncode != 0
+
+    @pytest.mark.parametrize(
+        "json_content",
+        ['{"Sys.Audit":1,"VM.Audit":1}', "{}"],
+    )
+    def test_valid_object_schema_accepted(self, tmp_path, json_content):
+        result = _run_json_schema_helper(
+            tmp_path, '_json_object_is_valid "{json_file}"', json_content=json_content,
+        )
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize(
+        "json_content",
+        ["[]", '["Sys.Audit","VM.Audit"]', '"a string"', "1", "not-valid-json{{{", ""],
+    )
+    def test_invalid_object_schema_rejected(self, tmp_path, json_content):
+        result = _run_json_schema_helper(
+            tmp_path, '_json_object_is_valid "{json_file}"', json_content=json_content,
+        )
+        assert result.returncode != 0
+
+
 class TestSecurityStatic:
     _ALL_SCRIPTS = ALL_SCRIPTS
 

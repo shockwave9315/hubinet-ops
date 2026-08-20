@@ -895,6 +895,50 @@ class TestPveIdentityOwnership:
         state = fake_env_obj.state()
         assert "HubinetOpsR0Auditor" in state["pve_roles"]
 
+    # -----------------------------------------------------------------
+    # Schema validation (fourth pass): an unexpected-but-syntactically-
+    # valid JSON shape on the ROLLBACK read-back must mean ownership is
+    # UNPROVEN -- preserve, never a false "owned" that could delete an
+    # object this run cannot actually verify is its own.
+    # -----------------------------------------------------------------
+
+    def test_user_ownership_readback_schema_invalid_preserves(self, tmp_path, source_checkout):
+        # Call #1 (phase6's own pre-existing-conflict check) sees the
+        # normal, well-formed listing; call #2 (rollback's live read-back)
+        # sees a schema-invalid one -- must never be read as a false match
+        # for BOOTSTRAP_RUN_ID, and must never be silently treated as
+        # "absent" either (both are simply "unproven").
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_output_override": {"user_list": '[{"user":"hubinetops@pve"}]'},
+                "pveum_user_list_override_after_calls": 1,
+            },
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+
+    def test_token_ownership_readback_schema_invalid_preserves(self, tmp_path, source_checkout):
+        # `pveum user token list` is only ever called from the rollback
+        # read-back (no earlier successful-path code calls it), so no
+        # call-count gating is needed here.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_output_override": {"token_list": '["hubinetops@pve!r0-readonly"]'},
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert "PRESERVING PVE token" in result.stderr
+        # The user's own ownership check is independent (normal schema)
+        # and still succeeds.
+        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+
 
 # ---------------------------------------------------------------------------
 # Identity pre-existing-conflict inspection must be fail-closed (ADDITIONAL
@@ -951,6 +995,73 @@ class TestIdentityInspectionFailClosed:
         result, fake_env_obj = _run_full(tmp_path, source_checkout)
         assert result.returncode == 0, result.stderr
         assert any(line.startswith("pveum user add") for line in fake_env_obj.log_lines())
+
+    # -----------------------------------------------------------------
+    # Schema validation (fourth pass): a syntactically valid JSON array
+    # with an unexpected element shape ([{}], wrong field name, bare
+    # strings/numbers, wrong field type) must be treated exactly like
+    # malformed JSON -- a hard STOP before any mutation -- never silently
+    # interpreted as "target not found, safe to proceed" merely because
+    # the expected field wasn't where the field-lookup helper looked for
+    # it.
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "bad_user_list",
+        ["[{}]", '[{"user":"hubinetops@pve"}]', '["hubinetops@pve"]', "[1]", '[{"userid":123}]'],
+    )
+    def test_schema_invalid_user_list_stops_before_user_add(self, tmp_path, source_checkout, bad_user_list):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"pveum_output_override": {"user_list": bad_user_list}},
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user add") for line in fake_env_obj.log_lines())
+        assert "does not match the expected PVE JSON shape" in result.stderr
+
+    @pytest.mark.parametrize(
+        "bad_role_list",
+        ['[{"role":"HubinetOpsR0Auditor"}]', '[{"roleid":123}]'],
+    )
+    def test_schema_invalid_role_list_stops_before_any_mutation(self, tmp_path, source_checkout, bad_role_list):
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"pveum_output_override": {"role_list": bad_role_list}},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user add") for line in log)
+        assert not any(line.startswith("pveum role add") for line in log)
+        assert "does not match the expected PVE JSON shape" in result.stderr
+
+    def test_schema_valid_but_target_absent_still_proceeds(self, tmp_path, source_checkout):
+        # Positive control at the new, stronger schema layer: a
+        # well-formed row for a DIFFERENT user/role must still be read as
+        # "target absent, proceed" -- the schema check must not be
+        # over-strict either.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "pveum_output_override": {
+                    "user_list": '[{"userid":"other@pve"}]',
+                    "role_list": '[{"roleid":"OtherRole"}]',
+                },
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert any(line.startswith("pveum user add") for line in fake_env_obj.log_lines())
+
+    def test_schema_invalid_token_permissions_stops_verification(self, tmp_path, source_checkout):
+        # A JSON array instead of the expected flat {"Priv": 1, ...} object
+        # must be an explicit STOP, never accidentally interpreted as an
+        # empty/partial privilege set that merely happens to also fail the
+        # exact-set comparison for an unrelated reason.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"pveum_output_override": {"token_permissions": '["Sys.Audit","VM.Audit"]'}},
+        )
+        assert result.returncode != 0
+        assert "did not produce a valid JSON object" in result.stderr
 
 
 # ---------------------------------------------------------------------------

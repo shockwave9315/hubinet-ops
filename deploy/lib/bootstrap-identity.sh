@@ -167,13 +167,23 @@ phase6_pve_identity() {
 # file resulted -- a transient `pveum` error, a rejected --output-format
 # flag, an unreachable pmxcfs, or truncated output would then be
 # indistinguishable from "the object genuinely does not exist," and the
-# run would proceed to create a PVE identity anyway. This helper
-# distinguishes four outcomes and only ever proceeds on the fourth:
-#   - the listing command itself fails                       -> STOP
-#   - it succeeds but the output is not valid JSON             -> STOP
-#   - a valid JSON array is read and the target id IS present  -> STOP
-#     (a real pre-existing-object conflict)
-#   - a valid JSON array is read and the target id is absent   -> proceed
+# run would proceed to create a PVE identity anyway.
+#
+# Fourth-pass corrective note: a naive "is this valid JSON" check (array-
+# only) is still too weak on its own -- a syntactically valid array with
+# an unexpected element shape ([{}], [{"user": "..."}] instead of
+# {"userid": ...}, ["hubinetops@pve"], [1], [{"userid": 123}]) would pass
+# an array-only check, and _json_list_field_equals's own "no match found"
+# result is then indistinguishable from a genuine absence. This helper
+# now distinguishes FOUR outcomes and only ever proceeds on the fourth:
+#   - the listing command itself fails                          -> STOP
+#   - it succeeds but the output does not match the exact minimum
+#     expected schema (array of objects, each with <id-field> as a
+#     string)                                                    -> STOP
+#   - a schema-valid JSON array is read and the target id IS present
+#     -> STOP (a real pre-existing-object conflict)
+#   - a schema-valid JSON array is read and the target id is absent
+#     -> proceed
 _assert_pve_object_absent() {
   local id_field="$1" id_value="$2" label="$3" delete_hint="$4"
   shift 4
@@ -191,9 +201,9 @@ _assert_pve_object_absent() {
     die "could not verify whether ${label} already exists ('${list_cmd[*]}' failed with exit ${cmd_status}) -- refusing to proceed without a reliable read of existing PVE identity state. This is a fail-closed pre-existing-conflict check, not a transient warning; retry once the PVE API is reliably reachable."
   fi
 
-  if ! _json_list_is_valid "${list_file}"; then
+  if ! _json_list_has_string_field_schema "${list_file}" "${id_field}"; then
     rm -f "${list_file}"
-    die "could not verify whether ${label} already exists ('${list_cmd[*]}' did not produce a valid JSON array) -- refusing to proceed without a reliable read of existing PVE identity state."
+    die "could not verify whether ${label} already exists ('${list_cmd[*]}' produced output that does not match the expected PVE JSON shape -- an array of objects each carrying a string '${id_field}' field) -- refusing to proceed without a reliable read of existing PVE identity state. No mutation was attempted."
   fi
 
   if _json_list_field_equals "${list_file}" "${id_field}" "${id_value}"; then
@@ -216,6 +226,19 @@ _verify_effective_permissions() {
   if ! pveum user token permissions "${PVE_USER}" "${PVE_TOKEN_ID}" --path / --output-format json >"${perms_file}" 2>/dev/null; then
     rm -f "${perms_file}"
     die "could not read back effective permissions for ${PVE_FULL_TOKEN_ID}"
+  fi
+
+  # Fourth-pass corrective note: explicitly requiring a JSON *object*
+  # here, rather than feeding the file straight into
+  # _json_truthy_keys_sorted, makes an unexpected top-level shape (e.g. a
+  # JSON array) an explicit, clearly-labeled STOP -- not merely an
+  # incidental one that happens to occur because the resulting empty/
+  # wrong key set doesn't equal PVE_REQUIRED_PRIVS. Never accidentally
+  # interpret an unrecognized structure as the exact expected privilege
+  # set.
+  if ! _json_object_is_valid "${perms_file}"; then
+    rm -f "${perms_file}"
+    die "could not verify effective permissions for ${PVE_FULL_TOKEN_ID}: 'pveum user token permissions' did not produce a valid JSON object -- refusing to continue with an unverifiable privilege set"
   fi
 
   # `... && parse_status=0 || parse_status=$?` rather than a plain
@@ -274,9 +297,14 @@ _user_object_owned_by_this_run() {
     log_warn "could not read back the current PVE user list to verify ownership of '${PVE_USER}' (pveum exited ${cmd_status}) -- treating ownership as unproven regardless of this run's own ledger history"
     return 1
   fi
-  if ! _json_list_is_valid "${list_file}"; then
+  # Same schema-validation strengthening as phase6's own conflict check
+  # (fourth-pass): an unrecognized PVE JSON shape here must mean ownership
+  # is UNPROVEN -- never fall through to a "no match found" state via
+  # _json_list_field_value that is indistinguishable from a genuine
+  # absence/mismatch.
+  if ! _json_list_has_string_field_schema "${list_file}" "userid"; then
     rm -f "${list_file}"
-    log_warn "could not verify ownership of '${PVE_USER}': the PVE user list did not parse as a valid JSON array -- treating ownership as unproven regardless of this run's own ledger history"
+    log_warn "could not verify ownership of '${PVE_USER}': the PVE user list did not match the expected JSON shape (an array of objects each carrying a string 'userid' field) -- treating ownership as unproven regardless of this run's own ledger history"
     return 1
   fi
 
@@ -317,9 +345,14 @@ _token_object_owned_by_this_run() {
     log_warn "could not read back the current PVE token list for '${PVE_USER}' to verify ownership of '${PVE_TOKEN_ID}' (pveum exited ${cmd_status}) -- treating ownership as unproven regardless of this run's own ledger history"
     return 1
   fi
-  if ! _json_list_is_valid "${list_file}"; then
+  # Same schema-validation strengthening as phase6's own conflict check
+  # (fourth-pass): an unrecognized PVE JSON shape here must mean ownership
+  # is UNPROVEN -- never fall through to a "no match found" state via
+  # _json_list_field_value that is indistinguishable from a genuine
+  # absence/mismatch.
+  if ! _json_list_has_string_field_schema "${list_file}" "tokenid"; then
     rm -f "${list_file}"
-    log_warn "could not verify ownership of token '${PVE_TOKEN_ID}': the PVE token list did not parse as a valid JSON array -- treating ownership as unproven regardless of this run's own ledger history"
+    log_warn "could not verify ownership of token '${PVE_TOKEN_ID}': the PVE token list did not match the expected JSON shape (an array of objects each carrying a string 'tokenid' field) -- treating ownership as unproven regardless of this run's own ledger history"
     return 1
   fi
 

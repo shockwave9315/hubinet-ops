@@ -204,31 +204,69 @@ for key in keys:
 ' "${file}" 2>/dev/null | tr -d '\r' | LC_ALL=C sort
 }
 
-# _json_list_is_valid <file>: true if `file` parses as a valid JSON array
-# (regardless of whether it is empty). Third-pass corrective note: earlier
-# callers of _json_list_field_equals (phase6's pre-existing-identity-
-# conflict checks) treated "command failed" and "produced no valid JSON"
-# identically to "object legitimately absent, safe to proceed" (via a bare
-# `... || true` around the listing command) -- a transient `pveum` error,
-# a rejected --output-format flag, or truncated output would then be
-# silently read as proof nothing conflicts, and the run would proceed to
-# create a PVE identity anyway. This helper lets a caller require a
-# genuinely successful, parseable read before trusting an "absent" result
-# from _json_list_field_equals -- command failure or malformed JSON must
-# always be a hard stop for a security-relevant conflict check, never a
-# fall-through to "absent."
-_json_list_is_valid() {
-  local file="$1"
+# _json_list_has_string_field_schema <file> <required-field>: true only if
+# `file` is a JSON array where EVERY element is a JSON object containing
+# `required-field` as a non-null JSON string. An empty array `[]` always
+# satisfies this (vacuously -- there are no elements to violate it),
+# matching "no objects exist yet."
+#
+# Fourth-pass corrective note: an earlier _json_list_is_valid proved only
+# "the top-level JSON value is an array" -- a syntactically valid but
+# semantically wrong array such as [{}], [{"user": "..."}] (wrong field
+# name), ["hubinetops@pve"] (bare strings, no object), or [1] (non-object
+# elements) would all pass that weaker check. _json_list_field_equals/
+# _json_list_field_value's own "no match found" result is then
+# INDISTINGUISHABLE from a genuinely empty/absent result -- for a
+# security-relevant pre-existing-identity conflict check or rollback
+# ownership read-back, an unrecognized PVE JSON shape must never be
+# silently read as "target absent" (or "not owned," in the rollback case)
+# merely because the expected field happened not to be found under an
+# unexpected structure. This is the exact minimum schema each caller
+# actually depends on -- deliberately NOT validating any other/optional
+# PVE field (e.g. `comment`, which real PVE omits when unset).
+_json_list_has_string_field_schema() {
+  local file="$1" field="$2"
   [[ -s "${file}" ]] || return 1
   if command -v jq >/dev/null 2>&1; then
-    jq -e 'type == "array"' "${file}" >/dev/null 2>&1
+    jq -e --arg f "${field}" \
+      'type == "array" and all(.[]; type == "object" and (.[$f] | type == "string"))' \
+      "${file}" >/dev/null 2>&1
     return
   fi
   python3 -c '
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as fh:
     data = json.load(fh)
-sys.exit(0 if isinstance(data, list) else 1)
+field = sys.argv[2]
+if not isinstance(data, list):
+    sys.exit(1)
+for row in data:
+    if not isinstance(row, dict) or not isinstance(row.get(field), str):
+        sys.exit(1)
+sys.exit(0)
+' "${file}" "${field}" 2>/dev/null
+}
+
+# _json_object_is_valid <file>: true if `file` parses as a valid JSON
+# object (a flat map), never an array/string/number/null/absent. Used
+# wherever a security-relevant read expects a JSON *object* shape (e.g.
+# effective-permission verification) -- parallel to
+# _json_list_has_string_field_schema's array check, so an unexpected
+# top-level type is an explicit, clearly-labeled parse failure rather than
+# silently feeding a wrong-shaped value into a key-extraction helper that
+# may just produce an empty/partial result instead of erroring.
+_json_object_is_valid() {
+  local file="$1"
+  [[ -s "${file}" ]] || return 1
+  if command -v jq >/dev/null 2>&1; then
+    jq -e 'type == "object"' "${file}" >/dev/null 2>&1
+    return
+  fi
+  python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+sys.exit(0 if isinstance(data, dict) else 1)
 ' "${file}" 2>/dev/null
 }
 

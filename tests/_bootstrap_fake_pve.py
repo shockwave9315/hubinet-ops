@@ -624,6 +624,21 @@ def _ambiguous_mode(op_key):
     return SCENARIO.get("ambiguous_pveum_ops", {}).get(op_key)
 
 
+def _output_override(key):
+    """Raw JSON text to emit verbatim instead of the normally computed
+    output for one PVE listing/read-back call -- fourth-pass corrective
+    addition, used to simulate a syntactically VALID but schema-
+    unexpected PVE response, e.g. [{}], ["hubinetops@pve"],
+    [{"user": "..."}] instead of {"userid": ...}, or a JSON array where an
+    object is expected (token permissions). This is a distinct failure
+    class from _fail() (command failure) and "malformed_pveum_output"
+    (genuinely invalid JSON) -- checked after both of those so all three
+    stay independently testable. Keyed the same as "malformed_pveum_output":
+    "user_list" / "role_list" / "token_list" / "token_permissions".
+    """
+    return SCENARIO.get("pveum_output_override", {}).get(key)
+
+
 def cmd_pveum(args):
     _log("pveum", *args)
     state = _load_state()
@@ -657,6 +672,16 @@ def cmd_pveum(args):
         ):
             sys.stdout.write("not-valid-json{{{\n")
             return 0
+        # Same call-count-gating reasoning as fail_after/malformed_after
+        # above -- an override with no threshold given applies to every
+        # call (including phase6's own pre-check); "override_after_calls"
+        # lets a test target the rollback read-back (call #2) specifically
+        # while leaving phase6's own first call unaffected.
+        override_after = SCENARIO.get("pveum_user_list_override_after_calls")
+        override = _output_override("user_list")
+        if override is not None and (override_after is None or call_num > override_after):
+            sys.stdout.write(override)
+            return 0
         print(json.dumps([
             {"userid": u, "comment": info.get("comment", "")}
             for u, info in state["pve_users"].items()
@@ -667,6 +692,10 @@ def cmd_pveum(args):
             return 1
         if SCENARIO.get("malformed_pveum_output", {}).get("role_list"):
             sys.stdout.write("not-valid-json{{{\n")
+            return 0
+        override = _output_override("role_list")
+        if override is not None:
+            sys.stdout.write(override)
             return 0
         print(json.dumps([{"roleid": r} for r in state["pve_roles"].keys()]))
         return 0
@@ -771,6 +800,10 @@ def cmd_pveum(args):
         if SCENARIO.get("malformed_pveum_output", {}).get("token_list"):
             sys.stdout.write("not-valid-json{{{\n")
             return 0
+        override = _output_override("token_list")
+        if override is not None:
+            sys.stdout.write(override)
+            return 0
         user = args[3]
         prefix = f"{user}!"
         entries = [
@@ -782,6 +815,10 @@ def cmd_pveum(args):
         return 0
     if args[:3] == ["user", "token", "permissions"]:
         # args shape: user token permissions <user> <tokenid> --path / ...
+        override = _output_override("token_permissions")
+        if override is not None:
+            sys.stdout.write(override)
+            return 0
         full_token_id = f"{args[3]}!{args[4]}"
         privs = set()
         for grant in state["acl_grants"]:
@@ -967,9 +1004,11 @@ def default_scenario() -> dict[str, Any]:
         # Left at their "no effect" defaults here; individual tests
         # override only the key(s) they need.
         "malformed_pveum_output": {},
+        "pveum_output_override": {},
         "replace_identity_before_failure": {},
         "pveum_user_list_fail_after_calls": None,
         "pveum_user_list_malformed_after_calls": None,
+        "pveum_user_list_override_after_calls": None,
         "ct_actual_resolv_conf": None,
     }
 
