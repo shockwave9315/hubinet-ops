@@ -2,9 +2,34 @@
 # Phase 10 -- mandatory R0 firewall boundary, automated per
 # deploy/README-0.5-firewall.md's nftables model: egress confined to the
 # `hubinetops` service user (meta skuid), ingress restricted to the
-# configured HA host/subnet on TCP 8787 only. Egress destination port is
-# always derived from the actual configured PVE endpoint (--pve-endpoint),
-# never hardcoded independently of it.
+# configured HA host/subnet on TCP 8787 only, loopback always reachable,
+# and reply traffic on an already-accepted connection always permitted
+# back out. Egress destination port is always derived from the actual
+# configured PVE endpoint (--pve-endpoint), never hardcoded independently
+# of it.
+#
+# Stateful model (fifth-pass corrective fix, P2-1 whole-feature review):
+# an earlier version had no loopback exemption in `input` and no
+# established/related exemption in `output`. Since 127.0.0.1 never
+# matches HA_SOURCE_CIDR (an external host/subnet, by definition), this
+# CT's own Phase 12 acceptance calls (http://127.0.0.1:8787) were dropped
+# by input's unconditional "tcp dport 8787 drop" -- and even once that is
+# fixed, the R0 backend's own HTTP replies (it runs AS the hubinetops
+# user) to either a loopback client OR a real HA client would themselves
+# be hubinetops-owned OUTPUT packets, silently dropped by the final "meta
+# skuid hubinetops drop" with no established/related exemption ahead of
+# it -- the inbound SYN would be accepted while every reply vanished. The
+# corrected model, exactly the classic stateful-firewall shape:
+#   input:  loopback always in; HA -> 8787 in; everything else on 8787
+#           dropped.
+#   output: replies to any already-accepted connection always out;
+#           hubinetops NEW connections only to the resolved PVE IP(s) and
+#           (when configured) the exact DNS resolver; everything else
+#           hubinetops originates is dropped.
+# `ct state established,related` matches only packets of a flow this
+# firewall already let in -- it grants no new capability to originate
+# connections; a hubinetops-initiated NEW connection to anywhere not on
+# the explicit allow-list below is still dropped exactly as before.
 #
 # Hostname PVE endpoints: nftables resolves a bare hostname in an address
 # expression to numeric address(es) at rule-LOAD time, and `nft list
@@ -241,11 +266,43 @@ phase10_firewall() {
     printf 'table inet hubinet_ops_r0 {\n'
     printf '  chain input {\n'
     printf '    type filter hook input priority 0; policy accept;\n'
+    # Fifth-pass corrective fix (P2-1, whole-feature review): loopback
+    # MUST be accepted before the HA-scoped 8787 rules, or Phase 12's own
+    # required http://127.0.0.1:8787 acceptance calls (and any future
+    # local health check) are dropped by the unconditional "tcp dport
+    # 8787 drop" fallthrough below -- 127.0.0.1 never matches
+    # HA_SOURCE_CIDR, which is by definition an external host/subnet.
+    # Interface-based (iifname "lo"), not address-based (ip saddr
+    # 127.0.0.1): loopback traffic can only ever originate from within
+    # this CT's own network namespace, so this is not a spoofable trust
+    # boundary widening -- it exactly restores the "local processes on
+    # this host may always reach services on this host" property every
+    # real firewall reference (including nftables' own documented base
+    # ruleset) grants explicitly and unconditionally.
+    printf '    iifname "lo" accept\n'
     printf '    ip saddr %s tcp dport 8787 accept\n' "${HA_SOURCE_CIDR}"
     printf '    tcp dport 8787 drop\n'
     printf '  }\n'
     printf '  chain output {\n'
     printf '    type filter hook output priority 0; policy accept;\n'
+    # Fifth-pass corrective fix, part 2: the R0 backend runs AS the
+    # hubinetops user, so its own HTTP replies to an already-accepted
+    # inbound connection (a real HA client, or a local loopback
+    # acceptance/health client) are themselves hubinetops-owned OUTPUT
+    # packets -- without this rule they would fall through to the final
+    # "meta skuid hubinetops drop" below and the connection would appear
+    # to hang (SYN accepted, but every reply silently dropped). `ct state
+    # established,related` matches only packets belonging to a connection
+    # this firewall already let in (or a directly related flow) -- it
+    # does NOT match the initial SYN of a NEW connection hubinetops
+    # itself originates, so it grants no new *outbound-initiated*
+    # capability at all; hubinetops-initiated NEW connections are still
+    # evaluated only against the PVE/DNS allow-list immediately below,
+    # then the final drop, exactly as before. Placed first so it also
+    # covers the loopback health-check server's own replies, which are
+    # otherwise indistinguishable (by ct state) from any other reply
+    # traffic.
+    printf '    ct state established,related accept\n'
     local ip
     for ip in "${resolved_ips[@]}"; do
       printf '    meta skuid "hubinetops" ip daddr %s tcp dport %s accept\n' "${ip}" "${pve_port}"
@@ -280,7 +337,7 @@ phase10_firewall() {
 
   _verify_firewall_active
 
-  log_pass "firewall: HA ${HA_SOURCE_CIDR} -> 8787 allowed, all other 8787 ingress denied, hubinetops egress confined to {${resolved_ips[*]}}:${pve_port}$( [[ -n "${dns_rule_lines}" ]] && printf ' + resolver %s:53 (udp+tcp)' "${DNS_RESOLVER_IP}" )"
+  log_pass "firewall: loopback always reachable, HA ${HA_SOURCE_CIDR} -> 8787 allowed, all other 8787 ingress denied, established/related replies always permitted out, hubinetops NEW egress confined to {${resolved_ips[*]}}:${pve_port}$( [[ -n "${dns_rule_lines}" ]] && printf ' + resolver %s:53 (udp+tcp)' "${DNS_RESOLVER_IP}" )"
 }
 
 # _verify_firewall_active: exact rule content AND order within each
@@ -312,10 +369,13 @@ _verify_firewall_active() {
   dns_rule_lines="$(_expected_dns_rule_lines "${pve_host}")"
 
   local -a expected_input=(
+    'iifname "lo" accept'
     "ip saddr ${HA_SOURCE_CIDR} tcp dport 8787 accept"
     "tcp dport 8787 drop"
   )
-  local -a expected_output=()
+  local -a expected_output=(
+    "ct state established,related accept"
+  )
   local ip
   for ip in "${resolved_ips[@]}"; do
     expected_output+=("meta skuid \"hubinetops\" ip daddr ${ip} tcp dport ${pve_port} accept")

@@ -1305,6 +1305,218 @@ class TestFirewall:
         assert result.returncode != 0
         assert "syntax validation" in result.stderr
 
+    def test_loopback_accept_is_first_input_rule(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert 'iifname "lo" accept' in ruleset
+        assert ruleset.index('iifname "lo" accept') < ruleset.index(f"ip saddr {FAKE_HA_SOURCE_CIDR}")
+
+    def test_established_related_accept_is_first_output_rule(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert "ct state established,related accept" in ruleset
+        pve_rule_idx = ruleset.index('meta skuid "hubinetops" ip daddr')
+        assert ruleset.index("ct state established,related accept") < pve_rule_idx
+        assert pve_rule_idx < ruleset.rindex('meta skuid "hubinetops" drop')
+
+
+# ---------------------------------------------------------------------------
+# Firewall STATEFUL SEMANTICS (fifth-pass corrective fix, P2-1 whole-
+# feature review): the OLD ruleset shape (no loopback accept in `input`,
+# no established/related accept in `output`) silently dropped the
+# bootstrap's own required Phase 12 loopback acceptance calls -- and even
+# a loopback-only partial fix still silently dropped the R0 backend's own
+# HTTP replies (it runs AS the hubinetops user) to either a loopback
+# client or a real HA client, since those replies are hubinetops-owned
+# OUTPUT packets with no established/related exemption ahead of the final
+# "meta skuid hubinetops drop". The fake's own `curl`/discovery-accept
+# simulators previously succeeded UNCONDITIONALLY, independent of what
+# ruleset had actually been generated and activated -- exactly the kind
+# of self-fulfilling test-double gap that let the original bug through
+# 130+ passing smoke tests. tests/_bootstrap_fake_pve.py now enforces a
+# bounded, order-aware structural invariant (NOT a full nftables
+# emulator -- no real packet/conntrack simulation) on the ACTUAL active
+# ruleset text before letting its curl/discovery-accept simulators report
+# success. These tests exercise that mechanism directly against the
+# OLD/partially-fixed/corrected shapes (proving the mechanism itself
+# would have caught the original bug), then confirm the real, corrected
+# bootstrap script's own end-to-end output satisfies every required
+# property.
+# ---------------------------------------------------------------------------
+
+_OLD_BUGGY_RULESET = f'''table inet hubinet_ops_r0 {{
+  chain input {{
+    type filter hook input priority 0; policy accept;
+    ip saddr {FAKE_HA_SOURCE_CIDR} tcp dport 8787 accept
+    tcp dport 8787 drop
+  }}
+  chain output {{
+    type filter hook output priority 0; policy accept;
+    meta skuid "hubinetops" ip daddr {FAKE_PVE_ENDPOINT_HOST} tcp dport 8006 accept
+    meta skuid "hubinetops" drop
+  }}
+}}
+'''
+
+_LOOPBACK_ONLY_RULESET = f'''table inet hubinet_ops_r0 {{
+  chain input {{
+    type filter hook input priority 0; policy accept;
+    iifname "lo" accept
+    ip saddr {FAKE_HA_SOURCE_CIDR} tcp dport 8787 accept
+    tcp dport 8787 drop
+  }}
+  chain output {{
+    type filter hook output priority 0; policy accept;
+    meta skuid "hubinetops" ip daddr {FAKE_PVE_ENDPOINT_HOST} tcp dport 8006 accept
+    meta skuid "hubinetops" drop
+  }}
+}}
+'''
+
+_CORRECTED_RULESET = f'''table inet hubinet_ops_r0 {{
+  chain input {{
+    type filter hook input priority 0; policy accept;
+    iifname "lo" accept
+    ip saddr {FAKE_HA_SOURCE_CIDR} tcp dport 8787 accept
+    tcp dport 8787 drop
+  }}
+  chain output {{
+    type filter hook output priority 0; policy accept;
+    ct state established,related accept
+    meta skuid "hubinetops" ip daddr {FAKE_PVE_ENDPOINT_HOST} tcp dport 8006 accept
+    meta skuid "hubinetops" drop
+  }}
+}}
+'''
+
+
+class TestFirewallStatefulSemantics:
+    def _activate(self, fake_env_obj, vmid, ruleset_text):
+        """Directly writes `ruleset_text` to the simulated CT filesystem
+        and "activates" it via the fake's own `pct exec <vmid> --
+        systemctl restart nftables` handler -- mirrors what
+        bootstrap-firewall.sh's phase10_firewall does (`pct push` then
+        activate), but lets a test construct a ruleset shape the CURRENT,
+        corrected production script would never itself generate anymore
+        (the OLD/partially-fixed shapes), so the fake's own semantic gate
+        can be exercised directly against them.
+        """
+        nft_path = fake_env_obj.ct_root / str(vmid) / "etc" / "nftables.conf"
+        nft_path.parent.mkdir(parents=True, exist_ok=True)
+        nft_path.write_text(ruleset_text, encoding="utf-8")
+        result = subprocess.run(
+            ["bash", "-c", f"pct exec {vmid} -- systemctl restart nftables"],
+            env=fake_env_obj.env, capture_output=True, text=True, timeout=15,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def _curl_health(self, fake_env_obj, vmid="110"):
+        return subprocess.run(
+            ["bash", "-c", f"pct exec {vmid} -- curl -fsS http://127.0.0.1:8787/r0/v1/health"],
+            env=fake_env_obj.env, capture_output=True, text=True, timeout=15,
+        )
+
+    def _discovery_accept(self, fake_env_obj, vmid="110"):
+        return subprocess.run(
+            ["bash", "-c", f'pct exec {vmid} -- python3 /tmp/hubinet-ops-bootstrap-accept.py "{FAKE_DISPLAY_NAME}" 5'],
+            env=fake_env_obj.env, capture_output=True, text=True, timeout=15,
+        )
+
+    # 1. The OLD (pre-fix) ruleset shape would fail acceptance.
+    def test_old_ruleset_shape_fails_local_health_and_discovery(self, tmp_path):
+        fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+        self._activate(fake_env_obj, "110", _OLD_BUGGY_RULESET)
+        health = self._curl_health(fake_env_obj)
+        assert health.returncode != 0
+        assert health.stdout == ""
+        discovery = self._discovery_accept(fake_env_obj)
+        assert discovery.returncode != 0
+        assert "FAIL" in discovery.stdout
+
+    # 2. A loopback-only partial fix (no established/related reply
+    #    allowance) would ALSO fail -- the compounding half of the bug.
+    def test_loopback_only_partial_fix_still_fails(self, tmp_path):
+        fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+        self._activate(fake_env_obj, "110", _LOOPBACK_ONLY_RULESET)
+        health = self._curl_health(fake_env_obj)
+        assert health.returncode != 0
+        assert health.stdout == ""
+        discovery = self._discovery_accept(fake_env_obj)
+        assert discovery.returncode != 0
+        assert "FAIL" in discovery.stdout
+
+    # 3. The corrected rules allow local process-health acceptance.
+    def test_corrected_ruleset_allows_local_process_health(self, tmp_path):
+        fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+        self._activate(fake_env_obj, "110", _CORRECTED_RULESET)
+        health = self._curl_health(fake_env_obj)
+        assert health.returncode == 0, health.stderr
+        assert health.stdout != ""
+
+    # 4. The corrected rules allow authenticated local discovery
+    #    acceptance.
+    def test_corrected_ruleset_allows_local_discovery_acceptance(self, tmp_path):
+        fake_env_obj = build_fake_pve_environment(tmp_path, default_scenario())
+        self._activate(fake_env_obj, "110", _CORRECTED_RULESET)
+        discovery = self._discovery_accept(fake_env_obj)
+        assert discovery.returncode == 0, discovery.stdout
+        assert discovery.stdout.strip().splitlines()[-1].startswith("PASS")
+
+    # 5. The corrected rules preserve HA ingress (never removed/narrowed
+    #    while fixing loopback/replies).
+    def test_corrected_ruleset_preserves_ha_ingress(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert f"ip saddr {FAKE_HA_SOURCE_CIDR} tcp dport 8787 accept" in ruleset
+
+    # 6. The final hubinetops drop remains, exactly once, still last.
+    def test_final_hubinetops_drop_remains_exactly_once_and_last(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        assert ruleset.count('meta skuid "hubinetops" drop') == 1
+        output_lines = [
+            line.strip() for line in ruleset.splitlines()
+            if line.strip() and not line.strip().startswith(("table", "chain", "type filter", "}"))
+        ]
+        # The output chain's rules are exactly the tail of this filtered
+        # list (input's rules come first) -- the final entry overall,
+        # after firewall generation, must be the hubinetops drop.
+        assert output_lines[-1] == 'meta skuid "hubinetops" drop'
+
+    # 7. Arbitrary NEW hubinetops egress is still not allowed -- the
+    #    established/related fix must not have widened into a general
+    #    outbound allowance. Every rule naming the hubinetops skuid is
+    #    either the final drop or an exact, narrow PVE/DNS destination
+    #    accept; established/related itself is NOT skuid-scoped (so it
+    #    cannot authorize a NEW hubinetops-initiated connection to an
+    #    arbitrary destination -- only replies to flows already accepted
+    #    by the input chain's own HA/loopback rules).
+    def test_no_broadened_new_hubinetops_egress(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(tmp_path, source_checkout)
+        assert result.returncode == 0, result.stderr
+        ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
+        skuid_lines = [
+            line.strip() for line in ruleset.splitlines()
+            if 'meta skuid "hubinetops"' in line
+        ]
+        for line in skuid_lines:
+            assert line == 'meta skuid "hubinetops" drop' or line.startswith(
+                'meta skuid "hubinetops" ip daddr'
+            ), f"unexpected/broadened hubinetops rule: {line}"
+        # established/related is a plain ct-state rule, never scoped to
+        # (or gated by) the hubinetops skuid -- confirms it cannot be
+        # mistaken for a hubinetops-specific NEW-connection allowance.
+        established_lines = [
+            line.strip() for line in ruleset.splitlines()
+            if "ct state established,related" in line
+        ]
+        assert len(established_lines) == 1
+        assert 'meta skuid "hubinetops"' not in established_lines[0]
+
 
 # ---------------------------------------------------------------------------
 # Hostname PVE endpoint firewall resolution (Blocker 4): nftables reports

@@ -378,7 +378,7 @@ def _exec_inner(vmid, inner, state):
         return _exec_sh_c(inner[2])
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-accept.py"):
-        return _exec_discovery_accept(inner[2:])
+        return _exec_discovery_accept(vmid, inner[2:])
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-resolve-dns.py"):
         return _exec_resolve_dns(inner[2:])
@@ -451,7 +451,7 @@ def _exec_sh_c(script):
     return 2
 
 
-def _exec_discovery_accept(args):
+def _exec_discovery_accept(vmid, args):
     # Simulates deploy/lib/hubinet-ops-bootstrap-accept.py's OWN observable
     # contract (its stdout vocabulary and exit codes) without actually
     # running it against a real HTTP server -- there is no real
@@ -463,12 +463,25 @@ def _exec_discovery_accept(args):
     # committed-success proof: latest_completed_outcome, last_committed_
     # run_sequence, last_successful_observed_at, committed_context ==
     # current_context, and a non-empty nodes[]).
+    #
+    # The real hubinet-ops-bootstrap-accept.py connects to
+    # http://127.0.0.1:8787 exactly like the process-health curl probe
+    # above -- it is equally subject to this CT's own active firewall. If
+    # the required loopback/reply semantics are absent, the real script's
+    # very first call (GET /backend) would raise urllib.error.URLError and
+    # print "FAIL backend-endpoint-unreachable <exc>"; this fake reproduces
+    # that exact outcome rather than succeeding unconditionally.
     expected_name = args[0] if len(args) > 0 else ""
     result = SCENARIO.get("discovery_result", "healthy")
     backend_id = SCENARIO.get("discovery_backend_instance_id", "fake-backend-instance-id")
     source_name = SCENARIO.get("discovery_source_name", expected_name)
     resource_count = SCENARIO.get("discovery_resource_count", 0)
     node_count = SCENARIO.get("discovery_node_count", 1)
+
+    state = _load_state()
+    if not _firewall_permits_local_and_reply_traffic(vmid, state):
+        print("FAIL backend-endpoint-unreachable simulated-firewall-blocked-loopback-or-reply")
+        return 1
 
     if result == "backend_unreachable":
         print("FAIL backend-endpoint-unreachable simulated")
@@ -563,6 +576,14 @@ def _exec_systemctl(vmid, args, state):
     if args[:1] == ["restart"] and "nftables" in args:
         if _fail("nft_activate"):
             return 1
+        # Marks the ruleset most recently `pct push`ed to
+        # /etc/nftables.conf as the ACTIVE one for this vmid -- pushing
+        # the file alone does not reload a running ruleset, matching real
+        # nftables.service semantics; see
+        # _firewall_permits_local_and_reply_traffic, which only trusts
+        # the pushed file once this flag is set.
+        entry["nftables_active"] = True
+        _save_state(state)
         return 0
     _log("systemctl", "UNHANDLED", *args)
     return 2
@@ -592,6 +613,93 @@ def _exec_nft(vmid, args):
     return 2
 
 
+# ---------------------------------------------------------------------------
+# Bounded firewall-semantics invariant (fifth-pass corrective fix, P2-1
+# whole-feature review). NOT a full nftables emulator -- this fake never
+# tracked real connection state or actually filtered any of its own
+# simulated traffic, which is exactly why the original bug (self-generated
+# firewall silently blocked the bootstrap's own required loopback/reply
+# traffic) went undetected: _exec_curl and _exec_discovery_accept both
+# succeeded unconditionally regardless of what ruleset had actually been
+# pushed and activated. This closes that blind spot narrowly: a
+# structural, order-aware check of the exact ACTIVE ruleset text (the same
+# chain-line shape bootstrap-firewall.sh's own
+# _verify_chain_rules_exact parses) for the two specific properties the
+# bootstrap's later phases actually depend on -- never a real packet/
+# conntrack simulation.
+# ---------------------------------------------------------------------------
+
+def _chain_lines(ruleset_text, chain_name):
+    """Same non-boilerplate-line extraction as bootstrap-firewall.sh's own
+    _verify_chain_rules_exact (awk version) -- reimplemented here in
+    python so the fake's own semantic check parses the exact same shape
+    the production verifier does, independently of it.
+    """
+    marker = f"chain {chain_name} {{"
+    in_chain = False
+    lines = []
+    for raw in ruleset_text.splitlines():
+        if marker in raw:
+            in_chain = True
+            continue
+        if not in_chain:
+            continue
+        stripped = raw.strip()
+        if stripped.startswith("}"):
+            in_chain = False
+            continue
+        if stripped.startswith("type filter hook") or stripped == "":
+            continue
+        lines.append(stripped)
+    return lines
+
+
+def _input_grants_loopback(input_lines):
+    target = 'iifname "lo" accept'
+    if target not in input_lines:
+        return False
+    accept_idx = input_lines.index(target)
+    # A "tcp dport 8787 drop"-shaped fallthrough appearing BEFORE the
+    # loopback accept would already have discarded the packet -- order
+    # matters, not merely presence.
+    return not any(
+        line == "tcp dport 8787 drop" and i < accept_idx
+        for i, line in enumerate(input_lines)
+    )
+
+
+def _output_grants_established_replies(output_lines):
+    target = "ct state established,related accept"
+    if target not in output_lines:
+        return False
+    accept_idx = output_lines.index(target)
+    return not any(
+        line == 'meta skuid "hubinetops" drop' and i < accept_idx
+        for i, line in enumerate(output_lines)
+    )
+
+
+def _firewall_permits_local_and_reply_traffic(vmid, state):
+    """True only if THIS vmid's firewall has actually been activated
+    (`systemctl restart nftables` succeeded -- pushing the file alone does
+    not reload the running ruleset, matching real semantics) AND the
+    active ruleset text grants both invariants Phase 12's own network
+    calls (and any real HA client's reply traffic) structurally require:
+    loopback ingress before the 8787 fallthrough drop, and established/
+    related reply egress before the final hubinetops drop.
+    """
+    entry = state["vmids"].get(str(vmid), {})
+    if not entry.get("nftables_active"):
+        return False
+    path = _ct_path(vmid, "/etc/nftables.conf")
+    if not path.exists():
+        return False
+    text = path.read_text()
+    return _input_grants_loopback(_chain_lines(text, "input")) and _output_grants_established_replies(
+        _chain_lines(text, "output")
+    )
+
+
 def _exec_curl(vmid, args):
     # Only the unauthenticated liveness probe (GET /r0/v1/health) is ever
     # curl'd by the bootstrap script now -- the authenticated snapshot/
@@ -601,6 +709,13 @@ def _exec_curl(vmid, args):
     url = args[-1]
     if "/r0/v1/health" in url:
         if _fail("backend_health"):
+            return 7
+        state = _load_state()
+        if not _firewall_permits_local_and_reply_traffic(vmid, state):
+            # Simulates the packet being silently dropped by this CT's own
+            # active firewall -- curl reports "no response" (exit 7),
+            # matching the real symptom of a connection that never
+            # receives a reply.
             return 7
         sys.stdout.write(SCENARIO.get("health_body", '{"status": "ok"}'))
         return 0
