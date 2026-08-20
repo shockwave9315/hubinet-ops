@@ -2,27 +2,60 @@
 # Phase 1 -- PVE host preflight. Fail closed before creating anything.
 #
 # Every check here is read-only: no `pct create`, no `pveum user/role/token
-# add`, no firewall change, nothing mutating happens in this phase. If any
-# check fails, the process must exit non-zero before phase 2 ever runs.
+# add`, no firewall change, no `pveam update`/`download`, nothing mutating
+# happens in this phase or in phase2_plan_template -- see
+# bootstrap-proxmox-0.5.sh's top-level orchestration comment for why: no
+# host mutation of any kind may occur before the operator has seen and
+# confirmed the full plan (VMID, template, source commit).
 
 phase1_preflight() {
   log_phase "Phase 1: preflight"
 
-  if [[ "${BOOTSTRAP_TEST_MODE:-0}" != "1" ]]; then
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" != "1" ]]; then
     [[ "${EUID}" -eq 0 ]] || die "must run as root on the Proxmox host"
   fi
 
   require_command pct "Proxmox container control"
   require_command pveum "Proxmox user/permission management"
   require_command pveam "Proxmox appliance/template management"
-  require_command pvesh "Proxmox API shell (node/storage introspection)"
+  require_command pvesh "Proxmox API shell (node/storage/next-VMID introspection)"
   require_command pvesm "Proxmox storage management"
+  require_command git "source commit verification (git archive of an exact, confirmed SHA)"
 
-  is_valid_vmid "${VMID}" || die "--vmid '${VMID}' is not a valid Proxmox VMID"
+  # A real JSON parser is required (not optional) specifically for the
+  # security-relevant checks in this bootstrap -- the exact-set PVE
+  # effective-permission proof (bootstrap-identity.sh) and the discovery-
+  # acceptance snapshot parsing (which runs inside the CT via python3,
+  # guaranteed there by install-0.5.0-fresh.sh, so this host-side
+  # requirement is for the PVE-host-side permission check only). A lexical
+  # regex "JSON parser" is not an acceptable substitute for a security
+  # verification gate.
+  if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+    die "neither 'jq' nor 'python3' is available on this PVE host -- one of them is required to reliably parse PVE's JSON output for the effective-permission verification gate (this bootstrap will not fall back to a regex-based JSON parser for a security check)"
+  fi
 
-  # --- VMID must not already exist ------------------------------------
-  if pct status "${VMID}" >/dev/null 2>&1; then
-    die "VMID ${VMID} already exists -- refusing to destroy, overwrite, adopt, or repurpose it. Choose a different --vmid or remove it yourself first."
+  case "${TLS_TRUST_MODE}" in
+    ""|system) : ;;
+    *) die "--tls-trust must be 'system' or omitted, got '${TLS_TRUST_MODE}'" ;;
+  esac
+  if [[ "${TLS_TRUST_MODE}" == "system" && -n "${PVE_CA_PATH}" ]]; then
+    die "--pve-ca-path and --tls-trust system are mutually exclusive -- choose one"
+  fi
+
+  # --- VMID: explicit value is validated/checked; auto-detect mode plans
+  #     a candidate now (read-only) and rechecks it immediately before
+  #     `pct create` in phase3 to handle a same-host race safely. -----------
+  if [[ -n "${VMID}" ]]; then
+    VMID_EXPLICIT=1
+    is_valid_vmid "${VMID}" || die "--vmid '${VMID}' is not a valid Proxmox VMID"
+    if pct status "${VMID}" >/dev/null 2>&1; then
+      die "VMID ${VMID} already exists -- refusing to destroy, overwrite, adopt, or repurpose it. Choose a different --vmid or remove it yourself first."
+    fi
+  else
+    VMID_EXPLICIT=0
+    VMID="$(_next_free_vmid)" \
+      || die "could not auto-detect the next free VMID via 'pvesh get /cluster/nextid'; pass --vmid explicitly"
+    log_info "auto-detected next free VMID: ${VMID} (via pvesh get /cluster/nextid; rechecked immediately before container creation)"
   fi
 
   # --- storage must exist and support container rootdirs --------------
@@ -37,11 +70,6 @@ phase1_preflight() {
   # --- bridge must exist ------------------------------------------------
   _bridge_exists "${BRIDGE}" \
     || die "bridge '${BRIDGE}' does not exist on this host (check 'ip link show' / PVE network configuration)"
-
-  # --- template situation understood -----------------------------------
-  # Resolved fully in phase 2 (template selection/download); here we only
-  # confirm the appliance manager itself is queryable.
-  pveam update >/dev/null 2>&1 || log_warn "pveam update failed or is unavailable offline -- proceeding with locally cached template list only"
 
   # --- required source repository/release payload exists ----------------
   [[ -d "${SOURCE_DIR}/app" ]] || die "SOURCE_DIR (${SOURCE_DIR}) does not look like a Hubinet Ops 0.5 checkout -- app/ is missing"
@@ -76,12 +104,29 @@ phase1_preflight() {
   is_positive_int "${MEMORY_MIB}" || die "--memory must be a positive integer (MiB)"
   [[ "${SWAP_MIB}" =~ ^[0-9]+$ ]] || die "--swap must be a non-negative integer (MiB)"
   is_positive_int "${ROOTFS_GIB}" || die "--rootfs-size must be a positive integer (GiB)"
+  is_positive_int "${BOOTSTRAP_DISCOVERY_TIMEOUT_SECONDS}" || die "--discovery-timeout must be a positive integer (seconds)"
 
   # --- enough disk/resources exist where reasonably checkable ------------
   _storage_has_free_space "${STORAGE}" "${ROOTFS_GIB}" \
     || die "storage '${STORAGE}' does not report enough free space for a ${ROOTFS_GIB}GiB rootfs"
 
   log_pass "preflight"
+}
+
+# _next_free_vmid: the real, verified Proxmox mechanism for an unused VMID
+# -- `/cluster/nextid` (see `man pvesh` / PVE API docs). Returns a bare
+# integer. This is called again, unconditionally, immediately before
+# `pct create` in phase3 to recheck for a same-host race between planning
+# and creation; an auto-detected ID may be safely recomputed on collision,
+# but this function is never used to override an operator-supplied
+# --vmid (see VMID_EXPLICIT in phase1/phase3).
+_next_free_vmid() {
+  local raw
+  raw="$(pvesh get /cluster/nextid --output-format json 2>/dev/null)" || return 1
+  raw="${raw//\"/}"
+  raw="$(printf '%s' "${raw}" | tr -d '[:space:]')"
+  is_valid_vmid "${raw}" || return 1
+  printf '%s' "${raw}"
 }
 
 _detect_default_container_storage() {

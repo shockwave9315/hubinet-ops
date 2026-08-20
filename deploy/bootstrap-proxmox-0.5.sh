@@ -7,11 +7,12 @@ set -Eeuo pipefail
 # docs/operations/0.5-r0-operational-activation.md sections 1-4: creates a
 # fresh unprivileged Debian 13 LXC, deploys the R0 read-only runtime into
 # it (deploy/install-0.5.0-fresh.sh, unmodified), provisions a
-# least-privilege PVE read-only identity (Sys.Audit+VM.Audit only, never
-# a mutation privilege), provisions PVE TLS trust material (never
-# verify=false), applies the mandatory nftables egress/ingress boundary,
-# and only then starts the service and enables CT boot -- in that order,
-# never reversed.
+# least-privilege PVE read-only identity (exactly Sys.Audit+VM.Audit,
+# verified as an exact set -- never a broader privilege), provisions PVE
+# TLS trust material (never verify=false), applies the mandatory nftables
+# egress/ingress boundary, and only then starts the service, verifies a
+# real authenticated discovery success, and enables CT boot -- in that
+# order, never reversed.
 #
 # This script does NOT add runtime mutation capability of any kind. R0
 # remains read-only end to end; `pct`/`pveum` invoked here are one-shot,
@@ -21,6 +22,12 @@ set -Eeuo pipefail
 #
 # Run as root ON the Proxmox VE host itself (this script drives `pct`/
 # `pveum`/`pveam`/`nft` locally; it is not SSH-orchestrated).
+#
+# NO HOST MUTATION OF ANY KIND (including `pveam update`/`download`)
+# happens before the operator has seen and confirmed the full plan
+# (VMID, template, source commit) -- see the single confirm_or_abort call
+# near the bottom of this file. Everything before it is read-only
+# planning; everything after it may mutate.
 #
 # See docs/operations/0.5-r0-operational-activation.md for the full
 # reference procedure this automates, including everything an operator
@@ -34,7 +41,12 @@ source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-common.sh"
 # Defaults
 # ---------------------------------------------------------------------------
 
-VMID="110"
+# VMID is intentionally empty by default: phase1_preflight auto-detects the
+# next free VMID via the real Proxmox `/cluster/nextid` API and shows it in
+# the plan. An operator-supplied --vmid is validated and never silently
+# overridden. See VMID_EXPLICIT below.
+VMID=""
+VMID_EXPLICIT="0"
 HOSTNAME_="hubinet-ops"
 STORAGE=""
 TEMPLATE=""
@@ -51,23 +63,30 @@ LXC_FEATURES=""
 HA_SOURCE_CIDR=""
 PVE_ENDPOINT=""
 PVE_CA_PATH=""
-TLS_TRUST_MODE="system"
+# TLS_TRUST_MODE default is "" (unset), NOT "system": relying on the CT's
+# system trust store is only ever taken when the operator explicitly opts
+# in with --tls-trust system (see bootstrap-identity.sh phase7). An
+# implicit silent fallback to system trust is exactly what this default
+# must never produce.
+TLS_TRUST_MODE=""
 DNS_RESOLVER_IP=""
 FRESHNESS_SECONDS="300"
 HA_DISPLAY_NAME="Home Proxmox"
 SOURCE_DIR="$(cd "${BOOTSTRAP_SCRIPT_DIR}/.." && pwd)"
+EXPECTED_SOURCE_SHA=""
 BOOTSTRAP_ASSUME_YES="0"
 BOOTSTRAP_NON_INTERACTIVE="0"
 BOOTSTRAP_CLEANUP_ON_FAILURE="0"
 BOOTSTRAP_NET_TIMEOUT_SECONDS="${BOOTSTRAP_NET_TIMEOUT_SECONDS:-120}"
 BOOTSTRAP_SERVICE_TIMEOUT_SECONDS="${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS:-60}"
-BOOTSTRAP_TEST_MODE="${BOOTSTRAP_TEST_MODE:-0}"
+BOOTSTRAP_DISCOVERY_TIMEOUT_SECONDS="${BOOTSTRAP_DISCOVERY_TIMEOUT_SECONDS:-180}"
+HUBINET_OPS_TEST_MODE="${HUBINET_OPS_TEST_MODE:-0}"
 
 CT_IP=""
 CT_CA_BUNDLE_PATH=""
 BOOTSTRAP_CA_SOURCE_PATH=""
 PVE_TOKEN_SECRET_FILE=""
-R0_API_BEARER_TOKEN=""
+DISCOVERY_ACCEPTANCE_SUMMARY=""
 
 usage() {
   cat <<'USAGE'
@@ -83,23 +102,46 @@ Required:
                              this must be explicit.
 
 Commonly overridden:
-  --vmid <N>                 default: 110
-  --hostname <name>          default: hubinet-ops
-  --storage <name>           default: auto-detected
-  --template <volid>         default: auto-selected/downloaded newest
-                              local Debian 13 standard template
-  --bridge <name>             default: vmbr0
-  --network dhcp|static       default: dhcp
-  --ip <address/prefix>       required if --network static
-  --gateway <address>         required if --network static
-  --pve-endpoint <url>        default: auto-detected https://<host-ip>:8006
-  --pve-ca-path <path>        default: auto-detected /etc/pve/pve-root-ca.pem
-  --tls-trust system|ca-file  default: system (only if no CA bundle found)
-  --dns-resolver <ip>         required only if --pve-endpoint uses a
+  --vmid <N>                  default: auto-detected next free VMID
+                               (pvesh get /cluster/nextid); an explicit
+                               value here is validated and never silently
+                               overridden, including on a creation-time
+                               race.
+  --hostname <name>           default: hubinet-ops
+  --storage <name>            default: auto-detected
+  --template <volid>          default: auto-selected/downloaded newest
+                               local Debian 13 standard template (newest
+                               across ALL storages, not just the last one
+                               checked)
+  --bridge <name>              default: vmbr0
+  --network dhcp|static        default: dhcp
+  --ip <address/prefix>        required if --network static
+  --gateway <address>          required if --network static
+  --pve-endpoint <url>         default: auto-detected https://<host-ip>:8006
+  --pve-ca-path <path>         default: auto-detected /etc/pve/pve-root-ca.pem
+  --tls-trust system            explicit opt-in to the target CT's system
+                               trust store when no CA bundle is found or
+                               given; there is no implicit default for
+                               this -- omitting both --pve-ca-path and
+                               --tls-trust fails closed if no CA is found.
+  --dns-resolver <ip>          required only if --pve-endpoint uses a
                                hostname rather than a literal IP
-  --freshness-seconds <N>     default: 300
-  --display-name <text>       default: "Home Proxmox"
-  --source-dir <path>         default: this script's own repository root
+  --expected-sha <full-sha>    the exact 40-character git commit SHA this
+                               run is authorized to deploy from
+                               --source-dir; required in --non-interactive
+                               mode, optional (but recommended) otherwise,
+                               where the detected HEAD SHA is printed and
+                               must be confirmed interactively instead.
+  --discovery-timeout <sec>    default: 180 -- how long phase 12 polls
+                               GET /r0/v1/snapshot for a genuinely healthy,
+                               provenance-verified discovery result before
+                               failing (see Mandatory acceptance below).
+  --freshness-seconds <N>      default: 300
+  --display-name <text>        default: "Home Proxmox"
+  --source-dir <path>          default: this script's own repository root
+                               (must be a git checkout with a clean
+                               working tree -- see --expected-sha above;
+                               there is no non-git deployment path).
 
 Resources:
   --cores <N>                default: 1
@@ -109,16 +151,21 @@ Resources:
 
 Behavior:
   --non-interactive           fail closed instead of prompting for any
-                               missing required value
-  --yes, -y                    skip interactive confirmations
+                               missing required value (including
+                               --expected-sha)
+  --yes, -y                    skip interactive confirmations (does not
+                               skip the --expected-sha requirement in
+                               --non-interactive mode)
   --cleanup-on-failure          destroy the container automatically if
                                bootstrap fails after creating it (default:
                                preserve it for forensic diagnosis)
   -h, --help                    show this help and exit
 
 PVE identity (user hubinetops@pve, role HubinetOpsR0Auditor, token
-r0-readonly) and the nftables firewall boundary are always created; there
-are no flags to weaken or skip them.
+r0-readonly, privileges exactly Sys.Audit,VM.Audit) and the nftables
+firewall boundary are always created; there are no flags to weaken or
+skip them. No host mutation of any kind (including `pveam update`/
+`download`) happens before the operator confirms the full plan.
 USAGE
 }
 
@@ -148,6 +195,8 @@ while [[ $# -gt 0 ]]; do
     --pve-ca-path) PVE_CA_PATH="$2"; shift 2 ;;
     --tls-trust) TLS_TRUST_MODE="$2"; shift 2 ;;
     --dns-resolver) DNS_RESOLVER_IP="$2"; shift 2 ;;
+    --expected-sha) EXPECTED_SOURCE_SHA="$2"; shift 2 ;;
+    --discovery-timeout) BOOTSTRAP_DISCOVERY_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --freshness-seconds) FRESHNESS_SECONDS="$2"; shift 2 ;;
     --display-name) HA_DISPLAY_NAME="$2"; shift 2 ;;
     --source-dir) SOURCE_DIR="$2"; shift 2 ;;
@@ -188,7 +237,11 @@ fi
 # Rollback/cleanup framework -- see the module docstrings for the exact
 # semantics (PVE identity always rolled back on failure; CT preserved by
 # default, destroyed only with --cleanup-on-failure; service/onboot never
-# left exposed on any failure path).
+# left exposed on any failure path). Cleanup is gated on "was this class
+# of object ever attempted by this run" markers, not "did the specific
+# creation call report success" -- a command can mutate PVE/CT state and
+# still return a nonzero exit for an unrelated reason, so success-only
+# ledger entries are not a reliable proxy for "nothing was created."
 # ---------------------------------------------------------------------------
 
 BOOTSTRAP_LEDGER="$(mktemp /tmp/hubinet-ops-bootstrap-ledger.XXXXXX)"
@@ -213,9 +266,12 @@ rollback_on_failure() {
 
   log_warn "bootstrap failed (exit ${exit_code}) -- running cleanup"
 
-  if ledger_has service-started "${VMID}"; then
+  # Idempotent, unconditional once attempted -- closes the partial-success
+  # window where `systemctl enable --now` mutates state but still returns
+  # nonzero for an unrelated reason (see phase11_start_service).
+  if ledger_has service-start-attempted "${VMID}"; then
     pct exec "${VMID}" -- systemctl disable --now hubinet-ops >/dev/null 2>&1 \
-      || log_warn "could not stop/disable hubinet-ops inside container ${VMID} during cleanup -- manual check required"
+      || log_warn "could not stop/disable hubinet-ops inside container ${VMID} during cleanup (may never have been enabled -- not necessarily an error)"
   fi
 
   if ledger_has ct "${VMID}"; then
@@ -225,26 +281,23 @@ rollback_on_failure() {
   # PVE identity objects created in THIS run are always rolled back
   # automatically: they are cheap to recreate, carry no material forensic
   # value, and (per the fresh-install-only conflict policy) would block
-  # every future retry if left behind. Reverse creation order.
-  if ledger_has pve-acl-token "${PVE_FULL_TOKEN_ID:-}"; then
+  # every future retry if left behind. Gated on the single
+  # "pve-identity-attempted" marker recorded at the top of phase6 (not on
+  # each sub-step's own success-only ledger entry) so a partial success on
+  # the PVE side is still cleaned up; every delete below is already
+  # idempotent (`|| log_warn`, never fatal) since some of these objects
+  # may never have actually been created. Reverse creation order.
+  if ledger_has pve-identity-attempted "${PVE_USER:-hubinetops@pve}"; then
     pveum acl delete / --tokens "${PVE_FULL_TOKEN_ID}" --roles "${PVE_ROLE}" >/dev/null 2>&1 \
-      || log_warn "could not remove ACL grant for token ${PVE_FULL_TOKEN_ID}"
-  fi
-  if ledger_has pve-token "${PVE_FULL_TOKEN_ID:-}"; then
+      || log_warn "could not remove ACL grant for token ${PVE_FULL_TOKEN_ID} (may never have existed)"
     pveum user token remove "${PVE_USER}" "${PVE_TOKEN_ID}" >/dev/null 2>&1 \
-      || log_warn "could not remove token ${PVE_FULL_TOKEN_ID}"
-  fi
-  if ledger_has pve-acl-user "${PVE_USER:-}"; then
+      || log_warn "could not remove token ${PVE_FULL_TOKEN_ID} (may never have existed)"
     pveum acl delete / --users "${PVE_USER}" --roles "${PVE_ROLE}" >/dev/null 2>&1 \
-      || log_warn "could not remove ACL grant for user ${PVE_USER}"
-  fi
-  if ledger_has pve-role "${PVE_ROLE:-}"; then
+      || log_warn "could not remove ACL grant for user ${PVE_USER} (may never have existed)"
     pveum role delete "${PVE_ROLE}" >/dev/null 2>&1 \
-      || log_warn "could not remove role ${PVE_ROLE}"
-  fi
-  if ledger_has pve-user "${PVE_USER:-}"; then
+      || log_warn "could not remove role ${PVE_ROLE} (may never have existed)"
     pveum user delete "${PVE_USER}" >/dev/null 2>&1 \
-      || log_warn "could not remove user ${PVE_USER}"
+      || log_warn "could not remove user ${PVE_USER} (may never have existed)"
   fi
 
   # The CT itself is preserved by default for forensic diagnosis --
@@ -282,21 +335,27 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ---------------------------------------------------------------------------
-# Orchestration -- fixed phase order, never reordered.
+# Orchestration -- fixed phase order, never reordered. Everything before
+# confirm_or_abort is read-only planning; nothing after phase1/phase2/
+# _plan_source_commit mutates PVE or CT state until the operator has
+# confirmed the printed plan.
 # ---------------------------------------------------------------------------
 
 phase1_preflight
-phase2_select_template
+phase2_plan_template
+_plan_source_commit
 
-log_info "Plan: create VMID ${VMID} (${HOSTNAME_}) from ${TEMPLATE} on storage ${STORAGE}, bridge ${BRIDGE}, network ${NETWORK_MODE}; PVE endpoint ${PVE_ENDPOINT}; HA source ${HA_SOURCE_CIDR} -> TCP 8787 only."
+log_info "Plan: create VMID ${VMID}$( [[ "${VMID_EXPLICIT}" == "0" ]] && printf ' (auto-detected next-free)' ) (${HOSTNAME_}) from template [${TEMPLATE_PLAN_NOTE}] on storage ${STORAGE}, bridge ${BRIDGE}, network ${NETWORK_MODE}; PVE endpoint ${PVE_ENDPOINT}; source commit ${SOURCE_HEAD_SHA}; HA source ${HA_SOURCE_CIDR} -> TCP 8787 only."
 confirm_or_abort "Proceed with this plan?"
 
+phase2b_provision_template
 phase3_create_container
 phase4_debian13_compat
 phase5_boot_and_discover_ip
 phase6_pve_identity
 phase7_tls_trust
 phase8_deploy_source
+phase8b_provision_tooling
 phase9_generate_config
 phase10_firewall
 phase11_start_service

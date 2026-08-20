@@ -1,52 +1,106 @@
 #!/usr/bin/env bash
 # Phases 2-5 -- template selection, fresh unprivileged CT creation,
 # Debian 13/systemd 257 nesting compatibility, boot + network discovery.
+#
+# Template selection is split into a read-only planning step
+# (phase2_plan_template, runs before the operator confirms the plan) and a
+# provisioning step that may mutate PVE-side template caches
+# (phase2b_provision_template, `pveam update`/`download` -- runs only
+# after confirm_or_abort). No host mutation of any kind happens before the
+# operator has seen and confirmed the plan.
 
 # Only a Debian *standard* LXC template is ever selected automatically --
 # never an arbitrary/unknown template merely because it exists locally.
 _TEMPLATE_NAME_PATTERN='^debian-13-standard_'
 
-phase2_select_template() {
-  log_phase "Phase 2: template selection"
+TEMPLATE_PLAN_NOTE=""
+
+phase2_plan_template() {
+  log_phase "Phase 2: template selection (planning, read-only)"
 
   if [[ -n "${TEMPLATE}" ]]; then
+    [[ "$(basename "${TEMPLATE}")" =~ ${_TEMPLATE_NAME_PATTERN} ]] \
+      || die "template '${TEMPLATE}' does not look like a supported Debian 13 standard template (expected a 'debian-13-standard_*' filename); pass a supported template explicitly or omit --template to auto-select one"
+    TEMPLATE_PLAN_NOTE="operator-specified: ${TEMPLATE}"
     log_info "using operator-specified template: ${TEMPLATE}"
+    log_pass "template selection: ${TEMPLATE}"
+    return 0
+  fi
+
+  local local_best
+  local_best="$(_newest_local_debian13_template)" || true
+  if [[ -n "${local_best}" ]]; then
+    TEMPLATE="${local_best}"
+    TEMPLATE_PLAN_NOTE="already cached locally: ${TEMPLATE}"
+    log_info "found cached template: ${TEMPLATE}"
   else
-    TEMPLATE="$(_newest_local_debian13_template)" || true
-    if [[ -z "${TEMPLATE}" ]]; then
-      log_info "no local Debian 13 standard template found; downloading the newest available one"
-      TEMPLATE="$(_download_newest_debian13_template)" \
-        || die "no Debian 13 standard LXC template is available locally or via 'pveam available' -- pass --template <storage>:vztmpl/<file> explicitly"
-    fi
-    log_info "selected template: ${TEMPLATE}"
+    TEMPLATE=""
+    TEMPLATE_PLAN_NOTE="not cached locally -- will be downloaded during provisioning (newest available Debian 13 standard template at that time; 'pveam update'/'download' run only after this plan is confirmed)"
+    log_info "no local Debian 13 standard template found; the newest available one will be downloaded after the plan is confirmed"
+  fi
+
+  log_pass "template selection (planned): ${TEMPLATE_PLAN_NOTE}"
+}
+
+# phase2b_provision_template: the only step in this bootstrap allowed to
+# run `pveam update`/`pveam download` -- always after confirm_or_abort.
+phase2b_provision_template() {
+  log_phase "Phase 2b: template provisioning"
+
+  if [[ -n "${TEMPLATE}" ]]; then
+    log_pass "template already resolved: ${TEMPLATE}"
+    return 0
+  fi
+
+  run_logged pveam update \
+    || log_warn "pveam update failed or is unavailable offline -- proceeding with the locally cached template list only"
+
+  TEMPLATE="$(_newest_local_debian13_template)" || true
+  if [[ -z "${TEMPLATE}" ]]; then
+    TEMPLATE="$(_download_newest_debian13_template)" \
+      || die "no Debian 13 standard LXC template is available locally or via 'pveam available' -- pass --template <storage>:vztmpl/<file> explicitly"
   fi
 
   [[ "$(basename "${TEMPLATE}")" =~ ${_TEMPLATE_NAME_PATTERN} ]] \
-    || die "template '${TEMPLATE}' does not look like a supported Debian 13 standard template (expected a 'debian-13-standard_*' filename); pass a supported template explicitly or omit --template to auto-select one"
+    || die "resolved template '${TEMPLATE}' does not look like a supported Debian 13 standard template"
 
-  log_pass "template selection: ${TEMPLATE}"
+  log_pass "template provisioned: ${TEMPLATE}"
 }
 
 # _newest_local_debian13_template: `pveam list <storage>` lists already
-# downloaded templates for one storage; scan every storage that reports
-# 'vztmpl' content support and pick the lexicographically newest matching
-# filename (Debian's own version-string ordering sorts correctly this way,
-# e.g. debian-13-standard_13.6-1_amd64.tar.zst > _13.5-1_).
+# downloaded templates for one storage. Candidates are collected from
+# EVERY storage that reports 'vztmpl' content support, then compared by
+# basename (the version-bearing filename, independent of storage-name
+# prefix) so the globally newest template wins regardless of which
+# storage happens to be enumerated last -- a per-storage "last one wins"
+# loop would silently pick an older template merely because it lives on
+# whichever storage iterated last.
 _newest_local_debian13_template() {
   local storage
-  local best=""
+  local -a candidates=()
   for storage in $(_vztmpl_storages); do
-    local candidate
-    candidate="$(pveam list "${storage}" 2>/dev/null \
+    while IFS= read -r volid; do
+      [[ -n "${volid}" ]] && candidates+=("${volid}")
+    done < <(pveam list "${storage}" 2>/dev/null \
       | awk '{print $1}' \
-      | grep -E "/${_TEMPLATE_NAME_PATTERN#^}" \
-      | sort -V \
-      | tail -n1)"
-    if [[ -n "${candidate}" ]]; then
-      best="${candidate}"
+      | grep -E "/${_TEMPLATE_NAME_PATTERN#^}")
+  done
+  [[ ${#candidates[@]} -gt 0 ]] || return 1
+
+  local best="" best_base="" volid base newest
+  for volid in "${candidates[@]}"; do
+    base="$(basename "${volid}")"
+    if [[ -z "${best_base}" ]]; then
+      best="${volid}"
+      best_base="${base}"
+      continue
+    fi
+    newest="$(printf '%s\n%s\n' "${best_base}" "${base}" | sort -V | tail -n1)"
+    if [[ "${newest}" == "${base}" && "${base}" != "${best_base}" ]]; then
+      best="${volid}"
+      best_base="${base}"
     fi
   done
-  [[ -n "${best}" ]] || return 1
   printf '%s' "${best}"
 }
 
@@ -69,6 +123,28 @@ _vztmpl_storages() {
 
 phase3_create_container() {
   log_phase "Phase 3: create unprivileged container"
+
+  # Recheck VMID immediately before creation: closes the window between
+  # planning (phase1/confirm) and this mutating step. An auto-detected
+  # VMID may be safely recomputed on a collision (cheap, no operator
+  # commitment was ever made to a specific auto-detected number); an
+  # explicit --vmid is NEVER silently overridden -- a collision there is
+  # always a hard stop, exactly like the phase1 check.
+  local attempt
+  for (( attempt = 1; attempt <= 5; attempt++ )); do
+    if ! pct status "${VMID}" >/dev/null 2>&1; then
+      break
+    fi
+    if [[ "${VMID_EXPLICIT}" == "1" ]]; then
+      die "VMID ${VMID} was created by something else between preflight and container creation -- refusing to destroy, overwrite, adopt, or repurpose it. Re-run with a different --vmid."
+    fi
+    log_warn "auto-detected VMID ${VMID} was claimed by another process since planning -- recomputing"
+    VMID="$(_next_free_vmid)" \
+      || die "could not recompute a free VMID via 'pvesh get /cluster/nextid' after a collision"
+  done
+  if pct status "${VMID}" >/dev/null 2>&1; then
+    die "VMID ${VMID} still exists after ${attempt} auto-detect attempts -- refusing to proceed under contention; re-run or pass --vmid explicitly"
+  fi
 
   local -a create_args=(
     "${VMID}"

@@ -47,9 +47,13 @@ step (`docs/operations/0.5-r0-operational-activation.md`).
   is no 0.4→0.5 upgrade path).
 - `deploy/bootstrap-proxmox-0.5.sh`, `deploy/lib/bootstrap-*.sh`,
   `deploy/README-bootstrap-proxmox-0.5.md`: the primary, product-facing PVE-host
-  entrypoint — automates fresh CT creation, least-privilege PVE identity, TLS trust,
+  entrypoint — automates next-free-VMID-auto-detected CT creation, least-privilege
+  PVE identity (exact-set-verified permissions), TLS trust (explicit opt-in only
+  for system-trust fallback), git-commit-provenance-gated source deployment via
   the in-CT install above, source-centric config, and the mandatory firewall
-  boundary, ending with CT boot enabled only after acceptance passes.
+  boundary (exact rule content/order verified), ending with CT boot enabled only
+  after a real discovery-acceptance check passes. Not yet run against a real host
+  — see the README's "What this script proves, and what it does not".
 - `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
   the authority order). `docs/operations/`: the R0 operational activation runbook and the
   Home Assistant clean-break/purge plan for a real deployed instance.
@@ -61,6 +65,7 @@ python -m compileall -q app custom_components tests scripts
 pytest -q
 bash -n deploy/install-0.5.0-fresh.sh
 for f in deploy/bootstrap-proxmox-0.5.sh deploy/lib/*.sh; do bash -n "$f"; done
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/lib/*.sh; do python scripts/validate_hermetic_shell_boundary.py "$f"; done
 python scripts/validate_yaml.py
 python scripts/check_tracked_files.py
 ```

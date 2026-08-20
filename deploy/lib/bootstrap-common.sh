@@ -9,6 +9,20 @@
 # xtrace would echo full command lines, including PVE token secrets
 # passed as arguments/heredocs during identity/config generation. Logging
 # below is explicit and secret-redacted instead.
+#
+# Secret-handling rule enforced throughout this file and every phase
+# module: a secret value (the PVE API token, the R0 API bearer token, the
+# raw "pveum user token add" JSON containing the token) is never passed as
+# a literal command-line argument to any process -- not to printf, not to
+# jq/python3/awk, not to curl. Every helper below that needs to read
+# secret-bearing content takes a file path (never secret) and reads the
+# content internally from that file/stdin. Corrective-pass note: an
+# earlier version of this file passed secret JSON via `printf '%s'
+# "${json}"` and `awk -v token="${var}"`, which put the secret literally
+# into those processes' own argv (visible via /proc/<pid>/cmdline for the
+# duration of the call) -- fixed here structurally, not by moving the
+# secret into an environment variable instead (which only changes, not
+# closes, the same exposure surface).
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -47,7 +61,16 @@ ledger_record() {
 # ledger_has: true if this run itself created the given kind/id pair.
 # Rollback and idempotency checks use this to distinguish "this run made
 # it" from "an operator resource happened to already exist" -- never the
-# other way around.
+# other way around. Corrective-pass note: rollback no longer uses this as
+# the ONLY gate for whether to attempt an idempotent cleanup action (see
+# bootstrap-proxmox-0.5.sh's rollback_on_failure) -- a command can mutate
+# state and still return non-zero, so "ledger_record happened" is not a
+# reliable proxy for "nothing was created." ledger_has(ct/pve-user/
+# pve-role) remains the sole authority for whether a resource was ever
+# reachable-created by THIS run at all (never touch anything for which
+# this returns false), but once true, cleanup attempts every dependent
+# sub-step idempotently rather than gating each one on its own separate
+# success-only ledger entry.
 ledger_has() {
   local kind="$1" id="$2"
   [[ -f "${BOOTSTRAP_LEDGER}" ]] || return 1
@@ -119,6 +142,86 @@ run_logged_redacted() {
 }
 
 # ---------------------------------------------------------------------------
+# JSON helpers -- every function below takes a file path, never secret
+# content as an argv string. `python3` is a hard preflight requirement
+# (phase1_preflight) specifically so this repository never has to fall
+# back to a lexical regex "parser" for security-verification-relevant
+# JSON (the effective-PVE-permission exact-set check in particular); `jq`
+# is used opportunistically first when present because it's faster/
+# simpler, but is never required.
+# ---------------------------------------------------------------------------
+
+# _json_string_value <file> <key>: top-level string/number field value, or
+# empty string if absent/null.
+_json_string_value() {
+  local file="$1" key="$2"
+  # `tr -d '\r'` defensively strips any stray carriage return (see
+  # _json_truthy_keys_sorted above) -- load-bearing here specifically
+  # because this function's output is written directly into
+  # PVE_TOKEN_SECRET_FILE, and a trailing '\r' left in that file would
+  # silently corrupt the credential written into agent.env later
+  # (awk's `getline` strips a trailing '\n' but not a preceding '\r').
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg k "${key}" '.[$k] // empty' "${file}" 2>/dev/null | tr -d '\r'
+    return
+  fi
+  python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+value = data.get(sys.argv[2])
+if value is not None:
+    print(value)
+' "${file}" "${key}" 2>/dev/null | tr -d '\r'
+}
+
+# _json_truthy_keys_sorted <file>: sorted, newline-separated list of every
+# top-level key whose value is truthy (1/true) in a flat JSON object --
+# used for the exact-set PVE effective-permission proof (Mandatory Fix 2).
+# Deliberately NOT a substring/blacklist check: this returns the complete
+# actual key set so callers can assert set equality against exactly what
+# is expected, catching any unexpected extra privilege regardless of its
+# name.
+_json_truthy_keys_sorted() {
+  local file="$1"
+  # `tr -d '\r'` defensively strips any stray carriage return a given
+  # jq/python3 build might emit (observed on a Windows text-mode python
+  # during development) -- harmless on a normal POSIX PVE host, where
+  # neither jq nor python3 ever emits '\r', but load-bearing for exact
+  # line-for-line set-equality comparison against this function's output
+  # wherever it runs.
+  if command -v jq >/dev/null 2>&1; then
+    jq -r 'to_entries | map(select(.value == true or .value == 1)) | .[].key' "${file}" 2>/dev/null | tr -d '\r' | LC_ALL=C sort
+    return
+  fi
+  python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+keys = sorted(k for k, v in data.items() if v in (1, True, "1"))
+for key in keys:
+    print(key)
+' "${file}" 2>/dev/null | tr -d '\r' | LC_ALL=C sort
+}
+
+# _json_list_field_equals <file> <field> <value>: true if the JSON array at
+# `file` contains at least one object whose `field` equals `value`.
+_json_list_field_equals() {
+  local file="$1" field="$2" value="$3"
+  if command -v jq >/dev/null 2>&1; then
+    jq -e --arg f "${field}" --arg v "${value}" 'any(.[]; .[$f] == $v)' "${file}" >/dev/null 2>&1
+    return
+  fi
+  python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+field, value = sys.argv[2], sys.argv[3]
+sys.exit(0 if any(row.get(field) == value for row in data) else 1)
+' "${file}" "${field}" "${value}" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
 
@@ -168,18 +271,23 @@ is_valid_https_url() {
   [[ "$1" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/?$ ]]
 }
 
-# confirm_or_abort: interactive-only confirmation. In --non-interactive
-# mode, with --yes, or with no controlling terminal, this is a no-op
-# (proceeds) -- every safety-relevant precondition is already enforced by
-# phase1_preflight independently of this prompt, so skipping it never
-# bypasses a real gate; it only skips an extra human "are you sure".
+# confirm_or_abort: skipped only by an explicit --yes/--non-interactive.
+# Deliberately does NOT special-case "stdin is not a tty" as "skip the
+# prompt and proceed" -- `read -r -p` works correctly against a piped
+# answer (e.g. `echo n | bootstrap-proxmox-0.5.sh`), and treating a
+# non-tty stdin as an automatic "yes" would silently bypass the very
+# confirmation gate this bootstrap's "no mutation before confirmation"
+# invariant depends on. If stdin is genuinely closed/unreadable (`read`
+# itself fails, e.g. redirected from /dev/null), that is fail-closed
+# (die), never fail-open.
 confirm_or_abort() {
   local prompt="$1"
-  if [[ "${BOOTSTRAP_ASSUME_YES:-0}" == "1" || "${BOOTSTRAP_NON_INTERACTIVE:-0}" == "1" || ! -t 0 ]]; then
+  if [[ "${BOOTSTRAP_ASSUME_YES:-0}" == "1" || "${BOOTSTRAP_NON_INTERACTIVE:-0}" == "1" ]]; then
     return 0
   fi
   local reply
-  read -r -p "${prompt} [y/N] " reply
+  read -r -p "${prompt} [y/N] " reply \
+    || die "no confirmation could be read from stdin (not running with --non-interactive/--yes, and stdin is closed or unreadable) -- pass --non-interactive --yes for unattended use, or ensure a real answer can be read on stdin"
   case "${reply}" in
     y|Y|yes|YES) return 0 ;;
     *) die "aborted by operator" ;;

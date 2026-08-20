@@ -1,25 +1,30 @@
 """Hermetic fake PVE command layer for testing deploy/bootstrap-proxmox-0.5.sh.
 
 Not a test file itself (no test_ functions) -- a fixture/helper module used
-by tests/test_bootstrap_proxmox_0_5.py.
+by tests/test_bootstrap_proxmox_0_5.py (local-safe, static-only) and
+tests/test_bootstrap_proxmox_0_5_smoke.py (sandbox-only, executes the real
+script -- see that file's own module docstring for why it is gated).
 
 Per AGENTS.md's test-boundary rules, tests must never invoke real `pct`,
 `pveum`, `pveam`, `pvesh`, `pvesm`, `nft`, or contact any real network/PVE
 endpoint. This module builds a temporary PATH containing fake replacements
-for exactly those command names (nothing else on PATH is touched -- real
-`bash`, `awk`, `grep`, `sed`, `git`, `tar`, `python3`, etc. remain the real
-system binaries, none of which contact PVE or a private network on their
-own). The bootstrap script under test is executed as a real subprocess
-against this PATH; nothing about the *bootstrap script's own logic* is
-mocked -- only the privileged/external commands it shells out to.
+for exactly those command names plus the CT-side commands the bootstrap
+script now also depends on (`apt-get`, `env`, `sh -c "command -v ..."`, and
+a simulated `python3 .../hubinet-ops-bootstrap-accept.py` discovery-
+acceptance check) -- nothing else on PATH is touched (real `bash`, `awk`,
+`grep`, `sed`, `git`, `tar`, `python3` itself, etc. remain the real system
+binaries; none of those contact PVE or a private network on their own, and
+`git` in particular is deliberately real -- see build_minimal_source_checkout
+-- because Mandatory Fix 4/6 (source-provenance gating) is specifically
+about real git behavior).
 
-The fake layer is a single Python dispatcher (`_dispatcher.py`) driven by a
-JSON scenario file; each fake command is a 3-line shell shim that execs the
-dispatcher with its own argv[0] basename so the dispatcher knows which
-command it is emulating. A simulated per-VMID container filesystem lives
-under a scratch directory so `pct push`/`pct exec ... cat ...` round-trip
-realistically (needed because later phases read back files earlier phases
-wrote, e.g. agent.env).
+Effective-permission verification is derived from actually-recorded ACL
+grants and role privilege sets in the fake's own state, not returned from a
+fixed canned value keyed only by scenario -- a test exercising "missing
+required privilege" or "extra mutation privilege" must actually cause the
+fake's ACL/role state to reflect that (via `role_privs_override`, below),
+so the fake command layer cannot silently diverge from the real sequence of
+`pveum acl modify`/`pveum role add` calls the script under test issued.
 """
 
 from __future__ import annotations
@@ -43,6 +48,9 @@ FAKE_STORAGE = "local-lxc"
 FAKE_TEMPLATE_STORAGE = "local"
 FAKE_TEMPLATE_FILENAME = "debian-13-standard_13.6-1_amd64.tar.zst"
 FAKE_TEMPLATE_VOLID = f"{FAKE_TEMPLATE_STORAGE}:vztmpl/{FAKE_TEMPLATE_FILENAME}"
+FAKE_NEXT_VMID = "110"
+FAKE_R0_API_TOKEN = "f" * 64
+FAKE_DISPLAY_NAME = "Home Proxmox"
 
 _DISPATCHER_SOURCE = r'''
 import json
@@ -56,6 +64,7 @@ FAKE_TEMPLATE_STORAGE = "local"
 FAKE_TEMPLATE_FILENAME = "debian-13-standard_13.6-1_amd64.tar.zst"
 FAKE_TEMPLATE_VOLID = f"{FAKE_TEMPLATE_STORAGE}:vztmpl/{FAKE_TEMPLATE_FILENAME}"
 FAKE_BRIDGE = "vmbr0"
+FAKE_NEXT_VMID = "110"
 
 LOG = Path(os.environ["HUBINET_FAKE_LOG"])
 SCENARIO = json.loads(Path(os.environ["HUBINET_FAKE_SCENARIO"]).read_text())
@@ -63,10 +72,24 @@ CT_ROOT = Path(os.environ["HUBINET_FAKE_CT_ROOT"])
 STATE_PATH = Path(os.environ["HUBINET_FAKE_STATE"])
 
 
+def _default_state():
+    return {
+        "vmids": {},
+        "pve_users": [],
+        "pve_roles": {},  # rolename -> [privs...]
+        "pve_tokens": [],
+        "acl_grants": [],  # [{"target": "user:X"|"token:Y", "role": rolename}]
+        "nextid_call_count": 0,
+    }
+
+
 def _load_state():
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
-    return {"vmids": {}, "pve_users": [], "pve_roles": [], "pve_tokens": []}
+        state = json.loads(STATE_PATH.read_text())
+        for key, value in _default_state().items():
+            state.setdefault(key, value)
+        return state
+    return _default_state()
 
 
 def _save_state(state):
@@ -88,6 +111,7 @@ _CT_PATH_ANCHORS = (
     "tmp/hubinet-ops-src",
     "tmp/nftables.conf",
     "tmp/hubinet-ops-src.tar.gz",
+    "tmp/hubinet-ops-bootstrap-accept.py",
 )
 
 
@@ -297,8 +321,98 @@ def _exec_inner(vmid, inner, state):
             return 0
         return 1
 
+    if inner[0] == "apt-get":
+        return _exec_apt_get(inner[1:])
+
+    if inner[0] == "env":
+        # `env VAR=val [VAR2=val2 ...] <command> [args...]` -- strip the
+        # leading VAR=val assignments and dispatch the wrapped command;
+        # none of these assignments are secret.
+        idx = 1
+        while idx < len(inner) and "=" in inner[idx] and not inner[idx].startswith("-"):
+            idx += 1
+        return _exec_inner(vmid, inner[idx:], state)
+
+    if inner[:2] == ["sh", "-c"]:
+        return _exec_sh_c(inner[2])
+
+    if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-accept.py"):
+        return _exec_discovery_accept(inner[2:])
+
     _log("pct", "exec", "UNHANDLED", *inner)
     return 2
+
+
+def _exec_apt_get(args):
+    if _fail("apt_get"):
+        return 1
+    return 0
+
+
+def _exec_sh_c(script):
+    # Only form this fake needs to understand: `command -v <name>`, used by
+    # bootstrap-deploy.sh's _require_ct_command after tooling provisioning.
+    prefix = "command -v "
+    if script.startswith(prefix):
+        name = script[len(prefix):].strip()
+        available = name in SCENARIO.get("ct_tools_available", ["nft", "curl", "ss"])
+        return 0 if available else 1
+    return 2
+
+
+def _exec_discovery_accept(args):
+    # Simulates deploy/lib/hubinet-ops-bootstrap-accept.py's OWN observable
+    # contract (its stdout vocabulary and exit codes) without actually
+    # running it against a real HTTP server -- there is no real
+    # /etc/hubinet-ops/agent.env or listening backend inside this
+    # simulated container filesystem. Driven by the "discovery_*" scenario
+    # keys; see default_scenario() for the default (immediate healthy
+    # PASS with zero resources, matching the real script's own field
+    # vocabulary).
+    expected_name = args[0] if len(args) > 0 else ""
+    result = SCENARIO.get("discovery_result", "healthy")
+    backend_id = SCENARIO.get("discovery_backend_instance_id", "fake-backend-instance-id")
+    source_name = SCENARIO.get("discovery_source_name", expected_name)
+    resource_count = SCENARIO.get("discovery_resource_count", 0)
+
+    if result == "backend_unreachable":
+        print("FAIL backend-endpoint-unreachable simulated")
+        return 1
+    if not backend_id:
+        print("FAIL backend-instance-id-missing-or-invalid")
+        return 1
+    print(f"INFO backend_instance_id={backend_id}")
+
+    if result == "snapshot_unreachable":
+        print("FAIL snapshot-endpoint-unreachable simulated")
+        return 1
+    if result == "source_count_mismatch":
+        print("FAIL unexpected-source-count got=[]")
+        return 1
+    if source_name != expected_name:
+        print(f"FAIL source-name-mismatch expected={expected_name!r} got={source_name!r}")
+        return 1
+    if isinstance(result, str) and result.startswith("terminal:"):
+        health = result.split(":", 1)[1]
+        print(f"FAIL source-health-terminal-failure health={health}")
+        return 1
+    if result == "timeout":
+        print("FAIL discovery-timeout last_health=not_yet_observed")
+        return 1
+    if result == "resource_state_level_violation":
+        print("FAIL resource-state-level-not-discovered got=managed")
+        return 1
+    if result == "resource_security_continuity_violation":
+        print("FAIL resource-security-continuity-trusted resource=fake-resource-id")
+        return 1
+    if result == "resource_capabilities_violation":
+        print("FAIL resource-has-effective-capabilities got=['snapshot.create']")
+        return 1
+    print(
+        f"PASS backend_instance_id={backend_id} "
+        f"source_health=healthy resource_count={resource_count}"
+    )
+    return 0
 
 
 def _exec_systemctl(vmid, args, state):
@@ -367,19 +481,16 @@ def _exec_nft(vmid, args):
 
 
 def _exec_curl(vmid, args):
+    # Only the unauthenticated liveness probe (GET /r0/v1/health) is ever
+    # curl'd by the bootstrap script now -- the authenticated snapshot/
+    # backend checks run entirely inside the simulated
+    # hubinet-ops-bootstrap-accept.py invocation above, never via curl,
+    # so no bearer token ever reaches this function's argv.
     url = args[-1]
     if "/r0/v1/health" in url:
         if _fail("backend_health"):
             return 7
         sys.stdout.write(SCENARIO.get("health_body", '{"status": "ok"}'))
-        return 0
-    if "/r0/v1/snapshot" in url:
-        if _fail("backend_snapshot"):
-            return 7
-        sys.stdout.write(SCENARIO.get(
-            "snapshot_body",
-            '{"sources": [{"display_name": "Home Proxmox"}], "resources": []}',
-        ))
         return 0
     return 7
 
@@ -392,7 +503,7 @@ def cmd_pveum(args):
         print(json.dumps([{"userid": u} for u in state["pve_users"]]))
         return 0
     if args[:2] == ["role", "list"]:
-        print(json.dumps([{"roleid": r} for r in state["pve_roles"]]))
+        print(json.dumps([{"roleid": r} for r in state["pve_roles"].keys()]))
         return 0
     if args[:2] == ["user", "add"]:
         if _fail("pveum_user_add"):
@@ -403,12 +514,47 @@ def cmd_pveum(args):
     if args[:2] == ["role", "add"]:
         if _fail("pveum_role_add"):
             return 1
-        state["pve_roles"].append(args[2])
+        rolename = args[2]
+        privs_csv = args[args.index("--privs") + 1] if "--privs" in args else ""
+        privs = [p for p in privs_csv.split(",") if p]
+        # role_privs_override simulates a real-world PVE-side discrepancy
+        # between the privileges requested and the privileges the role
+        # actually ends up with -- the mechanism this fake uses to
+        # exercise the verification logic's negative paths (missing
+        # required / extra mutation-shaped privilege) without ever
+        # weakening the bootstrap script's own fixed, correct request.
+        overrides = SCENARIO.get("role_privs_override", {})
+        if rolename in overrides:
+            privs = overrides[rolename]
+        state["pve_roles"][rolename] = privs
         _save_state(state)
         return 0
     if args[:2] == ["acl", "modify"]:
-        return 1 if _fail("pveum_acl_modify") else 0
+        if _fail("pveum_acl_modify"):
+            return 1
+        rolename = args[args.index("--roles") + 1] if "--roles" in args else None
+        if "--users" in args and rolename:
+            target = f"user:{args[args.index('--users') + 1]}"
+            state["acl_grants"].append({"target": target, "role": rolename})
+        if "--tokens" in args and rolename:
+            target = f"token:{args[args.index('--tokens') + 1]}"
+            state["acl_grants"].append({"target": target, "role": rolename})
+        _save_state(state)
+        return 0
     if args[:2] == ["acl", "delete"]:
+        rolename = args[args.index("--roles") + 1] if "--roles" in args else None
+        if "--users" in args:
+            target = f"user:{args[args.index('--users') + 1]}"
+        elif "--tokens" in args:
+            target = f"token:{args[args.index('--tokens') + 1]}"
+        else:
+            target = None
+        if target:
+            state["acl_grants"] = [
+                g for g in state["acl_grants"]
+                if not (g["target"] == target and g["role"] == rolename)
+            ]
+            _save_state(state)
         return 0
     if args[:3] == ["user", "token", "add"]:
         if _fail("pveum_token_add"):
@@ -423,17 +569,26 @@ def cmd_pveum(args):
         }))
         return 0
     if args[:3] == ["user", "token", "permissions"]:
-        perms = SCENARIO.get("token_permissions", {"Sys.Audit": 1, "VM.Audit": 1})
-        print(json.dumps(perms))
+        # args shape: user token permissions <user> <tokenid> --path / ...
+        full_token_id = f"{args[3]}!{args[4]}"
+        privs = set()
+        for grant in state["acl_grants"]:
+            if grant["target"] == f"token:{full_token_id}":
+                privs.update(state["pve_roles"].get(grant["role"], []))
+        print(json.dumps({p: 1 for p in sorted(privs)}))
         return 0
     if args[:3] == ["user", "token", "remove"]:
         return 0
     if args[:2] == ["role", "delete"]:
+        rolename = args[2]
+        state["pve_roles"].pop(rolename, None)
+        _save_state(state)
         return 0
     if args[:2] == ["user", "delete"]:
-        return 0
-    if args[:2] == ["user", "permissions"]:
-        print(json.dumps(SCENARIO.get("token_permissions", {"Sys.Audit": 1, "VM.Audit": 1})))
+        user = args[2]
+        if user in state["pve_users"]:
+            state["pve_users"].remove(user)
+            _save_state(state)
         return 0
     _log("pveum", "UNHANDLED", *args)
     return 2
@@ -442,6 +597,8 @@ def cmd_pveum(args):
 def cmd_pveam(args):
     _log("pveam", *args)
     if args[:1] == ["update"]:
+        if _fail("pveam_update"):
+            return 1
         return 0
     if args[:1] == ["list"]:
         for entry in SCENARIO.get("local_templates", [FAKE_TEMPLATE_VOLID]):
@@ -458,6 +615,29 @@ def cmd_pveam(args):
 
 def cmd_pvesh(args):
     _log("pvesh", *args)
+    state = _load_state()
+    # Windows Git-Bash only: MSYS can mangle a POSIX-looking absolute-path
+    # argument like "/cluster/nextid" into a real Windows path (e.g.
+    # "C:/Program Files/Git/cluster/nextid") before this dispatcher (a
+    # native python.exe) ever sees it -- matching by suffix instead of
+    # exact equality survives that no-op-on-Linux mangling. See
+    # _normalize_ct_arg above for the same class of issue elsewhere in
+    # this file.
+    if (
+        args[:1] == ["get"]
+        and len(args) > 1
+        and args[1].replace("\\", "/").endswith("/cluster/nextid")
+    ):
+        candidates = SCENARIO.get("next_free_vmid", FAKE_NEXT_VMID)
+        if isinstance(candidates, list):
+            idx = state.get("nextid_call_count", 0)
+            value = candidates[min(idx, len(candidates) - 1)]
+            state["nextid_call_count"] = idx + 1
+            _save_state(state)
+        else:
+            value = candidates
+        print(json.dumps(value))
+        return 0
     if args[:1] == ["get"] and "/network" in args[1]:
         bridges = SCENARIO.get("bridges", [FAKE_BRIDGE])
         print(json.dumps([{"iface": b, "type": "bridge"} for b in bridges]))
@@ -530,24 +710,32 @@ class FakePveEnvironment:
     def ct_file_text(self, vmid: str, ct_path: str) -> str:
         return self.ct_file(vmid, ct_path).read_text(encoding="utf-8")
 
+    def state(self) -> dict[str, Any]:
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
 
 def default_scenario() -> dict[str, Any]:
     return {
         "fail": [],
         "ct_ip": FAKE_CT_IP,
+        "next_free_vmid": FAKE_NEXT_VMID,
         "local_templates": [FAKE_TEMPLATE_VOLID],
         "available_templates": [f"system {FAKE_TEMPLATE_FILENAME}"],
         "bridges": [FAKE_BRIDGE],
         "storages": {"rootdir": [FAKE_STORAGE], "vztmpl": [FAKE_TEMPLATE_STORAGE]},
         "storage_available_bytes": 100 * 1024 * 1024 * 1024,
-        "token_permissions": {"Sys.Audit": 1, "VM.Audit": 1},
+        "role_privs_override": {},
         "pve_token_secret": FAKE_PVE_TOKEN_SECRET,
-        "r0_api_token": "f" * 64,
+        "r0_api_token": FAKE_R0_API_TOKEN,
         "systemd_status": "running",
         "failed_units": [],
         "legacy_present": {},
         "health_body": '{"status": "ok"}',
-        "snapshot_body": '{"sources": [{"display_name": "Home Proxmox"}], "resources": []}',
+        "ct_tools_available": ["nft", "curl", "ss"],
+        "discovery_result": "healthy",
+        "discovery_backend_instance_id": "fake-backend-instance-id",
+        "discovery_source_name": FAKE_DISPLAY_NAME,
+        "discovery_resource_count": 0,
     }
 
 
@@ -564,8 +752,12 @@ def build_minimal_source_checkout(tmp_path: Path, repo_root: Path) -> Path:
     (deploy/install-0.5.0-fresh.sh itself is intentionally NOT copied
     here for most tests -- the fake `pct exec ... bash .../install-0.5.0-
     fresh.sh` step is scenario-driven and never executes real content),
-    then `git init`s and commits it so `git archive HEAD` behaves exactly
-    like it would against a real release checkout.
+    then `git init`s and commits it so `git archive <sha>` behaves exactly
+    like it would against a real release checkout. `git` itself is the
+    real system binary (see this module's docstring) -- Mandatory Fix 4/6
+    is specifically about real git provenance behavior (clean worktree,
+    exact full SHA, `git archive <sha>` not `HEAD`), so faking it would
+    defeat the point of testing it.
     """
     src = tmp_path / "source-checkout"
     (src / "app").mkdir(parents=True)
@@ -595,6 +787,18 @@ def build_minimal_source_checkout(tmp_path: Path, repo_root: Path) -> Path:
     return src
 
 
+def git_head_sha(source_dir: Path) -> str:
+    import subprocess as _subprocess
+
+    result = _subprocess.run(
+        ["git", "-C", str(source_dir), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
 def build_fake_pve_environment(tmp_path: Path, scenario: dict[str, Any] | None = None) -> FakePveEnvironment:
     scenario = scenario if scenario is not None else default_scenario()
 
@@ -608,7 +812,10 @@ def build_fake_pve_environment(tmp_path: Path, scenario: dict[str, Any] | None =
     dispatcher_path = tmp_path / "_dispatcher.py"
 
     scenario_path.write_text(json.dumps(scenario))
-    state_path.write_text(json.dumps({"vmids": {}, "pve_users": [], "pve_roles": [], "pve_tokens": []}))
+    state_path.write_text(json.dumps({
+        "vmids": {}, "pve_users": [], "pve_roles": {}, "pve_tokens": [],
+        "acl_grants": [], "nextid_call_count": 0,
+    }))
     dispatcher_path.write_text(_DISPATCHER_SOURCE, encoding="utf-8")
 
     python_exe = sys.executable
@@ -626,12 +833,30 @@ def build_fake_pve_environment(tmp_path: Path, scenario: dict[str, Any] | None =
         shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
     env = dict(os.environ)
-    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    # AGENTS.md: "use an isolated PATH without inheriting the host PATH,
+    # ... and add only an explicit allowlist of unprivileged local tools."
+    # On the real (Linux, Docker-based) sandbox this smoke suite is
+    # restricted to, `bin_dir` plus the standard system directories is a
+    # genuine explicit allowlist -- it excludes anything a CI runner's own
+    # ambient PATH might otherwise contribute. sys.executable's own
+    # directory is included so the dispatcher shims (which exec
+    # sys.executable by absolute path already, independent of PATH) still
+    # have a working `python3` if any fake ever needs to invoke it by
+    # bare name. Windows developer machines (where this module is also
+    # exercised locally, never as the compliance-relevant run) keep
+    # inheriting the full host PATH instead, since MSYS/Git-for-Windows
+    # tool locations vary and this platform is never the real sandbox
+    # AGENTS.md's rule targets (Linux + Docker only).
+    if sys.platform.startswith("linux"):
+        allowlisted_dirs = [str(bin_dir), "/usr/local/bin", "/usr/bin", "/bin", str(Path(python_exe).parent)]
+        env["PATH"] = os.pathsep.join(dict.fromkeys(allowlisted_dirs))
+    else:
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
     env["HUBINET_FAKE_LOG"] = str(log_path)
     env["HUBINET_FAKE_SCENARIO"] = str(scenario_path)
     env["HUBINET_FAKE_CT_ROOT"] = str(ct_root)
     env["HUBINET_FAKE_STATE"] = str(state_path)
-    env["BOOTSTRAP_TEST_MODE"] = "1"
+    env["HUBINET_OPS_TEST_MODE"] = "1"
     # Windows Git-Bash-only: MSYS auto-converts POSIX-looking absolute-path
     # arguments (e.g. "/etc/hubinet-ops/...") into Windows paths when
     # exec'ing a native (non-MSYS) executable such as python.exe. That
@@ -647,6 +872,7 @@ def build_fake_pve_environment(tmp_path: Path, scenario: dict[str, Any] | None =
     # code path without slowing the suite down.
     env.setdefault("BOOTSTRAP_NET_TIMEOUT_SECONDS", "2")
     env.setdefault("BOOTSTRAP_SERVICE_TIMEOUT_SECONDS", "2")
+    env.setdefault("BOOTSTRAP_DISCOVERY_TIMEOUT_SECONDS", "2")
 
     return FakePveEnvironment(
         bin_dir=bin_dir,

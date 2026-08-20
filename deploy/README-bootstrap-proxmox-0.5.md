@@ -1,15 +1,14 @@
 # Hubinet Ops 0.5 R0 — automated Proxmox bootstrap
 
-`deploy/bootstrap-proxmox-0.5.sh` is the primary, product-facing way to
-activate Hubinet Ops 0.5 R0 on a Proxmox VE host. It automates the manual
-procedure documented in
+`deploy/bootstrap-proxmox-0.5.sh` automates the manual procedure documented
+in
 [`docs/operations/0.5-r0-operational-activation.md`](../docs/operations/0.5-r0-operational-activation.md)
 sections 1-4 (and the start/first-half of section 5): a fresh unprivileged
 Debian 13 LXC, the R0 read-only runtime deployed into it via
 `deploy/install-0.5.0-fresh.sh` (unmodified), a least-privilege PVE
 identity, PVE TLS trust material, and the mandatory nftables firewall
 boundary — in that order, ending with the service started and CT boot
-enabled only after every gate passes.
+enabled only after a genuine, contract-verified discovery success.
 
 This script adds **no runtime mutation capability**. R0 remains read-only
 end to end; the `pct`/`pveum` commands this script runs are one-shot,
@@ -17,12 +16,22 @@ human-invoked, PVE-host provisioning steps — structurally separate from
 Hubinet Ops's own GET-only production PVE transport
 (`app/inventory_pve_transport.py`).
 
+> **Status**: implemented and unit/smoke-tested against a hermetic fake
+> command layer only. It has **not** been run against a real Proxmox host.
+> Before a first real run, review the "What this script proves, and what
+> it does not" section below and the REAL-HOST PRECHECK commands in this
+> branch's corrective-pass report.
+
 ## Prerequisites
 
 - A Proxmox VE host you can run commands on as root (the script must run
   **on** the PVE host itself — it is not SSH-orchestrated).
 - The standard PVE toolchain already present on any PVE host: `pct`,
   `pveum`, `pveam`, `pvesh`, `pvesm`, `nft`.
+- `git` on the PVE host, plus either `jq` or `python3` (used for the
+  security-relevant effective-permission verification — the script fails
+  closed at preflight if neither is present rather than falling back to a
+  regex-based JSON parser for that check).
 - A storage backend supporting container rootdirs (`pvesm status
   --content rootdir`), and one supporting `vztmpl` if you want the script
   to auto-download the Debian 13 template.
@@ -30,26 +39,29 @@ Hubinet Ops's own GET-only production PVE transport
 - The Home Assistant host/subnet's IPv4 CIDR that must be allowed to
   reach the R0 API (e.g. `203.0.113.50/32`) — there is no safe default
   for this; you must provide it.
-- A checked-out copy of this repository on the PVE host (the script reads
-  its own `--source-dir`, default: its own repository root, to deploy).
+- A **clean git checkout** of this repository on the PVE host (no
+  uncommitted changes) — the script deploys from a real git commit, never
+  a non-git tarball; see "Source provenance" below.
 
 ## Usage
 
-Interactive (asks only for the Home Assistant source CIDR, and static
-network details if you choose static networking; every other value has a
-sensible auto-detected or documented default):
+Interactive (asks for the Home Assistant source CIDR, static network
+details if you choose static networking, and confirmation of the detected
+source commit; every other value has a sensible auto-detected or
+documented default, including the container's VMID):
 
 ```bash
 sudo bash deploy/bootstrap-proxmox-0.5.sh
 ```
 
 Non-interactive, fully deterministic (for scripted/repeatable activation
-or CI-adjacent automation against a real lab host):
+or CI-adjacent automation against a real lab host) — note `--expected-sha`
+is **required** in this mode:
 
 ```bash
 sudo bash deploy/bootstrap-proxmox-0.5.sh \
   --non-interactive --yes \
-  --vmid 110 \
+  --expected-sha "$(git rev-parse HEAD)" \
   --hostname hubinet-ops \
   --bridge vmbr0 \
   --network dhcp \
@@ -57,11 +69,24 @@ sudo bash deploy/bootstrap-proxmox-0.5.sh \
   --pve-endpoint https://203.0.113.10:8006
 ```
 
+An explicit `--vmid` is honored and never silently overridden; omit it to
+let the script auto-detect the next free VMID via the real Proxmox
+`/cluster/nextid` API instead:
+
+```bash
+sudo bash deploy/bootstrap-proxmox-0.5.sh \
+  --non-interactive --yes \
+  --expected-sha "$(git rev-parse HEAD)" \
+  --vmid 150 \
+  --ha-source 203.0.113.50/32
+```
+
 Static networking instead of DHCP:
 
 ```bash
 sudo bash deploy/bootstrap-proxmox-0.5.sh \
   --non-interactive --yes \
+  --expected-sha "$(git rev-parse HEAD)" \
   --ha-source 203.0.113.50/32 \
   --network static --ip 203.0.113.20/24 --gateway 203.0.113.1
 ```
@@ -73,25 +98,35 @@ reference (all flags, all defaults).
 
 On the Proxmox host:
 
-- One new LXC container at the configured VMID (default `110`):
-  unprivileged, `onboot=0` until the very last step, firewall enabled on
-  `net0`, default resources 1 core / 1024 MiB memory / 512 MiB swap / 8
-  GiB rootfs (all overridable), Debian 13 standard template (auto-
+- One new LXC container. **VMID**: auto-detected via `pvesh get
+  /cluster/nextid` and shown in the pre-confirmation plan by default; an
+  explicit `--vmid` is validated and never silently overridden, including
+  on a same-host creation-time race (an auto-detected candidate may be
+  safely recomputed on collision; an explicit `--vmid` collision is
+  always a hard stop). Unprivileged, `onboot=0` until the very last step,
+  firewall enabled on `net0`, default resources 1 core / 1024 MiB memory
+  / 512 MiB swap / 8 GiB rootfs (all overridable), the newest Debian 13
+  standard template found across **all** configured storages (auto-
   selected/downloaded), with `nesting=1` enabled specifically because
   Debian 13's systemd (>=257) requires it inside an unprivileged LXC to
   reach a healthy `systemctl is-system-running` (see the script's phase 4
   comments for the exact failing units this fixes:
   `dev-mqueue.mount`/`run-lock.mount`/`tmp.mount`).
 - One dedicated read-only PVE identity: user `hubinetops@pve`, role
-  `HubinetOpsR0Auditor` (privileges exactly `Sys.Audit`,`VM.Audit`, never
-  a mutation privilege), a privilege-separated API token
+  `HubinetOpsR0Auditor`, a privilege-separated API token
   `hubinetops@pve!r0-readonly`, with the role granted to **both** the
   user and the token at path `/` with propagation — see
   `docs/operations/0.5-r0-operational-activation.md` section 2 for the
   exact reasoning (this is the minimal set R0's own discovery contract
-  requires, not a guess). The script verifies the token's effective
-  permissions after creation and fails if any required privilege is
-  missing or any mutation-shaped privilege is present.
+  requires, not a guess). The script reads back the token's actual
+  effective permissions afterward and asserts the sorted set of truthy
+  privilege keys is **exactly** `{Sys.Audit, VM.Audit}` — an exact-set
+  equality proof, not a check against a fixed list of privileges to
+  avoid, so any unexpected privilege of any name fails the run closed.
+- Inside the CT: `nftables`, `curl`, and `iproute2` are explicitly
+  installed and their presence verified (never assumed present on the
+  base template) before the firewall and acceptance phases depend on
+  them.
 - Inside the CT: the R0 runtime (via the unmodified
   `deploy/install-0.5.0-fresh.sh`), a generated
   `/etc/hubinet-ops/inventory.yaml` (source-centric only — no VMID/
@@ -101,62 +136,135 @@ On the Proxmox host:
 - Inside the CT: an `nftables` ruleset (`/etc/nftables.conf`) restricting
   inbound TCP 8787 to exactly the configured HA source CIDR, and
   outbound traffic from the `hubinetops` service user to exactly the
-  configured PVE endpoint on TCP 8006 (plus, only if the endpoint is
-  configured as a hostname rather than a literal IP, a narrowly-scoped
-  DNS-resolver allow rule) — the same model documented in
-  `deploy/README-0.5-firewall.md`.
+  configured PVE endpoint on the port that endpoint is actually
+  configured with (never an independently hardcoded `8006` — derived from
+  `--pve-endpoint`; defaults to `8006` only when the endpoint itself
+  omits a port), plus, only if the endpoint is configured as a hostname
+  rather than a literal IP, a narrowly-scoped DNS-resolver allow rule —
+  the same model documented in `deploy/README-0.5-firewall.md`. Post-
+  activation verification checks the exact rule content **and order**
+  within each chain, not a loose substring match.
+
+## Source provenance
+
+This bootstrap deploys **only** from a real git checkout with a **clean**
+working tree, at an exact commit you have explicitly confirmed:
+
+- The script computes the full 40-character HEAD SHA of `--source-dir`.
+- **Interactive mode**: the detected SHA is printed and you must confirm
+  it explicitly before anything is created.
+- **Non-interactive mode**: you must pass `--expected-sha <full-sha>`; the
+  script fails closed if it does not match HEAD exactly.
+- A dirty working tree (any uncommitted change) is always a hard stop.
+- The transfer itself uses `git archive <the-confirmed-sha>` (never a
+  moving `HEAD` reference, and never a non-git tarball fallback — an
+  earlier implementation had one; it has been removed entirely, so a
+  non-git `--source-dir` is now also a hard stop). `git archive` transfers
+  tracked files only, so `.git`, gitignored venvs/caches/logs/runtime DBs,
+  and any local untracked developer files (including secrets you may have
+  sitting in your working tree) are never included.
+- The deployed commit SHA is always logged in full (`Deploying source
+  commit: <sha>`) — never a secret, always worth knowing exactly what was
+  deployed.
+
+A signed-release / `curl | bash` distribution trust chain is **explicitly
+out of scope** for this wave — see "What remains manual" below. Run this
+script from a real, trusted git checkout of this repository.
 
 ## What it never creates or does
 
 - No static VMID/resource/CT/QEMU inventory anywhere.
-- No mutation-shaped PVE privilege on the created user, role, or token.
+- No mutation-shaped PVE privilege on the created user, role, or token —
+  proven by an exact-set check, not merely a blacklist.
 - No `verify=false`/`--insecure` TLS bypass — the script fails closed if
-  it cannot determine valid CA trust material instead.
+  it cannot determine valid CA trust material and the operator has not
+  explicitly opted into system trust with `--tls-trust system`.
+- No implicit fallback to the CT's system TLS trust store — that path
+  requires an explicit `--tls-trust system` flag; omitting both
+  `--pve-ca-path` and `--tls-trust` fails closed when no CA is found.
+- No non-git source payload of any kind.
 - No 0.4 migration, import, or coexistence of any kind.
 - No SSH, MQTT, hostd, or forced-command wrapper of any kind.
 - No arbitrary command execution — every `pct`/`pveum` invocation uses a
   fixed, quoted argument list; nothing here accepts free-form command
   text, and `eval` is never used.
+- No host mutation of any kind (including `pveam update`/`download`)
+  before you have seen and confirmed the full plan (VMID, template,
+  source commit).
 
 ## Security model
 
-- **Least privilege by construction**, not by convention: the PVE role
-  created is exactly `Sys.Audit,VM.Audit`, matching
+- **Least privilege by construction, verified as an exact set**: the PVE
+  role created is exactly `Sys.Audit,VM.Audit`, matching
   `app.inventory.provider.ENDPOINT_ACL_MATRIX`'s actual requirement (see
-  the operational-activation runbook section 2.1) — not a broader
-  built-in role.
-- **Verified, not assumed**: after granting the role, the script reads
-  back the token's own effective permissions and fails closed if a
-  required privilege is missing or a forbidden (mutation-shaped)
-  privilege is present. It never performs a real mutating PVE API call
-  merely to prove it would fail.
-- **Secrets are never persisted outside their approved location**: the
-  PVE token secret exists only in restrictive (`0600`), guaranteed-
+  the operational-activation runbook section 2.1). Verification asserts
+  the token's actual effective privilege set equals that pair exactly —
+  any missing required privilege OR any unexpected extra one (of any
+  name) fails the run closed.
+- **Secrets never appear as a literal command-line argument.** The PVE
+  API token and the R0 API bearer token are never passed to
+  jq/python3/awk/curl (or any other process) as a `-v`/`--arg`/positional
+  argument or an exported environment variable — every helper that needs
+  the secret's content takes a **file path** and reads it internally
+  (e.g. the `awk` step that writes `agent.env` reads the PVE token via
+  `getline` from a restrictive temp file inside its own script, never via
+  `-v`; the discovery-acceptance check reads the R0 bearer token directly
+  from `/etc/hubinet-ops/agent.env` inside the CT, never via a `curl -H`
+  argument). Secrets exist only in restrictive (`0600`), guaranteed-
   cleaned-up temp files on the PVE host during the run, and in
-  `/etc/hubinet-ops/agent.env` (`0640 root:hubinetops`) inside the CT —
-  never in `inventory.yaml`, never printed to the console, never present
-  in the fake/real command-invocation log.
-- **TLS verification is never disabled.** The script only ever deploys CA
-  trust material (the PVE cluster's own root CA when found, or an
-  explicit `--pve-ca-path`) or relies on the CT's system trust store; it
-  has no code path that writes `verify: false`.
-- **The firewall boundary is applied and verified before the service is
-  ever started**, and CT boot (`onboot=1`) is enabled only after every
-  acceptance check in phase 12 passes — never earlier.
+  `/etc/hubinet-ops/agent.env` (`0640 root:hubinetops`) inside the CT.
+- **TLS verification is never disabled**, and relying on the CT's system
+  trust store instead of an explicit CA bundle requires an explicit
+  `--tls-trust system` opt-in — never an implicit default.
+- **The firewall boundary is applied and verified (exact content and
+  order) before the service is ever started**, and CT boot (`onboot=1`)
+  is enabled only after a real, contract-grounded discovery success (see
+  below) — never merely because the service process is listening.
+
+## Discovery acceptance — what "Discovery: PASS" actually proves
+
+The final gate before CT `onboot=1` is enabled runs
+`deploy/lib/hubinet-ops-bootstrap-accept.py` **inside** the new container
+(python3, already guaranteed present by `install-0.5.0-fresh.sh`). It:
+
+1. Calls the authenticated `GET /r0/v1/backend` endpoint and validates a
+   real, non-empty `backend_instance_id`.
+2. Polls the authenticated `GET /r0/v1/snapshot` endpoint (bounded by
+   `--discovery-timeout`, default 180 seconds), parsing the response as
+   real JSON against the exact field and enum names defined by
+   `app/inventory/publication.py` and
+   `custom_components/hubinet_ops/contract/enums.py` in this repository —
+   never a substring match against raw HTTP output.
+3. Requires the configured source to report `SourceHealth.HEALTHY` with a
+   matching display name. `SourceHealth.SOURCE_UNAVAILABLE` and
+   `SourceHealth.CONFIGURATION_ERROR` are terminal failures (never
+   retried); `NOT_YET_OBSERVED` and `DEGRADED` are treated as legitimate
+   transient states worth polling through, up to the timeout.
+4. For every resource the backend reports (zero is a legitimate result on
+   a fresh install), validates `state_level == "discovered"`,
+   `security_continuity != "trusted"`, and that `effective_capabilities`
+   is empty.
+
+An unauthenticated `GET /r0/v1/health` response alone (checked earlier,
+as a fast liveness probe) is **not** sufficient for a pass. A source stuck
+in `not_yet_observed`, a terminal failure health state, an authentication
+failure, or a TLS failure never yields `Discovery: PASS`, and CT `onboot`
+is never enabled unless this check actually returns success.
 
 ## Failure and rollback behavior
 
 - **Before the service ever goes live** (any failure through the end of
   phase 10), nothing is exposed: the service is never started, and CT
   `onboot` is never enabled until phase 13, the very last step.
-- **PVE identity objects this run created** (the user, role, and token,
-  and their ACL grants) **are always rolled back automatically** on any
-  failure — they are cheap to recreate and would otherwise block a
-  retry, since this bootstrap refuses to reuse an existing identity of
-  unknown provenance (see "Retrying" below).
+- **PVE identity objects this run may have touched are always rolled back
+  automatically** on any failure, gated on an "attempted" marker recorded
+  *before* the first mutating call in that phase (not a success-only
+  marker recorded after) — so a `pveum` command that mutates state but
+  still reports a nonzero exit for an unrelated reason is still cleaned
+  up. Every rollback action is idempotent.
 - **The container itself is preserved by default** on failure, for
-  forensic diagnosis (its Hubinet Ops service, if it was ever started, is
-  stopped and disabled first; its `onboot` is forced back to `0`). Pass
+  forensic diagnosis (its Hubinet Ops service, if it was ever touched, is
+  stopped and disabled; its `onboot` is forced back to `0`). Pass
   `--cleanup-on-failure` to have the script destroy it automatically
   instead.
 - The script **never destroys, overwrites, adopts, or repurposes a VMID
@@ -170,16 +278,15 @@ This is a fresh-install bootstrap, not an idempotent/adopt-existing tool:
 
 - A VMID that already exists → the script refuses to start (§ preflight).
   Remove it yourself (after confirming it's the failed run's own
-  container, e.g. via the preserved-container path above) and re-run.
+  container, e.g. via the preserved-container path above) and re-run, or
+  simply omit `--vmid` to let the script pick a different free one.
 - A conflicting `hubinetops@pve` user, `HubinetOpsR0Auditor` role, or
   `r0-readonly` token that still exists (e.g. left over from an
-  interrupted run, or a `--cleanup-on-failure`-less earlier attempt where
-  the PVE-identity rollback nonetheless failed loudly and was reported)
-  → the script refuses to reuse it. Either remove it manually after
-  confirming it is safe to do so (`pveum user delete hubinetops@pve`,
-  `pveum role delete HubinetOpsR0Auditor`), or — since PVE-identity
-  rollback happens automatically on every failure — simply re-run the
-  script; a normal failure never leaves these behind.
+  interrupted run) → the script refuses to reuse it. Either remove it
+  manually after confirming it is safe to do so (`pveum user delete
+  hubinetops@pve`, `pveum role delete HubinetOpsR0Auditor`), or — since
+  PVE-identity rollback happens automatically on every failure — simply
+  re-run the script; a normal failure never leaves these behind.
 
 ## Manually inspecting the generated PVE permissions
 
@@ -194,13 +301,34 @@ The last command's output must show exactly `Sys.Audit` and `VM.Audit`
 `docs/operations/0.5-r0-operational-activation.md` section 2.5 for the
 full manual verification procedure this script automates.
 
+## What this script proves, and what it does not
+
+- It proves the created PVE credential's **effective permission set** is
+  exactly `Sys.Audit,VM.Audit` at the moment of verification, the
+  **firewall ruleset actually active** matches the intended exact
+  content/order, and the backend reports a **genuinely healthy, matching
+  discovery result** at acceptance time.
+- It does **not** prove long-term operational health — see
+  `docs/operations/0.5-r0-operational-activation.md` section 7 for the
+  required multi-day observation window before declaring R0 operationally
+  accepted.
+- It has **not** been exercised against a real Proxmox host. All
+  verification to date is against the hermetic fake-command test harness
+  in `tests/_bootstrap_fake_pve.py` (`tests/test_bootstrap_proxmox_0_5.py`,
+  local-safe) and `tests/test_bootstrap_proxmox_0_5_smoke.py` (the only
+  file that executes the real script, and only inside
+  `tests/shell/run_bootstrap_smoke_sandbox.sh`'s ephemeral-CI-only Docker
+  sandbox). Real PVE-specific behavior this cannot exercise (exact `nft
+  list ruleset` textual formatting, real `pveam`/`pvesh` output shapes,
+  etc.) is a known residual risk before a first real run.
+
 ## After a successful run
 
-The script prints a summary (VMID, CT address, PVE endpoint, credential
-identity, permission profile, and PASS/FAIL for firewall/backend/
-discovery) — never a secret. The R0 API bearer token Home Assistant needs
-is in `/etc/hubinet-ops/agent.env` inside the new CT, not printed to the
-console.
+The script prints a summary (VMID, CT address, PVE endpoint, source
+commit, credential identity, permission profile, and PASS/FAIL for
+firewall/discovery) — never a secret. The R0 API bearer token Home
+Assistant needs is in `/etc/hubinet-ops/agent.env` inside the new CT, not
+printed to the console.
 
 Next step: add the native Hubinet Ops integration in Home Assistant,
 using the printed CT address on port 8787 and that bearer token — see
@@ -220,6 +348,6 @@ Assistant instance still has the legacy 0.4 package/dashboard installed).
 - Multi-source bootstrap (this script, like the R0 config format itself,
   supports exactly one PVE source per run — see
   `docs/architecture/0.5-r0-read-only-runtime-activation.md` section 5).
-- A `curl | bash` one-line distribution path — deferred as future
-  packaging work; run this script from a real checkout of this
-  repository for now.
+- A signed-release / `curl | bash` one-line distribution path — deferred
+  as future packaging work; run this script from a real, trusted git
+  checkout of this repository for now.

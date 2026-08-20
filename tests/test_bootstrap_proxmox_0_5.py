@@ -1,20 +1,30 @@
-"""Hermetic tests for deploy/bootstrap-proxmox-0.5.sh (the one-shot Proxmox
-bootstrap for the Hubinet Ops 0.5 R0 read-only runtime).
+"""Local-safe tests for deploy/bootstrap-proxmox-0.5.sh.
 
-Per AGENTS.md's test-boundary rules, no test here ever invokes a real
-`pct`, `pveum`, `pveam`, `pvesh`, `pvesm`, `nft`, `systemctl`, or contacts
-a real network/PVE/HA endpoint. tests/_bootstrap_fake_pve.py builds a
-temporary PATH containing fake replacements for exactly those command
-names; the bootstrap script itself is executed as a real `bash` subprocess
-against that PATH, so this file tests the script's actual logic/ordering/
-argument construction, not a reimplementation of it.
+Per AGENTS.md's deployment-script sandbox boundary, NO test in this file
+ever executes deploy/bootstrap-proxmox-0.5.sh (or sources any deploy/lib/
+bootstrap-*.sh phase module) as a real subprocess -- not even against the
+hermetic fake-command PATH in tests/_bootstrap_fake_pve.py. That category
+of test (the actual functional matrix: preflight, container creation, PVE
+identity, TLS, config generation, firewall, rollback, acceptance) lives in
+tests/test_bootstrap_proxmox_0_5_smoke.py instead, which only ever runs
+inside the Docker-based ephemeral-CI sandbox (see
+tests/shell/run_bootstrap_smoke_sandbox.sh) and is a hard pytest skip
+everywhere else -- see test_smoke_suite_is_sandbox_gated below, which
+proves that structurally rather than by convention.
+
+Everything in this file is either: a pure syntax check (`bash -n`, never
+executes script content), a lexical/static text scan of the script source,
+or a check that the sandbox infrastructure itself is present and
+consistent. tests/_bootstrap_fake_pve.py (the fake command layer used by
+the sandboxed smoke suite) is imported here only for its constants/scenario
+builders where useful for static assertions -- never to actually run the
+target script.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-import shutil
+import re
 import subprocess
 import sys
 
@@ -22,738 +32,217 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bootstrap_fake_pve import (  # noqa: E402
+    FAKE_DISPLAY_NAME,
     FAKE_HA_SOURCE_CIDR,
     FAKE_PVE_ENDPOINT,
-    FAKE_PVE_ENDPOINT_HOST,
-    build_fake_pve_environment,
-    build_minimal_source_checkout,
-    default_scenario,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOTSTRAP_SCRIPT = REPO_ROOT / "deploy" / "bootstrap-proxmox-0.5.sh"
+LIB_DIR = REPO_ROOT / "deploy" / "lib"
+ALL_SCRIPTS = [BOOTSTRAP_SCRIPT, *sorted(LIB_DIR.glob("*.sh"))]
+ACCEPT_SCRIPT_PY = LIB_DIR / "hubinet-ops-bootstrap-accept.py"
+SMOKE_TEST_FILE = REPO_ROOT / "tests" / "test_bootstrap_proxmox_0_5_smoke.py"
+VALIDATOR = REPO_ROOT / "scripts" / "validate_hermetic_shell_boundary.py"
+SANDBOX_DOCKERFILE = REPO_ROOT / "tests" / "shell" / "Dockerfile.bootstrap-smoke"
+SANDBOX_RUNNER = REPO_ROOT / "tests" / "shell" / "run_bootstrap_smoke_sandbox.sh"
+SANDBOX_ENTRYPOINT = REPO_ROOT / "tests" / "shell" / "bootstrap_smoke_sandbox_entrypoint.sh"
 
 pytestmark = pytest.mark.skipif(
-    shutil.which("bash") is None, reason="bash is not available in this environment"
+    __import__("shutil").which("bash") is None, reason="bash is not available in this environment"
 )
 
 
-def _run(env, args, *, source_dir=None, timeout=30, input_text=None):
-    argv = ["bash", str(BOOTSTRAP_SCRIPT), *args]
-    if source_dir is not None:
-        argv += ["--source-dir", str(source_dir)]
-    return subprocess.run(
-        argv,
-        cwd=str(REPO_ROOT),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        input=input_text,
+def _code_only(script: Path) -> str:
+    """Script text with comment-only lines stripped, so a lexical check
+    for a forbidden pattern doesn't false-positive on this repository's
+    own explanatory prose (e.g. a comment describing an anti-pattern that
+    was fixed, or naming the exact regression witness a test guards
+    against). Not a real shell parser -- good enough for these
+    line-oriented checks since every comment in these scripts starts a
+    line with '#' (no inline trailing '# comment' after real code in
+    these files' style).
+    """
+    return "\n".join(
+        line for line in script.read_text(encoding="utf-8").splitlines()
+        if not line.strip().startswith("#")
     )
 
 
-def _base_args(**overrides):
-    args = {
-        "--non-interactive": None,
-        "--yes": None,
-        "--ha-source": FAKE_HA_SOURCE_CIDR,
-        "--pve-endpoint": FAKE_PVE_ENDPOINT,
-        "--storage": "local-lxc",
-        "--bridge": "vmbr0",
-    }
-    args.update(overrides)
-    flat: list[str] = []
-    for key, value in args.items():
-        if value is None:
-            flat.append(key)
-        elif value is False:
+# ---------------------------------------------------------------------------
+# Sandbox boundary self-guards -- prove the P1 finding is structurally
+# closed, not merely fixed by convention.
+# ---------------------------------------------------------------------------
+
+
+def test_this_file_never_spawns_the_real_bootstrap_script():
+    """An AST-based self-guard (robust to formatting, unlike a plain
+    substring scan): every subprocess.run/Popen call in this file whose
+    argv references a bootstrap script variable (BOOTSTRAP_SCRIPT, ALL_SCRIPTS,
+    the parametrized `script` fixture value, ACCEPT_SCRIPT_PY) must also
+    pass a syntax-only flag ("-n" for bash, "py_compile" for python) --
+    proving structurally that this file never executes real script content,
+    which would silently reintroduce the P1 violation this split exists to
+    close.
+    """
+    import ast
+
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"), filename=str(__file__))
+    script_referencing_names = {"BOOTSTRAP_SCRIPT", "ALL_SCRIPTS", "script", "ACCEPT_SCRIPT_PY"}
+
+    def _dump_contains_any(node, names):
+        return any(name in ast.dump(node) for name in names)
+
+    checked_any = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
             continue
-        else:
-            flat += [key, str(value)]
-    return flat
+        func = node.func
+        is_subprocess_call = (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("run", "Popen")
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "subprocess"
+        )
+        if not is_subprocess_call or not node.args:
+            continue
+        argv_node = node.args[0]
+        if not _dump_contains_any(argv_node, script_referencing_names):
+            continue
+        checked_any = True
+        dumped = ast.dump(argv_node)
+        # Safe forms: `bash -n <script>` (syntax-only), `python -m
+        # py_compile <script>` (syntax-only), or running OUR OWN lexical
+        # validator against the script's text (never executes it) --
+        # anything else referencing a bootstrap script variable as a
+        # subprocess argv is exactly the P1 pattern this test exists to
+        # catch.
+        is_safe = "'-n'" in dumped or "py_compile" in dumped or "VALIDATOR" in dumped
+        assert is_safe, (
+            "a subprocess call references a bootstrap script without a "
+            "recognized safe form ('-n'/'py_compile'/VALIDATOR) -- this "
+            "file must never execute real script content"
+        )
+    assert checked_any, "expected at least one syntax-only subprocess call to exist in this file"
 
 
-@pytest.fixture
-def fake_env(tmp_path):
-    return build_fake_pve_environment(tmp_path, default_scenario())
+def test_smoke_suite_is_sandbox_gated():
+    """The file that DOES execute the real script must hard-skip outside
+    the sandbox marker -- checked lexically here so a future edit to that
+    file that removes the gate is itself caught by a local-safe test.
+    """
+    assert SMOKE_TEST_FILE.exists(), "sandboxed bootstrap smoke-test file is missing"
+    text = SMOKE_TEST_FILE.read_text(encoding="utf-8")
+    assert "HUBINET_OPS_SYSTEM_SANDBOX" in text
+    assert "pytest.mark.skipif" in text
 
 
-@pytest.fixture(scope="session")
-def source_checkout(tmp_path_factory):
-    # Session-scoped: identical, read-only fixture content for every test
-    # in this file. Building it involves a real (but tiny, local-only)
-    # `git init`/`commit`, which is unnecessary overhead to repeat once
-    # per test.
-    return build_minimal_source_checkout(tmp_path_factory.mktemp("bootstrap-src"), REPO_ROOT)
+def test_sandbox_infrastructure_files_exist():
+    for path in (SANDBOX_DOCKERFILE, SANDBOX_RUNNER, SANDBOX_ENTRYPOINT):
+        assert path.exists(), f"missing sandbox infrastructure file: {path}"
 
 
-def _run_full(fake_env_obj, tmp_path, source_checkout, *, args=(), scenario_overrides=None):
-    if scenario_overrides:
-        scenario = default_scenario()
-        scenario.update(scenario_overrides)
-        fake_env_obj = build_fake_pve_environment(tmp_path, scenario)
-    return _run(fake_env_obj.env, _base_args() + list(args), source_dir=source_checkout)
+def test_sandbox_runner_fails_closed_outside_ephemeral_ci():
+    text = SANDBOX_RUNNER.read_text(encoding="utf-8")
+    for marker in (
+        "GITHUB_ACTIONS",
+        "HUBINET_OPS_EPHEMERAL_CI",
+        "RUNNER_ENVIRONMENT",
+        "GITHUB_RUN_ID",
+    ):
+        assert marker in text, f"sandbox runner does not check {marker}"
+    for isolation_flag in (
+        "--network none",
+        "--read-only",
+        "--cap-drop ALL",
+        "no-new-privileges=true",
+        "--ipc none",
+        "--pids-limit",
+        "--memory",
+        "--cpus",
+        "--user 65534:65534",
+    ):
+        assert isolation_flag in text, f"sandbox runner is missing isolation flag: {isolation_flag}"
 
 
-# ---------------------------------------------------------------------------
-# Static syntax check
-# ---------------------------------------------------------------------------
+def test_sandbox_runner_never_executed_directly_by_pytest():
+    # Defense in depth: no test anywhere in this local-safe file invokes
+    # run_bootstrap_smoke_sandbox.sh (that would require Docker and is
+    # gated to ephemeral CI only, per the skip above) -- only referenced
+    # for its own existence/content checks (.exists()/.read_text()).
+    import ast
+
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"), filename=str(__file__))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_process_spawn = (
+            isinstance(func, ast.Attribute)
+            and (
+                (isinstance(func.value, ast.Name) and func.value.id in ("subprocess", "os"))
+            )
+            and func.attr in ("run", "Popen", "system", "call", "check_call", "check_output")
+        )
+        if not is_process_spawn:
+            continue
+        assert "SANDBOX_RUNNER" not in ast.dump(node), (
+            "SANDBOX_RUNNER must never be passed to a process-spawning call "
+            "from this local-safe file"
+        )
 
 
-@pytest.mark.parametrize(
-    "script",
-    [
-        "deploy/bootstrap-proxmox-0.5.sh",
-        "deploy/lib/bootstrap-common.sh",
-        "deploy/lib/bootstrap-preflight.sh",
-        "deploy/lib/bootstrap-container.sh",
-        "deploy/lib/bootstrap-identity.sh",
-        "deploy/lib/bootstrap-deploy.sh",
-        "deploy/lib/bootstrap-firewall.sh",
-        "deploy/lib/bootstrap-finish.sh",
-    ],
-)
-def test_syntax_is_valid(script):
+def test_hermetic_shell_boundary_validator_restored():
+    assert VALIDATOR.exists(), "scripts/validate_hermetic_shell_boundary.py must exist (restored static validator)"
+
+
+@pytest.mark.parametrize("script", ALL_SCRIPTS)
+def test_hermetic_shell_boundary_clean(script):
+    # Defense-in-depth lexical check (NOT the real sandbox boundary --
+    # that's tests/shell/run_bootstrap_smoke_sandbox.sh + Docker): rejects
+    # absolute standard-executable-path invocation and Bash network
+    # devices that would bypass the fake-command PATH the sandboxed smoke
+    # suite relies on for hermeticity.
     result = subprocess.run(
-        ["bash", "-n", str(REPO_ROOT / script)], capture_output=True, text=True, timeout=30
+        [sys.executable, str(VALIDATOR), str(script)],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------
-# Preflight
+# Static syntax check -- `bash -n` / `python -m py_compile` never execute
+# script content.
 # ---------------------------------------------------------------------------
 
 
-class TestPreflight:
-    def test_non_root_rejected(self, fake_env, source_checkout):
-        env = dict(fake_env.env)
-        env.pop("BOOTSTRAP_TEST_MODE", None)  # force the real EUID check
-        result = _run(env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "must run as root" in result.stderr
+@pytest.mark.parametrize("script", ALL_SCRIPTS)
+def test_syntax_is_valid(script):
+    result = subprocess.run(
+        ["bash", "-n", str(script)], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
 
-    def test_missing_pve_command_rejected(self, fake_env, source_checkout):
-        env = dict(fake_env.env)
-        # Remove the fake bin dir from PATH so 'pct' resolves to nothing.
-        env["PATH"] = env["PATH"].split(str(fake_env.bin_dir) + __import__("os").pathsep, 1)[-1]
-        result = _run(env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "not found" in result.stderr
 
-    def test_existing_vmid_rejected_without_any_destroy(self, fake_env, source_checkout):
-        fake_env.state_path.write_text(
-            json.dumps({"vmids": {"110": {"started": False}}, "pve_users": [], "pve_roles": [], "pve_tokens": []})
-        )
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "already exists" in result.stderr
-        assert "pct create" not in fake_env.log_path.read_text() if fake_env.log_path.exists() else True
-        for line in fake_env.log_lines():
-            assert not line.startswith("pct create")
-            assert not line.startswith("pct destroy")
-
-    def test_invalid_bridge_rejected(self, fake_env, source_checkout):
-        result = _run(
-            fake_env.env, _base_args(**{"--bridge": "vmbr99"}), source_dir=source_checkout
-        )
-        assert result.returncode != 0
-        assert "vmbr99" in result.stderr
-        assert "does not exist" in result.stderr
-
-    def test_invalid_storage_rejected(self, fake_env, source_checkout):
-        result = _run(
-            fake_env.env, _base_args(**{"--storage": "bogus-storage"}), source_dir=source_checkout
-        )
-        assert result.returncode != 0
-        assert "bogus-storage" in result.stderr
-
-    def test_missing_template_behavior_falls_back_to_download(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["local_templates"] = []
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        assert any("pveam" in line and "download" in line for line in env.log_lines())
-
-    def test_missing_template_entirely_fails_closed(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["local_templates"] = []
-        scenario["available_templates"] = []
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "template" in result.stderr.lower()
-
-    def test_unsupported_template_name_rejected(self, fake_env, source_checkout):
-        result = _run(
-            fake_env.env,
-            _base_args(**{"--template": "local:vztmpl/ubuntu-24.04-standard_amd64.tar.zst"}),
-            source_dir=source_checkout,
-        )
-        assert result.returncode != 0
-        assert "does not look like a supported Debian 13" in result.stderr
-
-    def test_invalid_ha_cidr_rejected(self, fake_env, source_checkout):
-        result = _run(
-            fake_env.env, _base_args(**{"--ha-source": "not-a-cidr"}), source_dir=source_checkout
-        )
-        assert result.returncode != 0
-        assert "not a valid IPv4 CIDR" in result.stderr
-
-    def test_invalid_vmid_rejected(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(**{"--vmid": "99"}), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "not a valid Proxmox VMID" in result.stderr
-
-    def test_static_network_requires_ip_and_gateway(self, fake_env, source_checkout):
-        result = _run(
-            fake_env.env,
-            _base_args(**{"--network": "static"}),
-            source_dir=source_checkout,
-        )
-        assert result.returncode != 0
-        assert "--ip" in result.stderr
-
-    def test_insufficient_storage_space_rejected(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["storage_available_bytes"] = 1024  # 1 KiB, far below 8 GiB rootfs
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "free space" in result.stderr
+def test_accept_script_syntax_is_valid():
+    result = subprocess.run(
+        [sys.executable, "-m", "py_compile", str(ACCEPT_SCRIPT_PY)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------
-# Container creation
-# ---------------------------------------------------------------------------
-
-
-class TestContainerCreation:
-    def test_pct_create_arguments(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        create_lines = [line for line in fake_env.log_lines() if line.startswith("pct create")]
-        assert len(create_lines) == 1
-        line = create_lines[0]
-        assert "--unprivileged 1" in line
-        assert "--onboot 0" in line
-        assert "net0 name=eth0,bridge=vmbr0,firewall=1,ip=dhcp" in line
-        assert "--cores 1" in line
-        assert "--memory 1024" in line
-        assert "--swap 512" in line
-        assert "local-lxc:8" in line
-
-    def test_static_network_configuration(self, fake_env, source_checkout):
-        result = _run(
-            fake_env.env,
-            _base_args(**{"--network": "static", "--ip": "192.0.2.5/24", "--gateway": "192.0.2.1"}),
-            source_dir=source_checkout,
-        )
-        assert result.returncode == 0, result.stderr
-        create_lines = [line for line in fake_env.log_lines() if line.startswith("pct create")]
-        assert "ip=192.0.2.5/24,gw=192.0.2.1" in create_lines[0]
-
-    def test_debian13_nesting_enabled(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        set_lines = [line for line in fake_env.log_lines() if line.startswith("pct set 110 --features")]
-        assert any("nesting=1" in line for line in set_lines)
-
-    def test_non_matching_local_template_is_skipped_not_selected(self, tmp_path, source_checkout):
-        # A present-but-wrong-shaped local template must never be silently
-        # selected -- distinct from test_missing_template_entirely_fails_closed
-        # (no templates anywhere), this proves the local-template scan
-        # correctly filters out a non-matching entry and still finds the
-        # genuinely available Debian 13 template via download, rather than
-        # picking the alpine one merely because *something* exists locally.
-        scenario = default_scenario()
-        scenario["local_templates"] = ["local:vztmpl/alpine-3.20-default_20240607_amd64.tar.xz"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        assert "alpine" not in result.stderr.lower()
-        create_lines = [line for line in env.log_lines() if line.startswith("pct create")]
-        assert "debian-13-standard" in create_lines[0]
-        assert "alpine" not in create_lines[0]
-
-    def test_no_debian13_template_anywhere_is_rejected(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["local_templates"] = ["local:vztmpl/alpine-3.20-default_20240607_amd64.tar.xz"]
-        scenario["available_templates"] = []
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "template" in result.stderr.lower()
-
-    def test_no_unrelated_lxc_features_set(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        set_lines = [line for line in fake_env.log_lines() if line.startswith("pct set 110 --features")]
-        for line in set_lines:
-            features = line.split("--features", 1)[1].strip()
-            assert set(features.split(",")) <= {"nesting=1"}
-
-
-# ---------------------------------------------------------------------------
-# PVE identity
-# ---------------------------------------------------------------------------
-
-
-class TestPveIdentity:
-    def test_exact_role_privileges(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        role_lines = [line for line in fake_env.log_lines() if line.startswith("pveum role add")]
-        assert len(role_lines) == 1
-        assert "--privs Sys.Audit,VM.Audit" in role_lines[0]
-
-    def test_privsep_token_created(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        token_lines = [line for line in fake_env.log_lines() if line.startswith("pveum user token add")]
-        assert len(token_lines) == 1
-        assert "--privsep 1" in token_lines[0]
-        assert "r0-readonly" in token_lines[0]
-
-    def test_separate_token_acl_grant(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        acl_lines = [line for line in fake_env.log_lines() if line.startswith("pveum acl modify")]
-        assert any("--users hubinetops@pve" in line for line in acl_lines)
-        assert any("--tokens hubinetops@pve!r0-readonly" in line for line in acl_lines)
-
-    def test_conflict_refusal_existing_user(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        env = build_fake_pve_environment(tmp_path, scenario)
-        env.state_path.write_text(
-            json.dumps({"vmids": {}, "pve_users": ["hubinetops@pve"], "pve_roles": [], "pve_tokens": []})
-        )
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "already exists" in result.stderr
-        assert "hubinetops@pve" in result.stderr
-        assert not any(line.startswith("pveum user add") for line in env.log_lines())
-
-    def test_conflict_refusal_existing_role(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        env = build_fake_pve_environment(tmp_path, scenario)
-        env.state_path.write_text(
-            json.dumps({"vmids": {}, "pve_users": [], "pve_roles": ["HubinetOpsR0Auditor"], "pve_tokens": []})
-        )
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "HubinetOpsR0Auditor" in result.stderr
-        assert "already exists" in result.stderr
-
-    def test_missing_required_privilege_fails_verification(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["token_permissions"] = {"Sys.Audit": 1}  # VM.Audit missing
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "VM.Audit" in result.stderr
-
-    def test_extra_mutation_privilege_fails_verification(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["token_permissions"] = {"Sys.Audit": 1, "VM.Audit": 1, "VM.Config.Disk": 1}
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "mutation-shaped privilege" in result.stderr
-
-    def test_token_secret_never_appears_in_stdout_or_stderr(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        secret = "00000000-0000-0000-0000-000000000000"
-        assert secret not in result.stdout
-        assert secret not in result.stderr
-
-    def test_token_secret_never_appears_in_fake_command_log(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        secret = "00000000-0000-0000-0000-000000000000"
-        log_text = fake_env.log_path.read_text() if fake_env.log_path.exists() else ""
-        assert secret not in log_text
-
-    def test_rollback_removes_pve_identity_on_later_failure(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["backend_health"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        log_lines = env.log_lines()
-        assert any(line.startswith("pveum user token remove") for line in log_lines)
-        assert any(line.startswith("pveum role delete") for line in log_lines)
-        assert any(line.startswith("pveum user delete") for line in log_lines)
-
-
-# ---------------------------------------------------------------------------
-# TLS trust
-# ---------------------------------------------------------------------------
-
-
-class TestTls:
-    def test_ca_bundle_deployed_when_available(self, tmp_path, fake_env, source_checkout):
-        fake_pve_ca = tmp_path / "pve-root-ca.pem"
-        fake_pve_ca.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
-        result = _run(
-            fake_env.env,
-            _base_args(**{"--pve-ca-path": str(fake_pve_ca)}),
-            source_dir=source_checkout,
-        )
-        assert result.returncode == 0, result.stderr
-        inventory = fake_env.ct_file_text("110", "/etc/hubinet-ops/inventory.yaml")
-        assert 'ca_bundle_path: "/etc/hubinet-ops/pve-ca.pem"' in inventory
-        assert "verify: true" in inventory
-
-    def test_no_verify_false_path_exists_anywhere_in_the_script(self):
-        # Checks executable (non-comment) lines only -- the scripts'
-        # own explanatory comments legitimately *mention* "verify=false"
-        # while explaining that it is never done; a blanket whole-file
-        # substring scan would false-positive on exactly that prose.
-        for script in (BOOTSTRAP_SCRIPT, *sorted((REPO_ROOT / "deploy" / "lib").glob("*.sh"))):
-            code_lines = [
-                line for line in script.read_text(encoding="utf-8").splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            ]
-            code_text = "\n".join(code_lines).lower()
-            assert "verify: false" not in code_text
-            assert "verify=false" not in code_text.replace(" ", "")
-            assert "--insecure" not in code_text
-            assert "-k http" not in code_text
-
-    def test_missing_explicit_ca_path_fails_closed(self, fake_env, source_checkout):
-        result = _run(
-            fake_env.env,
-            _base_args(**{"--pve-ca-path": "/nonexistent/ca.pem"}),
-            source_dir=source_checkout,
-        )
-        assert result.returncode != 0
-        assert "does not exist" in result.stderr
-
-    def test_generated_inventory_always_sets_verify_true(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        inventory = fake_env.ct_file_text("110", "/etc/hubinet-ops/inventory.yaml")
-        assert "verify: true" in inventory
-        assert "verify: false" not in inventory
-
-
-# ---------------------------------------------------------------------------
-# Config generation
-# ---------------------------------------------------------------------------
-
-
-class TestConfigGeneration:
-    def test_inventory_is_source_centric_only(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        inventory = fake_env.ct_file_text("110", "/etc/hubinet-ops/inventory.yaml")
-        # Checks executable (non-comment) YAML lines only -- the generated
-        # file's own explanatory header comment legitimately *mentions*
-        # "vmid" while explaining that none exists; a blanket whole-file
-        # substring scan would false-positive on exactly that prose.
-        code_lines = "\n".join(
-            line for line in inventory.splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ).lower()
-        for forbidden in (
-            "vmid",
-            "vmids",
-            "containers:",
-            "resources:",
-            "managed-vmids",
-            "allowed-vmids",
-            "lifecycle-vmids",
-        ):
-            assert forbidden not in code_lines
-        assert "source:" in inventory
-        assert "provider_kind: proxmox_ve" in inventory
-
-    def test_pve_token_only_in_agent_env_never_in_inventory_yaml(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        inventory = fake_env.ct_file_text("110", "/etc/hubinet-ops/inventory.yaml")
-        agent_env = fake_env.ct_file_text("110", "/etc/hubinet-ops/agent.env")
-        secret = "00000000-0000-0000-0000-000000000000"
-        assert secret not in inventory
-        assert secret in agent_env
-        assert "HUBINET_OPS_R0_PVE_TOKEN=hubinetops@pve!r0-readonly=" + secret in agent_env
-
-    def test_credential_reference_is_opaque_not_the_secret(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        inventory = fake_env.ct_file_text("110", "/etc/hubinet-ops/inventory.yaml")
-        assert 'credential_reference: "secret://' in inventory
-
-    def test_generated_files_pushed_with_restrictive_ownership(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        log = fake_env.log_lines()
-        assert any(
-            "chown root:hubinetops /etc/hubinet-ops/inventory.yaml" in line for line in log
-        )
-        assert any("chmod 0640 /etc/hubinet-ops/inventory.yaml" in line for line in log)
-        assert any("chown root:hubinetops /etc/hubinet-ops/agent.env" in line for line in log)
-        assert any("chmod 0640 /etc/hubinet-ops/agent.env" in line for line in log)
-
-    def test_existing_r0_api_bearer_token_from_installer_is_preserved(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        agent_env = fake_env.ct_file_text("110", "/etc/hubinet-ops/agent.env")
-        assert f"HUBINET_OPS_R0_API_TOKEN={'f' * 64}" in agent_env
-
-
-# ---------------------------------------------------------------------------
-# Firewall
-# ---------------------------------------------------------------------------
-
-
-class TestFirewall:
-    def test_exact_ha_source_allowed_to_8787(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        ruleset = fake_env.ct_file_text("110", "/etc/nftables.conf")
-        assert f"ip saddr {FAKE_HA_SOURCE_CIDR} tcp dport 8787 accept" in ruleset
-
-    def test_default_deny_for_other_8787_ingress(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        ruleset = fake_env.ct_file_text("110", "/etc/nftables.conf")
-        assert "tcp dport 8787 drop" in ruleset
-
-    def test_hubinetops_egress_confined_to_pve_endpoint_8006(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        ruleset = fake_env.ct_file_text("110", "/etc/nftables.conf")
-        assert f'meta skuid "hubinetops" ip daddr {FAKE_PVE_ENDPOINT_HOST} tcp dport 8006 accept' in ruleset
-        assert 'meta skuid "hubinetops" drop' in ruleset
-
-    def test_no_dns_rule_when_endpoint_is_a_literal_ip(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        ruleset = fake_env.ct_file_text("110", "/etc/nftables.conf")
-        assert "udp dport 53" not in ruleset
-
-    def test_dns_resolver_required_when_endpoint_is_a_hostname(self, fake_env, source_checkout):
-        # Fails at phase 10, after the CT already exists in this fake_env's
-        # state -- deliberately not reused by the positive case below (a
-        # second run against the same environment would then hit "VMID
-        # already exists" in phase 1, which is a different, already-covered
-        # concern, not what this test is about).
-        result = _run(
-            fake_env.env,
-            _base_args(**{"--pve-endpoint": "https://pve.example.internal:8006"}),
-            source_dir=source_checkout,
-        )
-        assert result.returncode != 0
-        assert "--dns-resolver" in result.stderr
-
-    def test_dns_rule_scoped_to_configured_resolver_when_endpoint_is_a_hostname(
-        self, tmp_path, source_checkout
-    ):
-        env = build_fake_pve_environment(tmp_path, default_scenario())
-        result = _run(
-            env.env,
-            _base_args(**{"--pve-endpoint": "https://pve.example.internal:8006", "--dns-resolver": "192.0.2.53"}),
-            source_dir=source_checkout,
-        )
-        assert result.returncode == 0, result.stderr
-        ruleset = env.ct_file_text("110", "/etc/nftables.conf")
-        assert 'meta skuid "hubinetops" ip daddr 192.0.2.53 udp dport 53 accept' in ruleset
-
-    def test_syntax_validated_before_activation(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["nft_syntax"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "syntax validation" in result.stderr
-        assert not any(
-            line.startswith("systemctl") and "restart" in line and "nftables" in line
-            for line in env.log_lines()
-        )
-
-    def test_service_cannot_start_before_firewall_succeeds(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["nft_activate"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert not any(
-            "systemctl" in line and "enable" in line and "--now" in line and "hubinet-ops" in line
-            for line in env.log_lines()
-        )
-
-
-# ---------------------------------------------------------------------------
-# Ordering / rollback / onboot semantics
-# ---------------------------------------------------------------------------
-
-
-class TestOrderingAndRollback:
-    def test_full_phase_ordering_on_success(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        phases = [
-            line for line in result.stderr.splitlines() if line.strip().startswith("[hubinet-ops-bootstrap] === Phase")
-        ]
-        numbers = [int(line.split("Phase")[1].split(":")[0].strip()) for line in phases]
-        assert numbers == sorted(numbers)
-        assert numbers == list(range(1, 14))
-
-    def test_onboot_enabled_only_at_the_very_end(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        log = fake_env.log_lines()
-        onboot_calls = [i for i, line in enumerate(log) if "--onboot 1" in line]
-        assert len(onboot_calls) == 1
-        service_enable_calls = [
-            i for i, line in enumerate(log) if line.startswith("pct exec 110 -- systemctl enable --now hubinet-ops")
-        ]
-        assert len(service_enable_calls) == 1
-        assert onboot_calls[0] > service_enable_calls[0]
-
-    def test_firewall_activation_happens_before_service_enable(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        log = fake_env.log_lines()
-        firewall_idx = next(
-            i for i, line in enumerate(log) if "systemctl restart nftables" in line
-        )
-        service_idx = next(
-            i for i, line in enumerate(log) if "systemctl enable --now hubinet-ops" in line
-        )
-        assert firewall_idx < service_idx
-
-    def test_failure_cannot_leave_service_enabled_or_ct_onboot_enabled(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["backend_snapshot"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-
-        state = json.loads(env.state_path.read_text())
-        entry = state["vmids"]["110"]
-        assert entry.get("onboot", "0") == "0"
-        assert entry.get("service_enabled", False) is False
-
-    def test_preserve_on_failure_is_the_default(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["backend_health"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert not any(line.startswith("pct destroy") for line in env.log_lines())
-        assert "preserving container" in result.stderr
-
-        state = json.loads(env.state_path.read_text())
-        assert "110" in state["vmids"]  # CT itself still exists
-
-    def test_cleanup_on_failure_flag_destroys_the_container(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["backend_health"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args() + ["--cleanup-on-failure"], source_dir=source_checkout)
-        assert result.returncode != 0
-        assert any(line.startswith("pct destroy") or "pct stop" in line for line in env.log_lines())
-
-        state = json.loads(env.state_path.read_text())
-        assert "110" not in state["vmids"]
-
-    def test_rollback_never_touches_a_preexisting_vmid(self, tmp_path, source_checkout):
-        # Preexisting VMID -> preflight stops before any creation, so
-        # rollback must never issue pct destroy/stop for it.
-        scenario = default_scenario()
-        env = build_fake_pve_environment(tmp_path, scenario)
-        env.state_path.write_text(
-            json.dumps({"vmids": {"110": {"started": False}}, "pve_users": [], "pve_roles": [], "pve_tokens": []})
-        )
-        result = _run(env.env, _base_args() + ["--cleanup-on-failure"], source_dir=source_checkout)
-        assert result.returncode != 0
-        assert not any(line.startswith("pct destroy") for line in env.log_lines())
-        assert not any(line.startswith("pct stop") for line in env.log_lines())
-
-
-# ---------------------------------------------------------------------------
-# Acceptance
-# ---------------------------------------------------------------------------
-
-
-class TestAcceptance:
-    def test_mocked_healthy_success_path(self, fake_env, source_checkout):
-        result = _run(fake_env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode == 0, result.stderr
-        assert "Hubinet Ops 0.5 R0 bootstrap: PASS" in result.stdout
-
-    def test_mocked_discovery_failure(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["backend_snapshot"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "snapshot" in result.stderr.lower()
-
-    def test_mocked_backend_health_failure(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["backend_health"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "health" in result.stderr.lower()
-
-    def test_failed_systemd_units_block_acceptance(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["failed_units"] = ["dev-mqueue.mount", "run-lock.mount", "tmp.mount"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "dev-mqueue.mount" in result.stderr
-
-    def test_legacy_ops_db_presence_blocks_acceptance(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["legacy_present"] = {"ops_db": True}
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "ops.db" in result.stderr
-
-    def test_legacy_hostd_presence_blocks_acceptance(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["legacy_present"] = {"hostd": True}
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "hostd" in result.stderr.lower()
-
-    def test_legacy_hostd_port_8741_blocks_acceptance(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["legacy_present"] = {"hostd_port": True}
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        assert "8741" in result.stderr
-
-    def test_installer_failure_stops_before_config_or_firewall(self, tmp_path, source_checkout):
-        scenario = default_scenario()
-        scenario["fail"] = ["installer"]
-        env = build_fake_pve_environment(tmp_path, scenario)
-        result = _run(env.env, _base_args(), source_dir=source_checkout)
-        assert result.returncode != 0
-        log = env.log_lines()
-        assert not any("inventory.yaml" in line for line in log)
-        assert not any("nftables" in line for line in log)
-
-
-# ---------------------------------------------------------------------------
-# Security / static checks
+# Static security/content checks
 # ---------------------------------------------------------------------------
 
 
 class TestSecurityStatic:
-    _ALL_SCRIPTS = [BOOTSTRAP_SCRIPT, *sorted((REPO_ROOT / "deploy" / "lib").glob("*.sh"))]
+    _ALL_SCRIPTS = ALL_SCRIPTS
 
     def test_no_eval(self):
         for script in self._ALL_SCRIPTS:
@@ -795,6 +284,79 @@ class TestSecurityStatic:
             assert 'bash -c "$' not in text
             assert "sh -c \"$" not in text
 
+    def test_no_verify_false_anywhere(self):
+        # R0 never supports disabling TLS verification. Comment-only
+        # lines are stripped first so this does not false-positive on
+        # this very sentence appearing in an explanatory comment.
+        for script in self._ALL_SCRIPTS:
+            code_text = _code_only(script)
+            assert "verify=false" not in code_text.lower()
+            assert "--insecure" not in code_text
+            assert "-k " not in code_text  # curl -k
+
+    def test_no_secret_passed_as_literal_argv_to_a_parser(self):
+        # Mandatory Fix 5: the PVE token / R0 bearer token must never be
+        # handed to jq/python3/awk/curl as a literal -a/-v/positional
+        # argument -- only ever as a file path the parser opens itself.
+        # These are the exact anti-patterns the corrective pass removed;
+        # a regression reintroducing any of them must fail this test.
+        # The precise regression witness: awk/jq/python3 given the token
+        # VALUE (not a token_file/perms_file path) as a -v/--arg/positional.
+        # Comment-only lines are stripped first (this repository's own
+        # explanatory prose deliberately names these exact anti-patterns).
+        token_value_patterns = (
+            re.compile(r"-v\s+token\s*="),
+            re.compile(r"--arg\s+\w*token\w*\s+\"\$\{?pve_token\}?\""),
+            re.compile(r'"\$\{pve_token\}"'),
+            re.compile(r'"\$\{R0_API_BEARER_TOKEN\}"'),
+        )
+        for script in self._ALL_SCRIPTS:
+            code_text = _code_only(script)
+            for pattern in token_value_patterns:
+                assert not pattern.search(code_text), f"{script} appears to pass a secret token value as a literal argument: {pattern.pattern}"
+
+    def test_no_curl_bearer_header_with_literal_token_variable(self):
+        for script in self._ALL_SCRIPTS:
+            text = script.read_text(encoding="utf-8")
+            assert "Bearer ${R0_API_BEARER_TOKEN}" not in text
+            assert "Bearer ${pve_token}" not in text
+
+    def test_no_hardcoded_vmid_default(self):
+        text = BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+        assert 'VMID="110"' not in text
+        assert 'VMID=""' in text, "VMID must default to empty (auto-detect), not a hardcoded value"
+
+    def test_no_implicit_system_tls_default(self):
+        text = BOOTSTRAP_SCRIPT.read_text(encoding="utf-8")
+        assert 'TLS_TRUST_MODE="system"' not in text
+        assert 'TLS_TRUST_MODE=""' in text
+
+    def test_non_git_source_fallback_removed(self):
+        for script in self._ALL_SCRIPTS:
+            text = script.read_text(encoding="utf-8")
+            assert "tar -czf" not in text, f"{script} still contains a non-git tarball fallback"
+            assert "is not a git checkout -- falling back" not in text
+
+    def test_no_pveam_update_before_confirm_in_preflight(self):
+        code_text = _code_only(LIB_DIR / "bootstrap-preflight.sh")
+        assert "pveam update" not in code_text
+
+    def test_python3_or_jq_required_on_host(self):
+        text = (LIB_DIR / "bootstrap-preflight.sh").read_text(encoding="utf-8")
+        assert "jq" in text and "python3" in text
+
+    def test_exact_permission_set_check_present(self):
+        text = (LIB_DIR / "bootstrap-identity.sh").read_text(encoding="utf-8")
+        assert "_json_truthy_keys_sorted" in text
+        assert "exact-set" in text.lower()
+
+    def test_firewall_port_derived_from_endpoint(self):
+        text = (LIB_DIR / "bootstrap-firewall.sh").read_text(encoding="utf-8")
+        assert "_endpoint_port" in text
+        # No bare hardcoded "8006" used independently as a literal in the
+        # rule-generation printf itself (it must flow through pve_port).
+        assert 'tcp dport %s accept' in text
+
     def test_no_legacy_runtime_surface_guard_remains_green(self):
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", "tests/test_no_legacy_runtime_surface.py"],
@@ -804,3 +366,16 @@ class TestSecurityStatic:
             timeout=60,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Sanity: the fake-command harness constants used by the sandboxed smoke
+# suite are at least importable/consistent from a local-safe context (does
+# not execute the target script).
+# ---------------------------------------------------------------------------
+
+
+def test_fake_pve_constants_are_sane():
+    assert FAKE_HA_SOURCE_CIDR.endswith("/32")
+    assert FAKE_PVE_ENDPOINT.startswith("https://")
+    assert FAKE_DISPLAY_NAME
