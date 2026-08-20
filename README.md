@@ -105,12 +105,15 @@ method — use HACS for real deployments.
   for system-trust fallback), git-commit-provenance-gated source deployment via
   the in-CT install above, source-centric config, and the mandatory firewall
   boundary (exact rule content/order verified), ending with CT boot enabled only
-  after a real discovery-acceptance check passes. Exercised twice against a real
-  Proxmox host (the same host both times; dogfood #1 stopped at Phase 10, dogfood #2
-  reached Phase 12) — neither run is a full bootstrap PASS, and a fresh, clean
-  Phase-13 PASS remains outstanding. See
-  `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script proves, and what it
-  does not" section for the exact current status.
+  after a real discovery-acceptance check passes. Exercised three times against a
+  real Proxmox host (the same host all three times; dogfood #1 stopped at Phase 10,
+  dogfood #2 reached Phase 12 but was not itself a full bootstrap PASS, and
+  **dogfood #3, from this repository's merged `main`, achieved a fresh, clean
+  Phase 1-13 PASS with no manual repair mid-run**). This proves the automated
+  bootstrap completes successfully on the real host; it does not by itself mean
+  operational activation (HA acceptance, the multi-day observation window) is
+  complete. See `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script
+  proves, and what it does not" section for the exact current status.
 - `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
   the authority order). `docs/operations/`: the R0 operational activation runbook and the
   Home Assistant clean-break/purge plan for a real deployed instance.

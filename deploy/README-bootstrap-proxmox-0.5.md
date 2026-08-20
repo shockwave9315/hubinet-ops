@@ -17,21 +17,25 @@ Hubinet Ops's own GET-only production PVE transport
 (`app/inventory_pve_transport.py`).
 
 > **Status**: implemented and unit/smoke-tested against a hermetic fake
-> command layer, AND exercised in two real, manual, operator-authorized
-> dogfood runs against the same real Proxmox host. **Neither dogfood is a
-> full bootstrap PASS**: dogfood #1 stopped at Phase 10 (nftables active-
-> ruleset canonicalization, since fixed); dogfood #2 reached Phase 12
-> (source acceptance) before failing on a legacy PVE root CA missing the
-> X509v3 Key Usage extension -- a subsequent read-only forensic replay on
-> the same preserved container proved the exact production provider and
-> Phase-12 acceptance checker both PASS once that CA is corrected, but
-> that replay is not itself a dogfood PASS either. A fresh, clean dogfood
-> #3 run through Phase 13 remains required before this bootstrap can be
-> considered operationally validated. Do not treat this as evidence of
-> operational readiness. Before running it yourself, review the "What
-> this script proves, and what it does not" section below and the
-> REAL-HOST PRECHECK commands (including the PVE root CA Key Usage
-> precheck) further down this document.
+> command layer, AND exercised in three real, manual, operator-authorized
+> dogfood runs against the same real Proxmox host. Dogfood #1 stopped at
+> Phase 10 (nftables active-ruleset canonicalization, since fixed);
+> dogfood #2 reached Phase 12 (source acceptance) before failing on a
+> legacy PVE root CA missing the X509v3 Key Usage extension -- a
+> subsequent read-only forensic replay on the same preserved container
+> proved the exact production provider and Phase-12 acceptance checker
+> both PASS once that CA is corrected, but that replay was not itself a
+> dogfood PASS. **Dogfood #3, run fresh and clean from this repository's
+> merged `main`, completed Phase 1 through Phase 13 PASS with no manual
+> repair mid-run** -- the first dogfood to reach a full bootstrap PASS.
+> This proves the automated bootstrap completes successfully end to end
+> on a real host; it does **not** by itself mean full operational
+> readiness -- Home Assistant enrollment/acceptance and the multi-day
+> observation window in `docs/operations/0.5-r0-operational-activation.md`
+> §6/§7 remain separate, later, and still pending. Before running it
+> yourself, review the "What this script proves, and what it does not"
+> section below and the REAL-HOST PRECHECK commands (including the PVE
+> root CA Key Usage precheck) further down this document.
 
 ## Prerequisites
 
@@ -463,7 +467,25 @@ full manual verification procedure this script automates.
   precision gap that recurred on this same run was further refined (see
   `docs/architecture/0.5-implementation-status.md`'s "second real
   dogfood" entry for the full detail). A fresh, clean dogfood #3 run
-  through Phase 13 with the CA corrected remains outstanding.
+  through Phase 13 with the CA corrected has since occurred and
+  achieved that PASS -- see the "third real dogfood" entry in the same
+  document.
+- **Third real dogfood** (fresh run from this repository's merged
+  `main`, `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2`, on the SAME
+  physical PVE host as the first two dogfoods, with the CA-classification
+  fix from the second dogfood in place): **completed Phase 1 through
+  Phase 13 PASS with no manual repair mid-run — the first dogfood run to
+  reach a full bootstrap PASS.** Verified final facts: backend
+  `source_health=healthy`, `source_freshness=fresh`,
+  `last_committed_run_sequence=1`, `node_count=1`, `resource_count=11`,
+  firewall (nftables) verification PASS, mutation authority confirmed
+  NONE, CT `onboot` enabled, `hubinet-ops` service active/enabled,
+  nftables active/enabled. This proves the automated bootstrap completes
+  successfully end to end on a real host. **It does not prove long-term
+  operational health or full R0 operational acceptance** — see
+  `docs/operations/0.5-r0-operational-activation.md` sections 6 and 7
+  for the still-pending Home Assistant enrollment/acceptance and
+  multi-day observation window.
 - `.github/workflows/bootstrap-smoke.yml` wires the compliant sandbox
   (`tests/shell/run_bootstrap_smoke_sandbox.sh`) into GitHub Actions,
   narrowly path-filtered to bootstrap/sandbox-related changes and
