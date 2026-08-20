@@ -4,8 +4,9 @@
   "codeowners": ["@shockwave9315"],
   "config_flow": true,
   "documentation": "https://github.com/shockwave9315/hubinet-ops",
+  "issue_tracker": "https://github.com/shockwave9315/hubinet-ops/issues",
   "integration_type": "service",
   "iot_class": "local_polling",
   "requirements": [],
-  "version": "0.5.0.dev0"
+  "version": "0.5.0-rc1"
 }
