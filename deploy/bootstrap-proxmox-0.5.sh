@@ -296,17 +296,29 @@ rollback_on_failure() {
   # be this run's doing -- it could belong to a concurrent bootstrap run
   # (or any other creator) that won a race for the same fixed name. See
   # bootstrap-identity.sh's _user_object_owned_by_this_run /
-  # _token_object_owned_by_this_run / _role_object_owned_by_this_run for
-  # the exact proof each object type supports (comment-embedded
-  # BOOTSTRAP_RUN_ID for user/token; ledger-only for role, which PVE gives
-  # no comment field to prove anything about). Gated on the single
-  # "pve-identity-attempted" marker recorded in phase6 (after its own
-  # pre-existing-conflict checks, before its first mutation) so a partial
-  # success is still evaluated for cleanup; every delete below remains
-  # idempotent (`|| log_warn`) since an OWNED object may still never have
-  # actually been created. Reverse creation order.
+  # _token_ownership_state / _role_object_owned_by_this_run for the exact
+  # proof each object type supports (comment-embedded BOOTSTRAP_RUN_ID for
+  # user/token; ledger-only for role, which PVE gives no comment field to
+  # prove anything about). Gated on the single "pve-identity-attempted"
+  # marker recorded in phase6 (after its own pre-existing-conflict checks,
+  # before its first mutation) so a partial success is still evaluated for
+  # cleanup; every delete below remains idempotent (`|| log_warn`) since
+  # an OWNED object may still never have actually been created. Reverse
+  # creation order.
+  #
+  # Eighth-pass corrective note (P1 finding, independent review): real
+  # Proxmox's `pveum user delete` removes the deleted user's ENTIRE
+  # configuration, including every token registered under it -- proven-
+  # ours or not. An earlier version of this rollback proved the TOKEN
+  # unowned/unproven and correctly skipped `pveum user token remove`, but
+  # still unconditionally deleted the PARENT USER whenever the user
+  # itself was proven owned -- indirectly destroying the very token this
+  # same rollback had just logged as "preserved." user_deletion_blocked_
+  # by_unproven_token below closes that: automatic user deletion now
+  # requires the token to be proven ABSENT (nothing to protect) or OWNED-
+  # AND-REMOVED, never merely "the token's ownership check said no."
   if ledger_has pve-identity-attempted "${PVE_USER:-hubinetops@pve}"; then
-    local user_owned=0 role_owned=0 token_owned=0
+    local user_owned=0 role_owned=0 token_owned=0 user_deletion_blocked_by_unproven_token=0
 
     if _user_object_owned_by_this_run; then
       user_owned=1
@@ -336,17 +348,31 @@ rollback_on_failure() {
     # Token ownership is checked independently too (not merely inherited
     # from user_owned) -- only queried once the user itself is proven
     # ours, since a token can only ever meaningfully exist under a user
-    # this bootstrap itself created.
+    # this bootstrap itself created. Tri-state, not a boolean: OWNED
+    # (safe to remove) / ABSENT (nothing to protect -- also safe to let
+    # the parent user be deleted) / UNPROVEN (must block automatic
+    # deletion of BOTH the token itself AND its parent user, since
+    # `pveum user delete` below would otherwise destroy this same
+    # unproven token as a side effect of removing its parent).
     if (( user_owned )); then
-      if _token_object_owned_by_this_run; then
-        token_owned=1
-      else
-        # Same reasoning as the user-preserve message above -- the
-        # specific reason is already logged by _token_object_owned_by_this_run
-        # itself; this generic message must not assert (and potentially
-        # contradict) a specific cause on top of it.
-        log_warn "PRESERVING PVE token '${PVE_FULL_TOKEN_ID}': this run could not prove live ownership of the current object (see the specific reason already logged above) -- manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}"
-      fi
+      local token_state
+      token_state="$(_token_ownership_state)"
+      case "${token_state}" in
+        owned)
+          token_owned=1
+          ;;
+        absent)
+          : # Nothing to preserve -- safe to proceed to user deletion.
+          ;;
+        *)
+          # Same reasoning as the user-preserve message above -- the
+          # specific reason is already logged by _token_ownership_state
+          # itself; this generic message must not assert (and potentially
+          # contradict) a specific cause on top of it.
+          log_warn "PRESERVING PVE token '${PVE_FULL_TOKEN_ID}': this run could not prove live ownership of the current object (see the specific reason already logged above) -- manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}' and its comment field, confirm provenance yourself, then remove it only if you are certain it is safe: pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}"
+          user_deletion_blocked_by_unproven_token=1
+          ;;
+      esac
     fi
 
     if (( token_owned )); then
@@ -365,9 +391,16 @@ rollback_on_failure() {
         || log_warn "could not remove role ${PVE_ROLE} (may never have existed)"
     fi
 
-    if (( user_owned )); then
+    if (( user_owned )) && (( ! user_deletion_blocked_by_unproven_token )); then
       pveum user delete "${PVE_USER}" >/dev/null 2>&1 \
         || log_warn "could not remove user ${PVE_USER} (may never have existed)"
+    elif (( user_owned )); then
+      # P1 fix (eighth pass, independent review): do NOT delete a
+      # proven-owned user whose token could not be proven owned or
+      # absent -- 'pveum user delete' removes the user's ENTIRE
+      # configuration, which would destroy that unproven token as a side
+      # effect, defeating the token preserve decision logged just above.
+      log_warn "PRESERVING PVE user '${PVE_USER}' despite being proven owned by this run: its token '${PVE_FULL_TOKEN_ID}' could not be proven owned or absent, and 'pveum user delete' would remove the user's entire configuration -- including that unproven token -- as a side effect. Manual remediation: inspect 'pveum user token list ${PVE_USER} --output-format json' for '${PVE_TOKEN_ID}', confirm provenance yourself, then remove the token first (pveum user token remove ${PVE_USER} ${PVE_TOKEN_ID}) and only then the user (pveum user delete ${PVE_USER}) if you are certain both are safe to remove."
     fi
   fi
 

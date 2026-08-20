@@ -1033,13 +1033,15 @@ class TestJsonListSchemaDiagnosis:
         assert result.returncode == 0, result.stderr
         assert result.stdout == "required-field-missing"
 
-    def test_required_field_null_is_also_diagnosed_as_missing(self, tmp_path):
-        # An explicit JSON null is treated the same as "absent," not as
-        # "present but not a string" -- null carries no provenance value
-        # either way.
+    def test_required_field_null_is_not_string_not_missing(self, tmp_path):
+        # Eighth-pass corrective note (P2/P3 finding, independent
+        # review): the key IS present with an explicit JSON null value --
+        # this must be "required-field-not-string", never
+        # "required-field-missing", which must mean the key is actually
+        # absent from the object.
         result = _run_schema_diagnosis_helper(tmp_path, '[{"userid":null}]')
         assert result.returncode == 0, result.stderr
-        assert result.stdout == "required-field-missing"
+        assert result.stdout == "required-field-not-string"
 
     def test_required_field_not_string_diagnosed(self, tmp_path):
         # The field is present but holds a non-string value.
@@ -1180,6 +1182,97 @@ class TestDiagnosticOwnershipReread:
         )
         assert secret_looking_value not in result.stderr
         assert "run_marker_match=true" in result.stderr
+
+
+def _run_token_ownership_state_helper(tmp_path, *, list_cmd_body, run_id="test-run-id"):
+    """Source ONLY bootstrap-common.sh + bootstrap-identity.sh, define a
+    fake `pveum` bash function, then call _token_ownership_state directly
+    and return the completed subprocess (stdout carries exactly one of
+    "owned"/"absent"/"unproven"; stderr carries any log_warn output). No
+    PVE command, no phase function, no orchestration, no real rollback
+    path is ever invoked.
+    """
+    bash_snippet = f'''
+source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"
+source "{(LIB_DIR / "bootstrap-identity.sh").as_posix()}"
+BOOTSTRAP_RUN_ID="{run_id}"
+
+pveum() {{
+{list_cmd_body}
+}}
+
+_token_ownership_state
+exit $?
+'''
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestTokenOwnershipState:
+    """P1 fix (eighth pass, independent review of dogfood #2's corrective
+    PR): _token_ownership_state must report an explicit tri-state --
+    "owned" / "absent" / "unproven" -- never a boolean that collapses
+    "genuinely does not exist" (safe to let the parent user be deleted)
+    and "could not be verified" (must ALSO block deletion of the parent
+    user, since real Proxmox's `pveum user delete` destroys every token
+    under the deleted user) into the same indistinguishable signal.
+    """
+
+    def test_matching_run_marker_is_owned(self, tmp_path):
+        result = _run_token_ownership_state_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"tokenid":"r0-readonly","comment":"run=test-run-id"}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "owned"
+
+    def test_genuinely_missing_tokenid_is_absent(self, tmp_path):
+        # A schema-valid array that simply does not contain this token.
+        result = _run_token_ownership_state_helper(tmp_path, list_cmd_body="echo '[]'")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "absent"
+
+    def test_command_failure_is_unproven_not_absent(self, tmp_path):
+        result = _run_token_ownership_state_helper(tmp_path, list_cmd_body="return 3")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_schema_invalid_is_unproven_not_absent(self, tmp_path):
+        result = _run_token_ownership_state_helper(tmp_path, list_cmd_body="echo '[1,2,3]'")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_present_with_non_matching_comment_is_unproven_not_absent(self, tmp_path):
+        # The token DOES exist (present in a schema-valid array) but its
+        # comment belongs to a different run -- this must never be
+        # reported as "absent" (there IS something to protect).
+        result = _run_token_ownership_state_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"tokenid":"r0-readonly","comment":"run=someone-elses-run"}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_present_with_no_comment_at_all_is_unproven_not_absent(self, tmp_path):
+        # PVE omits the comment field entirely when unset -- present but
+        # commentless must also be "unproven," never "absent."
+        result = _run_token_ownership_state_helper(
+            tmp_path, list_cmd_body='echo \'[{"tokenid":"r0-readonly"}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_output_is_always_exactly_one_of_the_three_states(self, tmp_path):
+        for body in (
+            'echo \'[{"tokenid":"r0-readonly","comment":"run=test-run-id"}]\'',
+            "echo '[]'",
+            "return 9",
+            "echo 'not-json{{{'",
+        ):
+            result = _run_token_ownership_state_helper(tmp_path, list_cmd_body=body)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout in ("owned", "absent", "unproven")
 
 
 class TestSecurityStatic:

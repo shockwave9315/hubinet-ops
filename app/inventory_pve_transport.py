@@ -97,28 +97,50 @@ def _require_pve_api_token(pve_api_token: str) -> str:
 # reaches this module -- the real exception is only reachable by walking
 # ``__cause__``/``__context__``, not by matching on the outer exception's
 # type or its rendered message text.
-_EXCEPTION_CHAIN_MAX_DEPTH = 20
+_EXCEPTION_GRAPH_MAX_NODES = 20
 
 
 def _exception_chain(exc: BaseException):
-    """Yield ``exc`` then each ``__cause__``/``__context__`` ancestor.
+    """Yield ``exc`` then every exception reachable via ``__cause__``
+    and/or ``__context__`` -- a breadth-first walk of the exception
+    *graph*, not merely a linear chain.
 
-    Bounded by ``_EXCEPTION_CHAIN_MAX_DEPTH`` and cycle-safe (tracks visited
-    exception identities) -- this walks whatever chain httpx/httpcore/ssl
-    happen to construct, which this module does not control, so it must
-    never be able to loop or recurse without bound.
+    Eighth-pass corrective note (P3 finding, independent review): an
+    earlier version used ``current.__cause__ or current.__context__``,
+    which only ever follows ONE edge per node -- if a node has both an
+    explicit cause (``raise X from Y``) and an implicit context (a
+    DIFFERENT exception that happened to be active when ``X`` was
+    raised), the ``or`` silently discards ``__context__`` whenever
+    ``__cause__`` is set, even though Python preserves both
+    independently. A real ``ssl.SSLCertVerificationError`` reachable only
+    through the discarded edge would never be found. This walks both
+    edges from every node, bounded by ``_EXCEPTION_GRAPH_MAX_NODES`` total
+    queue *pops* (not merely distinct nodes yielded) and cycle-safe
+    (tracks visited exception identities) -- this walks whatever graph
+    httpx/httpcore/ssl happen to construct, which this module does not
+    control, so it must never be able to loop or grow unbounded. Bounding
+    pops rather than only distinct visits matters for a pathological
+    diamond-shaped graph (multiple nodes each pointing to the same
+    already-seen ancestor via both edges): such a graph can enqueue many
+    duplicate references to nodes already in ``seen``, and each of those
+    is a real, if wasted, iteration -- capping only "new" visits would let
+    that duplicate work run unbounded.
     """
 
     seen: set[int] = set()
-    current: BaseException | None = exc
-    depth = 0
-    while current is not None and depth < _EXCEPTION_CHAIN_MAX_DEPTH:
+    queue: list[BaseException] = [exc]
+    iterations = 0
+    while queue and iterations < _EXCEPTION_GRAPH_MAX_NODES:
+        iterations += 1
+        current = queue.pop(0)
         if id(current) in seen:
-            return
+            continue
         seen.add(id(current))
         yield current
-        current = current.__cause__ or current.__context__
-        depth += 1
+        if current.__cause__ is not None:
+            queue.append(current.__cause__)
+        if current.__context__ is not None:
+            queue.append(current.__context__)
 
 
 def _find_certificate_verification_error(

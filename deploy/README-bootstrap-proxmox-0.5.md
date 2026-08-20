@@ -422,15 +422,21 @@ full manual verification procedure this script automates.
   exercise beyond what a real dogfood run has already confirmed remains
   a residual risk — see the REAL-HOST PRECHECK block below for read-only
   commands to sanity-check these assumptions manually.
-- **Second real dogfood** (fresh base after the fix above): reached
-  **Phase 12** — Phase 10 (firewall) and Phase 11 (service start) both
-  **PASSED**, confirming the `/32`/numeric-skuid fix above on a second,
-  independent, upgraded real host — then Phase 12 (source acceptance)
-  **failed closed** with `health=source_unavailable`. **This is still
-  not a real bootstrap PASS.** The actual cause, confirmed by directly
-  reading the service journal and by real, read-only forensic checks on
-  the preserved failed CT (TCP/TLS/firewall/UID/token-permission all
-  independently confirmed working): the PVE host's legacy root CA lacked
+- **Second real dogfood** (fresh base after the fix above, on the SAME
+  physical PVE host as the first dogfood, since upgraded to Proxmox VE
+  9.2.11 — not a second/independent host, and this run proves nothing
+  about generalization to a different one): reached **Phase 12** —
+  Phase 10 (firewall) and **Phase 11 (service start) both PASSED**, the
+  hubinet-ops service genuinely started inside the CT (only stopped/
+  disabled again by rollback once Phase 12 failed), confirming the
+  `/32`/numeric-skuid fix above still holds on this host after its
+  upgrade — then Phase 12 (source acceptance) **failed closed** with
+  `health=source_unavailable`. **This is still not a real bootstrap
+  PASS.** The actual cause, confirmed by directly reading the service
+  journal and by real, read-only forensic checks on the preserved failed
+  CT (TCP/TLS/firewall/UID [checked inside the CT itself]/token-
+  permission all independently confirmed working): the PVE host's legacy
+  root CA lacked
   the `X509v3 Key Usage` extension, which Python 3.13's strict
   certificate-chain validation (used by both this bootstrap's own httpx-
   based checks and the production R0 runtime's transport) rejects. This
@@ -563,11 +569,19 @@ openssl x509 -in /etc/pve/pve-root-ca.pem -noout -text | grep -A2 'X509v3 Key Us
 #   outside this bootstrap's authority) before proceeding.
 
 # Strict leaf-certificate chain verification against that CA (does not
-# require this bootstrap's Python/httpx stack -- a plain openssl check):
-openssl verify -CAfile /etc/pve/pve-root-ca.pem /etc/pve/local/pve-ssl.pem
-#   Expected: "pve-ssl.pem: OK". Any verification error here will also
-#   surface as this bootstrap's Phase 12 TLS certificate verification
-#   failure.
+# require this bootstrap's Python/httpx stack -- a plain openssl check).
+# -x509_strict is mandatory here, not optional -- plain `openssl verify`
+# uses OpenSSL's permissive legacy chain-building rules and can report
+# "OK" for a CA that Python 3.13's own strict validation (used by this
+# bootstrap and by the production R0 runtime's transport) still rejects
+# -- exactly the missing-Key-Usage condition dogfood #2 exposed. A
+# precheck using non-strict `openssl verify` can miss that condition
+# entirely and falsely report the host as ready.
+openssl verify -x509_strict -CAfile /etc/pve/pve-root-ca.pem /etc/pve/local/pve-ssl.pem
+#   Expected: "pve-ssl.pem: OK". Any verification error here (including
+#   one -x509_strict newly surfaces that a non-strict check would not)
+#   will also surface as this bootstrap's Phase 12 TLS certificate
+#   verification failure.
 
 # jq/python3 availability (required by phase 1 preflight on the PVE host
 # itself, for the effective-permission exact-set check)

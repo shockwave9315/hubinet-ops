@@ -656,3 +656,75 @@ def test_findingA_exception_chain_walk_is_bounded_and_cycle_safe() -> None:
     shallow_wrapper = ValueError("shallow")
     shallow_wrapper.__cause__ = ssl.SSLCertVerificationError("shallow cert failure")
     assert _find_certificate_verification_error(shallow_wrapper) is not None
+
+
+def test_findingA_exception_chain_bounds_total_work_not_only_distinct_visits() -> None:
+    # P3 hardening (independent review): every node's __cause__ AND
+    # __context__ point to the SAME next node, so each real hop is
+    # enqueued twice -- this must exhaust the traversal's iteration
+    # budget on the resulting duplicate pops, reaching noticeably FEWER
+    # distinct real nodes than a duplicate-free chain of the same length
+    # would. This proves the bound caps TOTAL queue pops (including
+    # wasted duplicate ones), not merely a count of genuinely-new nodes
+    # visited -- a bound that only capped new visits would still walk
+    # the full chain despite the duplication, doing unbounded extra work
+    # for a sufficiently duplicate-heavy graph.
+    from app.inventory_pve_transport import _exception_chain
+
+    deepest = ValueError("deepest")
+    current: BaseException = deepest
+    for _ in range(30):
+        node = ValueError("node")
+        node.__cause__ = current
+        node.__context__ = current  # identical to __cause__ -- doubles queue entries per hop
+        current = node
+
+    visited = list(_exception_chain(current))
+    # Empirically 11 distinct nodes reached (well under the 20-node cap
+    # a duplicate-free chain would reach) -- asserted as a bound, not the
+    # exact count, so this stays robust to a future retuning of
+    # _EXCEPTION_GRAPH_MAX_NODES while still proving genuine work-capping.
+    assert len(visited) < 15
+    assert deepest not in visited
+
+
+def test_findingA_cert_error_found_via_context_even_when_a_different_cause_is_also_set() -> None:
+    # P3 finding (independent review): an earlier version walked
+    # `current.__cause__ or current.__context__` -- only ONE edge per
+    # node -- so a node with BOTH a __cause__ (some unrelated, non-cert
+    # exception) and a __context__ (the real cert error) would silently
+    # never have its __context__ edge explored at all, since __cause__
+    # being truthy short-circuits the `or`. Both attributes are
+    # independent in real Python exception handling (a `raise X from Y`
+    # sets __cause__ without clearing whatever __context__ the runtime
+    # had already recorded for X) -- this reproduces that shape directly.
+    from app.inventory_pve_transport import _find_certificate_verification_error
+
+    non_cert_cause = ValueError("unrelated cause, not a cert error")
+    cert_error = ssl.SSLCertVerificationError("only reachable via __context__")
+    outer = httpx.ConnectError("connection failed")
+    outer.__cause__ = non_cert_cause
+    outer.__context__ = cert_error
+
+    assert _find_certificate_verification_error(outer) is cert_error
+
+
+def test_findingA_wrapped_cert_error_via_context_classifies_as_security_proof_end_to_end() -> None:
+    # Same shape as above, exercised through the real transport.get()
+    # path -- proves the graph walk (not just the standalone helper) is
+    # wired correctly when a real request raises exactly this shape.
+    def handler(request: httpx.Request) -> httpx.Response:
+        non_cert_cause = ValueError("unrelated cause, not a cert error")
+        cert_error = ssl.SSLCertVerificationError("only reachable via __context__")
+        outer = httpx.ConnectError("connection failed")
+        outer.__cause__ = non_cert_cause
+        outer.__context__ = cert_error
+        raise outer
+
+    transport = _transport(handler)
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.SECURITY_PROOF
+    finally:
+        transport.close()

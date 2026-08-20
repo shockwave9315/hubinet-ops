@@ -341,16 +341,24 @@ sys.exit(0)
 # string" -- still too coarse to tell "some element genuinely isn't a
 # JSON object" apart from "an element is an object but the field is
 # simply absent" apart from "the field is present but holds a non-string
-# value (e.g. a number, a bool, null)". These are structurally different
-# and worth distinguishing for a future occurrence, without printing the
-# offending element itself (user/token list metadata is not secret, but a
-# structural diagnosis is still preferred over a payload dump). Exactly
-# one of:
+# value (e.g. a number, a bool, or an explicit JSON null)". These are
+# structurally different and worth distinguishing for a future
+# occurrence, without printing the offending element itself (user/token
+# list metadata is not secret, but a structural diagnosis is still
+# preferred over a payload dump). Exactly one of:
 #   "command-output-missing-or-empty" | "malformed-json" |
 #   "top-level-not-an-array" | "element-not-object" |
 #   "required-field-missing" | "required-field-not-string"
 # The first element (in array order) that fails determines the diagnosis;
 # later elements are not inspected once one is found.
+#
+# Eighth-pass corrective note (P2/P3 finding, independent review): a key
+# that is PRESENT with an explicit JSON `null` value is "required-field-
+# not-string" (the key genuinely exists; its value merely isn't a
+# string), never "required-field-missing" (which must mean the key is
+# actually absent from the object). A prior version of this function
+# conflated "absent key" and "present-but-null" into the same
+# "required-field-missing" bucket.
 _json_list_schema_diagnosis() {
   local file="$1" field="$2"
   [[ -s "${file}" ]] || { printf 'command-output-missing-or-empty'; return 0; }
@@ -367,7 +375,7 @@ _json_list_schema_diagnosis() {
     diag="$(jq -r --arg f "${field}" '
       [ .[] |
           if (type != "object") then "element-not-object"
-          elif ((has($f) | not) or (.[$f] == null)) then "required-field-missing"
+          elif (has($f) | not) then "required-field-missing"
           elif ((.[$f] | type) != "string") then "required-field-not-string"
           else empty
           end
@@ -402,10 +410,12 @@ for row in data:
     if not isinstance(row, dict):
         diagnosis = "element-not-object"
         break
-    if field not in row or row.get(field) is None:
+    if field not in row:
         diagnosis = "required-field-missing"
         break
     if not isinstance(row.get(field), str):
+        # Covers both an explicit JSON null and any other non-string
+        # value -- the key IS present, so this is never "missing".
         diagnosis = "required-field-not-string"
         break
 print(diagnosis or "element-not-object-or-missing-%s-string" % field, end="")
