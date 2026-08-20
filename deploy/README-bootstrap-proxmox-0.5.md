@@ -17,10 +17,21 @@ Hubinet Ops's own GET-only production PVE transport
 (`app/inventory_pve_transport.py`).
 
 > **Status**: implemented and unit/smoke-tested against a hermetic fake
-> command layer only. It has **not** been run against a real Proxmox host.
-> Before a first real run, review the "What this script proves, and what
-> it does not" section below and the REAL-HOST PRECHECK commands in this
-> branch's corrective-pass report.
+> command layer, AND exercised in two real, manual, operator-authorized
+> dogfood runs against the same real Proxmox host. **Neither dogfood is a
+> full bootstrap PASS**: dogfood #1 stopped at Phase 10 (nftables active-
+> ruleset canonicalization, since fixed); dogfood #2 reached Phase 12
+> (source acceptance) before failing on a legacy PVE root CA missing the
+> X509v3 Key Usage extension -- a subsequent read-only forensic replay on
+> the same preserved container proved the exact production provider and
+> Phase-12 acceptance checker both PASS once that CA is corrected, but
+> that replay is not itself a dogfood PASS either. A fresh, clean dogfood
+> #3 run through Phase 13 remains required before this bootstrap can be
+> considered operationally validated. Do not treat this as evidence of
+> operational readiness. Before running it yourself, review the "What
+> this script proves, and what it does not" section below and the
+> REAL-HOST PRECHECK commands (including the PVE root CA Key Usage
+> precheck) further down this document.
 
 ## Prerequisites
 
@@ -417,14 +428,42 @@ full manual verification procedure this script automates.
   cause: real nftables canonicalizes both a `/32` HA-source address and
   the symbolic `hubinetops` skuid on the active-ruleset round trip (see
   `deploy/lib/bootstrap-firewall.sh`'s `_nft_canonical_ha_source_expr`
-  and `_hubinetops_uid`) — fixed in a corrective pass; the first real
-  dogfood run through Phase 13 with that fix remains outstanding. Real
-  PVE-specific behavior this repository's hermetic tests still cannot
-  independently exercise beyond what this one dogfood run has already
-  confirmed (real `pveam`/`pvesh` output shapes, real DNS resolution
-  behavior inside a fresh Debian 13 CT, etc.) remains a residual risk —
-  see the REAL-HOST PRECHECK block below for read-only commands to
-  sanity-check these assumptions manually.
+  and `_hubinetops_uid`) — fixed in a corrective pass. Real PVE-specific
+  behavior this repository's hermetic tests still cannot independently
+  exercise beyond what a real dogfood run has already confirmed remains
+  a residual risk — see the REAL-HOST PRECHECK block below for read-only
+  commands to sanity-check these assumptions manually.
+- **Second real dogfood** (fresh base after the fix above, on the SAME
+  physical PVE host as the first dogfood, since upgraded to Proxmox VE
+  9.2.11 — not a second/independent host, and this run proves nothing
+  about generalization to a different one): reached **Phase 12** —
+  Phase 10 (firewall) and **Phase 11 (service start) both PASSED**, the
+  hubinet-ops service genuinely started inside the CT (only stopped/
+  disabled again by rollback once Phase 12 failed), confirming the
+  `/32`/numeric-skuid fix above still holds on this host after its
+  upgrade — then Phase 12 (source acceptance) **failed closed** with
+  `health=source_unavailable`. **This is still not a real bootstrap
+  PASS.** The actual cause, confirmed by directly reading the service
+  journal and by real, read-only forensic checks on the preserved failed
+  CT (TCP/TLS/firewall/UID [checked inside the CT itself]/token-
+  permission all independently confirmed working): the PVE host's legacy
+  root CA lacked
+  the `X509v3 Key Usage` extension, which Python 3.13's strict
+  certificate-chain validation (used by both this bootstrap's own httpx-
+  based checks and the production R0 runtime's transport) rejects. This
+  is an **environmental PVE-host CA condition**, not a bootstrap defect —
+  see the "PVE root CA — Key Usage precheck" block below for how to check
+  this on your own host *before* running the bootstrap. This bootstrap
+  does not, and will not, create/regenerate/modify the PVE root CA
+  itself, and does not add any relaxed-verification fallback for a
+  legacy CA — that remains an external PVE-administrator operation.
+  Fixed in this pass: a certificate-verification failure now classifies
+  correctly as a security/configuration proof failure
+  (`app/inventory_pve_transport.py`), and a rollback-diagnostics
+  precision gap that recurred on this same run was further refined (see
+  `docs/architecture/0.5-implementation-status.md`'s "second real
+  dogfood" entry for the full detail). A fresh, clean dogfood #3 run
+  through Phase 13 with the CA corrected remains outstanding.
 - `.github/workflows/bootstrap-smoke.yml` wires the compliant sandbox
   (`tests/shell/run_bootstrap_smoke_sandbox.sh`) into GitHub Actions,
   narrowly path-filtered to bootstrap/sandbox-related changes and
@@ -520,6 +559,40 @@ pveam available --section system | grep -i debian-13
 
 # PVE CA trust material
 ls -la /etc/pve/pve-root-ca.pem
+
+# PVE root CA -- Key Usage precheck (second real dogfood, eighth
+# corrective pass): a legacy PVE root CA that predates current PVE
+# tooling may lack the X509v3 Key Usage extension. Python 3.13's strict
+# certificate-chain validation (used by both this bootstrap's own
+# checks and the production R0 runtime's transport) rejects such a CA
+# with "certificate verify failed: CA cert does not include key usage
+# extension" -- an environmental PVE-host condition, not something this
+# bootstrap can or will work around (no relaxed-verification fallback
+# exists or will be added for it). Confirm BEFORE a first real run:
+openssl x509 -in /etc/pve/pve-root-ca.pem -noout -text | grep -A2 'X509v3 Basic Constraints'
+openssl x509 -in /etc/pve/pve-root-ca.pem -noout -text | grep -A2 'X509v3 Key Usage'
+#   Expected: "CA:TRUE" under Basic Constraints, and Key Usage present
+#   and including at least "Certificate Sign" and "CRL Sign". If Key
+#   Usage is missing entirely, this bootstrap's Phase 12 acceptance
+#   (and the production R0 runtime once deployed) will fail closed with
+#   a TLS certificate verification error -- regenerate the PVE root CA
+#   using current PVE tooling (an external PVE-administrator operation,
+#   outside this bootstrap's authority) before proceeding.
+
+# Strict leaf-certificate chain verification against that CA (does not
+# require this bootstrap's Python/httpx stack -- a plain openssl check).
+# -x509_strict is mandatory here, not optional -- plain `openssl verify`
+# uses OpenSSL's permissive legacy chain-building rules and can report
+# "OK" for a CA that Python 3.13's own strict validation (used by this
+# bootstrap and by the production R0 runtime's transport) still rejects
+# -- exactly the missing-Key-Usage condition dogfood #2 exposed. A
+# precheck using non-strict `openssl verify` can miss that condition
+# entirely and falsely report the host as ready.
+openssl verify -x509_strict -CAfile /etc/pve/pve-root-ca.pem /etc/pve/local/pve-ssl.pem
+#   Expected: "pve-ssl.pem: OK". Any verification error here (including
+#   one -x509_strict newly surfaces that a non-strict check would not)
+#   will also surface as this bootstrap's Phase 12 TLS certificate
+#   verification failure.
 
 # jq/python3 availability (required by phase 1 preflight on the PVE host
 # itself, for the effective-permission exact-set check)

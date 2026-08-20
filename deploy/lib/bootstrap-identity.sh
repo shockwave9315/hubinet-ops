@@ -37,7 +37,8 @@
 # comment field RIGHT NOW.
 #
 # Third-pass corrective note: an earlier version of
-# _user_object_owned_by_this_run / _token_object_owned_by_this_run treated
+# _user_object_owned_by_this_run / the token ownership check (now
+# _token_ownership_state, eighth pass) treated
 # `ledger_has` (this run's OWN record that its create call once succeeded)
 # as sufficient proof by itself, returning immediately without any live
 # re-query. That proves only "this run created an object with this name
@@ -316,6 +317,12 @@ _user_object_owned_by_this_run() {
     diagnosis="$(_json_list_schema_diagnosis "${list_file}" "userid")"
     rm -f "${list_file}"
     log_warn "could not verify ownership of '${PVE_USER}': the PVE user list did not match the expected JSON shape (an array of objects each carrying a string 'userid' field) -- diagnosis: ${diagnosis:-unknown} -- treating ownership as unproven regardless of this run's own ledger history"
+    # Seventh-pass corrective note: at most ONE additional diagnostic-only
+    # re-read, for a future occurrence's forensics -- this can never
+    # authorize ownership; the decision above (not owned, return 1) is
+    # already final.
+    _diagnostic_ownership_reread "userid" "${PVE_USER}" "PVE user '${PVE_USER}'" \
+      pveum user list --output-format json
     return 1
   fi
 
@@ -336,25 +343,47 @@ _user_object_owned_by_this_run() {
   return 1
 }
 
-# _token_object_owned_by_this_run: same live-read-back reasoning as the
-# user check above, via `pveum user token list <user> --output-format
-# json`'s own `comment` field for the matching `tokenid`. Only
-# reachable/meaningful once the owning user itself is proven ours (see
-# rollback_on_failure) -- a token can only ever exist under a user this
-# bootstrap itself just created.
-_token_object_owned_by_this_run() {
+# _token_ownership_state: same live-read-back reasoning as
+# _user_object_owned_by_this_run above, via `pveum user token list <user>
+# --output-format json`'s own `comment` field for the matching `tokenid`.
+# Only reachable/meaningful once the owning user itself is proven ours
+# (see rollback_on_failure) -- a token can only ever exist under a user
+# this bootstrap itself just created.
+#
+# Eighth-pass corrective note (P1 finding, independent review of dogfood
+# #2's corrective PR): an earlier version of this check was a plain
+# boolean ("owned" vs. "not owned"), which collapses two SEMANTICALLY
+# DIFFERENT "not owned" outcomes into one indistinguishable signal:
+#   (a) the token GENUINELY DOES NOT EXIST (a schema-valid read found no
+#       element with this tokenid at all) -- safe: there is nothing to
+#       protect, so it is also safe to let the parent user be deleted;
+#   (b) the token's ownership could NOT BE VERIFIED AT ALL (read failure,
+#       malformed/unrecognized JSON shape, or a schema-valid read that
+#       DID find the token but whose comment does not carry this run's
+#       marker) -- unsafe: real Proxmox's `pveum user delete` removes the
+#       deleted user's ENTIRE configuration, including every token under
+#       it, proven-ours or not. A boolean that reports both (a) and (b)
+#       identically as "not owned" cannot tell rollback_on_failure NOT to
+#       delete the parent user in case (b) -- indirectly destroying the
+#       very token this function just logged as "preserved." This
+#       function now reports one of exactly three states via stdout --
+#       "owned" / "absent" / "unproven" -- so the caller can require
+#       (a) or a successful (proven-owned) removal before ever deleting
+#       the parent user, never merely "not proven owned."
+_token_ownership_state() {
   local had_ledger_record=0
   ledger_has pve-token "${PVE_FULL_TOKEN_ID}" && had_ledger_record=1
 
   local list_file
-  list_file="$(mktemp /tmp/hubinet-ops-bootstrap-tokenlist-rb.XXXXXX.json)" || return 1
+  list_file="$(mktemp /tmp/hubinet-ops-bootstrap-tokenlist-rb.XXXXXX.json)" || { printf 'unproven'; return 0; }
   chmod 0600 "${list_file}"
   local cmd_status
   pveum user token list "${PVE_USER}" --output-format json >"${list_file}" 2>/dev/null && cmd_status=0 || cmd_status=$?
   if (( cmd_status != 0 )); then
     rm -f "${list_file}"
-    log_warn "could not read back the current PVE token list for '${PVE_USER}' to verify ownership of '${PVE_TOKEN_ID}' (pveum exited ${cmd_status}) -- treating ownership as unproven regardless of this run's own ledger history"
-    return 1
+    log_warn "could not read back the current PVE token list for '${PVE_USER}' to verify ownership of '${PVE_TOKEN_ID}' (pveum exited ${cmd_status}) -- treating ownership as UNPROVEN regardless of this run's own ledger history"
+    printf 'unproven'
+    return 0
   fi
   # Same schema-validation strengthening as phase6's own conflict check
   # (fourth-pass): an unrecognized PVE JSON shape here must mean ownership
@@ -365,25 +394,109 @@ _token_object_owned_by_this_run() {
     local diagnosis
     diagnosis="$(_json_list_schema_diagnosis "${list_file}" "tokenid")"
     rm -f "${list_file}"
-    log_warn "could not verify ownership of token '${PVE_TOKEN_ID}': the PVE token list did not match the expected JSON shape (an array of objects each carrying a string 'tokenid' field) -- diagnosis: ${diagnosis:-unknown} -- treating ownership as unproven regardless of this run's own ledger history"
-    return 1
+    log_warn "could not verify ownership of token '${PVE_TOKEN_ID}': the PVE token list did not match the expected JSON shape (an array of objects each carrying a string 'tokenid' field) -- diagnosis: ${diagnosis:-unknown} -- treating ownership as UNPROVEN regardless of this run's own ledger history"
+    # Seventh-pass corrective note: at most ONE additional diagnostic-only
+    # re-read, for a future occurrence's forensics -- this can never
+    # authorize ownership; the decision above (unproven) is already
+    # final, regardless of what this diagnostic reread finds.
+    _diagnostic_ownership_reread "tokenid" "${PVE_TOKEN_ID}" "PVE token '${PVE_TOKEN_ID}'" \
+      pveum user token list "${PVE_USER}" --output-format json
+    printf 'unproven'
+    return 0
+  fi
+
+  # A schema-valid read that genuinely does not contain this tokenid at
+  # all is the ONLY state that safely means "absent" -- checked via
+  # presence, not merely "was the comment field empty," since a token
+  # that DOES exist but happens to carry no comment (PVE omits it when
+  # unset) must never be conflated with one that does not exist at all.
+  if ! _json_list_field_equals "${list_file}" "tokenid" "${PVE_TOKEN_ID}"; then
+    rm -f "${list_file}"
+    (( had_ledger_record )) && log_warn "this run's ledger recorded creating token '${PVE_FULL_TOKEN_ID}', but it no longer exists at rollback time -- nothing to clean up"
+    printf 'absent'
+    return 0
   fi
 
   local comment
   comment="$(_json_list_field_value "${list_file}" "tokenid" "${PVE_TOKEN_ID}" "comment")"
   rm -f "${list_file}"
 
-  if [[ -z "${comment}" ]]; then
-    (( had_ledger_record )) && log_warn "this run's ledger recorded creating token '${PVE_FULL_TOKEN_ID}', but it no longer exists at rollback time -- nothing to clean up"
-    return 1
-  fi
   if [[ "${comment}" == *"run=${BOOTSTRAP_RUN_ID}"* ]]; then
+    printf 'owned'
     return 0
   fi
   if (( had_ledger_record )); then
-    log_warn "this run's ledger recorded creating token '${PVE_FULL_TOKEN_ID}', but the CURRENT object's comment does not carry this run's id (run=${BOOTSTRAP_RUN_ID}) -- it appears to have been replaced by another actor since creation; preserving it rather than deleting an object this run can no longer prove is its own"
+    log_warn "this run's ledger recorded creating token '${PVE_FULL_TOKEN_ID}', but the CURRENT object's comment does not carry this run's id (run=${BOOTSTRAP_RUN_ID}) -- it appears to have been replaced by another actor since creation; preserving it (and its parent user, since deleting the user would also destroy this unproven token) rather than deleting an object this run can no longer prove is its own"
   fi
-  return 1
+  printf 'unproven'
+}
+
+# _parent_user_child_token_state: a FRESH, COMPLETE, authoritative read
+# of EVERY token currently registered under ${PVE_USER} -- never
+# filtered to the expected ${PVE_TOKEN_ID} -- prints exactly one of
+# "empty" / "nonempty" / "unproven" via stdout.
+#
+# Tenth-pass corrective note (P1 finding, independent review -- Codex):
+# proving only the EXPECTED token (r0-readonly) safe -- proven absent,
+# or proven owned and successfully removed -- is NOT sufficient
+# authorization to delete the parent user or even just its ACL grant.
+# `pveum user token list <user>` scopes to exactly that user's own
+# tokens; a real administrator, or a concurrent process, could have
+# registered a DIFFERENT token under this same fixed-name user at any
+# point after this bootstrap created it. Real Proxmox's `pveum user
+# delete` would destroy that other token too, and even just removing
+# the parent user's own ACL grant can functionally disable it (a
+# privsep=1 token's effective permissions are the intersection of the
+# owning user's permissions and the token's own). This performs a FRESH
+# read here -- deliberately never reusing the earlier expected-token
+# ownership read, since a child token could appear in the window
+# between the two -- of the user's COMPLETE token list, and requires it
+# to be authoritatively, schema-valid EMPTY before parent cleanup is
+# ever considered safe. This run has live-read provenance only for its
+# own expected token; it never attempts to classify, remove, or
+# otherwise act on any OTHER token found here -- a residual token of
+# ANY kind, known or unknown, simply blocks parent cleanup and is left
+# for the operator. Logs only structural/non-secret facts, exactly like
+# _token_ownership_state above -- never a tokenid, comment, or other
+# payload value.
+#
+# Same residual TOCTOU as every other live-read-then-mutate check in
+# this file: there is no PVE-exposed compare-and-delete primitive, so a
+# token could in principle still be added in the narrow window between
+# this read and the subsequent `pveum acl delete`/`pveum user delete`
+# calls. This function does not close that window (nothing in this
+# bootstrap can); it closes the SEPARATE, larger gap that existed before
+# it: previously there was no complete-child-set proof of any kind.
+_parent_user_child_token_state() {
+  local list_file
+  list_file="$(mktemp /tmp/hubinet-ops-bootstrap-childtokens-rb.XXXXXX.json)" || { printf 'unproven'; return 0; }
+  chmod 0600 "${list_file}"
+  local cmd_status
+  pveum user token list "${PVE_USER}" --output-format json >"${list_file}" 2>/dev/null && cmd_status=0 || cmd_status=$?
+  if (( cmd_status != 0 )); then
+    rm -f "${list_file}"
+    log_warn "could not read back the current full PVE token list for '${PVE_USER}' to confirm no residual child tokens remain (pveum exited ${cmd_status}) -- treating the child-token set as UNPROVEN; parent user cleanup requires an authoritative empty result"
+    printf 'unproven'
+    return 0
+  fi
+  if ! _json_list_has_string_field_schema "${list_file}" "tokenid"; then
+    local diagnosis
+    diagnosis="$(_json_list_schema_diagnosis "${list_file}" "tokenid")"
+    rm -f "${list_file}"
+    log_warn "could not confirm no residual child tokens remain for '${PVE_USER}': the PVE token list did not match the expected JSON shape (an array of objects each carrying a string 'tokenid' field) -- diagnosis: ${diagnosis:-unknown} -- treating the child-token set as UNPROVEN; parent user cleanup requires an authoritative empty result"
+    printf 'unproven'
+    return 0
+  fi
+
+  local count
+  count="$(_json_list_length "${list_file}")"
+  rm -f "${list_file}"
+  if [[ "${count}" =~ ^[0-9]+$ ]] && (( count == 0 )); then
+    printf 'empty'
+    return 0
+  fi
+  log_warn "PVE user '${PVE_USER}' still has one or more tokens registered under it -- residual child-token state blocks automatic parent cleanup regardless of that token's own identity or provenance"
+  printf 'nonempty'
 }
 
 # _role_object_owned_by_this_run: PVE roles carry no comment/description

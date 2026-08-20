@@ -35,6 +35,7 @@ target script.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -47,6 +48,7 @@ from _bootstrap_fake_pve import (  # noqa: E402
     FAKE_DISPLAY_NAME,
     FAKE_HA_SOURCE_CIDR,
     FAKE_PVE_ENDPOINT,
+    build_fake_pve_environment,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1012,10 +1014,52 @@ class TestJsonListSchemaDiagnosis:
         assert result.returncode == 0, result.stderr
         assert result.stdout == "top-level-not-an-array"
 
-    def test_element_wrong_shape_diagnosed(self, tmp_path):
+    # -----------------------------------------------------------------
+    # Seventh-pass corrective refinement: dogfood #2 hit this exact code
+    # path a SECOND time -- the old single "element-not-object-or-
+    # missing-<field>-string" catch-all was still too coarse to tell
+    # apart three structurally distinct causes. Each is now its own
+    # diagnosis string.
+    # -----------------------------------------------------------------
+
+    def test_element_not_object_diagnosed(self, tmp_path):
+        # A bare-string array element -- not a JSON object at all.
+        result = _run_schema_diagnosis_helper(tmp_path, '["hubinetops@pve"]')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "element-not-object"
+
+    def test_required_field_missing_diagnosed(self, tmp_path):
+        # An object element, but the required field is simply absent
+        # (wrong field name used instead) -- the real dogfood #2 witness.
         result = _run_schema_diagnosis_helper(tmp_path, '[{"user":"hubinetops@pve"}]')
         assert result.returncode == 0, result.stderr
-        assert result.stdout == "element-not-object-or-missing-userid-string"
+        assert result.stdout == "required-field-missing"
+
+    def test_required_field_null_is_not_string_not_missing(self, tmp_path):
+        # Eighth-pass corrective note (P2/P3 finding, independent
+        # review): the key IS present with an explicit JSON null value --
+        # this must be "required-field-not-string", never
+        # "required-field-missing", which must mean the key is actually
+        # absent from the object.
+        result = _run_schema_diagnosis_helper(tmp_path, '[{"userid":null}]')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "required-field-not-string"
+
+    def test_required_field_not_string_diagnosed(self, tmp_path):
+        # The field is present but holds a non-string value.
+        result = _run_schema_diagnosis_helper(tmp_path, '[{"userid":12345}]')
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "required-field-not-string"
+
+    def test_first_failing_element_determines_diagnosis(self, tmp_path):
+        # A valid element followed by an invalid one -- the diagnosis
+        # reflects the first element that actually fails, not merely
+        # "any" element in the array.
+        result = _run_schema_diagnosis_helper(
+            tmp_path, '[{"userid":"hubinetops@pve"},{"user":"someone-else"}]',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "required-field-missing"
 
     def test_diagnosis_never_dumps_the_actual_payload(self, tmp_path):
         # Structural diagnosis only -- the field's own (non-secret, but
@@ -1027,6 +1071,415 @@ class TestJsonListSchemaDiagnosis:
         )
         assert result.returncode == 0, result.stderr
         assert secret_looking_value not in result.stdout
+
+    def test_diagnosis_never_dumps_the_payload_for_each_refined_branch(self, tmp_path):
+        # Same guarantee, exercised against each of the three refined
+        # branches specifically (not just the pre-existing generic case
+        # above), since each now inspects element/field content it did
+        # not before.
+        secret_looking_value = "totally-not-a-real-secret-marker-xyz"
+        for payload in (
+            f'["{secret_looking_value}"]',
+            f'[{{"user":"{secret_looking_value}"}}]',
+            f'[{{"userid":{{"nested":"{secret_looking_value}"}}}}]',
+        ):
+            result = _run_schema_diagnosis_helper(tmp_path, payload)
+            assert result.returncode == 0, result.stderr
+            assert secret_looking_value not in result.stdout
+
+
+def _run_diagnostic_reread_helper(tmp_path, *, list_cmd_body, run_id="test-run-id"):
+    """Source ONLY bootstrap-common.sh, define a fake listing command as a
+    bash function, then call _diagnostic_ownership_reread directly and
+    return the completed subprocess (stderr carries the log_warn output;
+    _diagnostic_ownership_reread itself always returns 0). No PVE command,
+    no phase function, no orchestration, no real rollback path is ever
+    invoked -- this is a pure unit test of the diagnostic-only re-read
+    helper in isolation.
+    """
+    bash_snippet = f'''
+source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"
+BOOTSTRAP_RUN_ID="{run_id}"
+
+fake_list_cmd() {{
+{list_cmd_body}
+}}
+
+_diagnostic_ownership_reread "userid" "hubinetops@pve" "PVE user 'hubinetops@pve'" fake_list_cmd
+exit $?
+'''
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestDiagnosticOwnershipReread:
+    """Rollback diagnostics fix (seventh pass, Finding B): at most ONE
+    additional diagnostic-only re-read of the same listing command after
+    an authoritative ownership read was rejected as schema-invalid.
+    _diagnostic_ownership_reread itself has NO return-value contract a
+    caller could use to authorize deletion -- it only logs structural,
+    non-secret facts. These tests exercise it directly, in isolation from
+    the full rollback/ownership functions (which are covered end to end
+    by the sandbox-only smoke suite).
+    """
+
+    def test_always_returns_zero_regardless_of_what_it_finds(self, tmp_path):
+        # No return-code contract exists for the caller to misuse as an
+        # ownership signal -- exit 0 always, whether the second read
+        # succeeds, fails, or is schema-invalid.
+        for body in ("return 7", "echo 'not-json{{{'", 'echo \'[{"userid":"hubinetops@pve","comment":"run=test-run-id"}]\''):
+            result = _run_diagnostic_reread_helper(tmp_path, list_cmd_body=body)
+            assert result.returncode == 0, result.stderr
+
+    def test_second_command_failure_logged_structurally(self, tmp_path):
+        result = _run_diagnostic_reread_helper(tmp_path, list_cmd_body="return 9")
+        assert "also failed (exit 9)" in result.stderr
+        assert "does not change the preserve decision" in result.stderr
+
+    def test_second_schema_invalid_logged_with_diagnosis(self, tmp_path):
+        result = _run_diagnostic_reread_helper(
+            tmp_path, list_cmd_body="echo '[{\"user\":\"hubinetops@pve\"}]'",
+        )
+        assert "still schema-invalid" in result.stderr
+        assert "diagnosis: required-field-missing" in result.stderr
+        assert "does not change the preserve decision" in result.stderr
+
+    def test_second_valid_with_matching_run_marker_logs_true_true(self, tmp_path):
+        result = _run_diagnostic_reread_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"userid":"hubinetops@pve","comment":"run=test-run-id"}]\'',
+        )
+        assert "target_present=true" in result.stderr
+        assert "run_marker_match=true" in result.stderr
+        assert "remains UNPROVEN and PRESERVED" in result.stderr
+
+    def test_second_valid_with_non_matching_run_marker_logs_false(self, tmp_path):
+        result = _run_diagnostic_reread_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"userid":"hubinetops@pve","comment":"run=some-other-run-id"}]\'',
+        )
+        assert "target_present=true" in result.stderr
+        assert "run_marker_match=false" in result.stderr
+
+    def test_second_valid_but_target_absent_logs_false_false(self, tmp_path):
+        result = _run_diagnostic_reread_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"userid":"someone-else@pve","comment":"run=test-run-id"}]\'',
+        )
+        assert "target_present=false" in result.stderr
+        assert "run_marker_match=false" in result.stderr
+
+    def test_never_dumps_the_actual_comment_text(self, tmp_path):
+        # The comment carries a distinctive marker beyond the plain
+        # run=<id> substring the helper checks for -- it must never be
+        # echoed into the log, even though it does carry the run marker.
+        secret_looking_value = "totally-not-a-real-secret-marker-xyz"
+        result = _run_diagnostic_reread_helper(
+            tmp_path,
+            list_cmd_body=(
+                'echo \'[{"userid":"hubinetops@pve",'
+                f'"comment":"run=test-run-id extra={secret_looking_value}"}}]\''
+            ),
+        )
+        assert secret_looking_value not in result.stderr
+        assert "run_marker_match=true" in result.stderr
+
+
+def _run_token_ownership_state_helper(tmp_path, *, list_cmd_body, run_id="test-run-id"):
+    """Source ONLY bootstrap-common.sh + bootstrap-identity.sh, define a
+    fake `pveum` bash function, then call _token_ownership_state directly
+    and return the completed subprocess (stdout carries exactly one of
+    "owned"/"absent"/"unproven"; stderr carries any log_warn output). No
+    PVE command, no phase function, no orchestration, no real rollback
+    path is ever invoked.
+    """
+    bash_snippet = f'''
+source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"
+source "{(LIB_DIR / "bootstrap-identity.sh").as_posix()}"
+BOOTSTRAP_RUN_ID="{run_id}"
+
+pveum() {{
+{list_cmd_body}
+}}
+
+_token_ownership_state
+exit $?
+'''
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestTokenOwnershipState:
+    """P1 fix (eighth pass, independent review of dogfood #2's corrective
+    PR): _token_ownership_state must report an explicit tri-state --
+    "owned" / "absent" / "unproven" -- never a boolean that collapses
+    "genuinely does not exist" (safe to let the parent user be deleted)
+    and "could not be verified" (must ALSO block deletion of the parent
+    user, since real Proxmox's `pveum user delete` destroys every token
+    under the deleted user) into the same indistinguishable signal.
+    """
+
+    def test_matching_run_marker_is_owned(self, tmp_path):
+        result = _run_token_ownership_state_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"tokenid":"r0-readonly","comment":"run=test-run-id"}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "owned"
+
+    def test_genuinely_missing_tokenid_is_absent(self, tmp_path):
+        # A schema-valid array that simply does not contain this token.
+        result = _run_token_ownership_state_helper(tmp_path, list_cmd_body="echo '[]'")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "absent"
+
+    def test_command_failure_is_unproven_not_absent(self, tmp_path):
+        result = _run_token_ownership_state_helper(tmp_path, list_cmd_body="return 3")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_schema_invalid_is_unproven_not_absent(self, tmp_path):
+        result = _run_token_ownership_state_helper(tmp_path, list_cmd_body="echo '[1,2,3]'")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_present_with_non_matching_comment_is_unproven_not_absent(self, tmp_path):
+        # The token DOES exist (present in a schema-valid array) but its
+        # comment belongs to a different run -- this must never be
+        # reported as "absent" (there IS something to protect).
+        result = _run_token_ownership_state_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"tokenid":"r0-readonly","comment":"run=someone-elses-run"}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_present_with_no_comment_at_all_is_unproven_not_absent(self, tmp_path):
+        # PVE omits the comment field entirely when unset -- present but
+        # commentless must also be "unproven," never "absent."
+        result = _run_token_ownership_state_helper(
+            tmp_path, list_cmd_body='echo \'[{"tokenid":"r0-readonly"}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_output_is_always_exactly_one_of_the_three_states(self, tmp_path):
+        for body in (
+            'echo \'[{"tokenid":"r0-readonly","comment":"run=test-run-id"}]\'',
+            "echo '[]'",
+            "return 9",
+            "echo 'not-json{{{'",
+        ):
+            result = _run_token_ownership_state_helper(tmp_path, list_cmd_body=body)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout in ("owned", "absent", "unproven")
+
+
+def _run_parent_user_child_token_state_helper(tmp_path, *, list_cmd_body):
+    """Source ONLY bootstrap-common.sh + bootstrap-identity.sh, define a
+    fake `pveum` bash function, then call _parent_user_child_token_state
+    directly and return the completed subprocess (stdout carries exactly
+    one of "empty"/"nonempty"/"unproven"). No PVE command, no phase
+    function, no orchestration, no real rollback path is ever invoked.
+    """
+    bash_snippet = f'''
+source "{(LIB_DIR / "bootstrap-common.sh").as_posix()}"
+source "{(LIB_DIR / "bootstrap-identity.sh").as_posix()}"
+PVE_USER="hubinetops@pve"
+
+pveum() {{
+{list_cmd_body}
+}}
+
+_parent_user_child_token_state
+exit $?
+'''
+    return subprocess.run(
+        ["bash", "-c", bash_snippet], capture_output=True, text=True, timeout=15,
+    )
+
+
+class TestParentUserChildTokenState:
+    """P1 fix (tenth pass, independent review -- Codex): "check every
+    child token before deleting its parent user." Proving only the
+    expected token safe is not sufficient authorization to delete the
+    parent user -- a different administrator or a concurrent process
+    could have registered an entirely different token under the same
+    fixed-name user. _parent_user_child_token_state must report an
+    explicit tri-state -- "empty" / "nonempty" / "unproven" -- over a
+    FRESH, complete read of the user's ENTIRE token list, never filtered
+    to any one expected token.
+    """
+
+    def test_genuinely_empty_list_is_empty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(tmp_path, list_cmd_body="echo '[]'")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "empty"
+
+    def test_one_residual_token_is_nonempty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(
+            tmp_path,
+            list_cmd_body='echo \'[{"tokenid":"other-token","comment":"unrelated"}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "nonempty"
+
+    def test_multiple_residual_tokens_are_nonempty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(
+            tmp_path,
+            list_cmd_body=(
+                'echo \'[{"tokenid":"other-token","comment":"unrelated"},'
+                '{"tokenid":"r0-readonly","comment":"run=x"}]\''
+            ),
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "nonempty"
+
+    def test_command_failure_is_unproven_not_empty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(tmp_path, list_cmd_body="return 7")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_schema_invalid_is_unproven_not_empty(self, tmp_path):
+        result = _run_parent_user_child_token_state_helper(tmp_path, list_cmd_body="echo '[1,2,3]'")
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "unproven"
+
+    def test_never_dumps_tokenid_or_comment_into_the_log(self, tmp_path):
+        secret_looking_value = "totally-not-a-real-secret-marker-xyz"
+        result = _run_parent_user_child_token_state_helper(
+            tmp_path,
+            list_cmd_body=f'echo \'[{{"tokenid":"{secret_looking_value}","comment":"{secret_looking_value}"}}]\'',
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == "nonempty"
+        assert secret_looking_value not in result.stderr
+
+    def test_output_is_always_exactly_one_of_the_three_states(self, tmp_path):
+        for body in (
+            "echo '[]'",
+            'echo \'[{"tokenid":"other-token"}]\'',
+            "return 9",
+            "echo 'not-json{{{'",
+        ):
+            result = _run_parent_user_child_token_state_helper(tmp_path, list_cmd_body=body)
+            assert result.returncode == 0, result.stderr
+            assert result.stdout in ("empty", "nonempty", "unproven")
+
+
+def _run_fake_pveum(fake_env, *args):
+    """Invoke the fake `pveum` shim directly (never the real bootstrap
+    script, never `_run_full`'s full orchestration) -- a local-safe,
+    non-sandbox-gated way to exercise one fake PVE command in isolation.
+    Explicit `bash <shim>` rather than executing the shim path directly:
+    the shim is a `#!/usr/bin/env bash` script, and direct execution of a
+    shebang script by path is not reliably supported by Python's
+    subprocess module on a Windows dev machine.
+    """
+    return subprocess.run(
+        ["bash", str(fake_env.bin_dir / "pveum"), *args],
+        capture_output=True, text=True, timeout=15, env=fake_env.env,
+    )
+
+
+class TestFakeUserDeleteCascade:
+    """Tenth-pass corrective addition (P3 finding, independent review):
+    the fake PVE dispatcher's `pveum user delete <user>` handler must
+    model real Proxmox's cascade -- deleting the owning user also
+    removes every token registered under it -- so a test asserting a
+    token survived rollback is genuine proof against the exact hazard
+    this repository's rollback_on_failure logic exists to prevent, not
+    merely proof that the fake's own `pve_users`/`pve_tokens` dicts
+    happen to be unlinked. Exercises the fake directly (bypassing the
+    real bootstrap script and rollback logic entirely) to isolate the
+    fake's own cascade behavior from the production decision logic
+    already covered by TestTokenOwnershipState and the sandbox-gated
+    smoke tests.
+    """
+
+    def _seed_two_users_each_with_a_token(self, fake_env):
+        state = fake_env.state()
+        state["pve_users"] = {
+            "hubinetops@pve": {"comment": "run=some-run-id"},
+            "other@pve": {"comment": "unrelated"},
+        }
+        state["pve_tokens"] = {
+            "hubinetops@pve!r0-readonly": {"comment": "run=some-run-id"},
+            "other@pve!sometoken": {"comment": "unrelated"},
+        }
+        fake_env.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_user_delete_cascades_to_that_users_own_tokens(self, tmp_path):
+        fake_env = build_fake_pve_environment(tmp_path)
+        self._seed_two_users_each_with_a_token(fake_env)
+
+        result = _run_fake_pveum(fake_env, "user", "delete", "hubinetops@pve")
+        assert result.returncode == 0, result.stderr
+
+        state = fake_env.state()
+        assert "hubinetops@pve" not in state["pve_users"]
+        assert "hubinetops@pve!r0-readonly" not in state["pve_tokens"]
+
+    def test_user_delete_cascade_does_not_touch_a_different_users_token(self, tmp_path):
+        # Scoping check: the cascade must match on the exact "<user>!"
+        # prefix, never delete tokens belonging to an unrelated user.
+        fake_env = build_fake_pve_environment(tmp_path)
+        self._seed_two_users_each_with_a_token(fake_env)
+
+        result = _run_fake_pveum(fake_env, "user", "delete", "hubinetops@pve")
+        assert result.returncode == 0, result.stderr
+
+        state = fake_env.state()
+        assert "other@pve" in state["pve_users"]
+        assert "other@pve!sometoken" in state["pve_tokens"]
+
+    def test_user_delete_of_a_user_with_no_tokens_is_a_no_op_on_pve_tokens(self, tmp_path):
+        # Positive control: the cascade logic must not raise/misbehave
+        # when the deleted user happens to have no tokens registered.
+        fake_env = build_fake_pve_environment(tmp_path)
+        state = fake_env.state()
+        state["pve_users"] = {"hubinetops@pve": {"comment": "run=some-run-id"}}
+        fake_env.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = _run_fake_pveum(fake_env, "user", "delete", "hubinetops@pve")
+        assert result.returncode == 0, result.stderr
+
+        state = fake_env.state()
+        assert "hubinetops@pve" not in state["pve_users"]
+        assert state["pve_tokens"] == {}
+
+    def test_user_delete_cascades_to_all_of_that_users_multiple_tokens(self, tmp_path):
+        # Closure-review addition: the real bootstrap only ever creates
+        # exactly one token per run, but the cascade implementation itself
+        # is a generic loop over every "<user>!"-prefixed entry -- this
+        # proves it genuinely removes ALL matches (not merely the first),
+        # while still leaving a different user's token untouched.
+        fake_env = build_fake_pve_environment(tmp_path)
+        state = fake_env.state()
+        state["pve_users"] = {
+            "userA@pve": {"comment": "run=some-run-id"},
+            "userB@pve": {"comment": "unrelated"},
+        }
+        state["pve_tokens"] = {
+            "userA@pve!token1": {"comment": "run=some-run-id"},
+            "userA@pve!token2": {"comment": "run=some-run-id"},
+            "userB@pve!tokenB": {"comment": "unrelated"},
+        }
+        fake_env.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = _run_fake_pveum(fake_env, "user", "delete", "userA@pve")
+        assert result.returncode == 0, result.stderr
+
+        state = fake_env.state()
+        assert "userA@pve" not in state["pve_users"]
+        assert "userA@pve!token1" not in state["pve_tokens"]
+        assert "userA@pve!token2" not in state["pve_tokens"]
+        # A different user's own token, and that user's own object, both
+        # survive -- the cascade is scoped exactly to the deleted user.
+        assert "userB@pve" in state["pve_users"]
+        assert "userB@pve!tokenB" in state["pve_tokens"]
 
 
 class TestSecurityStatic:

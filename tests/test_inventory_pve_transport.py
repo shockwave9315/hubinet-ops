@@ -9,6 +9,8 @@ uses a fake/mock transport boundary instead of a live endpoint.
 
 from __future__ import annotations
 
+import ssl
+
 import httpx
 import pytest
 
@@ -502,5 +504,256 @@ def test_finding3_500_still_classifies_as_transport() -> None:
         with pytest.raises(PveTransportError) as exc:
             transport.get("/version")
         assert exc.value.kind is ProviderFailureKind.TRANSPORT
+    finally:
+        transport.close()
+
+
+# ---------------------------------------------------------------------------
+# Real dogfood #2, Finding A -- TLS certificate verification failures must
+# classify as SECURITY_PROOF (-> configuration_error), not TRANSPORT
+# (-> source_unavailable). The real evidence: a legacy PVE root CA missing
+# the X509v3 Key Usage extension made Python 3.13's strict certificate-chain
+# validation reject the leaf with ssl.SSLCertVerificationError, which httpx/
+# httpcore wrapped inside an outer httpx.ConnectError before it ever reached
+# this module.
+# ---------------------------------------------------------------------------
+
+
+def _wrapped_cert_verification_handler(request: httpx.Request) -> httpx.Response:
+    # Reproduces the real dogfood #2 wrapping shape: the typed
+    # ssl.SSLCertVerificationError only reachable via __cause__, exactly as
+    # httpx/httpcore actually wrap it -- never a bare httpx.ConnectError
+    # with no ssl exception underneath.
+    try:
+        raise ssl.SSLCertVerificationError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "CA cert does not include key usage extension"
+        )
+    except ssl.SSLCertVerificationError as ssl_exc:
+        raise httpx.ConnectError(
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "CA cert does not include key usage extension"
+        ) from ssl_exc
+
+
+def test_findingA_wrapped_cert_verification_error_classifies_as_security_proof() -> None:
+    transport = _transport(_wrapped_cert_verification_handler)
+    try:
+        with pytest.raises(PveTransportError, match="certificate verification") as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.SECURITY_PROOF
+    finally:
+        transport.close()
+
+
+def test_findingA_cert_verification_error_reachable_only_via_context_not_cause() -> None:
+    # __context__ (implicit chaining, e.g. a bare `raise NewExc(...)` inside
+    # an `except ssl.SSLCertVerificationError:` block, no `from`) must be
+    # walked too -- not only __cause__.
+    def handler(request: httpx.Request) -> httpx.Response:
+        try:
+            raise ssl.SSLCertVerificationError("certificate verify failed")
+        except ssl.SSLCertVerificationError:
+            raise httpx.ConnectError("connection failed")  # noqa: B904 -- deliberate implicit chaining
+
+    transport = _transport(handler)
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.SECURITY_PROOF
+    finally:
+        transport.close()
+
+
+def test_findingA_generic_connection_failure_without_cert_error_remains_transport() -> None:
+    # Same outer exception TYPE as the wrapped-cert case above (ConnectError)
+    # but with no ssl.SSLCertVerificationError anywhere in its chain --
+    # proves the detection is genuinely structural (typed chain walk), not
+    # merely "any ConnectError is now SECURITY_PROOF".
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    transport = _transport(handler)
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.TRANSPORT
+    finally:
+        transport.close()
+
+
+def test_findingA_timeout_remains_transport_even_if_it_wraps_no_cert_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("handshake timed out", request=request)
+
+    transport = _transport(handler)
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.TRANSPORT
+    finally:
+        transport.close()
+
+
+def test_findingA_invalid_ca_bundle_construction_remains_security_proof(tmp_path) -> None:
+    missing_ca = tmp_path / "does-not-exist.pem"
+    with pytest.raises(PveTransportError) as exc:
+        ProxmoxHttpTransport(
+            canonical_transport_locator=LOCATOR,
+            pve_api_token=TOKEN,
+            verify=str(missing_ca),
+        )
+    assert exc.value.kind is ProviderFailureKind.SECURITY_PROOF
+
+
+def test_findingA_401_still_classifies_as_security_proof_not_transport() -> None:
+    # Regression guard: Finding A's new cert-error branch is nested inside
+    # the same httpx.HTTPError except clause as the generic transport
+    # fallback -- must never accidentally shadow the pre-existing 401/403
+    # status-code check, which runs entirely inside the `try` body, before
+    # any exception is even raised.
+    transport = _transport(lambda request: httpx.Response(401, json={"data": None}))
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.SECURITY_PROOF
+    finally:
+        transport.close()
+
+
+def test_findingA_error_text_never_contains_the_pve_token() -> None:
+    transport = _transport(_wrapped_cert_verification_handler)
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert TOKEN not in str(exc.value)
+    finally:
+        transport.close()
+
+
+def test_findingA_exception_chain_walk_is_bounded_and_cycle_safe() -> None:
+    from app.inventory_pve_transport import _find_certificate_verification_error
+
+    # A self-referential __context__ cycle must terminate, not loop forever.
+    a = ValueError("a")
+    b = ValueError("b")
+    a.__context__ = b
+    b.__context__ = a
+    assert _find_certificate_verification_error(a) is None
+
+    # A very deep chain (deeper than the bound) with the cert error placed
+    # beyond the bound must not be found -- proves the bound is real and
+    # enforced, not merely decorative.
+    deepest = ssl.SSLCertVerificationError("too deep")
+    current: BaseException = deepest
+    for _ in range(50):
+        wrapper = ValueError("wrapper")
+        wrapper.__cause__ = current
+        current = wrapper
+    assert _find_certificate_verification_error(current) is None
+
+    # The same cert error placed well within the bound must be found.
+    shallow_wrapper = ValueError("shallow")
+    shallow_wrapper.__cause__ = ssl.SSLCertVerificationError("shallow cert failure")
+    assert _find_certificate_verification_error(shallow_wrapper) is not None
+
+
+def _build_duplicate_heavy_chain(total_nodes: int, cert_index: int) -> BaseException:
+    """Build a chain of `total_nodes` exceptions where each node's
+    __cause__ AND __context__ both point to the SAME previous node
+    (duplicate edges every hop -- exactly the shape that would exhaust a
+    pops-based budget on wasted duplicate pops). `cert_index` (0 =
+    deepest/oldest) is a real ssl.SSLCertVerificationError; every other
+    node is a plain ValueError. Returns the outermost/topmost exception
+    (the one a caller would actually receive and inspect).
+    """
+    prev: BaseException | None = None
+    outer: BaseException | None = None
+    for i in range(total_nodes):
+        node: BaseException = (
+            ssl.SSLCertVerificationError(f"cert at index {i}")
+            if i == cert_index
+            else ValueError(f"node {i}")
+        )
+        if prev is not None:
+            node.__cause__ = prev
+            node.__context__ = prev
+        prev = node
+        outer = node
+    assert outer is not None
+    return outer
+
+
+def test_findingA_duplicate_edges_do_not_prevent_finding_a_cert_error_within_the_bound() -> None:
+    # Independent-review corrective note (P2 finding, tenth pass): a cert
+    # error 15 unique hops from the outer exception must still be found,
+    # even though every hop along the way duplicates its reference (cause
+    # == context). The distance matters: this exact duplicate-heavy
+    # construction lets the previously-rejected pops-bounded design (which
+    # counted total queue pops instead of unique nodes visited) still
+    # reach ~11 unique nodes before its 20-pop budget exhausts, so a
+    # distance of 10 (an earlier version of this test) would ALSO have
+    # been found under that rejected design -- proving nothing about
+    # which of the two designs is in use. Direct mutation testing
+    # (swapping in the rejected pops-bounded implementation and re-running
+    # this exact body) confirms distance 15 genuinely discriminates: found
+    # under the current unique-node-bounded implementation, NOT found
+    # under the rejected pops-bounded one.
+    from app.inventory_pve_transport import _find_certificate_verification_error
+
+    outer = _build_duplicate_heavy_chain(total_nodes=31, cert_index=31 - 1 - 15)
+    found = _find_certificate_verification_error(outer)
+    assert found is not None
+    assert isinstance(found, ssl.SSLCertVerificationError)
+
+
+def test_findingA_cert_error_beyond_the_unique_node_bound_is_not_found() -> None:
+    # Same duplicate-heavy shape, but the cert error sits 25 unique hops
+    # away -- beyond _EXCEPTION_GRAPH_MAX_NODES (20) -- and must not be
+    # found. Proves the bound is real and enforced, not merely decorative.
+    from app.inventory_pve_transport import _find_certificate_verification_error
+
+    outer = _build_duplicate_heavy_chain(total_nodes=31, cert_index=31 - 1 - 25)
+    assert _find_certificate_verification_error(outer) is None
+
+
+def test_findingA_cert_error_found_via_context_even_when_a_different_cause_is_also_set() -> None:
+    # P3 finding (independent review): an earlier version walked
+    # `current.__cause__ or current.__context__` -- only ONE edge per
+    # node -- so a node with BOTH a __cause__ (some unrelated, non-cert
+    # exception) and a __context__ (the real cert error) would silently
+    # never have its __context__ edge explored at all, since __cause__
+    # being truthy short-circuits the `or`. Both attributes are
+    # independent in real Python exception handling (a `raise X from Y`
+    # sets __cause__ without clearing whatever __context__ the runtime
+    # had already recorded for X) -- this reproduces that shape directly.
+    from app.inventory_pve_transport import _find_certificate_verification_error
+
+    non_cert_cause = ValueError("unrelated cause, not a cert error")
+    cert_error = ssl.SSLCertVerificationError("only reachable via __context__")
+    outer = httpx.ConnectError("connection failed")
+    outer.__cause__ = non_cert_cause
+    outer.__context__ = cert_error
+
+    assert _find_certificate_verification_error(outer) is cert_error
+
+
+def test_findingA_wrapped_cert_error_via_context_classifies_as_security_proof_end_to_end() -> None:
+    # Same shape as above, exercised through the real transport.get()
+    # path -- proves the graph walk (not just the standalone helper) is
+    # wired correctly when a real request raises exactly this shape.
+    def handler(request: httpx.Request) -> httpx.Response:
+        non_cert_cause = ValueError("unrelated cause, not a cert error")
+        cert_error = ssl.SSLCertVerificationError("only reachable via __context__")
+        outer = httpx.ConnectError("connection failed")
+        outer.__cause__ = non_cert_cause
+        outer.__context__ = cert_error
+        raise outer
+
+    transport = _transport(handler)
+    try:
+        with pytest.raises(PveTransportError) as exc:
+            transport.get("/version")
+        assert exc.value.kind is ProviderFailureKind.SECURITY_PROOF
     finally:
         transport.close()

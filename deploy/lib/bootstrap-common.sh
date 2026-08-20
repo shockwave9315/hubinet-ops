@@ -334,14 +334,31 @@ sys.exit(0)
 # still-unproven cause) produced a rejection this log line alone could
 # not distinguish from a genuinely malformed response. Rather than
 # guessing at that one incident's cause or loosening the schema, this
-# gives a FUTURE occurrence enough structure to actually diagnose:
-# exactly one of "command-output-missing-or-empty", "malformed-json",
-# "top-level-not-an-array", or "element-not-object-or-missing-<field>-
-# string" (this last one covers both "some element isn't even a JSON
-# object" and "an element is an object but lacks <field> as a string" --
-# indistinguishable without printing the actual element, which this
-# function deliberately does not do: user/token list metadata is not
-# secret, but a structural diagnosis is preferred over a payload dump).
+# gives a FUTURE occurrence enough structure to actually diagnose.
+#
+# Seventh-pass corrective note: dogfood #2 hit this exact code path a
+# SECOND time, with the diagnosis "element-not-object-or-missing-userid-
+# string" -- still too coarse to tell "some element genuinely isn't a
+# JSON object" apart from "an element is an object but the field is
+# simply absent" apart from "the field is present but holds a non-string
+# value (e.g. a number, a bool, or an explicit JSON null)". These are
+# structurally different and worth distinguishing for a future
+# occurrence, without printing the offending element itself (user/token
+# list metadata is not secret, but a structural diagnosis is still
+# preferred over a payload dump). Exactly one of:
+#   "command-output-missing-or-empty" | "malformed-json" |
+#   "top-level-not-an-array" | "element-not-object" |
+#   "required-field-missing" | "required-field-not-string"
+# The first element (in array order) that fails determines the diagnosis;
+# later elements are not inspected once one is found.
+#
+# Eighth-pass corrective note (P2/P3 finding, independent review): a key
+# that is PRESENT with an explicit JSON `null` value is "required-field-
+# not-string" (the key genuinely exists; its value merely isn't a
+# string), never "required-field-missing" (which must mean the key is
+# actually absent from the object). A prior version of this function
+# conflated "absent key" and "present-but-null" into the same
+# "required-field-missing" bucket.
 _json_list_schema_diagnosis() {
   local file="$1" field="$2"
   [[ -s "${file}" ]] || { printf 'command-output-missing-or-empty'; return 0; }
@@ -354,7 +371,26 @@ _json_list_schema_diagnosis() {
       printf 'top-level-not-an-array'
       return 0
     fi
-    printf 'element-not-object-or-missing-%s-string' "${field}"
+    local diag status
+    diag="$(jq -r --arg f "${field}" '
+      [ .[] |
+          if (type != "object") then "element-not-object"
+          elif (has($f) | not) then "required-field-missing"
+          elif ((.[$f] | type) != "string") then "required-field-not-string"
+          else empty
+          end
+      ] | first // empty
+    ' "${file}" 2>/dev/null)" && status=0 || status=$?
+    if (( status == 0 )) && [[ -n "${diag}" ]]; then
+      printf '%s' "${diag}"
+    else
+      # Unreachable in practice -- this is only ever called after
+      # _json_list_has_string_field_schema already rejected the file, so
+      # some element must fail one of the three checks above. Kept as a
+      # safe, honest fallback rather than a guess if jq's own view of the
+      # schema ever somehow disagreed with the bash predicate's.
+      printf 'element-not-object-or-missing-%s-string' "${field}"
+    fi
     return 0
   fi
   python3 -c '
@@ -368,8 +404,81 @@ except (json.JSONDecodeError, UnicodeDecodeError, OSError):
 if not isinstance(data, list):
     print("top-level-not-an-array", end="")
     sys.exit(0)
-print("element-not-object-or-missing-%s-string" % sys.argv[2], end="")
+field = sys.argv[2]
+diagnosis = None
+for row in data:
+    if not isinstance(row, dict):
+        diagnosis = "element-not-object"
+        break
+    if field not in row:
+        diagnosis = "required-field-missing"
+        break
+    if not isinstance(row.get(field), str):
+        # Covers both an explicit JSON null and any other non-string
+        # value -- the key IS present, so this is never "missing".
+        diagnosis = "required-field-not-string"
+        break
+print(diagnosis or "element-not-object-or-missing-%s-string" % field, end="")
 ' "${file}" "${field}" 2>/dev/null
+}
+
+# _diagnostic_ownership_reread <id-field> <id-value> <label> <list-cmd...>:
+# at most ONE additional, diagnostic-only re-read of the same PVE listing
+# command already used for a rollback ownership check that was just
+# rejected as schema-invalid. Logs ONLY structural, non-secret facts
+# (second command succeeded/failed; schema valid/invalid and, if invalid,
+# which structural diagnosis; whether <id-value> is present; whether its
+# comment carries this run's BOOTSTRAP_RUN_ID marker) -- NEVER the
+# comment's actual text or any other payload value.
+#
+# Seventh-pass corrective note (real dogfood #2 hit the exact "malformed
+# first read, but a manual read immediately afterward was schema-valid"
+# scenario a SECOND time): this function's result is diagnostic ONLY. It
+# has no return-value contract the caller inspects for a decision, and the
+# caller's own ownership decision (not owned -- preserve) was already
+# final before this is ever invoked. Even a perfectly valid second read
+# whose comment carries this exact run's marker does not, and must never,
+# cause the object to be treated as owned or deleted here -- the
+# AUTHORITATIVE read for this rollback attempt already failed, and that
+# decision is not retried or overridden by a later, merely diagnostic one.
+_diagnostic_ownership_reread() {
+  local id_field="$1" id_value="$2" label="$3"
+  shift 3
+  local -a list_cmd=("$@")
+
+  local reread_file
+  reread_file="$(mktemp /tmp/hubinet-ops-bootstrap-ownership-reread.XXXXXX.json)" || return 0
+  chmod 0600 "${reread_file}"
+
+  local cmd_status
+  "${list_cmd[@]}" >"${reread_file}" 2>/dev/null && cmd_status=0 || cmd_status=$?
+  if (( cmd_status != 0 )); then
+    rm -f "${reread_file}"
+    log_warn "diagnostic reread of '${label}': the same listing command was retried exactly once, for diagnosis only -- it also failed (exit ${cmd_status}). This does not change the preserve decision already made above."
+    return 0
+  fi
+
+  if ! _json_list_has_string_field_schema "${reread_file}" "${id_field}"; then
+    local diagnosis
+    diagnosis="$(_json_list_schema_diagnosis "${reread_file}" "${id_field}")"
+    rm -f "${reread_file}"
+    log_warn "diagnostic reread of '${label}': retried once, for diagnosis only -- still schema-invalid (diagnosis: ${diagnosis:-unknown}). This does not change the preserve decision already made above."
+    return 0
+  fi
+
+  local target_present=false run_marker_match=false
+  if _json_list_field_equals "${reread_file}" "${id_field}" "${id_value}"; then
+    target_present=true
+    local comment
+    comment="$(_json_list_field_value "${reread_file}" "${id_field}" "${id_value}" "comment")"
+    if [[ "${comment}" == *"run=${BOOTSTRAP_RUN_ID}"* ]]; then
+      run_marker_match=true
+    fi
+  fi
+  rm -f "${reread_file}"
+
+  log_warn "diagnostic reread of '${label}': retried once, for diagnosis only -- this second read was schema-valid (target_present=${target_present}, run_marker_match=${run_marker_match}). The object remains UNPROVEN and PRESERVED regardless: the authoritative read for this rollback attempt already failed and is never retried or overridden by a later diagnostic-only read."
+  return 0
 }
 
 # _json_object_is_valid <file>: true if `file` parses as a valid JSON
@@ -438,6 +547,28 @@ for row in data:
             print(value)
         break
 ' "${file}" "${match_field}" "${match_value}" "${target_field}" 2>/dev/null | tr -d '\r'
+}
+
+# _json_list_length <file>: prints the number of elements in the JSON
+# array at `file`. Callers must already have confirmed schema validity
+# separately (e.g. via _json_list_has_string_field_schema) -- this only
+# distinguishes "zero elements" from "one or more," never validates
+# shape. Tenth-pass corrective addition (P1 finding, independent
+# review): used by bootstrap-identity.sh's
+# _parent_user_child_token_state to decide whether a FRESH, complete
+# read of a user's token list is authoritatively empty.
+_json_list_length() {
+  local file="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq 'length' "${file}" 2>/dev/null
+    return
+  fi
+  python3 -c '
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as fh:
+    data = json.load(fh)
+print(len(data))
+' "${file}" 2>/dev/null
 }
 
 # _generate_run_id: a per-invocation random identifier embedded into PVE

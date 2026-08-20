@@ -837,8 +837,16 @@ class TestPveIdentityOwnership:
     def test_ambiguous_token_creation_under_an_owned_user_is_never_blindly_deleted(self, tmp_path, source_checkout):
         # The user is genuinely ours (clean success); the token-add call
         # is ambiguous and cannot be attributed to this run (no matching
-        # run-id comment) -- the token must be preserved even though its
-        # parent user is legitimately cleaned up.
+        # run-id comment) -- the token must be preserved.
+        #
+        # Eighth-pass corrective note (P1 finding, independent review):
+        # an earlier version of this test asserted the PARENT USER was
+        # "still legitimately cleaned up" here -- but real Proxmox's
+        # `pveum user delete` removes the deleted user's ENTIRE
+        # configuration, including every token under it, so deleting the
+        # user would have indirectly destroyed the very token this same
+        # test proves is preserved. The parent user must ALSO be
+        # preserved whenever its token's ownership is unproven.
         result, fake_env_obj = _run_full(
             tmp_path, source_checkout,
             scenario_overrides={"ambiguous_pveum_ops": {"token_add": self._FOREIGN_COMMENT}},
@@ -847,8 +855,13 @@ class TestPveIdentityOwnership:
         log = fake_env_obj.log_lines()
         assert not any(line.startswith("pveum user token remove") for line in log)
         assert "PRESERVING PVE token" in result.stderr
-        # The user itself is still legitimately owned/cleaned up.
-        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+        # The parent user must NOT be deleted either -- doing so would
+        # destroy the unproven token as a side effect.
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+        assert "hubinetops@pve!r0-readonly" in state["pve_tokens"]
 
     def test_ambiguous_token_self_success_is_proven_and_cleaned_up(self, tmp_path, source_checkout):
         result, fake_env_obj = _run_full(
@@ -903,6 +916,12 @@ class TestPveIdentityOwnership:
         assert state["pve_users"]["hubinetops@pve"]["comment"] == foreign
 
     def test_ledger_success_but_replaced_live_token_before_rollback_survives(self, tmp_path, source_checkout):
+        # Eighth-pass corrective note (P1 finding, independent review):
+        # even though the USER object itself was not replaced (still
+        # provably ours), its TOKEN was -- and an unproven token must
+        # block automatic deletion of its parent user too, since
+        # `pveum user delete` would otherwise destroy that unproven token
+        # as a side effect of removing the user it lives under.
         foreign = "replaced by another admin; run=SOME-OTHER-ACTOR"
         result, fake_env_obj = _run_full(
             tmp_path, source_checkout,
@@ -917,8 +936,11 @@ class TestPveIdentityOwnership:
         assert "PRESERVING PVE token" in result.stderr
         state = fake_env_obj.state()
         assert state["pve_tokens"]["hubinetops@pve!r0-readonly"]["comment"] == foreign
-        # The user itself was not replaced -- still legitimately cleaned up.
-        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+        # The parent user must be preserved too, despite being provably
+        # ours -- deleting it would destroy the unproven token.
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        assert "hubinetops@pve" in state["pve_users"]
 
     def test_current_user_with_correct_run_id_may_still_be_removed(self, tmp_path, source_checkout):
         # Positive control: an ordinary clean creation followed by an
@@ -943,6 +965,249 @@ class TestPveIdentityOwnership:
             for line in fake_env_obj.log_lines()
         )
 
+    def test_token_genuinely_absent_still_allows_owned_user_deletion(self, tmp_path, source_checkout):
+        # Tri-state positive control (eighth pass, P1 finding): a
+        # schema-valid read-back that simply does not contain the token
+        # at all is the ONE "not owned" outcome that is safe to treat as
+        # "nothing to protect" -- the owned parent user may still be
+        # deleted normally. This must not be conflated with "unproven."
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_output_override": {"token_list": "[]"},
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        # Genuinely absent -- never logged as "preserved" (there is
+        # nothing to preserve), and never attempted to be removed either.
+        assert "PRESERVING PVE token" not in result.stderr
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        # The owned user is still legitimately deleted.
+        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+        assert "PRESERVING PVE user" not in result.stderr
+        # The user's own ACL grant is cleaned up normally too -- confirms
+        # the "absent" branch is not being conservative for the wrong
+        # reason (e.g. an accidental blanket ACL-skip).
+        assert any(line.startswith("pveum acl delete / --users hubinetops@pve") for line in log)
+
+    # -----------------------------------------------------------------
+    # Tenth-pass corrective fix, P1 (independent review -- Codex):
+    # "check every child token before deleting its parent user." Proving
+    # only the EXPECTED token (r0-readonly) safe -- absent, or owned and
+    # successfully removed -- is not sufficient authorization to touch
+    # the parent user: a different administrator or a concurrent process
+    # could have registered an entirely different token under this same
+    # fixed-name user at any point after this bootstrap created it.
+    # Parent cleanup now additionally requires a FRESH, complete read of
+    # the user's ENTIRE token list, proving it empty.
+    # -----------------------------------------------------------------
+
+    def test_codex_p1_owned_expected_token_with_foreign_extra_child_token_blocks_parent(
+        self, tmp_path, source_checkout,
+    ):
+        # The direct Codex P1 regression witness: our own expected token
+        # is genuinely proven owned and safely removed, but a foreign
+        # token also registered under the same user (simulating a
+        # different administrator or a concurrent process) must still
+        # block the parent user and its ACL from being touched at all.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "replace_identity_before_failure": {
+                    "apt_get": {
+                        "add_foreign_token": {
+                            "token": "hubinetops@pve!other-token",
+                            "comment": "unrelated",
+                        },
+                    },
+                },
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        # Our own expected token IS safely removed -- this is not merely
+        # "preserve everything," it correctly distinguishes the two.
+        assert any(line.startswith("pveum acl delete / --tokens hubinetops@pve!r0-readonly") for line in log)
+        assert any(line.startswith("pveum user token remove hubinetops@pve r0-readonly") for line in log)
+        # But the parent user and its OWN ACL grant are never touched,
+        # because a residual (foreign, unproven) token remains.
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+        assert "hubinetops@pve!r0-readonly" not in state["pve_tokens"]
+        assert "hubinetops@pve!other-token" in state["pve_tokens"]
+
+    def test_expected_token_absent_with_residual_foreign_token_blocks_parent(
+        self, tmp_path, source_checkout,
+    ):
+        # The expected token is genuinely absent (nothing to protect for
+        # IT specifically), but a residual foreign token under the same
+        # user must still block parent cleanup entirely.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "replace_identity_before_failure": {
+                    "apt_get": {
+                        "remove_expected_token": True,
+                        "add_foreign_token": {
+                            "token": "hubinetops@pve!other-token",
+                            "comment": "unrelated",
+                        },
+                    },
+                },
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+        assert "hubinetops@pve!other-token" in state["pve_tokens"]
+
+    def test_final_child_token_list_command_failure_blocks_parent_even_after_expected_token_removed(
+        self, tmp_path, source_checkout,
+    ):
+        # The expected token is proven owned and safely removed (call #1
+        # succeeds normally) -- but the FRESH, complete re-read that must
+        # follow (call #2) fails outright. Fail closed: parent user and
+        # its ACL are still preserved, even though the expected token's
+        # own cleanup genuinely completed.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_token_list_fail_at_call": 2,
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert any(line.startswith("pveum user token remove hubinetops@pve r0-readonly") for line in log)
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        assert "could not read back the current full PVE token list" in result.stderr
+
+    def test_final_child_token_list_schema_invalid_blocks_parent_even_after_expected_token_removed(
+        self, tmp_path, source_checkout,
+    ):
+        # Same shape as above, but the fresh re-read (call #2) succeeds
+        # yet is schema-invalid rather than failing outright -- same
+        # fail-closed result.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_token_list_malformed_at_call": 2,
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert any(line.startswith("pveum user token remove hubinetops@pve r0-readonly") for line in log)
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        assert "could not confirm no residual child tokens remain" in result.stderr
+
+    def test_owned_expected_token_and_empty_child_list_allows_full_parent_cleanup(
+        self, tmp_path, source_checkout,
+    ):
+        # Positive control: the expected token is proven owned and safely
+        # removed, and the fresh, complete re-read genuinely proves the
+        # user now has zero tokens -- parent cleanup proceeds normally.
+        # (test_current_user_with_correct_run_id_may_still_be_removed and
+        # test_current_token_with_correct_run_id_may_still_be_removed
+        # already cover this exact ordinary-success shape end to end;
+        # this test exists to make the fresh-empty-list precondition
+        # explicit and independently named.)
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout, scenario_overrides={"fail": ["apt_get"]},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert any(line.startswith("pveum user token remove hubinetops@pve r0-readonly") for line in log)
+        assert any(line.startswith("pveum acl delete / --users hubinetops@pve") for line in log)
+        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" not in state["pve_users"]
+        assert state["pve_tokens"] == {}
+
+    # -----------------------------------------------------------------
+    # Ninth-pass corrective fix, P1/P2 (independent review): an unproven
+    # token must block mutation of the WHOLE identity dependency chain
+    # (token, token ACL, parent user, parent user ACL) -- not merely the
+    # token object and the parent user object, leaving their ACL grants
+    # exposed to removal in between.
+    # -----------------------------------------------------------------
+
+    def test_unproven_token_preserves_both_token_acl_and_user_acl(self, tmp_path, source_checkout):
+        # A privsep=1 token's effective permissions are the INTERSECTION
+        # of the owning user's permissions and the token's own -- so even
+        # removing only the PARENT USER's own ACL grant (while leaving
+        # both the user and token objects themselves untouched) can
+        # functionally disable an unproven/possibly-foreign token.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_output_override": {"token_list": '["hubinetops@pve!r0-readonly"]'},
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        # Nothing in the whole dependency chain is mutated.
+        assert not any(line.startswith("pveum acl delete") for line in log)
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE token" in result.stderr
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        acl_targets = {grant["target"] for grant in state["acl_grants"]}
+        assert "user:hubinetops@pve" in acl_targets
+        assert "token:hubinetops@pve!r0-readonly" in acl_targets
+        assert "hubinetops@pve" in state["pve_users"]
+        assert "hubinetops@pve!r0-readonly" in state["pve_tokens"]
+
+    def test_owned_token_removal_command_failure_preserves_user_and_user_acl(self, tmp_path, source_checkout):
+        # P2 finding (independent review): the token is genuinely proven
+        # OWNED (schema-valid read, comment carries this run's marker),
+        # but the removal command itself fails -- parent_user_cleanup_
+        # safe must NOT become true merely because ownership was proven;
+        # it requires the removal command to have actually succeeded.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={"fail": ["apt_get", "pveum_user_token_remove"]},
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        # The token's own ACL grant IS attempted (independent step) --
+        # only the subsequent removal command fails.
+        assert any(line.startswith("pveum acl delete / --tokens") for line in log)
+        assert any(line.startswith("pveum user token remove") for line in log)
+        assert "could not remove token" in result.stderr
+        assert "token cleanup is INCOMPLETE" in result.stderr
+        # The parent user and its OWN acl grant must both be preserved.
+        assert not any(line.startswith("pveum acl delete / --users") for line in log)
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        state = fake_env_obj.state()
+        acl_targets = {grant["target"] for grant in state["acl_grants"]}
+        assert "user:hubinetops@pve" in acl_targets
+        assert "hubinetops@pve" in state["pve_users"]
+        # The token object itself did NOT get removed from PVE's state --
+        # the fake's own "remove" handler reports failure BEFORE mutating
+        # state (it never pops the token when simulating a failure),
+        # confirming the token, too, is genuinely still there.
+        assert "hubinetops@pve!r0-readonly" in state["pve_tokens"]
+
     def test_user_ownership_readback_command_failure_preserves(self, tmp_path, source_checkout):
         # Call #1 (phase6's own pre-existing-conflict check) succeeds;
         # call #2 (rollback's live read-back) fails.
@@ -964,6 +1229,10 @@ class TestPveIdentityOwnership:
         assert "PRESERVING PVE user" in result.stderr
 
     def test_token_ownership_readback_command_failure_preserves(self, tmp_path, source_checkout):
+        # Eighth-pass corrective note (P1 finding, independent review): a
+        # token read-back COMMAND FAILURE is UNPROVEN, not "safe to treat
+        # the user's ownership check as independent" -- an unproven token
+        # must block automatic deletion of its parent user too.
         result, fake_env_obj = _run_full(
             tmp_path, source_checkout,
             scenario_overrides={"fail": ["apt_get", "pveum_token_list"]},
@@ -972,8 +1241,10 @@ class TestPveIdentityOwnership:
         log = fake_env_obj.log_lines()
         assert not any(line.startswith("pveum user token remove") for line in log)
         assert "PRESERVING PVE token" in result.stderr
-        # The user's own ownership check is independent and still succeeds.
-        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+        # The parent user must be preserved too -- deleting it would
+        # destroy the unproven token as a side effect.
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
 
     def test_token_ownership_readback_malformed_json_preserves(self, tmp_path, source_checkout):
         result, fake_env_obj = _run_full(
@@ -984,8 +1255,13 @@ class TestPveIdentityOwnership:
             },
         )
         assert result.returncode != 0
-        assert not any(line.startswith("pveum user token remove") for line in fake_env_obj.log_lines())
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
         assert "PRESERVING PVE token" in result.stderr
+        # Eighth-pass corrective note: malformed token JSON is UNPROVEN,
+        # which must also block automatic deletion of the parent user.
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
 
     def test_role_rollback_always_conservative_even_on_a_fully_clean_run(self, tmp_path, source_checkout):
         # PVE roles have no comment/provenance field at all -- even in a
@@ -1027,8 +1303,12 @@ class TestPveIdentityOwnership:
         # Sixth-pass corrective note: this scenario is exactly the real
         # witness -- a clean ledger success (phase6 succeeded; apt_get
         # fails only afterward) followed by a schema-invalid live
-        # read-back. The specific structural diagnosis must be present...
-        assert "diagnosis: element-not-object-or-missing-userid-string" in result.stderr
+        # read-back. The specific structural diagnosis must be present.
+        # Seventh-pass corrective note: `{"user": ...}` is an object
+        # missing the required "userid" field -- refined diagnosis is now
+        # the more precise "required-field-missing", not the old coarse
+        # catch-all.
+        assert "diagnosis: required-field-missing" in result.stderr
         # ...and the generic preserve message must NOT assert a false
         # "no ledger record" claim -- this run's ledger genuinely DID
         # record a clean success.
@@ -1050,12 +1330,131 @@ class TestPveIdentityOwnership:
         log = fake_env_obj.log_lines()
         assert not any(line.startswith("pveum user token remove") for line in log)
         assert "PRESERVING PVE token" in result.stderr
-        assert "diagnosis: element-not-object-or-missing-tokenid-string" in result.stderr
+        # Seventh-pass corrective note: a bare-string array element (no
+        # object at all) is now diagnosed as the more precise
+        # "element-not-object", not the old coarse catch-all.
+        assert "diagnosis: element-not-object" in result.stderr
         assert "no ledger success record" not in result.stderr
         assert "this run could not prove live ownership of the current object" in result.stderr
-        # The user's own ownership check is independent (normal schema)
-        # and still succeeds.
-        assert any(line.startswith("pveum user delete hubinetops@pve") for line in log)
+        # Eighth-pass corrective note (P1 finding, independent review): a
+        # schema-invalid token read-back is UNPROVEN, which must also
+        # block automatic deletion of the parent user -- 'pveum user
+        # delete' would otherwise destroy this same unproven token as a
+        # side effect of removing its parent.
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+
+    # -----------------------------------------------------------------
+    # Real dogfood #2, Finding B: the diagnostic-only re-read
+    # (bootstrap-common.sh::_diagnostic_ownership_reread) can NEVER
+    # authorize ownership/deletion, no matter what the second read finds
+    # -- the authoritative first read already failed, and that decision
+    # is final. These reproduce the real dogfood #2 shape exactly: call
+    # #1 (phase6's own pre-existing-conflict check) succeeds normally;
+    # call #2 (rollback's authoritative read) is schema-invalid; call #3
+    # (the new diagnostic-only re-read) varies per test.
+    # -----------------------------------------------------------------
+
+    def test_diagnostic_reread_valid_with_matching_run_marker_still_preserves(
+        self, tmp_path, source_checkout,
+    ):
+        # Call #3 gets NO override at all -- it falls through to the
+        # fake's real, current state, which genuinely does carry this
+        # run's own comment (the user really was created earlier in this
+        # same run) -- exactly the real dogfood #2 shape: a perfectly
+        # valid, run-marker-matching second read that must still NOT
+        # rescue the object from the already-failed authoritative read.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_user_list_malformed_at_call": 2,
+            },
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+        assert "diagnostic reread" in result.stderr
+        assert "target_present=true" in result.stderr
+        assert "run_marker_match=true" in result.stderr
+        # The strong invariant: preserved regardless of the diagnostic
+        # reread's own result.
+        assert "remains UNPROVEN and PRESERVED" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+
+    def test_diagnostic_reread_also_malformed_still_preserves(self, tmp_path, source_checkout):
+        # Both the authoritative read (call #2) and the diagnostic-only
+        # re-read (call #3) are schema-invalid.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_user_list_malformed_after_calls": 1,
+            },
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+        assert "diagnostic reread" in result.stderr
+        assert "still schema-invalid" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+
+    def test_diagnostic_reread_command_failure_still_preserves(self, tmp_path, source_checkout):
+        # The authoritative read (call #2) is schema-invalid; the
+        # diagnostic-only re-read (call #3) fails outright (a second
+        # `pveum` command error) rather than merely being malformed again.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_user_list_malformed_at_call": 2,
+                "pveum_user_list_fail_at_call": 3,
+            },
+        )
+        assert result.returncode != 0
+        assert not any(line.startswith("pveum user delete") for line in fake_env_obj.log_lines())
+        assert "PRESERVING PVE user" in result.stderr
+        assert "diagnostic reread" in result.stderr
+        assert "also failed (exit 1)" in result.stderr
+        state = fake_env_obj.state()
+        assert "hubinetops@pve" in state["pve_users"]
+
+    def test_diagnostic_reread_wired_for_token_ownership_too(self, tmp_path, source_checkout):
+        # Same conservative pattern applied to the token ownership path
+        # (Finding B item 6): the authoritative token-list read (call #1
+        # -- token list has no earlier successful-path caller) is
+        # schema-invalid; the diagnostic-only re-read (call #2) also
+        # fails outright.
+        #
+        # Eighth-pass corrective note (P1 finding, independent review):
+        # an earlier version of this exact test asserted the parent user
+        # was STILL deleted here -- cementing the unsafe behavior real
+        # Proxmox's 'pveum user delete' would have produced (destroying
+        # this same "preserved" token as a side effect of removing its
+        # parent user). An unproven token must now also block automatic
+        # deletion of its parent user.
+        result, fake_env_obj = _run_full(
+            tmp_path, source_checkout,
+            scenario_overrides={
+                "fail": ["apt_get"],
+                "pveum_output_override": {"token_list": '["hubinetops@pve!r0-readonly"]'},
+                "pveum_token_list_fail_at_call": 2,
+            },
+        )
+        assert result.returncode != 0
+        log = fake_env_obj.log_lines()
+        assert not any(line.startswith("pveum user token remove") for line in log)
+        assert "PRESERVING PVE token" in result.stderr
+        assert "diagnostic reread" in result.stderr
+        assert "also failed (exit 1)" in result.stderr
+        state = fake_env_obj.state()
+        assert any(full.startswith("hubinetops@pve!") for full in state["pve_tokens"])
+        # The parent user must be preserved too -- not deleted.
+        assert not any(line.startswith("pveum user delete") for line in log)
+        assert "PRESERVING PVE user" in result.stderr
+        assert "hubinetops@pve" in state["pve_users"]
 
 
 # ---------------------------------------------------------------------------

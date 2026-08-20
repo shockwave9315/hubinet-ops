@@ -10,9 +10,17 @@ against a real Proxmox source, a durable SQLite authority database, and a read-o
 API consumed by the native Home Assistant integration. It has no policy, jobs, mutation,
 endpoint activation/failover, or attestation enrollment automation, and no code path in
 this release can grant `security_continuity=trusted`. R0 has been merged into `main` and
-is implemented and constructible in this repository; it has not yet been deployed to any
-real host — real-host operational activation is a separate, later, explicitly-authorized
-step (`docs/operations/0.5-r0-operational-activation.md`).
+is implemented and constructible in this repository. It has since been installed and
+genuinely exercised in a real container (CT110) via two explicitly-authorized manual
+dogfood runs of the automated Proxmox bootstrap, both against the same physical PVE host
+(dogfood #1 stopped at Phase 10; dogfood #2 reached Phase 12, and a later read-only
+forensic replay proved the production provider and the exact Phase-12 acceptance path
+both succeed once an environmental PVE root CA issue was corrected — that replay is not
+itself a bootstrap PASS). No fresh, clean run has yet completed Phase 13, and this
+repository's own automated tests/CI remain fully hermetic throughout. Real-host
+**operational activation** is not yet accepted and remains a separate, later,
+explicitly-authorized step (`docs/operations/0.5-r0-operational-activation.md`); see
+`docs/architecture/0.5-implementation-status.md` for the full dogfood record.
 
 ## Safety model
 
@@ -52,8 +60,12 @@ step (`docs/operations/0.5-r0-operational-activation.md`).
   for system-trust fallback), git-commit-provenance-gated source deployment via
   the in-CT install above, source-centric config, and the mandatory firewall
   boundary (exact rule content/order verified), ending with CT boot enabled only
-  after a real discovery-acceptance check passes. Not yet run against a real host
-  — see the README's "What this script proves, and what it does not".
+  after a real discovery-acceptance check passes. Exercised twice against a real
+  Proxmox host (the same host both times; dogfood #1 stopped at Phase 10, dogfood #2
+  reached Phase 12) — neither run is a full bootstrap PASS, and a fresh, clean
+  Phase-13 PASS remains outstanding. See
+  `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script proves, and what it
+  does not" section for the exact current status.
 - `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
   the authority order). `docs/operations/`: the R0 operational activation runbook and the
   Home Assistant clean-break/purge plan for a real deployed instance.

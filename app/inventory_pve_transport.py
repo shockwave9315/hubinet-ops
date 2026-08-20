@@ -18,8 +18,10 @@ transport that exposes one.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 import json
+import ssl
 from types import TracebackType
 from typing import Any
 
@@ -86,6 +88,88 @@ def _require_pve_api_token(pve_api_token: str) -> str:
             kind=ProviderFailureKind.SCHEMA,
         )
     return pve_api_token
+
+
+# Real dogfood #2 finding (docs/architecture/0.5-implementation-status.md):
+# a real legacy PVE root CA missing the X509v3 Key Usage extension made
+# Python 3.13's strict certificate-chain validation reject the leaf with
+# ``ssl.SSLCertVerificationError``. httpx/httpcore wrap that underlying ssl
+# exception inside their own ``httpx.ConnectError`` (or similar) before it
+# reaches this module -- the real exception is only reachable by walking
+# ``__cause__``/``__context__``, not by matching on the outer exception's
+# type or its rendered message text.
+_EXCEPTION_GRAPH_MAX_NODES = 20
+
+
+def _exception_chain(exc: BaseException):
+    """Yield ``exc`` then every exception reachable via ``__cause__``
+    and/or ``__context__`` -- a breadth-first walk of the exception
+    *graph*, not merely a linear chain.
+
+    Eighth-pass corrective note (P3 finding, independent review): an
+    earlier version used ``current.__cause__ or current.__context__``,
+    which only ever follows ONE edge per node -- if a node has both an
+    explicit cause (``raise X from Y``) and an implicit context (a
+    DIFFERENT exception that happened to be active when ``X`` was
+    raised), the ``or`` silently discards ``__context__`` whenever
+    ``__cause__`` is set, even though Python preserves both
+    independently. A real ``ssl.SSLCertVerificationError`` reachable only
+    through the discarded edge would never be found. This walks both
+    edges from every node.
+
+    Ninth-pass corrective note (P2/P3 finding, independent review): the
+    bound below applies to UNIQUE visited nodes, not raw queue pops. An
+    intermediate version bounded total pops instead, reasoning that a
+    duplicate-heavy graph could otherwise cause unbounded work -- but
+    that reasoning was wrong: every push onto the queue happens only as
+    a direct result of visiting a genuinely NEW (not-yet-seen) node, and
+    each such node pushes at most two references (its cause and its
+    context). Capping unique visits at ``_EXCEPTION_GRAPH_MAX_NODES``
+    therefore already caps total pushes at ``2 * _EXCEPTION_GRAPH_MAX_
+    NODES``, and total pops can never exceed pushes-plus-one -- so this
+    stays strictly bounded (and cycle-safe, via the visited-identity
+    ``seen`` set) for ANY graph shape, including one built specifically
+    to maximize duplicate references. Bounding pops instead of unique
+    nodes, as the intermediate version did, is strictly worse with no
+    safety benefit: a genuinely distinct, security-relevant exception
+    (e.g. the real ``ssl.SSLCertVerificationError``) sitting within the
+    first ``_EXCEPTION_GRAPH_MAX_NODES`` unique ancestors could be missed
+    simply because earlier duplicate references exhausted a pop-based
+    budget before ever reaching it.
+    """
+
+    seen: set[int] = set()
+    queue: deque[BaseException] = deque([exc])
+    unique_visited = 0
+    while queue and unique_visited < _EXCEPTION_GRAPH_MAX_NODES:
+        current = queue.popleft()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        unique_visited += 1
+        yield current
+        if current.__cause__ is not None:
+            queue.append(current.__cause__)
+        if current.__context__ is not None:
+            queue.append(current.__context__)
+
+
+def _find_certificate_verification_error(
+    exc: BaseException,
+) -> ssl.SSLCertVerificationError | None:
+    """Find a real ``ssl.SSLCertVerificationError`` anywhere in ``exc``'s
+    cause/context chain, or ``None`` if there isn't one.
+
+    Structural/typed exception inspection only -- this is deliberately not
+    a substring/regex match against any exception's rendered message text,
+    which would be a brittle proxy for the real, typed failure the ssl
+    module already distinguishes for us.
+    """
+
+    for candidate in _exception_chain(exc):
+        if isinstance(candidate, ssl.SSLCertVerificationError):
+            return candidate
+    return None
 
 
 class ProxmoxHttpTransport:
@@ -245,10 +329,26 @@ class ProxmoxHttpTransport:
                             kind=ProviderFailureKind.SCHEMA,
                         )
         except httpx.TimeoutException as exc:
+            # Caught ahead of the broader httpx.HTTPError branch below so a
+            # timeout is never reclassified as a certificate failure, even
+            # if a timeout happened to occur mid-TLS-handshake (Finding A
+            # item 6: timeout always remains TRANSPORT).
             raise PveTransportError(
                 f"PVE request timed out: {exc}", kind=ProviderFailureKind.TRANSPORT
             ) from exc
         except httpx.HTTPError as exc:
+            # Finding A: a TLS certificate verification failure is a
+            # security/trust/configuration proof failure, never a plain
+            # network-layer outage -- detected structurally (never by
+            # parsing the rendered message) by walking the real, typed
+            # ssl.SSLCertVerificationError httpx/httpcore wrap inside this
+            # exception's cause/context chain.
+            cert_error = _find_certificate_verification_error(exc)
+            if cert_error is not None:
+                raise PveTransportError(
+                    f"PVE TLS certificate verification failed: {cert_error}",
+                    kind=ProviderFailureKind.SECURITY_PROOF,
+                ) from exc
             raise PveTransportError(
                 f"PVE request failed: {exc}", kind=ProviderFailureKind.TRANSPORT
             ) from exc
