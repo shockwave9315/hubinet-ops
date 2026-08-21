@@ -1,6 +1,6 @@
 # ADR 0006: stronger workload-continuity proof — trusted host lifecycle witness research
 
-Status: **PROPOSED** (reopened — see note below)
+Status: **ACCEPTED**
 
 This ADR is a research pass on top of ADR 0005, not a reopening of it. ADR
 0005's conclusion — that no evidence composed of ordinary, copyable PVE/
@@ -15,49 +15,70 @@ it. This ADR is that follow-on research, directed specifically at the
 **trusted host lifecycle witness** hypothesis, plus a comparative audit of
 six further candidate families.
 
-**Reopening note.** This ADR was independently reviewed and briefly recorded
-as ACCEPTED. An automated PR review (Codex) subsequently raised two P2
-findings against that acceptance, both accepted as valid, one of which
-(§7c's local-vs-remote `pmxcfs` conflation) is **load-bearing**: it changes
-this ADR's classification of the single-node `pmxcfs`-filesystem-watcher
-design and introduces a new, previously unaudited distributed variant. This
-does **not** mean the automated review disproved the whole ADR — it
-specifically narrows the `pmxcfs`-witness conclusion (§7c, §8, §9 Family A,
-§10, §12). Because a load-bearing conclusion changed after acceptance,
-**Status reverts to PROPOSED** pending a fresh review pass over the
-corrected material. Unchanged throughout: **Blocker B remains OPEN; WAVE B1
-remains DEFERRED / NOT AUTHORIZED; Phase 1C remains BLOCKED; R0 remains
-unchanged and strictly read-only.**
+**Revision history note.** This ADR was independently reviewed and briefly
+recorded as ACCEPTED. An automated PR review (Codex) subsequently raised
+two P2 findings against that acceptance, both accepted as valid, one of
+which (§7c's local-vs-remote `pmxcfs` conflation) was **load-bearing**: it
+changed this ADR's classification of the single-node `pmxcfs`-filesystem-
+watcher design and introduced a new, previously unaudited distributed
+variant. That did **not** mean the automated review disproved the whole
+ADR — it specifically narrowed the `pmxcfs`-witness conclusion (§7c, §8,
+§9 Family A/A2, §10, §12). Because a load-bearing conclusion changed after
+the initial acceptance, Status was reverted `ACCEPTED -> PROPOSED` and both
+findings were corrected throughout the document. **A fresh independent
+review of the corrected material (HEAD `daac3c2fa80bf2bd555434b79778fbdf8ac15630`)
+then PASSED with no further P1/P2 findings**, and this ADR is **re-accepted
+here as the corrected negative research record** — the exact scoped
+classification below is what that review confirmed. Unchanged throughout
+every revision: **Blocker B remains OPEN; WAVE B1 remains DEFERRED / NOT
+AUTHORIZED; Phase 1C remains BLOCKED; R0 remains unchanged and strictly
+read-only.**
 
 This ADR's conclusion (§12) is an explicit **NO-GO, narrowly scoped to the
 families this ADR actually primary-source audited** (§9: a lifecycle
 witness built on Proxmox's own task/event history, and the *single-node*
 variant of `pmxcfs` filesystem-level observation; plus five further
 families already resolvable on separate, independently-established
-grounds). A *distributed*, per-node `pmxcfs`-filesystem-watcher variant —
-newly identified by this reopening — is **not** covered by that NO-GO: it
-is classified **UNRESOLVED / NOT AUDITED HERE** (§7c, §8, §9, §24 item 7).
-**It is not a claim that every conceivable host-rooted lifecycle witness is
-impossible.** In particular, a direct `pmxcfs` config write proves that
-task history and *single-node* filesystem-change observation can be
-bypassed or blind-spotted; it does not, by itself, prove that a genuinely
-different class of host-side enforcement — kernel audit-subsystem/`auditd`
-rules, LSM hooks, `eBPF`-based syscall interception, storage-layer
-block-change tracking, a *distributed* per-node `pmxcfs` watcher, or a
-witness backed by an explicitly root-resistant/external trust anchor —
-could never observe an actual physical/logical workload substitution.
-Those broader classes were **not** audited here and remain **unresolved**,
-not disproven (§24 item 7). Consistent with the mission that produced it:
+grounds). Exact classification, as re-confirmed by the fresh review above:
+
+```text
+PVE task/event-history-only witness:                          NO-GO / insufficient
+single-node pmxcfs watcher as a generic cluster-wide witness:  NO-GO / insufficient
+distributed per-node pmxcfs watcher:                    UNRESOLVED / NOT AUDITED HERE
+broader host-rooted/external mechanisms:                UNRESOLVED
+
+Blocker B:                                              OPEN
+future positive Blocker-B mechanism ADR:                NOT STARTED / UNRESOLVED
+WAVE B1:                                                DEFERRED / NOT AUTHORIZED
+Phase 1C:                                                BLOCKED
+R0:                                                      unchanged / read-only
+```
+
+A *distributed*, per-node `pmxcfs`-filesystem-watcher variant — newly
+identified during the reopening that preceded this re-acceptance — is
+**not** covered by the NO-GO: it is classified **UNRESOLVED / NOT AUDITED
+HERE** (§7c, §8, §9, §24 item 7). **It is not a claim that every
+conceivable host-rooted lifecycle witness is impossible.** In particular, a
+direct `pmxcfs` config write proves that task history and *single-node*
+filesystem-change observation can be bypassed or blind-spotted; it does
+not, by itself, prove that a genuinely different class of host-side
+enforcement — kernel audit-subsystem/`auditd` rules, LSM hooks, `eBPF`-
+based syscall interception, storage-layer block-change tracking, a
+*distributed* per-node `pmxcfs` watcher, or a witness backed by an
+explicitly root-resistant/external trust anchor — could never observe an
+actual physical/logical workload substitution. Those broader classes were
+**not** audited here and remain **unresolved**, not disproven (§24 item 7).
+Consistent with the mission that produced it:
 
 - this ADR does not, by itself, close Blocker B for mutation authority —
   Blocker B remains **OPEN**, exactly as ADR 0005 left it;
 - this ADR does not, by itself, authorize WAVE B1 — WAVE B1 remains
   **DEFERRED / NOT AUTHORIZED**;
-- even eventual re-acceptance of *this* ADR would only mean the (now
-  corrected) research conclusion below is accepted as the current record —
-  because that conclusion is negative, acceptance would still **not**
-  authorize WAVE B1 or grant `trusted` to anything; only a **different**,
-  later ADR that actually proposes a sufficient mechanism could do that;
+- re-acceptance of *this* ADR means the (now corrected) research
+  conclusion above is accepted as the current record — because that
+  conclusion is negative, acceptance does **not** authorize WAVE B1 or
+  grant `trusted` to anything; only a **different**, later ADR that
+  actually proposes a sufficient mechanism could do that;
 - Phase 1C remains **BLOCKED**; R0 remains unchanged and strictly read-only;
 - this ADR does not amend ADR 0001, ADR 0002, ADR 0003, ADR 0004, or ADR
   0005; where it depends on their invariants it cites them and adds a new,
@@ -580,9 +601,12 @@ findings:
 5. **`trusted` persists only as long as the witness can durably/
    cryptographically prove uninterrupted coverage.** This is the right
    requirement in principle — but it presupposes (4) is achievable, and (4)
-   is not, from the two audited channels alone. A witness that cannot observe
-   everything cannot prove it observed everything, no matter how strict its
-   own internal bookkeeping is.
+   is not satisfiable by PVE task history or by the single-node `pmxcfs`
+   watcher design audited here. A witness that cannot observe everything
+   cannot prove it observed everything, no matter how strict its own
+   internal bookkeeping is. This does not extend to the distributed variant
+   (A2), which this ADR does not audit either way (§8 property 4, §24
+   item 7).
 6. **Any observation gap is fail-closed.** Sound requirement, and the
    correct default *if* a witness existed (§14) — but a fail-closed rule
    only bounds the damage of a *detected* gap. §7b's direct-`pmxcfs`-write
@@ -861,7 +885,7 @@ for a co-resident witness that cannot actually survive it:
 
 ## 12. Selected mechanism: **NO-GO, narrowly scoped to the audited families**
 
-This ADR's NO-GO has three independently-grounded parts, and neither should
+This ADR's NO-GO has three independently-grounded parts, and none should
 be read as broader than its own evidence. **Exact classification (per the
 mission's requirement, corrected this reopening — P2 #1):**
 
@@ -1122,10 +1146,10 @@ Explicit, per the mission:
 ```text
 WAVE B1 remains DEFERRED / NOT AUTHORIZED.
 
-This ADR's own conclusion is NO-GO. Independent review and separate
-acceptance of THIS ADR would mean the negative research conclusion is
-accepted as the current record -- it would NOT authorize WAVE B1, because
-this ADR proposes no sufficient mechanism for WAVE B1 to implement.
+This ADR's own conclusion is NO-GO. Independent review and acceptance of
+THIS ADR means the negative research conclusion is accepted as the current
+record -- it does NOT authorize WAVE B1, because this ADR proposes no
+sufficient mechanism for WAVE B1 to implement.
 
 WAVE B1 may only begin after a DIFFERENT, later, separately reviewed and
 separately ACCEPTED ADR proposes an actual mechanism -- whether within the
@@ -1270,10 +1294,12 @@ enrollment).
 This ADR was independently reviewed and briefly recorded as ACCEPTED; an
 automated review then raised two further P2 findings (both accepted as
 valid), one load-bearing (P2 #1: the local-vs-remote `pmxcfs` conflation),
-reopening it to **PROPOSED**. This checklist is retained, and extended with
-items 9–11 below, as the standing record a fresh review pass must verify
-before any future re-acceptance — not of a trust-granting mechanism, since
-none is proposed:
+reopening it to PROPOSED while both were corrected. **A fresh independent
+review of the corrected material then verified every item below and
+PASSED with no further P1/P2 findings; this ADR is re-accepted on that
+basis.** This checklist, extended with items 9–14, is retained as the
+standing record of what that review confirmed — not of a trust-granting
+mechanism, since none is proposed:
 
 1. Does this ADR select or authorize any mechanism sufficient for
    `security_continuity=trusted`? **No** — confirm this remains true
@@ -1351,11 +1377,11 @@ none is proposed:
 14. Is Blocker B left explicitly OPEN, R0 explicitly unaffected, and Phase
     1C explicitly BLOCKED? Verify before accepting.
 
-Re-acceptance of this ADR, if it occurs, would record the corrected research
-conclusion (NO-GO for task history and the single-node `pmxcfs` witness;
-UNRESOLVED for the distributed variant and every other family this ADR does
-not audit) as the current architecture record. It would not, by itself,
-authorize any further implementation.
+Re-acceptance of this ADR records the corrected research conclusion (NO-GO
+for task history and the single-node `pmxcfs` witness; UNRESOLVED for the
+distributed variant and every other family this ADR does not audit) as the
+current architecture record. It does not, by itself, authorize any further
+implementation.
 
 ## Sources / Evidence
 
