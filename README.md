@@ -23,9 +23,14 @@ completed the full bootstrap through Phase 13**: backend
 confirmed NONE, and CT `onboot` enabled. This repository's own automated tests/CI remain
 fully hermetic throughout — none of the above was exercised by CI, only by a real,
 manual, explicitly-authorized operator run. Real-host **operational activation**
-(the multi-day observation window and Home Assistant acceptance checklist) is a
-separate, later step (`docs/operations/0.5-r0-operational-activation.md`); see
-`docs/architecture/0.5-implementation-status.md` for the full dogfood record.
+has since taken place as its own separate, later step
+(`docs/operations/0.5-r0-operational-activation.md`): the first real Home
+Assistant enrollment and its observed R0 acceptance checks **PASSED** against
+the real R0 backend, and the service has completed roughly 7 hours of clean, stable
+observation. The recorded decision is **GO WITH OBSERVATION**, not a plain
+GO — the runbook's recommended >=24-hour observation window has not yet
+fully elapsed. See `docs/architecture/0.5-implementation-status.md` for the
+full dogfood and operational-activation record.
 
 ## Safety model
 
