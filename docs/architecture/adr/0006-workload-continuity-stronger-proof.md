@@ -218,7 +218,7 @@ against, and the answer (detected / fail-closed-though-undetected / silently
 defeated) must be stated for each, not glossed over.
 
 **T3 requires a precise boundary, not an informal "partially defended"
-status (§11 resolves this fully).** A witness process **co-resident** on the
+status (§11/§11a resolve this precisely).** A witness process **co-resident** on the
 node it observes — running as an ordinary process subject to that node's
 root — is **not** a defense against T3 merely by existing: a root-shell
 actor on that node can kill it, patch it, or feed it fabricated events,
@@ -541,9 +541,9 @@ disclaimers.
 | **C. Hardware-rooted TPM / physical attestation** | Identity/integrity of the **physical host**, not of any specific guest incarnation | Physical TPM chip on one specific machine | N/A — a physical host property, not something guests carry | **Does not address this axis at all** — a hardware TPM attests the node, not which guest occupies a VMID slot | N/A | N/A | Breaks by construction: a hardware TPM cannot follow a guest across a live/offline migration to different physical hardware | N/A to resource continuity | N/A | N/A | Not applicable to resource continuity; **this is a node-attestation primitive, a different axis entirely (ADR 0001 node section)** | Would be identical for QEMU/LXC since it says nothing about either | **Not applicable** — solves a different problem (node trust), not Blocker B |
 | **D. vTPM** | Guest-visible TPM state at read time | Software-emulated; backed by a `vtpm0` disk volume | **Yes — copied by clone/backup/snapshot identically to any other disk (already ADR 0005 §6 candidate 20)** | Fails identically to any disk-resident evidence | Fails (state travels with the snapshot) | Fails (state travels with the restore) | Travels with the guest, proves nothing about continuity | N/A | N/A | Fully replayable by anyone who can copy the disk | Root/API-level access to guest storage | QEMU only (no stock LXC vTPM) | **No** — already rejected in ADR 0005 |
 | **E. Guest cryptographic agent + guest-resident key** | Key possession at read time | Private key material stored in guest disk/config state | **Yes — disk-resident, copied by clone/backup identically (ADR 0005 §13)** | Fails — new occupant can carry the copied key forward | Fails | Fails | N/A | N/A | N/A | Replayable by whoever can read the disk | Requires cooperative in-guest agent (QGA) or `pct exec`-class access; not default-on | Asymmetric (QGA is QEMU-only; LXC needs `pct exec`) | **No** — already evaluated and rejected in ADR 0005 §13 |
-| **F. External/HSM-backed guest identity** | Key possession bound to an external HSM | Reduces to (E) unless the credential itself is bound to specific node hardware, in which case it reduces to (C) | Same as (E) or (C) depending on binding | Same failure as whichever it reduces to | Same | Same | Same | Same | Same | Same | Requires either a guest-side credential (→E) or node-bound hardware (→C) | Same asymmetry concerns as whichever it reduces to | **No** — does not introduce a new, independent property beyond (C)/(E) |
+| **F. External/HSM-backed guest identity** — **narrowed this revision (P2 correction: the earlier row incorrectly collapsed the entire family into (E) or (C), excluding the genuinely externally-rooted/out-of-band class ADR 0005/0006 leave open; corrected below** | **Narrow variant audited here: a guest-resident credential whose signing authority is an external HSM, but the guest itself still presents that credential at use time.** Proves key possession at read time, same as Family E, because the artifact actually presented/copyable still lives in guest-readable state | Narrow variant: reduces to (E) — an external signer does not change that the guest-side artifact is what a clone/restore copies | Narrow variant: **yes, same as (E)** — copied identically to Family E's own limitation | Narrow variant fails identically to (E) | Same as (E) | Same as (E) | N/A | N/A | N/A | Replayable identically to (E) | Requires cooperative in-guest presentation, same as (E) | Same asymmetry as (E) | **Narrow variant: No** — reduces to Family E, already rejected on those grounds. **The broader externally-rooted/out-of-band per-workload identity class — where a specific workload's identity is tracked/attested by an external system through a channel that is neither guest-resident nor a node-bound hardware property — is UNRESOLVED / NOT AUDITED HERE (§24 item 7). This ADR does not claim that broader class satisfies Blocker B, and does not claim it fails; it was not researched to either conclusion this pass.** |
 | **G. Operator per-mutation re-attestation / ephemeral trust** | Nothing persists as `trusted`; every mutation instead requires its own fresh, explicit, human-confirmed identity check — this **sidesteps rather than answers** the persistent-`trusted` question this ADR audits (§24 item 3) | The human operator, at the instant of the check, **plus** a safe point-in-time target-identity proof binding that confirmation to the resource actually mutated — not yet defined by this family (§24 item 3) | N/A — no persistent trust artifact exists to copy | **Not immune, and not answered by this family** — there is no *persisted* `trusted` state for a recreated occupant to inherit, but a confirmation made against occupant A is exactly as vulnerable to a same-slot substitution as any other mechanism if the confirmation is not safely fenced against a race between the human check and backend execution (§24 item 3) | No persisted state to invalidate, but the underlying rollback-substitution risk is unaddressed by this family, not solved by it | Same as rollback | Same as rollback | No persisted coverage to lose across a restart — narrower claim than "immune" | No window during which *stale persisted* trust could be consumed — does not mean the underlying occupant-substitution question is solved | ADR 0001's exact-match CAS on `resource_id`/`binding_id`/`locator_generation`/`resource_continuity_revision` prevents replay of a **stale backend decision** — it does **not**, by itself, prove the physical/logical occupant was not substituted between confirmation and execution, since ADR 0001 explicitly permits those same tokens to remain unchanged across an observationally invisible same-slot delete/recreate (ADR 0001 row 10) | Symmetric | **Does not satisfy Blocker B by itself** — operator confirmation alone is not continuity proof (§24 item 3); adopting a mutation model that never requires persistent `security_continuity=trusted` would itself require a separate architecture change to ADR 0001/0005's accepted mutation-precondition formula, not something this ADR or a Family-G choice can authorize |
-| **H. Combinations of the above** | Higher empirical confidence, no new completeness guarantee | Whichever combination of the above is used | Combining (A)+(B)+(E), for example, still fails at the shared T3 blind spot (§7b) that all three rely on ordinary API/task-visible operations to detect | **Still not distinguished** — the shared blind spot is structural (direct `pmxcfs`/disk access), not statistical; adding more of the same class of evidence does not close a hole that is a *category* of access none of them observes | Still fails unless one member of the combination independently solves it (none does) | Same | Same | Same | Same | Same | Same | Same union of assumptions as the weakest member | Same | **No** — combining insufficient evidence classes does not manufacture sufficiency; useful only as an audit/anomaly-detection signal (mirrors ADR 0005 §9-10's demotion of the administrative marker to audit-only) |
+| **H. Combinations of the above** — **corrected this revision (P2): does not claim a combination automatically "inherits the weakest member"; the actual rule is narrower (below)** | Higher empirical confidence, no new independent security property, **for combinations drawn only from Families A/B/C/D/E and F's narrow variant** | Whichever combination of those insufficient families is used | Combining (A)+(B)+(E), for example, still fails at the shared T3 blind spot (§7b) that all three rely on ordinary API/task-visible operations to detect | **Still not distinguished, for combinations of only-insufficient families** — the shared blind spot is structural (direct `pmxcfs`/disk access), not statistical; adding more of the same class of evidence, none of which independently introduces a new security property, does not close a hole that is a *category* of access none of them observes | Still fails unless one member of the combination independently solves it (none of A–E/F-narrow does) | Same | Same | Same | Same | Same | Same | Depends on which families are combined — not a fixed "weakest member" rule; see below | Same | **No, for combinations drawn only from Families A/B/C/D/E/F-narrow** — combining only insufficient evidence classes that introduce no new independent security property does not manufacture sufficiency; useful only as an audit/anomaly-detection signal (mirrors ADR 0005 §9-10's demotion of the administrative marker to audit-only). **A combination that includes a future, independently sufficient externally-rooted proof (e.g. Family F's broader unresolved class, §24 item 7) would instead be judged entirely by that proof's own contract, not by this row** — this table does not evaluate, and does not pre-judge, any such future component. |
 
 ## 10. The critical same-slot witness test
 
@@ -602,11 +602,13 @@ Family C, and it applies identically here.
   mean "authority-ineligible," but a naive implementation that treats
   "no adverse event logged" as "still trusted" would fail exactly as
   Family C failed. Fails the test.
-- **Family C/D/E/F:** already shown to be disk/config-resident or
-  node-bound, not slot-transition-observing at all; B trivially inherits
-  whatever A had unless the mechanism separately fails closed for other
-  reasons (ADR 0005 §9–§13). Fails the test for the identical reason ADR
-  0005 already gives.
+- **Family C/D/E, and Family F's narrow guest-held-key variant:** already
+  shown to be disk/config-resident or node-bound, not slot-transition-
+  observing at all; B trivially inherits whatever A had unless the
+  mechanism separately fails closed for other reasons (ADR 0005 §9–§13).
+  Fails the test for the identical reason ADR 0005 already gives. **Family
+  F's broader externally-rooted/out-of-band class is not evaluated against
+  this test at all** — it is unresolved, not audited (§9, §24 item 7).
 - **Family G (ephemeral re-attestation):** there is no *persisted*
   `security_continuity=trusted` for B to inherit, because none is ever
   durably granted — the question as literally posed ("why can B not
@@ -618,10 +620,16 @@ Family C, and it applies identically here.
   substitution risk this test probes is simply unaddressed, not solved
   (§24 item 3). Family G avoids this test by declining to attempt persistent
   `trusted` at all, not by passing it.
-- **Family H:** inherits the worst-case answer of its weakest member for
-  the T3 blind spot, because that blind spot is a category of access
-  (direct `pmxcfs`+storage write) that adding more *task/config*-based
-  evidence does not observe.
+- **Family H (combinations of only-insufficient families):** combining
+  evidence classes that each introduce no new independent security property
+  does not manufacture one — the shared T3 blind spot is a *category* of
+  access (direct `pmxcfs`+storage write) that adding more *task/config*-based
+  evidence does not observe, regardless of how many such families are
+  combined. This is not a claim that a combination always inherits "the
+  weakest member's" answer as a general rule: a combination that includes a
+  future, independently sufficient externally-rooted proof would instead be
+  judged by that proof's own contract against this same test, not by this
+  bullet (§9, §24 item 7).
 
 **Controlling conclusion, narrowly scoped:** no family built on the two
 audited channels (task history, `pmxcfs` filesystem-change observation) —
@@ -677,34 +685,55 @@ for a co-resident witness that cannot actually survive it:
   specifies no such anchor, so its failure at T3 is the *same category* of
   failure as T4, not a narrower one. This ADR does not claim Family A is
   "defensible against T3 in a meaningfully weaker sense than T4"; it is not.
-- **The only way a future mechanism may legitimately claim T3-resilience
-  without inventing a new external trust anchor is by explicitly coupling
-  its witness-authority-eligibility to the current, already-accepted
+- **Explicitly coupling witness-authority-eligibility to the current
   node/hostd trust state** (`node_trust_state`/`binding_revision`/
-  `attestation_id`) — mirroring exactly how ADR 0003 couples Blocker A/B
-  evidence to `source_attestation_epoch` (§16). Under this coupling: as
-  long as the node remains node-trusted (the separate node/hostd
-  attestation gate has not detected or reported an integrity break), a
-  co-resident witness's coverage claim may be treated as conditionally
-  valid; the instant node trust is lost or revoked for any reason, every
-  witness-coverage claim that relied on that node's trust becomes
-  immediately authority-ineligible, exactly as an epoch bump invalidates
-  prior-epoch evidence. This is a genuine, coherent way to relate the two
-  axes without merging them into one state — but it is a **design choice a
-  future mechanism's own ADR would have to make and justify**, not
-  something this ADR adopts on Family A's behalf, because Family A as
-  hypothesized here specifies no such coupling.
-- **Absent that explicit coupling, no candidate audited in this ADR is
-  entitled to claim any resilience against T3**, and this ADR does not
-  claim it for any of them — this corrects the earlier looser framing that
-  treated T3 as a bounded, partially-defensible tier for Family A.
+  `attestation_id`) — mirroring how ADR 0003 couples Blocker A/B evidence
+  to `source_attestation_epoch` (§16) — **may be a necessary
+  authority-eligibility gate for a future mechanism, but it is not, by
+  itself, sufficient to claim T3 resilience, and this ADR does not claim
+  that it is.** Coupling only means: the witness's coverage claim can never
+  outlive the node's own trust state (an epoch-style fencing property). It
+  says nothing about whether that node trust state, as currently defined,
+  actually **detects or prevents** the specific act this ADR's threat model
+  calls T3 — a root-shell actor tampering directly with `pmxcfs`/storage.
+- **The concrete node/hostd attestation/trust-root contract remains
+  unresolved in accepted architecture.** ADR 0001's node section defines
+  `node_trust_state` (`unverified`/`trusted`/`revoked`) and requires
+  re-attestation on reinstall/rejoin/hostd-key-change, but explicitly
+  leaves "konkretny node/hostd attestation protocol, key rotation i
+  operatorowa procedura ponownego nadania `trusted`" to a separate,
+  not-yet-written future review (ADR 0001 §"Nierozstrzygnięte kwestie" #6).
+  Today, nothing in accepted architecture specifies that a currently
+  `trusted` node/hostd binding actually proves the absence of an
+  in-session root-shell compromise on that node — attestation, as
+  currently designed, verifies host/endpoint *identity* across
+  reinstall/rejoin-class events, not continuous absence of root tampering
+  during normal operation. Treating current `node_trust_state=trusted` as
+  if it already meant "no root-shell actor could have tampered with
+  `pmxcfs`/storage on this node" would be exactly the "trusted PVE
+  node/hostd itself is not compromised" assumption this ADR requires be
+  stated explicitly (§5) — it must not be presented as something the
+  existing `node_trust_state` mechanism already detects or prevents.
+- **T3 resilience may therefore only be claimed once both of the
+  following hold, neither of which exists today:** (a) a future
+  mechanism's witness-authority-eligibility is explicitly coupled to
+  `node_trust_state` as described above, **and** (b) a separately accepted
+  node/hostd attestation/trust-root contract — the still-unresolved item
+  above — actually defines and provides detection or prevention semantics
+  against a root-shell actor on that node. Absent (b), coupling to
+  `node_trust_state` (a) alone gives a fencing/freshness property, not a
+  resilience property, and no candidate audited in this ADR is entitled to
+  claim any resilience against T3 on that basis — this corrects the
+  earlier framing, which risked implying that coupling alone (a) already
+  answered the T3 question.
 - Any future mechanism that turns out to require a host-resident witness
   component must, at minimum, define its own node-migration/re-attestation
   semantics (mirroring ADR 0005 §21's requirement for any node-mediated
   evidence collection), and must never present "the node/hostd is trusted"
-  as if it also meant "this specific resource's continuity is proven,"
-  except through the explicit coupling described above, and even then only
-  as strong as the node/hostd trust state itself.
+  as if it also meant "this specific resource's continuity is proven" or
+  "root-shell tampering on this node is detected/prevented" — the latter
+  requires the separate, not-yet-designed node/hostd attestation contract
+  above, not an inference from the existing `node_trust_state` value.
 
 ## 12. Selected mechanism: **NO-GO, narrowly scoped to the audited families**
 
@@ -720,12 +749,16 @@ be read as broader than its own evidence:
   `eBPF`-based enforcement, or one backed by an explicit root-resistant/
   external trust anchor, §5) was not audited here and remains **unresolved**
   (§24 item 7), not disproven.
-- **Families C, D, E, F** fail for reasons independent of the §7 audit —
-  disk-resident state that clone/backup/restore copy identically (D, E),
-  or a node-vs-resource axis mismatch that no amount of host observation
-  changes (C, F) — and this part of the conclusion is not narrowed by the
+- **Family C, D, E, and Family F's narrow guest-held-key variant** fail for
+  reasons independent of the §7 audit — disk-resident state that
+  clone/backup/restore copy identically (D, E, F-narrow), or a
+  node-vs-resource axis mismatch that no amount of host observation
+  changes (C) — and this part of the conclusion is not narrowed by the
   scoping above; it rests on the same grounds ADR 0005 already established
-  for equivalent candidates.
+  for equivalent candidates. **Family F's broader externally-rooted/
+  out-of-band per-workload identity class is UNRESOLVED / NOT AUDITED
+  HERE** — this ADR does not claim it satisfies Blocker B, and does not
+  claim it fails (§9, §24 item 7).
 - **Family G (operator per-mutation re-attestation)** does not fail this
   ADR's tests, but it also does not pass them — it sidesteps the question
   by declining to grant persistent `trusted` at all. Per §9/§10/§24 item 3:
@@ -1025,10 +1058,14 @@ enrollment).
    watching specific syscalls against `pmxcfs`/guest storage paths; LSM
    (SELinux/AppArmor-class) hooks; `eBPF`-based syscall/tracepoint
    interception; storage-layer block-change tracking (e.g. ZFS/LVM
-   snapshot-diffing) as an independent occupant-substitution witness; or a
+   snapshot-diffing) as an independent occupant-substitution witness; a
    witness deliberately backed by an explicit root-resistant/external trust
-   anchor (§5/§11a) rather than ordinary co-resident-process trust. Any of
-   these could, in principle, observe an actual physical/logical occupant
+   anchor (§5/§11a) rather than ordinary co-resident-process trust; or
+   Family F's broader externally-rooted/out-of-band per-workload identity
+   class (§9) — a specific workload's identity tracked/attested by an
+   external system through a channel that is neither guest-resident nor
+   node-bound hardware. Any of these could, in principle, observe an actual
+   physical/logical occupant
    replacement (§4 concept 3) through a channel a node-root actor cannot as
    easily bypass as the two audited here — or could fail for reasons this
    ADR has not examined. A future ADR auditing one of these must perform
@@ -1071,9 +1108,13 @@ mechanism, since none is proposed):
 6. Does §11/§11a correctly keep node/hostd trust and resource continuity
    as two separate, unmerged axes, while stating precisely that a
    co-resident witness without an explicit root-resistant/external anchor
-   is not a defense against T3 (equivalent to T4), and that a future
-   mechanism may only claim T3-resilience via an explicit coupling to
-   `node_trust_state`? Verify before accepting.
+   is not a defense against T3 (equivalent to T4), that coupling
+   witness-authority-eligibility to `node_trust_state` is at most a
+   *necessary* fencing gate — not sufficient by itself — and that T3
+   resilience may only be claimed once a separately accepted node/hostd
+   attestation contract (still unresolved, ADR 0001 §"Nierozstrzygnięte
+   kwestie" #6) actually provides root-compromise detection/prevention
+   semantics? Verify before accepting.
 7. Does this ADR's NO-GO stay explicitly scoped to the audited task/event/
    `pmxcfs`-observation families (§9 rows A/B/H), without claiming that
    every conceivable host-rooted witness (kernel audit/LSM/`eBPF`-based,
