@@ -303,7 +303,13 @@ rather than re-acceptance:
    admits up to 5, and 25+ running admits none. **Fixed** in §7a, §7d,
    §24 item 5, §25 item 17, and the Sources/Evidence citation. The overall
    Surface A conclusion (a bounded, recent status-cache view) is
-   unchanged; Family B's classification remains UNRESOLVED.
+   unchanged; Family B's classification remains UNRESOLVED. **Historical
+   note, added in full-review correction #5: this fix's own "25-total
+   ceiling" framing was itself an overcorrection** — running tasks are
+   retained *unconditionally*, with no bound of their own, so the list
+   can exceed 25 entries when 25+ tasks are running; only the *finished*-
+   task admission is budget-limited. See full-review correction #5, P2
+   #1 below for the corrected wording actually in force in §7a/§7d/etc.
 3. **Family B's task-coverage contract was overclaimed.** §7b previously
    stated, in a blanket FACT-DOC/INFERENCE bullet, that ordinary
    `qm`/`pct`/API destroy/create/clone/migrate/restore operations all
@@ -354,6 +360,113 @@ retention remains forum-strength/UNKNOWN, as already noted elsewhere in
 §7a.
 
 None of these four P2 findings or the P3 item change the underlying
+classification — task history and both `pmxcfs`-watcher variants remain
+**UNRESOLVED / NOT FULLY AUDITED** (A2: **UNRESOLVED / NOT AUDITED
+HERE**), Families D/E/F-narrow remain "No", Family C remains "not
+sufficient / not applicable as a Blocker-B resource-continuity proof",
+Blocker B remains **OPEN**, the future positive Blocker-B mechanism ADR
+remains **NOT STARTED / UNRESOLVED**, WAVE B1 remains **DEFERRED / NOT
+AUTHORIZED**, Phase 1C remains **BLOCKED**, and R0 remains unchanged and
+strictly read-only. **ADR 0006 is NOT re-accepted in this pass.**
+
+**Full-review correction #5 (this revision).** A fifth, fresh full
+end-to-end independent architecture review found four further P2
+findings and two P3 items (P1 = 0), all accepted as valid, requiring
+correction rather than re-acceptance:
+
+1. **`MAX_FINISHED=25` is not a hard 25-total-entry cap — full-review
+   correction #4's own fix overcorrected into a different, also-
+   inaccurate claim.** The primary source
+   (`my $max = $MAX_FINISHED - scalar(@$tlist); foreach my $task (@ta) {
+   last if $max <= 0; push @$tlist, $task; $max--; }`) shows
+   `active_workers()` retains **all running tasks unconditionally** —
+   the running-task count never removes or caps running entries — and
+   *then* admits finished tasks only while the list is still below 25
+   entries. Concretely: 0 running admits up to 25 finished; 5 running
+   admits up to 20; 20 running admits up to 5; 25 running admits 0
+   finished (25 total); **40 running admits 0 finished, yielding a
+   40-entry list** — `active_workers()` can legitimately return *more*
+   than 25 entries, before `broadcast_tasklist()`'s independent 32 KiB
+   payload-size truncation. **Fixed:** removed every claim of "at most 25
+   total entries" or a "25-total-entry ceiling" in §7a, §7d, §9's Family
+   B row, §10, §20, §24 item 5, §25 items 17/28, Sources/Evidence, and
+   `docs/architecture/0.5-implementation-status.md`, replacing it with
+   the precise "all running tasks retained unconditionally; finished
+   tasks admitted only while list length is below 25" description. Does
+   **not** change Family B's classification.
+2. **Family B route coverage was still over-propagated to siblings after
+   §7b's own narrowing.** §7b correctly narrowed to the source-verified
+   QEMU (`qmcreate`/`qmdestroy`) and LXC (`vzcreate`/`vzdestroy`)
+   create/destroy witness, leaving clone/rollback/restore/migration
+   UNKNOWN at QEMU/LXC parity — but §7d's "Task creation for every
+   identity-breaking event" row still implied proven coverage for "the
+   high-level API/CLI path" generally, and the Family B table's "What it
+   proves" cell, snapshot-rollback/restore cells, and QEMU/LXC-parity
+   cell ("Symmetric") still generalized past the verified witness. **Fixed**
+   to state precisely, everywhere: task-generation is source-verified only
+   for the normal QEMU/LXC create/destroy routes; rollback/restore/clone/
+   migration remain UNKNOWN at complete QEMU/LXC parity (consistent with
+   §24 item 12); rollback/restore detection semantics are not claimed
+   until their own task-generation route is verified. **Also fixed: a
+   source-repository misattribution** — the QEMU/LXC create/destroy
+   worker dispatch lives in `proxmox/qemu-server` (`src/PVE/API2/Qemu.pm`)
+   and `proxmox/pve-container` (`src/PVE/API2/LXC.pm`) respectively, not
+   `proxmox/pve-manager` as previously cited; corrected in §7b and
+   Sources/Evidence. The already-verified worker facts themselves
+   (`qmcreate`/`qmdestroy`/`vzcreate`/`vzdestroy` via `fork_worker`) are
+   unchanged. This pass does not audit clone/restore/migration — they
+   remain UNKNOWN.
+3. **§11a over-constrained every possible T3-resilient design to a single,
+   node-trust-derived precondition.** §5/§13 already correctly distinguish
+   an anchor-less/co-resident design (T3 == T4, out of scope) from one that
+   *claims* T3 resilience (must define an explicit root-resistant/external
+   anchor and prove it), but §11a's closing bullet required **every** T3-
+   resilient claim to satisfy both (a) `node_trust_state` coupling and (b)
+   a separately accepted node/hostd attestation contract — conflating the
+   node-trust axis with a genuinely independent, externally-rooted
+   resource-continuity axis that never derives its resistance from node
+   trust at all. **Fixed:** §11a now scopes (a)/(b) to node-trust-*derived*
+   T3-resilience claims only; a mechanism relying on a genuinely
+   independent, root-resistant/external anchor must instead prove that
+   anchor's own T3-resistance directly, on its own evidentiary terms, and
+   is not required to also satisfy (a)/(b). **In every case, future
+   destructive mutation still independently requires the separately
+   accepted node/hostd trust gate** — `trusted` resource continuity and
+   `trusted` node/hostd remain two independent, both-required
+   preconditions for mutation; this fix does not weaken that separation.
+4. **§17's CAS/transaction model was missing conditional node-trust
+   context for node-trust-derived designs.** §17 required revalidating the
+   *resolved current node locator* (routing/presentation context) for any
+   node-mediated evidence read, but did not separately require revalidating
+   ADR 0001's actual node-*trust* context (`node_binding_id`, `binding_revision`,
+   `attestation_id`, `node_trust_state`) for a mechanism whose continuity-
+   evidence authority-eligibility depends on node/hostd trust (per §11a's
+   node-trust-derived path). **Fixed:** §17 now conditionally requires
+   capturing and revalidating the exact accepted node-trust context
+   immediately before committing, if and only if a future mechanism makes
+   node/hostd trust part of its continuity evidence's own authority-
+   eligibility; a mismatch classifies the attempt stale/authority-
+   ineligible. A mechanism relying on a genuinely independent,
+   root-resistant/external anchor that does not depend on node trust for
+   evidence authority is not required to carry these fields. Future
+   destructive mutation still independently requires the separate
+   node/hostd trust gate regardless (§11, §16).
+
+P3 cleanup: (1) §23's R0-boundary wording ("a NO-GO here changes nothing
+about R0's...posture") was classification-inconsistent with A/A2/B's
+current UNRESOLVED status; restated classification-neutrally ("regardless
+of this ADR's unresolved/negative research outcome, R0's already-accepted
+read-only posture is unchanged"). (2) §7c's Path B description ("the only
+way the kernel could learn of it is if `pmxcfs` explicitly pushes a
+low-level invalidation/notification call") overstated the scope of the
+actual security question; narrowed to what this ADR asks — whether a
+local `fsnotify`/`inotify` *watcher* receives an event for a
+non-local-syscall change — without claiming this is the only way the
+kernel could ever learn of or revalidate changed state by any mechanism.
+The bounded five-file Path-B evidence and UNRESOLVED classification are
+unchanged by either P3 item.
+
+None of these four P2 findings or two P3 items change the underlying
 classification — task history and both `pmxcfs`-watcher variants remain
 **UNRESOLVED / NOT FULLY AUDITED** (A2: **UNRESOLVED / NOT AUDITED
 HERE**), Families D/E/F-narrow remain "No", Family C remains "not
@@ -701,22 +814,29 @@ view, not the durable archive.**
   that count again upon finding the completion-time broadcast — the
   precise phrasing throughout this ADR is "confirmed update paths
   include...", never "the two update paths."
-- **FACT-SOURCE, corrected this revision (full-review correction #4, P2
-  #2): the prior wording misread this budget.** `active_workers()`
-  (`proxmox/pve-common`, `PVE/RESTEnvironment.pm`) retains **all
-  currently running tasks** in full, and only *then* fills whatever
-  budget remains, up to a fixed ceiling of **`MAX_FINISHED = 25`** total
-  entries, with recently-finished tasks: `my $max = $MAX_FINISHED -
-  scalar(@$tlist); foreach my $task (@ta) { last if $max <= 0; push
-  @$tlist, $task; $max--; }` — running tasks are already in `$tlist`
-  before this loop runs. Concretely: 0 running tasks admits up to 25
-  finished tasks; 5 running admits up to 20 finished; 20 running admits up
-  to 5 finished; 25 or more running admits **no** finished tasks at all.
-  **This is not** "all running tasks plus 25 additional finished tasks" —
-  it is a single, shared 25-entry ceiling that finished tasks fill only
-  after running tasks are accounted for, independent of the archive's own
-  size limit (Surface B), **before** the payload-size truncation below is
-  applied.
+- **FACT-SOURCE, corrected this revision (full-review correction #5, P2
+  #1): the prior wording overcorrected into a different, also-inaccurate
+  claim.** `active_workers()` (`proxmox/pve-common`,
+  `PVE/RESTEnvironment.pm`) retains **all currently running tasks
+  unconditionally** — the running-task count never, by itself, removes or
+  caps running entries. It then adds recently-finished tasks *only while
+  the current list length remains below* a fixed threshold of
+  **`MAX_FINISHED = 25`**: `my $max = $MAX_FINISHED - scalar(@$tlist);
+  foreach my $task (@ta) { last if $max <= 0; push @$tlist, $task; $max--;
+  }` — running tasks are already in `$tlist` before this loop runs.
+  Concretely: 0 running tasks admits up to 25 finished (list length up to
+  25); 5 running admits up to 20 finished (length up to 25); 20 running
+  admits up to 5 finished (length up to 25); 25 or more running admits
+  **no** finished tasks — and the list length is then however many tasks
+  are actually running, which **can exceed 25** (e.g. 40 running tasks
+  yields a 40-entry list with 0 finished tasks added). **`MAX_FINISHED`
+  is not a hard cap on the list's total size** — it only bounds how many
+  *finished* tasks are appended, contingent on how many tasks are already
+  running; a busy node can legitimately return well over 25 entries from
+  `active_workers()` alone, independent of the archive's own size limit
+  (Surface B). `broadcast_tasklist()`'s **separate, independent** 32 KiB
+  payload-size truncation (below) is the only bound that applies
+  regardless of how many entries `active_workers()` produced.
 - **FACT-SOURCE, corrected this revision (full-review correction #2,
   P2 #2).** `broadcast_tasklist()`'s *executable* truncation loop
   (`proxmox/pve-cluster`, `src/PVE/Cluster.pm`) is:
@@ -730,24 +850,27 @@ view, not the durable archive.**
   the load-bearing figure, with the unimplemented 128 KiB comment recorded
   only as documented intent, not current behavior.
 - **Conclusion for Surface A, corrected this revision (full-review
-  correction #4, P2 #2):** this is a **recent status-cache surface
-  only** — bounded to (at most) **25 total entries per node**, with
-  running tasks retained in full and finished tasks admitted only into
-  whatever budget remains under that shared ceiling (so fewer finished
-  tasks are retained the more tasks are currently running, and none once
-  25 or more tasks are already running), updated through confirmed paths
-  that include worker start, worker completion, and an additional
-  ~10-second periodic refresh (§7a; this ADR does not claim these three
-  are exhaustive), with its serialized payload actually truncated at 32
-  KiB (not 128 KiB), no durable retention, and no cursor. A sufficiently
-  busy ordinary T1/T2 interval (enough further finished tasks to exhaust
-  the remaining budget under the 25-entry ceiling, or enough further tasks
-  to exceed 32 KiB serialized, on the same node before the next check)
-  can cause a completed task's record to disappear from this surface
-  entirely, independent of the archive files in Surface B. **Task
-  creation (a UPID exists) is distinct from guaranteed observation in any
-  one Surface A snapshot** — Surface A is a bounded, truncating
-  status-cache view, not a durable ledger of every task ever created.
+  correction #5, P2 #1, replacing the prior "25 total entries" over-
+  correction):** this is a **recent status-cache surface only**. Running
+  tasks are always retained in full, with no upper bound of their own;
+  finished tasks are admitted only while the list is still below 25
+  entries (so a node with 25+ running tasks retains *zero* finished
+  tasks, and a busy node's `active_workers()` output can legitimately
+  exceed 25 entries in total), updated through confirmed paths that
+  include worker start, worker completion, and an additional ~10-second
+  periodic refresh (§7a; this ADR does not claim these three are
+  exhaustive). Independently of that composition, the serialized payload
+  is truncated at 32 KiB (not 128 KiB) by `broadcast_tasklist()`, with no
+  durable retention and no cursor. A sufficiently busy ordinary T1/T2
+  interval (enough further finished tasks to exhaust the remaining
+  under-25 budget for finished-task admission, and/or enough further
+  tasks — running or finished — to exceed 32 KiB serialized, on the same
+  node before the next check) can cause a completed task's record to
+  disappear from this surface entirely, independent of the archive files
+  in Surface B. **Task creation (a UPID exists) is distinct from
+  guaranteed observation in any one Surface A snapshot** — Surface A is a
+  bounded, truncating status-cache view, not a durable ledger of every
+  task ever created.
 
 **Surface B: `GET /nodes/<node>/tasks` — the bounded node-local archive.**
 
@@ -814,17 +937,20 @@ conclude that no such witness design can succeed (§8).
 ### 7b. Task creation coverage for destroy/create/clone/rollback/restore
 
 - **FACT-SOURCE, narrowed this revision (full-review correction #4, P2
-  #3): the same-slot create/destroy witness, confirmed directly against
-  source, not a blanket claim across every identity-breaking
-  operation.** For **QEMU**: create dispatches through
+  #3; repository attribution corrected this revision, full-review
+  correction #5, P2 #2): the same-slot create/destroy witness, confirmed
+  directly against source, not a blanket claim across every
+  identity-breaking operation.** For **QEMU**: create dispatches through
   `fork_worker('qmcreate', ...)`, and destroy through
-  `fork_worker('qmdestroy', ...)` (`proxmox/pve-manager`,
-  `PVE::API2::Qemu`). For **LXC**: create dispatches through a
+  `fork_worker('qmdestroy', ...)` (`proxmox/qemu-server`,
+  `src/PVE/API2/Qemu.pm` — **not** `proxmox/pve-manager` as a prior
+  revision misattributed). For **LXC**: create dispatches through a
   `vzcreate`-named worker via `fork_worker(...)`, and destroy through
-  `fork_worker('vzdestroy', ...)` (`proxmox/pve-manager`,
-  `PVE::API2::LXC`). Ordinary QEMU/LXC destroy and create, through these
-  verified normal API routes, are confirmed to create worker/UPID task
-  records exactly like any other task (§7a).
+  `fork_worker('vzdestroy', ...)` (`proxmox/pve-container`,
+  `src/PVE/API2/LXC.pm` — likewise **not** `proxmox/pve-manager`).
+  Ordinary QEMU/LXC destroy and create, through these verified normal API
+  routes, are confirmed to create worker/UPID task records exactly like
+  any other task (§7a).
 - **UNKNOWN, explicitly not extrapolated from the bullet above.** This
   session did **not** re-derive the exact route-registration source line
   for clone, snapshot rollback, backup restore, migration, or any other
@@ -947,13 +1073,21 @@ paths must not be conflated, and were conflated in the prior revision.**
 - **Path B — remotely-replicated / behind-the-mount changes.** When a
   change originates on a *different* node and reaches this node only via
   Corosync (applied inside `pmxcfs`'s own in-memory/SQLite state, not via a
-  syscall on this node's mount), the local kernel has no syscall to hook —
-  the *only* way the kernel could learn of it is if `pmxcfs` explicitly
-  pushes a low-level invalidation/notification call. This is exactly what
-  §7c's FUSE-operation-table finding, and the four further files checked,
-  found **absent**. This is the structurally correct scope for that
-  finding, and for the FUSE/`virtiofs` `inotify`-support RFC status below
-  (that RFC thread is itself about surfacing exactly this class of
+  syscall on this node's mount), the local kernel has no syscall on
+  *this* node to hook for that change. **Narrowed this revision
+  (full-review correction #5, P3 #2): the claim below is scoped to what
+  this ADR's security question actually asks — whether a local
+  `fsnotify`/`inotify` watcher receives an event for a change that did
+  not originate through a local VFS syscall — not a broader claim about
+  every possible way the kernel could ever later learn of or revalidate
+  changed state.** For a local `fsnotify`/`inotify` watcher to receive an
+  event for this behind-the-mount change, an explicit server/kernel
+  notification path would be required — specifically, `pmxcfs` pushing a
+  low-level invalidation/notification call. This is exactly what §7c's
+  FUSE-operation-table finding, and the four further files checked, found
+  **absent**. This is the structurally correct scope for that finding,
+  and for the FUSE/`virtiofs` `inotify`-support RFC status below (that
+  RFC thread is itself about surfacing exactly this class of
   behind-the-mount, non-local-syscall change — the `virtiofs` guest-side
   case is architecturally analogous to this cross-node case, not to Path A).
 - **FACT-SOURCE, general kernel limitation, independent of `pmxcfs`, pinned
@@ -1008,9 +1142,9 @@ paths must not be conflated, and were conflated in the prior revision.**
 | Property required for a witness | Stock PVE support |
 | --- | --- |
 | Monotonic, gapless task/event cursor, native to either PVE task surface | **No** — UPID is not a sequence; both Surface A and Surface B are independently bounded (§7a) |
-| Officially guaranteed task-history retention (either surface) | **No** — Surface A retains all running tasks in full and admits finished tasks only into whatever budget remains under a shared `MAX_FINISHED=25`-total-entry ceiling (0 running admits up to 25 finished; 25+ running admits none), on top of a 32 KiB serialized-payload truncation, refreshed through confirmed paths including worker start, worker completion, and every ~10s (not claimed exhaustive); Surface B rotates at a fixed size threshold (`index`/`index.1`); neither is a documented, permanent ledger (§7a) |
+| Officially guaranteed task-history retention (either surface) | **No** — corrected this revision (full-review correction #5, P2 #1): Surface A retains all running tasks unconditionally (no upper bound of their own) and admits finished tasks only while the current list length is still below `MAX_FINISHED=25` (0 running admits up to 25 finished; 25+ running admits none, and the list can then exceed 25 entries total), independently followed by a 32 KiB serialized-payload truncation — `MAX_FINISHED` is not a hard cap on total list size; refreshed through confirmed paths including worker start, worker completion, and every ~10s (not claimed exhaustive); Surface B rotates at a fixed size threshold (`index`/`index.1`); neither is a documented, permanent ledger (§7a) |
 | Whether a *stateful*, fail-closed overlap-sentinel witness could compensate for either surface's boundedness | **UNRESOLVED / NOT DESIGNED OR AUDITED HERE** — this ADR only shows a *stateless* observer cannot; a witness that durably tracks its own sentinel between observations was never evaluated (§7a, §10, §24 item 10) |
-| Task creation for *every* identity-breaking event | **No** — only for the high-level API/CLI path; direct `pmxcfs` write bypasses it entirely (§7b) — a T3-tier gap, supplementary/non-load-bearing (§5) |
+| Task creation for *every* identity-breaking event | **UNKNOWN beyond the verified create/destroy witness — corrected this revision (full-review correction #5, P2 #2).** Ordinary QEMU/LXC create and destroy, through the verified normal API routes checked in §7b, are confirmed to create UPID worker tasks. Complete task-generation coverage for every *other* in-scope identity-breaking route (clone, snapshot rollback, backup restore, migration, and any other variant) remains **UNKNOWN** — not re-derived at this citation granularity (§7b, §24 item 12). Separately, a direct `pmxcfs`/storage write (T3) creates no task at all, but this remains a supplementary, out-of-scope, non-load-bearing observation (§5, §7b) |
 | Reliable same-node, locally-originated `pmxcfs` change delivery (Path A: ordinary VFS `fsnotify` for a syscall issued on the watched node itself) | **UNKNOWN — plausible/expected per general Linux VFS behavior, NOT proven, and NOT disproven by this ADR** (corrected this reopening, P2 #1). The absent FUSE notify-callback finding does not bear on this path (§7c) |
 | Reliable cross-node `pmxcfs` change delivery for Corosync-replicated writes (Path B: a change applied on this node only via Corosync, no local syscall) | **No mechanism found in the five core files checked**, and FUSE-level support for exactly this class of behind-the-mount notification remained RFC-stage as of the mid-2025 kernel status checked; not verified as an exhaustive whole-repository absence (§7c, §24 item 8) |
 | Distributed, per-node `pmxcfs` watcher relying only on Path A per node | **UNRESOLVED / NOT AUDITED HERE** — depends on Path A's completeness (above, unproven), on which node executes a given operation (§7b, UNKNOWN), and on undesigned distributed coverage/gap semantics (§7c, §8, §9) |
@@ -1205,7 +1339,7 @@ disclaimers.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | **A. Single-node `pmxcfs`/hostd lifecycle witness + external epoch** — **corrected post-merge (P2 #1): downgraded from NO-GO to UNRESOLVED — the prior row's cross-node coverage-gap claim overstated a bounded five-file search as a proven blind spot** | Intended: gapless observation of identity-breaking events whose local syscall executes on the one node this witness runs on | A single host-resident witness process on one node; **is intended to defend** T1/T2 *for operations whose syscall executes on that same node* (Path A, §7c — plausible/expected, but UNKNOWN/unproven for `pmxcfs` specifically, not disproven — corrected this revision, full-review correction #4, P2 #1: actual protection is not yet established, only the design intent); whether it has coverage for operations executed on a different node is **UNRESOLVED** — the claimed cross-node gap is only an unproven inference from a bounded search (§7c, §24 item 8), not an established architectural fact. As hypothesized, it also specifies no explicit root-resistant/external trust anchor (§5), so T3 additionally collapses into T4 for it (§11a) — **not the load-bearing reason for this row's classification either way** (§5's consistency rule, §8) | Epoch value: no (external); whether the cross-node question affects clone-copyability is not evaluated | **UNRESOLVED — not shown to be distinguished, and not shown to fail, when the occupant's destroy/create syscall executes on a node other than the one this witness watches** (§7c: the absence of a confirmed remote-delivery mechanism is bounded to five checked files, not exhaustive). Even when the syscall executes on the watched node, this ADR does not prove Path A delivery is complete for `pmxcfs` (UNKNOWN) | Same unresolved cross-node/single-node question applies | Same | Requires explicit handling (§15); whether migration to a different node defeats coverage depends on the unresolved cross-node question | Must fail closed (§14); does not resolve the cross-node question either way | Not inherently defended | Not inherently defended; depends on epoch uniqueness discipline (ADR 0005 §16-style), which is sound but does not resolve the coverage question | A single ordinarily-privileged observer confined to one node | Symmetric in principle (both QEMU/LXC configs live under `pmxcfs`) | **UNRESOLVED / NOT FULLY AUDITED** — this ADR does not claim this design satisfies §6/§8's coverage requirement, and does not claim it fails it (§8 property 4, §24 item 7/8) |
 | **A2. Distributed, per-node `pmxcfs` lifecycle witness + external epoch** — **new this reopening (P2 #1): not audited, not designed** | Hypothetical: one witness per relevant PVE node, each relying only on that node's own local (Path A) delivery, intended so that whichever node actually executes a given operation's syscall has its own watcher observe it directly | One witness process per node in the source; whether this closes, partially closes, or fails to close the single-node gap above is **not evaluated** | **Not evaluated** | **UNRESOLVED / NOT AUDITED HERE** — depends on Path A's completeness at every node (UNKNOWN, §7c), on which node actually executes a given operation (UNKNOWN, §7b), and on cross-node coverage/gap semantics never designed here. This ADR does **not** claim this design observes a same-slot recreate, and does **not** claim it fails to | Not evaluated | Not evaluated | Not evaluated — a distributed witness's node-migration semantics were never designed | Not evaluated — multi-node restart/coordination semantics were never designed | Not evaluated | Not evaluated | Would require witness presence on every node in the source; whether this incidentally observes the T3 combined config+disk bypass (§7b) — since even a root actor's local `rm` is still a local syscall — is **not verified or claimed here either way** | Not evaluated | **UNRESOLVED / NOT AUDITED HERE** — this ADR does not claim this design satisfies ADR 0005 §14, and does not claim it fails (§24 item 7) |
-| **B. PVE task/event/audit history as witness** — **corrected this revision (full-review correction #2, P2 #1): downgraded from NO-GO to UNRESOLVED — this ADR's own analysis only shows a *stateless* observer fails; a *stateful*, fail-closed overlap-sentinel design was never audited** | A record exists on at least one of two surfaces (§7a) for operations that went through the high-level API/CLI path; whether a *stateful* witness could durably prove continuous coverage from these records is unresolved | Trust in Proxmox's own task subsystem, **plus, for any stateful design, durable state of the witness's own (sentinel tracking) — not evaluated here** | No (event record itself isn't guest state) | **UNRESOLVED, not a confirmed failure (§10): a genuine destroy+create pair via the normal API/CLI creates a worker/UPID task record for each operation (§7b) — corrected this pass (full-review pass #3, P2 #3): this is task **creation**, not a guarantee of **observation** in any arbitrary later snapshot of either surface. Surface A is a bounded, actively-truncating status-cache view (retaining only ~25 finished tasks, updated through confirmed paths including worker start, worker completion, and an additional ~10s refresh, truncated at 32 KiB), and Surface B is a size-rotated archive; a *stateless* observer querying at two points in time cannot prove a created pair's records weren't aged out of both surfaces between checks. Whether a *stateful* witness that durably tracks its own overlap sentinel and fails closed on its disappearance can close this gap is genuinely unaudited (§7a, §24 item 10). The T3 direct-`pmxcfs`-write bypass (§7b) is a separate, real, but supplementary/non-load-bearing observation (§5)** | Not detected by a stateless observer unless rollback itself is API-invoked and checked before rotation (§7a); unresolved for a stateful design | Same as same-slot recreate | Not addressed | Both surfaces are bounded, for different reasons (count/payload-size/time for Surface A, size for Surface B) — an old event can be silently aged out of either for a stateless observer (§7a); whether a stateful sentinel design detects this as a gap is unresolved | A gap in polling either surface is invisible to a stateless observer; neither surface has a *native* cursor; whether a witness-maintained sentinel can substitute for one is unresolved (§7a, §24 item 10) | Not addressed | Ordinary `VM.Audit`/`Sys.Audit`-class read access, not root | Symmetric | **UNRESOLVED / NOT FULLY AUDITED** — this ADR does not claim a task-history-based witness (stateless or stateful) satisfies ADR 0005 §14, and does not claim every possible design fails it; this is a narrower conclusion than ADR 0002's own prior Class B **UNKNOWN**, not a claim beyond it |
+| **B. PVE task/event/audit history as witness** — **corrected this revision (full-review correction #2, P2 #1): downgraded from NO-GO to UNRESOLVED — this ADR's own analysis only shows a *stateless* observer fails; a *stateful*, fail-closed overlap-sentinel design was never audited** | A record exists on at least one of two surfaces (§7a) for the source-verified QEMU/LXC create/destroy routes (§7b) — corrected this revision (full-review correction #5, P2 #2) to stop overstating this to "the high-level API/CLI path" generally, since complete task-generation coverage for every other in-scope identity-breaking route remains UNKNOWN (§24 item 12); whether a *stateful* witness could durably prove continuous coverage from these records is unresolved | Trust in Proxmox's own task subsystem, **plus, for any stateful design, durable state of the witness's own (sentinel tracking) — not evaluated here** | No (event record itself isn't guest state) | **UNRESOLVED, not a confirmed failure (§10): a genuine destroy+create pair via the normal API/CLI creates a worker/UPID task record for each operation (§7b) — corrected this pass (full-review pass #3, P2 #3): this is task **creation**, not a guarantee of **observation** in any arbitrary later snapshot of either surface. Surface A is a bounded, actively-truncating status-cache view — corrected this revision (full-review correction #5, P2 #1): all running tasks are retained unconditionally, and finished tasks are admitted only while the list length is still below `MAX_FINISHED=25` (not a hard cap on total list size), updated through confirmed paths including worker start, worker completion, and an additional ~10s refresh, independently truncated at 32 KiB — and Surface B is a size-rotated archive; a *stateless* observer querying at two points in time cannot prove a created pair's records weren't aged out of both surfaces between checks. Whether a *stateful* witness that durably tracks its own overlap sentinel and fails closed on its disappearance can close this gap is genuinely unaudited (§7a, §24 item 10). The T3 direct-`pmxcfs`-write bypass (§7b) is a separate, real, but supplementary/non-load-bearing observation (§5)** | **Corrected this revision (full-review correction #5, P2 #2): whether rollback generates a task record at all is itself UNKNOWN** — this ADR's §7b witness is verified only for QEMU/LXC create/destroy, not rollback (§24 item 12). If a future audit confirms rollback also generates a task record, the same stateless-observer/rotation caveat as create/destroy (above) would additionally apply; unresolved for a stateful design either way | **Same open question as rollback** — whether restore generates a task record at all is UNKNOWN (§7b, §24 item 12); if confirmed, the same same-slot-recreate caveats above would apply | Not addressed | Both surfaces are bounded, for different reasons (count/payload-size/time for Surface A, size for Surface B) — an old event can be silently aged out of either for a stateless observer (§7a); whether a stateful sentinel design detects this as a gap is unresolved | A gap in polling either surface is invisible to a stateless observer; neither surface has a *native* cursor; whether a witness-maintained sentinel can substitute for one is unresolved (§7a, §24 item 10) | Not addressed | Ordinary `VM.Audit`/`Sys.Audit`-class read access, not root | **Corrected this revision (full-review correction #5, P2 #2): source-verified symmetric only for the normal create/destroy witness** (§7b: QEMU `qmcreate`/`qmdestroy`, LXC `vzcreate`/`vzdestroy`) — broader identity-breaking task-generation parity (clone/rollback/restore/migration) remains UNKNOWN for both platforms (§24 item 12) | **UNRESOLVED / NOT FULLY AUDITED** — this ADR does not claim a task-history-based witness (stateless or stateful) satisfies ADR 0005 §14, and does not claim every possible design fails it; this is a narrower conclusion than ADR 0002's own prior Class B **UNKNOWN**, not a claim beyond it |
 | **C. Hardware-rooted TPM / physical attestation** | Identity/integrity of the **physical host**, not of any specific guest incarnation | Physical TPM chip on one specific machine | N/A — a physical host property, not something guests carry | **Does not address this axis at all** — a hardware TPM attests the node, not which guest occupies a VMID slot | N/A | N/A | Breaks by construction: a hardware TPM cannot follow a guest across a live/offline migration to different physical hardware | N/A to resource continuity | N/A | N/A | Not applicable to resource continuity; **this is a node-attestation primitive, a different axis entirely (ADR 0001 node section)** | Would be identical for QEMU/LXC since it says nothing about either | **Not applicable** — solves a different problem (node trust), not Blocker B |
 | **D. vTPM** | Guest-visible TPM state at read time | Software-emulated; backed by a `vtpm0` disk volume | **Yes — copied by clone/backup/snapshot identically to any other disk (already ADR 0005 §6 candidate 20)** | Fails identically to any disk-resident evidence | Fails (state travels with the snapshot) | Fails (state travels with the restore) | Travels with the guest, proves nothing about continuity | N/A | N/A | Fully replayable by anyone who can copy the disk | Root/API-level access to guest storage | QEMU only (no stock LXC vTPM) | **No** — already rejected in ADR 0005 |
 | **E. Guest cryptographic agent + guest-resident key** | Key possession at read time | Private key material stored in guest disk/config state | **Yes — disk-resident, copied by clone/backup identically (ADR 0005 §13)** | Fails — new occupant can carry the copied key forward | Fails | Fails | N/A | N/A | N/A | Replayable by whoever can read the disk | Requires cooperative in-guest agent (QGA) or `pct exec`-class access; not default-on | Asymmetric (QGA is QEMU-only; LXC needs `pct exec`) | **No** — already evaluated and rejected in ADR 0005 §13 |
@@ -1290,7 +1424,11 @@ Family C, and it applies identically here.
   ordinary API/CLI create of occupant B, same VMID
   enough further ordinary management-surface tasks occur, on this slot
     or on any other guest sharing the same bounded surface, to exceed:
-      Surface A's ~25-finished-task cache / 32 KiB serialized payload, and/or
+      Surface A's finished-task admission budget under MAX_FINISHED=25
+        (which shrinks as more tasks are concurrently running, and
+        admits none once 25+ tasks are running -- corrected this
+        revision, full-review correction #5, P2 #1) and/or its
+        independent 32 KiB serialized-payload truncation, and/or
       Surface B's fixed-size archive rotation threshold (§7a)
 
   observation O2: query the same task surface(s) again for slot 101,
@@ -1504,18 +1642,47 @@ for a co-resident witness that cannot actually survive it:
   node/hostd itself is not compromised" assumption this ADR requires be
   stated explicitly (§5) — it must not be presented as something the
   existing `node_trust_state` mechanism already detects or prevents.
-- **T3 resilience may therefore only be claimed once both of the
-  following hold, neither of which exists today:** (a) a future
-  mechanism's witness-authority-eligibility is explicitly coupled to
-  `node_trust_state` as described above, **and** (b) a separately accepted
-  node/hostd attestation/trust-root contract — the still-unresolved item
-  above — actually defines and provides detection or prevention semantics
-  against a root-shell actor on that node. Absent (b), coupling to
-  `node_trust_state` (a) alone gives a fencing/freshness property, not a
-  resilience property, and no candidate audited in this ADR is entitled to
-  claim any resilience against T3 on that basis — this corrects the
-  earlier framing, which risked implying that coupling alone (a) already
-  answered the T3 question.
+- **T3 resilience may only be claimed once its evidentiary basis actually
+  supports it — the exact requirement depends on *where* the mechanism's
+  T3-resilience claim comes from. Corrected this revision (full-review
+  correction #5, P2 #3): a prior wording of this bullet imposed a single,
+  universal precondition on every possible T3-resilient design, which
+  over-constrained the space §5/§13 deliberately leave open.**
+  - **If a mechanism derives its T3-resilience claim *from* node/hostd
+    trust** — i.e., its resistance to a root-shell actor rests on the
+    node itself being attested/trusted, rather than on an evidentiary
+    channel independent of the node — then **both** of the following must
+    hold, neither of which exists today: (a) the mechanism's
+    witness-authority-eligibility is explicitly coupled to
+    `node_trust_state` (above), **and** (b) a separately accepted
+    node/hostd attestation/trust-root contract — the still-unresolved
+    item above — actually defines and provides detection or prevention
+    semantics against a root-shell actor on that node. Absent (b),
+    coupling to `node_trust_state` (a) alone gives a fencing/freshness
+    property, not a resilience property, and no node-trust-derived
+    candidate is entitled to claim T3 resilience on (a) alone.
+  - **If a mechanism instead relies on a genuinely independent,
+    root-resistant/external resource-continuity anchor** (§5) — one whose
+    T3 resistance does not derive from, and is not contingent on,
+    `node_trust_state` or any node/hostd attestation contract at all —
+    it is **not** required to also satisfy (a)/(b) above; those
+    preconditions apply specifically to node-trust-*derived* claims. Such
+    a mechanism's own future positive ADR must instead prove that
+    independent anchor's T3-resistance property explicitly and directly,
+    on its own evidentiary terms (§5, §13) — this ADR does not design or
+    audit any such anchor and does not pre-approve one merely for being
+    "independent of node trust."
+  - **In every case, regardless of which path a resource-continuity proof
+    takes: future destructive mutation still independently requires the
+    separately accepted node/hostd trust gate** (ADR 0001, ADR 0005 §21,
+    §11 above) — a resource-continuity mechanism's own T3-resistance
+    property, however it is established, never substitutes for that gate,
+    and never grants node/hostd trust by implication. Symmetrically, a
+    trusted node/hostd never grants resource continuity by implication
+    (§11). **`trusted` resource continuity and `trusted` node/hostd
+    remain two independent, both-required preconditions for mutation —
+    neither implies the other, and this bullet does not weaken that
+    separation.**
 - Any future mechanism that turns out to require a host-resident witness
   component must, at minimum, define its own node-migration/re-attestation
   semantics (mirroring ADR 0005 §21's requirement for any node-mediated
@@ -1810,7 +1977,36 @@ Not implemented here; recorded as a binding requirement, mirroring ADR
   field (exact `resource_id`, active `binding_id`, `locator_generation`,
   current `resource_continuity_revision`, current
   `source_attestation_epoch`, and, if node-mediated, the resolved current
-  node locator) immediately before committing;
+  node locator) immediately before committing. **The resolved current
+  node locator is routing/presentation context (which node the evidence
+  read was actually served from), always preserved when the remote
+  evidence read is node-scoped — it is not, by itself, node *trust*
+  context (§11/§11a distinguish the two axes).**
+- **corrected this revision (full-review correction #5, P2 #4): node-trust
+  context is a conditional, not universal, addition to this CAS.** ADR
+  0001 separately defines `node_binding_id`, `node` `binding_revision`,
+  `attestation_id`, and `node_trust_state` as the accepted security context
+  for trusted mutation routing — distinct from the routing-only node
+  locator above, and from resource-level continuity evidence (§11/§11a).
+  **If, and only if, a future accepted Blocker-B mechanism makes
+  node/hostd trust part of the *authority-eligibility of its continuity
+  evidence itself*** (i.e. it is a node-trust-derived design per §11a),
+  then that mechanism's committing transition **must also** capture and
+  revalidate the exact accepted node-trust context — at minimum
+  `node_binding_id`, `node binding_revision`, `attestation_id`, and the
+  required `node_trust_state == trusted` (or an exact future accepted
+  equivalent) — immediately before accepting the transition; any change
+  or mismatch in that context classifies the attempt as
+  stale/authority-ineligible, granting no trust and accepting no stale
+  evidence. **A mechanism relying on a genuinely independent,
+  root-resistant/external resource-continuity anchor whose accepted
+  security contract does not depend on node trust for evidence authority
+  is not required to carry these node-trust fields in its own CAS** — see
+  §11a's parallel distinction. In every case, this CAS governs only
+  whether resource-continuity *evidence* is accepted as fresh; future
+  destructive *mutation* still independently requires the separately
+  accepted node/hostd trust gate defined by accepted architecture (§11,
+  §16, below), regardless of which path this CAS took;
 - a stale expected-context CAS must classify the attempt as stale and
   accept no transition, never partially apply one (ADR 0002/0003 pattern);
 - a witness-coverage gap transition (§14) and a migration-triggered
@@ -1909,11 +2105,14 @@ unblocked.
 ## 23. R0 boundary
 
 Unchanged. R0 remains strictly read-only. ADR 0005 §24's list of what R0
-must never do is unaffected by this ADR's conclusion — a NO-GO here changes
-nothing about R0's already-accepted posture, since R0 never depended on
-Blocker B closing (ADR 0005 §24, §27; `0.5-inventory-model.md`'s Phase 1
-runtime activation gate references neither workload continuity nor trusted
-enrollment).
+must never do is unaffected by this ADR's conclusion — **corrected this
+revision (full-review correction #5, P3 #1): the audited families (A/A2/B)
+are UNRESOLVED, not NO-GO, so this is stated classification-neutrally**
+— regardless of this ADR's unresolved/negative research outcome, R0's
+already-accepted read-only posture is unchanged, since R0 never depended
+on Blocker B closing (ADR 0005 §24, §27; `0.5-inventory-model.md`'s
+Phase 1 runtime activation gate references neither workload continuity
+nor trusted enrollment).
 
 ## 24. Open questions
 
@@ -1966,18 +2165,25 @@ enrollment).
    FACT-DOC/FACT-SOURCE strength this session and would need independent
    verification before any future ADR relies on it.
 5. **Corrected this revision (full-review correction #2; MAX_FINISHED
-   semantics further corrected in full-review correction #4, P2 #2):**
-   Surface A's exact parameters are now **FACT-SOURCE**, confirmed
-   directly against `PVE::RESTEnvironment` (`fork_worker`,
-   `active_workers`, `broadcast_tasklist`), `PVE::Service::pvestatd`, and
-   `PVE::Cluster` this session (§7a) — specifically: `MAX_FINISHED = 25`
-   is a ceiling on **total** retained entries, not a separate allowance
-   on top of running tasks — running tasks are retained in full and
-   finished tasks fill only whatever budget remains under that shared
-   ceiling (`my $max = $MAX_FINISHED - scalar(@$tlist); ...`), so a node
-   with 25 or more running tasks retains zero finished tasks (§7a); the
-   cache is updated through confirmed paths that include **worker start**
-   (`fork_worker`),
+   semantics corrected in full-review correction #4, P2 #2; and again
+   corrected this revision, full-review correction #5, P2 #1, which
+   overcorrected #4's fix into a different inaccurate "hard 25-total-
+   entry cap" claim):** Surface A's exact parameters are now
+   **FACT-SOURCE**, confirmed directly against `PVE::RESTEnvironment`
+   (`fork_worker`, `active_workers`, `broadcast_tasklist`),
+   `PVE::Service::pvestatd`, and `PVE::Cluster` this session (§7a) —
+   specifically: `MAX_FINISHED = 25` bounds only how many *finished*
+   tasks `active_workers()` appends; it is **not** a cap on the list's
+   total size. Running tasks are retained **unconditionally**, with no
+   upper bound of their own, and finished tasks are appended only while
+   the list is still below 25 entries (`my $max = $MAX_FINISHED -
+   scalar(@$tlist); ...`) — so a node with 25 or more running tasks
+   retains zero finished tasks, but its `active_workers()` list can still
+   legitimately exceed 25 entries in total (e.g. 40 running tasks yields
+   a 40-entry list). `broadcast_tasklist()`'s independent 32 KiB
+   serialized-payload truncation (below) applies regardless of this
+   composition (§7a); the cache is updated through confirmed paths that
+   include **worker start** (`fork_worker`),
    **worker completion** (`log_task_result`, confirmed this pass,
    full-review pass #3, P2 #3), *and* `pvestatd`'s separate 10-second
    periodic cycle (`my $updatetime = 10`) — this ADR does not claim these
@@ -2203,7 +2409,9 @@ Family A row ("defends" -> "is intended to defend") and §24 item 10
 that also includes Path A's own completeness. (P2 #2) `MAX_FINISHED=25`
 had been misread as "running tasks plus 25 additional finished tasks";
 corrected to the actual shared-budget semantics (finished tasks fill only
-the remainder under a 25-total ceiling after running tasks) across §7a,
+the remainder under a 25-total ceiling after running tasks — **this
+"25-total ceiling" framing was itself an overcorrection, further
+corrected in full-review correction #5, P2 #1 below**) across §7a,
 §7d, §24 item 5, §25 item 17, and the Sources/Evidence citation. (P2 #3)
 §7b's blanket claim that ordinary destroy/create/clone/migrate/restore
 all execute as UPID workers was narrowed to the actual source-verified
@@ -2223,11 +2431,50 @@ item 7 (same C/D-E-F-narrow distinction). (P3) Surface B's conclusion no
 longer asserts a rotated record moves "into an untracked older archive" —
 narrowed to "no longer present in the API-visible `index`/`index.1`
 retained set." None of these changed the underlying classification.
-**ADR 0006 remains NOT re-accepted in this pass** — Status remains
-`PROPOSED (full-review corrections pending)`. This checklist, extended
-with items 9–31, is retained as the standing record a fresh review must
-verify before any future re-acceptance — not of a trust-granting
-mechanism, since none is proposed:
+**ADR 0006 remains NOT re-accepted in that pass.** **A fifth, fresh full
+end-to-end independent review found four further P2 findings and two P3
+items (P1 = 0), all accepted as valid, corrected in this revision:** (P2
+#1) full-review correction #4's own `MAX_FINISHED=25` fix overcorrected
+into a "25-total-entry ceiling" claim; corrected to the actual semantics
+— running tasks are retained unconditionally with no bound of their own,
+finished tasks are admitted only while list length is below 25, and a
+busy node's `active_workers()` output can legitimately exceed 25 entries
+(e.g. 40 running yields 40 total) — across §7a, §7d, §9's Family B row,
+§10, §20, §24 item 5, §25 items 17/28, Sources/Evidence, and
+`0.5-implementation-status.md`. (P2 #2) Family B route coverage was still
+over-propagated past §7b's own narrowing in §7d's task-creation row and
+the Family B table's "What it proves"/rollback/restore/QEMU-LXC-parity
+cells; corrected to state task-generation is source-verified only for
+QEMU/LXC create/destroy, with rollback/restore/clone/migration remaining
+UNKNOWN at complete parity (§24 item 12); also corrected a source-
+repository misattribution (QEMU/LXC create/destroy dispatch lives in
+`proxmox/qemu-server`/`proxmox/pve-container`, not `proxmox/pve-manager`).
+(P2 #3) §11a's closing bullet required every T3-resilient design to
+satisfy node-trust coupling plus a separately accepted node/hostd
+attestation contract, over-constraining a genuinely independent,
+root-resistant/external resource-continuity anchor that does not derive
+its T3 resistance from node trust at all; corrected to scope that
+dual requirement to node-trust-*derived* claims only, while preserving
+that future destructive mutation always independently requires the
+separate node/hostd trust gate regardless. (P2 #4) §17's CAS/transaction
+model required revalidating only the routing-only resolved node locator,
+not ADR 0001's actual node-trust context (`node_binding_id`,
+`binding_revision`, `attestation_id`, `node_trust_state`) for a
+node-trust-derived design; corrected to conditionally require that
+context's revalidation only when a future mechanism's continuity-evidence
+authority-eligibility actually depends on node trust. (P3) §23's R0
+wording ("a NO-GO here...") was classification-inconsistent with A/A2/B's
+UNRESOLVED status; restated classification-neutrally. §7c's Path B
+description overstated its scope ("the only way the kernel could learn of
+it..."); narrowed to the actual security question (whether a local
+`fsnotify`/`inotify` watcher receives an event for a non-local-syscall
+change), without a broader claim about every way the kernel could ever
+learn of changed state. None of these changed the underlying
+classification. **ADR 0006 remains NOT re-accepted in this pass** —
+Status remains `PROPOSED (full-review corrections pending)`. This
+checklist, extended with items 9–39, is retained as the standing record a
+fresh review must verify before any future re-acceptance — not of a
+trust-granting mechanism, since none is proposed:
 
 1. Does this ADR select or authorize any mechanism sufficient for
    `security_continuity=trusted`? **No** — confirm this remains true
@@ -2322,11 +2569,13 @@ mechanism, since none is proposed:
     rollback of ADR 0001–0005, and avoid reopening R0 (§1, §22, §23)?
     Verify before accepting.
 17. Does §7a correctly model two distinct PVE task surfaces —
-    `/cluster/tasks`'s recent, corosync-distributed status cache (bounded
-    to at most `MAX_FINISHED=25` **total** entries — running tasks
-    retained in full, with finished tasks filling only the remaining
-    budget under that shared ceiling, corrected this revision, full-review
-    correction #4, P2 #2 — updated through confirmed paths
+    `/cluster/tasks`'s recent, corosync-distributed status cache (running
+    tasks retained **unconditionally**, with no upper bound of their own;
+    finished tasks admitted only while list length is below
+    `MAX_FINISHED=25` — **not** a hard cap on the list's total size, so a
+    node running 25+ tasks can legitimately return more than 25 entries,
+    corrected this revision, full-review correction #5, P2 #1, from #4's
+    own overcorrection — updated through confirmed paths
     that include worker start, worker completion, and an additional
     ~10-second refresh by `pvestatd` — not claimed exhaustive), with its
     serialized payload truncated at an **executable 32 KiB**
@@ -2435,13 +2684,20 @@ mechanism, since none is proposed:
     does §24 item 10 list the conclusive-audit gap set as "at least" Path
     A completeness, Path B's repository-wide absence, and node-dispatch
     predictability, rather than "exactly the two"? Verify before accepting.
-28. **New this pass (full-review correction #4, P2 #2).** Is
-    `MAX_FINISHED=25` correctly described everywhere (§7a, §7d, §24 item
-    5, §25 item 17, Sources/Evidence) as a ceiling on total retained
-    entries that finished tasks fill only after running tasks are already
-    accounted for — never as "all running tasks plus 25 additional
-    finished tasks" — with the concrete running/finished budget examples
-    (0/25, 5/20, 20/5, 25+/0) available at least in §7a? Verify before
+28. **New this pass (full-review correction #4, P2 #2; corrected again
+    this revision, full-review correction #5, P2 #1, after #4's own fix
+    overcorrected into a "hard 25-total-entry cap" claim).** Is
+    `MAX_FINISHED=25` correctly described everywhere (§7a, §7d, §9 Family
+    B row, §24 item 5, §25 item 17, Sources/Evidence,
+    `0.5-implementation-status.md`) as bounding only how many *finished*
+    tasks `active_workers()` appends — running tasks retained
+    unconditionally with no bound of their own, finished tasks admitted
+    only while list length remains below 25 — and **not** as a cap on the
+    list's total size (so 25+ running tasks yields zero finished tasks
+    admitted, but a list that can still exceed 25 entries overall, before
+    `broadcast_tasklist()`'s independent 32 KiB truncation), with the
+    concrete running/finished budget examples (0/25, 5/20, 20/5, 25+/0,
+    40 running/40 total) available at least in §7a? Verify before
     accepting.
 29. **New this pass (full-review correction #4, P2 #3).** Does §7b state
     only the source-verified same-slot witness (QEMU
@@ -2468,6 +2724,71 @@ mechanism, since none is proposed:
     goes ("into an untracked older archive"), stating instead only that it
     is no longer present in the API-visible `index`/`index.1` retained
     set? Verify before accepting.
+32. **New this pass (full-review correction #5, P2 #1).** Does the ADR
+    avoid claiming, anywhere, that `MAX_FINISHED=25` establishes "at most
+    25 total entries" or a universal "25-total-entry ceiling" on
+    `active_workers()`'s output — stating instead that running tasks are
+    retained **unconditionally** (no bound of their own) and finished
+    tasks are admitted only while the list length remains below 25, so a
+    node running 25+ tasks can return more than 25 entries in total,
+    independent of `broadcast_tasklist()`'s separate 32 KiB payload
+    truncation (§7a, §7d, §9 Family B row, §10, §20, §24 item 5, §25 items
+    17/28, Sources/Evidence, `0.5-implementation-status.md`)? Verify
+    before accepting.
+33. **New this pass (full-review correction #5, P2 #2).** Does §7d's
+    task-creation row and the Family B table's "What it proves,"
+    rollback, restore, and QEMU/LXC-parity cells state task-generation
+    coverage as source-verified **only** for the normal QEMU
+    (`qmcreate`/`qmdestroy`) and LXC (`vzcreate`/`vzdestroy`) create/
+    destroy routes, explicitly leaving clone/rollback/restore/migration
+    UNKNOWN at complete QEMU/LXC parity (§7b, §24 item 12), without
+    implying proven coverage for "the high-level API/CLI path" generally
+    or claiming rollback/restore detection semantics before their own
+    task-generation route is verified? Does §7b/Sources-Evidence
+    correctly attribute the QEMU/LXC create/destroy dispatch to
+    `proxmox/qemu-server` and `proxmox/pve-container` respectively, not
+    `proxmox/pve-manager`? Verify before accepting.
+34. **New this pass (full-review correction #5, P2 #3).** Does §11a scope
+    its "T3 resilience requires node-trust coupling plus an accepted
+    node/hostd attestation contract" rule to node-trust-*derived* T3
+    claims only, while allowing a genuinely independent, root-resistant/
+    external resource-continuity anchor to prove its own T3-resistance
+    directly, on its own evidentiary terms, without being forced through
+    that node-trust-derived precondition — and does it still state
+    explicitly that future destructive mutation independently requires
+    the separate node/hostd trust gate regardless of which path a
+    resource-continuity proof takes (§11, §13)? Verify before accepting.
+35. **New this pass (full-review correction #5, P2 #4).** Does §17's
+    CAS/transaction model distinguish the routing-only "resolved current
+    node locator" from ADR 0001's actual node-trust context
+    (`node_binding_id`, `binding_revision`, `attestation_id`,
+    `node_trust_state`), and does it require revalidating that node-trust
+    context **only** for a mechanism whose continuity-evidence authority-
+    eligibility actually depends on node/hostd trust — without imposing
+    those fields on a genuinely independent, externally-rooted design
+    whose accepted security contract does not depend on node trust for
+    evidence authority? Verify before accepting.
+36. **New this pass (full-review correction #5, P3 #1).** Does §23 state
+    R0's unaffected read-only posture in classification-neutral terms
+    (not "a NO-GO here...", given A/A2/B are UNRESOLVED, not NO-GO)?
+    Verify before accepting.
+37. **New this pass (full-review correction #5, P3 #2).** Does §7c's Path
+    B description stay scoped to the actual security question — whether a
+    local `fsnotify`/`inotify` watcher receives an event for a
+    non-local-syscall change — without a broader claim that this is the
+    only way the kernel could ever learn of or revalidate changed state by
+    any mechanism? Verify before accepting.
+38. Do all six MAX_FINISHED sibling locations (§7a, §7d, §9 Family B row,
+    §10's consecutive-observation demonstration, §20, §24 item 5, §25
+    items 17/28) and both Sources/Evidence citations (`RESTEnvironment.pm`
+    and `PVE::API2::Qemu`/`PVE::API2::LXC`) agree with each other, with no
+    remaining internal contradiction between any two locations? Verify
+    before accepting.
+39. Does `docs/architecture/0.5-implementation-status.md`'s ADR 0006
+    registration reflect this pass's corrected MAX_FINISHED semantics,
+    narrowed Family B route coverage, and the §11a/§17 T3/node-trust
+    scoping fix, consistent with this ADR's own text? Verify before
+    accepting.
 
 Re-acceptance of this ADR, if it occurs, would record the corrected
 research conclusion (UNRESOLVED for task history and for both the
@@ -2497,12 +2818,12 @@ that Path A/B distinction.
 - [`proxmox/pve-manager`, `PVE/API2/Tasks.pm`](https://github.com/proxmox/pve-manager/blob/master/PVE/API2/Tasks.pm) — `node_tasks` (`GET /nodes/<node>/tasks`), reading `/var/log/pve/tasks/index` and `index.1` via `File::ReadBackwards`; `start`/`limit`/`since`/`until`/`source=archive|active|all` parameters, no monotonic cursor (§7a)
 - [`proxmox/pve-cluster`, `src/PVE/Cluster.pm`](https://github.com/proxmox/pve-cluster/blob/master/src/PVE/Cluster.pm) — `get_tasklist()` reading a per-node, corosync-distributed in-memory/KV status cache (`ipcc_get_status("tasklist", $node)`), and `broadcast_tasklist()`'s **executable** truncation loop, `while ($size >= (32 * 1024)) { pop @$data; ... }` — an actual 32 KiB cap, with the 128 KiB `CFS_MAX_STATUS_SIZE` figure appearing only in a `# TODO: update to 128 KiB in PVE 8.x` comment on that same code (§7a, corrected this pass, full-review correction #2/P2 #2)
 - [`proxmox/pve-manager`, `PVE/Service/pvestatd.pm`](https://github.com/proxmox/pve-manager/blob/master/PVE/Service/pvestatd.pm) — the periodic `update_status()` loop calling `$rpcenv->active_workers()` then `PVE::Cluster::broadcast_tasklist($tlist)` every 10 seconds (`my $updatetime = 10`) — an *additional* refresh path, not the sole one (§7a)
-- [`proxmox/pve-common`, `PVE/RESTEnvironment.pm`](https://github.com/proxmox/pve-common) — `active_workers()`'s `MAX_FINISHED = 25` cap, corrected this pass (full-review correction #4, P2 #2) to state precisely: a ceiling on **total** retained entries, with running tasks retained in full and finished tasks filling only the remainder (`my $max = $MAX_FINISHED - scalar(@$tlist); ...`) (Surface A); the separate `index`/`index.1` archive rotation at `maxsize = 50000` (Surface B); UPID encoding; `fork_worker()` calling `$self->active_workers($upid, $sync)` then `$self->broadcast_tasklist($tlist)` **immediately at every worker start**; and — **confirmed this pass (full-review pass #3, P2 #3)** — `log_task_result()`, invoked by the worker reaper at **worker completion**, calling `$self->active_workers($upid)` then `$self->broadcast_tasklist($tlist)` immediately at that point too, establishing a *third* confirmed Surface A update path alongside worker-start and `pvestatd`'s periodic cycle — this ADR states these as "confirmed update paths include...", not as an exhaustive enumeration (§7a)
+- [`proxmox/pve-common`, `PVE/RESTEnvironment.pm`](https://github.com/proxmox/pve-common) — `active_workers()`'s `MAX_FINISHED = 25` cap, corrected this pass (full-review correction #5, P2 #1, replacing #4's own "ceiling on total retained entries" overcorrection) to state precisely: a bound on how many *finished* tasks are appended, not on the list's total size — running tasks are retained unconditionally with no bound of their own, and finished tasks fill only the remainder while the list is still below 25 entries (`my $max = $MAX_FINISHED - scalar(@$tlist); ...`), so a node running 25+ tasks can return more than 25 entries (Surface A); the separate `index`/`index.1` archive rotation at `maxsize = 50000` (Surface B); UPID encoding; `fork_worker()` calling `$self->active_workers($upid, $sync)` then `$self->broadcast_tasklist($tlist)` **immediately at every worker start**; and — **confirmed this pass (full-review pass #3, P2 #3)** — `log_task_result()`, invoked by the worker reaper at **worker completion**, calling `$self->active_workers($upid)` then `$self->broadcast_tasklist($tlist)` immediately at that point too, establishing a *third* confirmed Surface A update path alongside worker-start and `pvestatd`'s periodic cycle — this ADR states these as "confirmed update paths include...", not as an exhaustive enumeration (§7a)
 
 **§7b — QEMU/LXC same-slot create/destroy task-generation witness, new this pass (full-review correction #4, P2 #3):**
 
-- `proxmox/pve-manager`, `PVE::API2::Qemu` — QEMU guest create dispatches through `fork_worker('qmcreate', ...)`; destroy dispatches through `fork_worker('qmdestroy', ...)` (§7b)
-- `proxmox/pve-manager`, `PVE::API2::LXC` — LXC guest create dispatches through a `vzcreate`-named worker via `fork_worker(...)`; destroy dispatches through `fork_worker('vzdestroy', ...)` (§7b)
+- [`proxmox/qemu-server`, `src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/master/src/PVE/API2/Qemu.pm) — QEMU guest create dispatches through `fork_worker('qmcreate', ...)`; destroy dispatches through `fork_worker('qmdestroy', ...)` — corrected this revision (full-review correction #5, P2 #2) from a prior misattribution to `proxmox/pve-manager` (§7b)
+- [`proxmox/pve-container`, `src/PVE/API2/LXC.pm`](https://github.com/proxmox/pve-container/blob/master/src/PVE/API2/LXC.pm) — LXC guest create dispatches through a `vzcreate`-named worker via `fork_worker(...)`; destroy dispatches through `fork_worker('vzdestroy', ...)` — corrected this revision (full-review correction #5, P2 #2) from a prior misattribution to `proxmox/pve-manager` (§7b)
 - This is the specific, source-verified same-slot witness this ADR relies on in §7b/§10; clone, snapshot rollback, backup restore, migration, and other identity-breaking variants were **not** re-derived at this citation granularity and remain UNKNOWN at complete QEMU/LXC parity (§24 item 12)
 
 **§7c — `pmxcfs`/FUSE/`inotify` (Path A/B only, per the note above):**
