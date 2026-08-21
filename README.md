@@ -25,8 +25,8 @@ fully hermetic throughout — none of the above was exercised by CI, only by a r
 manual, explicitly-authorized operator run. Real-host **operational activation**
 has since taken place as its own separate, later step
 (`docs/operations/0.5-r0-operational-activation.md`): the first real Home
-Assistant enrollment/acceptance checklist **PASSED** against the real R0
-backend, and the service has completed roughly 7 hours of clean, stable
+Assistant enrollment and its observed R0 acceptance checks **PASSED** against
+the real R0 backend, and the service has completed roughly 7 hours of clean, stable
 observation. The recorded decision is **GO WITH OBSERVATION**, not a plain
 GO — the runbook's recommended >=24-hour observation window has not yet
 fully elapsed. See `docs/architecture/0.5-implementation-status.md` for the
