@@ -1,6 +1,12 @@
 # ADR 0006: stronger workload-continuity proof — trusted host lifecycle witness research
 
-Status: **PROPOSED — not accepted.**
+Status: **ACCEPTED** — accepted strictly as the negative/unresolved
+stronger-proof research record and as the normative requirements any future
+Blocker-B mechanism must satisfy. Acceptance selects **no** sufficient
+mechanism, grants `security_continuity=trusted` nowhere, leaves Blocker B
+**OPEN**, does not authorize WAVE B1, does not unblock Phase 1C, and
+authorizes no schema, runtime, `hostd`, enrollment, HA, or mutation work
+(§13).
 
 This is the **normative core** of ADR 0006: the decision record and the
 contract any future Blocker-B mechanism must satisfy. The primary-source
@@ -38,7 +44,7 @@ Families D/E/F-narrow:                              No / not sufficient
 Family C:                                           not sufficient / not applicable as a
                                                     Blocker-B resource-continuity proof
 
-ADR 0006:                                           PROPOSED
+ADR 0006:                                           ACCEPTED
 Blocker B:                                          OPEN
 future positive Blocker-B mechanism ADR:            NOT STARTED / UNRESOLVED
 WAVE B1:                                            DEFERRED / NOT AUTHORIZED
@@ -79,9 +85,8 @@ Explicitly **not** in scope, and not authorized by this ADR:
   would be a mutation; no mutation authority exists); changing
   `security_continuity` in code; or any change to production startup,
   scheduler, HTTP, or Home Assistant wiring;
-- any change to ADR 0001, 0002, 0003, 0004, or 0005; marking this ADR
-  ACCEPTED (a separate, later decision after independent review); or
-  authorizing WAVE B1 under any circumstance;
+- any change to ADR 0001, 0002, 0003, 0004, or 0005; or authorizing WAVE B1
+  under any circumstance;
 - any weakening of ADR 0001's invisible same-slot destroy/recreate
   limitation, ADR 0003's epoch authority-eligibility rule, or ADR 0005's
   Family A/B/C rejection.
@@ -756,10 +761,9 @@ record only.
 ```text
 WAVE B1 remains DEFERRED / NOT AUTHORIZED.
 
-Any eventual acceptance of THIS ADR would mean only that its
-negative/unresolved research conclusion is accepted as the current record.
-It would NOT authorize WAVE B1, because this ADR proposes no sufficient
-mechanism for WAVE B1 to implement.
+Acceptance of THIS ADR means only that its negative/unresolved research
+conclusion is accepted as the current record. It does NOT authorize WAVE B1,
+because this ADR proposes no sufficient mechanism for WAVE B1 to implement.
 
 WAVE B1 may only begin after a DIFFERENT, later, separately reviewed and
 separately ACCEPTED ADR proposes an actual mechanism -- whether within the
@@ -828,7 +832,8 @@ the research document (R8).
 
 ## 15. Acceptance checklist
 
-ADR 0006 remains **PROPOSED** and is not accepted here.
+ADR 0006 is **ACCEPTED**. Every answer below was verified before acceptance
+and remains the accepted record; acceptance changes none of them.
 
 1. Does this ADR select or authorize any mechanism sufficient for
    `security_continuity=trusted`, WAVE B1, Phase 1C mutation, or any
@@ -881,8 +886,9 @@ ADR 0006 remains **PROPOSED** and is not accepted here.
     Family-B ADR proves them (§8a, §14)?
 11. Is the evidence separated from the contract — the research document
     explicitly non-normative, subordinate to accepted architecture, and
-    authorizing nothing (§16) — and does ADR 0006 remain **PROPOSED** and
-    explicitly not accepted?
+    authorizing nothing (§16) — and is ADR 0006 **ACCEPTED** strictly as that
+    negative/unresolved record, selecting no mechanism and authorizing no
+    implementation?
 
 ## 16. Evidence
 

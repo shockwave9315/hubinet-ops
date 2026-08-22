@@ -10,7 +10,7 @@ Read this first:
   not an ADR, not an accepted architecture contract, and not a decision
   record.
 - **If anything here conflicts with an ACCEPTED ADR, or with ADR 0006's
-  eventual accepted normative text, the normative architecture wins** and
+  accepted normative text, the normative architecture wins** and
   this document is the thing that must be corrected.
 - Nothing here authorizes implementation, schema, runtime, `hostd`, HTTP,
   Home Assistant, mutation, or enrollment work of any kind, and nothing here
