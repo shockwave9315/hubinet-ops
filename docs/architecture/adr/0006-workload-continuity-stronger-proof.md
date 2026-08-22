@@ -98,7 +98,7 @@ them only to fix what it may not weaken.
 2. `security_continuity` (`unverified`/`trusted`/`revoked`) has exactly one
    durable owner, `resource_incarnations.security_continuity` (ADR 0001, ADR
    0005 §15). No future mechanism may introduce a second authoritative copy
-   or a fourth canonical value (ADR 0005 §17, §26).
+   or a fourth canonical value (ADR 0005 §15, §17).
 3. ADR 0005's Family A (ordinary stock fields), Family B (operator assertion
    alone), and Family C (administrative correlation marker, any entropy) are
    rejected as sufficient for `trusted`, permanently, for the reasons given
@@ -610,11 +610,11 @@ depends on** — neither may be universalized.
   routing/presentation context (which node an evidence read was served from).
   Ordinary read-only evidence acquisition does not automatically require a
   trusted node.
-- **Every witness-based family in §6 assumes T4 is out of scope** — that the
-  node's own control-plane software is not itself compromised or lying. No
-  mechanism evaluated here defends against a compromised node/hostd trust
-  root; that defense belongs to the separate node/hostd attestation protocol
-  ADR 0001 §"Nierozstrzygnięte kwestie" #6 already flags as future work.
+- **Families A, A2, and B assume T4 is out of scope** — that the node's own
+  control-plane software is not itself compromised or lying. No mechanism
+  evaluated here defends against a compromised node/hostd trust root; that
+  defense belongs to the separate node/hostd attestation protocol ADR 0001
+  §"Nierozstrzygnięte kwestie" #6 already flags as future work.
 - **The concrete node/hostd attestation/trust-root contract remains
   unresolved in accepted architecture.** ADR 0001 defines `node_trust_state`
   and requires re-attestation on reinstall/rejoin/hostd-key-change, but
