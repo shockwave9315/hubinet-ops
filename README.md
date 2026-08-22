@@ -27,9 +27,10 @@ has since taken place as its own separate, later step
 (`docs/operations/0.5-r0-operational-activation.md`): the first real Home
 Assistant enrollment and its observed R0 acceptance checks **PASSED** against
 the real R0 backend. The operator has since confirmed that the runbook's
-recommended >=24-hour observation window completed, so the current R0
-operational decision is **GO**. See `docs/architecture/0.5-implementation-status.md`
-for the full dogfood and operational-activation chronology.
+recommended >=24-hour observation window completed. The current R0
+operational decision remains **GO WITH OBSERVATION** because the recorded
+optional/synthetic §6/§7 operational scenarios remain unexercised. See
+`docs/architecture/0.5-implementation-status.md` for the full chronology.
 
 ## Safety model
 
@@ -118,9 +119,10 @@ method — use HACS for real deployments.
   with no manual repair mid-run**). This proves the automated
   bootstrap completes successfully on the real host; it did not by itself
   establish operational activation. HA acceptance and the observation window
-  were completed separately, and the current R0 operational decision is GO.
-  See `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script proves, and
-  what it does not" section for the exact evidence boundary.
+  were completed separately, while the optional/synthetic operational scenarios
+  remain unexercised; the current decision is GO WITH OBSERVATION. See
+  `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script proves, and what
+  it does not" section for the exact evidence boundary.
 - `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
   the authority order). `docs/operations/`: the R0 operational activation runbook and the
   Home Assistant clean-break/purge plan for a real deployed instance.
