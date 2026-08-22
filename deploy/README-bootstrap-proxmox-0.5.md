@@ -35,7 +35,7 @@ Hubinet Ops's own GET-only production PVE transport
 > observation window in `docs/operations/0.5-r0-operational-activation.md`
 > §6/§7 are separate operational evidence. Those later steps have since
 > progressed: Home Assistant enrollment/acceptance passed and the recommended
-> >=24-hour observation window completed, while four optional/synthetic
+> >=24-hour observation window completed, while five optional/synthetic
 > §6/§7 scenarios remain unexercised. The current decision is GO WITH
 > OBSERVATION.
 > Before running the bootstrap yourself, review the "What this script proves,
@@ -492,7 +492,7 @@ full manual verification procedure this script automates.
   operational health or full R0 operational acceptance** — see
   `docs/operations/0.5-r0-operational-activation.md` sections 6 and 7
   for the separately completed Home Assistant enrollment/acceptance and
-  recommended >=24-hour observation window. Four optional/synthetic
+  recommended >=24-hour observation window. Five optional/synthetic
   operational scenarios remain unexercised, so the current decision remains
   GO WITH OBSERVATION.
 - `.github/workflows/bootstrap-smoke.yml` wires the compliant sandbox
