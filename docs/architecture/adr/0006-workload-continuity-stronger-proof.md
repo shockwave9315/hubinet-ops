@@ -515,7 +515,7 @@ the mechanism / authoritative evidence channel loses or cannot prove
 
 durable materialization: trusted -> revoked (resource_continuity_revision
   +1 exactly once), expressed strictly within ADR 0001's existing
-  three-value vocabulary -- no fourth canonical state (ADR 0005 §17, §26)
+  three-value vocabulary -- no fourth canonical state (ADR 0005 §17)
 
 restoring trusted requires a fresh ACCEPTED enrollment/revalidation of
   the current occupant, under the future mechanism's current exact
