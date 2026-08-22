@@ -33,8 +33,10 @@ Hubinet Ops's own GET-only production PVE transport
 > on a real host; it does **not** by itself mean full operational
 > readiness -- Home Assistant enrollment/acceptance and the multi-day
 > observation window in `docs/operations/0.5-r0-operational-activation.md`
-> §6/§7 remain separate, later, and still pending. Before running it
-> yourself, review the "What this script proves, and what it does not"
+> §6/§7 are separate operational evidence. Those later steps have since
+> completed for the recorded first activation, whose current decision is
+> GO. Before running the bootstrap yourself, review the "What this script
+> proves, and what it does not"
 > section below and the REAL-HOST PRECHECK commands (including the PVE
 > root CA Key Usage precheck) further down this document.
 
@@ -486,8 +488,8 @@ full manual verification procedure this script automates.
   successfully end to end on a real host. **It does not prove long-term
   operational health or full R0 operational acceptance** — see
   `docs/operations/0.5-r0-operational-activation.md` sections 6 and 7
-  for the still-pending Home Assistant enrollment/acceptance and
-  multi-day observation window.
+  for the separately completed Home Assistant enrollment/acceptance and
+  observation window that produced the current GO decision.
 - `.github/workflows/bootstrap-smoke.yml` wires the compliant sandbox
   (`tests/shell/run_bootstrap_smoke_sandbox.sh`) into GitHub Actions,
   narrowly path-filtered to bootstrap/sandbox-related changes and
