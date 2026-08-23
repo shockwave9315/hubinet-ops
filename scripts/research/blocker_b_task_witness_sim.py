@@ -70,10 +70,11 @@ def evaluate(
 ) -> Coverage:
     """Evaluate one chronological fixture sequence.
 
-    A known gap is sticky.  Restart or archive rotation requires a fresh
-    overlap with the persisted sentinel.  A traversal can close that requirement
-    only when it reaches its final page after observing the sentinel in that
-    same traversal and the caller supplies an independently proven envelope.
+    A known gap is sticky.  Every explicitly started archive traversal requires
+    a fresh overlap with the persisted sentinel.  A traversal can close that
+    requirement only when it reaches its final page after observing the sentinel
+    in that same traversal and the caller supplies an independently proven
+    envelope.
     """
 
     sentinel: str | None = None
@@ -115,6 +116,7 @@ def evaluate(
             continue
 
         if event.kind is EventKind.ARCHIVE_TRAVERSAL_START:
+            overlap_required = True
             traversal_active = True
             traversal_overlap_seen = False
             continue

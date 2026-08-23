@@ -22,10 +22,13 @@ PROVEN = CoverageEnvelope(
 )
 
 
-def test_fully_proven_envelope_and_overlap_can_model_complete_coverage() -> None:
+@pytest.mark.parametrize("context_event", [EventKind.RESTART, EventKind.ROTATE])
+def test_context_transition_with_fresh_overlap_can_model_complete_coverage(
+    context_event: EventKind,
+) -> None:
     events = [
         Event(EventKind.SEED, upid="S"),
-        Event(EventKind.RESTART),
+        Event(context_event),
         Event(EventKind.ACTIVE, upid="T"),
         Event(EventKind.FINISHED, upid="T"),
         Event(EventKind.ARCHIVE_TRAVERSAL_START),
@@ -69,11 +72,37 @@ def test_valid_archive_traversals_can_complete(
 ) -> None:
     events = [
         Event(EventKind.SEED, upid="S"),
-        Event(EventKind.RESTART),
         *archive_events,
     ]
 
     assert evaluate(events, envelope=PROVEN) is Coverage.COMPLETE
+
+
+@pytest.mark.parametrize(
+    "archive_events",
+    [
+        (
+            Event(EventKind.ARCHIVE_TRAVERSAL_START),
+            Event(EventKind.ARCHIVE_PAGE, upids=("new",), final_page=True),
+        ),
+        (
+            Event(EventKind.ARCHIVE_TRAVERSAL_START),
+            Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=True),
+            Event(EventKind.ARCHIVE_TRAVERSAL_START),
+            Event(EventKind.ARCHIVE_PAGE, upids=("new",), final_page=True),
+        ),
+    ],
+    ids=(
+        "first-ordinary-traversal-misses-sentinel",
+        "later-traversal-must-independently-overlap",
+    ),
+)
+def test_every_completed_traversal_requires_its_own_overlap(
+    archive_events: tuple[Event, ...],
+) -> None:
+    events = [Event(EventKind.SEED, upid="S"), *archive_events]
+
+    assert evaluate(events, envelope=PROVEN) is Coverage.GAP
 
 
 def test_final_page_without_overlap_latches_gap_across_later_traversal() -> None:
