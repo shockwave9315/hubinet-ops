@@ -8,7 +8,7 @@ Research date: 2026-08-22
 Research execution base (exact `main` when this research ran):
 `e092eb14e73ff9e4ab76200bc682c67ca665d056`
 Current integration base after branch sync:
-`9282ace21c91f5b4ea04b62d7d82b631a0a5ddaa` (the PR #47 merge)
+`552542305d26fd6689a0fca1a12e4cc6460f6935` (the PR #48 merge)
 
 These two are **not** the same commit and must not be conflated: the second is
 only where this branch is now rebased for integration, not where the research
@@ -106,18 +106,35 @@ proof.
   the factual source observations established by this research. It does **not**
   strengthen the Family-B result, does **not** close Blocker B, does **not**
   authorize WAVE B1, and does **not** unblock Phase 1C.
-- **LATER REPOSITORY STATUS -- NOT A RETROACTIVE FIX.** PR #47 subsequently
-  merged into `main` as `9282ace21c91f5b4ea04b62d7d82b631a0a5ddaa`, onto which
-  this branch has since been rebased. That commit records: R0 bootstrap
-  **PASS**; Home Assistant enrollment/acceptance **PASS**; the recommended
-  >=24-hour observation **COMPLETE**; node migration **N/A** for the real
-  single-node topology; CT110 reboot / normal restart behavior **OBSERVED**;
-  abnormal-stop stranded-run fencing still **UNEXERCISED / UNRESOLVED**; a
-  current operational decision that remains **GO WITH OBSERVATION** and is not a
-  plain §9 GO; exactly five operational observations still open; and a common
-  re-check date of 2026-08-23. It is cited here **only** as a later
-  repository-status fact. It did not exist when this research ran, and it does
-  not retroactively satisfy the prerequisite described above.
+- **LATER PR #47 CHECKPOINT -- NOT A RETROACTIVE FIX.** PR #47 subsequently
+  merged into `main` as `9282ace21c91f5b4ea04b62d7d82b631a0a5ddaa`. That
+  historical checkpoint records: R0 bootstrap **PASS**; Home Assistant
+  enrollment/acceptance **PASS**; the recommended >=24-hour observation
+  **COMPLETE**; node migration **N/A** for the real single-node topology;
+  CT110 reboot / normal restart behavior **OBSERVED**; abnormal-stop
+  stranded-run fencing still **UNEXERCISED / UNRESOLVED**; an operational
+  decision that remained **GO WITH OBSERVATION** rather than a plain §9 GO;
+  exactly five operational observations still open; and a common re-check date
+  of 2026-08-23. It is cited here only as a historical later checkpoint. It did
+  not exist when this research ran, and it did not retroactively satisfy the
+  prerequisite described above.
+- **CURRENT PR #48 STATUS -- STILL NOT A RETROACTIVE FIX.** PR #48 later
+  merged into `main` as `552542305d26fd6689a0fca1a12e4cc6460f6935`, the
+  current integration base onto which this branch is now rebased. It records
+  the completed 2026-08-23 re-check: all five observations left open by PR #47
+  **PASS**, zero R0 operational observations remain open, and the current R0
+  operational decision is **GO**. The >=24-hour observation remains
+  **COMPLETE**; node migration remains **N/A** for the single-node topology;
+  ordinary CT110 reboot/autostart remains **OBSERVED**; and the separate real
+  stranded-run SIGKILL/startup-recovery fencing test is **PASS**. The forced
+  freshness-expiry witness is independently based on successful sequence 1642,
+  deadline elapse while durable state was still fresh, an explicit
+  `GET /r0/v1/snapshot` materializing `stale` with origin `time_expiry` and
+  reason `freshness_deadline_elapsed`, and successful sequence 1643 restoring
+  `healthy`/`fresh` -- not on the earlier PVE transport outage. These are later
+  repository-status facts only. PR #48 did not exist when the research ran and
+  does **not** retroactively repair the sequencing defect or make the original
+  prerequisite true at research-execution time.
 - **FACT-DOC:** the repository implementation status records the prior dogfood
   host as one node running `pve-manager 9.2.11`, `pve-cluster 9.1.6`, and kernel
   `7.0.14-12-pve`. These are prior repository evidence, not a new live query.
