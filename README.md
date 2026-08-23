@@ -29,11 +29,13 @@ Assistant enrollment and its observed R0 acceptance checks **PASSED** against
 the real R0 backend. The operator has since confirmed that the runbook's
 recommended >=24-hour observation window completed and that the
 single-node topology leaves the node-migration check N/A. A CT110 host
-reboot with normal service recovery was also observed, but does not by
-itself close the runbook's abnormal-stop stranded-run fencing check. The
-current R0 operational decision remains **GO WITH OBSERVATION** because
-five recorded optional/synthetic §6/§7 operational scenarios remain
-unexercised. See
+reboot with normal service recovery was also observed. On 2026-08-23 the
+operator performed the scheduled re-check: disposable new-LXC discovery,
+rename/identity preservation, synthetic PVE API outage and recovery,
+forced freshness expiry and recovery, and an actual stranded-run
+SIGKILL/startup-fencing recovery all passed. The current R0 operational
+decision is **GO**. This closes only the read-only operational observation
+gate; Blocker B remains open and mutation authority remains none. See
 `docs/architecture/0.5-implementation-status.md` for the full chronology.
 
 ## Safety model
@@ -123,8 +125,9 @@ method — use HACS for real deployments.
   with no manual repair mid-run**). This proves the automated
   bootstrap completes successfully on the real host; it did not by itself
   establish operational activation. HA acceptance and the observation window
-  were completed separately, while five optional/synthetic operational
-  scenarios remain unexercised; the current decision is GO WITH OBSERVATION. See
+  were completed separately, and the five remaining operational observations
+  subsequently passed during the 2026-08-23 re-check; the current decision is
+  GO. See
   `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script proves, and what
   it does not" section for the exact evidence boundary.
 - `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
