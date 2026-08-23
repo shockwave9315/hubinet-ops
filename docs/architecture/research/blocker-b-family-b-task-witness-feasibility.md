@@ -5,7 +5,14 @@
 Status: research only
 
 Research date: 2026-08-22
-Exact base `main`: `e092eb14e73ff9e4ab76200bc682c67ca665d056`
+Research execution base (exact `main` when this research ran):
+`e092eb14e73ff9e4ab76200bc682c67ca665d056`
+Current integration base after branch sync:
+`9282ace21c91f5b4ea04b62d7d82b631a0a5ddaa` (the PR #47 merge)
+
+These two are **not** the same commit and must not be conflated: the second is
+only where this branch is now rebased for integration, not where the research
+was executed.
 
 This document:
 
@@ -79,10 +86,38 @@ proof.
 
 ### 2.1 Repository and operational prerequisite
 
-- **FACT-DOC:** R0 operational closure was merged by PR 43 before this branch
-  was created.
-- **FACT-SOURCE:** this research branch was created from exact `origin/main`
-  commit `e092eb14e73ff9e4ab76200bc682c67ca665d056`.
+- **FACT-SOURCE:** this research branch was created from, and the research was
+  executed against, exact `origin/main` commit
+  `e092eb14e73ff9e4ab76200bc682c67ca665d056`.
+- **CORRECTED PROVENANCE.** An earlier revision of this section asserted that
+  "R0 operational closure was merged by PR 43 before this branch was created."
+  That statement is **false** and is withdrawn. PR #43 did **not** record final
+  R0 operational closure. It recorded a roughly 7-hour R0 checkpoint whose
+  decision at that time was **GO WITH OBSERVATION**; the recommended >=24-hour
+  observation window was not yet complete, and the optional/synthetic
+  operational observations remained open.
+- **PROCESS / PROVENANCE DEFECT.** This research execution began at
+  `e092eb14`, before PR #47 existed. The task-level prerequisite under which the
+  research was originally started -- a completed R0 operational closure -- was
+  therefore **not satisfied at research-execution time**. That sequencing defect
+  is recorded here rather than hidden or rewritten.
+- **SCOPE OF THAT DEFECT.** It is a defect of research provenance and
+  sequencing, not of the source reading itself. It does not by itself invalidate
+  the factual source observations established by this research. It does **not**
+  strengthen the Family-B result, does **not** close Blocker B, does **not**
+  authorize WAVE B1, and does **not** unblock Phase 1C.
+- **LATER REPOSITORY STATUS -- NOT A RETROACTIVE FIX.** PR #47 subsequently
+  merged into `main` as `9282ace21c91f5b4ea04b62d7d82b631a0a5ddaa`, onto which
+  this branch has since been rebased. That commit records: R0 bootstrap
+  **PASS**; Home Assistant enrollment/acceptance **PASS**; the recommended
+  >=24-hour observation **COMPLETE**; node migration **N/A** for the real
+  single-node topology; CT110 reboot / normal restart behavior **OBSERVED**;
+  abnormal-stop stranded-run fencing still **UNEXERCISED / UNRESOLVED**; a
+  current operational decision that remains **GO WITH OBSERVATION** and is not a
+  plain §9 GO; exactly five operational observations still open; and a common
+  re-check date of 2026-08-23. It is cited here **only** as a later
+  repository-status fact. It did not exist when this research ran, and it does
+  not retroactively satisfy the prerequisite described above.
 - **FACT-DOC:** the repository implementation status records the prior dogfood
   host as one node running `pve-manager 9.2.11`, `pve-cluster 9.1.6`, and kernel
   `7.0.14-12-pve`. These are prior repository evidence, not a new live query.
