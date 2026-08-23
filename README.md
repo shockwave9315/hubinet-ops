@@ -26,11 +26,15 @@ manual, explicitly-authorized operator run. Real-host **operational activation**
 has since taken place as its own separate, later step
 (`docs/operations/0.5-r0-operational-activation.md`): the first real Home
 Assistant enrollment and its observed R0 acceptance checks **PASSED** against
-the real R0 backend, and the service has completed roughly 7 hours of clean, stable
-observation. The recorded decision is **GO WITH OBSERVATION**, not a plain
-GO — the runbook's recommended >=24-hour observation window has not yet
-fully elapsed. See `docs/architecture/0.5-implementation-status.md` for the
-full dogfood and operational-activation record.
+the real R0 backend. The operator has since confirmed that the runbook's
+recommended >=24-hour observation window completed and that the
+single-node topology leaves the node-migration check N/A. A CT110 host
+reboot with normal service recovery was also observed, but does not by
+itself close the runbook's abnormal-stop stranded-run fencing check. The
+current R0 operational decision remains **GO WITH OBSERVATION** because
+five recorded optional/synthetic §6/§7 operational scenarios remain
+unexercised. See
+`docs/architecture/0.5-implementation-status.md` for the full chronology.
 
 ## Safety model
 
@@ -117,10 +121,12 @@ method — use HACS for real deployments.
   **dogfood #3, run from commit `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2`
   (merged into `main` at the time), achieved a fresh, clean Phase 1-13 PASS
   with no manual repair mid-run**). This proves the automated
-  bootstrap completes successfully on the real host; it does not by itself mean
-  operational activation (HA acceptance, the multi-day observation window) is
-  complete. See `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script
-  proves, and what it does not" section for the exact current status.
+  bootstrap completes successfully on the real host; it did not by itself
+  establish operational activation. HA acceptance and the observation window
+  were completed separately, while five optional/synthetic operational
+  scenarios remain unexercised; the current decision is GO WITH OBSERVATION. See
+  `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script proves, and what
+  it does not" section for the exact evidence boundary.
 - `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
   the authority order). `docs/operations/`: the R0 operational activation runbook and the
   Home Assistant clean-break/purge plan for a real deployed instance.
