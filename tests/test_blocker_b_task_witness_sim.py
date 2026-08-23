@@ -22,6 +22,33 @@ PROVEN = CoverageEnvelope(
 )
 
 
+@pytest.mark.parametrize(
+    "events",
+    [
+        (
+            Event(EventKind.ARCHIVE_TRAVERSAL_START),
+            Event(EventKind.SEED, upid="S"),
+            Event(EventKind.ARCHIVE_PAGE, upids=("new",), final_page=True),
+        ),
+        (Event(EventKind.RESTART), Event(EventKind.SEED, upid="S")),
+        (Event(EventKind.ACTIVE, upid="T"), Event(EventKind.SEED, upid="S")),
+        (Event(EventKind.SEED),),
+        (Event(EventKind.SEED, upid="S"), Event(EventKind.SEED, upid="T")),
+    ],
+    ids=(
+        "traversal-start-before-seed",
+        "context-transition-before-seed",
+        "task-evidence-before-seed",
+        "null-seed",
+        "repeated-seed",
+    ),
+)
+def test_seed_is_valid_only_once_as_the_first_event(
+    events: tuple[Event, ...],
+) -> None:
+    assert evaluate(events, envelope=PROVEN) is Coverage.GAP
+
+
 @pytest.mark.parametrize("context_event", [EventKind.RESTART, EventKind.ROTATE])
 def test_context_transition_with_fresh_overlap_can_model_complete_coverage(
     context_event: EventKind,

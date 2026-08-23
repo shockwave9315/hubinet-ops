@@ -70,11 +70,11 @@ def evaluate(
 ) -> Coverage:
     """Evaluate one chronological fixture sequence.
 
-    A known gap is sticky.  Every explicitly started archive traversal requires
-    a fresh overlap with the persisted sentinel.  A traversal can close that
-    requirement only when it reaches its final page after observing the sentinel
-    in that same traversal and the caller supplies an independently proven
-    envelope.
+    SEED is initialization-only and must be the first event.  A known gap is
+    sticky.  Every explicitly started archive traversal requires a fresh overlap
+    with the persisted sentinel.  A traversal can close that requirement only
+    when it reaches its final page after observing the sentinel in that same
+    traversal and the caller supplies an independently proven envelope.
     """
 
     sentinel: str | None = None
@@ -82,15 +82,20 @@ def evaluate(
     traversal_active = False
     traversal_overlap_seen = False
     gap_latched = False
+    stream_started = False
     visible = True
 
     for event in events:
-        if event.kind is EventKind.SEED:
-            if event.upid is None or sentinel is not None:
-                gap_latched = True
-            else:
+        if not stream_started:
+            stream_started = True
+            if event.kind is EventKind.SEED and event.upid is not None:
                 sentinel = event.upid
                 overlap_required = False
+                continue
+            gap_latched = True
+
+        if event.kind is EventKind.SEED:
+            gap_latched = True
             continue
 
         if event.kind in {
