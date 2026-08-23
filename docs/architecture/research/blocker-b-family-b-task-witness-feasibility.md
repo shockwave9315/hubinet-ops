@@ -355,8 +355,11 @@ No concrete observable is **PROVEN SUFFICIENT**.
 
 `scripts/research/blocker_b_task_witness_sim.py` is an offline deterministic
 model, not production code. It never contacts PVE. It consumes `ACTIVE`,
-`FINISHED`, `ARCHIVE_PAGE`, `ROTATE`, `RESTART`, `API_FAILURE`, `NODE_DOWN`,
-`ACL_VISIBILITY_LOST`, `ACL_VISIBILITY_RESTORED`, and `TASK_UNKNOWN` events.
+`FINISHED`, `ARCHIVE_TRAVERSAL_START`, `ARCHIVE_PAGE`, `ROTATE`, `RESTART`,
+`API_FAILURE`, `NODE_DOWN`, `ACL_VISIBILITY_LOST`,
+`ACL_VISIBILITY_RESTORED`, and `TASK_UNKNOWN` events. Archive pages are accepted
+only within an explicitly started traversal, whose overlap state cannot carry
+into a later traversal.
 
 It returns `COVERAGE_COMPLETE` only if all independently supplied properties are
 true:

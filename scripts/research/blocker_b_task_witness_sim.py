@@ -21,6 +21,7 @@ class EventKind(str, Enum):
     SEED = "SEED"
     ACTIVE = "ACTIVE"
     FINISHED = "FINISHED"
+    ARCHIVE_TRAVERSAL_START = "ARCHIVE_TRAVERSAL_START"
     ARCHIVE_PAGE = "ARCHIVE_PAGE"
     ROTATE = "ROTATE"
     RESTART = "RESTART"
@@ -77,6 +78,7 @@ def evaluate(
 
     sentinel: str | None = None
     overlap_required = True
+    traversal_active = False
     traversal_overlap_seen = False
     gap_latched = False
     visible = True
@@ -108,13 +110,23 @@ def evaluate(
 
         if event.kind in {EventKind.RESTART, EventKind.ROTATE}:
             overlap_required = True
+            traversal_active = False
+            traversal_overlap_seen = False
+            continue
+
+        if event.kind is EventKind.ARCHIVE_TRAVERSAL_START:
+            traversal_active = True
             traversal_overlap_seen = False
             continue
 
         if event.kind is EventKind.ARCHIVE_PAGE:
+            if not traversal_active:
+                gap_latched = True
+                continue
             if not visible or sentinel is None:
                 gap_latched = True
                 if event.final_page:
+                    traversal_active = False
                     traversal_overlap_seen = False
                 continue
             traversal_overlap_seen = (
@@ -126,6 +138,7 @@ def evaluate(
                         overlap_required = False
                     elif not traversal_overlap_seen:
                         gap_latched = True
+                traversal_active = False
                 traversal_overlap_seen = False
             continue
 

@@ -28,6 +28,7 @@ def test_fully_proven_envelope_and_overlap_can_model_complete_coverage() -> None
         Event(EventKind.RESTART),
         Event(EventKind.ACTIVE, upid="T"),
         Event(EventKind.FINISHED, upid="T"),
+        Event(EventKind.ARCHIVE_TRAVERSAL_START),
         Event(EventKind.ARCHIVE_PAGE, upids=("T", "S"), final_page=True),
     ]
 
@@ -35,9 +36,10 @@ def test_fully_proven_envelope_and_overlap_can_model_complete_coverage() -> None
 
 
 @pytest.mark.parametrize(
-    "archive_pages",
+    "archive_events",
     [
         (
+            Event(EventKind.ARCHIVE_TRAVERSAL_START),
             Event(
                 EventKind.ARCHIVE_PAGE,
                 upids=("new", "S"),
@@ -45,16 +47,30 @@ def test_fully_proven_envelope_and_overlap_can_model_complete_coverage() -> None
             ),
             Event(EventKind.ARCHIVE_PAGE, upids=("older",), final_page=True),
         ),
-        (Event(EventKind.ARCHIVE_PAGE, upids=("new", "S"), final_page=True),),
+        (
+            Event(EventKind.ARCHIVE_TRAVERSAL_START),
+            Event(EventKind.ARCHIVE_PAGE, upids=("new", "S"), final_page=True),
+        ),
+        (
+            Event(EventKind.ARCHIVE_TRAVERSAL_START),
+            Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=False),
+            Event(EventKind.ARCHIVE_TRAVERSAL_START),
+            Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=True),
+        ),
     ],
+    ids=(
+        "sentinel-before-final-page",
+        "sentinel-on-final-page",
+        "abandoned-then-new-successful-traversal",
+    ),
 )
-def test_overlap_and_final_page_in_same_traversal_can_complete(
-    archive_pages: tuple[Event, ...],
+def test_valid_archive_traversals_can_complete(
+    archive_events: tuple[Event, ...],
 ) -> None:
     events = [
         Event(EventKind.SEED, upid="S"),
         Event(EventKind.RESTART),
-        *archive_pages,
+        *archive_events,
     ]
 
     assert evaluate(events, envelope=PROVEN) is Coverage.COMPLETE
@@ -64,8 +80,33 @@ def test_final_page_without_overlap_latches_gap_across_later_traversal() -> None
     events = [
         Event(EventKind.SEED, upid="S"),
         Event(EventKind.RESTART),
+        Event(EventKind.ARCHIVE_TRAVERSAL_START),
         Event(EventKind.ARCHIVE_PAGE, upids=("new",), final_page=True),
+        Event(EventKind.ARCHIVE_TRAVERSAL_START),
         Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=False),
+    ]
+
+    assert evaluate(events, envelope=PROVEN) is Coverage.GAP
+
+
+def test_abandoned_traversal_overlap_cannot_satisfy_new_traversal() -> None:
+    events = [
+        Event(EventKind.SEED, upid="S"),
+        Event(EventKind.RESTART),
+        Event(EventKind.ARCHIVE_TRAVERSAL_START),
+        Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=False),
+        Event(EventKind.ARCHIVE_TRAVERSAL_START),
+        Event(EventKind.ARCHIVE_PAGE, upids=("new",), final_page=True),
+    ]
+
+    assert evaluate(events, envelope=PROVEN) is Coverage.GAP
+
+
+def test_archive_page_without_explicit_traversal_start_is_a_gap() -> None:
+    events = [
+        Event(EventKind.SEED, upid="S"),
+        Event(EventKind.RESTART),
+        Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=True),
     ]
 
     assert evaluate(events, envelope=PROVEN) is Coverage.GAP
@@ -85,6 +126,7 @@ def test_every_envelope_property_is_load_bearing(field: str) -> None:
     events = [
         Event(EventKind.SEED, upid="S"),
         Event(EventKind.RESTART),
+        Event(EventKind.ARCHIVE_TRAVERSAL_START),
         Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=True),
     ]
 
@@ -105,6 +147,7 @@ def test_known_uncertainty_is_sticky_even_after_later_overlap(hazard: EventKind)
         Event(EventKind.SEED, upid="S"),
         Event(hazard),
         Event(EventKind.ACL_VISIBILITY_RESTORED),
+        Event(EventKind.ARCHIVE_TRAVERSAL_START),
         Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=True),
     ]
 
@@ -115,6 +158,7 @@ def test_rotation_without_sentinel_overlap_is_a_gap() -> None:
     events = [
         Event(EventKind.SEED, upid="S"),
         Event(EventKind.ROTATE),
+        Event(EventKind.ARCHIVE_TRAVERSAL_START),
         Event(EventKind.ARCHIVE_PAGE, upids=("new",), final_page=True),
     ]
 
