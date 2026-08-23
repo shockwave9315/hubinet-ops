@@ -70,14 +70,14 @@ def evaluate(
     """Evaluate one chronological fixture sequence.
 
     A known gap is sticky.  Restart or archive rotation requires a fresh
-    overlap with the persisted sentinel.  A page can close that requirement
-    only when the caller supplies an independently proven complete envelope.
+    overlap with the persisted sentinel.  A traversal can close that requirement
+    only when it reaches its final page after observing the sentinel in that
+    same traversal and the caller supplies an independently proven envelope.
     """
 
     sentinel: str | None = None
     overlap_required = True
-    overlap_seen = False
-    final_page_seen = False
+    traversal_overlap_seen = False
     gap_latched = False
     visible = True
 
@@ -108,18 +108,25 @@ def evaluate(
 
         if event.kind in {EventKind.RESTART, EventKind.ROTATE}:
             overlap_required = True
-            overlap_seen = False
-            final_page_seen = False
+            traversal_overlap_seen = False
             continue
 
         if event.kind is EventKind.ARCHIVE_PAGE:
             if not visible or sentinel is None:
                 gap_latched = True
+                if event.final_page:
+                    traversal_overlap_seen = False
                 continue
-            overlap_seen = overlap_seen or sentinel in event.upids
-            final_page_seen = final_page_seen or event.final_page
-            if overlap_required and overlap_seen and final_page_seen and envelope.complete:
-                overlap_required = False
+            traversal_overlap_seen = (
+                traversal_overlap_seen or sentinel in event.upids
+            )
+            if event.final_page:
+                if overlap_required:
+                    if traversal_overlap_seen and envelope.complete:
+                        overlap_required = False
+                    elif not traversal_overlap_seen:
+                        gap_latched = True
+                traversal_overlap_seen = False
             continue
 
         if event.kind in {EventKind.ACTIVE, EventKind.FINISHED} and event.upid is None:

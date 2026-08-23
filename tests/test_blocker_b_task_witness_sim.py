@@ -35,6 +35,43 @@ def test_fully_proven_envelope_and_overlap_can_model_complete_coverage() -> None
 
 
 @pytest.mark.parametrize(
+    "archive_pages",
+    [
+        (
+            Event(
+                EventKind.ARCHIVE_PAGE,
+                upids=("new", "S"),
+                final_page=False,
+            ),
+            Event(EventKind.ARCHIVE_PAGE, upids=("older",), final_page=True),
+        ),
+        (Event(EventKind.ARCHIVE_PAGE, upids=("new", "S"), final_page=True),),
+    ],
+)
+def test_overlap_and_final_page_in_same_traversal_can_complete(
+    archive_pages: tuple[Event, ...],
+) -> None:
+    events = [
+        Event(EventKind.SEED, upid="S"),
+        Event(EventKind.RESTART),
+        *archive_pages,
+    ]
+
+    assert evaluate(events, envelope=PROVEN) is Coverage.COMPLETE
+
+
+def test_final_page_without_overlap_latches_gap_across_later_traversal() -> None:
+    events = [
+        Event(EventKind.SEED, upid="S"),
+        Event(EventKind.RESTART),
+        Event(EventKind.ARCHIVE_PAGE, upids=("new",), final_page=True),
+        Event(EventKind.ARCHIVE_PAGE, upids=("S",), final_page=False),
+    ]
+
+    assert evaluate(events, envelope=PROVEN) is Coverage.GAP
+
+
+@pytest.mark.parametrize(
     "field",
     [
         "retention_prefix_proven",
