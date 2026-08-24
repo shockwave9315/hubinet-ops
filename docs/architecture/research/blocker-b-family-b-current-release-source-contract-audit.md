@@ -138,24 +138,29 @@ authenticated user is encoded as task owner. The worker `id` shown above is a
 locator/operation attribute, not durable inventory identity. HA and remote
 migration helpers are the noted conditional cases.
 
-`INFERENCE`: a witness whose complete evidence vocabulary is UPID task history
-cannot cover every supported QEMU creation/backing-state route in 9.2.6. A task
-record cannot later be recovered for an operation that never called
-`fork_worker`. Stateful overlap cannot repair non-generation.
+`INFERENCE`: an UPID-only event stream does not contain an event for every
+supported QEMU creation/backing/configuration route in 9.2.6. A task record
+cannot later be recovered for an operation that never called `fork_worker`.
+This is negative route-coverage evidence; it does not establish that a
+particular no-UPID route is continuity-relevant under ADR0006 §4b/§4c or that
+every possible stateful repeated-traversal/overlap protocol is impossible.
 
 This is a precise limitation, not a claim that every row is continuity-relevant
-in every context. Ordinary config mutation remains outside the accepted
-replacement definition unless independent positive replacement evidence exists.
-The result does prove that a future task-only design must narrow and enforce its
-operation scope or add a separately proven evidence channel; silently assuming
-all supported routes create tasks is disproven.
+in every context. Ordinary config mutation is not continuity-relevant under
+ADR0006, and this pass did not source-prove an actual physical/logical workload
+replacement sequence whose continuity-relevant transition occurs through a
+no-UPID route. The result does prove that a future task-only design cannot
+silently assume all supported backing/configuration routes create tasks.
 
 For restore classification, `FACT-SOURCE` establishes only that `qmrestore` is
 owned by the target/route node and attributes the UPID to the target VMID,
 including `force` and storage variants. `INFERENCE` from the accepted lifecycle
-model, not from PVE task naming, classifies a new-locator restore as `N` and a
-same-locator restore as `P`-style retained identity/fail-closed continuity unless
-separate accepted positive replacement evidence establishes `R`.
+model, not from PVE task naming, classifies a new-locator restore as `N`. For a
+same-locator restore, accepted positive replacement evidence invokes the class-R
+backend identity transition; without it, the backend retains the read-only
+identity/binding with class-P-style fail-closed continuity. Evidence controls
+the backend recognition/identity consequence, not whether physical replacement
+actually occurred.
 
 ## 6. LXC operation-to-task matrix
 
@@ -198,16 +203,18 @@ installed `pve-container` version is read and mapped.
 
 For LXC restore, the audited source range supports archive restore through
 `vzrestore`, including forced overwrite of a stopped container and storage
-selection. `INFERENCE` applies the same accepted `P`/`N`/conditional-`R`
-taxonomy; the `vzrestore` label is not replacement evidence.
+selection. `INFERENCE` applies the same accepted new-locator `N` and
+same-locator evidence-dependent backend consequence; the `vzrestore` label is
+not replacement evidence, and evidence does not determine whether physical
+replacement occurred.
 
 The installed `pve-storage` revision is not pinned. Plugin-specific allocation,
 copy, import, and migration internals therefore remain `UNKNOWN` where their
 behavior would be load-bearing. This audit does establish the caller-level fact
 that supported QEMU and LXC synchronous configuration paths can make newly
 allocated/imported backing effective without creating a task. It does not use
-direct root shell or out-of-band storage manipulation as its bounded NO-GO
-witness.
+direct root shell or out-of-band storage manipulation as negative route-coverage
+evidence.
 
 ## 7. `/cluster/tasks`
 
@@ -367,9 +374,11 @@ the calls as well.
 | A later fresh traversal may observe the new record, but no source property proves a stable end boundary for the interval just consumed. | `INFERENCE` |
 | Successful offset pagination proves complete interval traversal. | `UNKNOWN` |
 
-This resolves the narrow source question negatively: current offset pagination
-is not a snapshot/cursor contract. It does not by itself prove that every
-possible stateful Family-B protocol is impossible.
+This partially resolves Research #1 unknown #4: native `start`/`limit`
+pagination is not a snapshot/cursor contract, and the normal two-page traversal
+above can omit/duplicate records. Whether a possible stateful
+repeated-traversal/overlap protocol over these surfaces can establish
+completeness remains `UNKNOWN`.
 
 ## 12. Archive rotation, generation, and loss
 
@@ -526,9 +535,9 @@ Annotations overlap; each numbered group remains present.
 | # | Original unknown group | Research #2A disposition | Basis |
 | --- | --- | --- | --- |
 | 1 | Exact installed/current-release source mapping | **PARTIALLY RESOLVED** + **REQUIRES OPERATOR VERSION READ** | Exact qemu-server, pve-manager, and pve-cluster mappings; other load-bearing installed versions remain unknown. |
-| 2 | Operation-to-task generation/type/owner/routes | **PARTIALLY RESOLVED** + **IMPOSSIBLE — WITH PROOF** for the precise UPID-only/all-supported-QEMU-backing-route scope + **REQUIRES CONTROLLED EXPERIMENT** for remaining mapped behavior | Exact QEMU tracing found both worker routes and supported no-worker routes. LXC mapping and runtime variants remain. |
+| 2 | Operation-to-task generation/type/owner/routes | **PARTIALLY RESOLVED** + **REQUIRES CONTROLLED EXPERIMENT** | Exact QEMU tracing found both worker routes and supported no-worker routes, disproving universal task-generation coverage. It did not establish a continuity-relevant no-UPID replacement witness. LXC mapping and runtime variants remain. |
 | 3 | Active-to-archive publication/handoff completeness | **PARTIALLY RESOLVED** + **REQUIRES CONTROLLED EXPERIMENT** | Normal lock/write ordering and the start-publication race are sourced; durable external gaplessness is unproven. |
-| 4 | Pagination completeness under concurrent task changes/rotation | **RESOLVED — SOURCE/DOC PROOF** for the negative API property | Source exposes mutable numeric offsets without snapshot/cursor/generation; a source-consistent prepend interleaving omits a record from the traversal. |
+| 4 | Pagination completeness under concurrent task changes/rotation | **PARTIALLY RESOLVED** + **STILL UNKNOWN** + **REQUIRES CONTROLLED EXPERIMENT** | Source proves native mutable offsets are not a snapshot/cursor and a normal two-page traversal can omit/duplicate records. It does not prove every possible stateful repeated-traversal/overlap protocol incapable of establishing completeness. |
 | 5 | Machine-observable archive generation/loss and exact `index/index.1` behavior | **PARTIALLY RESOLVED** + **REQUIRES CONTROLLED EXPERIMENT** | Normal append/rotation/retention are sourced; no API epoch/loss marker exists; crash behavior remains unknown. |
 | 6 | Exact-UPID retention after list disappearance/rotation/restart/rejoin | **PARTIALLY RESOLVED** + **REQUIRES CONTROLLED EXPERIMENT** | Separate log files and daily cleanup boundary are sourced; restart/rejoin/crash outcomes are incomplete. |
 | 7 | Concrete overlap anchor proving absence of unknown omitted tasks | **STILL UNKNOWN** | No cursor, immutable snapshot, generation, predecessor, sequence, or equivalent complete envelope found. |
@@ -541,11 +550,11 @@ Disposition annotation counts are:
 
 | Annotation | Count | Groups |
 | --- | ---: | --- |
-| `RESOLVED — SOURCE/DOC PROOF` | 1 | 4 |
-| `PARTIALLY RESOLVED` | 8 | 1, 2, 3, 5, 6, 8, 9, 10 |
-| `STILL UNKNOWN` | 3 | 7, 8, 11 |
-| `IMPOSSIBLE — WITH PROOF` | 1 | 2, only for the stated precise subcandidate |
-| `REQUIRES CONTROLLED EXPERIMENT` | 8 | 2, 3, 5, 6, 8, 9, 10, 11 |
+| `RESOLVED — SOURCE/DOC PROOF` | 0 | None |
+| `PARTIALLY RESOLVED` | 9 | 1, 2, 3, 4, 5, 6, 8, 9, 10 |
+| `STILL UNKNOWN` | 4 | 4, 7, 8, 11 |
+| `IMPOSSIBLE — WITH PROOF` | 0 | None |
+| `REQUIRES CONTROLLED EXPERIMENT` | 9 | 2, 3, 4, 5, 6, 8, 9, 10, 11 |
 | `REQUIRES OPERATOR VERSION READ` | 1 | 1 |
 
 The controlled-experiment annotation on group 11 means an adversarial experiment
@@ -567,14 +576,14 @@ be promoted into an undocumented security contract.
 | 4 | LXC clone | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Pin installed container package first. |
 | 5 | QEMU snapshot create/delete/rollback | **VALIDATION / ADVERSARIAL CONFIRMATION** | Exact `qmsnapshot/qmdelsnapshot/qmrollback` types are sourced; preserve class `P`. |
 | 6 | LXC snapshot create/delete/rollback | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Pin installed package; expected types are `vzsnapshot/vzdelsnapshot/vzrollback`. |
-| 7 | QEMU restore same/new VMID | **VALIDATION / ADVERSARIAL CONFIRMATION** | Exact `qmrestore` route is sourced; classify same-locator as `P`-style fail-closed unless independent replacement proof exists, new locator as `N`. |
+| 7 | QEMU restore same/new VMID | **VALIDATION / ADVERSARIAL CONFIRMATION** | Exact `qmrestore` route is sourced. New locator is `N`; at the same locator, accepted positive replacement evidence invokes the class-R backend identity transition, while its absence retains identity/binding with class-P-style fail-closed continuity. This evidence consequence does not determine whether physical replacement occurred. |
 | 8 | LXC restore | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Pin package and storage variants first. |
 | 9 | QEMU migration including failure | **NEEDS REFINEMENT BEFORE EXECUTION** | Separate local, remote, HA, source worker, target CLI/API tunnel, online/offline, and partial-failure cases. |
 | 10 | LXC migration including failure | **NEEDS REFINEMENT BEFORE EXECUTION** | Pin container/HA packages and separate local/remote/HA/restart variants. |
 | 11 | QEMU disk/import/move/attach/storage paths | **NEEDS REFINEMENT BEFORE EXECUTION** | Include `qmmove` plus synchronous `PUT config`, `qm disk import`, `qm importovf`, attach, unlink, and boot/backing changes; do not assume a task. |
 | 12 | LXC rootfs/storage paths | **NEEDS REFINEMENT BEFORE EXECUTION** | Pin package; distinguish `move_volume` from synchronous config attach/replace. |
-| 13 | High-volume tasks crossing pages/archive rotation | **VALIDATION / ADVERSARIAL CONFIRMATION** | Source already disproves snapshot-style offset semantics; experiment should test exact interleavings/rotation and loss observability, not attempt to manufacture a contract. |
-| 14 | Exact-UPID retention after list disappearance/rotation | **VALIDATION / ADVERSARIAL CONFIRMATION** | Validate separate-log persistence and daily cleanup boundary on a disposable fixture. |
+| 13 | High-volume tasks crossing pages/archive rotation | **NEEDS REFINEMENT BEFORE EXECUTION** | First pin the installed `pve-common` revision. Then define the candidate repeated-traversal/overlap protocol and adversarial interleavings; native offset traversal is already negatively bounded, but the broader stateful completeness question remains unknown. |
+| 14 | Exact-UPID retention after list disappearance/rotation | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Exact retention/rotation behavior depends on the still-unmapped installed `pve-common`; pin it before validating separate-log persistence and cleanup on a disposable fixture. |
 | 15 | Task-related PVE service restart around active task | **NEEDS REFINEMENT BEFORE EXECUTION** | Name exact service and distinguish reload, restart, stop/start, worker phase, archive write, and publisher recovery. |
 | 16 | Node reboot around active task | **NEEDS REFINEMENT BEFORE EXECUTION** | Define crash point, filesystem durability observation, membership state, and post-reboot/rejoin routing. |
 | 17 | `Sys.Audit` remove/restore ACL ABA around known task | **NEEDS REFINEMENT BEFORE EXECUTION** | Keep ordinary token ABA test; separately decide whether any future structurally privileged reader candidate is in scope. |
@@ -584,9 +593,9 @@ Status counts:
 | Status | Count | Experiments |
 | --- | ---: | --- |
 | `STILL REQUIRED` | 0 | None as the primary status; unresolved experiments are more precisely classified below. |
-| `VALIDATION / ADVERSARIAL CONFIRMATION` | 6 | 1, 3, 5, 7, 13, 14 |
-| `NEEDS REFINEMENT BEFORE EXECUTION` | 7 | 9, 10, 11, 12, 15, 16, 17 |
-| `BLOCKED BY MISSING VERSION/ENVIRONMENT DATA` | 4 | 2, 4, 6, 8 |
+| `VALIDATION / ADVERSARIAL CONFIRMATION` | 4 | 1, 3, 5, 7 |
+| `NEEDS REFINEMENT BEFORE EXECUTION` | 8 | 9, 10, 11, 12, 13, 15, 16, 17 |
+| `BLOCKED BY MISSING VERSION/ENVIRONMENT DATA` | 5 | 2, 4, 6, 8, 14 |
 | `PROPERTY ALREADY SOURCE-PROVEN` | 0 | None; even sourced mechanics retain adversarial validation value. |
 
 Every future execution still requires explicit operator approval, a controlled
@@ -595,42 +604,34 @@ not that fixture.
 
 ## 19. Family B Research #2A exit classification
 
-### CASE 1 — NO-GO WITH PROOF, for a precise candidate scope
+### CASE 2 — MATERIAL UNKNOWNS REMAIN
 
-The disproven candidate is:
+Research #2A establishes useful negative route-coverage evidence: exact target
+`qemu-server` 9.2.6 includes supported synchronous `PUT .../config`,
+`qm disk import`, and `qm importovf` paths that do not call `fork_worker` and
+therefore create no UPID. Universal task generation across all supported QEMU
+backing/configuration routes is disproven.
 
-> a Family-B witness whose exclusive positive event vocabulary is the current
-> UPID task surfaces and which claims complete coverage of every supported QEMU
-> route capable of creating, importing, attaching, moving, or replacing
-> effective workload backing state, without an independently enforced route
-> restriction or another evidence channel.
+That fact is not a continuity-relevant NO-GO proof. ADR0006 §4c distinguishes
+ordinary configuration mutation from actual physical/logical workload
+replacement. This pass did not establish from exact source a supported T1/T2
+no-UPID operation sequence whose unnoticed occurrence actually produces a
+class-R or class-P transition within ADR0006 §4b's detection scope. Missing
+that bridge is missing evidence, not impossibility.
 
-The proof is bounded and concrete:
+Whether an actual replacement physically occurred is independent of whether
+the backend has accepted positive replacement evidence. If actual replacement
+occurred without such evidence, it does not become ordinary config mutation:
+the backend retains the existing read-only `resource_id`/binding and continuity
+and policy fail closed under the accepted ambiguity path. Accepted positive
+replacement evidence instead authorizes the class-R atomic direct-replacement
+identity transition. Evidence controls recognition and backend consequence; it
+does not cause or define the physical replacement.
 
-1. exact target `qemu-server` 9.2.6 implements supported `qm disk import`,
-   `qm importovf`, and synchronous `PUT .../config`/attach/unlink paths without
-   `fork_worker` and therefore without a UPID;
-2. the audited task-list, status, and log surfaces enumerate or look up UPIDs;
-   they do not synthesize records for non-worker operations; and
-3. no stronger stateful overlap, sentinel, or pagination strategy can recover a
-   record that was never generated.
-
-The load-bearing no-worker witness is the supported PVE API `PUT` configuration
-route, which can attach/change/unlink effective disk references. The supported
-CLI imports corroborate route incompleteness but are not needed as a direct-root
-or out-of-band-storage NO-GO premise. This proof does not rely on arbitrary
-shell commands or direct storage manipulation.
-
-Avoiding that proof requires leaving the candidate scope: for example, a future
-accepted mechanism could fail closed on and independently enforce a narrower
-operation set, or add another proven evidence/authorization boundary. Neither
-mechanism exists or is authorized by this research.
-
-This is not a broad impossibility proof for every imaginable Family-B design.
-It does not establish a sufficient mechanism. It does not settle whether a
-strictly narrowed, independently enforced, structurally privileged, stateful
-reader could meet ADR0006. The missing completeness anchor, interval visibility,
-multi-node, restart, and exact-version questions remain material.
+The missing completeness anchor, possible stateful repeated-traversal/overlap
+protocol, interval visibility, multi-node, restart, and exact-version questions
+remain material. Research #2A therefore establishes no sufficient mechanism
+and no proven impossibility for the remaining Family-B candidate space.
 
 Therefore the architecture classification remains:
 
@@ -642,11 +643,12 @@ Phase 1C:  BLOCKED
 R0:        GO / STRICTLY READ-ONLY
 ```
 
-A separately approved Research #2B campaign remains justified for the
-experimentally resolvable questions in section 18. Experiments can validate or
-falsify source-derived runtime expectations. They cannot turn absent generation,
-an absent completeness anchor, or undocumented behavior into a security
-contract.
+Family B remains `UNRESOLVED / NOT FULLY AUDITED`. A separately approved
+Research #2B campaign is justified for the exact experimentally resolvable
+questions in section 18. Experiments can validate or falsify source-derived
+runtime expectations. They cannot establish a security boundary solely from
+undocumented observed behavior or substitute for the still-missing source and
+architecture contract.
 
 ## 20. Exact primary-source ledger
 
