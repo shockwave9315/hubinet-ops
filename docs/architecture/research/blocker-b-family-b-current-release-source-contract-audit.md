@@ -93,7 +93,7 @@ No source observation was promoted into an accepted trust mechanism.
 
 | Component | Installed/target version | Exact upstream tag/commit | Mapping evidence | Classification/status |
 | --- | --- | --- | --- | --- |
-| `qemu-server` | 9.2.6 | [`e6352be67f70042a7433a3a3c712b36d02f9f7cb`](https://github.com/proxmox/qemu-server/commit/e6352be67f70042a7433a3a3c712b36d02f9f7cb) | Exact `debian/changelog` bump | `FACT-SOURCE`; `REVERIFIED THIS RESEARCH PASS` |
+| `qemu-server` | `INSTALLED VERSION UNKNOWN` | Audited 9.2.6 [`e6352be67f70042a7433a3a3c712b36d02f9f7cb`](https://github.com/proxmox/qemu-server/commit/e6352be67f70042a7433a3a3c712b36d02f9f7cb) | Exact `debian/changelog` bump proves the 9.2.6-to-commit mapping; repository evidence does not establish the target host's installed `qemu-server` version | `FACT-SOURCE` for the audited revision; `REVERIFIED THIS RESEARCH PASS`; `UNKNOWN`; `CURRENT-RELEASE MAPPING UNKNOWN`; `OPERATOR READ REQUIRED` |
 | `pve-manager` | 9.2.11 | [`f6997e698c7933ea8e62319e2bf1bf7262daa56a`](https://github.com/proxmox/pve-manager/commit/f6997e698c7933ea8e62319e2bf1bf7262daa56a) | Exact `debian/changelog` bump | `FACT-SOURCE`; `REVERIFIED THIS RESEARCH PASS` |
 | `pve-cluster` | 9.1.6 | [`7091d92e594952dba65c1e57568b3d7cc244e960`](https://github.com/proxmox/pve-cluster/commit/7091d92e594952dba65c1e57568b3d7cc244e960) | Exact `debian/changelog` bump | `FACT-SOURCE`; `REVERIFIED THIS RESEARCH PASS` |
 | `pve-common` | `INSTALLED VERSION UNKNOWN` | Audited 9.1.21 [`5054082fe492429fc37574985c2ca812af9a3125`](https://github.com/proxmox/pve-common/commit/5054082fe492429fc37574985c2ca812af9a3125) and 9.2.1 [`f665029eac78022e81810ab2e44eace57ade13fb`](https://github.com/proxmox/pve-common/commit/f665029eac78022e81810ab2e44eace57ade13fb) | `pve-manager` 9.2.11 requires `libpve-common-perl (>= 9.1.21)`; relevant task files are identical at these audited endpoints | `UNKNOWN`; `CURRENT-RELEASE MAPPING UNKNOWN`; `OPERATOR READ REQUIRED` |
@@ -104,13 +104,19 @@ No source observation was promoted into an accepted trust mechanism.
 | `pve-ha-manager` | `INSTALLED VERSION UNKNOWN` | Audited 5.2.5 [`c73364c19d5317e6df5bb1c1b727d080a5e897ef`](https://github.com/proxmox/pve-ha-manager/commit/c73364c19d5317e6df5bb1c1b727d080a5e897ef) | Load-bearing only for HA-managed migration variants; not mapped to target | `UNKNOWN`; `CURRENT-RELEASE MAPPING UNKNOWN`; `OPERATOR READ REQUIRED` |
 
 The CT112 package database and kernel were deliberately not used as production
-PVE evidence. Exact mapping is complete for the three packages with prior
-installed-version evidence and incomplete for the other load-bearing packages.
+PVE evidence. Exact installed-to-source mapping is complete for `pve-manager`
+and `pve-cluster`. The `qemu-server` 9.2.6-to-commit mapping and source behavior
+are exact for that audited upstream release, but its identity with the package
+installed on the target host is unconfirmed. Other load-bearing package
+mappings also remain incomplete.
 
 ## 5. QEMU operation-to-task matrix
 
-All rows in this section are pinned to `qemu-server` 9.2.6 unless a row says
-otherwise. The main source is
+All rows in this section are pinned to the audited upstream `qemu-server` 9.2.6
+revision unless a row says otherwise. They are `FACT-SOURCE` for that revision;
+their direct applicability to the installed target is `CURRENT-RELEASE MAPPING
+UNKNOWN` until an operator read confirms the installed `qemu-server` version.
+The main source is
 [`src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm).
 
 | Operation | API/CLI route | Task generated? | Worker/task type | Owner node / UPID id | Alternate supported bypass? | Evidence | Classification |
@@ -494,8 +500,8 @@ source migration, and target helper records.
 
 | Migration question | Disposition | Classification |
 | --- | --- | --- |
-| Normal local source task type/owner | Established for exact QEMU; established only in unmapped LXC range | `FACT-SOURCE` |
-| Remote source and target task types | Established for exact QEMU; established only in unmapped LXC range | `FACT-SOURCE` |
+| Normal local source task type/owner | Established at audited upstream `qemu-server` 9.2.6, with target mapping unknown; established only in unmapped LXC range | `FACT-SOURCE` |
+| Remote source and target task types | Established at audited upstream `qemu-server` 9.2.6, with target mapping unknown; established only in unmapped LXC range | `FACT-SOURCE` |
 | HA wrapper-to-LRM task linkage as a complete observable chain | No durable UPID linkage/completeness contract established | `UNKNOWN` |
 | Failure ordering and partial source/target visibility for every supported variant | Not completely established | `UNKNOWN` |
 | Membership disagreement, node disappearance, and rejoin coverage | No complete contract established | `UNKNOWN` |
@@ -534,8 +540,8 @@ Annotations overlap; each numbered group remains present.
 
 | # | Original unknown group | Research #2A disposition | Basis |
 | --- | --- | --- | --- |
-| 1 | Exact installed/current-release source mapping | **PARTIALLY RESOLVED** + **REQUIRES OPERATOR VERSION READ** | Exact qemu-server, pve-manager, and pve-cluster mappings; other load-bearing installed versions remain unknown. |
-| 2 | Operation-to-task generation/type/owner/routes | **PARTIALLY RESOLVED** + **REQUIRES CONTROLLED EXPERIMENT** | Exact QEMU tracing found both worker routes and supported no-worker routes, disproving universal task-generation coverage. It did not establish a continuity-relevant no-UPID replacement witness. LXC mapping and runtime variants remain. |
+| 1 | Exact installed/current-release source mapping | **PARTIALLY RESOLVED** + **REQUIRES OPERATOR VERSION READ** | Exact installed-to-source mappings for `pve-manager` and `pve-cluster`; exact upstream mapping and behavior audit for `qemu-server` 9.2.6, whose installed-target identity remains unknown; other load-bearing installed versions also remain unknown. |
+| 2 | Operation-to-task generation/type/owner/routes | **PARTIALLY RESOLVED** + **REQUIRES CONTROLLED EXPERIMENT** | Exact tracing at audited upstream `qemu-server` 9.2.6 found both worker routes and supported no-worker routes, disproving universal task-generation coverage for that release. Installed-target applicability, LXC mapping, runtime variants, and a continuity-relevant no-UPID replacement witness remain unestablished. |
 | 3 | Active-to-archive publication/handoff completeness | **PARTIALLY RESOLVED** + **REQUIRES CONTROLLED EXPERIMENT** | Normal lock/write ordering and the start-publication race are sourced; durable external gaplessness is unproven. |
 | 4 | Pagination completeness under concurrent task changes/rotation | **PARTIALLY RESOLVED** + **STILL UNKNOWN** + **REQUIRES CONTROLLED EXPERIMENT** | Source proves native mutable offsets are not a snapshot/cursor and a normal two-page traversal can omit/duplicate records. It does not prove every possible stateful repeated-traversal/overlap protocol incapable of establishing completeness. |
 | 5 | Machine-observable archive generation/loss and exact `index/index.1` behavior | **PARTIALLY RESOLVED** + **REQUIRES CONTROLLED EXPERIMENT** | Normal append/rotation/retention are sourced; no API epoch/loss marker exists; crash behavior remains unknown. |
@@ -570,17 +576,17 @@ be promoted into an undocumented security contract.
 
 | # | Canonical experiment | #2A status | Refinement/source implication |
 | --- | --- | --- | --- |
-| 1 | QEMU create A, destroy A, create B at same VMID | **VALIDATION / ADVERSARIAL CONFIRMATION** | Exact normal `qmcreate/qmdestroy` routes are sourced; also test the boundary against supported no-task create/import routes. |
+| 1 | QEMU create A, destroy A, create B at same VMID | **VALIDATION / ADVERSARIAL CONFIRMATION** | Normal `qmcreate/qmdestroy` routes are source-proven at audited upstream `qemu-server` 9.2.6; confirm the installed mapping before applying them directly, then test the boundary against supported no-task create/import routes. |
 | 2 | LXC equivalent | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Pin installed `pve-container`; use only a disposable approved LXC fixture. |
-| 3 | QEMU clone variants | **VALIDATION / ADVERSARIAL CONFIRMATION** | Exact `qmclone` route and source-VMID UPID attribution are sourced. |
+| 3 | QEMU clone variants | **VALIDATION / ADVERSARIAL CONFIRMATION** | The `qmclone` route and source-VMID UPID attribution are source-proven at audited upstream `qemu-server` 9.2.6; direct target applicability remains version-mapping dependent. |
 | 4 | LXC clone | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Pin installed container package first. |
-| 5 | QEMU snapshot create/delete/rollback | **VALIDATION / ADVERSARIAL CONFIRMATION** | Exact `qmsnapshot/qmdelsnapshot/qmrollback` types are sourced; preserve class `P`. |
+| 5 | QEMU snapshot create/delete/rollback | **VALIDATION / ADVERSARIAL CONFIRMATION** | The `qmsnapshot/qmdelsnapshot/qmrollback` types are source-proven at audited upstream `qemu-server` 9.2.6; direct target applicability remains version-mapping dependent; preserve class `P`. |
 | 6 | LXC snapshot create/delete/rollback | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Pin installed package; expected types are `vzsnapshot/vzdelsnapshot/vzrollback`. |
-| 7 | QEMU restore same/new VMID | **VALIDATION / ADVERSARIAL CONFIRMATION** | Exact `qmrestore` route is sourced. New locator is `N`; at the same locator, accepted positive replacement evidence invokes the class-R backend identity transition, while its absence retains identity/binding with class-P-style fail-closed continuity. This evidence consequence does not determine whether physical replacement occurred. |
+| 7 | QEMU restore same/new VMID | **VALIDATION / ADVERSARIAL CONFIRMATION** | The `qmrestore` route is source-proven at audited upstream `qemu-server` 9.2.6; direct target applicability remains version-mapping dependent. New locator is `N`; at the same locator, accepted positive replacement evidence invokes the class-R backend identity transition, while its absence retains identity/binding with class-P-style fail-closed continuity. This evidence consequence does not determine whether physical replacement occurred. |
 | 8 | LXC restore | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Pin package and storage variants first. |
-| 9 | QEMU migration including failure | **NEEDS REFINEMENT BEFORE EXECUTION** | Separate local, remote, HA, source worker, target CLI/API tunnel, online/offline, and partial-failure cases. |
+| 9 | QEMU migration including failure | **NEEDS REFINEMENT BEFORE EXECUTION** | Confirm the installed `qemu-server` mapping, then separate local, remote, HA, source worker, target CLI/API tunnel, online/offline, and partial-failure cases. |
 | 10 | LXC migration including failure | **NEEDS REFINEMENT BEFORE EXECUTION** | Pin container/HA packages and separate local/remote/HA/restart variants. |
-| 11 | QEMU disk/import/move/attach/storage paths | **NEEDS REFINEMENT BEFORE EXECUTION** | Include `qmmove` plus synchronous `PUT config`, `qm disk import`, `qm importovf`, attach, unlink, and boot/backing changes; do not assume a task. |
+| 11 | QEMU disk/import/move/attach/storage paths | **NEEDS REFINEMENT BEFORE EXECUTION** | Confirm the installed `qemu-server` mapping; then include audited-9.2.6 `qmmove` plus synchronous `PUT config`, `qm disk import`, `qm importovf`, attach, unlink, and boot/backing changes; do not assume a task. |
 | 12 | LXC rootfs/storage paths | **NEEDS REFINEMENT BEFORE EXECUTION** | Pin package; distinguish `move_volume` from synchronous config attach/replace. |
 | 13 | High-volume tasks crossing pages/archive rotation | **NEEDS REFINEMENT BEFORE EXECUTION** | First pin the installed `pve-common` revision. Then define the candidate repeated-traversal/overlap protocol and adversarial interleavings; native offset traversal is already negatively bounded, but the broader stateful completeness question remains unknown. |
 | 14 | Exact-UPID retention after list disappearance/rotation | **BLOCKED BY MISSING VERSION/ENVIRONMENT DATA** | Exact retention/rotation behavior depends on the still-unmapped installed `pve-common`; pin it before validating separate-log persistence and cleanup on a disposable fixture. |
@@ -606,11 +612,16 @@ not that fixture.
 
 ### CASE 2 — MATERIAL UNKNOWNS REMAIN
 
-Research #2A establishes useful negative route-coverage evidence: exact target
-`qemu-server` 9.2.6 includes supported synchronous `PUT .../config`,
+`CASE 2` is a local Research #2A exit classification, not an accepted
+architecture taxonomy.
+
+Research #2A establishes useful negative route-coverage evidence: the audited
+upstream `qemu-server` 9.2.6 source includes supported synchronous `PUT .../config`,
 `qm disk import`, and `qm importovf` paths that do not call `fork_worker` and
 therefore create no UPID. Universal task generation across all supported QEMU
-backing/configuration routes is disproven.
+backing/configuration routes is disproven for that audited release. These exact
+source findings apply directly to the installed target only if an operator read
+confirms that its `qemu-server` maps to 9.2.6.
 
 That fact is not a continuity-relevant NO-GO proof. ADR0006 §4c distinguishes
 ordinary configuration mutation from actual physical/logical workload
@@ -654,11 +665,11 @@ architecture contract.
 
 | Component | Version | Commit | File | Symbol/function | Property established | Evidence class |
 | --- | --- | --- | --- | --- | --- | --- |
-| qemu-server | 9.2.6 | [`e6352be...`](https://github.com/proxmox/qemu-server/commit/e6352be67f70042a7433a3a3c712b36d02f9f7cb) | [`src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm) | `create_vm`, `destroy_vm`, `clone_vm` | Create/restore, destroy, clone task types/routes/owners | `FACT-SOURCE` |
-| qemu-server | 9.2.6 | same | same | `migrate_vm`, `remote_migrate_vm`, `mtunnel` | Source migration and remote target tunnel workers | `FACT-SOURCE` |
-| qemu-server | 9.2.6 | same | same | `move_vm_disk`, config update methods | `qmmove`, async `qmconfig`, synchronous `PUT` bypass | `FACT-SOURCE` |
-| qemu-server | 9.2.6 | same | [`src/PVE/API2/Qemu/Snapshot.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu/Snapshot.pm) | snapshot methods | `qmsnapshot`, `qmdelsnapshot`, `qmrollback` | `FACT-SOURCE` |
-| qemu-server | 9.2.6 | same | [`src/PVE/CLI/qm.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/CLI/qm.pm) | `importdisk`, `importovf`, `unlink`, `mtunnel` | Supported synchronous no-UPID routes and local helper | `FACT-SOURCE` |
+| qemu-server | audited upstream 9.2.6; target unknown | [`e6352be...`](https://github.com/proxmox/qemu-server/commit/e6352be67f70042a7433a3a3c712b36d02f9f7cb) | [`src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm) | `create_vm`, `destroy_vm`, `clone_vm` | Create/restore, destroy, clone task types/routes/owners | `FACT-SOURCE`; target mapping unknown |
+| qemu-server | same | same | same | `migrate_vm`, `remote_migrate_vm`, `mtunnel` | Source migration and remote target tunnel workers | `FACT-SOURCE`; target mapping unknown |
+| qemu-server | same | same | same | `move_vm_disk`, config update methods | `qmmove`, async `qmconfig`, synchronous `PUT` bypass | `FACT-SOURCE`; target mapping unknown |
+| qemu-server | same | same | [`src/PVE/API2/Qemu/Snapshot.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu/Snapshot.pm) | snapshot methods | `qmsnapshot`, `qmdelsnapshot`, `qmrollback` | `FACT-SOURCE`; target mapping unknown |
+| qemu-server | same | same | [`src/PVE/CLI/qm.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/CLI/qm.pm) | `importdisk`, `importovf`, `unlink`, `mtunnel` | Supported synchronous no-UPID routes and local helper | `FACT-SOURCE`; target mapping unknown |
 | pve-manager | 9.2.11 | [`f6997e...`](https://github.com/proxmox/pve-manager/commit/f6997e698c7933ea8e62319e2bf1bf7262daa56a) | [`PVE/API2/Tasks.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/API2/Tasks.pm) | task index/status/log route methods | Active/archive/all enumeration, offsets, filters, authorization, exact-UPID behavior | `FACT-SOURCE` |
 | pve-manager | 9.2.11 | same | [`PVE/API2/Cluster.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/API2/Cluster.pm) | `get_tasklist` route | Cluster task route and authorization filter | `FACT-SOURCE` |
 | pve-manager | 9.2.11 | same | [`PVE/Service/pvestatd.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/Service/pvestatd.pm) | `update_status` | Active scan and periodic cluster publication | `FACT-SOURCE` |
@@ -689,6 +700,7 @@ The operator, not this research agent, must run it on the target PVE node and
 supply the unredacted package names/versions (no credentials are involved). It
 is needed to pin at least:
 
+- `qemu-server`;
 - `pve-common` / `libpve-common-perl`;
 - `pve-container`;
 - `pve-storage` / `libpve-storage-perl`;
