@@ -18,10 +18,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_REVISION = "family-b-13-capture-v2"
-PROTOCOL_REVISION = "family-b-13-preexecution-v2"
+SCHEMA_REVISION = "family-b-13-capture-v3"
+PROTOCOL_REVISION = "family-b-13-preexecution-v3"
 EXPECTED_B_S1_REVISION = "B-S1-2B-f2fd1ddb442fb1e0202a7a0800a05c330b6ac9cc"
-ANALYZER_REVISION = "family-b-13-analyzer-v2"
+ANALYZER_REVISION = "family-b-13-analyzer-v3"
 GENERATOR_CONTRACT_REVISION = "family-b-13-generator-contract-v1"
 SUBRUN_CONTRACT_REVISION = "family-b-13-subrun-contract-v1"
 MAX_JSONL_LINE_BYTES = 1_048_576
@@ -75,7 +75,7 @@ EXPECTED_SOURCE_LEDGER = {
 class AnalyzerOutcome(str, Enum):
     PASS = "ANALYZER_PASS_TESTED_INTERLEAVING"
     GAP = "B_S1_GAP_DETECTED"
-    FALSE_CLOSED = "FALSE_CLOSED_COMPLETE_WITNESS"
+    ENUMERATION_WITNESS = "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS"
     INCOMPLETE = "HARNESS_INCOMPLETE"
     INELIGIBLE = "ENVIRONMENT_INELIGIBLE"
 
@@ -354,7 +354,9 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
         "filesystem_context",
         "reader_context",
         "generator_context",
+        "experiment_generator_window",
         "baseline_observation",
+        "t0_quiescence",
         "subrun_contract",
         "safety_limits",
         "capture_completeness",
@@ -533,8 +535,20 @@ def _ground_truth(
     close = _require_mapping(manifest["candidate_close"], "candidate_close")
     t0_monotonic_ns = _require_int(manifest, "t0_monotonic_ns")
     t1_monotonic_ns = _require_int(close, "monotonic_ns")
+    generator_window = _require_mapping(
+        manifest["experiment_generator_window"], "experiment_generator_window"
+    )
+    generator_window_start = _require_int(generator_window, "start_monotonic_ns")
+    generator_window_end = _require_int(generator_window, "end_monotonic_ns")
     if t1_monotonic_ns <= t0_monotonic_ns:
         raise CaptureError("candidate_close_not_after_t0")
+    if not (
+        t0_monotonic_ns
+        <= generator_window_start
+        < generator_window_end
+        <= t1_monotonic_ns
+    ):
+        raise CaptureError("experiment_generator_window_outside_candidate_interval")
     for record in records:
         event = _require_text(record, "event")
         if event == "generator_finalized":
@@ -567,7 +581,8 @@ def _ground_truth(
         raise CaptureError("ground_truth_finalization_not_durable")
     last_sequence = _require_int(finalized, "last_sequence")
     total_operations = _require_int(finalized, "total_operations")
-    if total_operations == 0:
+    subrun_id = _require_text(manifest, "subrun_id")
+    if total_operations == 0 and subrun_id != "13E":
         raise CaptureError("ground_truth_contains_no_operations")
     if total_operations > _require_int(
         generator_contract, "maximum_operation_count"
@@ -616,28 +631,45 @@ def _ground_truth(
             or decoded["owner"] != generator_contract["expected_owner"]
         ):
             raise EnvironmentError("generated_upid_outside_approved_contract")
-        relation = end.get("boundary_relation")
-        if relation not in {"before_t1", "after_t1", "ambiguous"}:
-            raise CaptureError("ground_truth_boundary_relation_invalid")
-        declared_within_scope = _require_bool(end, "within_scope")
+        relation = end.get("generator_window_relation")
+        if relation not in {
+            "inside_generator_window",
+            "after_generator_window",
+            "ambiguous",
+        }:
+            raise CaptureError("ground_truth_generator_window_relation_invalid")
+        declared_generator_membership = _require_bool(
+            end, "within_generator_window"
+        )
+        body_start_membership = _require_text(
+            end, "b_s1_body_start_membership"
+        )
+        if (
+            body_start_membership != "unknown"
+            or end.get("body_start_evidence") is not None
+        ):
+            raise CaptureError("b_s1_body_start_membership_not_established")
         request_end_monotonic_ns = _require_int(end, "monotonic_ns")
         if request_end_monotonic_ns < start["monotonic_ns"]:
             raise CaptureError("ground_truth_request_time_reversed")
-        if relation == "before_t1":
-            derived_within_scope = (
-                t0_monotonic_ns <= start["monotonic_ns"]
-                and request_end_monotonic_ns <= t1_monotonic_ns
+        if relation == "inside_generator_window":
+            derived_generator_membership = (
+                generator_window_start <= start["monotonic_ns"]
+                and request_end_monotonic_ns <= generator_window_end
             )
-            if not derived_within_scope:
-                raise CaptureError("before_t1_timing_inconsistent")
-        elif relation == "after_t1":
-            derived_within_scope = False
-            if start["monotonic_ns"] < t1_monotonic_ns:
-                raise CaptureError("after_t1_timing_inconsistent")
+            if not derived_generator_membership:
+                raise CaptureError("generator_window_timing_inconsistent")
+        elif relation == "after_generator_window":
+            derived_generator_membership = False
+            if start["monotonic_ns"] < generator_window_end:
+                raise CaptureError("after_generator_window_timing_inconsistent")
         else:
-            derived_within_scope = False
-        if relation != "ambiguous" and declared_within_scope != derived_within_scope:
-            raise CaptureError("ground_truth_scope_declaration_mismatch")
+            derived_generator_membership = False
+        if (
+            relation != "ambiguous"
+            and declared_generator_membership != derived_generator_membership
+        ):
+            raise CaptureError("ground_truth_generator_window_declaration_mismatch")
         operations.append(
             {
                 "sequence": sequence,
@@ -646,26 +678,30 @@ def _ground_truth(
                 "upid": upid,
                 "expected_task_type": end["expected_task_type"],
                 "expected_task_id": end["expected_task_id"],
-                "boundary_relation": relation,
-                "within_scope": derived_within_scope,
+                "generator_window_relation": relation,
+                "within_generator_window": derived_generator_membership,
+                "b_s1_body_start_membership": "unknown",
                 "request_start_monotonic_ns": start["monotonic_ns"],
                 "request_end_monotonic_ns": request_end_monotonic_ns,
+                "generator_finalized_monotonic_ns": finalized_monotonic_ns,
             }
         )
-    first_request_monotonic_ns = min(
-        operation["request_start_monotonic_ns"] for operation in operations
-    )
-    last_request_monotonic_ns = max(
-        operation["request_end_monotonic_ns"] for operation in operations
-    )
-    if finalized_monotonic_ns < last_request_monotonic_ns:
-        raise CaptureError("ground_truth_finalizer_precedes_request_end")
-    operation_span_ns = finalized_monotonic_ns - first_request_monotonic_ns
-    maximum_duration_ns = (
-        _require_int(generator_contract, "maximum_duration_seconds") * 1_000_000_000
-    )
-    if operation_span_ns > maximum_duration_ns:
-        raise CaptureError("ground_truth_duration_limit_exceeded")
+    if operations:
+        first_request_monotonic_ns = min(
+            operation["request_start_monotonic_ns"] for operation in operations
+        )
+        last_request_monotonic_ns = max(
+            operation["request_end_monotonic_ns"] for operation in operations
+        )
+        if finalized_monotonic_ns < last_request_monotonic_ns:
+            raise CaptureError("ground_truth_finalizer_precedes_request_end")
+        operation_span_ns = finalized_monotonic_ns - first_request_monotonic_ns
+        maximum_duration_ns = (
+            _require_int(generator_contract, "maximum_duration_seconds")
+            * 1_000_000_000
+        )
+        if operation_span_ns > maximum_duration_ns:
+            raise CaptureError("ground_truth_duration_limit_exceeded")
     return operations
 
 
@@ -688,10 +724,118 @@ def _stat_identity(record: Mapping[str, Any], field: str) -> tuple[int, int]:
     return (_require_int(stat, "device"), _require_int(stat, "inode"))
 
 
+def _validate_t0_quiescence(
+    manifest: Mapping[str, Any],
+    surfaces: Mapping[int, Mapping[str, Any]],
+    exact_records: Mapping[int, Mapping[str, Any]],
+    exact_final: set[str],
+) -> None:
+    t0 = _require_int(manifest, "t0_monotonic_ns")
+    baseline = _require_mapping(
+        manifest["baseline_observation"], "baseline_observation"
+    )
+    baseline_end = _require_int(baseline, "capture_end_monotonic_ns")
+    baseline_upids = {
+        _require_upid(value, "baseline_upids")
+        for value in _require_sequence(manifest.get("baseline_upids"), "baseline_upids")
+    }
+    generator_contract = _validate_generator_contract(
+        manifest, _require_text(manifest, "fixture_kind")
+    )
+    task_id_policy = _require_mapping(
+        generator_contract["expected_task_id_policy"],
+        "generator_contract.expected_task_id_policy",
+    )
+    quiescence = _require_mapping(manifest["t0_quiescence"], "t0_quiescence")
+    if quiescence.get("state") != "QUIESCENT":
+        raise CaptureError("t0_not_declared_quiescent")
+    committed = _require_int(quiescence, "committed_at_monotonic_ns")
+    if not baseline_end <= committed < t0:
+        raise CaptureError("t0_quiescence_commit_time_invalid")
+    pending = {
+        _require_upid(value, "t0_quiescence.pending_upids")
+        for value in _require_sequence(
+            quiescence.get("pending_upids"), "t0_quiescence.pending_upids"
+        )
+    }
+    if pending:
+        raise CaptureError("t0_quiescence_has_pending_upids")
+
+    surface_references = _require_mapping(
+        quiescence.get("surface_observation_sequences"),
+        "t0_quiescence.surface_observation_sequences",
+    )
+    if set(surface_references) != {"active", "index", "index.1"}:
+        raise CaptureError("t0_quiescence_surface_reference_set_invalid")
+    referenced_surfaces: dict[str, Mapping[str, Any]] = {}
+    for source in ("active", "index", "index.1"):
+        sequence = _require_int(surface_references, source)
+        surface = surfaces.get(sequence)
+        if surface is None or surface.get("source") != source:
+            raise CaptureError(f"t0_quiescence_surface_reference_invalid:{source}")
+        if not (
+            baseline_end
+            <= _require_int(surface, "capture_start_monotonic_ns")
+            <= _require_int(surface, "capture_end_monotonic_ns")
+            <= committed
+            < t0
+        ):
+            raise CaptureError(f"t0_quiescence_surface_time_invalid:{source}")
+        if not surface.get("readable") or not surface.get("complete"):
+            raise CaptureError(f"t0_quiescence_surface_incomplete:{source}")
+        referenced_surfaces[source] = surface
+    if referenced_surfaces["active"]["_normalized_upids"]:
+        raise CaptureError("t0_quiescence_active_worker_present")
+
+    classifications = _require_sequence(
+        quiescence.get("baseline_classifications"),
+        "t0_quiescence.baseline_classifications",
+    )
+    classified_upids: set[str] = set()
+    latest_exact_end = baseline_end
+    for index, value in enumerate(classifications):
+        record = _require_mapping(
+            value, f"t0_quiescence.baseline_classifications[{index}]"
+        )
+        upid = _require_upid(record.get("upid"), "baseline_classification.upid")
+        if upid in classified_upids:
+            raise CaptureError("t0_quiescence_duplicate_baseline_classification")
+        classified_upids.add(upid)
+        if record.get("lifecycle_state") != "finalized":
+            raise CaptureError("t0_quiescence_baseline_not_finalized")
+        decoded = _decode_upid(upid)
+        matches_generator_scope = (
+            decoded["node"] == generator_contract["expected_node"]
+            and decoded["task_type"] == generator_contract["expected_task_type"]
+            and decoded["task_id"] == task_id_policy["value"]
+            and decoded["owner"] == generator_contract["expected_owner"]
+        )
+        expected_classification = (
+            "supported_in_scope"
+            if matches_generator_scope
+            else "classified_out_of_scope"
+        )
+        if record.get("operation_classification") != expected_classification:
+            raise CaptureError("t0_quiescence_operation_unclassified")
+        exact_sequence = _require_int(record, "exact_observation_sequence")
+        exact = exact_records.get(exact_sequence)
+        if exact is None or exact.get("known_upid") != upid or upid not in exact_final:
+            raise CaptureError("t0_quiescence_final_exact_reference_invalid")
+        exact_end = _require_int(exact, "capture_end_monotonic_ns")
+        if exact_end > committed or exact_end >= t0:
+            raise CaptureError("t0_quiescence_final_exact_not_before_t0")
+        latest_exact_end = max(latest_exact_end, exact_end)
+    if classified_upids != baseline_upids:
+        raise CaptureError("t0_quiescence_baseline_classification_set_mismatch")
+    if latest_exact_end > committed:
+        raise CaptureError("t0_quiescence_precedes_final_exact_evidence")
+
+
 def _validate_subrun_obligations(
     manifest: Mapping[str, Any],
     expected_upids: set[str],
-    enumerated_known: set[str],
+    generator_window_operations: Sequence[Mapping[str, Any]],
+    positive_close_candidate: bool,
     watches: Mapping[int, Mapping[str, Any]],
     scans: Mapping[int, Mapping[str, Any]],
     surfaces: Mapping[int, Mapping[str, Any]],
@@ -701,8 +845,20 @@ def _validate_subrun_obligations(
     contract = _validate_subrun_contract(manifest)
     required = set(contract["required_phenomena"])
     evidence_ids = _require_mapping(contract["evidence_ids"], "evidence_ids")
+    subrun_id = _require_text(manifest, "subrun_id")
+    operations_by_sequence = {
+        int(operation["sequence"]): operation
+        for operation in generator_window_operations
+    }
 
-    if "low_volume_enumeration" in required and not (expected_upids or enumerated_known):
+    if positive_close_candidate and subrun_id != "13E" and not expected_upids:
+        raise CaptureError("subrun_generated_window_work_missing")
+
+    if (
+        positive_close_candidate
+        and "low_volume_enumeration" in required
+        and not expected_upids
+    ):
         raise CaptureError("subrun_13a_enumeration_not_exercised")
 
     if "pagination_movement" in required:
@@ -712,12 +868,21 @@ def _validate_subrun_obligations(
         page_starts = [
             _require_int(page, "request_start_monotonic_ns") for page in pages
         ]
+        overlaps_generator = any(
+            _require_int(page, "request_start_monotonic_ns")
+            <= int(operation["request_end_monotonic_ns"])
+            and _require_int(page, "response_end_monotonic_ns")
+            >= int(operation["request_start_monotonic_ns"])
+            for page in pages
+            for operation in generator_window_operations
+        )
         if (
             len(pages) < 2
             or page_sequences != list(range(1, len(pages) + 1))
             or page_starts != sorted(page_starts)
             or len({_require_int(page, "start_offset") for page in pages}) < 2
             or len({_require_text(page, "source") for page in pages}) != 1
+            or not overlaps_generator
         ):
             raise CaptureError("subrun_pagination_movement_not_evidenced")
 
@@ -742,7 +907,8 @@ def _validate_subrun_obligations(
         watch_time = _require_int(watch, "monotonic_ns")
         marker_time = _require_int(marker, "monotonic_ns")
         if (
-            target not in scan_set
+            target not in expected_upids
+            or target not in scan_set
             or watch.get("normalized_upid") != target
             or marker_time > _require_int(scan, "scan_start_monotonic_ns")
             or not (
@@ -770,7 +936,8 @@ def _validate_subrun_obligations(
         if active is None or archive is None:
             raise CaptureError("subrun_handoff_reference_missing")
         if (
-            active.get("source") != "active"
+            target not in expected_upids
+            or active.get("source") != "active"
             or archive.get("source") not in {"index", "index.1"}
             or target not in set(active["_normalized_upids"])
             or target not in set(archive["_normalized_upids"])
@@ -802,6 +969,34 @@ def _validate_subrun_obligations(
         after_start = _require_int(after, "capture_start_monotonic_ns")
         rotated_start = _require_int(rotated, "capture_start_monotonic_ns")
         marker_time = _require_int(marker, "monotonic_ns")
+        generator_sequences = {
+            _require_int({"value": value}, "value")
+            for value in _require_sequence(
+                marker.get("generator_sequences"),
+                "rotation.generator_sequences",
+            )
+        }
+        referenced_operations = [
+            operations_by_sequence[sequence]
+            for sequence in sorted(generator_sequences)
+            if sequence in operations_by_sequence
+        ]
+        rotation_within_generated_run = bool(referenced_operations) and (
+            min(
+                int(operation["request_start_monotonic_ns"])
+                for operation in referenced_operations
+            )
+            <= watch_time
+            <= max(
+                int(operation["generator_finalized_monotonic_ns"])
+                for operation in referenced_operations
+            )
+        )
+        rotation_generated_upids = (
+            set(before["_normalized_upids"])
+            | set(rotated["_normalized_upids"])
+            | set(after["_normalized_upids"])
+        ) & expected_upids
         if (
             before.get("source") != "index"
             or after.get("source") != "index"
@@ -821,6 +1016,9 @@ def _validate_subrun_obligations(
                 _require_int(after, "capture_end_monotonic_ns"),
                 _require_int(rotated, "capture_end_monotonic_ns"),
             )
+            or generator_sequences != set(operations_by_sequence)
+            or not rotation_within_generated_run
+            or not rotation_generated_upids
         ):
             raise CaptureError("subrun_index_rotation_not_evidenced")
 
@@ -1144,7 +1342,12 @@ def _analyze_loaded(
     enumerated_known = watch_known | scan_known | surface_known
     exact_confirmed: set[str] = set()
     exact_final: set[str] = set()
+    exact_records: dict[int, Mapping[str, Any]] = {}
     for record in records["exact_upid"]:
+        observation_sequence = _require_int(record, "observation_sequence")
+        if observation_sequence == 0 or observation_sequence in exact_records:
+            raise CaptureError("exact_observation_sequence_zero_or_duplicate")
+        exact_records[observation_sequence] = record
         upid = _require_upid(record.get("known_upid"), "exact.known_upid")
         capture_start = _require_int(record, "capture_start_monotonic_ns")
         capture_end = _require_int(record, "capture_end_monotonic_ns")
@@ -1240,12 +1443,25 @@ def _analyze_loaded(
         if final_interpretation in {"ok", "warning", "error"}:
             exact_final.add(upid)
 
-    in_scope = [operation for operation in operations if operation["within_scope"]]
-    expected_upids = {str(operation["upid"]) for operation in in_scope}
+    if set(exact_records) != set(range(1, len(exact_records) + 1)):
+        raise CaptureError("exact_observation_sequence_gap")
+    _validate_t0_quiescence(
+        manifest,
+        surfaces,
+        exact_records,
+        exact_final,
+    )
+
+    generator_window_operations = [
+        operation for operation in operations if operation["within_generator_window"]
+    ]
+    expected_upids = {
+        str(operation["upid"]) for operation in generator_window_operations
+    }
     ambiguous = {
         str(operation["upid"])
         for operation in operations
-        if operation["boundary_relation"] == "ambiguous"
+        if operation["generator_window_relation"] == "ambiguous"
     }
     if ambiguous:
         gap_reasons.add("t1_boundary_ordering_ambiguous")
@@ -1287,7 +1503,8 @@ def _analyze_loaded(
     _validate_subrun_obligations(
         manifest,
         expected_upids,
-        enumerated_known,
+        generator_window_operations,
+        close_state == "CLOSED_COMPLETE" and not gap_reasons,
         watches,
         scans,
         surfaces,
@@ -1304,16 +1521,18 @@ def _analyze_loaded(
 
     if close_state == "CLOSED_COMPLETE" and missing:
         operation_by_upid = {
-            str(operation["upid"]): operation for operation in in_scope
+            str(operation["upid"]): operation
+            for operation in generator_window_operations
         }
         missing_upid = sorted(missing)[0]
         operation = operation_by_upid[missing_upid]
         witness = {
-            "classification": "B-S1 NO-GO FOR THE TESTED EXACT SCOPE",
+            "classification": "ENUMERATION OMISSION FOR TESTED GENERATOR WINDOW",
             "ground_truth_upid": missing_upid,
             "ground_truth_generator_sequence": operation["sequence"],
             "operation": operation["operation"],
-            "within_declared_scope": True,
+            "within_experiment_generator_window": True,
+            "b_s1_body_start_membership": "UNKNOWN",
             "omitted_from_b_s1_enumeration_set": True,
             "candidate_close_event_id": close_event_id,
             "candidate_close_state": close_state,
@@ -1325,15 +1544,15 @@ def _analyze_loaded(
             ],
         }
         return AnalysisResult(
-            AnalyzerOutcome.FALSE_CLOSED,
-            ("ground_truth_upid_missing_without_gap",),
+            AnalyzerOutcome.ENUMERATION_WITNESS,
+            ("generator_window_upid_missing_without_gap",),
             witness,
         )
 
     if close_state != "CLOSED_COMPLETE":
         raise CaptureError("candidate_did_not_close")
     if expected_upids != declared_known:
-        raise CaptureError("candidate_close_known_set_not_exact_ground_truth_scope")
+        raise CaptureError("candidate_close_known_set_not_exact_generator_window")
     if expected_upids - exact_final:
         raise CaptureError("exact_final_status_set_incomplete")
 
@@ -1341,7 +1560,10 @@ def _analyze_loaded(
     # otherwise unknown UPID to the completeness-bearing enumeration set.
     return AnalysisResult(
         AnalyzerOutcome.PASS,
-        ("ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving",),
+        (
+            "generator_window_ground_truth_equals_reconciled_enumeration_set_"
+            "for_tested_interleaving",
+        ),
     )
 
 

@@ -124,12 +124,13 @@ and run identifiers is allowed; sharing task discovery is not.
 
 An analyzer result distinguishes:
 
-- `ANALYZER_PASS_TESTED_INTERLEAVING`: every in-scope generator UPID was
-  reconciled for this exact sealed run;
+- `ANALYZER_PASS_TESTED_INTERLEAVING`: every generator-window UPID and required
+  subrun phenomenon was reconciled for this exact sealed run;
 - `B_S1_GAP_DETECTED`: the observer or source surfaces reported a gap;
-- `FALSE_CLOSED_COMPLETE_WITNESS`: independent ground truth proves B-S1
-  omitted an in-scope task without a required gap while its candidate close
-  logic accepted `T1`;
+- `GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS`: independent generator-window
+  ground truth proves the candidate enumeration omitted a generated task
+  without a required gap while candidate close accepted T1, but exact B-S1
+  worker-body-start membership remains unknown;
 - `HARNESS_INCOMPLETE`: capture, sealing, generator, heartbeat, or parse
   evidence is incomplete; and
 - `ENVIRONMENT_INELIGIBLE`: the fixture/source/loaded-code context does not
@@ -137,7 +138,7 @@ An analyzer result distinguishes:
 
 None of these means `trusted`, `secure`, or “Family B solved.”
 
-## 4. Capture format: `family-b-13-capture-v2`
+## 4. Capture format: `family-b-13-capture-v3`
 
 One run is one explicit directory. JSON files are UTF-8; JSONL files contain
 one object per line. Timestamps carry both a process-local monotonic value in
@@ -182,7 +183,7 @@ explicit directory's fixed file set. It is not imported by production code.
 | versions | installed/source `version_ledger` and `loaded_code_status` |
 | environment | `kernel_context`, `filesystem_context`, start/end timestamps |
 | processes | `reader_context`, `generator_context`, process identities and clock descriptions |
-| boundary | `t0_monotonic_ns`, candidate-close T1, and the committed `baseline_upids` plus hashed `baseline_observation` captured and committed before T0 |
+| boundary | quiescent candidate `t0_monotonic_ns`, candidate-close T1, a distinct bounded `experiment_generator_window`, committed `baseline_upids` plus hashed `baseline_observation`, and independently cross-checked `t0_quiescence` evidence |
 | generator scope | complete `generator_contract`: contract revision, approval state, fixture/subrun, approved operation, expected task type, exact task-id policy, node, owner/auth identity, maximum count, and maximum duration |
 | subrun scope | complete `subrun_contract`: contract revision, subrun id, required phenomena, and unique evidence id for each phenomenon |
 | limits | disk/log limit and subrun identifier; generator count/duration limits are also bound by the generator contract |
@@ -205,6 +206,18 @@ observed post-T0 UPID must bind to the approved ground-truth generator; there
 is no implicit third category for ambient or unexplained work in this initial
 dedicated-fixture protocol.
 
+Baseline membership does not imply quiescence. `t0_quiescence` must be committed
+before T0 and reference complete local `active`, `index`, and `index.1`
+observations captured after the baseline scan. The referenced active set must
+be empty. Every baseline UPID must have exactly one finalized supported/in-scope
+or classified-out-of-scope record referencing final, readable exact evidence
+captured before the quiescence commit and T0; the analyzer derives which of the
+two classifications is valid by decoding node/type/id/owner against the
+generator scope. `pending_upids` must be empty.
+Missing, active, pending, non-final, unclassified, late, or mismatched evidence
+prevents positive close. Historical finalized exact/archive records may remain;
+retention is not worker liveness.
+
 ### 4.2 Ground-truth events
 
 `ground-truth.jsonl` contains paired `request_start` and `request_end` records
@@ -214,12 +227,18 @@ for each contiguous, generator-local sequence, followed by exactly one
 Each request record carries `generator_sequence`, `request_id`, `operation`,
 `monotonic_ns`, `wall_timestamp`, and `generator_process_identity`.
 `request_end` additionally carries `returned_upid`, `expected_task_type`,
-`expected_task_id`, `outcome`, `within_scope`, and `boundary_relation`
-(`before_t1`, `after_t1`, or `ambiguous`). `within_scope` is checked annotation,
-not an authority: the analyzer derives membership from the request timestamps,
-manifest T0, candidate-close T1, and boundary relation. `after_t1` is outside
-`[T0,T1]` even if the record claims otherwise; `ambiguous` is outside the
-positive set and latches a gap. The finalizer carries
+`expected_task_id`, `outcome`, checked `within_generator_window`, and
+`generator_window_relation` (`inside_generator_window`,
+`after_generator_window`, or
+`ambiguous`). The analyzer derives this experiment-generator relation from
+request timestamps and the explicit generator-window bounds, which must fit
+inside the quiescent-T0/candidate-close envelope. Matching numeric boundaries
+does not merge their semantics. `after_generator_window` is outside the
+generator window even if the record claims otherwise; `ambiguous` is
+outside the positive set and latches a gap. The record separately carries
+`b_s1_body_start_membership=unknown` and `body_start_evidence=null`. This v3
+protocol rejects a capture that tries to derive worker-body membership from
+request timing or self-assert it. The finalizer carries
 `last_sequence`, `total_operations`, generator identity, timestamps, and
 `durable_flush_complete`.
 
@@ -272,7 +291,8 @@ retained verbatim. Pagination alone never establishes completeness.
 
 ### 4.7 Exact-UPID observations
 
-`exact-upid.jsonl` records the known UPID, capture start/end, presence,
+`exact-upid.jsonl` records a contiguous `observation_sequence`, the known UPID,
+capture start/end, presence,
 readability, `previously_known`, discovery source/reference, raw status result,
 raw log result, each result's recomputed SHA-256, and final-status
 interpretation. Valid discovery sources are committed baseline, a prior watch
@@ -312,7 +332,14 @@ object. It binds `approval_state`, `fixture_id`, `subrun_id`, one
 `maximum_duration_seconds`. The analyzer decodes every returned and newly
 observed UPID and checks node, task type, task id, and owner/auth identity
 against this contract. Ground truth cannot authenticate itself with
-`within_scope`, task type/id strings, or a returned UPID alone.
+`within_generator_window`, task type/id strings, or a returned UPID alone.
+
+The operation initiator independently proves that it issued a request and
+received a UPID during the experiment-generator window. It does not observe
+the worker operation body's first instruction. Request start/end, UPID
+starttime, exact-log creation, and fork time are therefore not relabeled as
+B-S1 body start. No safe body-start proof is implemented or accepted by this
+v3 analyzer.
 
 A future generator must satisfy all of these conditions:
 
@@ -452,14 +479,22 @@ generator scope, heartbeat/process ordering, candidate close state, required
 surface profiles, a computed scan/watch fixed point, exact-UPID confirmation,
 subrun obligations, and the capture seal.
 
+Before any positive interval result, the analyzer also cross-checks a quiescent
+T0: the baseline scan precedes all referenced local surface captures; those
+captures and every required baseline exact finalization precede the committed
+T0; the active and pending sets are empty; and every retained baseline UPID is
+finalized and classified. A retained historical log or archive line is not
+treated as a running worker.
+
 The completeness-bearing `enumerated_known` set is the union of task-log watch
 discovery, recursive exact-log scans, and local parsed active/`index`/`index.1`
 observations. `exact_confirmed` is separate: exact-UPID records can confirm only
 an already enumerated or committed-baseline UPID. API results remain
 corroborative and cannot become completeness authority. The analyzer compares
-all post-T0 enumerated UPIDs with generated in-scope ground truth; an extra
-UPID, unknown task type/id/node/owner, or a candidate-close set that omits an
-observed UPID latches a gap.
+all post-T0 enumerated UPIDs with ground truth in the experiment-generator
+window; an extra UPID, unknown task type/id/node/owner, or a candidate-close set
+that omits an observed UPID latches a gap. This comparison does not establish
+B-S1 worker-body-start membership.
 
 Each `family-b-13-subrun-contract-v1` declares the phenomenon the subrun must
 exercise and an evidence id. The analyzer then cross-checks that id against raw
@@ -467,17 +502,20 @@ capture structure:
 
 | Subrun | Machine obligation |
 | --- | --- |
-| 13A | nonempty legitimate enumeration/reconciliation path |
-| 13B | sequenced pages for one source with multiple actual offsets |
-| 13C | one target present in ordered active then archive surface observations |
-| 13D | old `index` hash and device/inode reappear as `index.1`, new `index` differs, and matching rename watch evidence exists |
+| 13A | nonempty in-window generated UPID set plus legitimate enumeration/reconciliation |
+| 13B | sequenced pages for one source with multiple actual offsets overlapping an in-window generator request schedule |
+| 13C | an in-window generated target present in ordered active then archive surface observations |
+| 13D | old `index` hash and device/inode reappear as `index.1`, new `index` differs, matching rename watch evidence exists, captured rotation content includes an in-window generated UPID, and the marker binds every in-window generator sequence while rotation occurs inside the generated run |
 | 13E | a matching raw overflow or invalidation/loss signal; the successful expected classification is `B_S1_GAP_DETECTED` |
-| 13F | one scheduled target/watch event inside the referenced scan interval and present in that scan |
-| 13G | at least two explicitly approved combined phenomena, each independently satisfying its corresponding raw check |
+| 13F | one in-window generated target/watch event inside the referenced scan interval and present in that scan |
+| 13G | at least two explicitly approved combined phenomena, each independently satisfying its corresponding generated-run/raw check |
 
 A subrun label or task count is never phenomenon evidence. In particular, 13D
 cannot pass without observed rotation, and 13E cannot emit a plain analyzer
-PASS after its required signal.
+PASS after its required signal. Every positive subrun except 13E requires at
+least one in-window generated operation; baseline history alone cannot satisfy
+13A–13D, 13F, or 13G. 13E may use no unrelated generated task because its
+intended successful result is the approved injected gap signal.
 
 Decision precedence is fail-closed:
 
@@ -486,9 +524,10 @@ Decision precedence is fail-closed:
    `HARNESS_INCOMPLETE`;
 3. watcher, scan, source, T1-ordering, cleanup, or explicit gap ->
    `B_S1_GAP_DETECTED`;
-4. complete independent ground truth omitted by the allowed enumeration
-   surfaces, with no gap and an otherwise accepted close ->
-   `FALSE_CLOSED_COMPLETE_WITNESS`;
+4. complete generator-window ground truth omitted by the allowed enumeration
+   surfaces, with no gap and an otherwise accepted close, but without
+   independent body-start membership ->
+   `GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS`;
 5. only complete reconciliation for the exact captured interleaving ->
    `ANALYZER_PASS_TESTED_INTERLEAVING`.
 
@@ -505,15 +544,15 @@ exercise a collector.
 | # | Synthetic capture | Required analyzer result |
 | --- | --- | --- |
 | 1 | Ground truth equals reconciled B-S1 known set | `ANALYZER_PASS_TESTED_INTERLEAVING`; architecture effect remains `NONE` |
-| 2 | Unknown generated UPID absent from every B-S1 observation | `FALSE_CLOSED_COMPLETE_WITNESS` |
+| 2 | Generator-window UPID absent from every B-S1 observation, body-start membership unknown | `GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS` |
 | 3 | Watch queue overflow | `B_S1_GAP_DETECTED` |
 | 4 | Watch invalidation/loss | `B_S1_GAP_DETECTED` |
 | 5 | Duplicate API pages, independently reconciled | PASS for that interleaving |
-| 6 | Offset omission repeated without independent evidence | false-close witness, not pagination healing |
+| 6 | Offset omission repeated without independent evidence | generator-window enumeration witness, not pagination healing |
 | 7 | Task absent from temporary active/archive surfaces but legitimately scan/watch-discovered and retained in exact evidence | Not missing merely due to surface handoff |
 | 8 | Known exact log deleted by cleanup | `B_S1_GAP_DETECTED` |
-| 9 | Unknown pre-enumeration log deleted without watch signal | false-close witness |
-| 10 | Surviving overlap anchors around a removed unknown intermediate log | false-close witness; anchors do not clean the run |
+| 9 | Unknown pre-enumeration log deleted without watch signal | generator-window enumeration witness |
+| 10 | Surviving overlap anchors around a removed unknown intermediate log | generator-window enumeration witness; anchors do not clean the run |
 | 11 | Crash or missing/stale heartbeat before close | `HARNESS_INCOMPLETE` |
 | 12 | Incomplete/corrupt capture file | `HARNESS_INCOMPLETE` |
 | 13 | Generator sequence gap or missing finalizer | `HARNESS_INCOMPLETE` |
@@ -529,18 +568,22 @@ discovery provenance; lying fixed-point annotations; an undrained watch event;
 an unexpected valid UPID; each 13A–13G label without its required phenomenon;
 unhealthy or wrong-process heartbeats and early process stop; absent/unreadable
 exact evidence with a claimed final status; analyzer-source and surface-hash
-mismatches; false `within_scope` after T1; missing disposable-fixture generator
-scope; and a generated UPID with the wrong owner. Positive controls exercise
-computed drained equal scans and raw-evidence-backed 13B/13C/13D/13F/13G
-obligations.
+mismatches; false generator-window membership after T1; missing
+disposable-fixture generator scope; and a generated UPID with the wrong owner.
+The suite also rejects a live/pending baseline at T0, request-timing claims of
+body-start membership, baseline-only positive subruns, and baseline-only
+handoff/race targets. Positive controls exercise historical finalized baseline
+quiescence, computed drained equal scans, and raw-evidence-backed
+13B/13C/13D/13F/13G obligations.
 
-## 11. Exact false-clean witness
+## 11. Exact false-clean witness boundary
 
 A B-S1-killing witness must preserve all of the following in the sealed run:
 
 1. one independent ground-truth `request_start`/`request_end` pair and returned
    normalized UPID from the generator;
-2. proof the operation and UPID are within the declared subrun and T0/T1 scope;
+2. proof the operation and UPID are within the declared subrun's experiment
+   generator window;
 3. the full B-S1 watch, scan, active/archive, API, and exact-UPID streams showing
    that UPID was omitted from the allowed enumeration set or was once known and
    then lost;
@@ -548,20 +591,29 @@ A B-S1-killing witness must preserve all of the following in the sealed run:
    record;
 5. the candidate close record proving the same logic would otherwise accept
    `T1` as `CLOSED_COMPLETE`; and
-6. manifest, source/loaded-code ledger, file hashes, analyzer revision/source
+6. independent evidence that the worker operation body—not merely its request,
+   UPID starttime, exact-log creation, or fork—began inside the committed B-S1
+   `[T0,T1]` body-start interval; and
+7. manifest, source/loaded-code ledger, file hashes, analyzer revision/source
    hash, analyzer commit metadata, and overall seal hash preserving the
    evidence used for those facts.
 
-The analyzer emits a witness containing the ground-truth UPID and generator
-sequence, operation, derived scope membership, omission from the B-S1
-enumeration set, close event/state, and the fact that no required gap was
-recorded. Its consequence is exactly:
+Requirement 6 is not available from the #13 operation initiator or current
+source evidence. This v3 analyzer therefore cannot emit a precise B-S1-killing
+`FALSE_CLOSED_COMPLETE_WITNESS` or the following consequence from request
+timing alone:
 
 ```text
 B-S1 NO-GO FOR THE TESTED EXACT SCOPE
 ```
 
-It does not prove every possible Family-B mechanism impossible.
+Instead it preserves the UPID, generator sequence, derived generator-window
+membership, omission, close state, and absence of a recorded gap as
+`GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS`, explicitly recording
+`b_s1_body_start_membership=UNKNOWN`. That is a serious research-local
+enumeration falsification result and must stop later subruns, but it is not the
+precise B-S1 body-start NO-GO above. A future protocol may add an independently
+reviewed body-start proof; it must not synthesize one from adjacent timestamps.
 
 ## 12. Run sealing and integrity boundary
 
@@ -641,9 +693,11 @@ intentionally provides no executable generator or destructive cleanup command.
    operation/duration caps.
 5. Start the B-S1 observer; establish all existing and lazy-bucket watches,
    event drain, raw surface capture, heartbeat, and gap latch.
-6. Establish and commit `baseline_upids` before T0 with active/index/index.1
-   copies, API profiles, recursive exact-log scans, watch drain watermarks, and
-   the explicit subrun contract/evidence ids.
+6. Establish `baseline_upids`, then capture active/index/index.1 after the
+   baseline scan, obtain pre-T0 final exact/classification evidence for every
+   baseline UPID, prove active/pending empty, and commit quiescent T0. Also
+   record API profiles, watch drain watermarks, and the explicit subrun
+   contract/evidence ids.
 7. Execute exactly one approved bounded subrun. Any generator action at this
    stage is **NOT AUTHORIZED / TEMPLATE ONLY** until that separate approval.
 8. Stop generation, drain watch events, complete consecutive final scans and
@@ -654,9 +708,9 @@ intentionally provides no executable generator or destructive cleanup command.
    the immutable original.
 10. Move a copy to an offline workstation and invoke only the explicit
     `analyze --capture-dir` command from section 4.
-11. Record exactly one research-local classification and its evidence. A
-    false-close witness kills B-S1 for the tested exact scope; PASS only
-    enumerates that interleaving.
+11. Record exactly one research-local classification and its evidence. A v3
+    generator-window enumeration witness stops the sequence but does not claim
+    exact B-S1 body-start NO-GO; PASS only enumerates that interleaving.
 12. The identified cleanup owner performs the separately approved fixture
     cleanup. No cleanup command or real identifier is supplied here.
 13. Verify fixture service, storage, disk/log space, console access, and absence
@@ -665,8 +719,9 @@ intentionally provides no executable generator or destructive cleanup command.
 ## 16. Independently approvable subruns
 
 Recommended early-kill order is **13A -> 13F -> 13B -> 13C -> 13D -> 13E ->
-13G**. Any false-close witness stops and skips all later runs. A harness failure
-must be corrected and rerun under a new UUID; it does not justify moving on.
+13G**. Any generator-window enumeration omission witness stops and skips all
+later runs. A harness failure must be corrected and rerun under a new UUID; it
+does not justify moving on.
 
 ### 13A — low-volume watch/log ordering sanity
 
@@ -676,11 +731,12 @@ must be corrected and rerun under a new UUID; it does not justify moving on.
 - **Target:** 10–50 tasks; short/low-pressure duration category.
 - **Evidence:** all streams, especially raw watch order, ground truth, exact
   logs, and two scan fixed points.
-- **Falsification:** one in-scope UPID omitted/lost without gap, or close before
-  reconciliation.
-- **PASS means:** these enumerated low-volume orderings reconciled.
+- **Falsification:** one generator-window UPID omitted/lost without gap, or close
+  before reconciliation.
+- **PASS means:** these generated-window low-volume orderings reconciled.
 - **PASS does not mean:** pagination, rotation, overflow, cleanup, or universal
-  watcher completeness is proven.
+  watcher completeness is proven, or body-start interval membership was
+  established.
 - **Stops/burden:** all global stops; low operational burden.
 - **Skip rule:** never skip; a kill skips 13F–13G.
 
@@ -696,7 +752,8 @@ must be corrected and rerun under a new UUID; it does not justify moving on.
   exact logs, candidate state transitions.
 - **Falsification:** omitted UPID with no gap, including a create-before-watch
   and delete-before-scan witness.
-- **PASS means:** only the explicitly scheduled creation interleavings survived.
+- **PASS means:** only the explicitly scheduled in-window generated creation
+  interleavings survived.
 - **PASS does not mean:** every scheduler/kernel/filesystem interleaving is covered.
 - **Stops/burden:** stop on unplanned watch loss; moderate instrumentation burden.
 - **Skip rule:** skip after any prior kill; otherwise run early because it can
@@ -713,7 +770,8 @@ must be corrected and rerun under a new UUID; it does not justify moving on.
   and exact reads.
 - **Falsification:** missing UPID with no gap; pagination repetition alone may
   not repair the classification.
-- **PASS means:** tested page-movement schedules reconciled independently.
+- **PASS means:** tested page-movement schedules overlapped and reconciled the
+  approved in-window generator schedule independently.
 - **PASS does not mean:** offset pagination is a snapshot/cursor or is complete
   under arbitrary concurrency.
 - **Stops/burden:** normal stops; low-to-moderate task/log burden.
@@ -729,7 +787,7 @@ must be corrected and rerun under a new UUID; it does not justify moving on.
 - **Evidence:** dense active/index/exact captures, completion watches, API
   active/archive/all pages, ground truth.
 - **Falsification:** unexplained omitted/lost UPID at handoff.
-- **PASS means:** enumerated handoff timings reconciled, including temporary
+- **PASS means:** generated-target handoff timings reconciled, including temporary
   absence from active/archive after prior watch/scan discovery while exact
   confirmation remained readable.
 - **PASS does not mean:** handoff is atomic, durable across crash, or complete
@@ -746,11 +804,13 @@ must be corrected and rerun under a new UUID; it does not justify moving on.
 - **Target:** computed crossing volume with a planning ceiling of 1,000 short
   tasks from an empty/small index; medium/high-volume category, never an
   unbounded loop.
-- **Evidence:** per-entry ground truth, stat/inode/hash/raw content before and
-  after actual rotation, watch renames, scans, pages, exact logs.
+- **Evidence:** per-entry ground truth and generator-sequence binding,
+  stat/inode/hash/raw content before and after actual rotation, watch renames,
+  scans, pages, and exact logs.
 - **Falsification:** any UPID omitted/lost without gap, or anchors hide an
   intermediate deletion.
-- **PASS means:** one or more explicitly observed crossings reconciled.
+- **PASS means:** one or more explicitly observed crossings inside the approved
+  generated run reconciled with no ambient pressure task.
 - **PASS does not mean:** count predicts rotation, retention is indefinite, or
   all filesystems/kernels behave identically.
 - **Stops/burden:** tight disk/log health limits; high record volume.
@@ -788,7 +848,8 @@ must be corrected and rerun under a new UUID; it does not justify moving on.
   category. This protocol supplies no default 13G task count.
 - **Evidence:** every stream, actual rotation and retention markers, resource
   health telemetry, and enumerated schedule ledger.
-- **Falsification:** any false-close witness or failure to latch a required gap.
+- **Falsification:** any generator-window enumeration omission witness or
+  failure to latch a required gap.
 - **PASS means:** exactly the combined interleavings listed in that run ledger
   reconciled.
 - **PASS does not mean:** Phase S proven universally, Phase M designed, Family B

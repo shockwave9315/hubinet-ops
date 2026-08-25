@@ -83,6 +83,33 @@ def _set_surface_raw(
     record["normalized_upids"] = upids
 
 
+def _append_surface(
+    records: dict[str, list[dict[str, Any]]],
+    source: str,
+    *,
+    capture_start: int,
+    capture_end: int,
+    raw_evidence: str,
+    upids: list[str],
+    stat: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    sequence = len(records["surface_observations"]) + 1
+    record: dict[str, Any] = {
+        "observation_sequence": sequence,
+        "source": source,
+        "capture_start_monotonic_ns": capture_start,
+        "capture_end_monotonic_ns": capture_end,
+        "normalized_upids": upids,
+        "raw_evidence": raw_evidence,
+        "stat": stat or {"device": 1, "inode": sequence, "size": len(raw_evidence)},
+        "sha256": hashlib.sha256(raw_evidence.encode("utf-8")).hexdigest(),
+        "readable": True,
+        "complete": True,
+    }
+    records["surface_observations"].append(record)
+    return record
+
+
 def _ground_truth_operation(sequence: int, upid: str) -> list[dict[str, Any]]:
     request_id = f"request-{sequence}"
     return [
@@ -104,8 +131,10 @@ def _ground_truth_operation(sequence: int, upid: str) -> list[dict[str, Any]]:
             "expected_task_type": "stopall",
             "expected_task_id": "",
             "outcome": "success",
-            "within_scope": True,
-            "boundary_relation": "before_t1",
+            "within_generator_window": True,
+            "generator_window_relation": "inside_generator_window",
+            "b_s1_body_start_membership": "unknown",
+            "body_start_evidence": None,
             "monotonic_ns": 120 + sequence * 10,
             "wall_timestamp": f"2026-08-25T00:00:{sequence:02d}Z",
             "generator_process_identity": "synthetic-generator:1",
@@ -124,6 +153,10 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
         "fixture_kind": "synthetic",
         "subrun_id": "13A",
         "t0_monotonic_ns": 100,
+        "experiment_generator_window": {
+            "start_monotonic_ns": 100,
+            "end_monotonic_ns": 300,
+        },
         "baseline_upids": [],
         "baseline_observation": {
             "capture_start_monotonic_ns": 70,
@@ -133,6 +166,17 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
             "raw_evidence": "[]",
             "sha256": hashlib.sha256(b"[]").hexdigest(),
             "complete": True,
+        },
+        "t0_quiescence": {
+            "state": "QUIESCENT",
+            "committed_at_monotonic_ns": 90,
+            "pending_upids": [],
+            "surface_observation_sequences": {
+                "active": 1,
+                "index": 2,
+                "index.1": 3,
+            },
+            "baseline_classifications": [],
         },
         "node_identity": {"kind": "synthetic", "value": "node-a"},
         "boot_id": "synthetic-boot-id",
@@ -262,8 +306,8 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
             {
                 "observation_sequence": sequence,
                 "source": source,
-                "capture_start_monotonic_ns": 220,
-                "capture_end_monotonic_ns": 221,
+                "capture_start_monotonic_ns": 81 if sequence <= 3 else 220,
+                "capture_end_monotonic_ns": 82 if sequence <= 3 else 221,
                 "normalized_upids": [],
                 "raw_evidence": "",
                 "stat": {"device": 1, "inode": sequence, "size": 0},
@@ -271,7 +315,10 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "readable": True,
                 "complete": True,
             }
-            for sequence, source in enumerate(("active", "index", "index.1"), 1)
+            for sequence, source in enumerate(
+                ("active", "index", "index.1", "active", "index", "index.1"),
+                1,
+            )
         ],
         "api_pages": [
             {
@@ -289,6 +336,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
         ],
         "exact_upid": [
             {
+                "observation_sequence": 1,
                 "known_upid": UPID_A,
                 "status_result": {
                     "available": True,
@@ -316,13 +364,13 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
             {
                 "event": "process_start",
                 "process_identity": "synthetic-reader:1",
-                "monotonic_ns": 90,
+                "monotonic_ns": 50,
             },
             {
                 "event": "analyzer_version",
                 "analyzer_revision": ANALYZER_REVISION,
                 "process_identity": "synthetic-reader:1",
-                "monotonic_ns": 91,
+                "monotonic_ns": 51,
             },
             {
                 "event": "heartbeat",
@@ -422,6 +470,53 @@ def _add_ground_truth_operation(
     manifest["candidate_close"]["known_upids"] = [UPID_A]
 
 
+def _add_finalized_historical_baseline(
+    manifest: dict[str, Any], records: dict[str, list[dict[str, Any]]], upid: str
+) -> None:
+    baseline_raw = json.dumps([upid], separators=(",", ":"))
+    manifest["baseline_upids"] = [upid]
+    manifest["baseline_observation"]["normalized_upids"] = [upid]
+    manifest["baseline_observation"]["raw_evidence"] = baseline_raw
+    manifest["baseline_observation"]["sha256"] = hashlib.sha256(
+        baseline_raw.encode("utf-8")
+    ).hexdigest()
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = [UPID_A, upid]
+    archive = records["surface_observations"][1]
+    _set_surface_raw(archive, f"historical {upid}", [upid])
+    generated_exact = records["exact_upid"][0]
+    generated_exact["observation_sequence"] = 2
+    baseline_exact = {
+        **generated_exact,
+        "observation_sequence": 1,
+        "known_upid": upid,
+        "discovery_source": "baseline",
+        "discovery_reference": "manifest.baseline_upids",
+        "capture_start_monotonic_ns": 83,
+        "capture_end_monotonic_ns": 84,
+    }
+    records["exact_upid"].insert(0, baseline_exact)
+    manifest["t0_quiescence"]["baseline_classifications"] = [
+        {
+            "upid": upid,
+            "lifecycle_state": "finalized",
+            "operation_classification": "supported_in_scope",
+            "exact_observation_sequence": 1,
+        }
+    ]
+
+
+def _move_generator_operation_after_t1(
+    records: dict[str, list[dict[str, Any]]],
+) -> None:
+    start, end = records["ground_truth"][:2]
+    start["monotonic_ns"] = 310
+    end["monotonic_ns"] = 320
+    end["generator_window_relation"] = "after_generator_window"
+    end["within_generator_window"] = False
+    records["ground_truth"][-1]["monotonic_ns"] = 330
+
+
 def test_perfect_enumeration_is_only_tested_interleaving(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     result = analyze_capture(_materialize(tmp_path, manifest, records))
@@ -429,13 +524,31 @@ def test_perfect_enumeration_is_only_tested_interleaving(tmp_path: Path) -> None
     assert result.as_dict()["architecture_effect"] == "NONE"
 
 
-def test_unknown_generated_upid_missing_everywhere_is_false_clean(tmp_path: Path) -> None:
+def test_request_window_omission_is_not_precise_b_s1_body_start_no_go(
+    tmp_path: Path,
+) -> None:
     manifest, records = _default_capture()
     _add_ground_truth_operation(manifest, records, UPID_B)
     result = analyze_capture(_materialize(tmp_path, manifest, records))
-    assert result.outcome is AnalyzerOutcome.FALSE_CLOSED
+    assert result.outcome is AnalyzerOutcome.ENUMERATION_WITNESS
     assert result.witness is not None
     assert result.witness["ground_truth_upid"] == UPID_B
+    assert result.witness["b_s1_body_start_membership"] == "UNKNOWN"
+    assert result.witness["classification"] == (
+        "ENUMERATION OMISSION FOR TESTED GENERATOR WINDOW"
+    )
+
+
+def test_request_timing_cannot_self_assert_b_s1_body_start_membership(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["ground_truth"][1]["b_s1_body_start_membership"] = "in_interval"
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "b_s1_body_start_membership_not_established" in result.reasons
 
 
 @pytest.mark.parametrize(
@@ -475,12 +588,53 @@ def test_watch_loss_signals_gap(
     assert result.outcome is AnalyzerOutcome.GAP
 
 
+def test_subrun_13e_signal_does_not_require_unrelated_generated_work(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    evidence_ids = _set_subrun(
+        manifest, "13E", ["watch_overflow_or_invalidation"]
+    )
+    records["ground_truth"] = [
+        {
+            "event": "generator_finalized",
+            "last_sequence": 0,
+            "total_operations": 0,
+            "durable_flush_complete": True,
+            "generator_process_identity": "synthetic-generator:1",
+            "monotonic_ns": 150,
+            "wall_timestamp": "2026-08-25T00:00:02Z",
+        }
+    ]
+    records["watch_events"] = [
+        _watch_event(
+            1,
+            masks=["IN_Q_OVERFLOW"],
+            monotonic_ns=160,
+            event_type="queue_overflow",
+            phenomenon_id=evidence_ids["watch_overflow_or_invalidation"],
+        )
+    ]
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = []
+        scan["watch_drained_through_sequence"] = 1
+    records["exact_upid"] = []
+    manifest["candidate_close"]["known_upids"] = []
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "watch_queue_overflow" in result.reasons
+
+
 def test_duplicate_api_pages_tolerated_only_with_primary_reconciliation(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     evidence_ids = _set_subrun(manifest, "13B", ["pagination_movement"])
     archive_page = records["api_pages"][1]
     archive_page["phenomenon_id"] = evidence_ids["pagination_movement"]
     archive_page["page_sequence"] = 1
+    archive_page["request_start_monotonic_ns"] = 115
+    archive_page["response_end_monotonic_ns"] = 125
     duplicate = dict(records["api_pages"][1])
     duplicate["request_identity"] = "api-archive-duplicate"
     duplicate["start_offset"] = 10
@@ -508,7 +662,7 @@ def test_offset_repetition_cannot_heal_unknown_omission(tmp_path: Path) -> None:
             }
         )
     result = analyze_capture(_materialize(tmp_path, manifest, records))
-    assert result.outcome is AnalyzerOutcome.FALSE_CLOSED
+    assert result.outcome is AnalyzerOutcome.ENUMERATION_WITNESS
 
 
 def test_exact_confirmation_with_scan_discovery_survives_surface_handoff(
@@ -547,7 +701,9 @@ def test_cleanup_deleting_known_exact_log_is_gap(tmp_path: Path) -> None:
     assert result.outcome is AnalyzerOutcome.GAP
 
 
-def test_unknown_pre_enumeration_cleanup_can_witness_false_close(tmp_path: Path) -> None:
+def test_unknown_pre_enumeration_cleanup_preserves_generator_window_witness(
+    tmp_path: Path,
+) -> None:
     manifest, records = _default_capture()
     _add_ground_truth_operation(manifest, records, UPID_B)
     records["harness_events"].insert(
@@ -559,7 +715,7 @@ def test_unknown_pre_enumeration_cleanup_can_witness_false_close(tmp_path: Path)
         },
     )
     result = analyze_capture(_materialize(tmp_path, manifest, records))
-    assert result.outcome is AnalyzerOutcome.FALSE_CLOSED
+    assert result.outcome is AnalyzerOutcome.ENUMERATION_WITNESS
 
 
 def test_surviving_anchors_do_not_hide_unknown_intermediate_loss(tmp_path: Path) -> None:
@@ -583,6 +739,7 @@ def test_surviving_anchors_do_not_hide_unknown_intermediate_loss(tmp_path: Path)
     records["exact_upid"].append(
         {
             **records["exact_upid"][0],
+            "observation_sequence": 2,
             "known_upid": UPID_C,
             "discovery_source": "scan",
             "discovery_reference": 2,
@@ -590,7 +747,7 @@ def test_surviving_anchors_do_not_hide_unknown_intermediate_loss(tmp_path: Path)
     )
     manifest["candidate_close"]["known_upids"] = [UPID_A, UPID_C]
     result = analyze_capture(_materialize(tmp_path, manifest, records))
-    assert result.outcome is AnalyzerOutcome.FALSE_CLOSED
+    assert result.outcome is AnalyzerOutcome.ENUMERATION_WITNESS
     assert result.witness is not None
     assert result.witness["ground_truth_upid"] == UPID_B
 
@@ -637,7 +794,7 @@ def test_source_version_context_mismatch_is_ineligible(tmp_path: Path) -> None:
 
 def test_late_task_around_t1_requires_gap_not_positive_close(tmp_path: Path) -> None:
     manifest, records = _default_capture()
-    records["ground_truth"][1]["boundary_relation"] = "ambiguous"
+    records["ground_truth"][1]["generator_window_relation"] = "ambiguous"
     records["harness_events"].insert(
         -2,
         {"event": "gap_signal", "reason": "t1_log_body_order_ambiguous", "monotonic_ns": 299},
@@ -699,7 +856,6 @@ def test_computed_equal_terminal_scans_with_drained_queue_may_pass(
 
     assert result.outcome is AnalyzerOutcome.PASS
 
-
 def test_unexpected_post_t0_task_cannot_be_silently_omitted_at_close(
     tmp_path: Path,
 ) -> None:
@@ -727,6 +883,85 @@ def test_baseline_cannot_be_committed_after_t0(tmp_path: Path) -> None:
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
     assert "baseline_not_captured_and_committed_before_t0" in result.reasons
+
+
+def test_baseline_worker_active_across_t0_cannot_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    active = records["surface_observations"][0]
+    _set_surface_raw(active, f"active {UPID_B}", [UPID_B])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is not AnalyzerOutcome.PASS
+    assert "t0_quiescence_active_worker_present" in result.reasons
+
+
+def test_finalized_historical_baseline_allows_quiescent_t0(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_13a_baseline_only_with_generator_after_t1_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    _move_generator_operation_after_t1(records)
+    records["watch_events"] = []
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = [UPID_B]
+        scan["watch_drained_through_sequence"] = 0
+    records["exact_upid"] = [records["exact_upid"][0]]
+    manifest["candidate_close"]["known_upids"] = []
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "subrun_generated_window_work_missing" in result.reasons
+
+
+def test_13b_static_baseline_pages_without_generated_window_work_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    _move_generator_operation_after_t1(records)
+    records["watch_events"] = []
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = [UPID_B]
+        scan["watch_drained_through_sequence"] = 0
+    records["exact_upid"] = [records["exact_upid"][0]]
+    manifest["candidate_close"]["known_upids"] = []
+    evidence_ids = _set_subrun(manifest, "13B", ["pagination_movement"])
+    archive_page = records["api_pages"][1]
+    archive_page.update(
+        {
+            "normalized_upids": [UPID_B],
+            "phenomenon_id": evidence_ids["pagination_movement"],
+            "page_sequence": 1,
+        }
+    )
+    second_page = dict(archive_page)
+    second_page.update(
+        {
+            "request_identity": "baseline-page-2",
+            "start_offset": 10,
+            "page_sequence": 2,
+        }
+    )
+    records["api_pages"].append(second_page)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "subrun_generated_window_work_missing" in result.reasons
 
 
 @pytest.mark.parametrize(
@@ -762,21 +997,30 @@ def test_subrun_label_without_required_phenomenon_cannot_pass(
 def test_subrun_13c_requires_raw_referenced_handoff_evidence(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     evidence_ids = _set_subrun(manifest, "13C", ["active_archive_handoff"])
-    active, archive = records["surface_observations"][:2]
-    active["capture_start_monotonic_ns"] = 150
-    active["capture_end_monotonic_ns"] = 160
-    archive["capture_start_monotonic_ns"] = 170
-    archive["capture_end_monotonic_ns"] = 175
-    _set_surface_raw(active, "active A", [UPID_A])
-    _set_surface_raw(archive, "archive A", [UPID_A])
+    active = _append_surface(
+        records,
+        "active",
+        capture_start=150,
+        capture_end=160,
+        raw_evidence="active A",
+        upids=[UPID_A],
+    )
+    archive = _append_surface(
+        records,
+        "index",
+        capture_start=170,
+        capture_end=175,
+        raw_evidence="archive A",
+        upids=[UPID_A],
+    )
     records["harness_events"].insert(
         -2,
         {
             "event": "active_archive_handoff",
             "phenomenon_id": evidence_ids["active_archive_handoff"],
             "target_upid": UPID_A,
-            "active_observation_sequence": 1,
-            "archive_observation_sequence": 2,
+            "active_observation_sequence": active["observation_sequence"],
+            "archive_observation_sequence": archive["observation_sequence"],
             "monotonic_ns": 176,
         },
     )
@@ -786,30 +1030,77 @@ def test_subrun_13c_requires_raw_referenced_handoff_evidence(tmp_path: Path) -> 
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+def test_subrun_13c_baseline_only_handoff_target_cannot_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    evidence_ids = _set_subrun(manifest, "13C", ["active_archive_handoff"])
+    active = _append_surface(
+        records,
+        "active",
+        capture_start=150,
+        capture_end=160,
+        raw_evidence="historical active B",
+        upids=[UPID_B],
+    )
+    archive = _append_surface(
+        records,
+        "index",
+        capture_start=170,
+        capture_end=175,
+        raw_evidence="historical archive B",
+        upids=[UPID_B],
+    )
+    records["harness_events"].insert(
+        -2,
+        {
+            "event": "active_archive_handoff",
+            "phenomenon_id": evidence_ids["active_archive_handoff"],
+            "target_upid": UPID_B,
+            "active_observation_sequence": active["observation_sequence"],
+            "archive_observation_sequence": archive["observation_sequence"],
+            "monotonic_ns": 176,
+        },
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "subrun_handoff_not_evidenced" in result.reasons
+
+
 def test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence(
     tmp_path: Path,
 ) -> None:
     manifest, records = _default_capture()
     evidence_ids = _set_subrun(manifest, "13D", ["index_rotation"])
-    before = records["surface_observations"][1]
-    rotated = records["surface_observations"][2]
-    before["capture_start_monotonic_ns"] = 150
-    before["capture_end_monotonic_ns"] = 160
-    before["stat"] = {"device": 1, "inode": 20, "size": 9}
-    _set_surface_raw(before, "old-index", [])
-    rotated["capture_start_monotonic_ns"] = 180
-    rotated["capture_end_monotonic_ns"] = 185
-    rotated["stat"] = {"device": 1, "inode": 20, "size": 9}
-    _set_surface_raw(rotated, "old-index", [])
-    after = {
-        **before,
-        "observation_sequence": 4,
-        "capture_start_monotonic_ns": 180,
-        "capture_end_monotonic_ns": 185,
-        "stat": {"device": 1, "inode": 21, "size": 9},
-    }
-    _set_surface_raw(after, "new-index", [])
-    records["surface_observations"].append(after)
+    before = _append_surface(
+        records,
+        "index",
+        capture_start=150,
+        capture_end=160,
+        raw_evidence=f"old-index {UPID_A}",
+        upids=[UPID_A],
+        stat={"device": 1, "inode": 20, "size": len(f"old-index {UPID_A}")},
+    )
+    rotated = _append_surface(
+        records,
+        "index.1",
+        capture_start=180,
+        capture_end=185,
+        raw_evidence=f"old-index {UPID_A}",
+        upids=[UPID_A],
+        stat={"device": 1, "inode": 20, "size": len(f"old-index {UPID_A}")},
+    )
+    after = _append_surface(
+        records,
+        "index",
+        capture_start=180,
+        capture_end=185,
+        raw_evidence="new-index",
+        upids=[],
+        stat={"device": 1, "inode": 21, "size": 9},
+    )
+    records["ground_truth"][-1]["monotonic_ns"] = 190
     records["watch_events"].append(
         _watch_event(
             2,
@@ -826,10 +1117,11 @@ def test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence(
         {
             "event": "index_rotation",
             "phenomenon_id": evidence_ids["index_rotation"],
-            "before_index_sequence": 2,
-            "after_index_sequence": 4,
-            "after_index1_sequence": 3,
+            "before_index_sequence": before["observation_sequence"],
+            "after_index_sequence": after["observation_sequence"],
+            "after_index1_sequence": rotated["observation_sequence"],
             "watcher_sequence": 2,
+            "generator_sequences": [1],
             "monotonic_ns": 186,
         },
     )
@@ -837,6 +1129,14 @@ def test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.PASS
+
+    _set_surface_raw(before, "ambient-old-index", [])
+    _set_surface_raw(rotated, "ambient-old-index", [])
+    ambient_tmp = tmp_path / "ambient-only"
+    ambient_tmp.mkdir()
+    ambient_result = analyze_capture(_materialize(ambient_tmp, manifest, records))
+    assert ambient_result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "subrun_index_rotation_not_evidenced" in ambient_result.reasons
 
 
 def test_subrun_13f_requires_referenced_watch_during_scan(tmp_path: Path) -> None:
@@ -861,6 +1161,37 @@ def test_subrun_13f_requires_referenced_watch_during_scan(tmp_path: Path) -> Non
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+def test_subrun_13f_baseline_only_race_target_cannot_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    evidence_ids = _set_subrun(manifest, "13F", ["watch_scan_creation_race"])
+    records["watch_events"].append(
+        _watch_event(2, masks=["IN_CREATE"], monotonic_ns=185, upid=UPID_B)
+    )
+    records["watch_events"][1]["phenomenon_id"] = evidence_ids[
+        "watch_scan_creation_race"
+    ]
+    for scan in records["scan_rounds"]:
+        scan["watch_drained_through_sequence"] = 2
+    records["harness_events"].insert(
+        -2,
+        {
+            "event": "scheduled_interleaving",
+            "kind": "watch_scan_creation_race",
+            "phenomenon_id": evidence_ids["watch_scan_creation_race"],
+            "target_upid": UPID_B,
+            "scan_sequence": 1,
+            "watcher_sequence": 2,
+            "monotonic_ns": 170,
+        },
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "subrun_watch_scan_race_not_evidenced" in result.reasons
+
+
 def test_subrun_13g_requires_every_declared_combined_phenomenon(
     tmp_path: Path,
 ) -> None:
@@ -873,26 +1204,37 @@ def test_subrun_13g_requires_every_declared_combined_phenomenon(
     archive_page = records["api_pages"][1]
     archive_page["phenomenon_id"] = evidence_ids["pagination_movement"]
     archive_page["page_sequence"] = 1
+    archive_page["request_start_monotonic_ns"] = 115
+    archive_page["response_end_monotonic_ns"] = 125
     second_page = dict(archive_page)
     second_page["request_identity"] = "combined-page-2"
     second_page["start_offset"] = 10
     second_page["page_sequence"] = 2
     records["api_pages"].append(second_page)
-    active, archive = records["surface_observations"][:2]
-    active["capture_start_monotonic_ns"] = 150
-    active["capture_end_monotonic_ns"] = 160
-    archive["capture_start_monotonic_ns"] = 170
-    archive["capture_end_monotonic_ns"] = 175
-    _set_surface_raw(active, "combined active A", [UPID_A])
-    _set_surface_raw(archive, "combined archive A", [UPID_A])
+    active = _append_surface(
+        records,
+        "active",
+        capture_start=150,
+        capture_end=160,
+        raw_evidence="combined active A",
+        upids=[UPID_A],
+    )
+    archive = _append_surface(
+        records,
+        "index",
+        capture_start=170,
+        capture_end=175,
+        raw_evidence="combined archive A",
+        upids=[UPID_A],
+    )
     records["harness_events"].insert(
         -2,
         {
             "event": "active_archive_handoff",
             "phenomenon_id": evidence_ids["active_archive_handoff"],
             "target_upid": UPID_A,
-            "active_observation_sequence": 1,
-            "archive_observation_sequence": 2,
+            "active_observation_sequence": active["observation_sequence"],
+            "archive_observation_sequence": archive["observation_sequence"],
             "monotonic_ns": 176,
         },
     )
@@ -1003,19 +1345,21 @@ def test_surface_hash_must_match_raw_evidence(tmp_path: Path) -> None:
     assert result.reasons == ("surface_hash_mismatch:active:1",)
 
 
-def test_after_t1_operation_cannot_self_declare_within_scope(tmp_path: Path) -> None:
+def test_after_t1_operation_cannot_self_declare_in_generator_window(
+    tmp_path: Path,
+) -> None:
     manifest, records = _default_capture()
     start, end = records["ground_truth"][:2]
     start["monotonic_ns"] = 310
     end["monotonic_ns"] = 320
-    end["boundary_relation"] = "after_t1"
-    end["within_scope"] = True
+    end["generator_window_relation"] = "after_generator_window"
+    end["within_generator_window"] = True
     records["ground_truth"][-1]["monotonic_ns"] = 330
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
-    assert "ground_truth_scope_declaration_mismatch" in result.reasons
+    assert "ground_truth_generator_window_declaration_mismatch" in result.reasons
 
 
 def test_disposable_fixture_without_generator_contract_is_ineligible(
