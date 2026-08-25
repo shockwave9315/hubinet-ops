@@ -258,6 +258,24 @@ unreadable, and unavailable reads are excluded from this rule: they are
 evidence loss, already latched as gap reasons, and a task log legitimately
 removed by cleanup after completion is not a lifecycle contradiction.
 
+`ok`, `warning`, and `error` all mean the task is final, but they are distinct
+terminal outcomes, and a task writes its terminal line once and never rewrites
+it. Every self-sufficient final read of one UPID must therefore report the same
+sealed terminal result -- the same interpretation, task state, and
+`terminal_status`, the latter already pinned to the last line of that record's
+own raw log. Two reads that disagree are mutually contradictory sealed evidence,
+and contradictory final-status evidence is not a coherent proof of anything the
+candidate contract requires, including the enumeration claim a positive close
+makes; reducing them to the UPID-level boolean "this UPID reached some final
+state" is precisely what would hide the disagreement. Because terminal outcome
+is immutable, this needs no chronology at all: disagreeing reads convict the
+capture whatever their capture windows, declared ordinals, or physical order
+say, and no third agreeing read can launder them. Like a lifecycle regression,
+the outcome is `HARNESS_INCOMPLETE`, decided before enumeration is classified so
+that an incoherent capture can never be promoted into an enumeration-omission
+witness against B-S1. Absent, unreadable, and unavailable reads are again
+excluded: evidence loss is not terminal-outcome disagreement.
+
 ### 4.2 Shared monotonic clock contract
 
 `clock_contract` uses revision `family-b-13-clock-contract-v1`. It binds

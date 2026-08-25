@@ -2009,6 +2009,8 @@ def _analyze_loaded(
     # `observation_sequence`.
     final_exact_capture_starts: dict[str, list[int]] = {}
     non_final_exact_capture_ends: dict[str, list[int]] = {}
+    # Sealed terminal result of every self-sufficient final read, per UPID.
+    final_exact_terminal_results: dict[str, set[tuple[str, str, str]]] = {}
     exact_records: dict[int, Mapping[str, Any]] = {}
     for record in records["exact_upid"]:
         observation_sequence = _require_int(record, "observation_sequence")
@@ -2114,11 +2116,31 @@ def _analyze_loaded(
             exact_final.add(upid)
             final_exact_observation_sequences.add(observation_sequence)
             final_exact_capture_starts.setdefault(upid, []).append(capture_start)
+            final_exact_terminal_results.setdefault(upid, set()).add(
+                (final_interpretation, task_state, terminal_status)
+            )
         else:
             non_final_exact_capture_ends.setdefault(upid, []).append(capture_end)
 
     if set(exact_records) != set(range(1, len(exact_records) + 1)):
         raise CaptureError("exact_observation_sequence_gap")
+    # A task writes its terminal line once and never rewrites it, so every
+    # self-sufficient final read of one UPID must report the same sealed
+    # terminal result.  `ok`, `warning`, and `error` all mean "final", and
+    # collapsing them into the UPID-level boolean `exact_final` is exactly what
+    # would hide two reads disagreeing about *which* terminal outcome the task
+    # reached.  The candidate contract requires final-status evidence, and
+    # mutually contradictory final-status evidence is not a coherent proof of
+    # anything -- including of the enumeration claim a positive close makes.
+    # Terminal outcome is immutable, so unlike the lifecycle rule below this
+    # needs no chronology at all: two disagreeing reads convict the capture
+    # whatever their capture windows or ordinals say, and no third agreeing
+    # read can launder them.  `terminal_status` is already pinned to the last
+    # line of that record's own sealed raw log, so this compares sealed
+    # primitives rather than interpretations.
+    for upid, terminal_results in sorted(final_exact_terminal_results.items()):
+        if len(terminal_results) > 1:
+            raise CaptureError("exact_upid_terminal_status_conflict")
     # A task that has reached a final status cannot be observed running again.
     # `exact_final` is deliberately UPID-level, so on its own it answers only
     # "was this UPID ever final", and a later sealed read contradicting an

@@ -2172,6 +2172,226 @@ def test_contradictory_exact_observation_cannot_become_omission_witness(
     assert result.reasons == ("exact_upid_final_status_regressed",)
 
 
+def _final_exact(
+    sequence: int,
+    *,
+    capture_start: int,
+    capture_end: int,
+    terminal_status: str,
+    interpretation: str,
+) -> dict[str, Any]:
+    """One self-sufficient final observation with an explicit terminal result."""
+
+    return _generated_exact(
+        sequence,
+        capture_start=capture_start,
+        capture_end=capture_end,
+        terminal_status=terminal_status,
+        interpretation=interpretation,
+    )
+
+
+OK_RESULT = ("TASK OK", "ok")
+WARNING_RESULT = ("WARNINGS: 2", "warning")
+ERROR_RESULT = ("TASK ERROR: boom", "error")
+
+
+@pytest.mark.parametrize(
+    "terminal_status,interpretation",
+    [OK_RESULT, WARNING_RESULT, ERROR_RESULT],
+    ids=["ok", "warning", "error"],
+)
+def test_agreeing_final_exact_observations_may_pass(
+    tmp_path: Path, terminal_status: str, interpretation: str
+) -> None:
+    """1/2: repeated reads that agree on the terminal result are redundant."""
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _final_exact(
+            1,
+            capture_start=225,
+            capture_end=230,
+            terminal_status=terminal_status,
+            interpretation=interpretation,
+        ),
+        _final_exact(
+            2,
+            capture_start=245,
+            capture_end=250,
+            terminal_status=terminal_status,
+            interpretation=interpretation,
+        ),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    "first,second",
+    [
+        (OK_RESULT, ERROR_RESULT),
+        (ERROR_RESULT, OK_RESULT),
+        (WARNING_RESULT, OK_RESULT),
+        (OK_RESULT, WARNING_RESULT),
+        (WARNING_RESULT, ERROR_RESULT),
+    ],
+    ids=["ok-error", "error-ok", "warning-ok", "ok-warning", "warning-error"],
+)
+def test_conflicting_final_exact_terminal_results_cannot_pass(
+    tmp_path: Path, first: tuple[str, str], second: tuple[str, str]
+) -> None:
+    """3/4/5/6: one immutable task cannot have two terminal outcomes.
+
+    `ok`, `warning`, and `error` all mean final, so the UPID-level `exact_final`
+    boolean is blind to which one the task actually reached.
+    """
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _final_exact(
+            1, capture_start=225, capture_end=230,
+            terminal_status=first[0], interpretation=first[1],
+        ),
+        _final_exact(
+            2, capture_start=245, capture_end=250,
+            terminal_status=second[0], interpretation=second[1],
+        ),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_terminal_status_conflict",)
+
+
+def test_same_interpretation_with_different_raw_terminal_line_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    """The comparison is on sealed raw evidence, not the interpretation label.
+
+    Two `error` reads of one immutable log cannot disagree about its last line.
+    """
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _final_exact(
+            1, capture_start=225, capture_end=230,
+            terminal_status="TASK ERROR: boom", interpretation="error",
+        ),
+        _final_exact(
+            2, capture_start=245, capture_end=250,
+            terminal_status="TASK ERROR: other", interpretation="error",
+        ),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_terminal_status_conflict",)
+
+
+def test_third_agreeing_final_read_cannot_launder_terminal_conflict(
+    tmp_path: Path,
+) -> None:
+    """7: agreement elsewhere does not repair a contradicted terminal result."""
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _final_exact(1, capture_start=225, capture_end=230,
+                     terminal_status="TASK OK", interpretation="ok"),
+        _final_exact(2, capture_start=245, capture_end=250,
+                     terminal_status="TASK ERROR: boom", interpretation="error"),
+        _final_exact(3, capture_start=265, capture_end=270,
+                     terminal_status="TASK OK", interpretation="ok"),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_terminal_status_conflict",)
+
+
+@pytest.mark.parametrize(
+    "windows",
+    [((245, 250), (225, 230)), ((225, 230), (225, 230))],
+    ids=["reversed-order", "identical-windows"],
+)
+def test_terminal_status_conflict_needs_no_chronology(
+    tmp_path: Path, windows: tuple[tuple[int, int], tuple[int, int]]
+) -> None:
+    """8: terminal outcome is immutable, so ordering is irrelevant here.
+
+    The declared ordinals, the physical JSONL order, and the capture windows are
+    all varied; a contradicted terminal result must convict the capture anyway.
+    """
+
+    manifest, records = _default_capture()
+    (first_start, first_end), (second_start, second_end) = windows
+    records["exact_upid"] = [
+        _final_exact(1, capture_start=first_start, capture_end=first_end,
+                     terminal_status="TASK ERROR: boom", interpretation="error"),
+        _final_exact(2, capture_start=second_start, capture_end=second_end,
+                     terminal_status="TASK OK", interpretation="ok"),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_terminal_status_conflict",)
+
+
+def test_terminal_status_conflict_cannot_become_omission_witness(
+    tmp_path: Path,
+) -> None:
+    """9: an incoherent capture must never be reported against B-S1.
+
+    Without this the contradiction was simply absent from the gap set, so a
+    separately omitted generated UPID still produced an omission witness --
+    contradictory evidence promoted into a research finding.
+    """
+
+    manifest, records = _default_capture()
+    _add_ground_truth_operation(manifest, records, UPID_B)
+    witness = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert witness.outcome is AnalyzerOutcome.ENUMERATION_WITNESS
+
+    conflicted = tmp_path / "terminal-conflict"
+    conflicted.mkdir()
+    records["exact_upid"] = [
+        _final_exact(1, capture_start=225, capture_end=230,
+                     terminal_status="TASK OK", interpretation="ok"),
+        _final_exact(2, capture_start=245, capture_end=250,
+                     terminal_status="TASK ERROR: boom", interpretation="error"),
+    ]
+    result = analyze_capture(_materialize(conflicted, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_terminal_status_conflict",)
+
+
+def test_terminal_conflict_does_not_reclassify_lost_exact_evidence(
+    tmp_path: Path,
+) -> None:
+    """E: a later lost read is evidence loss, never a terminal conflict."""
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _final_exact(1, capture_start=225, capture_end=230,
+                     terminal_status="TASK OK", interpretation="ok"),
+        _generated_exact(2, capture_start=245, capture_end=250,
+                         terminal_status="TASK ERROR: boom",
+                         interpretation="unreadable", readable=False),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "known_exact_upid_lost" in result.reasons
+
+
 def test_baseline_upid_final_status_regression_also_fails_closed(
     tmp_path: Path,
 ) -> None:
