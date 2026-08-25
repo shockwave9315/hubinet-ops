@@ -27,6 +27,30 @@ SUBRUN_CONTRACT_REVISION = "family-b-13-subrun-contract-v1"
 CLOCK_CONTRACT_REVISION = "family-b-13-clock-contract-v1"
 MAX_JSONL_LINE_BYTES = 1_048_576
 
+# Linux inotify event-mask values from the UAPI contract in
+# include/uapi/linux/inotify.h.  Only event-output bits used by this bounded
+# research protocol are accepted; watch-configuration flags are not event
+# evidence and unknown bits fail closed.
+INOTIFY_EVENT_MASKS = {
+    "IN_ACCESS": 0x00000001,
+    "IN_MODIFY": 0x00000002,
+    "IN_ATTRIB": 0x00000004,
+    "IN_CLOSE_WRITE": 0x00000008,
+    "IN_CLOSE_NOWRITE": 0x00000010,
+    "IN_OPEN": 0x00000020,
+    "IN_MOVED_FROM": 0x00000040,
+    "IN_MOVED_TO": 0x00000080,
+    "IN_CREATE": 0x00000100,
+    "IN_DELETE": 0x00000200,
+    "IN_DELETE_SELF": 0x00000400,
+    "IN_MOVE_SELF": 0x00000800,
+    "IN_UNMOUNT": 0x00002000,
+    "IN_Q_OVERFLOW": 0x00004000,
+    "IN_IGNORED": 0x00008000,
+    "IN_ISDIR": 0x40000000,
+}
+INOTIFY_KNOWN_RAW_MASK = sum(INOTIFY_EVENT_MASKS.values())
+
 CLOCK_PARTICIPANTS = frozenset(
     {
         "manifest_boundaries",
@@ -249,6 +273,62 @@ def _decode_upid(upid: str) -> dict[str, str]:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _decode_inotify_raw_mask(raw_mask: int, context: str) -> frozenset[str]:
+    unknown_bits = raw_mask & ~INOTIFY_KNOWN_RAW_MASK
+    if unknown_bits:
+        raise CaptureError(
+            f"inotify_raw_mask_unknown_bits:{context}:0x{unknown_bits:08x}"
+        )
+    return frozenset(
+        name for name, value in INOTIFY_EVENT_MASKS.items() if raw_mask & value
+    )
+
+
+def _validated_inotify_masks(
+    record: Mapping[str, Any], context: str
+) -> frozenset[str]:
+    raw_mask = _require_int(record, "raw_mask")
+    decoded = _decode_inotify_raw_mask(raw_mask, context)
+    declared_values = _require_sequence(record.get("mask"), f"{context}.mask")
+    declared = {
+        _require_text({"value": value}, "value") for value in declared_values
+    }
+    if len(declared) != len(declared_values):
+        raise CaptureError(f"inotify_declared_mask_duplicate:{context}")
+    if declared != decoded:
+        raise CaptureError(f"inotify_mask_mismatch_raw_mask:{context}")
+    return decoded
+
+
+def _parse_surface_raw_evidence(source: str, raw_evidence: str) -> frozenset[str]:
+    """Parse the exact v4 UTF-8 serialization of one local PVE task surface."""
+
+    if source == "active":
+        line_pattern = re.compile(
+            r"^(?P<upid>\S+) [01](?: [0-9A-F]{8}"
+            r"(?: [^ \t\r\n][^\r\n]*)?)?\n$"
+        )
+    elif source in {"index", "index.1"}:
+        line_pattern = re.compile(
+            r"^(?P<upid>\S+) [0-9A-F]{8} [^ \t\r\n][^\r\n]*\n$"
+        )
+    else:
+        raise CaptureError(f"surface_raw_evidence_unknown_source:{source}")
+
+    parsed: set[str] = set()
+    for line in raw_evidence.splitlines(keepends=True):
+        match = line_pattern.fullmatch(line)
+        if match is None:
+            raise CaptureError(f"surface_raw_evidence_malformed:{source}")
+        upid = _require_upid(match.group("upid"), f"surface.raw_evidence:{source}")
+        if upid in parsed:
+            raise CaptureError(f"surface_raw_evidence_duplicate_upid:{source}")
+        parsed.add(upid)
+    if raw_evidence and not raw_evidence.endswith("\n"):
+        raise CaptureError(f"surface_raw_evidence_malformed:{source}")
+    return frozenset(parsed)
 
 
 def _analyzer_source_sha256() -> str:
@@ -798,13 +878,10 @@ def _watch_gap_reasons(record: Mapping[str, Any]) -> frozenset[str]:
 
     masks = set(record.get("_masks", ()))
     reasons: set[str] = set()
-    if record.get("queue_overflow") is True or "IN_Q_OVERFLOW" in masks:
+    if "IN_Q_OVERFLOW" in masks:
         reasons.add("watch_queue_overflow")
-    if (
-        record.get("event_type") in {"watch_invalidation", "watch_loss"}
-        or masks.intersection(
-            {"IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"}
-        )
+    if masks.intersection(
+        {"IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"}
     ):
         reasons.add("watch_invalidation_or_loss")
     return frozenset(reasons)
@@ -1020,10 +1097,9 @@ def _validate_pre_t0_establishment(
         if bucket in lazy_buckets:
             raise CaptureError("pre_t0_duplicate_lazy_bucket_event")
         lazy_buckets.add(bucket)
-        masks = {
-            _require_text({"value": value}, "value")
-            for value in _require_sequence(event.get("mask"), "pre_t0.bucket_created.mask")
-        }
+        masks = _validated_inotify_masks(
+            event, f"pre_t0.bucket_created:{_require_int(event, 'watcher_sequence')}"
+        )
         event_time = _require_int(event, "monotonic_ns")
         if (
             event.get("watch_scope") != "task_root"
@@ -1271,7 +1347,7 @@ def _validate_subrun_obligations(
         if (
             target not in expected_upids
             or target not in scan_set
-            or watch.get("normalized_upid") != target
+            or watch.get("_normalized_upid") != target
             or marker_time > _require_int(scan, "scan_start_monotonic_ns")
             or not (
                 _require_int(scan, "scan_start_monotonic_ns")
@@ -1516,29 +1592,41 @@ def _analyze_loaded(
         physical_watcher_sequences.append(watcher_sequence)
         _require_signed_int(record, "watch_descriptor")
         _require_int(record, "cookie")
-        _require_int(record, "raw_mask")
         raw_order = _require_int(record, "raw_order")
         if raw_order == 0:
             raise CaptureError("watch_raw_order_zero")
         raw_orders.append(raw_order)
         _require_string(record, "watched_path")
         _require_string(record, "filename")
-        _require_bool(record, "queue_overflow")
+        queue_overflow = _require_bool(record, "queue_overflow")
         event_time = _require_int(record, "monotonic_ns")
         _require_text(record, "wall_timestamp")
         _require_text(record, "event_type")
-        masks = {
-            _require_text({"value": value}, "value")
-            for value in _require_sequence(record.get("mask"), "watch.mask")
-        }
+        masks = _validated_inotify_masks(record, f"watch:{watcher_sequence}")
+        if queue_overflow != ("IN_Q_OVERFLOW" in masks):
+            raise CaptureError(
+                f"watch_queue_overflow_mismatch_raw_mask:{watcher_sequence}"
+            )
         record["_masks"] = masks
         watches[watcher_sequence] = record
         relevant = event_time <= close_monotonic
         if relevant:
             gap_reasons.update(_watch_gap_reasons(record))
-        upid_value = record.get("normalized_upid")
-        if upid_value is not None:
-            upid = _require_upid(upid_value, "watch.normalized_upid")
+        filename = _require_string(record, "filename")
+        parsed_upid = filename if UPID_PATTERN.fullmatch(filename) else None
+        declared_upid_value = record.get("normalized_upid")
+        declared_upid = (
+            _require_upid(declared_upid_value, "watch.normalized_upid")
+            if declared_upid_value is not None
+            else None
+        )
+        if parsed_upid != declared_upid:
+            raise CaptureError(
+                f"watch_normalized_upid_mismatch_filename:{watcher_sequence}"
+            )
+        record["_normalized_upid"] = parsed_upid
+        if parsed_upid is not None:
+            upid = parsed_upid
             if relevant and masks.intersection(
                 {"IN_CREATE", "IN_MOVED_TO", "IN_CLOSE_WRITE"}
             ):
@@ -1670,23 +1758,33 @@ def _analyze_loaded(
         capture_end = _require_int(record, "capture_end_monotonic_ns")
         if capture_end < capture_start or capture_end > close_monotonic:
             raise CaptureError("surface_capture_time_invalid_for_close")
-        normalized = {
+        declared_values = _require_sequence(
+            record.get("normalized_upids"), "surface.normalized_upids"
+        )
+        declared_upids = {
             _require_upid(value, "surface.normalized_upids")
-            for value in _require_sequence(
-                record.get("normalized_upids"), "surface.normalized_upids"
-            )
+            for value in declared_values
         }
-        record["_normalized_upids"] = normalized
+        if len(declared_upids) != len(declared_values):
+            raise CaptureError(
+                f"surface_declared_normalized_upids_duplicate:{source}:{sequence}"
+            )
         raw_evidence = _require_string(record, "raw_evidence")
         _require_mapping(record.get("stat"), "surface.stat")
         surface_hash = _require_text(record, "sha256")
         if surface_hash != _sha256_text(raw_evidence):
             raise CaptureError(f"surface_hash_mismatch:{source}:{sequence}")
+        parsed_upids = _parse_surface_raw_evidence(source, raw_evidence)
+        if parsed_upids != declared_upids:
+            raise CaptureError(
+                f"surface_normalized_upids_mismatch_raw_evidence:{source}:{sequence}"
+            )
+        record["_normalized_upids"] = parsed_upids
         readable = _require_bool(record, "readable")
         complete = _require_bool(record, "complete")
         if not readable or not complete:
             gap_reasons.add(f"surface_incomplete:{source}")
-        surface_known.update(normalized)
+        surface_known.update(parsed_upids)
         surfaces[sequence] = record
     if set(surfaces) != set(range(1, len(surfaces) + 1)):
         raise CaptureError("surface_observation_sequence_gap")
@@ -1753,7 +1851,7 @@ def _analyze_loaded(
             watch = watches.get(discovery_reference)
             provenance_valid = bool(
                 watch
-                and watch.get("normalized_upid") == upid
+                and watch.get("_normalized_upid") == upid
                 and set(watch["_masks"]).intersection(
                     {"IN_CREATE", "IN_MOVED_TO", "IN_CLOSE_WRITE"}
                 )

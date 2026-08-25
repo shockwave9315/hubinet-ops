@@ -318,6 +318,30 @@ invalidation state, monotonic/wall timestamps, and raw read-buffer ordering.
 `IN_Q_OVERFLOW`, `IN_IGNORED`, `IN_UNMOUNT`, `IN_DELETE_SELF`, and
 `IN_MOVE_SELF` are preserved even without a filename.
 
+The Linux UAPI `struct inotify_event.mask` integer is the primitive. The v4
+analyzer pins the numeric definitions from Linux
+`include/uapi/linux/inotify.h`: `IN_ACCESS=0x00000001`,
+`IN_MODIFY=0x00000002`, `IN_ATTRIB=0x00000004`,
+`IN_CLOSE_WRITE=0x00000008`, `IN_CLOSE_NOWRITE=0x00000010`,
+`IN_OPEN=0x00000020`, `IN_MOVED_FROM=0x00000040`,
+`IN_MOVED_TO=0x00000080`, `IN_CREATE=0x00000100`,
+`IN_DELETE=0x00000200`, `IN_DELETE_SELF=0x00000400`,
+`IN_MOVE_SELF=0x00000800`, `IN_UNMOUNT=0x00002000`,
+`IN_Q_OVERFLOW=0x00004000`, `IN_IGNORED=0x00008000`, and
+`IN_ISDIR=0x40000000`. These are the complete accepted output bits for this
+bounded protocol. Watch-configuration flags and every unknown raw bit are
+rejected rather than discarded.
+
+The analyzer decodes that integer itself. The declared textual `mask` must be
+a duplicate-free exact set match, and `queue_overflow` must equal whether the
+decoded set contains `IN_Q_OVERFLOW`. Discovery, deletion, observer-loss/GAP,
+13D rename, 13E, and subrun semantics use only the decoded set. Where a watch
+filename is an exact normalized UPID, the analyzer derives that UPID from the
+filename and requires the declared `normalized_upid` to match; either-sided
+omission or disagreement is incomplete. Pre-T0 lazy-bucket creation records
+likewise carry and decode `raw_mask`; their textual create/move plus
+`IN_ISDIR` names are cross-checks only.
+
 `raw_order` is a harness-assigned, one-based capture-order sequence. The v4
 analyzer requires JSONL physical order, `watcher_sequence`, and `raw_order` to
 be the same contiguous `1..N` sequence. This checks that sealed records retain
@@ -354,6 +378,32 @@ Missing `index.1` is represented explicitly as an absent-but-completely-read
 surface before first rotation, not silently omitted. The analyzer recomputes
 SHA-256 from the captured UTF-8 `raw_evidence`; hashes support comparison but
 do not prove an atomic snapshot.
+
+For v4, `raw_evidence` is exactly the captured UTF-8 file content, with no
+JSON wrapper, prefix, annotation, or collector-generated record envelope. The
+only accepted serializations are deliberately narrow and source-specific:
+
+```text
+active  := *(UPID SP ("0" / "1")
+             [SP 8UPPER-HEX [SP NONSPACE-STARTING-STATUS]] LF)
+index   := *(UPID SP 8UPPER-HEX SP NONSPACE-STARTING-STATUS LF)
+index.1 := *(UPID SP 8UPPER-HEX SP NONSPACE-STARTING-STATUS LF)
+```
+
+The `active` shape is the pinned `write_active_workers()` representation; the
+archive shape is the pinned `sprintf("%s %08X %s\n", ...)` representation.
+An empty string is the only zero-entry encoding and is also used with the
+explicit absent-but-completely-read `index.1` metadata. Every nonempty record
+must be LF-terminated. Missing final LF, CRLF, malformed fields, invalid UPID,
+or a duplicate UPID makes the capture `HARNESS_INCOMPLETE`.
+
+The offline analyzer parses the exact UPID set from these sealed bytes. The
+declared `normalized_upids` array is parsed separately, must contain no
+duplicates, and must equal the raw-derived set exactly. Only the raw-derived
+set enters enumeration, exact-UPID discovery provenance, T0 active quiescence,
+handoff, or rotation obligations. This format intentionally replaces the
+earlier ambiguous raw-content description; no real v4 capture exists and no
+backward compatibility is required.
 
 ### 4.8 API pages
 
@@ -683,6 +733,16 @@ point, with normal generated work beginning afterward.
 Final independent-review regressions reject matching 13E signals that occur
 only after candidate close, with zero or normal generated work and with an
 unrelated benign in-window watch; an in-window matching signal remains a GAP.
+The P1 corrective matrix additionally reproduces active, `index`, and
+`index.1` self-asserted normalized-UPID discovery; raw nonempty/declared empty
+and raw A/declared B disagreement; duplicate and malformed raw/declared surface
+forms; exact raw/declared positive controls; unchanged raw bytes with a changed
+projection; and 13C/13D referenced-surface disagreement. Its inotify matrix
+crosses raw/text discovery, deletion, overflow, every accepted observer-loss
+bit, `IN_ISDIR` lazy-directory creation/move, queue-overflow boolean mismatch,
+unknown raw bits, and watch filename/normalized-UPID disagreement. Correct raw
+agreement preserves discovery, deletion, GAP, handoff, rotation, and lazy
+bucket behavior; every disagreement is incomplete before semantic use.
 They also prove ordered disappearance detection, reject shuffled scan JSONL
 for both set and watermark histories, retain an ordered-scan positive control,
 fail closed on a missing watcher referenced by a nonzero watermark, enforce
@@ -726,6 +786,17 @@ adjacent timestamps.
 
 ## 12. Run sealing and integrity boundary
 
+Sealed raw evidence is the primitive evidence. Every normalized field that can
+affect completeness is only a deterministic parsed projection; it never
+authenticates itself. The offline analyzer recomputes such projections from the
+sealed primitive whenever this harness defines a raw representation and
+requires exact raw/normalized agreement. A disagreement is
+`HARNESS_INCOMPLETE`, before the record can enter a PASS-bearing set or GAP
+obligation. In v4 this rule applies directly to local surface raw bytes versus
+`normalized_upids`, watch `raw_mask` versus textual `mask` and
+`queue_overflow`, watch filename versus `normalized_upid`, and exact status/log
+raw text versus parsed terminal fields.
+
 After capture close and before analysis, the later sealer writes `seal.json`
 with the schema/run UUID, analyzer revision, SHA-256 of the exact analyzer
 source-file bytes, repository commit, and the filename, byte size, and SHA-256
@@ -736,8 +807,10 @@ file value and its own source hash before parsing.
 `analyzer_commit` remains provenance metadata only: this offline analyzer does
 not independently prove that the named repository commit contains the source
 bytes. The checked source SHA-256 binds analysis eligibility to the concrete
-analyzer file used. These hashes make only the basic post-capture integrity
-claim below.
+analyzer file used. Hashing raw bytes proves only post-capture byte integrity;
+it is not proof that the capture-side parser or any declared normalized field
+was correct. These hashes make only the basic post-capture integrity claim
+below.
 
 Completed captures become read-only in the operator evidence store; any later
 annotation is a separately hashed file outside the sealed directory. SHA-256

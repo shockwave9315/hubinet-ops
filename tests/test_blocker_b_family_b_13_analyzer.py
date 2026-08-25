@@ -30,6 +30,37 @@ UPID_C = "UPID:fixture:00000003:00000003:00000003:stopall::generator@pve:"
 UPID_X = "UPID:othernode:00000004:00000004:00000004:mystery:999:other@pve:"
 UPID_OWNER_X = "UPID:fixture:00000005:00000005:00000005:stopall::other@pve:"
 
+INOTIFY_MASKS = {
+    "IN_ACCESS": 0x00000001,
+    "IN_MODIFY": 0x00000002,
+    "IN_ATTRIB": 0x00000004,
+    "IN_CLOSE_WRITE": 0x00000008,
+    "IN_CLOSE_NOWRITE": 0x00000010,
+    "IN_OPEN": 0x00000020,
+    "IN_MOVED_FROM": 0x00000040,
+    "IN_MOVED_TO": 0x00000080,
+    "IN_CREATE": 0x00000100,
+    "IN_DELETE": 0x00000200,
+    "IN_DELETE_SELF": 0x00000400,
+    "IN_MOVE_SELF": 0x00000800,
+    "IN_UNMOUNT": 0x00002000,
+    "IN_Q_OVERFLOW": 0x00004000,
+    "IN_IGNORED": 0x00008000,
+    "IN_ISDIR": 0x40000000,
+}
+
+
+def _raw_mask(masks: list[str]) -> int:
+    return sum(INOTIFY_MASKS[mask] for mask in masks)
+
+
+def _active_raw(*upids: str) -> str:
+    return "".join(f"{upid} 0\n" for upid in upids)
+
+
+def _archive_raw(*upids: str) -> str:
+    return "".join(f"{upid} 00000001 OK\n" for upid in upids)
+
 
 def _set_subrun(
     manifest: dict[str, Any], subrun_id: str, phenomena: list[str]
@@ -65,7 +96,7 @@ def _watch_event(
         "queue_overflow": "IN_Q_OVERFLOW" in masks,
         "watch_descriptor": -1 if "IN_Q_OVERFLOW" in masks else 1,
         "cookie": 0,
-        "raw_mask": 1,
+        "raw_mask": _raw_mask(masks),
         "raw_order": sequence,
         "monotonic_ns": monotonic_ns,
         "wall_timestamp": "2026-08-25T00:00:03Z",
@@ -110,6 +141,36 @@ def _append_surface(
     }
     records["surface_observations"].append(record)
     return record
+
+
+def _use_watch_as_only_discovery(
+    records: dict[str, list[dict[str, Any]]], watch: dict[str, Any]
+) -> None:
+    records["watch_events"] = [watch]
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = []
+        scan["watch_drained_through_sequence"] = 1
+    exact = records["exact_upid"][0]
+    exact["discovery_source"] = "watch"
+    exact["discovery_reference"] = 1
+
+
+def _use_surface_as_only_discovery(
+    records: dict[str, list[dict[str, Any]]], source: str
+) -> dict[str, Any]:
+    records["watch_events"] = []
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = []
+        scan["watch_drained_through_sequence"] = 0
+    surface = next(
+        record
+        for record in reversed(records["surface_observations"])
+        if record["source"] == source
+    )
+    exact = records["exact_upid"][0]
+    exact["discovery_source"] = "active" if source == "active" else "archive"
+    exact["discovery_reference"] = surface["observation_sequence"]
+    return surface
 
 
 def _ground_truth_operation(sequence: int, upid: str) -> list[dict[str, Any]]:
@@ -565,7 +626,7 @@ def _add_finalized_historical_baseline(
     for scan in records["scan_rounds"]:
         scan["exact_normalized_upids"] = [UPID_A, upid]
     archive = records["surface_observations"][1]
-    _set_surface_raw(archive, f"historical {upid}", [upid])
+    _set_surface_raw(archive, _archive_raw(upid), [upid])
     generated_exact = records["exact_upid"][0]
     generated_exact["observation_sequence"] = 2
     baseline_exact = {
@@ -1266,7 +1327,7 @@ def test_baseline_worker_active_across_t0_cannot_pass(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     _add_finalized_historical_baseline(manifest, records, UPID_B)
     active = records["surface_observations"][0]
-    _set_surface_raw(active, f"active {UPID_B}", [UPID_B])
+    _set_surface_raw(active, _active_raw(UPID_B), [UPID_B])
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
@@ -1415,6 +1476,7 @@ def test_lazy_bucket_without_child_watch_and_rescan_cannot_pass(
             "watch_scope": "task_root",
             "bucket": "f",
             "mask": ["IN_CREATE", "IN_ISDIR"],
+            "raw_mask": _raw_mask(["IN_CREATE", "IN_ISDIR"]),
             "monotonic_ns": 52,
             "complete": True,
         },
@@ -1433,8 +1495,9 @@ def test_lazy_bucket_without_child_watch_and_rescan_cannot_pass(
     assert "pre_t0_bucket_watch_missing:f" in result.reasons
 
 
+@pytest.mark.parametrize("creation_mask", ["IN_CREATE", "IN_MOVED_TO"])
 def test_watch_first_pre_t0_fixed_point_with_lazy_bucket_may_continue(
-    tmp_path: Path,
+    tmp_path: Path, creation_mask: str
 ) -> None:
     manifest, records = _default_capture()
     records["pre_t0_establishment"][2:2] = [
@@ -1443,7 +1506,8 @@ def test_watch_first_pre_t0_fixed_point_with_lazy_bucket_may_continue(
             "watcher_sequence": 3,
             "watch_scope": "task_root",
             "bucket": "f",
-            "mask": ["IN_CREATE", "IN_ISDIR"],
+            "mask": [creation_mask, "IN_ISDIR"],
+            "raw_mask": _raw_mask([creation_mask, "IN_ISDIR"]),
             "monotonic_ns": 52,
             "complete": True,
         },
@@ -1590,7 +1654,7 @@ def test_subrun_13c_requires_raw_referenced_handoff_evidence(tmp_path: Path) -> 
         "active",
         capture_start=150,
         capture_end=160,
-        raw_evidence="active A",
+        raw_evidence=_active_raw(UPID_A),
         upids=[UPID_A],
     )
     archive = _append_surface(
@@ -1598,7 +1662,7 @@ def test_subrun_13c_requires_raw_referenced_handoff_evidence(tmp_path: Path) -> 
         "index",
         capture_start=170,
         capture_end=175,
-        raw_evidence="archive A",
+        raw_evidence=_archive_raw(UPID_A),
         upids=[UPID_A],
     )
     records["harness_events"].insert(
@@ -1617,6 +1681,16 @@ def test_subrun_13c_requires_raw_referenced_handoff_evidence(tmp_path: Path) -> 
 
     assert result.outcome is AnalyzerOutcome.PASS
 
+    active["normalized_upids"] = []
+    mismatch_tmp = tmp_path / "13c-raw-projection-mismatch"
+    mismatch_tmp.mkdir()
+    mismatch = analyze_capture(_materialize(mismatch_tmp, manifest, records))
+    assert mismatch.outcome is AnalyzerOutcome.INCOMPLETE
+    assert mismatch.reasons == (
+        f"surface_normalized_upids_mismatch_raw_evidence:active:"
+        f"{active['observation_sequence']}",
+    )
+
 
 def test_subrun_13c_baseline_only_handoff_target_cannot_pass(tmp_path: Path) -> None:
     manifest, records = _default_capture()
@@ -1627,7 +1701,7 @@ def test_subrun_13c_baseline_only_handoff_target_cannot_pass(tmp_path: Path) -> 
         "active",
         capture_start=150,
         capture_end=160,
-        raw_evidence="historical active B",
+        raw_evidence=_active_raw(UPID_B),
         upids=[UPID_B],
     )
     archive = _append_surface(
@@ -1635,7 +1709,7 @@ def test_subrun_13c_baseline_only_handoff_target_cannot_pass(tmp_path: Path) -> 
         "index",
         capture_start=170,
         capture_end=175,
-        raw_evidence="historical archive B",
+        raw_evidence=_archive_raw(UPID_B),
         upids=[UPID_B],
     )
     records["harness_events"].insert(
@@ -1666,27 +1740,27 @@ def test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence(
         "index",
         capture_start=150,
         capture_end=160,
-        raw_evidence=f"old-index {UPID_A}",
+        raw_evidence=_archive_raw(UPID_A),
         upids=[UPID_A],
-        stat={"device": 1, "inode": 20, "size": len(f"old-index {UPID_A}")},
+        stat={"device": 1, "inode": 20, "size": len(_archive_raw(UPID_A))},
     )
     rotated = _append_surface(
         records,
         "index.1",
         capture_start=180,
         capture_end=185,
-        raw_evidence=f"old-index {UPID_A}",
+        raw_evidence=_archive_raw(UPID_A),
         upids=[UPID_A],
-        stat={"device": 1, "inode": 20, "size": len(f"old-index {UPID_A}")},
+        stat={"device": 1, "inode": 20, "size": len(_archive_raw(UPID_A))},
     )
     after = _append_surface(
         records,
         "index",
         capture_start=180,
         capture_end=185,
-        raw_evidence="new-index",
+        raw_evidence="",
         upids=[],
-        stat={"device": 1, "inode": 21, "size": 9},
+        stat={"device": 1, "inode": 21, "size": 0},
     )
     records["ground_truth"][-1]["monotonic_ns"] = 190
     records["watch_events"].append(
@@ -1718,8 +1792,19 @@ def test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence(
 
     assert result.outcome is AnalyzerOutcome.PASS
 
-    _set_surface_raw(before, "ambient-old-index", [])
-    _set_surface_raw(rotated, "ambient-old-index", [])
+    before["normalized_upids"] = []
+    mismatch_tmp = tmp_path / "13d-raw-projection-mismatch"
+    mismatch_tmp.mkdir()
+    mismatch = analyze_capture(_materialize(mismatch_tmp, manifest, records))
+    assert mismatch.outcome is AnalyzerOutcome.INCOMPLETE
+    assert mismatch.reasons == (
+        f"surface_normalized_upids_mismatch_raw_evidence:index:"
+        f"{before['observation_sequence']}",
+    )
+    before["normalized_upids"] = [UPID_A]
+
+    _set_surface_raw(before, "", [])
+    _set_surface_raw(rotated, "", [])
     ambient_tmp = tmp_path / "ambient-only"
     ambient_tmp.mkdir()
     ambient_result = analyze_capture(_materialize(ambient_tmp, manifest, records))
@@ -1804,7 +1889,7 @@ def test_subrun_13g_requires_every_declared_combined_phenomenon(
         "active",
         capture_start=150,
         capture_end=160,
-        raw_evidence="combined active A",
+        raw_evidence=_active_raw(UPID_A),
         upids=[UPID_A],
     )
     archive = _append_surface(
@@ -1812,7 +1897,7 @@ def test_subrun_13g_requires_every_declared_combined_phenomenon(
         "index",
         capture_start=170,
         capture_end=175,
-        raw_evidence="combined archive A",
+        raw_evidence=_archive_raw(UPID_A),
         upids=[UPID_A],
     )
     records["harness_events"].insert(
@@ -1955,6 +2040,291 @@ def test_surface_hash_must_match_raw_evidence(tmp_path: Path) -> None:
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
     assert result.reasons == ("surface_hash_mismatch:active:1",)
+
+
+@pytest.mark.parametrize("source", ["active", "index", "index.1"])
+def test_surface_declared_upid_absent_from_raw_cannot_manufacture_discovery(
+    tmp_path: Path, source: str
+) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, source)
+    _set_surface_raw(surface, "", [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "surface_normalized_upids_mismatch_raw_evidence:"
+        f"{source}:{surface['observation_sequence']}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("declared", "expected_reason"),
+    [
+        ([], "surface_normalized_upids_mismatch_raw_evidence"),
+        ([UPID_B], "surface_normalized_upids_mismatch_raw_evidence"),
+        ([UPID_A, UPID_A], "surface_declared_normalized_upids_duplicate"),
+    ],
+)
+def test_surface_raw_upid_requires_exact_duplicate_free_declared_projection(
+    tmp_path: Path, declared: list[str], expected_reason: str
+) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, "active")
+    _set_surface_raw(surface, _active_raw(UPID_A), declared)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        f"{expected_reason}:active:{surface['observation_sequence']}",
+    )
+
+
+def test_surface_raw_and_declared_upids_exactly_agree_may_continue(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, "active")
+    _set_surface_raw(surface, _active_raw(UPID_A), [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_malformed_surface_raw_evidence_is_incomplete(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, "index")
+    _set_surface_raw(surface, f"not-an-archive-line {UPID_A}\n", [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("surface_raw_evidence_malformed:index",)
+
+
+def test_duplicate_upid_in_surface_raw_evidence_is_incomplete(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, "index.1")
+    _set_surface_raw(surface, _archive_raw(UPID_A, UPID_A), [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("surface_raw_evidence_duplicate_upid:index.1",)
+
+
+@pytest.mark.parametrize("source", ["active", "index", "index.1"])
+def test_changing_only_surface_projection_cannot_change_raw_enumeration_to_pass(
+    tmp_path: Path, source: str
+) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, source)
+    records["exact_upid"] = []
+    manifest["candidate_close"]["known_upids"] = []
+    _set_surface_raw(surface, "", [])
+    missing = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert missing.outcome is AnalyzerOutcome.ENUMERATION_WITNESS
+
+    surface["normalized_upids"] = [UPID_A]
+    changed_dir = tmp_path / "changed-projection"
+    changed_dir.mkdir()
+    changed = analyze_capture(_materialize(changed_dir, manifest, records))
+
+    assert changed.outcome is AnalyzerOutcome.INCOMPLETE
+    assert changed.outcome is not AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    ("raw_mask", "declared_mask"),
+    [
+        (INOTIFY_MASKS["IN_ACCESS"], ["IN_CREATE"]),
+        (INOTIFY_MASKS["IN_CREATE"], ["IN_ACCESS"]),
+    ],
+)
+def test_watch_raw_mask_text_disagreement_cannot_manufacture_discovery(
+    tmp_path: Path, raw_mask: int, declared_mask: list[str]
+) -> None:
+    manifest, records = _default_capture()
+    watch = _watch_event(1, masks=declared_mask, monotonic_ns=140, upid=UPID_A)
+    watch["raw_mask"] = raw_mask
+    _use_watch_as_only_discovery(records, watch)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("inotify_mask_mismatch_raw_mask:watch:1",)
+
+
+@pytest.mark.parametrize(
+    ("raw_mask", "declared_mask", "queue_overflow"),
+    [
+        (INOTIFY_MASKS["IN_Q_OVERFLOW"], [], False),
+        (INOTIFY_MASKS["IN_ATTRIB"], ["IN_Q_OVERFLOW"], True),
+    ],
+)
+def test_watch_overflow_projection_must_match_raw_mask(
+    tmp_path: Path,
+    raw_mask: int,
+    declared_mask: list[str],
+    queue_overflow: bool,
+) -> None:
+    manifest, records = _default_capture()
+    watch = _watch_event(
+        1,
+        masks=declared_mask,
+        monotonic_ns=160,
+        event_type="queue_overflow",
+    )
+    watch["raw_mask"] = raw_mask
+    watch["queue_overflow"] = queue_overflow
+    records["watch_events"] = [watch]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("inotify_mask_mismatch_raw_mask:watch:1",)
+
+
+def test_queue_overflow_boolean_must_match_agreed_raw_mask(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    watch = _watch_event(
+        1,
+        masks=["IN_Q_OVERFLOW"],
+        monotonic_ns=160,
+        event_type="queue_overflow",
+    )
+    watch["queue_overflow"] = False
+    records["watch_events"] = [watch]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("watch_queue_overflow_mismatch_raw_mask:1",)
+
+
+def test_13e_textual_fake_overflow_cannot_create_gap_or_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    evidence_ids = _set_subrun(
+        manifest, "13E", ["watch_overflow_or_invalidation"]
+    )
+    watch = _watch_event(
+        1,
+        masks=["IN_Q_OVERFLOW"],
+        monotonic_ns=160,
+        event_type="queue_overflow",
+        phenomenon_id=evidence_ids["watch_overflow_or_invalidation"],
+    )
+    watch["raw_mask"] = INOTIFY_MASKS["IN_ATTRIB"]
+    records["watch_events"] = [watch]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.outcome not in {AnalyzerOutcome.GAP, AnalyzerOutcome.PASS}
+
+
+@pytest.mark.parametrize(
+    "mask",
+    ["IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"],
+)
+def test_raw_agreed_observer_loss_variants_latch_gap(
+    tmp_path: Path, mask: str
+) -> None:
+    manifest, records = _default_capture()
+    evidence_ids = _set_subrun(
+        manifest, "13E", ["watch_overflow_or_invalidation"]
+    )
+    watch = _watch_event(
+        1,
+        masks=[mask],
+        monotonic_ns=160,
+        event_type="watch_invalidation",
+        phenomenon_id=evidence_ids["watch_overflow_or_invalidation"],
+    )
+    records["watch_events"] = [watch]
+    records["exact_upid"][0]["discovery_source"] = "scan"
+    records["exact_upid"][0]["discovery_reference"] = 2
+    for scan in records["scan_rounds"]:
+        scan["watch_drained_through_sequence"] = 1
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "watch_invalidation_or_loss" in result.reasons
+
+
+@pytest.mark.parametrize(
+    "mask",
+    ["IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"],
+)
+def test_observer_loss_text_disagreement_is_incomplete(
+    tmp_path: Path, mask: str
+) -> None:
+    manifest, records = _default_capture()
+    watch = _watch_event(
+        1, masks=[mask], monotonic_ns=160, event_type="watch_invalidation"
+    )
+    watch["raw_mask"] = INOTIFY_MASKS["IN_ATTRIB"]
+    records["watch_events"] = [watch]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+
+
+@pytest.mark.parametrize("mask", ["IN_CREATE", "IN_MOVED_TO", "IN_CLOSE_WRITE"])
+def test_raw_agreed_discovery_variants_may_continue(
+    tmp_path: Path, mask: str
+) -> None:
+    manifest, records = _default_capture()
+    _use_watch_as_only_discovery(
+        records,
+        _watch_event(1, masks=[mask], monotonic_ns=140, upid=UPID_A),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize("mask", ["IN_DELETE", "IN_MOVED_FROM"])
+def test_raw_agreed_deletion_variants_preserve_gap_semantics(
+    tmp_path: Path, mask: str
+) -> None:
+    manifest, records = _default_capture()
+    records["watch_events"].append(
+        _watch_event(2, masks=[mask], monotonic_ns=240, upid=UPID_A)
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "ground_truth_exact_log_deleted" in result.reasons
+
+
+def test_unknown_inotify_raw_bit_is_incomplete(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["watch_events"][0]["raw_mask"] |= 0x00001000
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "inotify_raw_mask_unknown_bits:watch:1:0x00001000",
+    )
+
+
+def test_watch_normalized_upid_must_be_derived_from_filename(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["watch_events"][0]["filename"] = UPID_B
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("watch_normalized_upid_mismatch_filename:1",)
 
 
 def test_after_t1_operation_cannot_self_declare_in_generator_window(
