@@ -275,6 +275,16 @@ or appends after the finalizer, is `HARNESS_INCOMPLETE`. Physical append order
 is the evidence that `request_start` is a causal lower bound at all; a declared
 `generator_sequence` cannot reorder it.
 
+One generator process appends that stream and CLOCK_MONOTONIC cannot run
+backwards within a single participant, so `monotonic_ns` taken in physical order
+across `request_start`, `request_end`, and the finalizer must be nondecreasing.
+Equal adjacent values are legal at timer resolution; a reversal is
+`HARNESS_INCOMPLETE`. Without this a physically late `request_start` could
+backdate itself and admit completeness-bearing evidence recorded before the
+request was actually initiated. Overlapping in-flight requests remain legal:
+only the capture stream, not the operations, is ordered. This orders capture
+records only and never identifies worker body start.
+
 Each child-watch installation declares `bucket_origin` as either
 `existing_at_root_install` or `root_event`. A `root_event` installation must
 reference the exact creation-event watcher sequence; an initially existing

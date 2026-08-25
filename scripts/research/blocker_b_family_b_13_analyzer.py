@@ -672,7 +672,7 @@ def _ground_truth(
     starts: dict[int, Mapping[str, Any]] = {}
     ends: dict[int, Mapping[str, Any]] = {}
     finalizers: list[Mapping[str, Any]] = []
-    physical_ground_truth_order: list[tuple[str, int]] = []
+    physical_ground_truth_order: list[tuple[str, int, int]] = []
     process_identity = str(
         _require_mapping(manifest["generator_context"], "generator_context")[
             "process_identity"
@@ -701,7 +701,9 @@ def _ground_truth(
         event = _require_text(record, "event")
         if event == "generator_finalized":
             finalizers.append(record)
-            physical_ground_truth_order.append(("generator_finalized", 0))
+            physical_ground_truth_order.append(
+                ("generator_finalized", 0, _require_int(record, "monotonic_ns"))
+            )
             continue
         if event not in {"request_start", "request_end"}:
             raise CaptureError(f"unknown_ground_truth_event:{event}")
@@ -717,7 +719,9 @@ def _ground_truth(
         target = starts if event == "request_start" else ends
         if sequence in target:
             raise CaptureError(f"duplicate_ground_truth_event:{event}:{sequence}")
-        physical_ground_truth_order.append((event, sequence))
+        physical_ground_truth_order.append(
+            (event, sequence, _require_int(record, "monotonic_ns"))
+        )
         target[sequence] = record
 
     if len(finalizers) != 1:
@@ -749,7 +753,9 @@ def _ground_truth(
     # UPID; a stream that physically records the end before the start, or keeps
     # appending after the finalizer, cannot support that bound.
     seen_start_sequences: set[int] = set()
-    for position, (event, sequence) in enumerate(physical_ground_truth_order):
+    for position, (event, sequence, _monotonic) in enumerate(
+        physical_ground_truth_order
+    ):
         if event == "generator_finalized":
             if position != len(physical_ground_truth_order) - 1:
                 raise CaptureError("ground_truth_finalizer_not_physically_last")
@@ -759,6 +765,16 @@ def _ground_truth(
             raise CaptureError(
                 f"ground_truth_request_end_precedes_start_in_capture:{sequence}"
             )
+    # One generator process appends this stream, and CLOCK_MONOTONIC cannot run
+    # backwards within a single participant, so physically later records cannot
+    # declare an earlier time.  Without this a physically late `request_start`
+    # could backdate itself and admit completeness-bearing evidence that
+    # predates the real request initiation.  Equal adjacent values are legal at
+    # timer resolution, so the requirement is nondecreasing, not strict.  This
+    # orders capture records only; it never identifies worker body start.
+    physical_times = [monotonic for _, _, monotonic in physical_ground_truth_order]
+    if physical_times != sorted(physical_times):
+        raise CaptureError("ground_truth_monotonic_time_reversed_in_capture")
 
     operations: list[dict[str, Any]] = []
     seen_upids: set[str] = set()

@@ -631,7 +631,12 @@ def _add_ground_truth_operation(
     manifest: dict[str, Any], records: dict[str, list[dict[str, Any]]], upid: str
 ) -> None:
     records["ground_truth"].pop()
-    records["ground_truth"].extend(_ground_truth_operation(2, upid))
+    second = _ground_truth_operation(2, upid)
+    # The generator appends this stream in capture order, so the second
+    # operation must start no earlier than the first one ended.
+    second[0]["monotonic_ns"] = 140
+    second[1]["monotonic_ns"] = 150
+    records["ground_truth"].extend(second)
     records["ground_truth"].append(
         {
             "event": "generator_finalized",
@@ -1463,7 +1468,10 @@ def test_surviving_anchors_do_not_hide_unknown_intermediate_loss(tmp_path: Path)
     manifest, records = _default_capture()
     _add_ground_truth_operation(manifest, records, UPID_B)
     records["ground_truth"].pop()
-    records["ground_truth"].extend(_ground_truth_operation(3, UPID_C))
+    third = _ground_truth_operation(3, UPID_C)
+    third[0]["monotonic_ns"] = 160
+    third[1]["monotonic_ns"] = 170
+    records["ground_truth"].extend(third)
     records["ground_truth"].append(
         {
             "event": "generator_finalized",
@@ -1471,7 +1479,7 @@ def test_surviving_anchors_do_not_hide_unknown_intermediate_loss(tmp_path: Path)
             "total_operations": 3,
             "durable_flush_complete": True,
             "generator_process_identity": "synthetic-generator:1",
-            "monotonic_ns": 170,
+            "monotonic_ns": 180,
             "wall_timestamp": "2026-08-25T00:00:04Z",
         }
     )
@@ -2123,6 +2131,127 @@ def test_ground_truth_request_end_physically_before_start_is_incomplete(
     assert result.reasons == (
         "ground_truth_request_end_precedes_start_in_capture:1",
     )
+
+
+def _gt_pair(sequence: int, upid: str, start: int, end: int) -> list[dict[str, Any]]:
+    records = _ground_truth_operation(sequence, upid)
+    records[0]["monotonic_ns"] = start
+    records[1]["monotonic_ns"] = end
+    return records
+
+
+def _two_operation_ground_truth(
+    manifest: dict[str, Any],
+    records: dict[str, list[dict[str, Any]]],
+    stream: list[dict[str, Any]],
+    *,
+    evidence: tuple[int, int],
+) -> None:
+    records["ground_truth"] = stream + [
+        {
+            "event": "generator_finalized",
+            "last_sequence": 2,
+            "total_operations": 2,
+            "durable_flush_complete": True,
+            "generator_process_identity": "synthetic-generator:1",
+            "monotonic_ns": 150,
+            "wall_timestamp": "2026-08-25T00:00:09Z",
+        }
+    ]
+    manifest["candidate_close"]["known_upids"] = [UPID_A, UPID_B]
+    records["watch_events"] = [
+        _watch_event(1, masks=["IN_CREATE"], monotonic_ns=evidence[0], upid=UPID_A),
+        _watch_event(2, masks=["IN_CREATE"], monotonic_ns=evidence[1], upid=UPID_B),
+    ]
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = [UPID_A, UPID_B]
+        scan["watch_drained_through_sequence"] = 2
+    first = records["exact_upid"][0]
+    first["discovery_reference"] = 1
+    records["exact_upid"].append(
+        {
+            **first,
+            "observation_sequence": 2,
+            "known_upid": UPID_B,
+            "discovery_source": "watch",
+            "discovery_reference": 2,
+        }
+    )
+
+
+def test_backdated_request_start_cannot_admit_earlier_evidence(
+    tmp_path: Path,
+) -> None:
+    """A physically late ``request_start`` cannot backdate its own causal bound.
+
+    ``B``'s start record is appended after a ground-truth record at 130 but
+    declares 100, which would otherwise let evidence at 105 satisfy the strict
+    ``> request_start`` bound for a request that had not yet been initiated.
+    """
+
+    manifest, records = _default_capture()
+    _two_operation_ground_truth(
+        manifest,
+        records,
+        _gt_pair(1, UPID_A, 110, 130) + _gt_pair(2, UPID_B, 100, 140),
+        evidence=(140, 105),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("ground_truth_monotonic_time_reversed_in_capture",)
+
+
+def test_backdated_request_end_is_incomplete(tmp_path: Path) -> None:
+    """The end still follows its own start, but reverses the capture stream."""
+
+    manifest, records = _default_capture()
+    _two_operation_ground_truth(
+        manifest,
+        records,
+        _gt_pair(1, UPID_A, 110, 140) + _gt_pair(2, UPID_B, 120, 130),
+        evidence=(145, 146),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("ground_truth_monotonic_time_reversed_in_capture",)
+
+
+def test_concurrent_generator_operations_may_pass(tmp_path: Path) -> None:
+    """Overlapping requests are legal while the capture stream never reverses."""
+
+    manifest, records = _default_capture()
+    start_a, end_a = _gt_pair(1, UPID_A, 110, 130)
+    start_b, end_b = _gt_pair(2, UPID_B, 120, 140)
+    _two_operation_ground_truth(
+        manifest,
+        records,
+        [start_a, start_b, end_a, end_b],
+        evidence=(145, 146),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_equal_adjacent_ground_truth_timestamps_may_pass(tmp_path: Path) -> None:
+    """CLOCK_MONOTONIC may repeat at timer resolution, so equality is legal."""
+
+    manifest, records = _default_capture()
+    _two_operation_ground_truth(
+        manifest,
+        records,
+        _gt_pair(1, UPID_A, 110, 130) + _gt_pair(2, UPID_B, 130, 130),
+        evidence=(140, 141),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
 
 
 def test_ground_truth_finalizer_must_be_physically_last(tmp_path: Path) -> None:
