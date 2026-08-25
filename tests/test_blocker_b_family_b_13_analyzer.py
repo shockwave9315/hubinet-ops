@@ -1744,6 +1744,194 @@ def test_finalized_historical_baseline_allows_quiescent_t0(
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+def _raw_result(available: bool, raw_evidence: str, parsed_field: str, parsed: str) -> dict[str, Any]:
+    return {
+        "available": available,
+        "raw_evidence": raw_evidence,
+        "sha256": hashlib.sha256(raw_evidence.encode("utf-8")).hexdigest(),
+        parsed_field: parsed,
+    }
+
+
+def _set_referenced_baseline_exact(
+    records: dict[str, list[dict[str, Any]]],
+    *,
+    task_state: str = "stopped",
+    terminal_status: str = "TASK OK",
+    interpretation: str = "ok",
+    available: bool = True,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Rewrite the exact observation that `t0_quiescence` actually references."""
+
+    exact = records["exact_upid"][0]
+    assert exact["observation_sequence"] == 1
+    exact["status_result"] = _raw_result(
+        available, task_state if available else "", "task_state", task_state
+    )
+    exact["log_result"] = _raw_result(
+        available, terminal_status if available else "", "terminal_status", terminal_status
+    )
+    exact["final_status_interpretation"] = interpretation
+    exact.update(overrides)
+    return exact
+
+
+def _append_baseline_exact(
+    records: dict[str, list[dict[str, Any]]],
+    upid: str,
+    *,
+    task_state: str = "stopped",
+    terminal_status: str = "TASK OK",
+    interpretation: str = "ok",
+    capture_start: int,
+    capture_end: int,
+) -> dict[str, Any]:
+    """Append one more exact observation of the same baseline UPID."""
+
+    record = {
+        "observation_sequence": len(records["exact_upid"]) + 1,
+        "known_upid": upid,
+        "status_result": _raw_result(True, task_state, "task_state", task_state),
+        "log_result": _raw_result(True, terminal_status, "terminal_status", terminal_status),
+        "presence": True,
+        "readable": True,
+        "previously_known": True,
+        "discovery_source": "baseline",
+        "discovery_reference": "manifest.baseline_upids",
+        "final_status_interpretation": interpretation,
+        "capture_start_monotonic_ns": capture_start,
+        "capture_end_monotonic_ns": capture_end,
+    }
+    records["exact_upid"].append(record)
+    return record
+
+
+def test_referenced_non_final_baseline_exact_without_borrow_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    """A: the referenced pre-T0 observation alone must carry the finality."""
+
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    _set_referenced_baseline_exact(
+        records,
+        task_state="running",
+        terminal_status="starting",
+        interpretation="not_final",
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "t0_quiescence_final_exact_reference_invalid" in result.reasons
+
+
+@pytest.mark.parametrize("interpretation", ["not_final", "unknown"])
+def test_post_t0_exact_cannot_finalize_referenced_pre_t0_observation(
+    tmp_path: Path, interpretation: str
+) -> None:
+    """B/C: post-T0 evidence must not discharge a pre-T0 quiescence obligation.
+
+    The referenced pre-T0 bytes are identical to the control above; only a
+    later observation of the same UPID is added.  Its existence must not change
+    the T0 verdict.
+    """
+
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    referenced = _set_referenced_baseline_exact(
+        records,
+        task_state="running",
+        terminal_status="starting",
+        interpretation=interpretation,
+    )
+    assert referenced["capture_end_monotonic_ns"] < manifest["t0_monotonic_ns"]
+    _append_baseline_exact(
+        records, UPID_B, capture_start=240, capture_end=241
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "t0_quiescence_final_exact_reference_invalid" in result.reasons
+
+
+def test_referenced_pre_t0_observation_proving_finality_may_pass(
+    tmp_path: Path,
+) -> None:
+    """D: positive control -- the reference itself proves finality before T0."""
+
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    referenced = _set_referenced_baseline_exact(
+        records, task_state="stopped", terminal_status="TASK OK", interpretation="ok"
+    )
+    assert referenced["capture_end_monotonic_ns"] <= manifest["t0_monotonic_ns"]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_second_later_final_observation_does_not_disturb_valid_reference(
+    tmp_path: Path,
+) -> None:
+    """E: an extra final observation of the same UPID is simply redundant."""
+
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    _append_baseline_exact(records, UPID_B, capture_start=240, capture_end=241)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    "overrides,interpretation",
+    [
+        ({"presence": False}, "absent"),
+        ({"readable": False}, "unreadable"),
+    ],
+)
+def test_referenced_absent_or_unreadable_exact_cannot_be_rehabilitated(
+    tmp_path: Path, overrides: dict[str, Any], interpretation: str
+) -> None:
+    """F: a lost referenced observation stays lost despite a later good read."""
+
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    _set_referenced_baseline_exact(
+        records, available=False, interpretation=interpretation, **overrides
+    )
+    _append_baseline_exact(records, UPID_B, capture_start=240, capture_end=241)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "t0_quiescence_final_exact_reference_invalid" in result.reasons
+
+
+def test_reference_to_late_exact_is_invalid_even_with_pre_t0_final_sibling(
+    tmp_path: Path,
+) -> None:
+    """G: authority follows the reference, not the convenient observation."""
+
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    referenced = _set_referenced_baseline_exact(
+        records, capture_start_monotonic_ns=240, capture_end_monotonic_ns=241
+    )
+    assert referenced["capture_end_monotonic_ns"] > manifest["t0_monotonic_ns"]
+    _append_baseline_exact(records, UPID_B, capture_start=83, capture_end=84)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "t0_quiescence_final_exact_not_before_t0" in result.reasons
+
+
 def test_post_t0_watch_and_fixed_point_cannot_establish_quiescent_t0(
     tmp_path: Path,
 ) -> None:

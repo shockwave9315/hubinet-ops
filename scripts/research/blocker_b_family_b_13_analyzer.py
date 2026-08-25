@@ -1264,7 +1264,7 @@ def _validate_t0_quiescence(
     manifest: Mapping[str, Any],
     surfaces: Mapping[int, Mapping[str, Any]],
     exact_records: Mapping[int, Mapping[str, Any]],
-    exact_final: set[str],
+    final_exact_observation_sequences: set[int],
 ) -> None:
     t0 = _require_int(manifest, "t0_monotonic_ns")
     baseline = _require_mapping(
@@ -1355,7 +1355,18 @@ def _validate_t0_quiescence(
             raise CaptureError("t0_quiescence_operation_unclassified")
         exact_sequence = _require_int(record, "exact_observation_sequence")
         exact = exact_records.get(exact_sequence)
-        if exact is None or exact.get("known_upid") != upid or upid not in exact_final:
+        # Finality here is a property of the *referenced observation*, never of
+        # the UPID.  `lifecycle_state="finalized"` is a self-asserted label and
+        # proves nothing on its own; only the referenced record's own sealed raw
+        # status/log evidence does.  A UPID-keyed membership test would let a
+        # later -- possibly post-T0 -- observation of the same UPID rehabilitate
+        # a non-final, unknown, unreadable, or absent referenced observation, so
+        # a pre-T0 obligation could be discharged by post-T0 evidence.
+        if (
+            exact is None
+            or exact.get("known_upid") != upid
+            or exact_sequence not in final_exact_observation_sequences
+        ):
             raise CaptureError("t0_quiescence_final_exact_reference_invalid")
         exact_end = _require_int(exact, "capture_end_monotonic_ns")
         if exact_end > committed or exact_end > t0:
@@ -1986,7 +1997,12 @@ def _analyze_loaded(
 
     enumerated_known = watch_known | scan_known | surface_known
     exact_confirmed: set[str] = set()
+    # `exact_final` stays UPID-level: post-T0 reconciliation legitimately asks
+    # whether a task reached a final status at some point before close.
+    # `final_exact_observation_sequences` is observation-level, for callers that
+    # reference one specific observation and must not borrow another's result.
     exact_final: set[str] = set()
+    final_exact_observation_sequences: set[int] = set()
     exact_records: dict[int, Mapping[str, Any]] = {}
     for record in records["exact_upid"]:
         observation_sequence = _require_int(record, "observation_sequence")
@@ -2090,6 +2106,7 @@ def _analyze_loaded(
             raise CaptureError("exact_upid_final_interpretation_inconsistent")
         if final_interpretation in {"ok", "warning", "error"}:
             exact_final.add(upid)
+            final_exact_observation_sequences.add(observation_sequence)
 
     if set(exact_records) != set(range(1, len(exact_records) + 1)):
         raise CaptureError("exact_observation_sequence_gap")
@@ -2097,7 +2114,7 @@ def _analyze_loaded(
         manifest,
         surfaces,
         exact_records,
-        exact_final,
+        final_exact_observation_sequences,
     )
 
     expected_upids = {

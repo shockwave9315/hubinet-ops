@@ -222,6 +222,21 @@ Missing, active, pending, non-final, unclassified, late, or mismatched evidence
 prevents positive close. Historical finalized exact/archive records may remain;
 retention is not worker liveness.
 
+That finality is observation-local. `lifecycle_state="finalized"` is a
+self-asserted label and proves nothing by itself; the observation named by
+`exact_observation_sequence` must independently satisfy every final-exact
+requirement -- matching `known_upid`, presence, readability, available and
+hash-valid raw status/log evidence, parsed state agreeing with that raw
+evidence, a terminal interpretation, and capture completed no later than T0.
+The analyzer therefore keeps two distinct notions of finality: a UPID-level set,
+which post-T0 reconciliation legitimately uses to ask whether a task reached a
+final status at some point before close, and an observation-level set keyed by
+`observation_sequence`, which is the only one T0 quiescence may consult. A
+later observation of the same UPID -- in particular one captured after T0 --
+must never rehabilitate a non-final, unknown, unreadable, absent, or late
+referenced observation. Authority follows the reference, never whichever
+observation of that UPID is convenient.
+
 ### 4.2 Shared monotonic clock contract
 
 `clock_contract` uses revision `family-b-13-clock-contract-v1`. It binds
