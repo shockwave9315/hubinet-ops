@@ -18,13 +18,29 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_REVISION = "family-b-13-capture-v3"
-PROTOCOL_REVISION = "family-b-13-preexecution-v3"
+SCHEMA_REVISION = "family-b-13-capture-v4"
+PROTOCOL_REVISION = "family-b-13-preexecution-v4"
 EXPECTED_B_S1_REVISION = "B-S1-2B-f2fd1ddb442fb1e0202a7a0800a05c330b6ac9cc"
-ANALYZER_REVISION = "family-b-13-analyzer-v3"
+ANALYZER_REVISION = "family-b-13-analyzer-v4"
 GENERATOR_CONTRACT_REVISION = "family-b-13-generator-contract-v1"
 SUBRUN_CONTRACT_REVISION = "family-b-13-subrun-contract-v1"
+CLOCK_CONTRACT_REVISION = "family-b-13-clock-contract-v1"
 MAX_JSONL_LINE_BYTES = 1_048_576
+
+CLOCK_PARTICIPANTS = frozenset(
+    {
+        "manifest_boundaries",
+        "reader",
+        "generator",
+        "pre_t0",
+        "watch",
+        "scan",
+        "surface",
+        "api",
+        "exact",
+        "harness",
+    }
+)
 
 SUBRUN_PHENOMENA = {
     "13A": frozenset({"low_volume_enumeration"}),
@@ -51,6 +67,7 @@ UPID_PATTERN = re.compile(
 
 CAPTURE_FILES = {
     "ground_truth": "ground-truth.jsonl",
+    "pre_t0_establishment": "pre-t0-establishment.jsonl",
     "watch_events": "watch-events.jsonl",
     "scan_rounds": "scan-rounds.jsonl",
     "surface_observations": "surface-observations.jsonl",
@@ -318,6 +335,49 @@ def _validate_subrun_contract(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
     return contract
 
 
+def _validate_clock_contract(
+    manifest: Mapping[str, Any], fixture_kind: str
+) -> Mapping[str, Any]:
+    """Require one explicitly bound CLOCK_MONOTONIC domain for every plane."""
+
+    try:
+        contract = _require_mapping(manifest.get("clock_contract"), "clock_contract")
+        if contract.get("contract_revision") != CLOCK_CONTRACT_REVISION:
+            raise CaptureError("clock_contract_revision_mismatch")
+        if contract.get("clock_kind") != "CLOCK_MONOTONIC":
+            raise CaptureError("clock_contract_kind_mismatch")
+        domain_id = _require_text(contract, "clock_domain_id")
+        if contract.get("boot_id") != manifest.get("boot_id"):
+            raise CaptureError("clock_contract_boot_id_mismatch")
+        if contract.get("fixture_id") != manifest.get("fixture_id"):
+            raise CaptureError("clock_contract_fixture_id_mismatch")
+        if contract.get("node_identity") != manifest.get("node_identity"):
+            raise CaptureError("clock_contract_node_identity_mismatch")
+        _require_text(contract, "time_namespace_id")
+        expected_correlation = (
+            "synthetic_single_shared_domain"
+            if fixture_kind == "synthetic"
+            else "verified_single_shared_domain"
+        )
+        if contract.get("correlation_state") != expected_correlation:
+            raise CaptureError("clock_contract_correlation_state_mismatch")
+        participants = _require_mapping(
+            contract.get("participant_clock_domain_ids"),
+            "clock_contract.participant_clock_domain_ids",
+        )
+        if set(participants) != CLOCK_PARTICIPANTS:
+            raise CaptureError("clock_contract_participant_set_mismatch")
+        for participant, participant_domain in participants.items():
+            if participant_domain != domain_id:
+                raise CaptureError(f"clock_domain_mismatch:{participant}")
+        return contract
+    except CaptureError as exc:
+        # Cross-process monotonic comparisons are load-bearing throughout v4.
+        # A missing or mismatched contract is therefore an environment
+        # eligibility failure, including for synthetic captures.
+        raise EnvironmentError(f"clock_contract_ineligible:{exc}") from exc
+
+
 def _validate_manifest(manifest: Mapping[str, Any]) -> None:
     exact_values = {
         "schema_revision": SCHEMA_REVISION,
@@ -347,6 +407,10 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
         raise EnvironmentError("unsupported_fixture_kind")
     if fixture_kind == "disposable_pve" and "placeholder" in fixture_id.lower():
         raise EnvironmentError("fixture_identity_is_placeholder")
+
+    # Establish one shared monotonic domain before validating any timestamp
+    # relation emitted by different capture participants.
+    _validate_clock_contract(manifest, fixture_kind)
 
     for field in (
         "node_identity",
@@ -417,6 +481,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
     )
     required_markers = {
         "ground_truth_finalized",
+        "pre_t0_establishment_complete",
         "watch_capture_complete",
         "scan_capture_complete",
         "surface_capture_complete",
@@ -722,6 +787,259 @@ def _validate_raw_result(
 def _stat_identity(record: Mapping[str, Any], field: str) -> tuple[int, int]:
     stat = _require_mapping(record.get("stat"), field)
     return (_require_int(stat, "device"), _require_int(stat, "inode"))
+
+
+def _validate_pre_t0_establishment(
+    manifest: Mapping[str, Any], records: Sequence[Mapping[str, Any]]
+) -> None:
+    """Prove that the candidate's watch-first baseline protocol was executed."""
+
+    t0 = _require_int(manifest, "t0_monotonic_ns")
+    baseline = _require_mapping(
+        manifest["baseline_observation"], "baseline_observation"
+    )
+    baseline_start = _require_int(baseline, "capture_start_monotonic_ns")
+    baseline_end = _require_int(baseline, "capture_end_monotonic_ns")
+    baseline_upids = {
+        _require_upid(value, "baseline_upids")
+        for value in _require_sequence(manifest.get("baseline_upids"), "baseline_upids")
+    }
+    quiescence = _require_mapping(manifest["t0_quiescence"], "t0_quiescence")
+    committed = _require_int(quiescence, "committed_at_monotonic_ns")
+    establishment_reference = _require_mapping(
+        quiescence.get("pre_t0_establishment"),
+        "t0_quiescence.pre_t0_establishment",
+    )
+    root_reference = _require_int(
+        establishment_reference, "root_watch_establishment_sequence"
+    )
+    scan_references = [
+        _require_int({"value": value}, "value")
+        for value in _require_sequence(
+            establishment_reference.get("baseline_scan_sequences"),
+            "t0_quiescence.pre_t0_establishment.baseline_scan_sequences",
+        )
+    ]
+    declared_watermark = _require_int(
+        establishment_reference, "watch_drained_through_sequence"
+    )
+    if len(scan_references) != 2 or scan_references[1] != scan_references[0] + 1:
+        raise CaptureError("pre_t0_baseline_scan_reference_invalid")
+
+    by_establishment_sequence: dict[int, Mapping[str, Any]] = {}
+    watcher_records: dict[int, Mapping[str, Any]] = {}
+    baseline_scans: dict[int, Mapping[str, Any]] = {}
+    bucket_rescans: list[Mapping[str, Any]] = []
+    prior_time = -1
+    for record in records:
+        sequence = _require_int(record, "establishment_sequence")
+        if sequence == 0 or sequence in by_establishment_sequence:
+            raise CaptureError("pre_t0_establishment_sequence_zero_or_duplicate")
+        by_establishment_sequence[sequence] = record
+        event = _require_text(record, "event")
+        if event in {"watch_installed", "bucket_created", "watch_event"}:
+            watcher_sequence = _require_int(record, "watcher_sequence")
+            if watcher_sequence == 0 or watcher_sequence in watcher_records:
+                raise CaptureError("pre_t0_watcher_sequence_zero_or_duplicate")
+            event_time = _require_int(record, "monotonic_ns")
+            if event_time < prior_time:
+                raise CaptureError("pre_t0_establishment_time_reversed")
+            prior_time = event_time
+            if not _require_bool(record, "complete"):
+                raise CaptureError("pre_t0_watch_record_incomplete")
+            watcher_records[watcher_sequence] = record
+        elif event == "baseline_scan":
+            if record.get("phase") != "PRE_T0_BASELINE":
+                raise CaptureError("pre_t0_baseline_scan_phase_invalid")
+            scan_sequence = _require_int(record, "baseline_scan_sequence")
+            if scan_sequence == 0 or scan_sequence in baseline_scans:
+                raise CaptureError("pre_t0_baseline_scan_sequence_zero_or_duplicate")
+            baseline_scans[scan_sequence] = record
+        elif event == "bucket_rescan":
+            if record.get("phase") != "PRE_T0_BUCKET_RESCAN":
+                raise CaptureError("pre_t0_bucket_rescan_phase_invalid")
+            bucket_rescans.append(record)
+        else:
+            raise CaptureError(f"unknown_pre_t0_establishment_event:{event}")
+
+    if set(by_establishment_sequence) != set(range(1, len(records) + 1)):
+        raise CaptureError("pre_t0_establishment_sequence_gap")
+    if not watcher_records or set(watcher_records) != set(
+        range(1, max(watcher_records) + 1)
+    ):
+        raise CaptureError("pre_t0_watcher_sequence_gap")
+    if not baseline_scans or set(baseline_scans) != set(
+        range(1, max(baseline_scans) + 1)
+    ):
+        raise CaptureError("pre_t0_baseline_scan_sequence_gap")
+    if scan_references != [len(baseline_scans) - 1, len(baseline_scans)]:
+        raise CaptureError("pre_t0_baseline_scan_reference_not_terminal")
+
+    root_record = by_establishment_sequence.get(root_reference)
+    if (
+        root_record is None
+        or root_record.get("event") != "watch_installed"
+        or root_record.get("watch_scope") != "task_root"
+    ):
+        raise CaptureError("pre_t0_root_watch_reference_invalid")
+    root_time = _require_int(root_record, "monotonic_ns")
+    if root_time >= baseline_start:
+        raise CaptureError("pre_t0_root_watch_not_installed_before_baseline")
+
+    selected_scans = [baseline_scans[sequence] for sequence in scan_references]
+    scan_sets: list[set[str]] = []
+    bucket_sets: list[set[str]] = []
+    prior_watermark = 0
+    for scan in selected_scans:
+        scan_start = _require_int(scan, "scan_start_monotonic_ns")
+        scan_end = _require_int(scan, "scan_end_monotonic_ns")
+        if not (
+            root_time < baseline_start <= scan_start <= scan_end <= baseline_end
+            <= committed < t0
+        ):
+            raise CaptureError("pre_t0_baseline_scan_time_invalid")
+        if (
+            not _require_bool(scan, "complete")
+            or _require_sequence(scan.get("unreadable_entries"), "pre_t0.unreadable_entries")
+            or _require_sequence(scan.get("malformed_entries"), "pre_t0.malformed_entries")
+        ):
+            raise CaptureError("pre_t0_baseline_scan_incomplete")
+        normalized = {
+            _require_upid(value, "pre_t0.exact_normalized_upids")
+            for value in _require_sequence(
+                scan.get("exact_normalized_upids"),
+                "pre_t0.exact_normalized_upids",
+            )
+        }
+        buckets = {
+            _require_text({"value": value}, "value")
+            for value in _require_sequence(scan.get("bucket_set"), "pre_t0.bucket_set")
+        }
+        watermark = _require_int(scan, "watch_drained_through_sequence")
+        if (
+            watermark == 0
+            or watermark < prior_watermark
+            or watermark > max(watcher_records)
+        ):
+            raise CaptureError("pre_t0_watch_drain_watermark_invalid")
+        if _require_int(watcher_records[watermark], "monotonic_ns") > scan_end:
+            raise CaptureError("pre_t0_watch_drain_watermark_after_scan")
+        prior_watermark = watermark
+        scan_sets.append(normalized)
+        bucket_sets.append(buckets)
+
+    if _require_int(selected_scans[0], "scan_end_monotonic_ns") > _require_int(
+        selected_scans[1], "scan_start_monotonic_ns"
+    ):
+        raise CaptureError("pre_t0_baseline_scan_order_invalid")
+    if scan_sets[0] != scan_sets[1] or scan_sets[1] != baseline_upids:
+        raise CaptureError("pre_t0_baseline_fixed_point_not_reached")
+    if bucket_sets[0] != bucket_sets[1]:
+        raise CaptureError("pre_t0_baseline_bucket_set_changed")
+    if prior_watermark != declared_watermark:
+        raise CaptureError("pre_t0_declared_watch_watermark_mismatch")
+    relevant_pre_t0_watchers = {
+        sequence
+        for sequence, record in watcher_records.items()
+        if _require_int(record, "monotonic_ns") <= committed
+    }
+    if relevant_pre_t0_watchers and declared_watermark < max(relevant_pre_t0_watchers):
+        raise CaptureError("pre_t0_watch_event_undrained")
+
+    first_scan_start = _require_int(selected_scans[0], "scan_start_monotonic_ns")
+    installed_buckets: dict[str, list[Mapping[str, Any]]] = {}
+    for record in watcher_records.values():
+        if record.get("event") == "watch_installed" and record.get("watch_scope") == "bucket":
+            bucket = _require_text(record, "bucket")
+            origin = _require_text(record, "bucket_origin")
+            if origin == "existing_at_root_install":
+                if record.get("trigger_watcher_sequence") is not None:
+                    raise CaptureError("pre_t0_existing_bucket_has_event_trigger")
+            elif origin == "root_event":
+                _require_int(record, "trigger_watcher_sequence")
+            else:
+                raise CaptureError("pre_t0_bucket_watch_origin_invalid")
+            installed_buckets.setdefault(bucket, []).append(record)
+    for bucket in bucket_sets[0]:
+        installs = installed_buckets.get(bucket, [])
+        if not any(
+            root_time <= _require_int(record, "monotonic_ns") <= first_scan_start
+            for record in installs
+        ):
+            raise CaptureError(f"pre_t0_bucket_watch_missing:{bucket}")
+
+    lazy_events = [
+        record for record in watcher_records.values() if record.get("event") == "bucket_created"
+    ]
+    lazy_buckets: set[str] = set()
+    for event in lazy_events:
+        bucket = _require_text(event, "bucket")
+        if bucket in lazy_buckets:
+            raise CaptureError("pre_t0_duplicate_lazy_bucket_event")
+        lazy_buckets.add(bucket)
+        masks = {
+            _require_text({"value": value}, "value")
+            for value in _require_sequence(event.get("mask"), "pre_t0.bucket_created.mask")
+        }
+        event_time = _require_int(event, "monotonic_ns")
+        if (
+            event.get("watch_scope") != "task_root"
+            or "IN_ISDIR" not in masks
+            or not masks.intersection({"IN_CREATE", "IN_MOVED_TO"})
+            or not root_time <= event_time < committed
+        ):
+            raise CaptureError("pre_t0_lazy_bucket_event_invalid")
+        trigger_sequence = _require_int(event, "watcher_sequence")
+        installs = [
+            record
+            for record in installed_buckets.get(bucket, [])
+            if event_time <= _require_int(record, "monotonic_ns") <= first_scan_start
+            and record.get("bucket_origin") == "root_event"
+            and record.get("trigger_watcher_sequence") == trigger_sequence
+        ]
+        rescans = [
+            record
+            for record in bucket_rescans
+            if record.get("bucket") == bucket
+            and record.get("trigger_watcher_sequence") == trigger_sequence
+        ]
+        if len(installs) != 1 or len(rescans) != 1:
+            raise CaptureError("pre_t0_lazy_bucket_watch_or_rescan_missing")
+        rescan = rescans[0]
+        rescan_start = _require_int(rescan, "scan_start_monotonic_ns")
+        rescan_end = _require_int(rescan, "scan_end_monotonic_ns")
+        {
+            _require_upid(value, "pre_t0.rescan.exact_normalized_upids")
+            for value in _require_sequence(
+                rescan.get("exact_normalized_upids"),
+                "pre_t0.rescan.exact_normalized_upids",
+            )
+        }
+        if (
+            not _require_bool(rescan, "complete")
+            or _require_sequence(rescan.get("unreadable_entries"), "pre_t0.rescan.unreadable_entries")
+            or _require_sequence(rescan.get("malformed_entries"), "pre_t0.rescan.malformed_entries")
+            or not _require_int(installs[0], "monotonic_ns")
+            <= rescan_start
+            <= rescan_end
+            <= first_scan_start
+        ):
+            raise CaptureError("pre_t0_lazy_bucket_rescan_invalid")
+    if len(bucket_rescans) != len(lazy_events):
+        raise CaptureError("pre_t0_bucket_rescan_without_unique_lazy_event")
+
+    # A bucket installation's origin is explicit: a post-root discovery event
+    # cannot be relabeled as an initially existing bucket merely because its
+    # watch happened to be installed before enumeration began.
+    for bucket, installs in installed_buckets.items():
+        for install in installs:
+            if install.get("bucket_origin") == "root_event" and bucket not in lazy_buckets:
+                raise CaptureError("pre_t0_lazy_bucket_watch_without_root_event")
+            if (
+                install.get("bucket_origin") == "existing_at_root_install"
+                and _require_int(install, "monotonic_ns") >= baseline_start
+            ):
+                raise CaptureError("pre_t0_existing_bucket_watch_installed_too_late")
 
 
 def _validate_t0_quiescence(
@@ -1048,6 +1366,9 @@ def _validate_subrun_obligations(
 def _analyze_loaded(
     manifest: Mapping[str, Any], records: Mapping[str, Sequence[Mapping[str, Any]]]
 ) -> AnalysisResult:
+    _validate_pre_t0_establishment(
+        manifest, records["pre_t0_establishment"]
+    )
     operations = _ground_truth(records["ground_truth"], manifest)
     close = _require_mapping(manifest["candidate_close"], "candidate_close")
     close_state = _require_text(close, "state")
@@ -1614,6 +1935,7 @@ __all__ = [
     "AnalyzerOutcome",
     "AnalysisResult",
     "CAPTURE_FILES",
+    "CLOCK_CONTRACT_REVISION",
     "EXPECTED_B_S1_REVISION",
     "EXPECTED_SOURCE_LEDGER",
     "GENERATOR_CONTRACT_REVISION",

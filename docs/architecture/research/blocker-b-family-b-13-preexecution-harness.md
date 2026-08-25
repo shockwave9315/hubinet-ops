@@ -138,18 +138,19 @@ An analyzer result distinguishes:
 
 None of these means `trusted`, `secure`, or “Family B solved.”
 
-## 4. Capture format: `family-b-13-capture-v3`
+## 4. Capture format: `family-b-13-capture-v4`
 
 One run is one explicit directory. JSON files are UTF-8; JSONL files contain
-one object per line. Timestamps carry both a process-local monotonic value in
-nanoseconds and a UTC wall-clock string where ordering across processes must
-later be correlated. No field is described as a stock PVE cursor or generation
-number.
+one object per line. Every load-bearing monotonic timestamp is nanoseconds from
+one explicitly bound Linux `CLOCK_MONOTONIC` domain. UTC wall-clock strings are
+provenance only and are never a precision-ordering substitute. No field is
+described as a stock PVE cursor or generation number.
 
 ```text
 run-<uuid>/
   manifest.json
   ground-truth.jsonl
+  pre-t0-establishment.jsonl
   watch-events.jsonl
   scan-rounds.jsonl
   surface-observations.jsonl
@@ -183,6 +184,7 @@ explicit directory's fixed file set. It is not imported by production code.
 | versions | installed/source `version_ledger` and `loaded_code_status` |
 | environment | `kernel_context`, `filesystem_context`, start/end timestamps |
 | processes | `reader_context`, `generator_context`, process identities and clock descriptions |
+| clock | complete `clock_contract`: `CLOCK_MONOTONIC`, one domain id, fixture/node/boot/time-namespace binding, correlation state, and the domain id used by every timestamp-producing plane |
 | boundary | quiescent candidate `t0_monotonic_ns`, candidate-close T1, a distinct bounded `experiment_generator_window`, committed `baseline_upids` plus hashed `baseline_observation`, and independently cross-checked `t0_quiescence` evidence |
 | generator scope | complete `generator_contract`: contract revision, approval state, fixture/subrun, approved operation, expected task type, exact task-id policy, node, owner/auth identity, maximum count, and maximum duration |
 | subrun scope | complete `subrun_contract`: contract revision, subrun id, required phenomena, and unique evidence id for each phenomenon |
@@ -218,7 +220,57 @@ Missing, active, pending, non-final, unclassified, late, or mismatched evidence
 prevents positive close. Historical finalized exact/archive records may remain;
 retention is not worker liveness.
 
-### 4.2 Ground-truth events
+### 4.2 Shared monotonic clock contract
+
+`clock_contract` uses revision `family-b-13-clock-contract-v1`. It binds
+`clock_kind=CLOCK_MONOTONIC`, one `clock_domain_id`, the manifest fixture,
+node identity and boot ID, a time-namespace identity, and an explicit
+correlation state. Its participant map must bind manifest T0/T1 boundaries,
+reader, generator, pre-T0 establishment, watch, scan, surface, API, exact, and
+harness timestamps to that same domain. Synthetic captures use an explicit
+synthetic shared domain. A `disposable_pve` capture requires a verified single
+shared domain on the same fixture node, boot, and relevant time namespace.
+
+Missing or mismatched clock evidence is `ENVIRONMENT_INELIGIBLE`. v4 does not
+invent offsets between unrelated monotonic clocks and does not use UTC to
+repair them. A generator on another host or time namespace is ineligible until
+a separately reviewed cross-clock correlation protocol exists. The analyzer
+validates clock eligibility before comparing generator windows, API overlap,
+rotation timing, or watch/scan/surface order.
+
+### 4.3 Pre-T0 watch-first establishment
+
+`pre-t0-establishment.jsonl` is a distinct sealed protocol stream. It records a
+contiguous establishment sequence; task-root and bucket `watch_installed`
+records with watcher sequence and monotonic time; root-watch `bucket_created`
+events and masks; immediate `PRE_T0_BUCKET_RESCAN` records; and explicitly
+phased `PRE_T0_BASELINE` scan rounds. `t0_quiescence` references the task-root
+watch installation, the exact terminal pair of baseline scan sequences, and
+the final pre-T0 watch-drain watermark.
+
+Each child-watch installation declares `bucket_origin` as either
+`existing_at_root_install` or `root_event`. A `root_event` installation must
+reference the exact creation-event watcher sequence; an initially existing
+bucket cannot carry such a trigger or be installed after baseline enumeration
+begins. These are capture protocol assertions, not stock PVE fields.
+
+Before positive close, the analyzer machine-checks that the task-root watch was
+installed before baseline capture; every bucket in the baseline scan has an
+installed child watch before the selected fixed-point rounds; every lazy/new
+bucket has a root event, child-watch installation and affected-directory
+rescan; and the selected terminal baseline rounds are consecutive, complete,
+ordered, equal to each other and to the committed baseline set. Their second
+watermark must drain every relevant watcher sequence, and both rounds and all
+required rescans must finish before the quiescence commit and T0. Final local
+surface, active/pending, classification and exact-status quiescence checks then
+remain independently required.
+
+This evidence proves only that the candidate watch-first protocol steps were
+recorded and passed these capture checks. It does not prove inotify, kernel, or
+filesystem completeness; those source-completeness semantics remain
+`UNKNOWN`.
+
+### 4.4 Ground-truth events
 
 `ground-truth.jsonl` contains paired `request_start` and `request_end` records
 for each contiguous, generator-local sequence, followed by exactly one
@@ -236,7 +288,7 @@ inside the quiescent-T0/candidate-close envelope. Matching numeric boundaries
 does not merge their semantics. `after_generator_window` is outside the
 generator window even if the record claims otherwise; `ambiguous` is
 outside the positive set and latches a gap. The record separately carries
-`b_s1_body_start_membership=unknown` and `body_start_evidence=null`. This v3
+`b_s1_body_start_membership=unknown` and `body_start_evidence=null`. This v4
 protocol rejects a capture that tries to derive worker-body membership from
 request timing or self-assert it. The finalizer carries
 `last_sequence`, `total_operations`, generator identity, timestamps, and
@@ -246,7 +298,7 @@ A failed, timed-out, ambiguously answered, unpaired, duplicated, or
 non-contiguous request makes the harness incomplete. It is never interpreted
 as absence of a task.
 
-### 4.3 Watch events
+### 4.5 Watch events
 
 `watch-events.jsonl` records `watcher_sequence`, `event_type`, kernel mask
 names and raw numeric mask, watch descriptor, cookie, watched path, filename,
@@ -255,7 +307,7 @@ invalidation state, monotonic/wall timestamps, and raw read-buffer ordering.
 `IN_Q_OVERFLOW`, `IN_IGNORED`, `IN_UNMOUNT`, `IN_DELETE_SELF`, and
 `IN_MOVE_SELF` are preserved even without a filename.
 
-### 4.4 Scan rounds
+### 4.6 Scan rounds
 
 `scan-rounds.jsonl` records a contiguous monotonic `scan_sequence`, `round_id`,
 start/end times, the sorted exact normalized UPID set, bucket set,
@@ -268,7 +320,7 @@ Watcher sequence/time and each scan's drain watermark are cross-checked so a
 scan cannot claim an event that occurred after it ended. A disappearing exact
 log or unreadable/malformed/inconsistent scan latches a gap.
 
-### 4.5 Active and archive observations
+### 4.7 Active and archive observations
 
 `surface-observations.jsonl` records a contiguous `observation_sequence` and
 one or more captures for each of `active`, `index`, and `index.1`: capture
@@ -279,7 +331,7 @@ surface before first rotation, not silently omitted. The analyzer recomputes
 SHA-256 from the captured UTF-8 `raw_evidence`; hashes support comparison but
 do not prove an atomic snapshot.
 
-### 4.6 API pages
+### 4.8 API pages
 
 `api-pages.jsonl` records source profile (`active`, `archive`, or `all`),
 `start_offset`, `limit`, normalized returned UPIDs, request identity,
@@ -289,7 +341,7 @@ contiguous `page_sequence`; the analyzer requires multiple offsets for one
 source. Offsets and page numbers are harness fields only. Duplicate pages are
 retained verbatim. Pagination alone never establishes completeness.
 
-### 4.7 Exact-UPID observations
+### 4.9 Exact-UPID observations
 
 `exact-upid.jsonl` records a contiguous `observation_sequence`, the known UPID,
 capture start/end, presence,
@@ -311,7 +363,7 @@ absent from `active`, `index`, and `index.1` is not missing if a legitimate
 watch or scan discovery remains and its exact evidence is preserved and
 reconciled.
 
-### 4.8 Harness events
+### 4.10 Harness events
 
 `harness-events.jsonl` records a contiguous `harness_sequence`, observer
 process identity, process start/stop/crash, sequenced heartbeats, capture
@@ -339,7 +391,7 @@ received a UPID during the experiment-generator window. It does not observe
 the worker operation body's first instruction. Request start/end, UPID
 starttime, exact-log creation, and fork time are therefore not relabeled as
 B-S1 body start. No safe body-start proof is implemented or accepted by this
-v3 analyzer.
+v4 analyzer.
 
 A future generator must satisfy all of these conditions:
 
@@ -480,11 +532,16 @@ surface profiles, a computed scan/watch fixed point, exact-UPID confirmation,
 subrun obligations, and the capture seal.
 
 Before any positive interval result, the analyzer also cross-checks a quiescent
-T0: the baseline scan precedes all referenced local surface captures; those
-captures and every required baseline exact finalization precede the committed
-T0; the active and pending sets are empty; and every retained baseline UPID is
-finalized and classified. A retained historical log or archive line is not
-treated as a running worker.
+T0: task-root and existing-bucket watches precede the explicitly phased
+baseline enumeration; lazy buckets require a root event, child watch, and
+affected-directory rescan; the referenced consecutive complete baseline scans
+have equal normalized sets and drain all relevant pre-T0 watch events; and all
+of this precedes the quiescence commit and T0. The referenced local surface
+captures and every required baseline exact finalization also precede the
+commit; the active and pending sets are empty; and every retained baseline UPID
+is finalized and classified. A retained historical log or archive line is not
+treated as a running worker. These checks prove protocol execution, not
+universal kernel/filesystem completeness.
 
 The completeness-bearing `enumerated_known` set is the union of task-log watch
 discovery, recursive exact-log scans, and local parsed active/`index`/`index.1`
@@ -508,7 +565,7 @@ capture structure:
 | 13D | old `index` hash and device/inode reappear as `index.1`, new `index` differs, matching rename watch evidence exists, captured rotation content includes an in-window generated UPID, and the marker binds every in-window generator sequence while rotation occurs inside the generated run |
 | 13E | a matching raw overflow or invalidation/loss signal; the successful expected classification is `B_S1_GAP_DETECTED` |
 | 13F | one in-window generated target/watch event inside the referenced scan interval and present in that scan |
-| 13G | at least two explicitly approved combined phenomena, each independently satisfying its corresponding generated-run/raw check |
+| 13G | at least two phenomena explicitly selected by this run contract, each independently satisfying its corresponding generated-run/raw check |
 
 A subrun label or task count is never phenomenon evidence. In particular, 13D
 cannot pass without observed rotation, and 13E cannot emit a plain analyzer
@@ -516,6 +573,9 @@ PASS after its required signal. Every positive subrun except 13E requires at
 least one in-window generated operation; baseline history alone cannot satisfy
 13A–13D, 13F, or 13G. 13E may use no unrelated generated task because its
 intended successful result is the approved injected gap signal.
+For 13G, PASS covers only the exact selected `required_phenomena` in that run's
+contract; it does not imply that every phenomenon in the narrative combined
+pressure scenario occurred.
 
 Decision precedence is fail-closed:
 
@@ -575,6 +635,14 @@ body-start membership, baseline-only positive subruns, and baseline-only
 handoff/race targets. Positive controls exercise historical finalized baseline
 quiescence, computed drained equal scans, and raw-evidence-backed
 13B/13C/13D/13F/13G obligations.
+v4 regressions additionally reject post-T0 or missing root-watch establishment,
+different pre-T0 baseline scan sets, an undrained pre-T0 event, and a lazy
+bucket without its child watch/rescan. A positive lazy-bucket control reaches a
+drained watch-first pre-T0 fixed point. Clock-contract regressions reject a
+missing disposable-fixture contract, mismatched generator/reader domains, and
+a boot-ID mismatch; one explicit shared synthetic clock domain may continue.
+The baseline-classification regression also locks owner/auth identity into the
+existing node/type/id/owner comparison.
 
 ## 11. Exact false-clean witness boundary
 
@@ -599,21 +667,17 @@ A B-S1-killing witness must preserve all of the following in the sealed run:
    evidence used for those facts.
 
 Requirement 6 is not available from the #13 operation initiator or current
-source evidence. This v3 analyzer therefore cannot emit a precise B-S1-killing
-`FALSE_CLOSED_COMPLETE_WITNESS` or the following consequence from request
-timing alone:
-
-```text
-B-S1 NO-GO FOR THE TESTED EXACT SCOPE
-```
+source evidence. This v4 analyzer therefore cannot emit a precise B-S1-killing
+witness or exact-scope B-S1 rejection from request timing alone.
 
 Instead it preserves the UPID, generator sequence, derived generator-window
 membership, omission, close state, and absence of a recorded gap as
 `GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS`, explicitly recording
 `b_s1_body_start_membership=UNKNOWN`. That is a serious research-local
 enumeration falsification result and must stop later subruns, but it is not the
-precise B-S1 body-start NO-GO above. A future protocol may add an independently
-reviewed body-start proof; it must not synthesize one from adjacent timestamps.
+precise body-start-scoped B-S1 consequence. A future protocol may add an
+independently reviewed body-start proof; it must not synthesize one from
+adjacent timestamps.
 
 ## 12. Run sealing and integrity boundary
 
@@ -685,19 +749,25 @@ intentionally provides no executable generator or destructive cleanup command.
 1. Verify fixture identity, isolation, absence of production dependencies, and
    that it is not CT112.
 2. Record installed packages, immutable source mapping, boot ID, and loaded-code
-   preflight; mismatch makes the run ineligible.
+   preflight. Record and verify the single-node/single-boot/single-time-namespace
+   `CLOCK_MONOTONIC` contract for every timestamp-producing participant before
+   making any cross-plane ordering comparison; mismatch makes the run
+   ineligible.
 3. Record filesystem/mount context and disk/log free-space; set numeric stop
    thresholds before starting any process.
 4. Start the independent ground-truth writer; verify durable test write,
    monotonic sequence initialization, generator-contract binding, and
    operation/duration caps.
-5. Start the B-S1 observer; establish all existing and lazy-bucket watches,
-   event drain, raw surface capture, heartbeat, and gap latch.
-6. Establish `baseline_upids`, then capture active/index/index.1 after the
-   baseline scan, obtain pre-T0 final exact/classification evidence for every
-   baseline UPID, prove active/pending empty, and commit quiescent T0. Also
-   record API profiles, watch drain watermarks, and the explicit subrun
-   contract/evidence ids.
+5. Start the B-S1 observer; install the task-root and all existing-bucket
+   watches before baseline enumeration. For every lazy/new bucket, preserve the
+   root event, attach its child watch, and immediately rescan it. Keep heartbeat
+   and gap latches active.
+6. Record two consecutive complete `PRE_T0_BASELINE` scans with equal normalized
+   sets and a second watermark draining every relevant pre-T0 watch event.
+   Reference those exact rounds from `t0_quiescence`; then capture
+   active/index/index.1, obtain pre-T0 final exact/classification evidence for
+   every baseline UPID, prove active/pending empty, and commit quiescent T0.
+   Also record API profiles and the explicit subrun contract/evidence ids.
 7. Execute exactly one approved bounded subrun. Any generator action at this
    stage is **NOT AUTHORIZED / TEMPLATE ONLY** until that separate approval.
 8. Stop generation, drain watch events, complete consecutive final scans and
@@ -708,9 +778,10 @@ intentionally provides no executable generator or destructive cleanup command.
    the immutable original.
 10. Move a copy to an offline workstation and invoke only the explicit
     `analyze --capture-dir` command from section 4.
-11. Record exactly one research-local classification and its evidence. A v3
+11. Record exactly one research-local classification and its evidence. A v4
     generator-window enumeration witness stops the sequence but does not claim
-    exact B-S1 body-start NO-GO; PASS only enumerates that interleaving.
+    an exact body-start-scoped B-S1 consequence; PASS only enumerates that
+    interleaving.
 12. The identified cleanup owner performs the separately approved fixture
     cleanup. No cleanup command or real identifier is supplied here.
 13. Verify fixture service, storage, disk/log space, console access, and absence
@@ -850,8 +921,9 @@ does not justify moving on.
   health telemetry, and enumerated schedule ledger.
 - **Falsification:** any generator-window enumeration omission witness or
   failure to latch a required gap.
-- **PASS means:** exactly the combined interleavings listed in that run ledger
-  reconciled.
+- **PASS means:** only the combined phenomena explicitly selected in that
+  run's `required_phenomena` contract reconciled; it does not mean every
+  phenomenon named in this narrative scenario was exercised.
 - **PASS does not mean:** Phase S proven universally, Phase M designed, Family B
   solved, Blocker B closed, or trust granted.
 - **Stops/burden:** all stops with the tightest count/rate/disk/health bounds;

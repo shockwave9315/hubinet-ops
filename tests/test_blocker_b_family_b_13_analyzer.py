@@ -12,6 +12,7 @@ import pytest
 from scripts.research.blocker_b_family_b_13_analyzer import (
     ANALYZER_REVISION,
     CAPTURE_FILES,
+    CLOCK_CONTRACT_REVISION,
     EXPECTED_B_S1_REVISION,
     EXPECTED_SOURCE_LEDGER,
     GENERATOR_CONTRACT_REVISION,
@@ -27,6 +28,7 @@ UPID_A = "UPID:fixture:00000001:00000001:00000001:stopall::generator@pve:"
 UPID_B = "UPID:fixture:00000002:00000002:00000002:stopall::generator@pve:"
 UPID_C = "UPID:fixture:00000003:00000003:00000003:stopall::generator@pve:"
 UPID_X = "UPID:othernode:00000004:00000004:00000004:mystery:999:other@pve:"
+UPID_OWNER_X = "UPID:fixture:00000005:00000005:00000005:stopall::other@pve:"
 
 
 def _set_subrun(
@@ -152,6 +154,28 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
         "fixture_id": "synthetic-fixture-13",
         "fixture_kind": "synthetic",
         "subrun_id": "13A",
+        "clock_contract": {
+            "contract_revision": CLOCK_CONTRACT_REVISION,
+            "clock_kind": "CLOCK_MONOTONIC",
+            "clock_domain_id": "synthetic-clock-domain-1",
+            "boot_id": "synthetic-boot-id",
+            "fixture_id": "synthetic-fixture-13",
+            "node_identity": {"kind": "synthetic", "value": "node-a"},
+            "time_namespace_id": "synthetic-time-namespace-1",
+            "correlation_state": "synthetic_single_shared_domain",
+            "participant_clock_domain_ids": {
+                "manifest_boundaries": "synthetic-clock-domain-1",
+                "reader": "synthetic-clock-domain-1",
+                "generator": "synthetic-clock-domain-1",
+                "pre_t0": "synthetic-clock-domain-1",
+                "watch": "synthetic-clock-domain-1",
+                "scan": "synthetic-clock-domain-1",
+                "surface": "synthetic-clock-domain-1",
+                "api": "synthetic-clock-domain-1",
+                "exact": "synthetic-clock-domain-1",
+                "harness": "synthetic-clock-domain-1",
+            },
+        },
         "t0_monotonic_ns": 100,
         "experiment_generator_window": {
             "start_monotonic_ns": 100,
@@ -159,7 +183,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
         },
         "baseline_upids": [],
         "baseline_observation": {
-            "capture_start_monotonic_ns": 70,
+            "capture_start_monotonic_ns": 60,
             "capture_end_monotonic_ns": 80,
             "committed_at_monotonic_ns": 90,
             "normalized_upids": [],
@@ -175,6 +199,11 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "active": 1,
                 "index": 2,
                 "index.1": 3,
+            },
+            "pre_t0_establishment": {
+                "root_watch_establishment_sequence": 1,
+                "baseline_scan_sequences": [1, 2],
+                "watch_drained_through_sequence": 2,
             },
             "baseline_classifications": [],
         },
@@ -227,6 +256,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
         },
         "capture_completeness": {
             "ground_truth_finalized": True,
+            "pre_t0_establishment_complete": True,
             "watch_capture_complete": True,
             "scan_capture_complete": True,
             "surface_capture_complete": True,
@@ -253,6 +283,56 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "generator_process_identity": "synthetic-generator:1",
                 "monotonic_ns": 150,
                 "wall_timestamp": "2026-08-25T00:00:02Z",
+            },
+        ],
+        "pre_t0_establishment": [
+            {
+                "establishment_sequence": 1,
+                "event": "watch_installed",
+                "watcher_sequence": 1,
+                "watch_scope": "task_root",
+                "watched_path": "tasks",
+                "monotonic_ns": 50,
+                "complete": True,
+            },
+            {
+                "establishment_sequence": 2,
+                "event": "watch_installed",
+                "watcher_sequence": 2,
+                "watch_scope": "bucket",
+                "watched_path": "tasks/0",
+                "bucket": "0",
+                "bucket_origin": "existing_at_root_install",
+                "monotonic_ns": 51,
+                "complete": True,
+            },
+            {
+                "establishment_sequence": 3,
+                "event": "baseline_scan",
+                "phase": "PRE_T0_BASELINE",
+                "baseline_scan_sequence": 1,
+                "scan_start_monotonic_ns": 60,
+                "scan_end_monotonic_ns": 65,
+                "exact_normalized_upids": [],
+                "bucket_set": ["0"],
+                "watch_drained_through_sequence": 2,
+                "unreadable_entries": [],
+                "malformed_entries": [],
+                "complete": True,
+            },
+            {
+                "establishment_sequence": 4,
+                "event": "baseline_scan",
+                "phase": "PRE_T0_BASELINE",
+                "baseline_scan_sequence": 2,
+                "scan_start_monotonic_ns": 70,
+                "scan_end_monotonic_ns": 75,
+                "exact_normalized_upids": [],
+                "bucket_set": ["0"],
+                "watch_drained_through_sequence": 2,
+                "unreadable_entries": [],
+                "malformed_entries": [],
+                "complete": True,
             },
         ],
         "watch_events": [
@@ -480,6 +560,8 @@ def _add_finalized_historical_baseline(
     manifest["baseline_observation"]["sha256"] = hashlib.sha256(
         baseline_raw.encode("utf-8")
     ).hexdigest()
+    for scan in records["pre_t0_establishment"][-2:]:
+        scan["exact_normalized_upids"] = [upid]
     for scan in records["scan_rounds"]:
         scan["exact_normalized_upids"] = [UPID_A, upid]
     archive = records["surface_observations"][1]
@@ -517,11 +599,66 @@ def _move_generator_operation_after_t1(
     records["ground_truth"][-1]["monotonic_ns"] = 330
 
 
+def _resequence_pre_t0(records: dict[str, list[dict[str, Any]]]) -> None:
+    for sequence, record in enumerate(records["pre_t0_establishment"], 1):
+        record["establishment_sequence"] = sequence
+
+
 def test_perfect_enumeration_is_only_tested_interleaving(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     result = analyze_capture(_materialize(tmp_path, manifest, records))
     assert result.outcome is AnalyzerOutcome.PASS
     assert result.as_dict()["architecture_effect"] == "NONE"
+
+
+def test_explicit_shared_synthetic_clock_domain_may_continue(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_generator_clock_domain_mismatch_is_ineligible(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    manifest["clock_contract"]["participant_clock_domain_ids"]["generator"] = (
+        "unrelated-monotonic-domain"
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert "clock_domain_mismatch:generator" in result.reasons[0]
+
+
+def test_missing_clock_contract_on_disposable_fixture_is_ineligible(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    manifest["fixture_kind"] = "disposable_pve"
+    manifest["fixture_id"] = "disposable-fixture-13"
+    manifest["generator_contract"].update(
+        {
+            "approval_state": "approved",
+            "fixture_id": "disposable-fixture-13",
+        }
+    )
+    del manifest["clock_contract"]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons[0].startswith("clock_contract_ineligible:")
+
+
+def test_clock_contract_boot_id_mismatch_is_ineligible(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    manifest["clock_contract"]["boot_id"] = "different-boot-id"
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert "clock_contract_boot_id_mismatch" in result.reasons[0]
 
 
 def test_request_window_omission_is_not_precise_b_s1_body_start_no_go(
@@ -906,6 +1043,158 @@ def test_finalized_historical_baseline_allows_quiescent_t0(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_post_t0_watch_and_fixed_point_cannot_establish_quiescent_t0(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    root, bucket, first_scan, second_scan = records["pre_t0_establishment"]
+    root["monotonic_ns"] = 110
+    bucket["monotonic_ns"] = 111
+    first_scan["scan_start_monotonic_ns"] = 120
+    first_scan["scan_end_monotonic_ns"] = 125
+    second_scan["scan_start_monotonic_ns"] = 130
+    second_scan["scan_end_monotonic_ns"] = 135
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "pre_t0_root_watch_not_installed_before_baseline" in result.reasons
+
+
+def test_missing_root_watch_before_baseline_cannot_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"][0]["watch_scope"] = "bucket"
+    records["pre_t0_establishment"][0]["bucket"] = "root-is-not-a-bucket"
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "pre_t0_root_watch_reference_invalid" in result.reasons
+
+
+def test_pre_t0_baseline_scan_sets_must_match(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"][-1]["exact_normalized_upids"] = [UPID_A]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "pre_t0_baseline_fixed_point_not_reached" in result.reasons
+
+
+def test_undrained_pre_t0_watch_event_cannot_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"].append(
+        {
+            "establishment_sequence": 5,
+            "event": "watch_event",
+            "watcher_sequence": 3,
+            "watch_scope": "task_root",
+            "mask": ["IN_ATTRIB"],
+            "monotonic_ns": 76,
+            "complete": True,
+        }
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "pre_t0_watch_event_undrained" in result.reasons
+
+
+def test_lazy_bucket_without_child_watch_and_rescan_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"].insert(
+        2,
+        {
+            "event": "bucket_created",
+            "watcher_sequence": 3,
+            "watch_scope": "task_root",
+            "bucket": "f",
+            "mask": ["IN_CREATE", "IN_ISDIR"],
+            "monotonic_ns": 52,
+            "complete": True,
+        },
+    )
+    _resequence_pre_t0(records)
+    for scan in records["pre_t0_establishment"][-2:]:
+        scan["bucket_set"] = ["0", "f"]
+        scan["watch_drained_through_sequence"] = 3
+    manifest["t0_quiescence"]["pre_t0_establishment"][
+        "watch_drained_through_sequence"
+    ] = 3
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "pre_t0_bucket_watch_missing:f" in result.reasons
+
+
+def test_watch_first_pre_t0_fixed_point_with_lazy_bucket_may_continue(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"][2:2] = [
+        {
+            "event": "bucket_created",
+            "watcher_sequence": 3,
+            "watch_scope": "task_root",
+            "bucket": "f",
+            "mask": ["IN_CREATE", "IN_ISDIR"],
+            "monotonic_ns": 52,
+            "complete": True,
+        },
+        {
+            "event": "watch_installed",
+            "watcher_sequence": 4,
+            "watch_scope": "bucket",
+            "watched_path": "tasks/f",
+            "bucket": "f",
+            "bucket_origin": "root_event",
+            "trigger_watcher_sequence": 3,
+            "monotonic_ns": 53,
+            "complete": True,
+        },
+        {
+            "event": "bucket_rescan",
+            "phase": "PRE_T0_BUCKET_RESCAN",
+            "bucket": "f",
+            "trigger_watcher_sequence": 3,
+            "scan_start_monotonic_ns": 54,
+            "scan_end_monotonic_ns": 55,
+            "exact_normalized_upids": [],
+            "unreadable_entries": [],
+            "malformed_entries": [],
+            "complete": True,
+        },
+    ]
+    _resequence_pre_t0(records)
+    for scan in records["pre_t0_establishment"][-2:]:
+        scan["bucket_set"] = ["0", "f"]
+        scan["watch_drained_through_sequence"] = 4
+    manifest["t0_quiescence"]["pre_t0_establishment"][
+        "watch_drained_through_sequence"
+    ] = 4
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_t0_baseline_owner_classification_is_not_inferred_from_type_and_id(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_OWNER_X)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "t0_quiescence_operation_unclassified" in result.reasons
 
 
 def test_13a_baseline_only_with_generator_after_t1_cannot_pass(
@@ -1368,6 +1657,10 @@ def test_disposable_fixture_without_generator_contract_is_ineligible(
     manifest, records = _default_capture()
     manifest["fixture_kind"] = "disposable_pve"
     manifest["fixture_id"] = "disposable-fixture-13"
+    manifest["clock_contract"]["fixture_id"] = "disposable-fixture-13"
+    manifest["clock_contract"]["correlation_state"] = (
+        "verified_single_shared_domain"
+    )
     del manifest["generator_contract"]
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
