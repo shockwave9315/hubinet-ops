@@ -1,0 +1,708 @@
+# NON-NORMATIVE RESEARCH / EVIDENCE
+
+# Family B Research #2C — experiment #13 pre-execution package
+
+## 1. Authority, result, and execution boundary
+
+This package specifies an offline evidence format, a fail-closed analyzer, and
+an operator runbook for a possible later **Family B experiment #13:
+pagination / archive rotation / watch-scan omission**. It does not execute or
+authorize that experiment. `B-S1`, the experiment states, and the analyzer
+outcomes are research-local terminology, not architecture, API, persistence,
+or runtime contracts.
+
+Authority remains:
+
+```text
+explicit operator decisions
+> ACCEPTED ADRs / accepted architecture
+> AGENTS.md
+> implementation status
+> code/tests
+> non-normative research/evidence
+```
+
+The fixed result is unchanged:
+
+```text
+B-S1:       PLAUSIBLE CANDIDATE / NOT PROVEN
+Phase S:    DESIGN ONLY / REQUIRES CONTROLLED FALSIFICATION
+Phase M:    NOT DESIGNED / NOT SOLVED
+Family B:   UNRESOLVED / NOT FULLY AUDITED
+Blocker B:  OPEN
+WAVE B1:    DEFERRED / NOT AUTHORIZED
+Phase 1C:   BLOCKED
+R0:         GO / STRICTLY READ-ONLY
+trusted:    GRANTED NOWHERE
+```
+
+This package creates no backend owner and changes no accepted architecture.
+Any future B-S1 owner remains `DEFERRED / DORMANT BACKEND OWNER`; it must not be
+wired into R0, application startup, PVE I/O, Home Assistant, or mutation paths.
+
+This pass made zero PVE-node contact, read zero host `/var/log/pve` data, made
+zero PVE API calls, ran no `pct`, `qm`, or `pvesh`, restarted no service,
+created no guest or storage object, provisioned no fixture, and executed no
+experiment. CT112 is a development environment, not a Family-B fixture.
+
+### 1.1 Evidence labels
+
+| Label | Meaning |
+| --- | --- |
+| `FACT-SOURCE` | Established in an identified immutable upstream source revision. |
+| `FACT-DOC` | Established in an ACCEPTED architecture source or official version-relevant documentation. |
+| `INFERENCE` | A bounded conclusion from cited facts, not an upstream or architecture contract. |
+| `UNKNOWN` | Not established at ADR0005/ADR0006 security strength. |
+
+Operator observations are provenance metadata only. They do not become a
+separate authority class and cannot turn an inference into a source contract.
+
+## 2. Exact applicability and source ledger
+
+The repository base for this pass is merge commit
+`cdbe8e07d4b5d62b7877aedda8e4e220b2c5a743` (merged PR #51). Current `main`
+had not moved beyond that commit when this work began.
+
+The future fixture must match the Research #2A.1 target ledger and prove the
+loaded-code context before a capture is eligible:
+
+| Component | Version | Immutable source revision |
+| --- | --- | --- |
+| `pve-manager` | 9.2.11 | [`f6997e698c7933ea8e62319e2bf1bf7262daa56a`](https://github.com/proxmox/pve-manager/tree/f6997e698c7933ea8e62319e2bf1bf7262daa56a) |
+| `pve-cluster` | 9.1.6 | [`7091d92e594952dba65c1e57568b3d7cc244e960`](https://github.com/proxmox/pve-cluster/tree/7091d92e594952dba65c1e57568b3d7cc244e960) |
+| `pve-common` | 9.2.1 | [`f665029eac78022e81810ab2e44eace57ade13fb`](https://github.com/proxmox/pve-common/tree/f665029eac78022e81810ab2e44eace57ade13fb) |
+| `pve-access-control` | 9.1.1 | [`5ccd07d9302562b73374d331b63d25b04b86766c`](https://github.com/proxmox/pve-access-control/tree/5ccd07d9302562b73374d331b63d25b04b86766c) |
+| `pve-ha-manager` | 5.2.5 | [`c73364c19d5317e6df5bb1c1b727d080a5e897ef`](https://github.com/proxmox/pve-ha-manager/tree/c73364c19d5317e6df5bb1c1b727d080a5e897ef) |
+| `pve-storage` | 9.1.8 | [`cd5c90ccd9ffd14a9578f58bbf528e78120f8bf2`](https://github.com/proxmox/pve-storage/tree/cd5c90ccd9ffd14a9578f58bbf528e78120f8bf2) |
+| `qemu-server` | 9.2.6 | [`e6352be67f70042a7433a3a3c712b36d02f9f7cb`](https://github.com/proxmox/qemu-server/tree/e6352be67f70042a7433a3a3c712b36d02f9f7cb) |
+| `pve-container` | 6.1.13 | [`c8132559faedb76a56498d411bf3e024c1ff07e7`](https://github.com/proxmox/pve-container/tree/c8132559faedb76a56498d411bf3e024c1ff07e7) |
+| `pve-guest-common` | 6.0.5 | [`191c23e385e5dbed1938b2d1d322196831ef9331`](https://github.com/proxmox/pve-guest-common/tree/191c23e385e5dbed1938b2d1d322196831ef9331) |
+
+The load-bearing source paths for this package are:
+
+- **FACT-SOURCE:** [`PVE/RESTEnvironment.pm`](https://github.com/proxmox/pve-common/blob/f665029eac78022e81810ab2e44eace57ade13fb/src/PVE/RESTEnvironment.pm)
+  for worker creation, exact-log creation, archive-line construction, and the
+  50,000-byte `index` rotation threshold;
+- **FACT-SOURCE:** [`PVE/UPID.pm`](https://github.com/proxmox/pve-common/blob/f665029eac78022e81810ab2e44eace57ade13fb/src/PVE/UPID.pm)
+  for the encoded UPID fields and exact-log path mapping;
+- **FACT-SOURCE:** [`PVE/API2/Tasks.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/API2/Tasks.pm)
+  for mutable `start`/`limit` enumeration;
+- **FACT-SOURCE:** [`PVE/API2/Nodes.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/API2/Nodes.pm)
+  for the `stopall`, `startall`, and `vncshell` candidate routes;
+- **FACT-SOURCE:** [`PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm)
+  for the `qmstart` candidate route; and
+- **FACT-DOC:** Linux man-pages 6.18
+  [`inotify(7)`](https://git.kernel.org/pub/scm/docs/man-pages/man-pages.git/tree/man7/inotify.7?h=man-pages-6.18),
+  dated 2026-02-14, for the userspace inotify interface and documented caveats.
+
+The inotify document is an official interface description, not a PVE
+completeness contract. No exact running-kernel source commit is claimed.
+
+## 3. Question and independent evidence planes
+
+The later experiment asks whether B-S1 can reach a false clean result while
+deliberately generated tasks overlap mutable API offset pagination, exact-UPID
+log creation, recursive scans, watch delivery/draining, active-to-archive
+movement, `index` to `index.1` rotation, and cleanup pressure.
+
+Every run has two independent planes:
+
+```text
+operation initiator                         proposed B-S1 observer
+  | request_start -> durable GT record        | inotify events
+  | execute one approved fixture action       | recursive exact-log scans
+  | returned UPID -> durable GT record         | active/index/index.1 copies
+  | request_end/finalize -> durable GT record  | API pages + exact-UPID reads
+  +---------------- offline comparison --------+ candidate close/gap state
+```
+
+The **ground-truth plane** is written by the operation initiator from every
+request and its returned UPID. It must not enumerate task history, consume the
+B-S1 watcher, or infer missing requests from B-S1 evidence. The
+**system-under-test plane** contains only what B-S1 could know. Sharing clocks
+and run identifiers is allowed; sharing task discovery is not.
+
+An analyzer result distinguishes:
+
+- `ANALYZER_PASS_TESTED_INTERLEAVING`: every in-scope generator UPID was
+  reconciled for this exact sealed run;
+- `B_S1_GAP_DETECTED`: the observer or source surfaces reported a gap;
+- `FALSE_CLOSED_COMPLETE_WITNESS`: independent ground truth proves B-S1
+  omitted an in-scope task without a required gap while its candidate close
+  logic accepted `T1`;
+- `HARNESS_INCOMPLETE`: capture, sealing, generator, heartbeat, or parse
+  evidence is incomplete; and
+- `ENVIRONMENT_INELIGIBLE`: the fixture/source/loaded-code context does not
+  match this exact protocol.
+
+None of these means `trusted`, `secure`, or “Family B solved.”
+
+## 4. Capture format: `family-b-13-capture-v1`
+
+One run is one explicit directory. JSON files are UTF-8; JSONL files contain
+one object per line. Timestamps carry both a process-local monotonic value in
+nanoseconds and a UTC wall-clock string where ordering across processes must
+later be correlated. No field is described as a stock PVE cursor or generation
+number.
+
+```text
+run-<uuid>/
+  manifest.json
+  ground-truth.jsonl
+  watch-events.jsonl
+  scan-rounds.jsonl
+  surface-observations.jsonl
+  api-pages.jsonl
+  exact-upid.jsonl
+  harness-events.jsonl
+  seal.json
+```
+
+The research-only parser is
+`scripts/research/blocker_b_family_b_13_analyzer.py`. It accepts only:
+
+```text
+python scripts/research/blocker_b_family_b_13_analyzer.py analyze \
+  --capture-dir ./fixture-data/run-001
+```
+
+It has no collection mode, networking, subprocess, credential, host discovery,
+or mutation capability. It lexically rejects the host `/var/log/pve` tree
+before stat or read, rejects symlink capture roots/files, and reads only the
+explicit directory's fixed file set. It is not imported by production code.
+
+### 4.1 Run manifest
+
+`manifest.json` records:
+
+| Field | Required content |
+| --- | --- |
+| identity | `schema_revision`, `experiment_id`, `run_uuid`, exact `protocol_revision`, exact `expected_b_s1_revision` |
+| fixture | `fixture_kind`, placeholder-or-approved `fixture_id`, `node_identity`, `boot_id`; live analysis rejects a placeholder and CT112 |
+| versions | installed/source `version_ledger` and `loaded_code_status` |
+| environment | `kernel_context`, `filesystem_context`, start/end timestamps |
+| processes | `reader_context`, `generator_context`, process identities and clock descriptions |
+| limits | maximum operation count, duration, disk/log limit, and subrun identifier |
+| completeness | one explicit true/false marker for every JSONL stream and ground-truth finalization |
+| candidate close | close state, monotonic time, event id, and exact normalized known-UPID set |
+| files | the exact logical-name-to-filename mapping |
+
+`node_identity` is fixture provenance, not workload identity. `boot_id` is
+captured as context, not treated as a PVE generation. Synthetic runs use
+`fixture_kind=synthetic`; a later real run uses `disposable_pve` only after the
+fixture contract is satisfied.
+
+### 4.2 Ground-truth events
+
+`ground-truth.jsonl` contains paired `request_start` and `request_end` records
+for each contiguous, generator-local sequence, followed by exactly one
+`generator_finalized` record.
+
+Each request record carries `generator_sequence`, `request_id`, `operation`,
+`monotonic_ns`, `wall_timestamp`, and `generator_process_identity`.
+`request_end` additionally carries `returned_upid`, `expected_task_type`,
+`expected_task_id`, `outcome`, `within_scope`, and `boundary_relation`
+(`before_t1`, `after_t1`, or `ambiguous`). The finalizer carries
+`last_sequence`, `total_operations`, generator identity, timestamps, and
+`durable_flush_complete`.
+
+A failed, timed-out, ambiguously answered, unpaired, duplicated, or
+non-contiguous request makes the harness incomplete. It is never interpreted
+as absence of a task.
+
+### 4.3 Watch events
+
+`watch-events.jsonl` records `watcher_sequence`, `event_type`, kernel mask
+names and raw numeric mask, watch descriptor, cookie, watched path, filename,
+normalized UPID when parseable, `queue_overflow`, watch add/remove and
+invalidation state, monotonic/wall timestamps, and raw read-buffer ordering.
+`IN_Q_OVERFLOW`, `IN_IGNORED`, `IN_UNMOUNT`, `IN_DELETE_SELF`, and
+`IN_MOVE_SELF` are preserved even without a filename.
+
+### 4.4 Scan rounds
+
+`scan-rounds.jsonl` records `round_id`, start/end times, the sorted exact
+normalized UPID set, bucket set, per-directory and per-file stat/inode
+metadata, unreadable and malformed entries, and a consistency marker. Positive
+close requires at least two completed fixed-point rounds; a disappearing exact
+log or an unreadable/malformed entry latches a gap.
+
+### 4.5 Active and archive observations
+
+`surface-observations.jsonl` records one or more captures for each of `active`,
+`index`, and `index.1`: capture start/end, raw evidence, parsed normalized UPID
+set, read/parse completeness, size, inode/device/mtime metadata, and SHA-256.
+Missing `index.1` is represented explicitly as an absent-but-completely-read
+surface before first rotation, not silently omitted. Hashes support comparison;
+they do not prove an atomic snapshot.
+
+### 4.6 API pages
+
+`api-pages.jsonl` records source profile (`active`, `archive`, or `all`),
+`start_offset`, `limit`, normalized returned UPIDs, request identity,
+request/response times, completion, and `restart_reason` (or explicit `null`).
+Offsets and page numbers are harness fields only. Duplicate pages are retained
+verbatim. Pagination alone never establishes completeness.
+
+### 4.7 Exact-UPID observations
+
+`exact-upid.jsonl` records the known UPID, capture start/end, status result, log
+result, presence, readability, whether previously known, and the final-status
+interpretation. A known exact log becoming absent/unreadable is a gap. A task
+temporarily absent from `active`, `index`, and `index.1` is not missing if its
+exact log is independently preserved and reconciled.
+
+### 4.8 Harness events
+
+`harness-events.jsonl` records process start/stop/crash, heartbeats,
+capture finalization, analyzer version, injected synthetic overflow,
+dropped-input simulation, and explicit gap signals. A stale/missing heartbeat,
+crash, missing finalizer, or version mismatch cannot produce a positive result.
+
+## 5. Ground-truth generator contract
+
+A future generator must satisfy all of these conditions:
+
+1. It is separately approved for one disposable fixture and one subrun.
+2. It has immutable maximum operation-count and duration bounds and exits on
+   either bound.
+3. It operates only on explicitly reserved disposable objects. No production
+   identifier is embedded in this package.
+4. It assigns a monotonically increasing generator-local sequence and durable
+   request id before every attempt.
+5. It durably appends and flushes `request_start` **before** the operation.
+6. It records and durably flushes a returned UPID immediately, before any next
+   operation; the record is sourced from the initiator response, not PVE task
+   enumeration or B-S1.
+7. It pairs the request end, outcome, expected task type/id, and timestamps,
+   and closes with an independently durable contiguous-sequence finalizer.
+8. A failure, timeout, disconnect, unknown response, flush failure, sequence
+   gap, or lost finalizer stops generation and yields `HARNESS_INCOMPLETE`.
+9. It never substitutes a guessed UPID and never uses an observer-detected
+   UPID to repair ground truth.
+
+Durable here means flushed to the approved fixture evidence volume and copied
+into the sealed capture; it is not a claim of crash-proof distributed commit.
+
+## 6. Cheapest-safe task-generator research
+
+No generator command is authorized here. No real VMID or storage was selected.
+
+| Candidate | Real UPID / RESTEnvironment worker | Guest or storage mutation | Expected duration | Repeatability / cleanup | Hundreds or thousands on disposable node | Scope risk |
+| --- | --- | --- | --- | --- | --- | --- |
+| node `stopall` with one explicitly reserved, verified-absent VMID and `force-stop=false` | Yes, `stopall` | None **only while the reserved slot remains absent** | Short worker | High; no object cleanup when filter is empty | Plausible under explicit load/disk bounds | Race or configuration error could target a newly present guest; strict absence guard is load-bearing |
+| node `startall` with an empty/filtered set | Yes, `startall` | Unsafe for this purpose: source removes stale backup locks before the filter | Short if empty | Cleanup ambiguous | No | Broadens into guest-lock lifecycle mutation |
+| `qmstart` against an already-running disposable QEMU guest | Yes, `qmstart` | Normally fails in worker without starting it, but a race could start a stopped guest | Short failure | Requires a running guest and power authority | Possible but noisy | Broadens into guest power lifecycle and race control |
+| node `vncshell` | Yes, `vncshell` | No guest/storage mutation | Proxy/session bounded; not minimal | Repeated proxy/ticket/port cleanup | Operationally possible, not preferred | Adds console, port, ticket, authentication, and timeout behavior unrelated to #13 |
+| `aptupdate` | Yes | Mutates package caches and may use network | Network-dependent | Cleanup and determinism poor | No | Broadens into network/package lifecycle |
+| create/destroy, snapshot, backup, restore, clone | Yes | Yes | Variable | High cleanup/storage burden | Not safely assumed | Becomes a guest/storage lifecycle experiment |
+
+**FACT-SOURCE:** the pinned `stopall` route filters its guest list to an
+explicit VMID before entering the genuine `fork_worker('stopall', ...)`; with
+an absent ID the worker loop is empty. **INFERENCE:** this is the cheapest safe
+stock candidate identified for task-record pressure because it reaches the
+same RESTEnvironment worker/log/archive machinery without intended guest or
+storage mutation.
+
+Selection is therefore **CONDITIONAL CANDIDATE / NOT YET AUTHORIZED**:
+`stopall` with a fixture-reserved absent slot, `force-stop=false`, and
+independent pre-request and post-request proof that the slot remained absent.
+Any observed guest, unexpected task type, or inability to make that absence
+check independent and race-safe stops the run. Fixture review may reject the
+candidate and leave generator selection open; no fallback generator is
+preapproved.
+
+## 7. Index-rotation volume estimate
+
+**FACT-SOURCE:** `log_task_result()` appends
+`sprintf("%s %08X %s\n", $upid, $endtime, $status)` to `index`, closes the
+append, then rotates by renaming `index` to `index.1` when observed size is
+strictly greater than `50,000` bytes. The source comment says “about 1000
+entries”; it is not an exact count.
+
+For one entry:
+
+```text
+archive_line_bytes = len(UPID) + 1 + 8 + 1 + len(status) + 1
+                   = len(UPID) + 11 + len(status)
+
+len(UPID) = 28 + len(node) + len(pstart_hex) + len(type)
+               + len(id) + len(user)
+```
+
+`pstart_hex` is eight or nine characters under the pinned decoder, and node,
+type, id, user, and status lengths vary. For the conditional `stopall`
+candidate (`type` length 7, empty id, short `OK` status), the source-format
+floor with one-byte node/user values and an eight-byte `pstart` is 58 bytes per
+line. A more realistic planning envelope with 8–20 byte node names and 8–32
+byte users is about **72–109 bytes per line**. From an empty index, those sizes
+imply roughly **459–695 entries** for the planning envelope and **863 entries**
+at the source-format floor before the first append that crosses 50,000 bytes.
+These are estimates, not source guarantees.
+
+The future preflight must measure the actual starting size and observed line
+sizes. Reserving a separately approved ceiling of **1,000 successful short
+entries** covers the source-format floor from an empty index, but the actual
+target must be recomputed as:
+
+```text
+ceil((50,001 - observed_start_size) / minimum_observed_line_size)
+```
+
+and bounded by the approved operation and disk limits. Rotation is accepted
+only when actual `index`/`index.1` stat, inode, hash, content, and watch evidence
+shows it. Count never substitutes for observation because starting size,
+variable line/status length, concurrent tasks, reaper timing, and rotation
+races all affect the crossing point.
+
+## 8. Linux watch boundary
+
+The intended future primitive is direct Linux inotify:
+`inotify_init1(IN_NONBLOCK | IN_CLOEXEC)` followed by explicit
+`inotify_add_watch()` calls. A convenience recursive watcher is insufficient
+unless it exposes the same raw masks and watch lifecycle.
+
+Likely directory mask:
+
+```text
+IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE | IN_ATTRIB |
+IN_DELETE | IN_MOVED_FROM | IN_DELETE_SELF | IN_MOVE_SELF | IN_UNMOUNT
+```
+
+`IN_ONLYDIR` should protect directory watch installation. `IN_MASK_CREATE` may
+be used when supported to avoid clobbering an existing mask. The reader must
+also preserve returned `IN_IGNORED`, `IN_Q_OVERFLOW`, and `IN_ISDIR` bits.
+
+| Claim | Classification | Consequence |
+| --- | --- | --- |
+| inotify directory monitoring is not recursive | `FACT-DOC` | Every existing and newly created task bucket needs its own explicit watch. |
+| New files/subdirectories may appear between child-directory creation and watch attachment | `FACT-DOC` | Attach the child watch, then scan it immediately; the interval remains an adversarial race for #13F. |
+| Queue overflow emits `IN_Q_OVERFLOW` with watch descriptor `-1`; excess events are dropped | `FACT-DOC` | Latch `GAP`; intentional overflow ends that bounded subrun after evidence capture. |
+| Watch removal/unmount yields `IN_IGNORED`; unmount also yields `IN_UNMOUNT` | `FACT-DOC` | Latch `GAP`, record watch lifecycle, and stop. |
+| `IN_DELETE_SELF`/`IN_MOVE_SELF` indicates loss or movement of a watched object | `FACT-DOC` | Treat as invalidation until a full gap-aware rebuild; never silently reattach and close clean. |
+| Event names may be stale by consumption time; move pairs are not atomically queued | `FACT-DOC` | Preserve raw cookie/order and reconcile by scans/exact logs, not event counting. |
+| Identical unread events can coalesce | `FACT-DOC` | Inotify cannot be ground truth or a reliable task counter. |
+| Mounting over a watched directory may emit no event and hide descendants | `FACT-DOC` | Fixture mount topology is frozen/recorded; a change or ambiguity makes the run ineligible/gapped. |
+| Scan-after-watch closes every creation race | `UNKNOWN` | It is a mitigation to falsify, not a proof. |
+| A passing #13 run proves universal watcher completeness | `UNKNOWN` and explicitly not claimed | PASS applies only to enumerated interleavings on the exact kernel/filesystem/context. |
+
+## 9. Analyzer decision contract
+
+The analyzer validates environment eligibility, fixed filenames, JSON/JSONL
+shape, source ledger, independent ground truth, contiguous request pairs,
+heartbeats, candidate close state, required surface profiles, fixed-point
+scans, exact-UPID reconciliation, and the capture seal.
+
+Decision precedence is fail-closed:
+
+1. context mismatch -> `ENVIRONMENT_INELIGIBLE`;
+2. missing/corrupt/unsealed/ambiguous harness or ground truth ->
+   `HARNESS_INCOMPLETE`;
+3. watcher, scan, source, T1-ordering, cleanup, or explicit gap ->
+   `B_S1_GAP_DETECTED`;
+4. complete independent ground truth omitted by the primary watch/scan/exact
+   plane, with no gap and an otherwise accepted close ->
+   `FALSE_CLOSED_COMPLETE_WITNESS`;
+5. only complete reconciliation for the exact captured interleaving ->
+   `ANALYZER_PASS_TESTED_INTERLEAVING`.
+
+API UPIDs are deliberately corroborative. Duplicate pages are tolerated only
+when watch/scan/exact evidence independently reconciles every ground-truth
+UPID. Repeating mutable pagination cannot heal its own omission.
+
+## 10. Synthetic adversarial suite
+
+The tests use temporary synthetic directories only. They neither import nor
+exercise a collector.
+
+| # | Synthetic capture | Required analyzer result |
+| --- | --- | --- |
+| 1 | Ground truth equals reconciled B-S1 known set | `ANALYZER_PASS_TESTED_INTERLEAVING`; architecture effect remains `NONE` |
+| 2 | Unknown generated UPID absent from every B-S1 observation | `FALSE_CLOSED_COMPLETE_WITNESS` |
+| 3 | Watch queue overflow | `B_S1_GAP_DETECTED` |
+| 4 | Watch invalidation/loss | `B_S1_GAP_DETECTED` |
+| 5 | Duplicate API pages, independently reconciled | PASS for that interleaving |
+| 6 | Offset omission repeated without independent evidence | false-close witness, not pagination healing |
+| 7 | Task only in exact log during active/archive handoff | Not missing merely due to surface handoff |
+| 8 | Known exact log deleted by cleanup | `B_S1_GAP_DETECTED` |
+| 9 | Unknown pre-enumeration log deleted without watch signal | false-close witness |
+| 10 | Surviving overlap anchors around a removed unknown intermediate log | false-close witness; anchors do not clean the run |
+| 11 | Crash or missing/stale heartbeat before close | `HARNESS_INCOMPLETE` |
+| 12 | Incomplete/corrupt capture file | `HARNESS_INCOMPLETE` |
+| 13 | Generator sequence gap or missing finalizer | `HARNESS_INCOMPLETE` |
+| 14 | Source/version mismatch | `ENVIRONMENT_INELIGIBLE` |
+| 15 | Late task ambiguous around synthetic T1 | `B_S1_GAP_DETECTED`; no universal ordering claim |
+
+Additional guards prove the analyzer rejects `/var/log/pve` before file open,
+completes with network and subprocess entry points patched to fail, and
+contains no network, subprocess, or PVE-command collection path.
+
+## 11. Exact false-clean witness
+
+A B-S1-killing witness must preserve all of the following in the sealed run:
+
+1. one independent ground-truth `request_start`/`request_end` pair and returned
+   normalized UPID from the generator;
+2. proof the operation and UPID are within the declared subrun and T0/T1 scope;
+3. the full B-S1 watch, scan, active/archive, API, and exact-UPID streams showing
+   that UPID was omitted or was once known and then lost;
+4. absence of every required gap signal in the complete watch/harness/source
+   record;
+5. the candidate close record proving the same logic would otherwise accept
+   `T1` as `CLOSED_COMPLETE`; and
+6. manifest, source/loaded-code ledger, file hashes, analyzer version/commit,
+   and overall seal hash preserving the evidence used for those facts.
+
+The analyzer emits a witness containing the ground-truth UPID and generator
+sequence, operation, scope membership, omission fact, close event/state, and
+the fact that no required gap was recorded. Its consequence is exactly:
+
+```text
+B-S1 NO-GO FOR THE TESTED EXACT SCOPE
+```
+
+It does not prove every possible Family-B mechanism impossible.
+
+## 12. Run sealing and integrity boundary
+
+After capture close and before analysis, the later sealer writes `seal.json`
+with the schema/run UUID, analyzer revision and repository commit, and the
+filename, byte size, and SHA-256 of `manifest.json` and every JSONL evidence
+file. It then hashes the canonical sorted seal payload as
+`overall_manifest_hash`. The analyzer recomputes every value before parsing.
+
+Completed captures become read-only in the operator evidence store; any later
+annotation is a separately hashed file outside the sealed directory. SHA-256
+here detects post-capture byte changes under ordinary evidence handling. It
+does not establish author identity, trusted time, non-repudiation, or resistance
+to an actor able to replace both capture and seal.
+
+## 13. Later disposable-fixture contract
+
+No fixture is instantiated or selected by this package. A later approval must
+name a fixture satisfying all of these requirements:
+
+- a non-production PVE node with no production dependencies, HA production
+  integration, private workload, or real workload data;
+- exact target package/source and loaded-code baseline from section 2;
+- known and recorded kernel, boot ID, mount topology, filesystem, storage
+  backend, clock, and retention configuration;
+- console/recovery access independent of the experiment;
+- explicit CPU, RAM, evidence-disk, log-space, task-count, task-rate, and total
+  duration limits;
+- only explicitly reserved disposable guest IDs if a separately approved
+  generator requires guests; no production host IDs are chosen here;
+- an identified cleanup owner, evidence owner, experiment start/stop window,
+  and post-run health acceptance criteria; and
+- reboot permission only for a separately approved subrun that requires it.
+
+CT112 explicitly does not satisfy this contract and must not be used.
+
+## 14. Immediate stop conditions
+
+The later operator stops generation and prevents positive close if:
+
+- any production dependency, real workload, or unapproved identifier appears;
+- ground-truth durability, pairing, sequencing, or completeness is lost;
+- inotify reports overflow/invalidation, except that an intentional bounded
+  13E injection captures the event and then stops that subrun;
+- disk/log space crosses the preapproved safety threshold;
+- task count, rate, duration, or archive volume crosses its approved bound;
+- any unexpected task type or target appears;
+- service/node health degrades outside the approved fixture bounds;
+- collector, protocol, analyzer, source, installed package, or loaded-code
+  context mismatches;
+- mount/watch topology changes unexpectedly; or
+- cleanup or evidence ownership becomes ambiguous.
+
+## 15. Later operator runbook skeleton
+
+Every PVE-mutating or task-generating action remains **NOT AUTHORIZED / TEMPLATE
+ONLY** until the exact subrun has separate operator approval. This document
+intentionally provides no executable generator or destructive cleanup command.
+
+0. Obtain separate written approval for one fixture, generator, bounds, and
+   subrun; record the approver and window.
+1. Verify fixture identity, isolation, absence of production dependencies, and
+   that it is not CT112.
+2. Record installed packages, immutable source mapping, boot ID, and loaded-code
+   preflight; mismatch makes the run ineligible.
+3. Record filesystem/mount context and disk/log free-space; set numeric stop
+   thresholds before starting any process.
+4. Start the independent ground-truth writer; verify durable test write,
+   monotonic sequence initialization, heartbeat, and operation/duration caps.
+5. Start the B-S1 observer; establish all existing and lazy-bucket watches,
+   event drain, raw surface capture, heartbeat, and gap latch.
+6. Establish baseline with active/index/index.1 copies, API profiles, recursive
+   exact-log scan, and two fixed-point rounds.
+7. Execute exactly one approved bounded subrun. Any generator action at this
+   stage is **NOT AUTHORIZED / TEMPLATE ONLY** until that separate approval.
+8. Stop generation, drain watch events, complete final scans/exact-UPID reads,
+   capture all surfaces, record candidate T1 close/gap, and finalize streams.
+9. Copy and seal evidence; verify file list, sizes, SHA-256 values, analyzer
+   revision/commit, and overall manifest hash. Preserve the immutable original.
+10. Move a copy to an offline workstation and invoke only the explicit
+    `analyze --capture-dir` command from section 4.
+11. Record exactly one research-local classification and its evidence. A
+    false-close witness kills B-S1 for the tested exact scope; PASS only
+    enumerates that interleaving.
+12. The identified cleanup owner performs the separately approved fixture
+    cleanup. No cleanup command or real identifier is supplied here.
+13. Verify fixture service, storage, disk/log space, console access, and absence
+    of residual experiment objects; preserve health evidence separately.
+
+## 16. Independently approvable subruns
+
+Recommended early-kill order is **13A -> 13F -> 13B -> 13C -> 13D -> 13E ->
+13G**. Any false-close witness stops and skips all later runs. A harness failure
+must be corrected and rerun under a new UUID; it does not justify moving on.
+
+### 13A — low-volume watch/log ordering sanity
+
+- **Question:** Does the observer preserve every generator-returned UPID and
+  exact log across simple start/completion ordering?
+- **Prerequisites:** full fixture/preflight; conditional generator approved.
+- **Target:** 10–50 tasks; short/low-pressure duration category.
+- **Evidence:** all streams, especially raw watch order, ground truth, exact
+  logs, and two scan fixed points.
+- **Falsification:** one in-scope UPID omitted/lost without gap, or close before
+  reconciliation.
+- **PASS means:** these enumerated low-volume orderings reconciled.
+- **PASS does not mean:** pagination, rotation, overflow, cleanup, or universal
+  watcher completeness is proven.
+- **Stops/burden:** all global stops; low operational burden.
+- **Skip rule:** never skip; a kill skips 13F–13G.
+
+### 13F — scan/watch creation-race adversary
+
+- **Question:** Can task or lazy-bucket creation between directory scan and
+  explicit child-watch installation escape without a gap?
+- **Prerequisites:** 13A PASS; controllable observer scheduling/instrumentation
+  that does not alter PVE source.
+- **Target:** 10–100 tasks across deliberately enumerated timing windows;
+  short/burst duration category.
+- **Evidence:** watch-add times, raw events, bucket/inode scans, ground truth,
+  exact logs, candidate state transitions.
+- **Falsification:** omitted UPID with no gap, including a create-before-watch
+  and delete-before-scan witness.
+- **PASS means:** only the explicitly scheduled creation interleavings survived.
+- **PASS does not mean:** every scheduler/kernel/filesystem interleaving is covered.
+- **Stops/burden:** stop on unplanned watch loss; moderate instrumentation burden.
+- **Skip rule:** skip after any prior kill; otherwise run early because it can
+  cheaply reject the candidate.
+
+### 13B — mutable API offset pagination
+
+- **Question:** Can inserts/completions while `start`/`limit` pages advance
+  cause an omission that the independent planes fail to expose?
+- **Prerequisites:** 13A and 13F PASS; explicit small page limit and enumerated
+  generator/page schedules.
+- **Target:** 50–200 tasks spanning at least 3–10 pages; short/medium category.
+- **Evidence:** every API request/page/restart plus ground truth, watch, scans,
+  and exact reads.
+- **Falsification:** missing UPID with no gap; pagination repetition alone may
+  not repair the classification.
+- **PASS means:** tested page-movement schedules reconciled independently.
+- **PASS does not mean:** offset pagination is a snapshot/cursor or is complete
+  under arbitrary concurrency.
+- **Stops/burden:** normal stops; low-to-moderate task/log burden.
+- **Skip rule:** skip after a kill.
+
+### 13C — active-to-archive handoff
+
+- **Question:** Can a UPID disappear between active publication, exact log, and
+  archive observation without B-S1 preserving it or latching a gap?
+- **Prerequisites:** earlier PASS; controllable mix of short and bounded longer
+  workers without adding a new lifecycle experiment.
+- **Target:** 25–100 tasks; short/medium transition category.
+- **Evidence:** dense active/index/exact captures, completion watches, API
+  active/archive/all pages, ground truth.
+- **Falsification:** unexplained omitted/lost UPID at handoff.
+- **PASS means:** enumerated handoff timings reconciled, including exact-log-only
+  temporary presence.
+- **PASS does not mean:** handoff is atomic, durable across crash, or complete
+  for other task types.
+- **Stops/burden:** normal stops; moderate sampling burden.
+- **Skip rule:** skip after a kill or if a safe duration mix is unavailable.
+
+### 13D — `index` to `index.1` rotation
+
+- **Question:** Does actual threshold crossing/rename cause omission or false
+  close during scans, watches, and pagination?
+- **Prerequisites:** earlier PASS; measured line sizes/starting index; approved
+  disk and operation cap sufficient for one observed rotation.
+- **Target:** computed crossing volume with a planning ceiling of 1,000 short
+  tasks from an empty/small index; medium/high-volume category, never an
+  unbounded loop.
+- **Evidence:** per-entry ground truth, stat/inode/hash/raw content before and
+  after actual rotation, watch renames, scans, pages, exact logs.
+- **Falsification:** any UPID omitted/lost without gap, or anchors hide an
+  intermediate deletion.
+- **PASS means:** one or more explicitly observed crossings reconciled.
+- **PASS does not mean:** count predicts rotation, retention is indefinite, or
+  all filesystems/kernels behave identically.
+- **Stops/burden:** tight disk/log health limits; high record volume.
+- **Skip rule:** skip after a kill or if the approved cap cannot safely cross.
+
+### 13E — watcher overflow/invalidation
+
+- **Question:** Does B-S1 reliably latch and preserve a gap when the kernel
+  reports intentional bounded overflow or watch invalidation?
+- **Prerequisites:** earlier PASS; separately approved, isolated injection
+  method and recovery plan. A synthetic injection may precede any kernel test.
+- **Target:** minimum activity needed to produce the approved signal; bounded
+  fault-injection duration, not a promised count.
+- **Evidence:** raw overflow/invalidation event, watch descriptor lifecycle,
+  observer latch, heartbeats, final scans and health.
+- **Falsification:** candidate reaches `CLOSED_COMPLETE` after the signal or
+  silently clears/replaces the gap.
+- **PASS means:** the tested signal forced `B_S1_GAP_DETECTED`.
+- **PASS does not mean:** overflow can always be induced, every loss emits a
+  signal, or completeness is restored afterward.
+- **Stops/burden:** stop immediately after signal capture; moderate/high fault
+  burden and separately approved recovery.
+- **Skip rule:** skip after any kill; kernel injection may be omitted if it
+  cannot be bounded safely, leaving that question open.
+
+### 13G — combined bounded pressure
+
+- **Question:** Can combined page movement, rapid transitions, real rotation,
+  watch drain, recursive scans, and approved cleanup pressure yield a false
+  close despite the earlier isolated results?
+- **Prerequisites:** 13A/13F/13B/13C/13D PASS and 13E gap behavior understood;
+  a new explicit combined-load approval.
+- **Target:** no more than the separately approved maximum, provisionally
+  1,000–2,000 tasks and only as needed for enumerated schedules; high-pressure
+  bounded duration category.
+- **Evidence:** every stream, actual rotation and retention markers, resource
+  health telemetry, and enumerated schedule ledger.
+- **Falsification:** any false-close witness or failure to latch a required gap.
+- **PASS means:** exactly the combined interleavings listed in that run ledger
+  reconciled.
+- **PASS does not mean:** Phase S proven universally, Phase M designed, Family B
+  solved, Blocker B closed, or trust granted.
+- **Stops/burden:** all stops with the tightest count/rate/disk/health bounds;
+  highest operational burden.
+- **Skip rule:** mandatory skip after any earlier kill or unresolved harness,
+  source, generator, fixture, or safety condition.
+
+## 17. Unresolved before any live experiment
+
+The following remain open and require a separate reviewed approval:
+
+- name and validate a disposable fixture satisfying section 13;
+- prove installed and loaded-code context, kernel/filesystem/mount topology, and
+  reader permissions for that fixture;
+- accept or reject the conditional absent-slot `stopall` generator, including
+  a race-safe absence guard and exact request method;
+- select non-production identifiers only after fixture allocation;
+- implement and review a fixture-only collector/generator; this PR intentionally
+  implements neither;
+- define numeric CPU/RAM/disk/log/task-rate/count/duration stop limits;
+- define exact enumerated interleavings and T0/T1 clock-correlation procedure;
+- decide whether and how cleanup pressure or kernel overflow/invalidation can be
+  induced without broadening the experiment;
+- review raw-evidence capture atomicity limitations and evidence-store sealing;
+- obtain explicit operator approval for each subrun and any PVE action; and
+- complete the later architecture review if evidence ever supports changing
+  B-S1 or the accepted status. A successful experiment alone changes nothing.
