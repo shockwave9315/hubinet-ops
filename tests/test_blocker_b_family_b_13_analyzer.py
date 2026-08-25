@@ -1813,6 +1813,348 @@ def test_quiescence_commit_at_t0_with_drained_fixed_point_may_pass(
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+def _pre_t0_root(establishment: int, watcher: int) -> dict[str, Any]:
+    return {
+        "establishment_sequence": establishment,
+        "event": "watch_installed",
+        "watcher_sequence": watcher,
+        "watch_scope": "task_root",
+        "watched_path": "tasks",
+        "monotonic_ns": 50,
+        "complete": True,
+    }
+
+
+def _pre_t0_bucket(establishment: int, watcher: int) -> dict[str, Any]:
+    return {
+        "establishment_sequence": establishment,
+        "event": "watch_installed",
+        "watcher_sequence": watcher,
+        "watch_scope": "bucket",
+        "watched_path": "tasks/0",
+        "bucket": "0",
+        "bucket_origin": "existing_at_root_install",
+        "monotonic_ns": 51,
+        "complete": True,
+    }
+
+
+def _pre_t0_scan(
+    establishment: int, scan: int, start: int, end: int, watermark: int
+) -> dict[str, Any]:
+    return {
+        "establishment_sequence": establishment,
+        "event": "baseline_scan",
+        "phase": "PRE_T0_BASELINE",
+        "baseline_scan_sequence": scan,
+        "scan_start_monotonic_ns": start,
+        "scan_end_monotonic_ns": end,
+        "exact_normalized_upids": [],
+        "bucket_set": ["0"],
+        "watch_drained_through_sequence": watermark,
+        "unreadable_entries": [],
+        "malformed_entries": [],
+        "complete": True,
+    }
+
+
+def _pre_t0_watch(establishment: int, watcher: int, monotonic_ns: int) -> dict[str, Any]:
+    return {
+        "establishment_sequence": establishment,
+        "event": "watch_event",
+        "watcher_sequence": watcher,
+        "watched_path": "tasks/0",
+        "monotonic_ns": monotonic_ns,
+        "complete": True,
+    }
+
+
+def _with_pre_t0_stream(
+    manifest: dict[str, Any],
+    records: dict[str, list[dict[str, Any]]],
+    stream: list[dict[str, Any]],
+    *,
+    root_reference: int,
+    watermark: int,
+) -> None:
+    records["pre_t0_establishment"] = stream
+    manifest["t0_quiescence"]["pre_t0_establishment"] = {
+        "root_watch_establishment_sequence": root_reference,
+        "baseline_scan_sequences": [1, 2],
+        "watch_drained_through_sequence": watermark,
+    }
+
+
+def test_permuted_pre_t0_ordinals_cannot_hide_late_watcher_event(
+    tmp_path: Path,
+) -> None:
+    """The terminal fixed point is capture order, not a self-declared ordinal.
+
+    A watcher event physically recorded after the terminal baseline scan is
+    relabelled with a smaller ``establishment_sequence`` and a ``watcher_sequence``
+    that hides it beneath the declared drain watermark.
+    """
+
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 3),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_scan(4, 1, 60, 65, 3),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+            _pre_t0_watch(3, 1, 76),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("pre_t0_establishment_sequence_not_jsonl_ordered",)
+
+
+def test_permuted_pre_t0_establishment_sequence_alone_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(2, 1),
+            _pre_t0_bucket(1, 2),
+            _pre_t0_scan(3, 1, 60, 65, 2),
+            _pre_t0_scan(4, 2, 70, 75, 2),
+        ],
+        root_reference=2,
+        watermark=2,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("pre_t0_establishment_sequence_not_jsonl_ordered",)
+
+
+def test_permuted_pre_t0_watcher_sequence_alone_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 2),
+            _pre_t0_bucket(2, 1),
+            _pre_t0_scan(3, 1, 60, 65, 2),
+            _pre_t0_scan(4, 2, 70, 75, 2),
+        ],
+        root_reference=1,
+        watermark=2,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("pre_t0_watcher_sequence_not_jsonl_ordered",)
+
+
+def test_permuted_pre_t0_baseline_scan_sequence_alone_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_scan(3, 2, 60, 65, 2),
+            _pre_t0_scan(4, 1, 70, 75, 2),
+        ],
+        root_reference=1,
+        watermark=2,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("pre_t0_baseline_scan_sequence_not_jsonl_ordered",)
+
+
+def test_late_watcher_event_invalidates_fixed_point_with_honest_ordinals(
+    tmp_path: Path,
+) -> None:
+    """Ordinals fully consistent with capture order still cannot rescue it."""
+
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_scan(3, 1, 60, 65, 3),
+            _pre_t0_scan(4, 2, 70, 75, 3),
+            _pre_t0_watch(5, 3, 76),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("pre_t0_watch_drain_watermark_after_scan",)
+
+
+def test_watcher_below_watermark_cannot_postdate_terminal_scan(
+    tmp_path: Path,
+) -> None:
+    """Ordinal binding plus ascending capture time forces the watermark prefix.
+
+    Once ``watcher_sequence`` equals physical capture position, a record below
+    the watermark cannot carry a later timestamp than the record at the mark, so
+    an attempt to hide a late event beneath the watermark fails closed on
+    capture-time ordering instead.
+    """
+
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_watch(3, 3, 52),
+            _pre_t0_scan(4, 1, 60, 65, 3),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+    records["pre_t0_establishment"][1]["monotonic_ns"] = 76
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "pre_t0_establishment_time_reversed" in result.reasons
+
+
+def test_watcher_event_inside_terminal_scan_window_may_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_scan(3, 1, 60, 65, 2),
+            _pre_t0_watch(4, 3, 72),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_watcher_event_exactly_at_terminal_scan_end_may_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_scan(3, 1, 60, 65, 2),
+            _pre_t0_watch(4, 3, 75),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_ordered_pre_t0_stream_positive_control_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_scan(3, 1, 60, 65, 2),
+            _pre_t0_scan(4, 2, 70, 75, 2),
+        ],
+        root_reference=1,
+        watermark=2,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_ground_truth_request_end_physically_before_start_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    start, end, finalized = records["ground_truth"]
+    records["ground_truth"] = [end, start, finalized]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "ground_truth_request_end_precedes_start_in_capture:1",
+    )
+
+
+def test_ground_truth_finalizer_must_be_physically_last(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    start, end, finalized = records["ground_truth"]
+    records["ground_truth"] = [finalized, start, end]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("ground_truth_finalizer_not_physically_last",)
+
+
+def test_permuted_harness_sequence_is_incomplete(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    result_dir = _materialize(tmp_path, manifest, records)
+    stream = [
+        json.loads(line)
+        for line in (result_dir / CAPTURE_FILES["harness_events"])
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    stream[0], stream[1] = stream[1], stream[0]
+    _write_jsonl(result_dir / CAPTURE_FILES["harness_events"], stream)
+    _seal(result_dir, manifest["run_uuid"])
+
+    result = analyze_capture(result_dir)
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "harness_sequence_not_contiguous_or_ordered" in result.reasons
+
+
 def test_missing_root_watch_before_baseline_cannot_pass(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     records["pre_t0_establishment"][0]["watch_scope"] = "bucket"

@@ -255,6 +255,26 @@ phased `PRE_T0_BASELINE` scan rounds. `t0_quiescence` references the task-root
 watch installation, the exact terminal pair of baseline scan sequences, and
 the final pre-T0 watch-drain watermark.
 
+Physical JSONL order in this stream is itself sealed evidence. Every declared
+ordinal here is chronology-bearing: `establishment_sequence` is order-compared
+against the terminal fixed point, and `watcher_sequence` is compared against the
+drain watermark. Each must therefore equal its own physical capture position --
+`establishment_sequence` over the whole stream, and `watcher_sequence` and
+`baseline_scan_sequence` over their own record subsequences. A set-contiguity
+check would accept a permutation, letting a self-declared ordinal relabel a
+watcher event captured after the terminal fixed-point scan as an earlier one and
+hide it beneath the drain watermark. Any permutation is `HARNESS_INCOMPLETE`
+before fixed-point reasoning begins. Independently of every ordinal, a watcher
+event whose monotonic time falls after the terminal scan end and at or before T0
+invalidates the fixed point.
+
+`ground-truth.jsonl` is bound the same way. The generator durably appends
+`request_start` before issuing the operation and closes with the finalizer, so a
+stream that physically records a `request_end` before its own `request_start`,
+or appends after the finalizer, is `HARNESS_INCOMPLETE`. Physical append order
+is the evidence that `request_start` is a causal lower bound at all; a declared
+`generator_sequence` cannot reorder it.
+
 Each child-watch installation declares `bucket_origin` as either
 `existing_at_root_install` or `root_event`. A `root_event` installation must
 reference the exact creation-event watcher sequence; an initially existing

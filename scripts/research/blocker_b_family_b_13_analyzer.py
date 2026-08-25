@@ -672,6 +672,7 @@ def _ground_truth(
     starts: dict[int, Mapping[str, Any]] = {}
     ends: dict[int, Mapping[str, Any]] = {}
     finalizers: list[Mapping[str, Any]] = []
+    physical_ground_truth_order: list[tuple[str, int]] = []
     process_identity = str(
         _require_mapping(manifest["generator_context"], "generator_context")[
             "process_identity"
@@ -700,6 +701,7 @@ def _ground_truth(
         event = _require_text(record, "event")
         if event == "generator_finalized":
             finalizers.append(record)
+            physical_ground_truth_order.append(("generator_finalized", 0))
             continue
         if event not in {"request_start", "request_end"}:
             raise CaptureError(f"unknown_ground_truth_event:{event}")
@@ -715,6 +717,7 @@ def _ground_truth(
         target = starts if event == "request_start" else ends
         if sequence in target:
             raise CaptureError(f"duplicate_ground_truth_event:{event}:{sequence}")
+        physical_ground_truth_order.append((event, sequence))
         target[sequence] = record
 
     if len(finalizers) != 1:
@@ -740,6 +743,22 @@ def _ground_truth(
         raise CaptureError("ground_truth_sequence_gap")
     if total_operations != last_sequence:
         raise CaptureError("ground_truth_finalization_count_mismatch")
+    # The generator durably appends `request_start` before issuing the operation
+    # and closes with the finalizer, so physical append order is itself evidence.
+    # `request_start` is the causal lower bound for that operation's returned
+    # UPID; a stream that physically records the end before the start, or keeps
+    # appending after the finalizer, cannot support that bound.
+    seen_start_sequences: set[int] = set()
+    for position, (event, sequence) in enumerate(physical_ground_truth_order):
+        if event == "generator_finalized":
+            if position != len(physical_ground_truth_order) - 1:
+                raise CaptureError("ground_truth_finalizer_not_physically_last")
+        elif event == "request_start":
+            seen_start_sequences.add(sequence)
+        elif sequence not in seen_start_sequences:
+            raise CaptureError(
+                f"ground_truth_request_end_precedes_start_in_capture:{sequence}"
+            )
 
     operations: list[dict[str, Any]] = []
     seen_upids: set[str] = set()
@@ -964,17 +983,24 @@ def _validate_pre_t0_establishment(
     watcher_records: dict[int, Mapping[str, Any]] = {}
     baseline_scans: dict[int, Mapping[str, Any]] = {}
     bucket_rescans: list[Mapping[str, Any]] = []
+    # Declared ordinals are collected in physical JSONL iteration order so a
+    # permutation cannot relabel captured history as a different chronology.
+    physical_establishment_sequences: list[int] = []
+    physical_watcher_sequences: list[int] = []
+    physical_baseline_scan_sequences: list[int] = []
     prior_time = -1
     for record in records:
         sequence = _require_int(record, "establishment_sequence")
         if sequence == 0 or sequence in by_establishment_sequence:
             raise CaptureError("pre_t0_establishment_sequence_zero_or_duplicate")
+        physical_establishment_sequences.append(sequence)
         by_establishment_sequence[sequence] = record
         event = _require_text(record, "event")
         if event in {"watch_installed", "bucket_created", "watch_event"}:
             watcher_sequence = _require_int(record, "watcher_sequence")
             if watcher_sequence == 0 or watcher_sequence in watcher_records:
                 raise CaptureError("pre_t0_watcher_sequence_zero_or_duplicate")
+            physical_watcher_sequences.append(watcher_sequence)
             event_time = _require_int(record, "monotonic_ns")
             if event_time > t0:
                 raise CaptureError("pre_t0_watch_event_after_t0")
@@ -994,6 +1020,7 @@ def _validate_pre_t0_establishment(
             scan_sequence = _require_int(record, "baseline_scan_sequence")
             if scan_sequence == 0 or scan_sequence in baseline_scans:
                 raise CaptureError("pre_t0_baseline_scan_sequence_zero_or_duplicate")
+            physical_baseline_scan_sequences.append(scan_sequence)
             baseline_scans[scan_sequence] = record
         elif event == "bucket_rescan":
             if record.get("phase") != "PRE_T0_BUCKET_RESCAN":
@@ -1006,16 +1033,21 @@ def _validate_pre_t0_establishment(
         else:
             raise CaptureError(f"unknown_pre_t0_establishment_event:{event}")
 
-    if set(by_establishment_sequence) != set(range(1, len(records) + 1)):
-        raise CaptureError("pre_t0_establishment_sequence_gap")
-    if not watcher_records or set(watcher_records) != set(
-        range(1, max(watcher_records) + 1)
+    # Every pre-T0 ordinal below is chronology-bearing: `establishment_sequence`
+    # is order-compared against the terminal fixed point and `watcher_sequence`
+    # is prefix-compared against the drain watermark.  A set-equality check would
+    # accept any permutation, letting a declared ordinal rewrite physical
+    # history, so each declared sequence must equal its physical position.
+    if physical_establishment_sequences != list(range(1, len(records) + 1)):
+        raise CaptureError("pre_t0_establishment_sequence_not_jsonl_ordered")
+    if not watcher_records or physical_watcher_sequences != list(
+        range(1, len(physical_watcher_sequences) + 1)
     ):
-        raise CaptureError("pre_t0_watcher_sequence_gap")
-    if not baseline_scans or set(baseline_scans) != set(
-        range(1, max(baseline_scans) + 1)
+        raise CaptureError("pre_t0_watcher_sequence_not_jsonl_ordered")
+    if not baseline_scans or physical_baseline_scan_sequences != list(
+        range(1, len(physical_baseline_scan_sequences) + 1)
     ):
-        raise CaptureError("pre_t0_baseline_scan_sequence_gap")
+        raise CaptureError("pre_t0_baseline_scan_sequence_not_jsonl_ordered")
     if scan_references != [len(baseline_scans) - 1, len(baseline_scans)]:
         raise CaptureError("pre_t0_baseline_scan_reference_not_terminal")
 
@@ -1066,7 +1098,14 @@ def _validate_pre_t0_establishment(
             or watermark > max(watcher_records)
         ):
             raise CaptureError("pre_t0_watch_drain_watermark_invalid")
-        if _require_int(watcher_records[watermark], "monotonic_ns") > scan_end:
+        # A watermark asserts every watcher event through `watermark` was drained
+        # before the scan record, so the whole covered prefix -- not merely the
+        # record sitting at the watermark -- must precede the scan end.
+        if any(
+            _require_int(record, "monotonic_ns") > scan_end
+            for sequence, record in watcher_records.items()
+            if sequence <= watermark
+        ):
             raise CaptureError("pre_t0_watch_drain_watermark_after_scan")
         prior_watermark = watermark
         scan_sets.append(normalized)
@@ -1097,6 +1136,16 @@ def _validate_pre_t0_establishment(
         > terminal_scan_establishment_sequence
         for record in watcher_records.values()
         if _require_int(record, "monotonic_ns") <= t0
+    ):
+        raise CaptureError("pre_t0_watch_event_after_terminal_fixed_point")
+    # Independent of any declared ordinal, a relevant pre-T0 watcher event that
+    # physically occurred after the terminal fixed-point scan ended invalidates
+    # that fixed point.  This holds even if every ordinal in the stream is
+    # internally consistent, so it is proven from monotonic time alone.
+    terminal_scan_end = _require_int(selected_scans[1], "scan_end_monotonic_ns")
+    if any(
+        terminal_scan_end < _require_int(record, "monotonic_ns") <= t0
+        for record in watcher_records.values()
     ):
         raise CaptureError("pre_t0_watch_event_after_terminal_fixed_point")
 
