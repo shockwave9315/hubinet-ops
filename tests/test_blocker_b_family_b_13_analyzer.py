@@ -2445,6 +2445,8 @@ def test_quiescence_commit_before_t0_is_invalid_even_with_later_watch_event(
             "watcher_sequence": 3,
             "watch_scope": "task_root",
             "mask": ["IN_ATTRIB"],
+            "raw_mask": INOTIFY_MASKS["IN_ATTRIB"],
+            "queue_overflow": False,
             "monotonic_ns": 95,
             "complete": True,
         }
@@ -2467,6 +2469,8 @@ def test_watch_event_after_terminal_fixed_point_before_t0_cannot_pass(
             "watcher_sequence": 3,
             "watch_scope": "task_root",
             "mask": ["IN_ATTRIB"],
+            "raw_mask": INOTIFY_MASKS["IN_ATTRIB"],
+            "queue_overflow": False,
             "monotonic_ns": 95,
             "complete": True,
         }
@@ -2537,12 +2541,23 @@ def _pre_t0_scan(
     }
 
 
-def _pre_t0_watch(establishment: int, watcher: int, monotonic_ns: int) -> dict[str, Any]:
+def _pre_t0_watch(
+    establishment: int,
+    watcher: int,
+    monotonic_ns: int,
+    *,
+    masks: list[str] | None = None,
+) -> dict[str, Any]:
+    declared_masks = masks if masks is not None else ["IN_ATTRIB"]
     return {
         "establishment_sequence": establishment,
         "event": "watch_event",
         "watcher_sequence": watcher,
+        "watch_scope": "task_root",
         "watched_path": "tasks/0",
+        "mask": declared_masks,
+        "raw_mask": _raw_mask(declared_masks),
+        "queue_overflow": "IN_Q_OVERFLOW" in declared_masks,
         "monotonic_ns": monotonic_ns,
         "complete": True,
     }
@@ -2789,6 +2804,116 @@ def test_ordered_pre_t0_stream_positive_control_may_pass(tmp_path: Path) -> None
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+@pytest.mark.parametrize(
+    ("mask", "reason"),
+    [
+        ("IN_Q_OVERFLOW", "watch_queue_overflow"),
+        ("IN_IGNORED", "watch_invalidation_or_loss"),
+        ("IN_UNMOUNT", "watch_invalidation_or_loss"),
+        ("IN_DELETE_SELF", "watch_invalidation_or_loss"),
+        ("IN_MOVE_SELF", "watch_invalidation_or_loss"),
+    ],
+)
+def test_drained_pre_t0_observer_loss_prevents_positive_close(
+    tmp_path: Path, mask: str, reason: str
+) -> None:
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_watch(3, 3, 55, masks=[mask]),
+            _pre_t0_scan(4, 1, 60, 65, 3),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert reason in result.reasons
+
+
+def test_drained_benign_pre_t0_raw_watch_event_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            _pre_t0_watch(3, 3, 55),
+            _pre_t0_scan(4, 1, 60, 65, 3),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_pre_t0_watch_raw_mask_text_disagreement_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    watch = _pre_t0_watch(3, 3, 55, masks=["IN_Q_OVERFLOW"])
+    watch["raw_mask"] = INOTIFY_MASKS["IN_ATTRIB"]
+    watch["queue_overflow"] = False
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            watch,
+            _pre_t0_scan(4, 1, 60, 65, 3),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "inotify_mask_mismatch_raw_mask:pre_t0.watch:3",
+    )
+
+
+def test_pre_t0_watch_unknown_raw_mask_bit_is_incomplete(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    watch = _pre_t0_watch(3, 3, 55)
+    watch["raw_mask"] |= 0x00001000
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            watch,
+            _pre_t0_scan(4, 1, 60, 65, 3),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "inotify_raw_mask_unknown_bits:pre_t0.watch:3:0x00001000",
+    )
+
+
 def test_ground_truth_request_end_physically_before_start_is_incomplete(
     tmp_path: Path,
 ) -> None:
@@ -2985,6 +3110,8 @@ def test_undrained_pre_t0_watch_event_cannot_pass(tmp_path: Path) -> None:
             "watcher_sequence": 3,
             "watch_scope": "task_root",
             "mask": ["IN_ATTRIB"],
+            "raw_mask": INOTIFY_MASKS["IN_ATTRIB"],
+            "queue_overflow": False,
             "monotonic_ns": 76,
             "complete": True,
         }

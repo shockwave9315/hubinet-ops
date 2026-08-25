@@ -958,7 +958,7 @@ def _reject_generated_upids_not_strictly_after_request_start(
 
 def _validate_pre_t0_establishment(
     manifest: Mapping[str, Any], records: Sequence[Mapping[str, Any]]
-) -> None:
+) -> frozenset[str]:
     """Prove that the candidate's watch-first baseline protocol was executed."""
 
     t0 = _require_int(manifest, "t0_monotonic_ns")
@@ -1004,6 +1004,7 @@ def _validate_pre_t0_establishment(
     physical_establishment_sequences: list[int] = []
     physical_watcher_sequences: list[int] = []
     physical_baseline_scan_sequences: list[int] = []
+    gap_reasons: set[str] = set()
     prior_time = -1
     for record in records:
         sequence = _require_int(record, "establishment_sequence")
@@ -1025,6 +1026,18 @@ def _validate_pre_t0_establishment(
             prior_time = event_time
             if not _require_bool(record, "complete"):
                 raise CaptureError("pre_t0_watch_record_incomplete")
+            if event == "watch_event":
+                masks = _validated_inotify_masks(
+                    record, f"pre_t0.watch:{watcher_sequence}"
+                )
+                if _require_bool(record, "queue_overflow") != (
+                    "IN_Q_OVERFLOW" in masks
+                ):
+                    raise CaptureError(
+                        "pre_t0_watch_queue_overflow_mismatch_raw_mask:"
+                        f"{watcher_sequence}"
+                    )
+                gap_reasons.update(_watch_gap_reasons({"_masks": masks}))
             watcher_records[watcher_sequence] = record
         elif event == "baseline_scan":
             if record.get("phase") != "PRE_T0_BASELINE":
@@ -1258,6 +1271,8 @@ def _validate_pre_t0_establishment(
                 and _require_int(install, "monotonic_ns") >= baseline_start
             ):
                 raise CaptureError("pre_t0_existing_bucket_watch_installed_too_late")
+
+    return frozenset(gap_reasons)
 
 
 def _validate_t0_quiescence(
@@ -1595,8 +1610,10 @@ def _validate_subrun_obligations(
 def _analyze_loaded(
     manifest: Mapping[str, Any], records: Mapping[str, Sequence[Mapping[str, Any]]]
 ) -> AnalysisResult:
-    _validate_pre_t0_establishment(
-        manifest, records["pre_t0_establishment"]
+    gap_reasons = set(
+        _validate_pre_t0_establishment(
+            manifest, records["pre_t0_establishment"]
+        )
     )
     operations = _ground_truth(records["ground_truth"], manifest)
     close = _require_mapping(manifest["candidate_close"], "candidate_close")
@@ -1626,8 +1643,6 @@ def _analyze_loaded(
     generator_contract = _validate_generator_contract(
         manifest, _require_text(manifest, "fixture_kind")
     )
-    gap_reasons: set[str] = set()
-
     harness = list(records["harness_events"])
     reader_context = _require_mapping(manifest["reader_context"], "reader_context")
     reader_identity = _require_text(reader_context, "process_identity")

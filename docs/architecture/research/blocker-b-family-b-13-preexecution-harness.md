@@ -374,6 +374,13 @@ commit timestamp. Final local
 surface, active/pending, classification and exact-status quiescence checks then
 remain independently required.
 
+A generic pre-T0 `watch_event` carries the same authoritative numeric
+`raw_mask`, exact textual-mask projection, and queue-overflow projection as a
+candidate-interval watch record. A decoded overflow or watch
+invalidation/loss bit latches observer GAP even when the event is drained before
+the terminal baseline scans; draining cannot restore observations that may
+already have been lost.
+
 This sealed establishment stream exclusively owns watcher evidence at or
 before logical T0, including an event exactly at T0. Such an event is never
 duplicated or reused in `watch-events.jsonl` to prove candidate-interval
