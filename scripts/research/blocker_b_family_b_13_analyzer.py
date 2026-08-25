@@ -887,6 +887,37 @@ def _watch_gap_reasons(record: Mapping[str, Any]) -> frozenset[str]:
     return frozenset(reasons)
 
 
+def _is_candidate_interval_watch(
+    record: Mapping[str, Any], t0_monotonic: int, close_monotonic: int
+) -> bool:
+    """Return whether a watch belongs to the strict post-T0 candidate interval."""
+
+    event_time = _require_int(record, "monotonic_ns")
+    return t0_monotonic < event_time <= close_monotonic
+
+
+def _reject_generated_upids_before_request_start(
+    upids: set[str],
+    evidence_end_monotonic: int,
+    operation_by_upid: Mapping[str, Mapping[str, Any]],
+    reason_prefix: str,
+) -> None:
+    """Reject exact generated-UPID evidence that predates request initiation.
+
+    Request initiation is only a causal impossibility lower bound for the exact
+    UPID returned by that request. It is not evidence of worker body start.
+    """
+
+    for upid in sorted(upids):
+        operation = operation_by_upid.get(upid)
+        if operation is None:
+            continue
+        if evidence_end_monotonic < int(
+            operation["request_start_monotonic_ns"]
+        ):
+            raise CaptureError(f"{reason_prefix}_predates_request_start")
+
+
 def _validate_pre_t0_establishment(
     manifest: Mapping[str, Any], records: Sequence[Mapping[str, Any]]
 ) -> None:
@@ -1273,6 +1304,7 @@ def _validate_subrun_obligations(
     expected_upids: set[str],
     generator_window_operations: Sequence[Mapping[str, Any]],
     positive_close_candidate: bool,
+    t0_monotonic: int,
     close_monotonic: int,
     watches: Mapping[int, Mapping[str, Any]],
     scans: Mapping[int, Mapping[str, Any]],
@@ -1348,6 +1380,9 @@ def _validate_subrun_obligations(
             target not in expected_upids
             or target not in scan_set
             or watch.get("_normalized_upid") != target
+            or not _is_candidate_interval_watch(
+                watch, t0_monotonic, close_monotonic
+            )
             or marker_time > _require_int(scan, "scan_start_monotonic_ns")
             or not (
                 _require_int(scan, "scan_start_monotonic_ns")
@@ -1448,6 +1483,9 @@ def _validate_subrun_obligations(
             or not watch_masks.intersection({"IN_MOVED_FROM", "IN_MOVED_TO"})
             or watch.get("filename") not in {"index", "index.1"}
             or watch.get("phenomenon_id") != evidence_id
+            or not _is_candidate_interval_watch(
+                watch, t0_monotonic, close_monotonic
+            )
             or not (before_end <= watch_time <= min(after_start, rotated_start))
             or marker_time
             < max(
@@ -1465,7 +1503,9 @@ def _validate_subrun_obligations(
         relevant_matching_signals = [
             watch
             for watch in watches.values()
-            if _require_int(watch, "monotonic_ns") <= close_monotonic
+            if _is_candidate_interval_watch(
+                watch, t0_monotonic, close_monotonic
+            )
             and watch.get("phenomenon_id") == evidence_id
             and _watch_gap_reasons(watch)
         ]
@@ -1487,6 +1527,13 @@ def _analyze_loaded(
     close_monotonic = _require_int(close, "monotonic_ns")
     close_event_id = _require_text(close, "event_id")
     t0_monotonic = _require_int(manifest, "t0_monotonic_ns")
+    generator_window_operations = [
+        operation for operation in operations if operation["within_generator_window"]
+    ]
+    operation_by_upid = {
+        str(operation["upid"]): operation
+        for operation in generator_window_operations
+    }
     declared_known = {
         _require_upid(value, "candidate_close.known_upids")
         for value in _require_sequence(
@@ -1608,10 +1655,6 @@ def _analyze_loaded(
                 f"watch_queue_overflow_mismatch_raw_mask:{watcher_sequence}"
             )
         record["_masks"] = masks
-        watches[watcher_sequence] = record
-        relevant = event_time <= close_monotonic
-        if relevant:
-            gap_reasons.update(_watch_gap_reasons(record))
         filename = _require_string(record, "filename")
         parsed_upid = filename if UPID_PATTERN.fullmatch(filename) else None
         declared_upid_value = record.get("normalized_upid")
@@ -1625,13 +1668,33 @@ def _analyze_loaded(
                 f"watch_normalized_upid_mismatch_filename:{watcher_sequence}"
             )
         record["_normalized_upid"] = parsed_upid
+        if event_time <= t0_monotonic:
+            raise CaptureError(
+                f"post_t0_watch_event_not_after_t0:{watcher_sequence}"
+            )
+        candidate_interval = _is_candidate_interval_watch(
+            record, t0_monotonic, close_monotonic
+        )
+        record["_candidate_interval"] = candidate_interval
+        watches[watcher_sequence] = record
+        if candidate_interval:
+            gap_reasons.update(_watch_gap_reasons(record))
         if parsed_upid is not None:
             upid = parsed_upid
-            if relevant and masks.intersection(
+            if candidate_interval:
+                _reject_generated_upids_before_request_start(
+                    {upid},
+                    event_time,
+                    operation_by_upid,
+                    f"watch_generated_upid:{watcher_sequence}",
+                )
+            if candidate_interval and masks.intersection(
                 {"IN_CREATE", "IN_MOVED_TO", "IN_CLOSE_WRITE"}
             ):
                 watch_known.add(upid)
-            if relevant and masks.intersection({"IN_DELETE", "IN_MOVED_FROM"}):
+            if candidate_interval and masks.intersection(
+                {"IN_DELETE", "IN_MOVED_FROM"}
+            ):
                 watch_deleted.add(upid)
     expected_watch_order = list(range(1, len(watches) + 1))
     if physical_watcher_sequences != expected_watch_order:
@@ -1666,6 +1729,12 @@ def _analyze_loaded(
                 record.get("exact_normalized_upids"), "scan.exact_normalized_upids"
             )
         }
+        _reject_generated_upids_before_request_start(
+            current,
+            scan_end,
+            operation_by_upid,
+            f"scan_generated_upid:{sequence}",
+        )
         record["_normalized_upids"] = current
         for value in _require_sequence(record.get("bucket_set"), "scan.bucket_set"):
             if not isinstance(value, str):
@@ -1731,7 +1800,9 @@ def _analyze_loaded(
     relevant_watch_sequences = {
         sequence
         for sequence, watch in watches.items()
-        if _require_int(watch, "monotonic_ns") <= close_monotonic
+        if _is_candidate_interval_watch(
+            watch, t0_monotonic, close_monotonic
+        )
     }
     terminal_watermark = _require_int(
         terminal_scans[1], "watch_drained_through_sequence"
@@ -1779,6 +1850,12 @@ def _analyze_loaded(
             raise CaptureError(
                 f"surface_normalized_upids_mismatch_raw_evidence:{source}:{sequence}"
             )
+        _reject_generated_upids_before_request_start(
+            parsed_upids,
+            capture_end,
+            operation_by_upid,
+            f"surface_generated_upid:{source}:{sequence}",
+        )
         record["_normalized_upids"] = parsed_upids
         readable = _require_bool(record, "readable")
         complete = _require_bool(record, "complete")
@@ -1851,6 +1928,9 @@ def _analyze_loaded(
             watch = watches.get(discovery_reference)
             provenance_valid = bool(
                 watch
+                and _is_candidate_interval_watch(
+                    watch, t0_monotonic, close_monotonic
+                )
                 and watch.get("_normalized_upid") == upid
                 and set(watch["_masks"]).intersection(
                     {"IN_CREATE", "IN_MOVED_TO", "IN_CLOSE_WRITE"}
@@ -1939,9 +2019,6 @@ def _analyze_loaded(
         exact_final,
     )
 
-    generator_window_operations = [
-        operation for operation in operations if operation["within_generator_window"]
-    ]
     expected_upids = {
         str(operation["upid"]) for operation in generator_window_operations
     }
@@ -1992,6 +2069,7 @@ def _analyze_loaded(
         expected_upids,
         generator_window_operations,
         close_state == "CLOSED_COMPLETE" and not gap_reasons,
+        t0_monotonic,
         close_monotonic,
         watches,
         scans,
@@ -2008,10 +2086,6 @@ def _analyze_loaded(
         )
 
     if close_state == "CLOSED_COMPLETE" and missing:
-        operation_by_upid = {
-            str(operation["upid"]): operation
-            for operation in generator_window_operations
-        }
         missing_upid = sorted(missing)[0]
         operation = operation_by_upid[missing_upid]
         witness = {

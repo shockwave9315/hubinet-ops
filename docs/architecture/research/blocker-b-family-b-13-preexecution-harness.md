@@ -276,6 +276,12 @@ commit timestamp. Final local
 surface, active/pending, classification and exact-status quiescence checks then
 remain independently required.
 
+This sealed establishment stream exclusively owns watcher evidence at or
+before logical T0, including an event exactly at T0. Such an event is never
+duplicated or reused in `watch-events.jsonl` to prove candidate-interval
+enumeration. The post-T0 candidate watch stream and this establishment stream
+therefore have a strict, no-grace partition.
+
 This evidence proves only that the candidate watch-first protocol steps were
 recorded and passed these capture checks. It does not prove inotify, kernel, or
 filesystem completeness; those source-completeness semantics remain
@@ -305,6 +311,12 @@ request timing or self-assert it. The finalizer carries
 `last_sequence`, `total_operations`, generator identity, timestamps, and
 `durable_flush_complete`.
 
+For the exact UPID returned by an in-window request, `request_start` is also an
+independent causal impossibility lower bound: completeness-bearing evidence for
+that returned UPID cannot end before the request was initiated. This does not
+identify worker body start, change `b_s1_body_start_membership=unknown`, or
+support a B-S1 NO-GO conclusion.
+
 A failed, timed-out, ambiguously answered, unpaired, duplicated, or
 non-contiguous request makes the harness incomplete. It is never interpreted
 as absence of a task.
@@ -317,6 +329,16 @@ normalized UPID when parseable, `queue_overflow`, watch add/remove and
 invalidation state, monotonic/wall timestamps, and raw read-buffer ordering.
 `IN_Q_OVERFLOW`, `IN_IGNORED`, `IN_UNMOUNT`, `IN_DELETE_SELF`, and
 `IN_MOVE_SELF` are preserved even without a filename.
+
+Candidate-interval watch semantics use exactly
+`T0 < monotonic_ns <= T1`. A `watch-events.jsonl` record at or before T0 is
+`HARNESS_INCOMPLETE` because it belongs to the pre-T0 establishment plane. A
+record after T1 may remain as structurally validated diagnostic evidence, but
+it cannot affect discovery, deletion, observer GAP latching, exact-UPID watch
+provenance, 13D/13E/13F evidence, or terminal watch-drain success. There is no
+grace interval. A candidate-interval record carrying an in-window generated
+UPID is incomplete when its event time precedes that UPID's independent
+`request_start`.
 
 The Linux UAPI `struct inotify_event.mask` integer is the primitive. The v4
 analyzer pins the numeric definitions from Linux
@@ -360,6 +382,12 @@ with identical normalized sets and no relevant watcher sequence left undrained.
 Watcher sequence/time and each scan's drain watermark are cross-checked so a
 scan cannot claim an event that occurred after it ended. A disappearing exact
 log or unreadable/malformed/inconsistent scan latches a gap.
+
+A scan containing an in-window generated UPID is causally eligible for that
+UPID only when `scan_end_monotonic_ns >= request_start_monotonic_ns`. Its start
+may precede request initiation because a scan may span the creation boundary.
+An earlier scan end is `HARNESS_INCOMPLETE` before the UPID enters enumeration
+or exact scan provenance.
 
 The JSONL records themselves must physically occur in ascending
 `scan_sequence`; out-of-order capture is `HARNESS_INCOMPLETE`. After parsing,
@@ -405,6 +433,13 @@ handoff, or rotation obligations. This format intentionally replaces the
 earlier ambiguous raw-content description; no real v4 capture exists and no
 backward compatibility is required.
 
+A surface containing an in-window generated UPID is causally eligible for that
+UPID only when `capture_end_monotonic_ns >= request_start_monotonic_ns`. Its
+capture may span request initiation. An earlier capture end is
+`HARNESS_INCOMPLETE` before the raw-derived UPID enters enumeration, handoff or
+rotation semantics, or exact active/archive provenance. This also prevents a
+T0-quiescence surface from manufacturing evidence for a later request.
+
 ### 4.8 API pages
 
 `api-pages.jsonl` records source profile (`active`, `archive`, or `all`),
@@ -426,6 +461,11 @@ event, a completed scan, or a prior local active/archive observation. Exact-UPID
 reads confirm and finalize only an already enumerated UPID; they never add one
 to the completeness-bearing enumeration set. Missing discovery provenance is
 `HARNESS_INCOMPLETE`.
+
+Watch provenance additionally requires a strict candidate-interval watch.
+Scan and surface provenance inherits their respective end-time causal checks.
+Thus an exact record cannot rehabilitate temporally impossible discovery
+evidence and remains confirmation-only.
 
 A final status counts only when the known exact evidence is present and
 readable, both status and log raw results are available, their hashes match,
@@ -632,6 +672,12 @@ window; an extra UPID, unknown task type/id/node/owner, or a candidate-close set
 that omits an observed UPID latches a gap. This comparison does not establish
 B-S1 worker-body-start membership.
 
+The union is built only after structural/raw-projection validation and temporal
+eligibility. Watch discovery uses the strict candidate interval; watch, scan,
+and surface evidence for each in-window generated UPID must meet that UPID's
+request-start causal lower bound. Request timing is not added to the
+enumeration set and remains no evidence of worker body start.
+
 Each `family-b-13-subrun-contract-v1` declares the phenomenon the subrun must
 exercise and an evidence id. The analyzer then cross-checks that id against raw
 capture structure:
@@ -642,7 +688,7 @@ capture structure:
 | 13B | sequenced pages for one source with multiple actual offsets overlapping an in-window generator request schedule |
 | 13C | an in-window generated target present in ordered active then archive surface observations |
 | 13D | old `index` hash and device/inode reappear as `index.1`, new `index` differs, matching rename watch evidence exists, captured rotation content includes an in-window generated UPID, and the marker binds every in-window generator sequence while rotation occurs inside the generated run |
-| 13E | a matching raw overflow or invalidation/loss signal at or before candidate close; the exact qualifying watch record must also cause the observer GAP, and the successful expected classification is `B_S1_GAP_DETECTED` |
+| 13E | a matching raw overflow or invalidation/loss signal strictly after T0 and at or before candidate close; the exact qualifying watch record must also cause the observer GAP, and the successful expected classification is `B_S1_GAP_DETECTED` |
 | 13F | one in-window generated target/watch event inside the referenced scan interval and present in that scan |
 | 13G | at least two phenomena explicitly selected by this run contract, each independently satisfying its corresponding generated-run/raw check |
 
@@ -743,6 +789,13 @@ bit, `IN_ISDIR` lazy-directory creation/move, queue-overflow boolean mismatch,
 unknown raw bits, and watch filename/normalized-UPID disagreement. Correct raw
 agreement preserves discovery, deletion, GAP, handoff, rotation, and lazy
 bucket behavior; every disagreement is incomplete before semantic use.
+The temporal P1 matrix reproduces the pre-T0 sole-watch false PASS, rejects an
+event exactly at T0 and a post-T0 event before the returned UPID's request
+start, and admits watch evidence at or after request start through T1. It also
+rejects post-close watch discovery, scans ending before request start, and
+active/`index`/`index.1` captures ending before request start, while admitting
+scan and surface captures that span request initiation. Every negative case
+keeps exact provenance from rehabilitating the impossible evidence.
 They also prove ordered disappearance detection, reject shuffled scan JSONL
 for both set and watermark histories, retain an ordered-scan positive control,
 fail closed on a missing watcher referenced by a nonzero watermark, enforce

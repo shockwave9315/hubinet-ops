@@ -173,6 +173,17 @@ def _use_surface_as_only_discovery(
     return surface
 
 
+def _use_scan_as_only_discovery(
+    records: dict[str, list[dict[str, Any]]], scan_sequence: int
+) -> None:
+    records["watch_events"] = []
+    for scan in records["scan_rounds"]:
+        scan["watch_drained_through_sequence"] = 0
+    exact = records["exact_upid"][0]
+    exact["discovery_source"] = "scan"
+    exact["discovery_reference"] = scan_sequence
+
+
 def _ground_truth_operation(sequence: int, upid: str) -> list[dict[str, Any]]:
     request_id = f"request-{sequence}"
     return [
@@ -697,6 +708,180 @@ def test_perfect_enumeration_is_only_tested_interleaving(tmp_path: Path) -> None
     result = analyze_capture(_materialize(tmp_path, manifest, records))
     assert result.outcome is AnalyzerOutcome.PASS
     assert result.as_dict()["architecture_effect"] == "NONE"
+
+
+def test_pre_t0_watch_cannot_manufacture_post_t0_discovery(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _use_watch_as_only_discovery(
+        records,
+        _watch_event(
+            1,
+            masks=["IN_CREATE"],
+            monotonic_ns=90,
+            upid=UPID_A,
+        ),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("post_t0_watch_event_not_after_t0:1",)
+
+
+def test_watch_exactly_at_t0_belongs_to_pre_t0_establishment(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _use_watch_as_only_discovery(
+        records,
+        _watch_event(
+            1,
+            masks=["IN_CREATE"],
+            monotonic_ns=100,
+            upid=UPID_A,
+        ),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("post_t0_watch_event_not_after_t0:1",)
+
+
+def test_post_t0_watch_before_returning_request_start_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _use_watch_as_only_discovery(
+        records,
+        _watch_event(
+            1,
+            masks=["IN_CREATE"],
+            monotonic_ns=101,
+            upid=UPID_A,
+        ),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "watch_generated_upid:1_predates_request_start",
+    )
+
+
+@pytest.mark.parametrize("watch_time", [110, 111])
+def test_watch_at_or_after_request_start_is_temporally_eligible(
+    tmp_path: Path, watch_time: int
+) -> None:
+    manifest, records = _default_capture()
+    _use_watch_as_only_discovery(
+        records,
+        _watch_event(
+            1,
+            masks=["IN_CREATE"],
+            monotonic_ns=watch_time,
+            upid=UPID_A,
+        ),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_post_close_watch_cannot_satisfy_candidate_discovery(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    watch = _watch_event(
+        1,
+        masks=["IN_CREATE"],
+        monotonic_ns=301,
+        upid=UPID_A,
+    )
+    _use_watch_as_only_discovery(records, watch)
+    for scan in records["scan_rounds"]:
+        scan["watch_drained_through_sequence"] = 0
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_without_valid_discovery_provenance",)
+
+
+def test_scan_ending_before_returning_request_start_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _use_scan_as_only_discovery(records, 1)
+    records["scan_rounds"][0]["scan_start_monotonic_ns"] = 101
+    records["scan_rounds"][0]["scan_end_monotonic_ns"] = 109
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "scan_generated_upid:1_predates_request_start",
+    )
+
+
+def test_scan_spanning_returning_request_start_is_temporally_eligible(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _use_scan_as_only_discovery(records, 1)
+    first, second = records["scan_rounds"]
+    first["scan_start_monotonic_ns"] = 109
+    first["scan_end_monotonic_ns"] = 111
+    second["scan_start_monotonic_ns"] = 112
+    second["scan_end_monotonic_ns"] = 113
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize("source", ["active", "index", "index.1"])
+def test_surface_ending_before_returning_request_start_is_incomplete(
+    tmp_path: Path, source: str
+) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, source)
+    surface["capture_start_monotonic_ns"] = 99
+    surface["capture_end_monotonic_ns"] = 100
+    raw_evidence = (
+        _active_raw(UPID_A) if source == "active" else _archive_raw(UPID_A)
+    )
+    _set_surface_raw(surface, raw_evidence, [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        f"surface_generated_upid:{source}:"
+        f"{surface['observation_sequence']}_predates_request_start",
+    )
+
+
+@pytest.mark.parametrize("source", ["active", "index", "index.1"])
+def test_surface_spanning_returning_request_start_is_temporally_eligible(
+    tmp_path: Path, source: str
+) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, source)
+    surface["capture_start_monotonic_ns"] = 109
+    surface["capture_end_monotonic_ns"] = 111
+    raw_evidence = (
+        _active_raw(UPID_A) if source == "active" else _archive_raw(UPID_A)
+    )
+    _set_surface_raw(surface, raw_evidence, [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
 
 
 def test_explicit_shared_synthetic_clock_domain_may_continue(tmp_path: Path) -> None:
