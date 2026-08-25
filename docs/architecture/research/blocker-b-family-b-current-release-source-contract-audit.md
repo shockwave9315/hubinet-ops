@@ -124,9 +124,9 @@ The main source is
 | Create | `POST /nodes/{node}/qemu` without archive | YES | `qmcreate` | Executing/route node; target VMID | `qm importovf` creates/imports synchronously without a worker | `create_vm`; [`PVE/CLI/qm.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/CLI/qm.pm) `importovf` | `FACT-SOURCE` |
 | Destroy | `DELETE /nodes/{node}/qemu/{vmid}` | YES | `qmdestroy` | Executing node; source VMID | No supported API/CLI destroy bypass found in audited component | `destroy_vm` | `FACT-SOURCE` |
 | Clone, linked/full/snapshot/storage/target variants | `POST /nodes/{node}/qemu/{vmid}/clone` | YES | `qmclone` | Source/route node; source VMID | No supported clone bypass found | `clone_vm` | `FACT-SOURCE` |
-| Snapshot create | `POST /nodes/{node}/qemu/{vmid}/snapshot` | YES | `qmsnapshot` | Route node; VMID | None found | [`src/PVE/API2/Qemu/Snapshot.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu/Snapshot.pm) `snapshot` | `FACT-SOURCE` |
-| Snapshot delete | `DELETE /nodes/{node}/qemu/{vmid}/snapshot/{snapname}` | YES | `qmdelsnapshot` | Route node; VMID | None found | `delsnapshot` | `FACT-SOURCE` |
-| Snapshot rollback | `POST /nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback` | YES | `qmrollback` | Route node; VMID | None found | `rollback` | `FACT-SOURCE` |
+| Snapshot create | `POST /nodes/{node}/qemu/{vmid}/snapshot` | YES | `qmsnapshot` | Route node; VMID | None found | [`src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm) `snapshot` | `FACT-SOURCE` |
+| Snapshot delete | `DELETE /nodes/{node}/qemu/{vmid}/snapshot/{snapname}` | YES | `qmdelsnapshot` | Route node; VMID | None found | [`src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm) `delsnapshot` | `FACT-SOURCE` |
+| Snapshot rollback | `POST /nodes/{node}/qemu/{vmid}/snapshot/{snapname}/rollback` | YES | `qmrollback` | Route node; VMID | None found | [`src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm) `rollback` | `FACT-SOURCE` |
 | Backup restore, same or new VMID, including `force` overwrite and storage variants | `POST /nodes/{node}/qemu` with `archive` | YES | `qmrestore` | Target/route node; target VMID | No supported restore bypass found; `qmrestore` CLI calls this API method | `create_vm`; CLI `qmrestore` | `FACT-SOURCE` |
 | Local migration, online/offline/storage variants | `POST /nodes/{node}/qemu/{vmid}/migrate` | CONDITIONAL | `qmigrate`; HA request wrapper is `hamigrate` | Source/route node; VMID | HA path queues separate HA work; target helper is not always a target-node task | `migrate_vm` | `FACT-SOURCE` |
 | Remote migration source | `POST /nodes/{node}/qemu/{vmid}/remote_migrate` | YES | `qmigrate` | Source node; source VMID | None found for source operation | `remote_migrate_vm` | `FACT-SOURCE` |
@@ -513,6 +513,7 @@ gap into a successor.
 ## 16. Service restart and node reboot source findings
 
 Exact `pve-manager` 9.2.11 includes
+[`PVE/Service/pvedaemon.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/Service/pvedaemon.pm),
 [`pvedaemon.service`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/services/pvedaemon.service),
 [`pvestatd.service`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/services/pvestatd.service),
 and
@@ -520,7 +521,7 @@ and
 
 | Event/property | Source finding | Classification |
 | --- | --- | --- |
-| `pvedaemon` reload configuration | Daemon options request that children remain open on reload. | `FACT-SOURCE` |
+| `pvedaemon` reload configuration | `PVE/Service/pvedaemon.pm` sets `leave_children_open_on_reload => 1`. | `FACT-SOURCE` |
 | `pvedaemon` worker lifetime | Exact task-worker lifetime for reload, stop/restart, and every failure interleaving is not established by that daemon option. | `UNKNOWN` |
 | `pvestatd` restart | On its update loop, it calls `active_workers()` specifically to recover a correct list after unexpected crash, then republishes cluster task status. | `FACT-SOURCE` |
 | Dead active process | `active_workers` detects PID/process-start mismatch, reads final status, and attempts archive append; a killed task can become an error/unknown final status. | `FACT-SOURCE`; pve-common mapping unknown |
@@ -668,12 +669,13 @@ architecture contract.
 | qemu-server | audited upstream 9.2.6; target unknown | [`e6352be...`](https://github.com/proxmox/qemu-server/commit/e6352be67f70042a7433a3a3c712b36d02f9f7cb) | [`src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm) | `create_vm`, `destroy_vm`, `clone_vm` | Create/restore, destroy, clone task types/routes/owners | `FACT-SOURCE`; target mapping unknown |
 | qemu-server | same | same | same | `migrate_vm`, `remote_migrate_vm`, `mtunnel` | Source migration and remote target tunnel workers | `FACT-SOURCE`; target mapping unknown |
 | qemu-server | same | same | same | `move_vm_disk`, config update methods | `qmmove`, async `qmconfig`, synchronous `PUT` bypass | `FACT-SOURCE`; target mapping unknown |
-| qemu-server | same | same | [`src/PVE/API2/Qemu/Snapshot.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu/Snapshot.pm) | snapshot methods | `qmsnapshot`, `qmdelsnapshot`, `qmrollback` | `FACT-SOURCE`; target mapping unknown |
+| qemu-server | same | same | [`src/PVE/API2/Qemu.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/API2/Qemu.pm) | `snapshot`, `delsnapshot`, `rollback` | `qmsnapshot`, `qmdelsnapshot`, `qmrollback` | `FACT-SOURCE`; target mapping unknown |
 | qemu-server | same | same | [`src/PVE/CLI/qm.pm`](https://github.com/proxmox/qemu-server/blob/e6352be67f70042a7433a3a3c712b36d02f9f7cb/src/PVE/CLI/qm.pm) | `importdisk`, `importovf`, `unlink`, `mtunnel` | Supported synchronous no-UPID routes and local helper | `FACT-SOURCE`; target mapping unknown |
 | pve-manager | 9.2.11 | [`f6997e...`](https://github.com/proxmox/pve-manager/commit/f6997e698c7933ea8e62319e2bf1bf7262daa56a) | [`PVE/API2/Tasks.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/API2/Tasks.pm) | task index/status/log route methods | Active/archive/all enumeration, offsets, filters, authorization, exact-UPID behavior | `FACT-SOURCE` |
 | pve-manager | 9.2.11 | same | [`PVE/API2/Cluster.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/API2/Cluster.pm) | `get_tasklist` route | Cluster task route and authorization filter | `FACT-SOURCE` |
 | pve-manager | 9.2.11 | same | [`PVE/Service/pvestatd.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/Service/pvestatd.pm) | `update_status` | Active scan and periodic cluster publication | `FACT-SOURCE` |
 | pve-manager | 9.2.11 | same | [`bin/pveupdate`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/bin/pveupdate) | `cleanup_tasks` | Exact-UPID log cleanup boundary | `FACT-SOURCE` |
+| pve-manager | 9.2.11 | same | [`PVE/Service/pvedaemon.pm`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/PVE/Service/pvedaemon.pm) | `leave_children_open_on_reload` daemon option | Children remain open on daemon reload | `FACT-SOURCE` |
 | pve-manager | 9.2.11 | same | [`services/pvedaemon.service`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/services/pvedaemon.service), [`pvestatd.service`](https://github.com/proxmox/pve-manager/blob/f6997e698c7933ea8e62319e2bf1bf7262daa56a/services/pvestatd.service) | unit definitions | Service start/stop/reload entry points | `FACT-SOURCE` |
 | pve-cluster | 9.1.6 | [`7091d92...`](https://github.com/proxmox/pve-cluster/commit/7091d92e594952dba65c1e57568b3d7cc244e960) | [`src/PVE/Cluster.pm`](https://github.com/proxmox/pve-cluster/blob/7091d92e594952dba65c1e57568b3d7cc244e960/src/PVE/Cluster.pm) | `broadcast_tasklist`, `get_tasklist` | 32 KiB per-node publication and membership-based cache aggregation | `FACT-SOURCE` |
 | pve-common | audited 9.1.21/9.2.1 endpoints; target unknown | [`f665029...`](https://github.com/proxmox/pve-common/commit/f665029eac78022e81810ab2e44eace57ade13fb) | [`src/PVE/RESTEnvironment.pm`](https://github.com/proxmox/pve-common/blob/f665029eac78022e81810ab2e44eace57ade13fb/src/PVE/RESTEnvironment.pm) | `fork_worker`, `active_workers` | UPID start ordering, archive append, rotation, active retention | `FACT-SOURCE`; mapping unknown |
