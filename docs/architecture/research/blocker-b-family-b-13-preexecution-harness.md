@@ -208,14 +208,16 @@ observed post-T0 UPID must bind to the approved ground-truth generator; there
 is no implicit third category for ambient or unexplained work in this initial
 dedicated-fixture protocol.
 
-Baseline membership does not imply quiescence. `t0_quiescence` must be committed
-before T0 and reference complete local `active`, `index`, and `index.1`
-observations captured after the baseline scan. The referenced active set must
-be empty. Every baseline UPID must have exactly one finalized supported/in-scope
-or classified-out-of-scope record referencing final, readable exact evidence
-captured before the quiescence commit and T0; the analyzer derives which of the
-two classifications is valid by decoding node/type/id/owner against the
-generator scope. `pending_upids` must be empty.
+Baseline membership does not imply quiescence. The `t0_quiescence` commit is
+the logical T0: `committed_at_monotonic_ns` must equal `t0_monotonic_ns`, with
+no grace interval between them. It must reference complete local `active`,
+`index`, and `index.1` observations captured after the baseline scan. The
+referenced active set must be empty. Every baseline UPID must have exactly one
+finalized supported/in-scope or classified-out-of-scope record referencing
+final, readable exact evidence captured no later than the quiescence
+commit/T0; the analyzer derives which of the two classifications is valid by
+decoding node/type/id/owner against the generator scope. `pending_upids` must
+be empty.
 Missing, active, pending, non-final, unclassified, late, or mismatched evidence
 prevents positive close. Historical finalized exact/archive records may remain;
 retention is not worker liveness.
@@ -237,6 +239,11 @@ repair them. A generator on another host or time namespace is ineligible until
 a separately reviewed cross-clock correlation protocol exists. The analyzer
 validates clock eligibility before comparing generator windows, API overlap,
 rotation timing, or watch/scan/surface order.
+
+For a future `disposable_pve` capture, the separately reviewed
+collector/preflight must derive the clock-domain and time-namespace evidence
+from the actual fixture environment. Arbitrary operator-entered strings are not
+proof of that binding. This package does not implement that collector.
 
 ### 4.3 Pre-T0 watch-first establishment
 
@@ -261,7 +268,11 @@ bucket has a root event, child-watch installation and affected-directory
 rescan; and the selected terminal baseline rounds are consecutive, complete,
 ordered, equal to each other and to the committed baseline set. Their second
 watermark must drain every relevant watcher sequence, and both rounds and all
-required rescans must finish before the quiescence commit and T0. Final local
+required rescans must finish no later than the quiescence commit/logical T0.
+Every pre-T0 watcher record at or before T0 must be covered. An event after the
+selected terminal scan invalidates that fixed point and requires another
+rescan/fixed-point establishment before T0; it cannot be excluded by an earlier
+commit timestamp. Final local
 surface, active/pending, classification and exact-status quiescence checks then
 remain independently required.
 
@@ -536,9 +547,11 @@ T0: task-root and existing-bucket watches precede the explicitly phased
 baseline enumeration; lazy buckets require a root event, child watch, and
 affected-directory rescan; the referenced consecutive complete baseline scans
 have equal normalized sets and drain all relevant pre-T0 watch events; and all
-of this precedes the quiescence commit and T0. The referenced local surface
-captures and every required baseline exact finalization also precede the
-commit; the active and pending sets are empty; and every retained baseline UPID
+of this finishes by the quiescence commit, which exactly defines logical T0.
+Any watcher record through T0 that follows the selected terminal scan
+invalidates that fixed point. The referenced local surface captures and every
+required baseline exact finalization also finish no later than T0; the active
+and pending sets are empty; and every retained baseline UPID
 is finalized and classified. A retained historical log or archive line is not
 treated as a running worker. These checks prove protocol execution, not
 universal kernel/filesystem completeness.
@@ -643,6 +656,10 @@ missing disposable-fixture contract, mismatched generator/reader domains, and
 a boot-ID mismatch; one explicit shared synthetic clock domain may continue.
 The baseline-classification regression also locks owner/auth identity into the
 existing node/type/id/owner comparison.
+The final boundary regressions reject a quiescence commit earlier than T0 and a
+watch event after the selected terminal fixed point but at or before T0. The
+positive control commits quiescence exactly at T0 after a fully drained fixed
+point, with normal generated work beginning afterward.
 
 ## 11. Exact false-clean witness boundary
 
@@ -752,7 +769,9 @@ intentionally provides no executable generator or destructive cleanup command.
    preflight. Record and verify the single-node/single-boot/single-time-namespace
    `CLOCK_MONOTONIC` contract for every timestamp-producing participant before
    making any cross-plane ordering comparison; mismatch makes the run
-   ineligible.
+   ineligible. The later reviewed collector/preflight must derive this evidence
+   from the fixture environment, never accept operator-entered identifiers as
+   proof.
 3. Record filesystem/mount context and disk/log free-space; set numeric stop
    thresholds before starting any process.
 4. Start the independent ground-truth writer; verify durable test write,
@@ -766,7 +785,9 @@ intentionally provides no executable generator or destructive cleanup command.
    sets and a second watermark draining every relevant pre-T0 watch event.
    Reference those exact rounds from `t0_quiescence`; then capture
    active/index/index.1, obtain pre-T0 final exact/classification evidence for
-   every baseline UPID, prove active/pending empty, and commit quiescent T0.
+   every baseline UPID, prove active/pending empty, and atomically commit
+   quiescence as logical T0 with identical monotonic values and no intervening
+   grace interval.
    Also record API profiles and the explicit subrun contract/evidence ids.
 7. Execute exactly one approved bounded subrun. Any generator action at this
    stage is **NOT AUTHORIZED / TEMPLATE ONLY** until that separate approval.

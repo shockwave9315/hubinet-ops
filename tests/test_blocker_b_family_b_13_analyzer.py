@@ -193,7 +193,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
         },
         "t0_quiescence": {
             "state": "QUIESCENT",
-            "committed_at_monotonic_ns": 90,
+            "committed_at_monotonic_ns": 100,
             "pending_upids": [],
             "surface_observation_sequences": {
                 "active": 1,
@@ -1060,7 +1060,66 @@ def test_post_t0_watch_and_fixed_point_cannot_establish_quiescent_t0(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
-    assert "pre_t0_root_watch_not_installed_before_baseline" in result.reasons
+    assert "pre_t0_watch_event_after_t0" in result.reasons
+
+
+def test_quiescence_commit_before_t0_is_invalid_even_with_later_watch_event(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    manifest["t0_quiescence"]["committed_at_monotonic_ns"] = 90
+    records["pre_t0_establishment"].append(
+        {
+            "establishment_sequence": 5,
+            "event": "watch_event",
+            "watcher_sequence": 3,
+            "watch_scope": "task_root",
+            "mask": ["IN_ATTRIB"],
+            "monotonic_ns": 95,
+            "complete": True,
+        }
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "t0_quiescence_commit_must_equal_t0" in result.reasons
+
+
+def test_watch_event_after_terminal_fixed_point_before_t0_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"].append(
+        {
+            "establishment_sequence": 5,
+            "event": "watch_event",
+            "watcher_sequence": 3,
+            "watch_scope": "task_root",
+            "mask": ["IN_ATTRIB"],
+            "monotonic_ns": 95,
+            "complete": True,
+        }
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "pre_t0_watch_event_undrained" in result.reasons
+
+
+def test_quiescence_commit_at_t0_with_drained_fixed_point_may_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+
+    assert manifest["t0_quiescence"]["committed_at_monotonic_ns"] == manifest[
+        "t0_monotonic_ns"
+    ]
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
 
 
 def test_missing_root_watch_before_baseline_cannot_pass(tmp_path: Path) -> None:

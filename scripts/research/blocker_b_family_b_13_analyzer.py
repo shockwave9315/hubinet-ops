@@ -806,6 +806,8 @@ def _validate_pre_t0_establishment(
     }
     quiescence = _require_mapping(manifest["t0_quiescence"], "t0_quiescence")
     committed = _require_int(quiescence, "committed_at_monotonic_ns")
+    if committed != t0:
+        raise CaptureError("t0_quiescence_commit_must_equal_t0")
     establishment_reference = _require_mapping(
         quiescence.get("pre_t0_establishment"),
         "t0_quiescence.pre_t0_establishment",
@@ -842,6 +844,8 @@ def _validate_pre_t0_establishment(
             if watcher_sequence == 0 or watcher_sequence in watcher_records:
                 raise CaptureError("pre_t0_watcher_sequence_zero_or_duplicate")
             event_time = _require_int(record, "monotonic_ns")
+            if event_time > t0:
+                raise CaptureError("pre_t0_watch_event_after_t0")
             if event_time < prior_time:
                 raise CaptureError("pre_t0_establishment_time_reversed")
             prior_time = event_time
@@ -851,6 +855,10 @@ def _validate_pre_t0_establishment(
         elif event == "baseline_scan":
             if record.get("phase") != "PRE_T0_BASELINE":
                 raise CaptureError("pre_t0_baseline_scan_phase_invalid")
+            scan_start = _require_int(record, "scan_start_monotonic_ns")
+            scan_end = _require_int(record, "scan_end_monotonic_ns")
+            if scan_end < scan_start or scan_end > t0:
+                raise CaptureError("pre_t0_baseline_scan_time_invalid")
             scan_sequence = _require_int(record, "baseline_scan_sequence")
             if scan_sequence == 0 or scan_sequence in baseline_scans:
                 raise CaptureError("pre_t0_baseline_scan_sequence_zero_or_duplicate")
@@ -858,6 +866,10 @@ def _validate_pre_t0_establishment(
         elif event == "bucket_rescan":
             if record.get("phase") != "PRE_T0_BUCKET_RESCAN":
                 raise CaptureError("pre_t0_bucket_rescan_phase_invalid")
+            rescan_start = _require_int(record, "scan_start_monotonic_ns")
+            rescan_end = _require_int(record, "scan_end_monotonic_ns")
+            if rescan_end < rescan_start or rescan_end > t0:
+                raise CaptureError("pre_t0_bucket_rescan_time_invalid")
             bucket_rescans.append(record)
         else:
             raise CaptureError(f"unknown_pre_t0_establishment_event:{event}")
@@ -895,7 +907,7 @@ def _validate_pre_t0_establishment(
         scan_end = _require_int(scan, "scan_end_monotonic_ns")
         if not (
             root_time < baseline_start <= scan_start <= scan_end <= baseline_end
-            <= committed < t0
+            <= committed == t0
         ):
             raise CaptureError("pre_t0_baseline_scan_time_invalid")
         if (
@@ -941,10 +953,20 @@ def _validate_pre_t0_establishment(
     relevant_pre_t0_watchers = {
         sequence
         for sequence, record in watcher_records.items()
-        if _require_int(record, "monotonic_ns") <= committed
+        if _require_int(record, "monotonic_ns") <= t0
     }
     if relevant_pre_t0_watchers and declared_watermark < max(relevant_pre_t0_watchers):
         raise CaptureError("pre_t0_watch_event_undrained")
+    terminal_scan_establishment_sequence = _require_int(
+        selected_scans[1], "establishment_sequence"
+    )
+    if any(
+        _require_int(record, "establishment_sequence")
+        > terminal_scan_establishment_sequence
+        for record in watcher_records.values()
+        if _require_int(record, "monotonic_ns") <= t0
+    ):
+        raise CaptureError("pre_t0_watch_event_after_terminal_fixed_point")
 
     first_scan_start = _require_int(selected_scans[0], "scan_start_monotonic_ns")
     installed_buckets: dict[str, list[Mapping[str, Any]]] = {}
@@ -986,7 +1008,7 @@ def _validate_pre_t0_establishment(
             event.get("watch_scope") != "task_root"
             or "IN_ISDIR" not in masks
             or not masks.intersection({"IN_CREATE", "IN_MOVED_TO"})
-            or not root_time <= event_time < committed
+            or not root_time <= event_time <= t0
         ):
             raise CaptureError("pre_t0_lazy_bucket_event_invalid")
         trigger_sequence = _require_int(event, "watcher_sequence")
@@ -1068,7 +1090,7 @@ def _validate_t0_quiescence(
     if quiescence.get("state") != "QUIESCENT":
         raise CaptureError("t0_not_declared_quiescent")
     committed = _require_int(quiescence, "committed_at_monotonic_ns")
-    if not baseline_end <= committed < t0:
+    if not baseline_end <= committed == t0:
         raise CaptureError("t0_quiescence_commit_time_invalid")
     pending = {
         _require_upid(value, "t0_quiescence.pending_upids")
@@ -1096,7 +1118,7 @@ def _validate_t0_quiescence(
             <= _require_int(surface, "capture_start_monotonic_ns")
             <= _require_int(surface, "capture_end_monotonic_ns")
             <= committed
-            < t0
+            == t0
         ):
             raise CaptureError(f"t0_quiescence_surface_time_invalid:{source}")
         if not surface.get("readable") or not surface.get("complete"):
@@ -1140,7 +1162,7 @@ def _validate_t0_quiescence(
         if exact is None or exact.get("known_upid") != upid or upid not in exact_final:
             raise CaptureError("t0_quiescence_final_exact_reference_invalid")
         exact_end = _require_int(exact, "capture_end_monotonic_ns")
-        if exact_end > committed or exact_end >= t0:
+        if exact_end > committed or exact_end > t0:
             raise CaptureError("t0_quiescence_final_exact_not_before_t0")
         latest_exact_end = max(latest_exact_end, exact_end)
     if classified_upids != baseline_upids:
