@@ -318,6 +318,12 @@ invalidation state, monotonic/wall timestamps, and raw read-buffer ordering.
 `IN_Q_OVERFLOW`, `IN_IGNORED`, `IN_UNMOUNT`, `IN_DELETE_SELF`, and
 `IN_MOVE_SELF` are preserved even without a filename.
 
+`raw_order` is a harness-assigned, one-based capture-order sequence. The v4
+analyzer requires JSONL physical order, `watcher_sequence`, and `raw_order` to
+be the same contiguous `1..N` sequence. This checks that sealed records retain
+the observer's raw capture order; it is not a kernel cursor, an inotify
+completeness proof, or a theorem about causal ordering inside the kernel.
+
 ### 4.6 Scan rounds
 
 `scan-rounds.jsonl` records a contiguous monotonic `scan_sequence`, `round_id`,
@@ -330,6 +336,13 @@ with identical normalized sets and no relevant watcher sequence left undrained.
 Watcher sequence/time and each scan's drain watermark are cross-checked so a
 scan cannot claim an event that occurred after it ended. A disappearing exact
 log or unreadable/malformed/inconsistent scan latches a gap.
+
+The JSONL records themselves must physically occur in ascending
+`scan_sequence`; out-of-order capture is `HARNESS_INCOMPLETE`. After parsing,
+all watermark monotonicity, scan-time ordering, disappearance, adjacency, and
+terminal fixed-point semantics are evaluated over sorted `scan_sequence`,
+never raw iteration order. A nonzero drain watermark must reference an existing
+watcher sequence or the capture is incomplete.
 
 ### 4.7 Active and archive observations
 
@@ -383,8 +396,11 @@ overflow, dropped-input simulation, and explicit gap signals. Every event must
 bind to `reader_context.process_identity`. The analyzer considers every
 heartbeat in the open interval, requires the last pre-close heartbeat to be
 healthy and fresh, and enforces start <= T0 < close < finalization <= stop. An
-unhealthy/stale/missing heartbeat, early stop, crash, missing finalizer, or
-version mismatch cannot produce a positive result.
+explicit structurally valid unhealthy or stale heartbeat is observer-health
+loss and yields `B_S1_GAP_DETECTED`. A missing, malformed, non-contiguous, or
+wrong-identity heartbeat stream is instead `HARNESS_INCOMPLETE`, as are
+incoherent process boundaries, crash, missing finalizer, or version mismatch.
+Neither class can produce a positive result.
 
 ## 5. Ground-truth generator contract
 
@@ -576,13 +592,16 @@ capture structure:
 | 13B | sequenced pages for one source with multiple actual offsets overlapping an in-window generator request schedule |
 | 13C | an in-window generated target present in ordered active then archive surface observations |
 | 13D | old `index` hash and device/inode reappear as `index.1`, new `index` differs, matching rename watch evidence exists, captured rotation content includes an in-window generated UPID, and the marker binds every in-window generator sequence while rotation occurs inside the generated run |
-| 13E | a matching raw overflow or invalidation/loss signal; the successful expected classification is `B_S1_GAP_DETECTED` |
+| 13E | a matching raw overflow or invalidation/loss signal at or before candidate close; the exact qualifying watch record must also cause the observer GAP, and the successful expected classification is `B_S1_GAP_DETECTED` |
 | 13F | one in-window generated target/watch event inside the referenced scan interval and present in that scan |
 | 13G | at least two phenomena explicitly selected by this run contract, each independently satisfying its corresponding generated-run/raw check |
 
 A subrun label or task count is never phenomenon evidence. In particular, 13D
 cannot pass without observed rotation, and 13E cannot emit a plain analyzer
-PASS after its required signal. Every positive subrun except 13E requires at
+PASS after its required in-interval signal. A matching 13E signal only after
+candidate close does not exercise 13E for that run and cannot satisfy its
+obligation; no claim is made about which dropped events a post-close overflow
+represents. Every positive subrun except 13E requires at
 least one in-window generated operation; baseline history alone cannot satisfy
 13A–13D, 13F, or 13G. 13E may use no unrelated generated task because its
 intended successful result is the approved injected gap signal.
@@ -626,7 +645,8 @@ exercise a collector.
 | 8 | Known exact log deleted by cleanup | `B_S1_GAP_DETECTED` |
 | 9 | Unknown pre-enumeration log deleted without watch signal | generator-window enumeration witness |
 | 10 | Surviving overlap anchors around a removed unknown intermediate log | generator-window enumeration witness; anchors do not clean the run |
-| 11 | Crash or missing/stale heartbeat before close | `HARNESS_INCOMPLETE` |
+| 11 | Valid heartbeat explicitly unhealthy/stale before close | `B_S1_GAP_DETECTED` |
+| 11a | Missing/malformed/wrong-identity heartbeat evidence or incoherent process lifecycle | `HARNESS_INCOMPLETE` |
 | 12 | Incomplete/corrupt capture file | `HARNESS_INCOMPLETE` |
 | 13 | Generator sequence gap or missing finalizer | `HARNESS_INCOMPLETE` |
 | 14 | Source/version mismatch | `ENVIRONMENT_INELIGIBLE` |
@@ -660,6 +680,14 @@ The final boundary regressions reject a quiescence commit earlier than T0 and a
 watch event after the selected terminal fixed point but at or before T0. The
 positive control commits quiescence exactly at T0 after a fully drained fixed
 point, with normal generated work beginning afterward.
+Final independent-review regressions reject matching 13E signals that occur
+only after candidate close, with zero or normal generated work and with an
+unrelated benign in-window watch; an in-window matching signal remains a GAP.
+They also prove ordered disappearance detection, reject shuffled scan JSONL
+for both set and watermark histories, retain an ordered-scan positive control,
+fail closed on a missing watcher referenced by a nonzero watermark, enforce
+raw watch capture order, and distinguish valid stale-heartbeat GAP from missing
+heartbeat-stream incompleteness.
 
 ## 11. Exact false-clean witness boundary
 

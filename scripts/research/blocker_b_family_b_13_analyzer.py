@@ -118,7 +118,7 @@ class CaptureError(ValueError):
     """The capture cannot be interpreted completely."""
 
 
-class EnvironmentError(ValueError):
+class CaptureEnvironmentError(ValueError):
     """The capture context is not eligible for this exact protocol."""
 
 
@@ -255,7 +255,7 @@ def _analyzer_source_sha256() -> str:
     try:
         return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     except OSError as exc:
-        raise EnvironmentError("analyzer_source_unreadable") from exc
+        raise CaptureEnvironmentError("analyzer_source_unreadable") from exc
 
 
 def _validate_generator_contract(
@@ -297,7 +297,9 @@ def _validate_generator_contract(
         return contract
     except CaptureError as exc:
         if fixture_kind == "disposable_pve":
-            raise EnvironmentError(f"generator_contract_ineligible:{exc}") from exc
+            raise CaptureEnvironmentError(
+                f"generator_contract_ineligible:{exc}"
+            ) from exc
         raise
 
 
@@ -323,7 +325,7 @@ def _validate_subrun_contract(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
         if len(required) < 2 or not required.issubset(COMBINED_PHENOMENA):
             raise CaptureError("combined_subrun_contract_invalid")
     else:
-        raise EnvironmentError("unsupported_subrun_id")
+        raise CaptureEnvironmentError("unsupported_subrun_id")
     evidence_ids = _require_mapping(
         contract.get("evidence_ids"), "subrun_contract.evidence_ids"
     )
@@ -375,7 +377,7 @@ def _validate_clock_contract(
         # Cross-process monotonic comparisons are load-bearing throughout v4.
         # A missing or mismatched contract is therefore an environment
         # eligibility failure, including for synthetic captures.
-        raise EnvironmentError(f"clock_contract_ineligible:{exc}") from exc
+        raise CaptureEnvironmentError(f"clock_contract_ineligible:{exc}") from exc
 
 
 def _validate_manifest(manifest: Mapping[str, Any]) -> None:
@@ -387,7 +389,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
     }
     for field, expected in exact_values.items():
         if manifest.get(field) != expected:
-            raise EnvironmentError(f"context_mismatch:{field}")
+            raise CaptureEnvironmentError(f"context_mismatch:{field}")
 
     for field in (
         "run_uuid",
@@ -402,11 +404,11 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
     fixture_kind = _require_text(manifest, "fixture_kind")
     fixture_id = str(manifest["fixture_id"])
     if fixture_id.lower() == "ct112":
-        raise EnvironmentError("ct112_is_not_a_family_b_fixture")
+        raise CaptureEnvironmentError("ct112_is_not_a_family_b_fixture")
     if fixture_kind not in {"synthetic", "disposable_pve"}:
-        raise EnvironmentError("unsupported_fixture_kind")
+        raise CaptureEnvironmentError("unsupported_fixture_kind")
     if fixture_kind == "disposable_pve" and "placeholder" in fixture_id.lower():
-        raise EnvironmentError("fixture_identity_is_placeholder")
+        raise CaptureEnvironmentError("fixture_identity_is_placeholder")
 
     # Establish one shared monotonic domain before validating any timestamp
     # relation emitted by different capture participants.
@@ -523,22 +525,22 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
         )
     for component, expected in EXPECTED_SOURCE_LEDGER.items():
         if observed.get(component) != expected:
-            raise EnvironmentError(f"source_version_mismatch:{component}")
+            raise CaptureEnvironmentError(f"source_version_mismatch:{component}")
     if manifest.get("loaded_code_status") != "exact_context_matched":
-        raise EnvironmentError("loaded_code_context_not_matched")
+        raise CaptureEnvironmentError("loaded_code_context_not_matched")
 
 
 def _validate_seal(root: Path, seal: Mapping[str, Any]) -> None:
     if seal.get("schema_revision") != SCHEMA_REVISION:
         raise CaptureError("seal_schema_mismatch")
     if seal.get("analyzer_revision") != ANALYZER_REVISION:
-        raise EnvironmentError("analyzer_revision_mismatch")
+        raise CaptureEnvironmentError("analyzer_revision_mismatch")
     _require_text(seal, "analyzer_commit")
     analyzer_source_sha256 = _require_text(seal, "analyzer_source_sha256")
     if re.fullmatch(r"[0-9a-f]{64}", analyzer_source_sha256) is None:
         raise CaptureError("analyzer_source_hash_not_sha256")
     if analyzer_source_sha256 != _analyzer_source_sha256():
-        raise EnvironmentError("analyzer_source_hash_mismatch")
+        raise CaptureEnvironmentError("analyzer_source_hash_mismatch")
     entries = _require_sequence(seal.get("files"), "seal.files")
     expected_names = {"manifest.json", *CAPTURE_FILES.values()}
     seen: set[str] = set()
@@ -668,7 +670,9 @@ def _ground_truth(
             if start[field] != end.get(field):
                 raise CaptureError(f"ground_truth_request_pair_mismatch:{sequence}:{field}")
         if end["operation"] != generator_contract["approved_operation"]:
-            raise EnvironmentError("generated_operation_outside_approved_contract")
+            raise CaptureEnvironmentError(
+                "generated_operation_outside_approved_contract"
+            )
         if end.get("outcome") != "success":
             raise CaptureError(f"ground_truth_request_not_successful:{sequence}")
         upid = _require_upid(end.get("returned_upid"), "returned_upid")
@@ -695,7 +699,7 @@ def _ground_truth(
             or decoded["node"] != generator_contract["expected_node"]
             or decoded["owner"] != generator_contract["expected_owner"]
         ):
-            raise EnvironmentError("generated_upid_outside_approved_contract")
+            raise CaptureEnvironmentError("generated_upid_outside_approved_contract")
         relation = end.get("generator_window_relation")
         if relation not in {
             "inside_generator_window",
@@ -787,6 +791,23 @@ def _validate_raw_result(
 def _stat_identity(record: Mapping[str, Any], field: str) -> tuple[int, int]:
     stat = _require_mapping(record.get("stat"), field)
     return (_require_int(stat, "device"), _require_int(stat, "inode"))
+
+
+def _watch_gap_reasons(record: Mapping[str, Any]) -> frozenset[str]:
+    """Return the exact observer-gap reasons structurally carried by a watch."""
+
+    masks = set(record.get("_masks", ()))
+    reasons: set[str] = set()
+    if record.get("queue_overflow") is True or "IN_Q_OVERFLOW" in masks:
+        reasons.add("watch_queue_overflow")
+    if (
+        record.get("event_type") in {"watch_invalidation", "watch_loss"}
+        or masks.intersection(
+            {"IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"}
+        )
+    ):
+        reasons.add("watch_invalidation_or_loss")
+    return frozenset(reasons)
 
 
 def _validate_pre_t0_establishment(
@@ -1176,6 +1197,7 @@ def _validate_subrun_obligations(
     expected_upids: set[str],
     generator_window_operations: Sequence[Mapping[str, Any]],
     positive_close_candidate: bool,
+    close_monotonic: int,
     watches: Mapping[int, Mapping[str, Any]],
     scans: Mapping[int, Mapping[str, Any]],
     surfaces: Mapping[int, Mapping[str, Any]],
@@ -1364,25 +1386,15 @@ def _validate_subrun_obligations(
 
     if "watch_overflow_or_invalidation" in required:
         evidence_id = str(evidence_ids["watch_overflow_or_invalidation"])
-        signal_present = any(
-            watch.get("phenomenon_id") == evidence_id
-            and (
-                watch.get("queue_overflow") is True
-                or set(watch["_masks"]).intersection(
-                    {
-                        "IN_Q_OVERFLOW",
-                        "IN_IGNORED",
-                        "IN_UNMOUNT",
-                        "IN_DELETE_SELF",
-                        "IN_MOVE_SELF",
-                    }
-                )
-                or watch.get("event_type") in {"watch_invalidation", "watch_loss"}
-            )
+        relevant_matching_signals = [
+            watch
             for watch in watches.values()
-        )
-        if not signal_present:
-            raise CaptureError("subrun_watch_loss_signal_not_evidenced")
+            if _require_int(watch, "monotonic_ns") <= close_monotonic
+            and watch.get("phenomenon_id") == evidence_id
+            and _watch_gap_reasons(watch)
+        ]
+        if not relevant_matching_signals:
+            raise CaptureError("subrun_watch_loss_signal_not_evidenced_before_close")
 
 
 def _analyze_loaded(
@@ -1494,21 +1506,27 @@ def _analyze_loaded(
     watch_known: set[str] = set()
     watch_deleted: set[str] = set()
     watches: dict[int, dict[str, Any]] = {}
+    physical_watcher_sequences: list[int] = []
+    raw_orders: list[int] = []
     for source_record in records["watch_events"]:
         record = dict(source_record)
         watcher_sequence = _require_int(record, "watcher_sequence")
         if watcher_sequence == 0 or watcher_sequence in watches:
             raise CaptureError("watcher_sequence_zero_or_duplicate")
+        physical_watcher_sequences.append(watcher_sequence)
         _require_signed_int(record, "watch_descriptor")
         _require_int(record, "cookie")
         _require_int(record, "raw_mask")
-        _require_int(record, "raw_order")
+        raw_order = _require_int(record, "raw_order")
+        if raw_order == 0:
+            raise CaptureError("watch_raw_order_zero")
+        raw_orders.append(raw_order)
         _require_string(record, "watched_path")
         _require_string(record, "filename")
-        overflow = _require_bool(record, "queue_overflow")
+        _require_bool(record, "queue_overflow")
         event_time = _require_int(record, "monotonic_ns")
         _require_text(record, "wall_timestamp")
-        event_type = _require_text(record, "event_type")
+        _require_text(record, "event_type")
         masks = {
             _require_text({"value": value}, "value")
             for value in _require_sequence(record.get("mask"), "watch.mask")
@@ -1516,15 +1534,8 @@ def _analyze_loaded(
         record["_masks"] = masks
         watches[watcher_sequence] = record
         relevant = event_time <= close_monotonic
-        if relevant and (overflow or "IN_Q_OVERFLOW" in masks):
-            gap_reasons.add("watch_queue_overflow")
-        if relevant and (
-            event_type in {"watch_invalidation", "watch_loss"}
-            or masks.intersection(
-                {"IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"}
-            )
-        ):
-            gap_reasons.add("watch_invalidation_or_loss")
+        if relevant:
+            gap_reasons.update(_watch_gap_reasons(record))
         upid_value = record.get("normalized_upid")
         if upid_value is not None:
             upid = _require_upid(upid_value, "watch.normalized_upid")
@@ -1534,8 +1545,11 @@ def _analyze_loaded(
                 watch_known.add(upid)
             if relevant and masks.intersection({"IN_DELETE", "IN_MOVED_FROM"}):
                 watch_deleted.add(upid)
-    if watches and set(watches) != set(range(1, max(watches) + 1)):
-        raise CaptureError("watcher_sequence_gap")
+    expected_watch_order = list(range(1, len(watches) + 1))
+    if physical_watcher_sequences != expected_watch_order:
+        raise CaptureError("watcher_sequence_not_contiguous_or_jsonl_ordered")
+    if raw_orders != expected_watch_order or raw_orders != physical_watcher_sequences:
+        raise CaptureError("watch_raw_order_not_contiguous_or_capture_ordered")
     watcher_times = [
         _require_int(watches[sequence], "monotonic_ns") for sequence in sorted(watches)
     ]
@@ -1543,14 +1557,16 @@ def _analyze_loaded(
         raise CaptureError("watcher_sequence_time_reversed")
 
     scan_known: set[str] = set()
-    prior_scan: set[str] | None = None
     scans: dict[int, dict[str, Any]] = {}
-    prior_watermark = 0
+    physical_scan_sequences: list[int] = []
+
+    # Phase 1: decode each record without applying sequence-sensitive meaning.
     for source_record in records["scan_rounds"]:
         record = dict(source_record)
         sequence = _require_int(record, "scan_sequence")
         if sequence == 0 or sequence in scans:
             raise CaptureError("scan_sequence_zero_or_duplicate")
+        physical_scan_sequences.append(sequence)
         _require_text(record, "round_id")
         scan_start = _require_int(record, "scan_start_monotonic_ns")
         scan_end = _require_int(record, "scan_end_monotonic_ns")
@@ -1573,22 +1589,52 @@ def _analyze_loaded(
         malformed = _require_sequence(
             record.get("malformed_entries"), "scan.malformed_entries"
         )
-        complete = _require_bool(record, "complete")
+        _require_bool(record, "complete")
+        _require_int(record, "watch_drained_through_sequence")
+        record["_unreadable_entries"] = unreadable
+        record["_malformed_entries"] = malformed
+        scans[sequence] = record
+
+    expected_scan_sequences = list(range(1, len(scans) + 1))
+    if len(scans) < 2 or set(scans) != set(expected_scan_sequences):
+        raise CaptureError("scan_sequence_not_contiguous_or_too_short")
+    if physical_scan_sequences != expected_scan_sequences:
+        raise CaptureError("scan_sequence_not_jsonl_ordered")
+
+    # Phase 2: every adjacency, disappearance, watermark, and timing decision
+    # follows declared scan_sequence, never JSONL iteration order.
+    prior_scan: set[str] | None = None
+    prior_watermark = 0
+    prior_scan_end: int | None = None
+    for sequence in sorted(scans):
+        record = scans[sequence]
+        scan_start = _require_int(record, "scan_start_monotonic_ns")
+        scan_end = _require_int(record, "scan_end_monotonic_ns")
+        current = set(record["_normalized_upids"])
         watermark = _require_int(record, "watch_drained_through_sequence")
-        if watermark < prior_watermark or (watches and watermark > max(watches)):
-            raise CaptureError("scan_watch_drain_watermark_invalid")
-        if watermark and _require_int(watches[watermark], "monotonic_ns") > scan_end:
-            raise CaptureError("scan_watch_drain_watermark_after_scan_end")
-        prior_watermark = watermark
-        if unreadable or malformed or not complete or record.get("consistency_marker") == "inconsistent":
+        if watermark < prior_watermark:
+            raise CaptureError("scan_watch_drain_watermark_reversed")
+        if watermark:
+            referenced_watch = watches.get(watermark)
+            if referenced_watch is None:
+                raise CaptureError("scan_watch_drain_watermark_reference_missing")
+            if _require_int(referenced_watch, "monotonic_ns") > scan_end:
+                raise CaptureError("scan_watch_drain_watermark_after_scan_end")
+        if prior_scan_end is not None and scan_start < prior_scan_end:
+            raise CaptureError("scan_sequence_time_overlap_or_reversed")
+        if (
+            record["_unreadable_entries"]
+            or record["_malformed_entries"]
+            or not record["complete"]
+            or record.get("consistency_marker") == "inconsistent"
+        ):
             gap_reasons.add("scan_unreadable_malformed_or_inconsistent")
         if prior_scan is not None and prior_scan - current:
             gap_reasons.add("exact_log_disappeared_between_scans")
         prior_scan = current
+        prior_watermark = watermark
+        prior_scan_end = scan_end
         scan_known.update(current)
-        scans[sequence] = record
-    if set(scans) != set(range(1, len(scans) + 1)) or len(scans) < 2:
-        raise CaptureError("scan_sequence_not_contiguous_or_too_short")
     terminal_scans = [scans[len(scans) - 1], scans[len(scans)]]
     if not all(scan["complete"] for scan in terminal_scans):
         gap_reasons.add("terminal_scan_incomplete")
@@ -1848,6 +1894,7 @@ def _analyze_loaded(
         expected_upids,
         generator_window_operations,
         close_state == "CLOSED_COMPLETE" and not gap_reasons,
+        close_monotonic,
         watches,
         scans,
         surfaces,
@@ -1927,7 +1974,7 @@ def analyze_capture(capture_dir: str | os.PathLike[str]) -> AnalysisResult:
             key: _load_jsonl(_safe_file(root, name)) for key, name in CAPTURE_FILES.items()
         }
         return _analyze_loaded(manifest, records)
-    except EnvironmentError as exc:
+    except CaptureEnvironmentError as exc:
         return AnalysisResult(AnalyzerOutcome.INELIGIBLE, (str(exc),))
     except (CaptureError, OSError) as exc:
         return AnalysisResult(AnalyzerOutcome.INCOMPLETE, (str(exc),))

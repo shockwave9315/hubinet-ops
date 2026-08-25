@@ -604,6 +604,33 @@ def _resequence_pre_t0(records: dict[str, list[dict[str, Any]]]) -> None:
         record["establishment_sequence"] = sequence
 
 
+def _set_scan_history(
+    records: dict[str, list[dict[str, Any]]],
+    upid_sets: list[list[str]],
+    watermarks: list[int],
+) -> None:
+    assert len(upid_sets) == len(watermarks)
+    records["scan_rounds"] = [
+        {
+            "scan_sequence": sequence,
+            "round_id": f"scan-{sequence}",
+            "scan_start_monotonic_ns": 180 + (sequence - 1) * 20,
+            "scan_end_monotonic_ns": 190 + (sequence - 1) * 20,
+            "exact_normalized_upids": upids,
+            "bucket_set": ["0"],
+            "stat_metadata": {},
+            "unreadable_entries": [],
+            "malformed_entries": [],
+            "complete": True,
+            "watch_drained_through_sequence": watermark,
+            "consistency_marker": "fixed_point",
+        }
+        for sequence, (upids, watermark) in enumerate(
+            zip(upid_sets, watermarks, strict=True), 1
+        )
+    ]
+
+
 def test_perfect_enumeration_is_only_tested_interleaving(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     result = analyze_capture(_materialize(tmp_path, manifest, records))
@@ -719,8 +746,8 @@ def test_watch_loss_signals_gap(
             "phenomenon_id": evidence_ids["watch_overflow_or_invalidation"],
         }
     )
-    for scan in records["scan_rounds"]:
-        scan["watch_drained_through_sequence"] = 2
+    records["scan_rounds"][0]["watch_drained_through_sequence"] = 1
+    records["scan_rounds"][1]["watch_drained_through_sequence"] = 2
     result = analyze_capture(_materialize(tmp_path, manifest, records))
     assert result.outcome is AnalyzerOutcome.GAP
 
@@ -762,6 +789,132 @@ def test_subrun_13e_signal_does_not_require_unrelated_generated_work(
 
     assert result.outcome is AnalyzerOutcome.GAP
     assert "watch_queue_overflow" in result.reasons
+
+
+def test_13e_post_close_signal_with_zero_operations_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    evidence_ids = _set_subrun(
+        manifest, "13E", ["watch_overflow_or_invalidation"]
+    )
+    records["ground_truth"] = [
+        {
+            "event": "generator_finalized",
+            "last_sequence": 0,
+            "total_operations": 0,
+            "durable_flush_complete": True,
+            "generator_process_identity": "synthetic-generator:1",
+            "monotonic_ns": 150,
+            "wall_timestamp": "2026-08-25T00:00:02Z",
+        }
+    ]
+    records["watch_events"] = [
+        _watch_event(
+            1,
+            masks=["IN_Q_OVERFLOW"],
+            monotonic_ns=305,
+            event_type="queue_overflow",
+            phenomenon_id=evidence_ids["watch_overflow_or_invalidation"],
+        )
+    ]
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = []
+        scan["watch_drained_through_sequence"] = 0
+    records["exact_upid"] = []
+    manifest["candidate_close"]["known_upids"] = []
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "subrun_watch_loss_signal_not_evidenced_before_close" in result.reasons
+
+
+def test_13e_post_close_signal_with_normal_generated_work_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    evidence_ids = _set_subrun(
+        manifest, "13E", ["watch_overflow_or_invalidation"]
+    )
+    records["watch_events"].append(
+        _watch_event(
+            2,
+            masks=["IN_Q_OVERFLOW"],
+            monotonic_ns=305,
+            event_type="queue_overflow",
+            phenomenon_id=evidence_ids["watch_overflow_or_invalidation"],
+        )
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "subrun_watch_loss_signal_not_evidenced_before_close" in result.reasons
+
+
+def test_13e_matching_signal_at_close_or_earlier_is_gap(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    evidence_ids = _set_subrun(
+        manifest, "13E", ["watch_overflow_or_invalidation"]
+    )
+    records["watch_events"].append(
+        _watch_event(
+            2,
+            masks=["IN_IGNORED"],
+            monotonic_ns=300,
+            event_type="watch_invalidation",
+            phenomenon_id=evidence_ids["watch_overflow_or_invalidation"],
+        )
+    )
+    records["scan_rounds"][0]["watch_drained_through_sequence"] = 1
+    records["scan_rounds"][1]["watch_drained_through_sequence"] = 2
+    records["scan_rounds"][-1]["scan_end_monotonic_ns"] = 300
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "watch_invalidation_or_loss" in result.reasons
+
+
+def test_13e_post_close_match_plus_benign_in_window_watch_cannot_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    evidence_ids = _set_subrun(
+        manifest, "13E", ["watch_overflow_or_invalidation"]
+    )
+    records["ground_truth"] = [
+        {
+            "event": "generator_finalized",
+            "last_sequence": 0,
+            "total_operations": 0,
+            "durable_flush_complete": True,
+            "generator_process_identity": "synthetic-generator:1",
+            "monotonic_ns": 150,
+            "wall_timestamp": "2026-08-25T00:00:02Z",
+        }
+    ]
+    records["watch_events"] = [
+        _watch_event(1, masks=["IN_ATTRIB"], monotonic_ns=160, filename="index"),
+        _watch_event(
+            2,
+            masks=["IN_Q_OVERFLOW"],
+            monotonic_ns=305,
+            event_type="queue_overflow",
+            phenomenon_id=evidence_ids["watch_overflow_or_invalidation"],
+        ),
+    ]
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = []
+        scan["watch_drained_through_sequence"] = 1
+    records["exact_upid"] = []
+    manifest["candidate_close"]["known_upids"] = []
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "subrun_watch_loss_signal_not_evidenced_before_close" in result.reasons
 
 
 def test_duplicate_api_pages_tolerated_only_with_primary_reconciliation(tmp_path: Path) -> None:
@@ -992,6 +1145,93 @@ def test_computed_equal_terminal_scans_with_drained_queue_may_pass(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_ordered_scan_history_detects_exact_log_disappearance(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _set_scan_history(records, [[UPID_A], [], []], [1, 1, 1])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "exact_log_disappeared_between_scans" in result.reasons
+
+
+def test_shuffled_scan_jsonl_cannot_hide_exact_log_disappearance(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _set_scan_history(records, [[UPID_A], [], []], [1, 1, 1])
+    scans = records["scan_rounds"]
+    records["scan_rounds"] = [scans[1], scans[2], scans[0]]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "scan_sequence_not_jsonl_ordered" in result.reasons
+
+
+def test_shuffled_scan_jsonl_cannot_bypass_watermark_ordering(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["watch_events"].extend(
+        [
+            _watch_event(2, masks=["IN_ATTRIB"], monotonic_ns=195, filename="index"),
+            _watch_event(3, masks=["IN_ATTRIB"], monotonic_ns=215, filename="index"),
+        ]
+    )
+    _set_scan_history(
+        records,
+        [[UPID_A], [UPID_A], [UPID_A]],
+        [1, 2, 3],
+    )
+    scans = records["scan_rounds"]
+    records["scan_rounds"] = [scans[1], scans[2], scans[0]]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "scan_sequence_not_jsonl_ordered" in result.reasons
+
+
+def test_valid_ordered_three_scan_history_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _set_scan_history(
+        records,
+        [[UPID_A], [UPID_A], [UPID_A]],
+        [1, 1, 1],
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_missing_watch_referenced_by_scan_watermark_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["watch_events"] = []
+    for scan in records["scan_rounds"]:
+        scan["watch_drained_through_sequence"] = 7
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "scan_watch_drain_watermark_reference_missing" in result.reasons
+
+
+def test_raw_watch_order_must_match_capture_order(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["watch_events"][0]["raw_order"] = 7
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "watch_raw_order_not_contiguous_or_capture_ordered" in result.reasons
 
 def test_unexpected_post_t0_task_cannot_be_silently_omitted_at_close(
     tmp_path: Path,
@@ -1609,6 +1849,30 @@ def test_healthy_then_unhealthy_heartbeat_before_close_cannot_pass(
 
     assert result.outcome is AnalyzerOutcome.GAP
     assert "observer_unhealthy_heartbeat" in result.reasons
+
+
+def test_structurally_valid_stale_heartbeat_is_gap(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    manifest["reader_context"]["heartbeat_timeout_ns"] = 40
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "observer_unhealthy_or_stale_at_close" in result.reasons
+
+
+def test_missing_heartbeat_stream_is_incomplete(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"] = [
+        event
+        for event in records["harness_events"]
+        if event["event"] != "heartbeat"
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "harness_heartbeat_missing" in result.reasons
 
 
 def test_reader_process_stop_before_close_cannot_pass(tmp_path: Path) -> None:
