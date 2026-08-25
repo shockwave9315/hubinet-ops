@@ -57,10 +57,11 @@ Primary labels have exactly these meanings:
 | `UNKNOWN` | Not established at ADR0005/ADR0006 security strength. |
 
 `FACT-OPERATOR` is provenance metadata for the operator-supplied, manually
-collected `pveversion -v` values recorded by Research #2A.1. It is not a new
-normative evidence class and says nothing beyond what the operator actually
-read. Qualifiers such as `REQUIRES CONTROLLED EXPERIMENT` and
-`LOADED-CODE APPLICABILITY UNKNOWN` do not replace a primary label.
+collected `pveversion -v` output; Research #2A.1 recorded a selected subset of
+that output. It is not a new normative evidence class and says nothing beyond
+what the operator actually read. Qualifiers such as
+`REQUIRES CONTROLLED EXPERIMENT` and `LOADED-CODE APPLICABILITY UNKNOWN` do
+not replace a primary label.
 
 ### 1.2 Repository and source provenance
 
@@ -95,7 +96,10 @@ The following findings are inputs, not decisions made by B-S1.
    `pve-common` 9.2.1 `f665029...`, `pve-container` 6.1.13 `c813255...`,
    `pve-cluster` 9.1.6 `7091d92...`, `pve-access-control` 9.1.1
    `5ccd07d...`, `pve-ha-manager` 5.2.5 `c73364c...`, and `pve-storage`
-   9.1.8 `cd5c90c...`.
+   9.1.8 `cd5c90c...`. The fuller original operator `pveversion -v` output
+   also contains `libpve-guest-common-perl` 6.0.5; #2A.1's selected evidence
+   subset omitted that line. **FACT-SOURCE:** 6.0.5 maps to upstream revision
+   `191c23e385e5dbed1938b2d1d322196831ef9331`.
 4. **INFERENCE:** the combined operator/version mapping establishes installed-
    target source applicability, not which Perl code a long-lived process has
    loaded.
@@ -103,21 +107,32 @@ The following findings are inputs, not decisions made by B-S1.
    `start`/`limit` offsets; no immutable snapshot, cursor, archive generation,
    predecessor link, or monotonic task sequence is exposed.
 6. **FACT-SOURCE:** completed task list history is reverse-read from
-   `/var/log/pve/tasks/index` and `index.1`; normal writer rotation occurs
-   after `index` exceeds 50,000 bytes by renaming it to `index.1`.
+   `/var/log/pve/tasks/index` and `index.1`. Stopped tasks found by one
+   `active_workers()` call are sorted by task `starttime` descending within
+   that processed batch; the batch is appended to `index`, and `endtime` is
+   the time that call observes/finalizes the stopped task. Normal writer
+   rotation occurs after `index` exceeds 50,000 bytes by renaming it to
+   `index.1`. No global chronological or adjacency contract follows.
 7. **FACT-SOURCE:** `/cluster/tasks` is a bounded, asynchronously published
-   per-node cache: all detected running tasks plus at most 25 recent finished
-   entries before the separate 32 KiB per-node broadcast bound. It is not the
-   node archive.
-8. **FACT-SOURCE:** an async `fork_worker` child creates its exact UPID log,
-   reports readiness, and waits for the parent `OK` before invoking the worker
-   function. The parent registers/publishes active state only after that child
-   readiness exchange. This gives a promising pre-operation exact-log creation
-   point, but not a complete external observer contract.
+   per-node cache: all detected running tasks are retained first, and only the
+   remaining slots up to `MAX_FINISHED = 25` total are used for finished tasks,
+   before the separate 32 KiB per-node broadcast bound. It is not the node
+   archive; this is not “all running plus 25 finished.”
+8. **FACT-SOURCE:** in the exact pinned `pve-common` 9.2.1 `fork_worker`, an
+   async child creates its exact UPID log before reporting readiness. In CLI
+   foreground sync mode, the child reports readiness before the exact log
+   exists; the parent validates readiness, creates the exact log, sends `OK`,
+   and only then may the child invoke the worker function. The parent
+   registers/publishes active state after the readiness exchange. Both pinned
+   paths give a promising log-before-worker-body point, but not a generalized
+   caller or complete external observer contract.
 9. **FACT-SOURCE:** exact-UPID logs are separate files beneath
-   `/var/log/pve/tasks/<bucket>/<UPID>`; daily cleanup can later remove older
-   files using retained `index.1` time as a boundary. Known-record retention is
-   distinct from enumeration completeness.
+   `/var/log/pve/tasks/<bucket>/<UPID>`. `cleanup_tasks()` obtains its cleanup
+   boundary from the first retained `index.1` entry, recursively examines exact
+   UPID files, and unlinks any whose **file mtime** is older than that boundary,
+   with no task-liveness or active/index/index.1-membership guard. File mtime is
+   a file-write property, not task start ordering or a durable predecessor
+   relation. Known-record retention is distinct from enumeration completeness.
 10. **FACT-SOURCE:** ordinary API task reads are owner-filtered unless the
     caller has the route's `Sys.Audit`; privilege-separated token authority is
     the intersection of token and base-user authority; `root@pam` takes a
@@ -187,9 +202,9 @@ plane, and exact-UPID confirmation never proves an unknown UPID did not exist.
 | Surface | B-S1 role | Exact source/scope | Retention/rotation | Authorization and limits |
 | --- | --- | --- | --- | --- |
 | Local task-directory watch | Primary prospective enumeration | Read-only watch of `/var/log/pve/tasks` and its bucket directories on the one Phase-S node; observe create/move/delete/watch-loss/queue-overflow events | Kernel queue is bounded; process/watch loss or overflow is a gap. Exact target delivery completeness is `UNKNOWN / REQUIRES SOURCE REVIEW AND CONTROLLED EXPERIMENT` | Structurally privileged local process must be able to traverse directories/read files. PVE ACLs do not filter this file view, but Linux identity/permissions, mount, namespace, process health, and T3/T4 assumptions become explicit context |
-| Recursive exact-UPID log scan | Primary recovery/overlap enumeration | `/var/log/pve/tasks/<hex-bucket>/<UPID>` files; source derives filename from UPID | Separate from `index/index.1`; later daily cleanup removes old logs. No accepted minimum retention interval exists | Direct file read; exact files default to owner `www-data`, caller group, mode `0640` in `PVE::File::create_owned_file_fh`; exact deployment identity still requires design |
-| Local active file | Handoff/status cross-check | `/var/log/pve/tasks/active`; all running plus bounded recent saved entries as written by `active_workers()` | Mutable/re-written; all running plus at most 25 finished; no exposed generation | Direct local read avoids API owner filter. File atomicity/generation and safe read protocol are not accepted contracts |
-| Local archive files | Completion/order/overlap cross-check | `/var/log/pve/tasks/index`, then `index.1`; append occurs under `.active.lock` | `index` appended chronologically; normal rotation at `> 50,000` bytes renames to `index.1`, replacing prior generation; only two list files are read by API | `index` is created `0644` in exact source. inode/stat/hash observations are research anchors, not stock PVE cursor semantics |
+| Recursive exact-UPID log scan | Primary recovery/overlap enumeration | `/var/log/pve/tasks/<hex-bucket>/<UPID>` files; source derives filename from UPID | Separate from `index/index.1`; `cleanup_tasks()` may unlink any exact log whose file mtime predates the first retained `index.1` boundary, without liveness or membership guards. No accepted minimum retention interval exists | Direct file read; exact files default to owner `www-data`, caller group, mode `0640` in `PVE::File::create_owned_file_fh`; exact deployment identity still requires design |
+| Local active file | Handoff/status cross-check | `/var/log/pve/tasks/active`; all running plus bounded recent saved entries as written by `active_workers()` | Mutable/re-written; all running are retained first and only remaining slots up to 25 total are filled by finished tasks; no exposed generation | Direct local read avoids API owner filter. File atomicity/generation and safe read protocol are not accepted contracts |
+| Local archive files | Completion/order/overlap cross-check | `/var/log/pve/tasks/index`, then `index.1`; append occurs under `.active.lock` | Each processed stopped-task batch is sorted by starttime descending and appended; endtime is finalization/observation time. No global chronology/adjacency contract exists. Rotation at `> 50,000` bytes renames to `index.1`, replacing its prior generation | `index` is created `0644` in exact source. inode/stat/hash observations are research anchors, not stock PVE cursor semantics |
 | Per-node API active | Corroboration and API-profile testing | `GET /nodes/{node}/tasks?source=active` | Mutable active state; offset/limit; no snapshot | All tasks require `Sys.Audit` at `/nodes/{node}`; otherwise owner filtered |
 | Per-node API archive | Repeated-traversal corroboration | `GET /nodes/{node}/tasks?source=archive&start=...&limit=...` | Reverse reads mutable `index` then `index.1`; numeric offsets move | Same route privilege/filtering. Pagination is never primary completeness proof |
 | Per-node API all | Active/archive handoff adversary | `GET /nodes/{node}/tasks?source=all` | Reads active first, then archive, without one shared read snapshot | Same privilege/filtering; duplicates/omissions remain possible |
@@ -237,11 +252,11 @@ second authority for any canonical ADR0001 field.
 | `coverage_state` | One research-local state from section 6 |
 | `covered_from_barrier`, `covered_through_barrier` | Durable logical `[T0,T1]` boundary identities, plus audit wall/monotonic timestamps |
 | `last_durable_observation_sequence` | Sentinel-owned commit order, not a PVE task cursor |
-| `last_successful_observation_at` and `heartbeat_deadline` | Detect observer silence/crash; elapsed deadline latches a gap |
+| `last_successful_observation_at` and `heartbeat_deadline` | Give an independent supervisor and/or consumption-time freshness check the data needed to reject stale open coverage; a dead observer cannot latch its own gap |
 | `known_upids` / bounded set digest | Exact normalized UPID set in current retention envelope; digest never substitutes for retained collision/audit details |
 | `baseline_upids` | Files present before T0; prevents treating pre-existing logs as interval starts |
 | `pending_upids` | Known records whose final status/log or supported-task classification is unresolved |
-| `overlap_anchors` | Multiple retained exact UPIDs at different ages plus their source surface/provenance; one anchor alone is insufficient |
+| `overlap_anchors` | Retained known UPIDs plus source/provenance used only to diagnose known-record continuity or loss. Survival of one or multiple anchors does not prove that every unknown record between them survived cleanup |
 | `task_log_directory_digest` | Bounded scan result including bucket, filename, stat tuple, and content hash where readable; not a stock generation |
 | `active_observation` | Raw digest, parsed UPIDs, file stat/context, read start/end |
 | `archive_observation` | Separate `index`/`index.1` stat/inode/hash/first-last UPIDs and traversal boundaries |
@@ -264,7 +279,7 @@ mechanism would still use ADR0001's sole canonical owner and revision rules.
 | State | Entry criteria | Exit criteria | Restart/durability semantics |
 | --- | --- | --- | --- |
 | `INITIALIZING` | No prior valid B-S1 epoch; new node/version/reader context; explicit rebaseline | Install the watch before scanning, durably capture context, complete baseline scans, and either enter `ESTABLISHING_OVERLAP` or latch a gap | Durable epoch/context required. Restart during initialization discards the attempt; no coverage exists |
-| `ESTABLISHING_OVERLAP` | Watch active; baseline known; no detected gap yet | Required fixed-point traversals, multi-anchor overlap, exact-log reconciliation, and all preconditions succeed → `COVERAGE_ELIGIBLE`; ambiguity → `GAP_LATCHED`; context invalid → `AUTHORITY_INELIGIBLE` | Only atomically committed scan rounds survive. An unclean observer restart latches a gap for the attempted interval |
+| `ESTABLISHING_OVERLAP` | Watch active; baseline known; no detected gap yet | Required fixed-point traversals, exact-log reconciliation, and all independently proven prospective watch/scan preconditions succeed → `COVERAGE_ELIGIBLE`; ambiguity → `GAP_LATCHED`; context invalid → `AUTHORITY_INELIGIBLE` | Only atomically committed scan rounds survive. An unclean observer restart latches a gap for the attempted interval |
 | `COVERAGE_ELIGIBLE` | Every section 8 invariant is independently satisfied for the exact current epoch and a committed T0 exists | Successful close protocol commits T1 and a complete interval; any failure/context change immediately enters `GAP_LATCHED` or `AUTHORITY_INELIGIBLE` before use | Heartbeat/lease and current context are durable. Loss of the observer or its supervisor is not automatically recoverable |
 | `GAP_LATCHED` | Watch overflow/invalidation; missed heartbeat; unreadable/malformed surface; anchor/pagination/rotation/handoff ambiguity; unknown task/operation; crash/reboot/restart uncertainty | Never retroactively returns to eligible for the affected interval. A distinct, explicit rebaseline may start a **new** epoch only after the future accepted revalidation/enrollment contract permits it | Gap reason and affected interval are durable, append-only, and survive every restart |
 | `AUTHORITY_INELIGIBLE` | Reader/source/node/version/loaded-code context is absent, changed, unsupported, or cannot be proven | Explicit context revalidation may start a new `INITIALIZING` epoch; it cannot heal an old interval or automatically restore trust | Durable. Package/daemon/credential equality after an ABA does not restore eligibility |
@@ -282,6 +297,12 @@ coverage gap -> replacement identity transition
 Phase-S complete -> Family-B complete
 experiment PASS -> trusted
 ```
+
+A stored `COVERAGE_ELIGIBLE` value is never self-certifying after observer
+death. The crashed sentinel cannot record its own failure; an independent
+supervisor and/or every consumption-time freshness/heartbeat check must reject
+stale open coverage before dependent authority could be consumed. That future
+mechanism is required for safety but is neither designed nor implemented here.
 
 ## 7. Exact coverage-interval semantics
 
@@ -342,13 +363,13 @@ work and controlled experiments can falsify the candidate precisely.
 
 | Race/event | Candidate handling | Current strength |
 | --- | --- | --- |
-| Task starts while pages/files are read | Exact log creation should precede worker-body execution; watch-first plus scan reconciliation must discover it regardless of API page | `FACT-SOURCE` for normal `fork_worker` ordering; observer completeness `UNKNOWN` |
+| Task starts while pages/files are read | Exact log creation should precede worker-body execution; watch-first plus scan reconciliation must discover it regardless of API page | `FACT-SOURCE` for exact pinned async and CLI foreground sync `fork_worker` ordering; no caller generalization; observer completeness `UNKNOWN` |
 | Task completes while pages/files are read | Exact log remains primary known identity; final status may move active→archive. Repeat scans and exact reads until reconciled or gap | Normal writer order `FACT-SOURCE`; external gaplessness `UNKNOWN` |
 | Active→archive handoff | Never rely on one `source=all` read. Compare exact UPID across log, active, index, index.1, and API; any unexplained omission/duplication is a gap | `UNKNOWN / REQUIRES CONTROLLED EXPERIMENT` |
-| Archive rotation | Track file stat/inode/hash observations, reopen after rename, rescan exact logs, and require multi-anchor retention. Unchecked rename/error or ambiguous generation is a gap | Normal rename `FACT-SOURCE`; generation proof `UNKNOWN` |
+| Archive rotation | Track file stat/inode/hash observations, reopen after rename, and rescan exact logs. Retained anchors are loss diagnostics only. Unchecked rename/error or ambiguous generation is a gap | Normal rename `FACT-SOURCE`; generation proof `UNKNOWN` |
 | Offset pagination movement | Every API traversal starts again at offset zero after any prefix change. Require repeated identical normalized prefixes through overlap; API result remains corroborative only | Native offset weakness `FACT-SOURCE/INFERENCE`; no API-only proof |
 | Exact-UPID failure | Keep the known identity and latch a gap; never reinterpret not-found as absence/nonexistence | `FACT-SOURCE` route behavior |
-| Sentinel process restart | Clean close starts a new interval. Unclean exit, missed durable heartbeat, or uncertain commit latches a gap | Required fail-closed design; supervisor mechanism `UNKNOWN` |
+| Sentinel process restart | Clean close starts a new interval. After an unclean exit, an independent supervisor and/or consumption-time freshness check must reject stale open coverage and durably latch the gap; the dead sentinel cannot do so itself | Required fail-closed design; supervisor mechanism `UNKNOWN` |
 | PVE service reload/restart | Close current interval as ineligible unless loaded-code and handoff semantics are separately proven; begin a new version/service epoch | Source behavior partly known; runtime result `UNKNOWN` |
 | Node reboot | Always gap the old interval; no automatic overlap recovery in Phase S | Required conservative default |
 | Reader/permission change | Any API-reader change gaps the interval; local-reader uid/gid/group/namespace/file-access change also gaps | ADR0002 ACL ABA applies; structural context contract `UNKNOWN` |
@@ -369,14 +390,16 @@ work and controlled experiments can falsify the candidate precisely.
    bucket watches, and rescan every affected directory.
 5. Repeat steps 3--4 until two consecutive complete normalized scans and the
    intervening drained event set form the same exact UPID set. Any overflow,
-   malformed name, unreadable entry, disappearance without an explained cleanup
-   boundary, or unstable context latches a gap.
+   malformed name, unreadable entry, disappearance (including cleanup loss), or
+   unstable context latches a gap.
 6. Traverse local `active`, `index`, and `index.1` completely. Independently
    traverse API `source=active`, `archive`, and `all` from offset zero, restarting
    a traversal whenever its normalized prefix changes.
-7. Require multiple prior anchors spanning both retained archive generations
-   where available, plus exact-log presence/status for every newly known UPID.
-   One old anchor is never sufficient.
+7. Retain multiple prior anchors where available to diagnose known-record loss,
+   but do not use their survival to prove that an unknown intervening record
+   survived. Positive completeness depends on the independently proven
+   prospective watch/scan contract, plus exact-log presence/status for every
+   UPID that contract durably enumerates.
 8. Compare the local exact-log set, local active/archive sets, API sets, and
    known pending set. Expected surface asymmetry must be explicitly explained by
    source behavior; unexplained asymmetry is a gap.
@@ -396,21 +419,23 @@ work and controlled experiments can falsify the candidate precisely.
 | Invariant | Status |
 | --- | --- |
 | Every claimed operation route reaches `fork_worker` with the expected type/owner/id | `FACT-SOURCE` for named exact-target routes; runtime/loaded-code validation required |
-| Exact UPID log creation completes before the worker body begins | `FACT-SOURCE` for the audited normal async `fork_worker` path |
+| Exact UPID log creation completes before the worker body begins | `FACT-SOURCE` for the exact pinned async path and CLI foreground sync handshake; no generalization beyond pinned implementation/callers |
 | Exact-target kernel/filesystem watch delivery reports every relevant create/rename/delete or an unambiguous overflow/loss event | `UNKNOWN / REQUIRES KERNEL-SOURCE REVIEW AND CONTROLLED EXPERIMENT` |
 | Watch installation plus recursive scan has no creation race | Plausible watch-first algorithm; `UNKNOWN / REQUIRES CONTROLLED EXPERIMENT` |
 | Directory scans enumerate every retained exact log without silent filtering | `UNKNOWN / REQUIRES CONTROLLED EXPERIMENT` |
-| Normal cleanup cannot delete a newer unknown exact log while every required older anchor remains | Bounded `INFERENCE` from normal cleanup/retention; crash/manual/error cases unresolved |
+| Normal cleanup may unlink any exact UPID log whose file mtime is older than the boundary derived from the first retained `index.1` record, regardless of task liveness or active/archive membership | `FACT-SOURCE` at `pve-manager` 9.2.11 `f6997e...`, `bin/pveupdate`, `cleanup_tasks()` |
+| Unknown-record completeness from surviving overlap anchors | **Cannot be provided by anchor survival itself**; exact-log mtime is not task start ordering or a durable predecessor relation. `UNKNOWN / REQUIRES CONTROLLED EXPERIMENT` whether the prospective watch/scan contract detects every relevant cleanup loss |
 | Multiple repeated API traversals plus local file evidence distinguish new tasks from offset omissions | Candidate hypothesis; `UNKNOWN / REQUIRES CONTROLLED EXPERIMENT` |
 | Local reader permission/process continuity is independently gap-detectable | `UNKNOWN`; requires a future accepted reader/supervisor boundary |
 | No supported in-scope R/P event can occur through a no-UPID route | `UNKNOWN`; experiments #11/#12 are designed to kill this assumption |
 
 The maximum tolerable movement is not a numeric page count. B-S1 tolerates
 arbitrary duplicates or prefix movement only while every change is explained by
-the primary exact-log/watch set, all required anchors remain retained, and the
-full traversal can restart and reach its fixed point before the watch/retention
-budget is exhausted. It tolerates **zero unexplained omission**, **zero watch
-loss**, and **zero lost required anchor**. Otherwise it gaps.
+the primary exact-log/watch set and the full traversal can restart and reach its
+fixed point before the watch/retention budget is exhausted. Retained known
+anchors remain useful loss diagnostics, but their survival contributes no proof
+about unknown records. B-S1 tolerates **zero unexplained omission**, **zero
+watch loss**, and **zero known-record loss without a gap**. Otherwise it gaps.
 
 ### 8.3 What repeated traversal cannot prove today
 
@@ -419,6 +444,13 @@ unknown omitted record from the exposed fields alone. Two identical results can
 occur after an unknown task was filtered, created and removed outside retention,
 or hidden during reader ABA. Repeated API traversal is therefore never B-S1's
 completeness authority.
+
+Nor can survival of one or multiple exact-log anchors prove that no unknown
+exact log was deleted. Stock cleanup compares file mtime—a file-write property,
+not task start/end order—to the first retained `index.1` boundary and has no
+liveness or active/archive-membership guard. Anchor survival therefore diagnoses
+known-record retention only; it creates no durable predecessor relation and no
+unknown-record completeness theorem.
 
 The local watch-plus-exact-log design is stronger because it proposes a
 pre-operation creation point and a detectable overflow channel. It still fails
@@ -555,14 +587,16 @@ their QEMU/LXC config classes inherit snapshot create/delete/rollback core from
 Exact qemu-server 9.2.6 requires `libpve-guest-common-perl >= 5.2.2`; exact
 pve-container 6.1.13 requires `>= 5.1.3`.
 
-The operator-provided #2A.1 package set did not state the installed
-`libpve-guest-common-perl` version. The 5.2.2 changelog boundary maps to
-[`58ad1835bf48ac8a62877cc8889c67b49330113f`](https://github.com/proxmox/pve-guest-common/commit/58ad1835bf48ac8a62877cc8889c67b49330113f),
-but no claim is made that this is the installed version.
+**FACT-OPERATOR:** the fuller original operator `pveversion -v` evidence states
+`libpve-guest-common-perl: 6.0.5`; Research #2A.1's selected evidence subset
+omitted that line. **FACT-SOURCE:** exact upstream revision
+[`191c23e385e5dbed1938b2d1d322196831ef9331`](https://github.com/proxmox/pve-guest-common/commit/191c23e385e5dbed1938b2d1d322196831ef9331)
+is the 6.0.5 version bump. This establishes installed-target mapping, not an
+audit of the loaded code or the two modules' relevant behavior.
 
 Result: **add `libpve-guest-common-perl` to the later source ledger.** Before
-#5/#6, obtain its installed version, map its exact source, and audit
-`PVE::AbstractConfig` plus `PVE::GuestHelpers` for snapshot/lock behavior.
+#5/#6, audit exact 6.0.5 `PVE::AbstractConfig` plus `PVE::GuestHelpers` for
+snapshot/lock behavior.
 This dependency is load-bearing for whether the class-P operation actually
 executes/succeeds and what its task log/status means, even though the outer API
 route creates the UPID before entering the lock-protected worker body.
@@ -608,13 +642,14 @@ No Phase-M assertion is made by this document.
 | Unreadable required surface | `GAP_LATCHED`; retain prior audit, no positive coverage |
 | Malformed/partial response or file | `GAP_LATCHED`; never skip the record and continue |
 | Pagination ambiguity or changing prefix | Restart traversal; if a stable proven close cannot be reached before budget/retention limit, `GAP_LATCHED` |
+| Watch overflow, invalidation, or loss | `GAP_LATCHED` for the affected interval; no scan or surviving anchor heals it |
 | Archive rotation ambiguity, rename failure, unexplained inode/hash change | `GAP_LATCHED` |
-| Lost overlap anchor or insufficient multi-anchor span | `GAP_LATCHED` |
+| Known overlap-anchor loss | `GAP_LATCHED`; surviving anchors prove nothing about unknown records |
 | Exact-UPID status/log lookup failure | Keep known identity; `GAP_LATCHED` |
 | Reader permission/credential/local identity change | `AUTHORITY_INELIGIBLE` and gap the affected interval |
 | ACL uncertainty or API-reader ABA | `GAP_LATCHED`; equal later ACL does not heal it |
 | Daemon/service reload/restart with unproven loaded-code/handoff semantics | `AUTHORITY_INELIGIBLE`; new epoch only after explicit revalidation |
-| Sentinel process crash or missed heartbeat | `GAP_LATCHED` for the open interval; no optimistic replay |
+| Sentinel process crash or missed heartbeat | Independent supervisor and/or consumption-time freshness validation must reject stale open coverage and cause `GAP_LATCHED`; the crashed sentinel cannot latch its own gap, and no optimistic replay is allowed |
 | Node reboot/boot-ID change | `GAP_LATCHED`; Phase S never auto-recovers the old interval |
 | Source/package/version/file-hash change | `AUTHORITY_INELIGIBLE`; source re-pin and new epoch required |
 | Unknown task type, owner, node, or malformed UPID | `GAP_LATCHED` and add to route/source audit |
@@ -674,6 +709,10 @@ kill the claimed task-only operation boundary cheaply.
 - **Hypothesis:** watch-first exact-log discovery plus repeated scans prevents a
   false `CLOSED_COMPLETE`; native offset traversal alone will show duplicates or
   omissions under adversarial interleavings.
+- **Source-contract boundary:** exact watcher/kernel/filesystem semantics are
+  load-bearing for any positive `SOURCE CONTRACT`. #13 is still useful as an
+  early falsification attempt before universal source proof, but no PASS can
+  close that source contract by itself.
 - **Fixture/preconditions:** cold exact-version Phase-S node; approved bounded
   task generator; local sentinel instrumentation; volume sufficient to cross
   API pages and at least one archive rotation; ground-truth client records every
@@ -685,8 +724,9 @@ kill the claimed task-only operation boundary cheaply.
   while B-S1 reports complete; or an intentional offset/rotation omission is not
   converted to a gap.
 - **PASS:** every tested interleaving is fully enumerated or explicitly gapped.
-- **PASS does not prove:** all kernel/filesystem interleavings, cleanup behavior,
-  authorization, operation route coverage, or security sufficiency.
+- **PASS does not prove:** the watcher/kernel/filesystem source contract, all
+  kernel/filesystem interleavings, cleanup behavior, authorization, operation
+  route coverage, or security sufficiency.
 - **Cleanup/destructive scope:** stop load, remove only fixture-created tasks and
   disposable guests/snapshots according to the approved generator; preserve
   evidence copy. High task/log load is operationally disruptive.
@@ -694,21 +734,32 @@ kill the claimed task-only operation boundary cheaply.
 
 ### 15.4 #14 — exact-UPID retention
 
-- **Question:** how long and across which rotations/cleanup/service states do
-  known exact logs/status reads remain usable?
-- **Hypothesis:** exact logs outlive `index/index.1` membership but eventually
-  cross a cleanup boundary; B-S1 detects every loss before claiming overlap.
-- **Fixture/preconditions:** #13 UPIDs, exact cleanup schedule/source, clock
-  discipline, no unrecorded manual log changes.
-- **Collect:** list membership, direct file presence/stat/hash, exact status/log
-  API result, cleanup invocation provenance, archive boundaries, service/PID
-  context at each observation.
+- **Question:** what does exact stock cleanup do to completed and, if safely
+  reproducible, long-running/low-output exact logs across archive rotation; how
+  do file mtime and task start/end relate; and can B-S1 detect each loss?
+- **Hypothesis:** `cleanup_tasks()` applies its first-retained-`index.1`
+  boundary to exact-log file mtime without a liveness or membership guard;
+  retained known anchors diagnose losses but do not establish enumeration
+  completeness.
+- **Fixture/preconditions:** #13 UPIDs; bounded completed tasks; a safely
+  reproducible long-running/low-output task if available without broadening
+  destructive scope; exact cleanup schedule/source; recorded task start/end,
+  clock discipline, and no unrecorded manual log changes.
+- **Collect:** every fixture ground-truth UPID; task start/end and running state;
+  list membership; exact-log creation/write times, file mtime/presence/stat/hash;
+  exact status/log API result; cleanup invocation provenance and computed
+  `index.1` boundary; archive boundaries; watch/scan loss signals; sentinel and
+  service/PID context at every observation.
 - **Falsification:** a known record disappears or becomes unreadable while B-S1
-  retains complete coverage without a prior gap.
-- **PASS:** tested retention/loss boundaries are observed and every loss is
-  converted to a gap.
-- **PASS does not prove:** unknown-UPID enumeration or a universal minimum
-  retention guarantee.
+  retains complete coverage without a prior gap; or an unknown in-scope exact
+  log can be deleted before durable enumeration with no independent watcher/gap
+  signal while B-S1 can still close complete.
+- **PASS:** the tested stock mtime-bound cleanup behavior is reproduced (or any
+  source/runtime mismatch is explicitly reported), and every tested known loss
+  or ground-truth pre-enumeration loss is converted to a gap.
+- **PASS does not prove:** that surviving anchors establish enumeration
+  completeness, that no unknown exact log was deleted, a universal minimum
+  retention guarantee, or watcher/kernel completeness.
 - **Cleanup/destructive scope:** allow only approved fixture cleanup; do not
   delete task evidence manually merely to finish the run.
 - **Approval:** separately required.
@@ -938,15 +989,18 @@ conditions:
    on every selected B-S1 enumeration surface and no detectable gap occurs;
 2. a created UPID/log can be omitted by watch/scan/traversal/rotation while
    B-S1 still closes the affected interval complete;
-3. a task begins before the supposed primary exact-log evidence point;
-4. an active→archive or cleanup transition loses the only record without an
+3. stock cleanup can silently remove an unknown in-scope exact log before the
+   observer durably enumerates it, while no independent watcher/gap signal
+   detects the loss and B-S1 can still close the affected interval complete;
+4. a task begins before the supposed primary exact-log evidence point;
+5. an active→archive or cleanup transition loses a known record without an
    independently detectable gap;
-5. reader visibility disappears/reappears without invalidation;
-6. daemon/package ABA or old loaded code is accepted as exact current code;
-7. the sentinel crashes, loses durable state/coverage, and later reconstructs a
+6. reader visibility disappears/reappears without invalidation;
+7. daemon/package ABA or old loaded code is accepted as exact current code;
+8. the sentinel crashes, loses durable state/coverage, and later reconstructs a
    false clean interval;
-8. node reboot/name reuse restores coverage automatically; or
-9. an unsupported/unknown task or lifecycle event is silently ignored.
+9. node reboot/name reuse restores coverage automatically; or
+10. an unsupported/unknown task or lifecycle event is silently ignored.
 
 A NO-GO is bounded to B-S1's exact protocol, reader profile, operation scope,
 and version/fixture context. It is not “all Family B is impossible,” not a
@@ -987,21 +1041,24 @@ applicable gate closes, `security_continuity=trusted` remains unavailable.
    across bucket creation, file creation, cleanup, and mount changes?
 3. Can any finite file/API repeated traversal exclude an unknown omitted record
    without relying on watcher completeness?
-4. Is the normal cleanup ordering strong enough to use retained older exact logs
-   as multi-anchor loss detection across every non-T3 crash/error case?
+4. Can the prospective watch/scan contract durably enumerate every in-scope
+   exact log before stock mtime-bound cleanup can silently remove it, or emit an
+   independent gap signal for every such loss? Anchor survival cannot answer
+   this question.
 5. Can the structurally privileged local reader receive an accepted,
    independently gap-detectable identity/permission/watchdog contract without
    becoming an unjustified root oracle?
 6. Can loaded Perl code be validated strongly enough without a disruptive full
    restart, and how are old HUP-surviving workers excluded?
-7. Which exact installed `libpve-guest-common-perl` version and source revision
-   govern #5/#6?
+7. Does the required audit of exact `libpve-guest-common-perl` 6.0.5
+   `PVE::AbstractConfig` and `PVE::GuestHelpers` close snapshot/lock behavior
+   for #5/#6?
 8. Which LXC restore storage/archive/provider variants are in #8's first fixture,
    and what additional package/plugin sources do they import?
 9. Can an actual class-R or class-P physical transition occur through an exact
    supported no-UPID QEMU/LXC route at T1/T2?
-10. Are `fork_worker` sync-mode or alternate caller paths relevant to any
-    claimed lifecycle route and, if so, do they preserve log-before-body order?
+10. Which alternate `fork_worker` caller paths, if any, fall within a claimed
+    lifecycle route and do they preserve the exact pinned log-before-body order?
 11. What exact task generator safely produces #13's required volume without
     broadening lifecycle or storage scope?
 12. How would a future backend atomically make dependent authority ineligible
