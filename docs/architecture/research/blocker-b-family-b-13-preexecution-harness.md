@@ -313,9 +313,11 @@ request timing or self-assert it. The finalizer carries
 
 For the exact UPID returned by an in-window request, `request_start` is also an
 independent causal impossibility lower bound: completeness-bearing evidence for
-that returned UPID cannot end before the request was initiated. This does not
-identify worker body start, change `b_s1_body_start_membership=unknown`, or
-support a B-S1 NO-GO conclusion.
+that returned UPID must end strictly after the request was initiated. Equality
+between independently recorded monotonic timestamps does not establish
+happens-after ordering and fails closed. This does not identify worker body
+start, change `b_s1_body_start_membership=unknown`, or support a B-S1 NO-GO
+conclusion.
 
 A failed, timed-out, ambiguously answered, unpaired, duplicated, or
 non-contiguous request makes the harness incomplete. It is never interpreted
@@ -337,8 +339,8 @@ record after T1 may remain as structurally validated diagnostic evidence, but
 it cannot affect discovery, deletion, observer GAP latching, exact-UPID watch
 provenance, 13D/13E/13F evidence, or terminal watch-drain success. There is no
 grace interval. A candidate-interval record carrying an in-window generated
-UPID is incomplete when its event time precedes that UPID's independent
-`request_start`.
+UPID is incomplete when its event time is at or before that UPID's independent
+`request_start`; temporal eligibility requires a strictly later event.
 
 The Linux UAPI `struct inotify_event.mask` integer is the primitive. The v4
 analyzer pins the numeric definitions from Linux
@@ -384,10 +386,10 @@ scan cannot claim an event that occurred after it ended. A disappearing exact
 log or unreadable/malformed/inconsistent scan latches a gap.
 
 A scan containing an in-window generated UPID is causally eligible for that
-UPID only when `scan_end_monotonic_ns >= request_start_monotonic_ns`. Its start
+UPID only when `scan_end_monotonic_ns > request_start_monotonic_ns`. Its start
 may precede request initiation because a scan may span the creation boundary.
-An earlier scan end is `HARNESS_INCOMPLETE` before the UPID enters enumeration
-or exact scan provenance.
+An earlier or equal scan end is `HARNESS_INCOMPLETE` before the UPID enters
+enumeration or exact scan provenance.
 
 The JSONL records themselves must physically occur in ascending
 `scan_sequence`; out-of-order capture is `HARNESS_INCOMPLETE`. After parsing,
@@ -434,11 +436,12 @@ earlier ambiguous raw-content description; no real v4 capture exists and no
 backward compatibility is required.
 
 A surface containing an in-window generated UPID is causally eligible for that
-UPID only when `capture_end_monotonic_ns >= request_start_monotonic_ns`. Its
+UPID only when `capture_end_monotonic_ns > request_start_monotonic_ns`. Its
 capture may span request initiation. An earlier capture end is
-`HARNESS_INCOMPLETE` before the raw-derived UPID enters enumeration, handoff or
-rotation semantics, or exact active/archive provenance. This also prevents a
-T0-quiescence surface from manufacturing evidence for a later request.
+`HARNESS_INCOMPLETE`, and equality is equally ambiguous and incomplete, before
+the raw-derived UPID enters enumeration, handoff or rotation semantics, or
+exact active/archive provenance. This also prevents a T0-quiescence surface
+from manufacturing evidence for a request recorded at the same timestamp.
 
 ### 4.8 API pages
 
@@ -791,11 +794,13 @@ agreement preserves discovery, deletion, GAP, handoff, rotation, and lazy
 bucket behavior; every disagreement is incomplete before semantic use.
 The temporal P1 matrix reproduces the pre-T0 sole-watch false PASS, rejects an
 event exactly at T0 and a post-T0 event before the returned UPID's request
-start, and admits watch evidence at or after request start through T1. It also
-rejects post-close watch discovery, scans ending before request start, and
-active/`index`/`index.1` captures ending before request start, while admitting
-scan and surface captures that span request initiation. Every negative case
-keeps exact provenance from rehabilitating the impossible evidence.
+start, rejects equality at request start on every completeness-bearing plane,
+and admits watch evidence strictly after request start through T1. It also
+rejects post-close watch discovery, scans ending at or before request start,
+and active/`index`/`index.1` captures ending at or before request start, while
+admitting scan and surface captures that strictly span request initiation.
+Every negative case keeps exact provenance from rehabilitating the impossible
+evidence.
 They also prove ordered disappearance detection, reject shuffled scan JSONL
 for both set and watermark histories, retain an ordered-scan positive control,
 fail closed on a missing watcher referenced by a nonzero watermark, enforce

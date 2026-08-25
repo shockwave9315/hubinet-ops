@@ -710,6 +710,64 @@ def test_perfect_enumeration_is_only_tested_interleaving(tmp_path: Path) -> None
     assert result.as_dict()["architecture_effect"] == "NONE"
 
 
+def test_t0_index_surface_equal_to_request_start_cannot_manufacture_discovery(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["ground_truth"][0]["monotonic_ns"] = 100
+    records["watch_events"] = []
+    for scan in records["scan_rounds"]:
+        scan["exact_normalized_upids"] = []
+        scan["watch_drained_through_sequence"] = 0
+    surface = records["surface_observations"][1]
+    surface["capture_start_monotonic_ns"] = 81
+    surface["capture_end_monotonic_ns"] = 100
+    _set_surface_raw(surface, _archive_raw(UPID_A), [UPID_A])
+    exact = records["exact_upid"][0]
+    exact["discovery_source"] = "archive"
+    exact["discovery_reference"] = surface["observation_sequence"]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "surface_generated_upid:index:2_not_strictly_after_request_start",
+    )
+
+
+def test_ordinary_surface_equal_to_request_start_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["ground_truth"][0]["monotonic_ns"] = 100
+    surface = _use_surface_as_only_discovery(records, "active")
+    surface["capture_start_monotonic_ns"] = 95
+    surface["capture_end_monotonic_ns"] = 100
+    _set_surface_raw(surface, _active_raw(UPID_A), [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "surface_generated_upid:active:4_not_strictly_after_request_start",
+    )
+
+
+def test_ordinary_surface_after_request_start_is_temporally_eligible(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["ground_truth"][0]["monotonic_ns"] = 100
+    surface = _use_surface_as_only_discovery(records, "active")
+    surface["capture_start_monotonic_ns"] = 95
+    surface["capture_end_monotonic_ns"] = 101
+    _set_surface_raw(surface, _active_raw(UPID_A), [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
 def test_pre_t0_watch_cannot_manufacture_post_t0_discovery(
     tmp_path: Path,
 ) -> None:
@@ -768,13 +826,12 @@ def test_post_t0_watch_before_returning_request_start_is_incomplete(
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
     assert result.reasons == (
-        "watch_generated_upid:1_predates_request_start",
+        "watch_generated_upid:1_not_strictly_after_request_start",
     )
 
 
-@pytest.mark.parametrize("watch_time", [110, 111])
-def test_watch_at_or_after_request_start_is_temporally_eligible(
-    tmp_path: Path, watch_time: int
+def test_watch_equal_to_request_start_is_incomplete(
+    tmp_path: Path,
 ) -> None:
     manifest, records = _default_capture()
     _use_watch_as_only_discovery(
@@ -782,7 +839,29 @@ def test_watch_at_or_after_request_start_is_temporally_eligible(
         _watch_event(
             1,
             masks=["IN_CREATE"],
-            monotonic_ns=watch_time,
+            monotonic_ns=110,
+            upid=UPID_A,
+        ),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "watch_generated_upid:1_not_strictly_after_request_start",
+    )
+
+
+def test_watch_after_request_start_is_temporally_eligible(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _use_watch_as_only_discovery(
+        records,
+        _watch_event(
+            1,
+            masks=["IN_CREATE"],
+            monotonic_ns=111,
             upid=UPID_A,
         ),
     )
@@ -824,7 +903,23 @@ def test_scan_ending_before_returning_request_start_is_incomplete(
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
     assert result.reasons == (
-        "scan_generated_upid:1_predates_request_start",
+        "scan_generated_upid:1_not_strictly_after_request_start",
+    )
+
+
+def test_scan_ending_at_returning_request_start_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _use_scan_as_only_discovery(records, 1)
+    records["scan_rounds"][0]["scan_start_monotonic_ns"] = 109
+    records["scan_rounds"][0]["scan_end_monotonic_ns"] = 110
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "scan_generated_upid:1_not_strictly_after_request_start",
     )
 
 
@@ -862,7 +957,29 @@ def test_surface_ending_before_returning_request_start_is_incomplete(
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
     assert result.reasons == (
         f"surface_generated_upid:{source}:"
-        f"{surface['observation_sequence']}_predates_request_start",
+        f"{surface['observation_sequence']}_not_strictly_after_request_start",
+    )
+
+
+@pytest.mark.parametrize("source", ["active", "index", "index.1"])
+def test_surface_ending_at_returning_request_start_is_incomplete(
+    tmp_path: Path, source: str
+) -> None:
+    manifest, records = _default_capture()
+    surface = _use_surface_as_only_discovery(records, source)
+    surface["capture_start_monotonic_ns"] = 109
+    surface["capture_end_monotonic_ns"] = 110
+    raw_evidence = (
+        _active_raw(UPID_A) if source == "active" else _archive_raw(UPID_A)
+    )
+    _set_surface_raw(surface, raw_evidence, [UPID_A])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        f"surface_generated_upid:{source}:"
+        f"{surface['observation_sequence']}_not_strictly_after_request_start",
     )
 
 

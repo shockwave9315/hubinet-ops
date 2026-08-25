@@ -896,26 +896,29 @@ def _is_candidate_interval_watch(
     return t0_monotonic < event_time <= close_monotonic
 
 
-def _reject_generated_upids_before_request_start(
+def _reject_generated_upids_not_strictly_after_request_start(
     upids: set[str],
     evidence_end_monotonic: int,
     operation_by_upid: Mapping[str, Mapping[str, Any]],
     reason_prefix: str,
 ) -> None:
-    """Reject exact generated-UPID evidence that predates request initiation.
+    """Require exact generated-UPID evidence strictly after request initiation.
 
     Request initiation is only a causal impossibility lower bound for the exact
-    UPID returned by that request. It is not evidence of worker body start.
+    UPID returned by that request. Equal timestamps do not establish ordering
+    and fail closed. This is not evidence of worker body start.
     """
 
     for upid in sorted(upids):
         operation = operation_by_upid.get(upid)
         if operation is None:
             continue
-        if evidence_end_monotonic < int(
+        if evidence_end_monotonic <= int(
             operation["request_start_monotonic_ns"]
         ):
-            raise CaptureError(f"{reason_prefix}_predates_request_start")
+            raise CaptureError(
+                f"{reason_prefix}_not_strictly_after_request_start"
+            )
 
 
 def _validate_pre_t0_establishment(
@@ -1682,7 +1685,7 @@ def _analyze_loaded(
         if parsed_upid is not None:
             upid = parsed_upid
             if candidate_interval:
-                _reject_generated_upids_before_request_start(
+                _reject_generated_upids_not_strictly_after_request_start(
                     {upid},
                     event_time,
                     operation_by_upid,
@@ -1729,7 +1732,7 @@ def _analyze_loaded(
                 record.get("exact_normalized_upids"), "scan.exact_normalized_upids"
             )
         }
-        _reject_generated_upids_before_request_start(
+        _reject_generated_upids_not_strictly_after_request_start(
             current,
             scan_end,
             operation_by_upid,
@@ -1850,7 +1853,7 @@ def _analyze_loaded(
             raise CaptureError(
                 f"surface_normalized_upids_mismatch_raw_evidence:{source}:{sequence}"
             )
-        _reject_generated_upids_before_request_start(
+        _reject_generated_upids_not_strictly_after_request_start(
             parsed_upids,
             capture_end,
             operation_by_upid,
