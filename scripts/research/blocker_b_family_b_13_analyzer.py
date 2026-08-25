@@ -2003,6 +2003,12 @@ def _analyze_loaded(
     # reference one specific observation and must not borrow another's result.
     exact_final: set[str] = set()
     final_exact_observation_sequences: set[int] = set()
+    # Capture windows of the self-sufficient final reads, and of the
+    # structurally valid non-final reads, per UPID.  Lifecycle chronology is
+    # decided from these shared-domain windows alone, never from
+    # `observation_sequence`.
+    final_exact_capture_starts: dict[str, list[int]] = {}
+    non_final_exact_capture_ends: dict[str, list[int]] = {}
     exact_records: dict[int, Mapping[str, Any]] = {}
     for record in records["exact_upid"]:
         observation_sequence = _require_int(record, "observation_sequence")
@@ -2107,9 +2113,33 @@ def _analyze_loaded(
         if final_interpretation in {"ok", "warning", "error"}:
             exact_final.add(upid)
             final_exact_observation_sequences.add(observation_sequence)
+            final_exact_capture_starts.setdefault(upid, []).append(capture_start)
+        else:
+            non_final_exact_capture_ends.setdefault(upid, []).append(capture_end)
 
     if set(exact_records) != set(range(1, len(exact_records) + 1)):
         raise CaptureError("exact_observation_sequence_gap")
+    # A task that has reached a final status cannot be observed running again.
+    # `exact_final` is deliberately UPID-level, so on its own it answers only
+    # "was this UPID ever final", and a later sealed read contradicting an
+    # established final read would leave that aggregate -- and therefore a
+    # positive close -- untouched.  A structurally valid non-final read is
+    # admissible only as the earlier half of a `non-final -> final` progression,
+    # which means it must have completed strictly before the *earliest* final
+    # read of the same UPID began.  Comparing against the earliest final read is
+    # what stops a later redundant confirmation from laundering a regression
+    # sitting between two final observations.  Overlapping or merely touching
+    # windows do not order two reads, so they fail closed rather than being
+    # read as a progression.  This is decided from capture windows in the one
+    # shared CLOCK_MONOTONIC domain; `observation_sequence` is an identifier,
+    # not a chronology, and a permuted stream must reach the same verdict.
+    # Absent, unreadable, and unavailable reads never reach this bookkeeping:
+    # they are evidence loss, already latched as gap reasons above, and a log
+    # legitimately removed after completion is not a lifecycle contradiction.
+    for upid, non_final_ends in sorted(non_final_exact_capture_ends.items()):
+        final_starts = final_exact_capture_starts.get(upid)
+        if final_starts and max(non_final_ends) >= min(final_starts):
+            raise CaptureError("exact_upid_final_status_regressed")
     _validate_t0_quiescence(
         manifest,
         surfaces,

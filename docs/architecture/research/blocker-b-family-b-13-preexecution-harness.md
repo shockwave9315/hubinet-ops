@@ -237,6 +237,27 @@ must never rehabilitate a non-final, unknown, unreadable, absent, or late
 referenced observation. Authority follows the reference, never whichever
 observation of that UPID is convenient.
 
+The UPID-level set answers only "was this UPID ever final", so on its own it is
+untouched by a later sealed read that contradicts an established final one. A
+task lifecycle may progress `non-final -> final`, and may be confirmed final
+repeatedly, but the same exact UPID must never regress. A structurally valid
+non-final read is therefore admissible only as the earlier half of a
+`non-final -> final` progression: it must have completed strictly before the
+*earliest* final read of that UPID began. Comparing against the earliest final
+read is what stops a later redundant confirmation from laundering a regression
+sitting between two final observations. This chronology is decided from capture
+windows in the one shared CLOCK_MONOTONIC domain; `observation_sequence` is an
+identifier, not a chronology, and a permuted stream must reach the same verdict.
+Overlapping or merely touching windows do not order two reads, so they fail
+closed rather than being read as a progression. Mutually impossible exact
+snapshots are an evidence-consistency failure of the capture rather than an
+observation about B-S1, so they are `HARNESS_INCOMPLETE`; they are never
+silently ignored, never permitted to produce a positive close, and never
+dropped in a way that manufactures an enumeration-omission witness. Absent,
+unreadable, and unavailable reads are excluded from this rule: they are
+evidence loss, already latched as gap reasons, and a task log legitimately
+removed by cleanup after completion is not a lifecycle contradiction.
+
 ### 4.2 Shared monotonic clock contract
 
 `clock_contract` uses revision `family-b-13-clock-contract-v1`. It binds

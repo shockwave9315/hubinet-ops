@@ -1932,6 +1932,269 @@ def test_reference_to_late_exact_is_invalid_even_with_pre_t0_final_sibling(
     assert "t0_quiescence_final_exact_not_before_t0" in result.reasons
 
 
+def _generated_exact(
+    sequence: int,
+    *,
+    capture_start: int,
+    capture_end: int,
+    task_state: str = "stopped",
+    terminal_status: str = "TASK OK",
+    interpretation: str = "ok",
+    available: bool = True,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """One exact observation of the generated UPID, discovered by watch 1."""
+
+    record = {
+        "observation_sequence": sequence,
+        "known_upid": UPID_A,
+        "status_result": _raw_result(
+            available, task_state if available else "", "task_state", task_state
+        ),
+        "log_result": _raw_result(
+            available,
+            terminal_status if available else "",
+            "terminal_status",
+            terminal_status,
+        ),
+        "presence": True,
+        "readable": True,
+        "previously_known": True,
+        "discovery_source": "watch",
+        "discovery_reference": 1,
+        "final_status_interpretation": interpretation,
+        "capture_start_monotonic_ns": capture_start,
+        "capture_end_monotonic_ns": capture_end,
+    }
+    record.update(overrides)
+    return record
+
+
+def _running_exact(sequence: int, *, capture_start: int, capture_end: int,
+                   interpretation: str = "not_final") -> dict[str, Any]:
+    return _generated_exact(
+        sequence,
+        capture_start=capture_start,
+        capture_end=capture_end,
+        task_state="running",
+        terminal_status="starting",
+        interpretation=interpretation,
+    )
+
+
+def test_non_final_then_final_exact_progression_may_pass(tmp_path: Path) -> None:
+    """1: `non-final -> final` is the ordinary lifecycle and must still pass."""
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _running_exact(1, capture_start=205, capture_end=210),
+        _running_exact(2, capture_start=215, capture_end=220),
+        _generated_exact(3, capture_start=225, capture_end=230),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_repeated_final_exact_observations_may_pass(tmp_path: Path) -> None:
+    """2: redundant confirmation of an already final task is not a conflict."""
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _generated_exact(1, capture_start=225, capture_end=230),
+        _generated_exact(2, capture_start=245, capture_end=250),
+        _generated_exact(3, capture_start=265, capture_end=270),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize("interpretation", ["not_final", "unknown"])
+def test_final_then_non_final_exact_observation_cannot_pass(
+    tmp_path: Path, interpretation: str
+) -> None:
+    """3/4: a task that reached a final status cannot be seen running again.
+
+    `exact_final` is UPID-level, so without this the later contradicting read
+    left the aggregate -- and therefore the positive close -- untouched.
+    """
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _generated_exact(1, capture_start=225, capture_end=230),
+        _running_exact(
+            2, capture_start=245, capture_end=250, interpretation=interpretation
+        ),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_final_status_regressed",)
+
+
+def test_final_status_regression_is_decided_by_capture_window_not_ordinal(
+    tmp_path: Path,
+) -> None:
+    """3: `observation_sequence` is an identifier, not a chronology.
+
+    The same two capture windows must reach the same verdict when the declared
+    ordinals and the physical JSONL order are both reversed.
+    """
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _running_exact(1, capture_start=245, capture_end=250),
+        _generated_exact(2, capture_start=225, capture_end=230),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_final_status_regressed",)
+
+
+@pytest.mark.parametrize(
+    "overrides,interpretation,reason",
+    [
+        ({"presence": False}, "absent", "known_exact_upid_lost"),
+        ({"readable": False}, "unreadable", "known_exact_upid_lost"),
+        ({"available": False}, "unknown", "exact_upid_raw_result_unavailable"),
+    ],
+)
+def test_final_then_lost_exact_observation_keeps_existing_gap_semantics(
+    tmp_path: Path, overrides: dict[str, Any], interpretation: str, reason: str
+) -> None:
+    """5/6: evidence loss after completion stays a gap, not a contradiction.
+
+    A finished task's log may legitimately be removed by cleanup, so an absent,
+    unreadable, or unavailable later read is loss -- already latched above --
+    and must not be reclassified by the lifecycle rule.
+    """
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _generated_exact(1, capture_start=225, capture_end=230),
+        _generated_exact(
+            2,
+            capture_start=245,
+            capture_end=250,
+            interpretation=interpretation,
+            **overrides,
+        ),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert reason in result.reasons
+
+
+def test_later_final_sibling_cannot_launder_intermediate_regression(
+    tmp_path: Path,
+) -> None:
+    """7: comparison is against the *earliest* final read of that UPID.
+
+    A third, independently valid final observation after the contradiction must
+    not restore a positive close.
+    """
+
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _generated_exact(1, capture_start=225, capture_end=230),
+        _running_exact(2, capture_start=245, capture_end=250),
+        _generated_exact(3, capture_start=265, capture_end=270),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_final_status_regressed",)
+
+
+@pytest.mark.parametrize(
+    "non_final_window",
+    [(229, 250), (215, 225)],
+    ids=["overlapping", "touching"],
+)
+def test_unorderable_exact_windows_fail_closed(
+    tmp_path: Path, non_final_window: tuple[int, int]
+) -> None:
+    """D: overlapping or merely touching windows do not order two reads.
+
+    Neither pair proves a `non-final -> final` progression, so neither may be
+    read as one.  A genuine progression needs strict separation.
+    """
+
+    manifest, records = _default_capture()
+    capture_start, capture_end = non_final_window
+    records["exact_upid"] = [
+        _running_exact(1, capture_start=capture_start, capture_end=capture_end),
+        _generated_exact(2, capture_start=225, capture_end=230),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_final_status_regressed",)
+
+    strictly_earlier = tmp_path / "strictly-earlier"
+    strictly_earlier.mkdir()
+    records["exact_upid"][0] = _running_exact(1, capture_start=215, capture_end=224)
+    progression = analyze_capture(
+        _materialize(strictly_earlier, manifest, records)
+    )
+    assert progression.outcome is AnalyzerOutcome.PASS
+
+
+def test_contradictory_exact_observation_cannot_become_omission_witness(
+    tmp_path: Path,
+) -> None:
+    """8: an inconsistent capture must never be reported as a B-S1 omission."""
+
+    manifest, records = _default_capture()
+    _add_ground_truth_operation(manifest, records, UPID_B)
+    witness = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert witness.outcome is AnalyzerOutcome.ENUMERATION_WITNESS
+
+    contradictory = tmp_path / "contradictory"
+    contradictory.mkdir()
+    records["exact_upid"] = [
+        _generated_exact(1, capture_start=225, capture_end=230),
+        _running_exact(2, capture_start=245, capture_end=250),
+    ]
+    result = analyze_capture(_materialize(contradictory, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_final_status_regressed",)
+
+
+def test_baseline_upid_final_status_regression_also_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """E: the lifecycle rule is a physical fact, not a scope-dependent one."""
+
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    _append_baseline_exact(
+        records,
+        UPID_B,
+        task_state="running",
+        terminal_status="starting",
+        interpretation="not_final",
+        capture_start=245,
+        capture_end=250,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_upid_final_status_regressed",)
+
+
 def test_post_t0_watch_and_fixed_point_cannot_establish_quiescent_t0(
     tmp_path: Path,
 ) -> None:
