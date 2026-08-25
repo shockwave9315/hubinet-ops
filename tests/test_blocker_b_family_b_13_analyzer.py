@@ -184,6 +184,30 @@ def _use_scan_as_only_discovery(
     exact["discovery_reference"] = scan_sequence
 
 
+def _set_pagination_pages(
+    records: dict[str, list[dict[str, Any]]],
+    evidence_id: str,
+    intervals: list[tuple[int, int]],
+) -> None:
+    assert len(intervals) >= 2
+    first = records["api_pages"][1]
+    for sequence, (request_start, response_end) in enumerate(intervals, 1):
+        page = first if sequence == 1 else dict(first)
+        page.update(
+            {
+                "source": "archive",
+                "start_offset": (sequence - 1) * 10,
+                "request_identity": f"pagination-page-{sequence}",
+                "request_start_monotonic_ns": request_start,
+                "response_end_monotonic_ns": response_end,
+                "phenomenon_id": evidence_id,
+                "page_sequence": sequence,
+            }
+        )
+        if sequence > 1:
+            records["api_pages"].append(page)
+
+
 def _ground_truth_operation(sequence: int, upid: str) -> list[dict[str, Any]]:
     request_id = f"request-{sequence}"
     return [
@@ -1297,6 +1321,70 @@ def test_duplicate_api_pages_tolerated_only_with_primary_reconciliation(tmp_path
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+@pytest.mark.parametrize(
+    ("intervals", "expected_outcome"),
+    [
+        ([(100, 110), (101, 110)], AnalyzerOutcome.INCOMPLETE),
+        ([(100, 111), (101, 111)], AnalyzerOutcome.PASS),
+        ([(130, 140), (130, 141)], AnalyzerOutcome.INCOMPLETE),
+        ([(129, 140), (129, 141)], AnalyzerOutcome.PASS),
+    ],
+    ids=[
+        "page-end-equals-request-start",
+        "page-end-strictly-after-request-start",
+        "page-start-equals-request-end",
+        "page-start-strictly-before-request-end",
+    ],
+)
+def test_13b_requires_strict_generator_request_overlap(
+    tmp_path: Path,
+    intervals: list[tuple[int, int]],
+    expected_outcome: AnalyzerOutcome,
+) -> None:
+    manifest, records = _default_capture()
+    evidence_id = _set_subrun(
+        manifest, "13B", ["pagination_movement"]
+    )["pagination_movement"]
+    _set_pagination_pages(records, evidence_id, intervals)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is expected_outcome
+    if expected_outcome is AnalyzerOutcome.INCOMPLETE:
+        assert result.reasons == (
+            "subrun_pagination_movement_not_evidenced",
+        )
+
+
+def test_13b_multiple_equality_only_pages_do_not_establish_overlap(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    evidence_id = _set_subrun(
+        manifest, "13B", ["pagination_movement"]
+    )["pagination_movement"]
+    _set_pagination_pages(records, evidence_id, [(100, 110), (130, 140)])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("subrun_pagination_movement_not_evidenced",)
+
+
+def test_13b_one_genuine_overlap_preserves_positive_control(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    evidence_id = _set_subrun(
+        manifest, "13B", ["pagination_movement"]
+    )["pagination_movement"]
+    _set_pagination_pages(records, evidence_id, [(100, 110), (129, 140)])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
 def test_offset_repetition_cannot_heal_unknown_omission(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     _add_ground_truth_operation(manifest, records, UPID_B)
@@ -2217,6 +2305,21 @@ def test_subrun_13g_requires_every_declared_combined_phenomenon(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.PASS
+
+    for page in (archive_page, second_page):
+        page["request_start_monotonic_ns"] = 100
+        page["response_end_monotonic_ns"] = 110
+    equality_tmp = tmp_path / "13g-pagination-equality-only"
+    equality_tmp.mkdir()
+
+    equality_result = analyze_capture(
+        _materialize(equality_tmp, manifest, records)
+    )
+
+    assert equality_result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert equality_result.reasons == (
+        "subrun_pagination_movement_not_evidenced",
+    )
 
 
 def test_healthy_then_unhealthy_heartbeat_before_close_cannot_pass(

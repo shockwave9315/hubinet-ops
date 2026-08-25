@@ -1343,9 +1343,9 @@ def _validate_subrun_obligations(
         ]
         overlaps_generator = any(
             _require_int(page, "request_start_monotonic_ns")
-            <= int(operation["request_end_monotonic_ns"])
+            < int(operation["request_end_monotonic_ns"])
             and _require_int(page, "response_end_monotonic_ns")
-            >= int(operation["request_start_monotonic_ns"])
+            > int(operation["request_start_monotonic_ns"])
             for page in pages
             for operation in generator_window_operations
         )

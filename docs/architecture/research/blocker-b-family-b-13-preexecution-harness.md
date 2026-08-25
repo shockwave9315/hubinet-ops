@@ -688,7 +688,7 @@ capture structure:
 | Subrun | Machine obligation |
 | --- | --- |
 | 13A | nonempty in-window generated UPID set plus legitimate enumeration/reconciliation |
-| 13B | sequenced pages for one source with multiple actual offsets overlapping an in-window generator request schedule |
+| 13B | sequenced pages for one source with multiple actual offsets and at least one strict half-open interval overlap (`page_start < request_end` and `page_end > request_start`) with an in-window generator request schedule; equality-only boundary contact is insufficient |
 | 13C | an in-window generated target present in ordered active then archive surface observations |
 | 13D | old `index` hash and device/inode reappear as `index.1`, new `index` differs, matching rename watch evidence exists, captured rotation content includes an in-window generated UPID, and the marker binds every in-window generator sequence while rotation occurs inside the generated run |
 | 13E | a matching raw overflow or invalidation/loss signal strictly after T0 and at or before candidate close; the exact qualifying watch record must also cause the observer GAP, and the successful expected classification is `B_S1_GAP_DETECTED` |
@@ -1019,6 +1019,11 @@ does not justify moving on.
 - **Target:** 50–200 tasks spanning at least 3–10 pages; short/medium category.
 - **Evidence:** every API request/page/restart plus ground truth, watch, scans,
   and exact reads.
+- **Temporal obligation:** at least one page interval strictly overlaps an
+  in-window generator request: `page_request_start < generator_request_end`
+  and `page_response_end > generator_request_start`. Equality at either edge
+  is ambiguous between independently recorded monotonic planes and does not
+  exercise pagination during generator activity.
 - **Falsification:** missing UPID with no gap; pagination repetition alone may
   not repair the classification.
 - **PASS means:** tested page-movement schedules overlapped and reconciled the
