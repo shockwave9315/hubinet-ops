@@ -285,6 +285,20 @@ request was actually initiated. Overlapping in-flight requests remain legal:
 only the capture stream, not the operations, is ordered. This orders capture
 records only and never identifies worker body start.
 
+`capture_finalized` closes semantic capture in `harness-events.jsonl`. Every
+machine-bearing harness record -- subrun markers (`scheduled_interleaving`,
+`active_archive_handoff`, `index_rotation`, and the markers 13G inherits),
+explicit gap signals, heartbeats, and the analyzer-version record -- must
+already be sealed when it is written, so the only record permitted after it is
+`process_stop`, which is physically last. Anything else after finalization is
+`HARNESS_INCOMPLETE`, and a post-finalization gap signal is incomplete rather
+than a retroactive GAP. This boundary is enforced from sealed physical
+`harness_sequence`/JSONL order, never from a declared timestamp: a marker
+appended after finalization can always backdate its own `monotonic_ns`. Harness
+physical order deliberately does not imply nondecreasing time -- a marker
+legitimately carries the monotonic value of the phenomenon it records while
+being appended later -- so no global harness timestamp ordering is imposed.
+
 Each child-watch installation declares `bucket_origin` as either
 `existing_at_root_install` or `root_event`. A `root_event` installation must
 reference the exact creation-event watcher sequence; an initially existing

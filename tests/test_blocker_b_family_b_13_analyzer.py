@@ -2673,6 +2673,179 @@ def test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence(
     assert "subrun_index_rotation_not_evidenced" in ambient_result.reasons
 
 
+def _f13_marker(
+    manifest: dict[str, Any], records: dict[str, list[dict[str, Any]]]
+) -> dict[str, Any]:
+    evidence_ids = _set_subrun(manifest, "13F", ["watch_scan_creation_race"])
+    records["watch_events"][0]["monotonic_ns"] = 185
+    return {
+        "event": "scheduled_interleaving",
+        "kind": "watch_scan_creation_race",
+        "phenomenon_id": evidence_ids["watch_scan_creation_race"],
+        "target_upid": UPID_A,
+        "scan_sequence": 1,
+        "watcher_sequence": 1,
+        "monotonic_ns": 170,
+    }
+
+
+def _c13_marker(
+    manifest: dict[str, Any], records: dict[str, list[dict[str, Any]]]
+) -> dict[str, Any]:
+    evidence_ids = _set_subrun(manifest, "13C", ["active_archive_handoff"])
+    active = _append_surface(
+        records, "active", capture_start=150, capture_end=160,
+        raw_evidence=_active_raw(UPID_A), upids=[UPID_A],
+    )
+    archive = _append_surface(
+        records, "index", capture_start=170, capture_end=175,
+        raw_evidence=_archive_raw(UPID_A), upids=[UPID_A],
+    )
+    return {
+        "event": "active_archive_handoff",
+        "phenomenon_id": evidence_ids["active_archive_handoff"],
+        "target_upid": UPID_A,
+        "active_observation_sequence": active["observation_sequence"],
+        "archive_observation_sequence": archive["observation_sequence"],
+        "monotonic_ns": 176,
+    }
+
+
+def _d13_marker(
+    manifest: dict[str, Any], records: dict[str, list[dict[str, Any]]]
+) -> dict[str, Any]:
+    evidence_ids = _set_subrun(manifest, "13D", ["index_rotation"])
+    raw = _archive_raw(UPID_A)
+    before = _append_surface(
+        records, "index", capture_start=150, capture_end=160, raw_evidence=raw,
+        upids=[UPID_A], stat={"device": 1, "inode": 20, "size": len(raw)},
+    )
+    rotated = _append_surface(
+        records, "index.1", capture_start=180, capture_end=185, raw_evidence=raw,
+        upids=[UPID_A], stat={"device": 1, "inode": 20, "size": len(raw)},
+    )
+    after = _append_surface(
+        records, "index", capture_start=180, capture_end=185, raw_evidence="",
+        upids=[], stat={"device": 1, "inode": 21, "size": 0},
+    )
+    records["ground_truth"][-1]["monotonic_ns"] = 190
+    records["watch_events"].append(
+        _watch_event(
+            2, masks=["IN_MOVED_TO"], monotonic_ns=170, filename="index.1",
+            phenomenon_id=evidence_ids["index_rotation"],
+        )
+    )
+    for scan in records["scan_rounds"]:
+        scan["watch_drained_through_sequence"] = 2
+    return {
+        "event": "index_rotation",
+        "phenomenon_id": evidence_ids["index_rotation"],
+        "before_index_sequence": before["observation_sequence"],
+        "after_index_sequence": after["observation_sequence"],
+        "after_index1_sequence": rotated["observation_sequence"],
+        "watcher_sequence": 2,
+        "generator_sequences": [1],
+        "monotonic_ns": 186,
+    }
+
+
+@pytest.mark.parametrize(
+    ("builder", "outcome"),
+    [
+        (_f13_marker, AnalyzerOutcome.PASS),
+        (_c13_marker, AnalyzerOutcome.PASS),
+        (_d13_marker, AnalyzerOutcome.PASS),
+    ],
+)
+def test_subrun_marker_before_capture_finalization_may_pass(
+    tmp_path: Path, builder: Any, outcome: AnalyzerOutcome
+) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"].insert(-2, builder(manifest, records))
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is outcome
+
+
+@pytest.mark.parametrize("builder", [_f13_marker, _c13_marker, _d13_marker])
+def test_subrun_marker_after_capture_finalization_is_incomplete(
+    tmp_path: Path, builder: Any
+) -> None:
+    """`capture_finalized` closes semantic capture.
+
+    The marker keeps a fully valid backdated ``monotonic_ns`` and valid
+    referenced evidence; only its physical position moved past finalization.
+    """
+
+    manifest, records = _default_capture()
+    records["harness_events"].insert(-1, builder(manifest, records))
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_record_after_capture_finalized",)
+
+
+def test_gap_signal_after_capture_finalization_is_incomplete_not_gap(
+    tmp_path: Path,
+) -> None:
+    """A post-finalization gap signal cannot retroactively latch a GAP."""
+
+    manifest, records = _default_capture()
+    signal = {"event": "gap_signal", "reason": "injected_loss", "monotonic_ns": 260}
+
+    before_dir = tmp_path / "before"
+    before_dir.mkdir()
+    before_manifest, before_records = _default_capture()
+    before_records["harness_events"].insert(-2, dict(signal))
+    before = analyze_capture(_materialize(before_dir, before_manifest, before_records))
+    assert before.outcome is AnalyzerOutcome.GAP
+    assert before.reasons == ("injected_loss",)
+
+    records["harness_events"].insert(-1, signal)
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_record_after_capture_finalized",)
+
+
+def test_heartbeat_after_capture_finalization_is_incomplete(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"].insert(
+        -1, {"event": "heartbeat", "healthy": True, "monotonic_ns": 260}
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_record_after_capture_finalized",)
+
+
+def test_process_stop_must_be_physically_last(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"].append(
+        {"event": "heartbeat", "healthy": True, "monotonic_ns": 330}
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_record_after_capture_finalized",)
+
+
+def test_default_harness_lifecycle_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    assert [record["event"] for record in records["harness_events"]][-2:] == [
+        "capture_finalized",
+        "process_stop",
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
 def test_subrun_13f_requires_referenced_watch_during_scan(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     evidence_ids = _set_subrun(manifest, "13F", ["watch_scan_creation_race"])

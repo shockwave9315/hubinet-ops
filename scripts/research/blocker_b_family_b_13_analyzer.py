@@ -1654,6 +1654,19 @@ def _analyze_loaded(
         raise CaptureError("harness_process_close_finalization_order_invalid")
     if not _require_bool(finalizers[0], "complete"):
         raise CaptureError("harness_capture_finalization_false")
+    # `capture_finalized` closes semantic capture.  Every machine-bearing harness
+    # record -- subrun markers, gap signals, heartbeats, the analyzer-version
+    # record -- must already be sealed by then, so the only record permitted
+    # after it is `process_stop`, which is physically last.  This is enforced
+    # from sealed physical order, never from a self-declared timestamp: a marker
+    # appended after finalization can always backdate its own `monotonic_ns`,
+    # and legitimate harness records do carry times earlier than records
+    # physically preceding them.
+    if (
+        kinds[-1] != "process_stop"
+        or kinds.index("capture_finalized") != len(kinds) - 2
+    ):
+        raise CaptureError("harness_record_after_capture_finalized")
     if any(record["event"] == "process_crash" for record in harness):
         raise CaptureError("harness_process_crash")
     version_events = [record for record in harness if record["event"] == "analyzer_version"]
