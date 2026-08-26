@@ -277,6 +277,16 @@ that an incoherent capture can never be promoted into an enumeration-omission
 witness against B-S1. Absent, unreadable, and unavailable reads are again
 excluded: evidence loss is not terminal-outcome disagreement.
 
+The sealed `log_result.raw_evidence` is the exact task-log content, not the
+normalized value returned later by `PVE::UPID::read_status()`. Its last
+nonempty raw line is classified only as `TASK OK` (`ok`),
+`TASK WARNINGS: N` with one or more decimal digits (`warning`), or
+`TASK ERROR: <nonempty message>` (`error`), matching the pinned worker
+serialization. In particular, bare `WARNINGS: N` is a `read_status()` return
+projection and is not a valid raw task-log terminal line. An unknown raw line
+or a declared interpretation that disagrees with this classification is
+`HARNESS_INCOMPLETE`.
+
 ### 4.2 Shared monotonic clock contract
 
 `clock_contract` uses revision `family-b-13-clock-contract-v1`. It binds

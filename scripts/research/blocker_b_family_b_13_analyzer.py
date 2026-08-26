@@ -1070,6 +1070,18 @@ def _validate_raw_result(
     return result
 
 
+def _classify_exact_log_terminal_status(terminal_status: str) -> str | None:
+    """Classify one raw exact-log terminal line using pinned PVE syntax."""
+
+    if terminal_status == "TASK OK":
+        return "ok"
+    if re.fullmatch(r"TASK WARNINGS: \d+", terminal_status):
+        return "warning"
+    if re.fullmatch(r"TASK ERROR: .+", terminal_status):
+        return "error"
+    return None
+
+
 def _stat_identity(record: Mapping[str, Any], field: str) -> tuple[int, int]:
     stat = _require_mapping(record.get("stat"), field)
     return (_require_int(stat, "device"), _require_int(stat, "inode"))
@@ -2609,20 +2621,17 @@ def _analyze_loaded(
         ]
         if status_raw != task_state or not log_lines or log_lines[-1] != terminal_status:
             raise CaptureError("exact_upid_parsed_result_mismatches_raw_evidence")
+        raw_terminal_interpretation = _classify_exact_log_terminal_status(
+            terminal_status
+        )
         interpretation_consistent = (
-            final_interpretation == "ok"
-            and task_state == "stopped"
-            and terminal_status == "TASK OK"
-        ) or (
-            final_interpretation == "warning"
-            and task_state == "stopped"
-            and terminal_status.startswith("WARNINGS:")
-        ) or (
-            final_interpretation == "error"
-            and task_state == "stopped"
-            and terminal_status not in {"", "TASK OK"}
-            and not terminal_status.startswith("WARNINGS:")
-        ) or final_interpretation in {"not_final", "unknown"}
+            final_interpretation in {"not_final", "unknown"}
+            or (
+                final_interpretation in {"ok", "warning", "error"}
+                and task_state == "stopped"
+                and raw_terminal_interpretation == final_interpretation
+            )
+        )
         if not interpretation_consistent:
             raise CaptureError("exact_upid_final_interpretation_inconsistent")
         if final_interpretation in {"ok", "warning", "error"}:

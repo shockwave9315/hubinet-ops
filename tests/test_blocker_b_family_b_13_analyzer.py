@@ -2829,8 +2829,59 @@ def _final_exact(
 
 
 OK_RESULT = ("TASK OK", "ok")
-WARNING_RESULT = ("WARNINGS: 2", "warning")
+WARNING_RESULT = ("TASK WARNINGS: 2", "warning")
 ERROR_RESULT = ("TASK ERROR: boom", "error")
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "interpretation", "expected"),
+    [
+        ("TASK OK", "ok", AnalyzerOutcome.PASS),
+        ("TASK WARNINGS: 1", "warning", AnalyzerOutcome.PASS),
+        ("TASK WARNINGS: 123", "warning", AnalyzerOutcome.PASS),
+        ("TASK ERROR: boom", "error", AnalyzerOutcome.PASS),
+        ("TASK WARNINGS: 2", "error", AnalyzerOutcome.INCOMPLETE),
+        ("TASK WARNINGS: 2", "ok", AnalyzerOutcome.INCOMPLETE),
+        ("WARNINGS: 2", "warning", AnalyzerOutcome.INCOMPLETE),
+        ("arbitrary terminal text", "error", AnalyzerOutcome.INCOMPLETE),
+        ("TASK ERROR: boom", "warning", AnalyzerOutcome.INCOMPLETE),
+    ],
+    ids=[
+        "ok",
+        "warning-one",
+        "warning-many",
+        "error",
+        "warning-declared-error",
+        "warning-declared-ok",
+        "normalized-warning-not-raw",
+        "unknown-declared-error",
+        "error-declared-warning",
+    ],
+)
+def test_exact_raw_terminal_status_uses_pinned_pve_serialization(
+    tmp_path: Path,
+    terminal_status: str,
+    interpretation: str,
+    expected: AnalyzerOutcome,
+) -> None:
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _final_exact(
+            1,
+            capture_start=225,
+            capture_end=230,
+            terminal_status=terminal_status,
+            interpretation=interpretation,
+        )
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is expected
+    if expected is AnalyzerOutcome.INCOMPLETE:
+        assert result.reasons == (
+            "exact_upid_final_interpretation_inconsistent",
+        )
 
 
 @pytest.mark.parametrize(
