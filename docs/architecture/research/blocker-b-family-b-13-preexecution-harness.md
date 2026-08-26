@@ -182,7 +182,7 @@ explicit directory's fixed file set. It is not imported by production code.
 | identity | `schema_revision`, `experiment_id`, `run_uuid`, exact `protocol_revision`, exact `expected_b_s1_revision` |
 | fixture | `fixture_kind`, placeholder-or-approved `fixture_id`, `node_identity`, `boot_id`; live analysis rejects a placeholder and CT112 |
 | versions | installed/source `version_ledger` and `loaded_code_status` |
-| environment | `kernel_context`, `filesystem_context`, start/end timestamps |
+| environment | `kernel_context`, `filesystem_context` including a sealed `task_tree` contract, start/end timestamps |
 | processes | `reader_context`, `generator_context`, process identities and clock descriptions |
 | clock | complete `clock_contract`: `CLOCK_MONOTONIC`, one domain id, fixture/node/boot/time-namespace binding, correlation state, and the domain id used by every timestamp-producing plane |
 | boundary | quiescent candidate `t0_monotonic_ns`, candidate-close T1, a distinct bounded `experiment_generator_window`, committed `baseline_upids` plus hashed `baseline_observation`, and independently cross-checked `t0_quiescence` evidence |
@@ -301,6 +301,21 @@ proof of that binding. This package does not implement that collector.
 
 ### 4.3 Pre-T0 watch-first establishment
 
+`filesystem_context.task_tree` commits one fixture-local task-tree provenance
+contract before any watch evidence is interpreted. It contains a canonical
+absolute `task_root` and `bucket_layout=direct_lowercase_hex_child`; therefore
+the exact path for bucket identifier `[0-9a-f]` is deterministically
+`task_root + "/" + bucket`. Synthetic captures use an explicit synthetic root.
+A future `disposable_pve` collector/preflight supplies and seals its fixture's
+root; the offline analyzer neither derives it from nor dereferences the host
+filesystem.
+
+Path validation is lexical and exact. Empty or relative paths, `/` as the task
+root, NUL, `.` or `..` components, duplicate separators, and trailing slashes
+are non-canonical. No `Path.resolve()` or filesystem lookup participates.
+Alternate spellings and paths outside the committed root are rejected as
+`HARNESS_INCOMPLETE`.
+
 `pre-t0-establishment.jsonl` is a distinct sealed protocol stream. It records a
 contiguous establishment sequence; task-root and bucket `watch_installed`
 records with watcher sequence and monotonic time; root-watch `bucket_created`
@@ -308,6 +323,14 @@ events and masks; immediate `PRE_T0_BUCKET_RESCAN` records; and explicitly
 phased `PRE_T0_BASELINE` scan rounds. `t0_quiescence` references the task-root
 watch installation, the exact terminal pair of baseline scan sequences, and
 the final pre-T0 watch-drain watermark.
+
+Every pre-T0 watcher record declares `watch_scope`. A task-root installation,
+root `bucket_created` event, or generic root event must name the exact committed
+root. A bucket installation or generic bucket event carries the exact bucket
+identifier and derived bucket path, and generic events must correspond to a
+watch established by this stream. Bucket rescans and scan bucket sets use the
+same bounded identifier rule. An unrelated or scope-mismatched sealed path is
+incoherent capture provenance, never fixed-point evidence.
 
 Physical JSONL order in this stream is itself sealed evidence. Every declared
 ordinal here is chronology-bearing: `establishment_sequence` is order-compared
@@ -436,6 +459,15 @@ normalized UPID when parseable, `queue_overflow`, watch add/remove and
 invalidation state, monotonic/wall timestamps, and raw read-buffer ordering.
 `IN_Q_OVERFLOW`, `IN_IGNORED`, `IN_UNMOUNT`, `IN_DELETE_SELF`, and
 `IN_MOVE_SELF` are preserved even without a filename.
+
+Each record also declares `watch_scope=task_root|bucket`; bucket scope includes
+its lowercase-hex bucket identifier. Before a record can contribute to watch
+discovery/deletion, observer GAP, exact-UPID provenance, or 13D/13E/13F, the
+analyzer requires its canonical `watched_path` to equal the committed root or
+the exact derived path of a pre-T0-established bucket. Invalid path provenance
+is `HARNESS_INCOMPLETE` and is not silently dropped. A genuine raw
+overflow/invalidation on a correctly bound path retains its existing
+`B_S1_GAP_DETECTED` semantics.
 
 Candidate-interval watch semantics use exactly
 `T0 < monotonic_ns <= T1`. A `watch-events.jsonl` record at or before T0 is

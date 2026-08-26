@@ -138,6 +138,12 @@ class AnalysisResult:
         return result
 
 
+@dataclass(frozen=True)
+class _TaskTreeContract:
+    task_root: str
+    bucket_layout: str
+
+
 class CaptureError(ValueError):
     """The capture cannot be interpreted completely."""
 
@@ -302,6 +308,75 @@ def _validated_inotify_masks(
     return decoded
 
 
+def _validated_canonical_absolute_path(value: Any, context: str) -> str:
+    """Validate one sealed POSIX path lexically without host dereferencing."""
+
+    if not isinstance(value, str) or not value:
+        raise CaptureError(f"task_tree_path_not_nonempty_string:{context}")
+    if not value.startswith("/"):
+        raise CaptureError(f"task_tree_path_not_absolute:{context}")
+    if value == "/" or value.endswith("/") or "//" in value or "\x00" in value:
+        raise CaptureError(f"task_tree_path_not_canonical:{context}")
+    components = value.split("/")[1:]
+    if any(component in {"", ".", ".."} for component in components):
+        raise CaptureError(f"task_tree_path_not_canonical:{context}")
+    return value
+
+
+def _validated_task_tree_contract(
+    manifest: Mapping[str, Any],
+) -> _TaskTreeContract:
+    filesystem_context = _require_mapping(
+        manifest.get("filesystem_context"), "filesystem_context"
+    )
+    task_tree = _require_mapping(
+        filesystem_context.get("task_tree"), "filesystem_context.task_tree"
+    )
+    task_root = _validated_canonical_absolute_path(
+        task_tree.get("task_root"), "filesystem_context.task_tree.task_root"
+    )
+    bucket_layout = _require_text(task_tree, "bucket_layout")
+    if bucket_layout != "direct_lowercase_hex_child":
+        raise CaptureError("task_tree_bucket_layout_unsupported")
+    return _TaskTreeContract(task_root=task_root, bucket_layout=bucket_layout)
+
+
+def _task_bucket_path(
+    task_tree: _TaskTreeContract, bucket: Any, context: str
+) -> str:
+    if not isinstance(bucket, str) or re.fullmatch(r"[0-9a-f]", bucket) is None:
+        raise CaptureError(f"task_tree_bucket_identifier_invalid:{context}")
+    return f"{task_tree.task_root}/{bucket}"
+
+
+def _validate_watch_path(
+    record: Mapping[str, Any],
+    task_tree: _TaskTreeContract,
+    context: str,
+    *,
+    root_event_with_bucket: bool = False,
+) -> tuple[str, str | None]:
+    scope = _require_text(record, "watch_scope")
+    watched_path = _validated_canonical_absolute_path(
+        record.get("watched_path"), context
+    )
+    if scope == "task_root":
+        if watched_path != task_tree.task_root:
+            raise CaptureError(f"watch_path_not_bound_to_task_tree:{context}")
+        if root_event_with_bucket:
+            _task_bucket_path(task_tree, record.get("bucket"), context)
+        elif record.get("bucket") is not None:
+            raise CaptureError(f"watch_scope_bucket_mismatch:{context}")
+        return (scope, None)
+    if scope == "bucket":
+        bucket = record.get("bucket")
+        expected_path = _task_bucket_path(task_tree, bucket, context)
+        if watched_path != expected_path:
+            raise CaptureError(f"watch_path_not_bound_to_task_tree:{context}")
+        return (scope, str(bucket))
+    raise CaptureError(f"watch_scope_invalid:{context}")
+
+
 def _parse_surface_raw_evidence(source: str, raw_evidence: str) -> frozenset[str]:
     """Parse the exact v4 UTF-8 serialization of one local PVE task surface."""
 
@@ -460,7 +535,7 @@ def _validate_clock_contract(
         raise CaptureEnvironmentError(f"clock_contract_ineligible:{exc}") from exc
 
 
-def _validate_manifest(manifest: Mapping[str, Any]) -> None:
+def _validate_manifest(manifest: Mapping[str, Any]) -> _TaskTreeContract:
     exact_values = {
         "schema_revision": SCHEMA_REVISION,
         "experiment_id": "family-b-13",
@@ -509,6 +584,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
         "candidate_close",
     ):
         _require_mapping(manifest.get(field), field)
+    task_tree = _validated_task_tree_contract(manifest)
 
     t0_monotonic_ns = _require_int(manifest, "t0_monotonic_ns")
     baseline_upids = {
@@ -608,6 +684,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> None:
             raise CaptureEnvironmentError(f"source_version_mismatch:{component}")
     if manifest.get("loaded_code_status") != "exact_context_matched":
         raise CaptureEnvironmentError("loaded_code_context_not_matched")
+    return task_tree
 
 
 def _validate_seal(root: Path, seal: Mapping[str, Any]) -> None:
@@ -957,8 +1034,10 @@ def _reject_generated_upids_not_strictly_after_request_start(
 
 
 def _validate_pre_t0_establishment(
-    manifest: Mapping[str, Any], records: Sequence[Mapping[str, Any]]
-) -> frozenset[str]:
+    manifest: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    task_tree: _TaskTreeContract,
+) -> tuple[frozenset[str], frozenset[str]]:
     """Prove that the candidate's watch-first baseline protocol was executed."""
 
     t0 = _require_int(manifest, "t0_monotonic_ns")
@@ -1026,6 +1105,12 @@ def _validate_pre_t0_establishment(
             prior_time = event_time
             if not _require_bool(record, "complete"):
                 raise CaptureError("pre_t0_watch_record_incomplete")
+            _validate_watch_path(
+                record,
+                task_tree,
+                f"pre_t0.watch:{watcher_sequence}",
+                root_event_with_bucket=event == "bucket_created",
+            )
             if event == "watch_event":
                 masks = _validated_inotify_masks(
                     record, f"pre_t0.watch:{watcher_sequence}"
@@ -1120,6 +1205,8 @@ def _validate_pre_t0_establishment(
             _require_text({"value": value}, "value")
             for value in _require_sequence(scan.get("bucket_set"), "pre_t0.bucket_set")
         }
+        for bucket in buckets:
+            _task_bucket_path(task_tree, bucket, "pre_t0.bucket_set")
         watermark = _require_int(scan, "watch_drained_through_sequence")
         if (
             watermark == 0
@@ -1192,6 +1279,17 @@ def _validate_pre_t0_establishment(
             else:
                 raise CaptureError("pre_t0_bucket_watch_origin_invalid")
             installed_buckets.setdefault(bucket, []).append(record)
+    established_bucket_ids = frozenset(installed_buckets)
+    for watcher_sequence, record in watcher_records.items():
+        if record.get("event") != "watch_event":
+            continue
+        scope, bucket = _validate_watch_path(
+            record, task_tree, f"pre_t0.watch:{watcher_sequence}"
+        )
+        if scope == "bucket" and bucket not in established_bucket_ids:
+            raise CaptureError(
+                f"pre_t0_watch_scope_not_established:{watcher_sequence}"
+            )
     for bucket in bucket_sets[0]:
         installs = installed_buckets.get(bucket, [])
         if not any(
@@ -1237,6 +1335,7 @@ def _validate_pre_t0_establishment(
         if len(installs) != 1 or len(rescans) != 1:
             raise CaptureError("pre_t0_lazy_bucket_watch_or_rescan_missing")
         rescan = rescans[0]
+        _task_bucket_path(task_tree, rescan.get("bucket"), "pre_t0.bucket_rescan")
         rescan_start = _require_int(rescan, "scan_start_monotonic_ns")
         rescan_end = _require_int(rescan, "scan_end_monotonic_ns")
         {
@@ -1272,7 +1371,7 @@ def _validate_pre_t0_establishment(
             ):
                 raise CaptureError("pre_t0_existing_bucket_watch_installed_too_late")
 
-    return frozenset(gap_reasons)
+    return (frozenset(gap_reasons), established_bucket_ids)
 
 
 def _validate_t0_quiescence(
@@ -1608,13 +1707,14 @@ def _validate_subrun_obligations(
 
 
 def _analyze_loaded(
-    manifest: Mapping[str, Any], records: Mapping[str, Sequence[Mapping[str, Any]]]
+    manifest: Mapping[str, Any],
+    records: Mapping[str, Sequence[Mapping[str, Any]]],
+    task_tree: _TaskTreeContract,
 ) -> AnalysisResult:
-    gap_reasons = set(
-        _validate_pre_t0_establishment(
-            manifest, records["pre_t0_establishment"]
-        )
+    pre_t0_gap_reasons, established_bucket_ids = _validate_pre_t0_establishment(
+        manifest, records["pre_t0_establishment"], task_tree
     )
+    gap_reasons = set(pre_t0_gap_reasons)
     operations = _ground_truth(records["ground_truth"], manifest)
     close = _require_mapping(manifest["candidate_close"], "candidate_close")
     close_state = _require_text(close, "state")
@@ -1750,7 +1850,13 @@ def _analyze_loaded(
         if raw_order == 0:
             raise CaptureError("watch_raw_order_zero")
         raw_orders.append(raw_order)
-        _require_string(record, "watched_path")
+        watch_scope, watch_bucket = _validate_watch_path(
+            record, task_tree, f"watch:{watcher_sequence}"
+        )
+        if watch_scope == "bucket" and watch_bucket not in established_bucket_ids:
+            raise CaptureError(f"watch_scope_not_established:{watcher_sequence}")
+        record["_watch_scope"] = watch_scope
+        record["_watch_bucket"] = watch_bucket
         _require_string(record, "filename")
         queue_overflow = _require_bool(record, "queue_overflow")
         event_time = _require_int(record, "monotonic_ns")
@@ -1774,6 +1880,10 @@ def _analyze_loaded(
             raise CaptureError(
                 f"watch_normalized_upid_mismatch_filename:{watcher_sequence}"
             )
+        if parsed_upid is not None and watch_scope != "bucket":
+            raise CaptureError(f"watch_upid_scope_invalid:{watcher_sequence}")
+        if filename in {"index", "index.1"} and watch_scope != "task_root":
+            raise CaptureError(f"watch_index_scope_invalid:{watcher_sequence}")
         record["_normalized_upid"] = parsed_upid
         if event_time <= t0_monotonic:
             raise CaptureError(
@@ -2301,7 +2411,7 @@ def analyze_capture(capture_dir: str | os.PathLike[str]) -> AnalysisResult:
         root = _capture_root(capture_dir)
         manifest_value = _load_json(_safe_file(root, "manifest.json"))
         manifest = _require_mapping(manifest_value, "manifest")
-        _validate_manifest(manifest)
+        task_tree = _validate_manifest(manifest)
         seal_value = _load_json(_safe_file(root, "seal.json"))
         seal = _require_mapping(seal_value, "seal")
         _validate_seal(root, seal)
@@ -2310,7 +2420,7 @@ def analyze_capture(capture_dir: str | os.PathLike[str]) -> AnalysisResult:
         records = {
             key: _load_jsonl(_safe_file(root, name)) for key, name in CAPTURE_FILES.items()
         }
-        return _analyze_loaded(manifest, records)
+        return _analyze_loaded(manifest, records, task_tree)
     except CaptureEnvironmentError as exc:
         return AnalysisResult(AnalyzerOutcome.INELIGIBLE, (str(exc),))
     except (CaptureError, OSError) as exc:

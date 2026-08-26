@@ -29,6 +29,7 @@ UPID_B = "UPID:fixture:00000002:00000002:00000002:stopall::generator@pve:"
 UPID_C = "UPID:fixture:00000003:00000003:00000003:stopall::generator@pve:"
 UPID_X = "UPID:othernode:00000004:00000004:00000004:mystery:999:other@pve:"
 UPID_OWNER_X = "UPID:fixture:00000005:00000005:00000005:stopall::other@pve:"
+SYNTHETIC_TASK_ROOT = "/synthetic/pve/tasks"
 
 INOTIFY_MASKS = {
     "IN_ACCESS": 0x00000001,
@@ -52,6 +53,10 @@ INOTIFY_MASKS = {
 
 def _raw_mask(masks: list[str]) -> int:
     return sum(INOTIFY_MASKS[mask] for mask in masks)
+
+
+def _task_bucket_path(bucket: str) -> str:
+    return f"{SYNTHETIC_TASK_ROOT}/{bucket}"
 
 
 def _active_raw(*upids: str) -> str:
@@ -87,11 +92,17 @@ def _watch_event(
     filename: str | None = None,
     phenomenon_id: str | None = None,
 ) -> dict[str, Any]:
+    watch_scope = "bucket" if upid is not None else "task_root"
     record: dict[str, Any] = {
         "watcher_sequence": sequence,
         "event_type": event_type,
         "mask": masks,
-        "watched_path": "tasks/0",
+        "watch_scope": watch_scope,
+        "watched_path": (
+            _task_bucket_path("0")
+            if watch_scope == "bucket"
+            else SYNTHETIC_TASK_ROOT
+        ),
         "filename": filename if filename is not None else (upid or ""),
         "queue_overflow": "IN_Q_OVERFLOW" in masks,
         "watch_descriptor": -1 if "IN_Q_OVERFLOW" in masks else 1,
@@ -101,6 +112,8 @@ def _watch_event(
         "monotonic_ns": monotonic_ns,
         "wall_timestamp": "2026-08-25T00:00:03Z",
     }
+    if watch_scope == "bucket":
+        record["bucket"] = "0"
     if upid is not None:
         record["normalized_upid"] = upid
     if phenomenon_id is not None:
@@ -315,7 +328,14 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
         ],
         "loaded_code_status": "exact_context_matched",
         "kernel_context": {"release": "synthetic", "source_commit": None},
-        "filesystem_context": {"type": "synthetic", "mount_id": "fixture"},
+        "filesystem_context": {
+            "type": "synthetic",
+            "mount_id": "fixture",
+            "task_tree": {
+                "task_root": SYNTHETIC_TASK_ROOT,
+                "bucket_layout": "direct_lowercase_hex_child",
+            },
+        },
         "started_at": "2026-08-25T00:00:00Z",
         "ended_at": "2026-08-25T00:01:00Z",
         "reader_context": {
@@ -387,7 +407,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "event": "watch_installed",
                 "watcher_sequence": 1,
                 "watch_scope": "task_root",
-                "watched_path": "tasks",
+                "watched_path": SYNTHETIC_TASK_ROOT,
                 "monotonic_ns": 50,
                 "complete": True,
             },
@@ -396,7 +416,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "event": "watch_installed",
                 "watcher_sequence": 2,
                 "watch_scope": "bucket",
-                "watched_path": "tasks/0",
+                "watched_path": _task_bucket_path("0"),
                 "bucket": "0",
                 "bucket_origin": "existing_at_root_install",
                 "monotonic_ns": 51,
@@ -436,7 +456,9 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "watcher_sequence": 1,
                 "event_type": "exact_log_event",
                 "mask": ["IN_CREATE"],
-                "watched_path": "tasks/0",
+                "watch_scope": "bucket",
+                "watched_path": _task_bucket_path("0"),
+                "bucket": "0",
                 "filename": UPID_A,
                 "normalized_upid": UPID_A,
                 "queue_overflow": False,
@@ -1126,7 +1148,8 @@ def test_watch_loss_signals_gap(
             "watcher_sequence": 2,
             "event_type": event_type,
             "mask": mask,
-            "watched_path": "tasks",
+            "watch_scope": "task_root",
+            "watched_path": SYNTHETIC_TASK_ROOT,
             "filename": "",
             "queue_overflow": overflow,
             "watch_descriptor": -1 if overflow else 1,
@@ -1431,7 +1454,9 @@ def test_cleanup_deleting_known_exact_log_is_gap(tmp_path: Path) -> None:
             "watcher_sequence": 2,
             "event_type": "exact_log_event",
             "mask": ["IN_DELETE"],
-            "watched_path": "tasks/0",
+            "watch_scope": "bucket",
+            "watched_path": _task_bucket_path("0"),
+            "bucket": "0",
             "filename": UPID_A,
             "normalized_upid": UPID_A,
             "queue_overflow": False,
@@ -2444,6 +2469,7 @@ def test_quiescence_commit_before_t0_is_invalid_even_with_later_watch_event(
             "event": "watch_event",
             "watcher_sequence": 3,
             "watch_scope": "task_root",
+            "watched_path": SYNTHETIC_TASK_ROOT,
             "mask": ["IN_ATTRIB"],
             "raw_mask": INOTIFY_MASKS["IN_ATTRIB"],
             "queue_overflow": False,
@@ -2468,6 +2494,7 @@ def test_watch_event_after_terminal_fixed_point_before_t0_cannot_pass(
             "event": "watch_event",
             "watcher_sequence": 3,
             "watch_scope": "task_root",
+            "watched_path": SYNTHETIC_TASK_ROOT,
             "mask": ["IN_ATTRIB"],
             "raw_mask": INOTIFY_MASKS["IN_ATTRIB"],
             "queue_overflow": False,
@@ -2502,7 +2529,7 @@ def _pre_t0_root(establishment: int, watcher: int) -> dict[str, Any]:
         "event": "watch_installed",
         "watcher_sequence": watcher,
         "watch_scope": "task_root",
-        "watched_path": "tasks",
+        "watched_path": SYNTHETIC_TASK_ROOT,
         "monotonic_ns": 50,
         "complete": True,
     }
@@ -2514,7 +2541,7 @@ def _pre_t0_bucket(establishment: int, watcher: int) -> dict[str, Any]:
         "event": "watch_installed",
         "watcher_sequence": watcher,
         "watch_scope": "bucket",
-        "watched_path": "tasks/0",
+        "watched_path": _task_bucket_path("0"),
         "bucket": "0",
         "bucket_origin": "existing_at_root_install",
         "monotonic_ns": 51,
@@ -2553,8 +2580,9 @@ def _pre_t0_watch(
         "establishment_sequence": establishment,
         "event": "watch_event",
         "watcher_sequence": watcher,
-        "watch_scope": "task_root",
-        "watched_path": "tasks/0",
+        "watch_scope": "bucket",
+        "watched_path": _task_bucket_path("0"),
+        "bucket": "0",
         "mask": declared_masks,
         "raw_mask": _raw_mask(declared_masks),
         "queue_overflow": "IN_Q_OVERFLOW" in declared_masks,
@@ -2577,6 +2605,126 @@ def _with_pre_t0_stream(
         "baseline_scan_sequences": [1, 2],
         "watch_drained_through_sequence": watermark,
     }
+
+
+def test_exact_committed_root_and_bucket_watch_paths_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+
+    assert records["pre_t0_establishment"][0]["watched_path"] == SYNTHETIC_TASK_ROOT
+    assert records["pre_t0_establishment"][1]["watched_path"] == _task_bucket_path(
+        "0"
+    )
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        (
+            "task_root",
+            "synthetic/pve/tasks",
+            "task_tree_path_not_absolute:filesystem_context.task_tree.task_root",
+        ),
+        (
+            "task_root",
+            f"{SYNTHETIC_TASK_ROOT}/",
+            "task_tree_path_not_canonical:filesystem_context.task_tree.task_root",
+        ),
+        (
+            "bucket_layout",
+            "direct_child",
+            "task_tree_bucket_layout_unsupported",
+        ),
+    ],
+)
+def test_task_tree_contract_fails_closed(
+    tmp_path: Path, field: str, value: str, reason: str
+) -> None:
+    manifest, records = _default_capture()
+    manifest["filesystem_context"]["task_tree"][field] = value
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (reason,)
+
+
+def test_pre_t0_root_watch_must_match_committed_task_root(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"][0]["watched_path"] = "/tmp/unrelated"
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "watch_path_not_bound_to_task_tree:pre_t0.watch:1",
+    )
+
+
+def test_pre_t0_bucket_watch_must_match_its_bucket_path(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"][1]["watched_path"] = _task_bucket_path("f")
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "watch_path_not_bound_to_task_tree:pre_t0.watch:2",
+    )
+
+
+def test_pre_t0_generic_watch_must_match_committed_task_tree(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    watch = _pre_t0_watch(3, 3, 55)
+    watch["watched_path"] = "/tmp/unrelated"
+    _with_pre_t0_stream(
+        manifest,
+        records,
+        [
+            _pre_t0_root(1, 1),
+            _pre_t0_bucket(2, 2),
+            watch,
+            _pre_t0_scan(4, 1, 60, 65, 3),
+            _pre_t0_scan(5, 2, 70, 75, 3),
+        ],
+        root_reference=1,
+        watermark=3,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "watch_path_not_bound_to_task_tree:pre_t0.watch:3",
+    )
+
+
+def test_lazy_bucket_event_must_come_from_committed_task_root(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["pre_t0_establishment"].insert(
+        2,
+        {
+            "event": "bucket_created",
+            "watcher_sequence": 3,
+            "watch_scope": "task_root",
+            "watched_path": "/tmp/unrelated",
+            "bucket": "f",
+            "mask": ["IN_CREATE", "IN_ISDIR"],
+            "raw_mask": _raw_mask(["IN_CREATE", "IN_ISDIR"]),
+            "monotonic_ns": 52,
+            "complete": True,
+        },
+    )
+    _resequence_pre_t0(records)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "watch_path_not_bound_to_task_tree:pre_t0.watch:3",
+    )
 
 
 def test_permuted_pre_t0_ordinals_cannot_hide_late_watcher_event(
@@ -3083,7 +3231,8 @@ def test_permuted_harness_sequence_is_incomplete(tmp_path: Path) -> None:
 def test_missing_root_watch_before_baseline_cannot_pass(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     records["pre_t0_establishment"][0]["watch_scope"] = "bucket"
-    records["pre_t0_establishment"][0]["bucket"] = "root-is-not-a-bucket"
+    records["pre_t0_establishment"][0]["bucket"] = "f"
+    records["pre_t0_establishment"][0]["watched_path"] = _task_bucket_path("f")
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
@@ -3109,6 +3258,7 @@ def test_undrained_pre_t0_watch_event_cannot_pass(tmp_path: Path) -> None:
             "event": "watch_event",
             "watcher_sequence": 3,
             "watch_scope": "task_root",
+            "watched_path": SYNTHETIC_TASK_ROOT,
             "mask": ["IN_ATTRIB"],
             "raw_mask": INOTIFY_MASKS["IN_ATTRIB"],
             "queue_overflow": False,
@@ -3133,6 +3283,7 @@ def test_lazy_bucket_without_child_watch_and_rescan_cannot_pass(
             "event": "bucket_created",
             "watcher_sequence": 3,
             "watch_scope": "task_root",
+            "watched_path": SYNTHETIC_TASK_ROOT,
             "bucket": "f",
             "mask": ["IN_CREATE", "IN_ISDIR"],
             "raw_mask": _raw_mask(["IN_CREATE", "IN_ISDIR"]),
@@ -3164,6 +3315,7 @@ def test_watch_first_pre_t0_fixed_point_with_lazy_bucket_may_continue(
             "event": "bucket_created",
             "watcher_sequence": 3,
             "watch_scope": "task_root",
+            "watched_path": SYNTHETIC_TASK_ROOT,
             "bucket": "f",
             "mask": [creation_mask, "IN_ISDIR"],
             "raw_mask": _raw_mask([creation_mask, "IN_ISDIR"]),
@@ -3174,7 +3326,7 @@ def test_watch_first_pre_t0_fixed_point_with_lazy_bucket_may_continue(
             "event": "watch_installed",
             "watcher_sequence": 4,
             "watch_scope": "bucket",
-            "watched_path": "tasks/f",
+            "watched_path": _task_bucket_path("f"),
             "bucket": "f",
             "bucket_origin": "root_event",
             "trigger_watcher_sequence": 3,
@@ -3485,6 +3637,125 @@ def _f13_marker(
         "watcher_sequence": 1,
         "monotonic_ns": 170,
     }
+
+
+@pytest.mark.parametrize(
+    ("watch_scope", "bucket", "watched_path", "reason"),
+    [
+        (
+            "bucket",
+            "0",
+            "/tmp/unrelated",
+            "watch_path_not_bound_to_task_tree:watch:1",
+        ),
+        (
+            "bucket",
+            "0",
+            f"{SYNTHETIC_TASK_ROOT}/../unrelated",
+            "task_tree_path_not_canonical:watch:1",
+        ),
+        (
+            "bucket",
+            "0",
+            f"{SYNTHETIC_TASK_ROOT}//0",
+            "task_tree_path_not_canonical:watch:1",
+        ),
+        (
+            "bucket",
+            "0",
+            f"{SYNTHETIC_TASK_ROOT}/0/",
+            "task_tree_path_not_canonical:watch:1",
+        ),
+        (
+            "bucket",
+            "0",
+            "synthetic/pve/tasks/0",
+            "task_tree_path_not_absolute:watch:1",
+        ),
+        (
+            "bucket",
+            "0",
+            _task_bucket_path("f"),
+            "watch_path_not_bound_to_task_tree:watch:1",
+        ),
+        (
+            "bucket",
+            "0",
+            SYNTHETIC_TASK_ROOT,
+            "watch_path_not_bound_to_task_tree:watch:1",
+        ),
+        (
+            "task_root",
+            None,
+            _task_bucket_path("0"),
+            "watch_path_not_bound_to_task_tree:watch:1",
+        ),
+        (
+            "task_root",
+            None,
+            SYNTHETIC_TASK_ROOT,
+            "watch_upid_scope_invalid:1",
+        ),
+        (
+            "bucket",
+            "f",
+            _task_bucket_path("f"),
+            "watch_scope_not_established:1",
+        ),
+    ],
+)
+def test_post_t0_watch_path_must_match_committed_scope(
+    tmp_path: Path,
+    watch_scope: str,
+    bucket: str | None,
+    watched_path: str,
+    reason: str,
+) -> None:
+    manifest, records = _default_capture()
+    watch = records["watch_events"][0]
+    watch["watch_scope"] = watch_scope
+    watch["watched_path"] = watched_path
+    if bucket is None:
+        watch.pop("bucket", None)
+    else:
+        watch["bucket"] = bucket
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (reason,)
+
+
+def test_unrelated_13f_watch_path_cannot_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"].insert(-2, _f13_marker(manifest, records))
+    records["watch_events"][0]["watched_path"] = "/tmp/unrelated"
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("watch_path_not_bound_to_task_tree:watch:1",)
+
+
+def test_task_tree_bound_13f_watch_scan_race_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"].insert(-2, _f13_marker(manifest, records))
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_task_tree_bound_watch_only_discovery_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _use_watch_as_only_discovery(
+        records,
+        _watch_event(1, masks=["IN_CREATE"], monotonic_ns=140, upid=UPID_A),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
 
 
 def _c13_marker(
