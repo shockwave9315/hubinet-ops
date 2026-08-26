@@ -1231,6 +1231,16 @@ def _without_trailing_line_terminator(raw: str) -> str:
     return raw
 
 
+def _split_lf_crlf_lines(raw: str) -> list[str]:
+    """Split raw evidence only at literal LF and CRLF boundaries."""
+
+    lines = raw.split("\n")
+    return [
+        line[:-1] if index < len(lines) - 1 and line.endswith("\r") else line
+        for index, line in enumerate(lines)
+    ]
+
+
 def _classify_exact_log_terminal_status(terminal_status: str) -> str | None:
     """Classify one raw exact-log terminal line using pinned PVE syntax."""
 
@@ -2830,7 +2840,9 @@ def _analyze_loaded(
         )
         log_lines = [
             line
-            for line in _require_string(log_result, "raw_evidence").splitlines()
+            for line in _split_lf_crlf_lines(
+                _require_string(log_result, "raw_evidence")
+            )
             if line != ""
         ]
         if status_raw != task_state or not log_lines or log_lines[-1] != terminal_status:

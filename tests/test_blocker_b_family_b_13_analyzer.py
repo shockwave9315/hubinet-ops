@@ -5718,6 +5718,58 @@ def test_log_raw_truly_empty_trailing_line_is_skipped_as_blank(
 
 
 @pytest.mark.parametrize(
+    "separator",
+    [
+        "\x0b",
+        "\x0c",
+        "\r",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    ],
+    ids=["vt", "ff", "lone-cr", "fs", "gs", "rs", "nel", "ls", "ps"],
+)
+def test_log_raw_unauthorized_line_separator_cannot_finalize_task_ok(
+    tmp_path: Path, separator: str
+) -> None:
+    manifest, records = _default_capture()
+    _set_log_raw(records, "TASK OK" + separator)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "exact_upid_parsed_result_mismatches_raw_evidence" in result.reasons
+
+
+@pytest.mark.parametrize("raw", ["TASK OK\x0b\n", "TASK OK\u2028\n"])
+def test_log_raw_final_lf_does_not_erase_malformed_line_content(
+    tmp_path: Path, raw: str
+) -> None:
+    manifest, records = _default_capture()
+    _set_log_raw(records, raw)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "exact_upid_parsed_result_mismatches_raw_evidence" in result.reasons
+
+
+@pytest.mark.parametrize("serialization", ["", "\n", "\r\n", "\n\n", "\r\n\r\n"])
+def test_log_raw_lf_crlf_serializations_remain_legal(
+    tmp_path: Path, serialization: str
+) -> None:
+    manifest, records = _default_capture()
+    _set_log_raw(records, "TASK OK" + serialization)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
     ("terminal_status", "interpretation"),
     [
         ("TASK OK", "ok"),
@@ -5725,14 +5777,15 @@ def test_log_raw_truly_empty_trailing_line_is_skipped_as_blank(
         ("TASK ERROR: boom", "error"),
     ],
 )
+@pytest.mark.parametrize("line_ending", ["", "\n", "\r\n"])
 def test_canonical_terminal_serializations_remain_pass_eligible(
-    tmp_path: Path, terminal_status: str, interpretation: str
+    tmp_path: Path, terminal_status: str, interpretation: str, line_ending: str
 ) -> None:
     """The raw-evidence tightening must not regress the three pinned
     terminal serializations reaching PASS."""
 
     manifest, records = _default_capture()
-    _set_log_raw(records, terminal_status)
+    _set_log_raw(records, terminal_status + line_ending)
     exact = records["exact_upid"][0]
     exact["log_result"]["terminal_status"] = terminal_status
     exact["final_status_interpretation"] = interpretation
