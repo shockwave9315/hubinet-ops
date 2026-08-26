@@ -890,7 +890,7 @@ capture structure:
 | 13C | an in-window generated target present in ordered active then archive surface observations |
 | 13D | old `index` hash and device/inode reappear as `index.1`, new `index` differs, matching rename watch evidence exists, captured rotation content includes an in-window generated UPID, and the marker binds every in-window generator sequence while rotation occurs inside the generated run |
 | 13E | a matching raw overflow or invalidation/loss signal strictly after T0 and at or before candidate close; the exact qualifying watch record must also cause the observer GAP, and the successful expected classification is `B_S1_GAP_DETECTED` |
-| 13F | one in-window generated target/watch event inside the referenced scan interval and present in that scan |
+| 13F | one in-window generated target present in the referenced scan, plus an already provenance-valid watch event for that target inside the scan interval whose exact `phenomenon_id` matches the 13F evidence id and whose authoritative raw mask contains `IN_CREATE` or `IN_MOVED_TO` without deletion, move-out, or observer-loss semantics |
 | 13G | at least two phenomena explicitly selected by this run contract, each independently satisfying its corresponding generated-run/raw check |
 
 A subrun label or task count is never phenomenon evidence. In particular, 13D
@@ -1198,7 +1198,12 @@ does not justify moving on.
 - **Target:** 10–100 tasks across deliberately enumerated timing windows;
   short/burst duration category.
 - **Evidence:** watch-add times, raw events, bucket/inode scans, ground truth,
-  exact logs, candidate state transitions.
+  exact logs, candidate state transitions. The referenced watch must already
+  pass generic descriptor/path/bucket/UPID provenance, carry this exact 13F
+  evidence id, and decode from its authoritative raw mask to `IN_CREATE` or
+  `IN_MOVED_TO` without deletion, move-out, or observer-loss semantics; later
+  `IN_ATTRIB`, `IN_MODIFY`, or `IN_CLOSE_WRITE` activity alone is not evidence
+  of the scheduled creation/move-in race.
 - **Falsification:** omitted UPID with no gap, including a create-before-watch
   and delete-before-scan witness.
 - **PASS means:** only the explicitly scheduled in-window generated creation

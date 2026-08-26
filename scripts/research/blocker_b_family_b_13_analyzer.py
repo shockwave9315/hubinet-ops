@@ -1858,10 +1858,15 @@ def _validate_subrun_obligations(
         scan_set = set(scan["_normalized_upids"])
         watch_time = _require_int(watch, "monotonic_ns")
         marker_time = _require_int(marker, "monotonic_ns")
+        watch_masks = frozenset(watch["_masks"])
         if (
             target not in expected_upids
             or target not in scan_set
             or watch.get("_normalized_upid") != target
+            or watch.get("phenomenon_id") != evidence_id
+            or not watch_masks.intersection({"IN_CREATE", "IN_MOVED_TO"})
+            or watch_masks.intersection({"IN_DELETE", "IN_MOVED_FROM"})
+            or _watch_gap_reasons(watch)
             or not _is_candidate_interval_watch(
                 watch, t0_monotonic, close_monotonic
             )

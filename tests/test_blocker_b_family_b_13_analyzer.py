@@ -4165,19 +4165,39 @@ def test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence(
 
 
 def _f13_marker(
-    manifest: dict[str, Any], records: dict[str, list[dict[str, Any]]]
+    manifest: dict[str, Any],
+    records: dict[str, list[dict[str, Any]]],
+    *,
+    target_upid: str = UPID_A,
+    watcher_sequence: int = 1,
 ) -> dict[str, Any]:
     evidence_ids = _set_subrun(manifest, "13F", ["watch_scan_creation_race"])
-    records["watch_events"][0]["monotonic_ns"] = 185
+    watch = records["watch_events"][watcher_sequence - 1]
+    watch["monotonic_ns"] = 185
+    watch["phenomenon_id"] = evidence_ids["watch_scan_creation_race"]
     return {
         "event": "scheduled_interleaving",
         "kind": "watch_scan_creation_race",
         "phenomenon_id": evidence_ids["watch_scan_creation_race"],
-        "target_upid": UPID_A,
+        "target_upid": target_upid,
         "scan_sequence": 1,
-        "watcher_sequence": 1,
+        "watcher_sequence": watcher_sequence,
         "monotonic_ns": 170,
     }
+
+
+def _f13_capture_with_independent_discovery() -> tuple[
+    dict[str, Any], dict[str, list[dict[str, Any]]], dict[str, Any]
+]:
+    manifest, records = _default_capture()
+    marker = _f13_marker(manifest, records)
+    records["harness_events"].insert(-2, marker)
+    records["watch_events"].append(
+        _watch_event(2, masks=["IN_CREATE"], monotonic_ns=195, upid=UPID_A)
+    )
+    records["scan_rounds"][1]["watch_drained_through_sequence"] = 2
+    records["exact_upid"][0]["discovery_reference"] = 2
+    return manifest, records, marker
 
 
 def test_13f_watch_reference_cannot_relabel_upid_bucket(tmp_path: Path) -> None:
@@ -4295,6 +4315,181 @@ def test_unrelated_13f_watch_path_cannot_pass(tmp_path: Path) -> None:
 def test_task_tree_bound_13f_watch_scan_race_may_pass(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     records["harness_events"].insert(-2, _f13_marker(manifest, records))
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize("creation_mask", ["IN_CREATE", "IN_MOVED_TO"])
+def test_13f_creation_or_move_in_raw_event_may_pass(
+    tmp_path: Path, creation_mask: str
+) -> None:
+    manifest, records = _default_capture()
+    marker = _f13_marker(manifest, records)
+    records["harness_events"].insert(-2, marker)
+    watch = records["watch_events"][0]
+    watch["mask"] = [creation_mask]
+    watch["raw_mask"] = _raw_mask([creation_mask])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    "non_creation_masks",
+    [
+        ["IN_ATTRIB"],
+        ["IN_MODIFY"],
+        ["IN_CLOSE_WRITE"],
+        ["IN_DELETE"],
+        ["IN_MOVED_FROM"],
+        ["IN_CREATE", "IN_DELETE"],
+        ["IN_CREATE", "IN_MOVED_FROM"],
+        ["IN_CREATE", "IN_IGNORED"],
+    ],
+)
+def test_13f_non_creation_raw_event_cannot_satisfy_race(
+    tmp_path: Path, non_creation_masks: list[str]
+) -> None:
+    manifest, records, _ = _f13_capture_with_independent_discovery()
+    watch = records["watch_events"][0]
+    watch["mask"] = non_creation_masks
+    watch["raw_mask"] = _raw_mask(non_creation_masks)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("subrun_watch_scan_race_not_evidenced",)
+
+
+@pytest.mark.parametrize("phenomenon_id", [None, "unrelated-evidence-id"])
+def test_13f_watch_requires_exact_phenomenon_binding(
+    tmp_path: Path, phenomenon_id: str | None
+) -> None:
+    manifest, records = _default_capture()
+    marker = _f13_marker(manifest, records)
+    records["harness_events"].insert(-2, marker)
+    watch = records["watch_events"][0]
+    if phenomenon_id is None:
+        watch.pop("phenomenon_id")
+    else:
+        watch["phenomenon_id"] = phenomenon_id
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("subrun_watch_scan_race_not_evidenced",)
+
+
+def test_13f_marker_requires_exact_phenomenon_binding(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    marker = _f13_marker(manifest, records)
+    marker["phenomenon_id"] = "unrelated-evidence-id"
+    records["harness_events"].insert(-2, marker)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("subrun_watch_scan_race_marker_missing",)
+
+
+def test_13f_creation_watch_for_wrong_target_cannot_satisfy_race(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    marker = _f13_marker(manifest, records)
+    marker["target_upid"] = UPID_B
+    records["harness_events"].insert(-2, marker)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("subrun_watch_scan_race_not_evidenced",)
+
+
+def test_13f_creation_watch_outside_referenced_scan_cannot_satisfy_race(
+    tmp_path: Path,
+) -> None:
+    manifest, records, _ = _f13_capture_with_independent_discovery()
+    records["watch_events"][0]["monotonic_ns"] = 175
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("subrun_watch_scan_race_not_evidenced",)
+
+
+def test_13f_creation_watch_outside_candidate_interval_cannot_satisfy_race(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["watch_events"].append(
+        _watch_event(2, masks=["IN_CREATE"], monotonic_ns=301, upid=UPID_A)
+    )
+    marker = _f13_marker(
+        manifest, records, target_upid=UPID_A, watcher_sequence=2
+    )
+    records["watch_events"][1]["monotonic_ns"] = 301
+    records["harness_events"].insert(-2, marker)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("subrun_watch_scan_race_not_evidenced",)
+
+
+def test_13f_creation_watch_with_invalid_descriptor_fails_generic_provenance(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"].insert(-2, _f13_marker(manifest, records))
+    records["watch_events"][0]["watch_descriptor"] = 999
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("watch_descriptor_uninstalled:watch:1:999",)
+
+
+@pytest.mark.parametrize("loss_mask", ["IN_IGNORED", "IN_Q_OVERFLOW"])
+def test_13f_observer_loss_cannot_satisfy_creation_race(
+    tmp_path: Path, loss_mask: str
+) -> None:
+    manifest, records, _ = _f13_capture_with_independent_discovery()
+    if loss_mask == "IN_Q_OVERFLOW":
+        records["watch_events"][0] = _watch_event(
+            1, masks=[loss_mask], monotonic_ns=185
+        )
+    else:
+        watch = records["watch_events"][0]
+        watch["mask"] = [loss_mask]
+        watch["raw_mask"] = _raw_mask([loss_mask])
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("subrun_watch_scan_race_not_evidenced",)
+
+
+def test_13f_dynamic_bucket_creation_watch_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _set_dynamic_bucket_capture(manifest, records)
+    records["watch_events"].append(
+        {
+            **_watch_event(
+                2, masks=["IN_CREATE"], monotonic_ns=185, upid=UPID_HEX_A
+            ),
+            "watch_descriptor": 3,
+        }
+    )
+    for scan in records["scan_rounds"]:
+        scan["watch_drained_through_sequence"] = 2
+    marker = _f13_marker(
+        manifest, records, target_upid=UPID_HEX_A, watcher_sequence=2
+    )
+    records["harness_events"].insert(-2, marker)
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
@@ -4474,6 +4669,9 @@ def test_subrun_13f_requires_referenced_watch_during_scan(tmp_path: Path) -> Non
     manifest, records = _default_capture()
     evidence_ids = _set_subrun(manifest, "13F", ["watch_scan_creation_race"])
     records["watch_events"][0]["monotonic_ns"] = 185
+    records["watch_events"][0]["phenomenon_id"] = evidence_ids[
+        "watch_scan_creation_race"
+    ]
     records["harness_events"].insert(
         -2,
         {
