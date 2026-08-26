@@ -835,7 +835,7 @@ def _validate_seal(root: Path, seal: Mapping[str, Any]) -> None:
 
 def _ground_truth(
     records: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], int]:
     starts: dict[int, Mapping[str, Any]] = {}
     ends: dict[int, Mapping[str, Any]] = {}
     finalizers: list[Mapping[str, Any]] = []
@@ -1053,7 +1053,7 @@ def _ground_truth(
         )
         if operation_span_ns > maximum_duration_ns:
             raise CaptureError("ground_truth_duration_limit_exceeded")
-    return operations
+    return operations, finalized_monotonic_ns
 
 
 def _validate_raw_result(
@@ -2013,7 +2013,9 @@ def _analyze_loaded(
         manifest, records["pre_t0_establishment"], task_tree
     )
     gap_reasons = set(pre_t0_gap_reasons)
-    operations = _ground_truth(records["ground_truth"], manifest)
+    operations, generator_finalized_monotonic = _ground_truth(
+        records["ground_truth"], manifest
+    )
     close = _require_mapping(manifest["candidate_close"], "candidate_close")
     close_state = _require_text(close, "state")
     if close_state not in {"CLOSED_COMPLETE", "GAP_LATCHED"}:
@@ -2280,6 +2282,8 @@ def _analyze_loaded(
         scan_end = _require_int(record, "scan_end_monotonic_ns")
         if scan_end < scan_start or scan_end > close_monotonic:
             raise CaptureError("scan_time_invalid_for_close")
+        if scan_end <= t0_monotonic:
+            raise CaptureError(f"scan_round_not_after_t0:{sequence}")
         current = {
             _require_upid(value, "scan.exact_normalized_upids")
             for value in _require_sequence(
@@ -2370,6 +2374,12 @@ def _analyze_loaded(
         prior_scan_end = scan_end
         scan_known.update(record["_eligible_normalized_upids"])
     terminal_scans = [scans[len(scans) - 1], scans[len(scans)]]
+    if any(
+        _require_int(scan, "scan_end_monotonic_ns")
+        <= generator_finalized_monotonic
+        for scan in terminal_scans
+    ):
+        raise CaptureError("terminal_scan_not_after_generator_finalization")
     if not all(scan["complete"] for scan in terminal_scans):
         gap_reasons.add("terminal_scan_incomplete")
     if terminal_scans[0]["_normalized_upids"] != terminal_scans[1]["_normalized_upids"]:

@@ -588,6 +588,16 @@ may precede request initiation because a scan may span the creation boundary.
 An earlier or equal scan end is `HARNESS_INCOMPLETE` before the UPID enters
 enumeration or exact scan provenance.
 
+This stream is exclusively the candidate/T1 scan plane. Every scan round must
+end strictly after logical T0; scans ending at or before T0 belong only in the
+separate `PRE_T0_BASELINE` establishment stream. A scan may start before T0 if
+it genuinely spans that boundary. The selected terminal pair is bound to the
+T1 close chronology by requiring both terminal scans to end strictly after the
+sealed generator finalizer. Their existing candidate-close upper bound, final
+watch-drain watermark, and dynamic-handoff ordering checks remain independent.
+Thus an early pair cannot be relabeled as the close fixed point and later
+rescued by surface or exact evidence.
+
 The JSONL records themselves must physically occur in ascending
 `scan_sequence`; out-of-order capture is `HARNESS_INCOMPLETE`. After parsing,
 all watermark monotonicity, scan-time ordering, disappearance, adjacency, and

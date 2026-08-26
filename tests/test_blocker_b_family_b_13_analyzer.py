@@ -767,6 +767,21 @@ def _set_scan_history(
     ]
 
 
+def _set_surface_only_discovery_with_scan_times(
+    records: dict[str, list[dict[str, Any]]],
+    scan_times: list[tuple[int, int]],
+) -> None:
+    surface = records["surface_observations"][4]
+    _set_surface_raw(surface, _archive_raw(UPID_A), [UPID_A])
+    _use_surface_as_only_discovery(records, "index")
+    assert len(scan_times) == len(records["scan_rounds"])
+    for scan, (scan_start, scan_end) in zip(
+        records["scan_rounds"], scan_times, strict=True
+    ):
+        scan["scan_start_monotonic_ns"] = scan_start
+        scan["scan_end_monotonic_ns"] = scan_end
+
+
 def _replace_upid_in_capture(
     manifest: dict[str, Any],
     records: dict[str, list[dict[str, Any]]],
@@ -1191,6 +1206,7 @@ def test_earlier_global_scan_cannot_replace_immediate_bucket_rescan(
     records["scan_rounds"][1]["exact_normalized_upids"] = []
     records["exact_upid"][0]["discovery_source"] = "scan"
     records["exact_upid"][0]["discovery_reference"] = 1
+    records["ground_truth"][-1]["monotonic_ns"] = 130
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
@@ -1476,6 +1492,24 @@ def test_scan_spanning_returning_request_start_is_temporally_eligible(
     first["scan_end_monotonic_ns"] = 111
     second["scan_start_monotonic_ns"] = 112
     second["scan_end_monotonic_ns"] = 113
+    records["scan_rounds"].extend(
+        [
+            {
+                **second,
+                "scan_sequence": 3,
+                "round_id": "scan-3",
+                "scan_start_monotonic_ns": 160,
+                "scan_end_monotonic_ns": 170,
+            },
+            {
+                **second,
+                "scan_sequence": 4,
+                "round_id": "scan-4",
+                "scan_start_monotonic_ns": 180,
+                "scan_end_monotonic_ns": 190,
+            },
+        ]
+    )
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
@@ -2133,6 +2167,80 @@ def test_computed_equal_terminal_scans_with_drained_queue_may_pass(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    ("scan_times", "reason"),
+    [
+        ([(83, 90), (91, 99)], "scan_round_not_after_t0:1"),
+        ([(83, 90), (91, 100)], "scan_round_not_after_t0:1"),
+    ],
+    ids=["both-pre-t0", "second-ends-at-t0"],
+)
+def test_candidate_scan_rounds_cannot_reuse_pre_t0_baseline_time(
+    tmp_path: Path,
+    scan_times: list[tuple[int, int]],
+    reason: str,
+) -> None:
+    manifest, records = _default_capture()
+    _set_surface_only_discovery_with_scan_times(records, scan_times)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (reason,)
+
+
+def test_candidate_scan_may_span_t0_and_finish_after_generator_finalization(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["scan_rounds"][0].update(
+        scan_start_monotonic_ns=95,
+        scan_end_monotonic_ns=160,
+    )
+    records["scan_rounds"][1].update(
+        scan_start_monotonic_ns=170,
+        scan_end_monotonic_ns=180,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_early_post_t0_scans_cannot_be_rescued_by_later_surface_evidence(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _set_surface_only_discovery_with_scan_times(
+        records, [(101, 104), (105, 109)]
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "terminal_scan_not_after_generator_finalization",
+    )
+
+
+def test_baseline_log_missing_from_true_terminal_pair_remains_gap(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    _set_scan_history(
+        records,
+        [[UPID_A, UPID_B], [UPID_A], [UPID_A]],
+        [1, 1, 1],
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "exact_log_disappeared_between_scans" in result.reasons
+    assert "baseline_exact_log_missing_at_close" in result.reasons
 
 
 def test_ordered_scan_history_detects_exact_log_disappearance(
@@ -3928,7 +4036,9 @@ def test_13a_baseline_only_with_generator_after_t1_cannot_pass(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
-    assert "subrun_generated_window_work_missing" in result.reasons
+    assert result.reasons == (
+        "terminal_scan_not_after_generator_finalization",
+    )
 
 
 def test_13b_static_baseline_pages_without_generated_window_work_cannot_pass(
@@ -3965,7 +4075,9 @@ def test_13b_static_baseline_pages_without_generated_window_work_cannot_pass(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
-    assert "subrun_generated_window_work_missing" in result.reasons
+    assert result.reasons == (
+        "terminal_scan_not_after_generator_finalization",
+    )
 
 
 @pytest.mark.parametrize(
@@ -4126,6 +4238,14 @@ def test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence(
     )
     for scan in records["scan_rounds"]:
         scan["watch_drained_through_sequence"] = 2
+    records["scan_rounds"][0].update(
+        scan_start_monotonic_ns=191,
+        scan_end_monotonic_ns=200,
+    )
+    records["scan_rounds"][1].update(
+        scan_start_monotonic_ns=210,
+        scan_end_monotonic_ns=220,
+    )
     records["harness_events"].insert(
         -2,
         {
@@ -4556,6 +4676,14 @@ def _d13_marker(
     )
     for scan in records["scan_rounds"]:
         scan["watch_drained_through_sequence"] = 2
+    records["scan_rounds"][0].update(
+        scan_start_monotonic_ns=191,
+        scan_end_monotonic_ns=200,
+    )
+    records["scan_rounds"][1].update(
+        scan_start_monotonic_ns=210,
+        scan_end_monotonic_ns=220,
+    )
     return {
         "event": "index_rotation",
         "phenomenon_id": evidence_ids["index_rotation"],
