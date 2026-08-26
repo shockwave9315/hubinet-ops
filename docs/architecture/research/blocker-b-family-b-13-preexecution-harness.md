@@ -152,6 +152,7 @@ run-<uuid>/
   ground-truth.jsonl
   pre-t0-establishment.jsonl
   watch-events.jsonl
+  watch-lifecycle.jsonl
   scan-rounds.jsonl
   surface-observations.jsonl
   api-pages.jsonl
@@ -282,8 +283,8 @@ excluded: evidence loss is not terminal-outcome disagreement.
 `clock_kind=CLOCK_MONOTONIC`, one `clock_domain_id`, the manifest fixture,
 node identity and boot ID, a time-namespace identity, and an explicit
 correlation state. Its participant map must bind manifest T0/T1 boundaries,
-reader, generator, pre-T0 establishment, watch, scan, surface, API, exact, and
-harness timestamps to that same domain. Synthetic captures use an explicit
+reader, generator, pre-T0 establishment, watch, watch-lifecycle, scan, surface,
+API, exact, and harness timestamps to that same domain. Synthetic captures use an explicit
 synthetic shared domain. A `disposable_pve` capture requires a verified single
 shared domain on the same fixture node, boot, and relevant time namespace.
 
@@ -303,9 +304,14 @@ proof of that binding. This package does not implement that collector.
 
 `filesystem_context.task_tree` commits one fixture-local task-tree provenance
 contract before any watch evidence is interpreted. It contains a canonical
-absolute `task_root` and `bucket_layout=direct_lowercase_hex_child`; therefore
-the exact path for bucket identifier `[0-9a-f]` is deterministically
-`task_root + "/" + bucket`. Synthetic captures use an explicit synthetic root.
+absolute `task_root` and `bucket_layout=upid_starttime_final_hex_child`.
+Pinned `pve-common` 9.2.1 commit
+`f665029eac78022e81810ab2e44eace57ade13fb` formats normal UPID fields with
+`%08X`, and `PVE::UPID::decode()` selects the exact-log child from the final
+textual character of the UPID `starttime` field without lowercasing it. The
+exact path for that source-derived bucket identifier `[0-9A-Fa-f]` is therefore
+`task_root + "/" + bucket`, preserving the UPID's textual case. Synthetic
+captures use an explicit synthetic root.
 A future `disposable_pve` collector/preflight supplies and seals its fixture's
 root; the offline analyzer neither derives it from nor dereferences the host
 filesystem.
@@ -318,13 +324,18 @@ Alternate spellings and paths outside the committed root are rejected as
 
 `pre-t0-establishment.jsonl` is a distinct sealed protocol stream. It records a
 contiguous establishment sequence; task-root and bucket `watch_installed`
-records with watcher sequence and monotonic time; root-watch `bucket_created`
+records with the nonnegative kernel watch descriptor returned by installation,
+watcher sequence, and monotonic time; root-watch `bucket_created`
 events and masks; immediate `PRE_T0_BUCKET_RESCAN` records; and explicitly
 phased `PRE_T0_BASELINE` scan rounds. `t0_quiescence` references the task-root
 watch installation, the exact terminal pair of baseline scan sequences, and
 the final pre-T0 watch-drain watermark.
 
-Every pre-T0 watcher record declares `watch_scope`. A task-root installation,
+Every normal pre-T0 event is admitted through its raw `watch_descriptor` and
+an already physically recorded installation. Its scope, canonical path and
+bucket projections must equal that installation binding, and its monotonic time
+cannot precede installation. Duplicate or conflicting descriptor installation
+is incomplete. Every pre-T0 watcher record declares `watch_scope`. A task-root installation,
 root `bucket_created` event, or generic root event must name the exact committed
 root. A bucket installation or generic bucket event carries the exact bucket
 identifier and derived bucket path, and generic events must correspond to a
@@ -404,6 +415,13 @@ invalidation/loss bit latches observer GAP even when the event is drained before
 the terminal baseline scans; draining cannot restore observations that may
 already have been lost.
 
+Linux queue overflow is the one descriptor exception. A raw event whose exact
+decoded mask is `IN_Q_OVERFLOW` must carry `watch_descriptor=-1`, cannot carry
+filename/UPID discovery evidence, and immediately latches GAP without inventing
+a path-specific installation. Other invalidation/loss events remain bound to
+their installed descriptor before latching GAP. Malformed overflow or
+descriptor provenance is `HARNESS_INCOMPLETE`.
+
 This sealed establishment stream exclusively owns watcher evidence at or
 before logical T0, including an event exactly at T0. Such an event is never
 duplicated or reused in `watch-events.jsonl` to prove candidate-interval
@@ -461,10 +479,12 @@ invalidation state, monotonic/wall timestamps, and raw read-buffer ordering.
 `IN_MOVE_SELF` are preserved even without a filename.
 
 Each record also declares `watch_scope=task_root|bucket`; bucket scope includes
-its lowercase-hex bucket identifier. Before a record can contribute to watch
+the exact source-derived textual hex bucket identifier. Before a record can contribute to watch
 discovery/deletion, observer GAP, exact-UPID provenance, or 13D/13E/13F, the
-analyzer requires its canonical `watched_path` to equal the committed root or
-the exact derived path of a pre-T0-established bucket. Invalid path provenance
+analyzer requires its raw descriptor to identify a sealed active installation,
+and requires scope, canonical path and bucket projections to equal that
+installation. For an exact UPID filename, the UPID-derived bucket must also
+equal the descriptor bucket and watched-path child. Invalid provenance
 is `HARNESS_INCOMPLETE` and is not silently dropped. A genuine raw
 overflow/invalidation on a correctly bound path retains its existing
 `B_S1_GAP_DETECTED` semantics.
@@ -509,6 +529,43 @@ be the same contiguous `1..N` sequence. This checks that sealed records retain
 the observer's raw capture order; it is not a kernel cursor, an inotify
 completeness proof, or a theorem about causal ordering inside the kernel.
 
+### 4.5.1 Dynamic post-T0 watch lifecycle
+
+`watch-lifecycle.jsonl` is the sealed provenance stream for a bucket that does
+not exist at T0. It uses a contiguous `lifecycle_sequence` equal to physical
+JSONL order. A `POST_T0_DYNAMIC_BUCKET` `watch_installed` record binds the
+returned nonnegative descriptor to the exact bucket scope/path and explicitly
+references the triggering `watch-events.jsonl` task-root watcher sequence. The
+referenced raw event must already be bound to the pre-T0 root descriptor, name
+the same one-character bucket, and decode to `IN_ISDIR` plus `IN_CREATE` or
+`IN_MOVED_TO`.
+
+The physically later `POST_T0_BUCKET_RESCAN` record references both that exact
+installation sequence and its root-event sequence. Shared CLOCK_MONOTONIC time
+must satisfy root event `<=` installation `<=` rescan start `<=` rescan end;
+the explicit references and lifecycle physical order provide causality when
+clock values are equal. The rescan is complete only with no unreadable or
+malformed entries, and every exact UPID it reports must source-derive to that
+same bucket. This immediate rescan reconciles files created between the root
+event and child-watch installation.
+
+Every post-T0 root bucket-creation event must have exactly one complete
+install/rescan handoff, and no lifecycle record may invent one without its
+trigger. Every bucket used by completeness-bearing scans or watches must be
+either established before T0 or covered by a complete dynamic handoff. A scan
+may first detect a new bucket and force reconciliation, but evidence from that
+bucket does not become positive enumeration authority before the handoff
+rescan, and both terminal fixed-point scans must finish after every dynamic
+handoff. A later global scan cannot replace the immediate affected-bucket
+rescan. Unmatched, unfinished, relabeled, or scan-only lifecycle provenance is
+`HARNESS_INCOMPLETE`; proven observer loss remains GAP.
+
+Linux can recycle a descriptor after removal, including a documented extreme
+case involving unread queued events. This bounded protocol rejects descriptor
+reuse: relevant descriptor-specific invalidation already prevents positive
+close, so accepting a later generation is unnecessary and would be ambiguous
+without a larger generation model.
+
 ### 4.6 Scan rounds
 
 `scan-rounds.jsonl` records a contiguous monotonic `scan_sequence`, `round_id`,
@@ -518,6 +575,9 @@ entries, `complete`, and `watch_drained_through_sequence`. A capture-supplied
 consistency marker is annotation only; the analyzer computes the terminal
 fixed point. Positive close requires two consecutive terminal complete scans
 with identical normalized sets and no relevant watcher sequence left undrained.
+Its bucket set is observation only, not installation authority: each bucket
+must be covered by the sealed pre-T0 or dynamic lifecycle, and every reported
+UPID must source-derive to a bucket in that scan.
 Watcher sequence/time and each scan's drain watermark are cross-checked so a
 scan cannot claim an event that occurred after it ended. A disappearing exact
 log or unreadable/malformed/inconsistent scan latches a gap.
@@ -597,7 +657,8 @@ capture start/end, presence,
 readability, `previously_known`, discovery source/reference, raw status result,
 raw log result, each result's recomputed SHA-256, and final-status
 interpretation. Valid discovery sources are committed baseline, a prior watch
-event, a completed scan, or a prior local active/archive observation. Exact-UPID
+event, a completed global scan, a completed immediate bucket rescan, or a prior
+local active/archive observation. Exact-UPID
 reads confirm and finalize only an already enumerated UPID; they never add one
 to the completeness-bearing enumeration set. Missing discovery provenance is
 `HARNESS_INCOMPLETE`.

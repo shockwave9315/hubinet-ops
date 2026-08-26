@@ -58,6 +58,7 @@ CLOCK_PARTICIPANTS = frozenset(
         "generator",
         "pre_t0",
         "watch",
+        "watch_lifecycle",
         "scan",
         "surface",
         "api",
@@ -93,6 +94,7 @@ CAPTURE_FILES = {
     "ground_truth": "ground-truth.jsonl",
     "pre_t0_establishment": "pre-t0-establishment.jsonl",
     "watch_events": "watch-events.jsonl",
+    "watch_lifecycle": "watch-lifecycle.jsonl",
     "scan_rounds": "scan-rounds.jsonl",
     "surface_observations": "surface-observations.jsonl",
     "api_pages": "api-pages.jsonl",
@@ -142,6 +144,17 @@ class AnalysisResult:
 class _TaskTreeContract:
     task_root: str
     bucket_layout: str
+
+
+@dataclass(frozen=True)
+class _InstalledWatch:
+    descriptor: int
+    source: str
+    sequence: int
+    watch_scope: str
+    watched_path: str
+    bucket: str | None
+    monotonic_ns: int
 
 
 class CaptureError(ValueError):
@@ -271,6 +284,11 @@ def _decode_upid(upid: str) -> dict[str, str]:
         raise CaptureError("cannot_decode_normalized_upid")
     return {
         "node": match.group(1),
+        # PVE::UPID::decode() in pinned pve-common 9.2.1 selects the exact-log
+        # child with substr($starttime, 7, 8).  Preserve the textual nibble:
+        # decode does not lowercase an A-F character produced by encode's %08X.
+        "starttime": match.group(4),
+        "task_bucket": match.group(4)[-1],
         "task_type": match.group(5),
         "task_id": match.group(6),
         "owner": match.group(7),
@@ -336,7 +354,7 @@ def _validated_task_tree_contract(
         task_tree.get("task_root"), "filesystem_context.task_tree.task_root"
     )
     bucket_layout = _require_text(task_tree, "bucket_layout")
-    if bucket_layout != "direct_lowercase_hex_child":
+    if bucket_layout != "upid_starttime_final_hex_child":
         raise CaptureError("task_tree_bucket_layout_unsupported")
     return _TaskTreeContract(task_root=task_root, bucket_layout=bucket_layout)
 
@@ -344,7 +362,7 @@ def _validated_task_tree_contract(
 def _task_bucket_path(
     task_tree: _TaskTreeContract, bucket: Any, context: str
 ) -> str:
-    if not isinstance(bucket, str) or re.fullmatch(r"[0-9a-f]", bucket) is None:
+    if not isinstance(bucket, str) or re.fullmatch(r"[0-9A-Fa-f]", bucket) is None:
         raise CaptureError(f"task_tree_bucket_identifier_invalid:{context}")
     return f"{task_tree.task_root}/{bucket}"
 
@@ -375,6 +393,77 @@ def _validate_watch_path(
             raise CaptureError(f"watch_path_not_bound_to_task_tree:{context}")
         return (scope, str(bucket))
     raise CaptureError(f"watch_scope_invalid:{context}")
+
+
+def _register_installed_watch(
+    installations: dict[int, _InstalledWatch],
+    record: Mapping[str, Any],
+    task_tree: _TaskTreeContract,
+    context: str,
+    *,
+    source: str,
+    sequence: int,
+) -> _InstalledWatch:
+    descriptor = _require_int(record, "watch_descriptor")
+    if descriptor > 2**31 - 1:
+        raise CaptureError(f"watch_descriptor_out_of_range:{context}")
+    scope, bucket = _validate_watch_path(record, task_tree, context)
+    installation = _InstalledWatch(
+        descriptor=descriptor,
+        source=source,
+        sequence=sequence,
+        watch_scope=scope,
+        watched_path=_require_text(record, "watched_path"),
+        bucket=bucket,
+        monotonic_ns=_require_int(record, "monotonic_ns"),
+    )
+    # This bounded capture never needs descriptor reuse: every descriptor-
+    # specific invalidation latches GAP, after which positive close is already
+    # impossible.  Reuse without an installation generation would be ambiguous.
+    if descriptor in installations:
+        raise CaptureError(f"watch_descriptor_duplicate_or_reused:{descriptor}")
+    installations[descriptor] = installation
+    return installation
+
+
+def _bind_watch_event_to_installation(
+    record: Mapping[str, Any],
+    installations: Mapping[int, _InstalledWatch],
+    task_tree: _TaskTreeContract,
+    context: str,
+    masks: frozenset[str],
+    *,
+    root_event_with_bucket: bool = False,
+) -> _InstalledWatch | None:
+    descriptor = _require_signed_int(record, "watch_descriptor")
+    if "IN_Q_OVERFLOW" in masks:
+        if masks != frozenset({"IN_Q_OVERFLOW"}) or descriptor != -1:
+            raise CaptureError(f"watch_overflow_descriptor_or_mask_invalid:{context}")
+        if _require_string(record, "filename") or record.get("normalized_upid") is not None:
+            raise CaptureError(f"watch_overflow_carries_path_specific_evidence:{context}")
+        return None
+    if descriptor < 0:
+        raise CaptureError(f"watch_descriptor_invalid:{context}")
+    if descriptor > 2**31 - 1:
+        raise CaptureError(f"watch_descriptor_out_of_range:{context}")
+    installation = installations.get(descriptor)
+    if installation is None:
+        raise CaptureError(f"watch_descriptor_uninstalled:{context}:{descriptor}")
+    scope, bucket = _validate_watch_path(
+        record,
+        task_tree,
+        context,
+        root_event_with_bucket=root_event_with_bucket,
+    )
+    if (
+        scope != installation.watch_scope
+        or _require_text(record, "watched_path") != installation.watched_path
+        or bucket != installation.bucket
+    ):
+        raise CaptureError(f"watch_descriptor_binding_mismatch:{context}")
+    if _require_int(record, "monotonic_ns") < installation.monotonic_ns:
+        raise CaptureError(f"watch_event_predates_installation:{context}")
+    return installation
 
 
 def _parse_surface_raw_evidence(source: str, raw_evidence: str) -> frozenset[str]:
@@ -641,6 +730,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> _TaskTreeContract:
         "ground_truth_finalized",
         "pre_t0_establishment_complete",
         "watch_capture_complete",
+        "watch_lifecycle_complete",
         "scan_capture_complete",
         "surface_capture_complete",
         "api_capture_complete",
@@ -1037,7 +1127,7 @@ def _validate_pre_t0_establishment(
     manifest: Mapping[str, Any],
     records: Sequence[Mapping[str, Any]],
     task_tree: _TaskTreeContract,
-) -> tuple[frozenset[str], frozenset[str]]:
+) -> tuple[frozenset[str], frozenset[str], dict[int, _InstalledWatch]]:
     """Prove that the candidate's watch-first baseline protocol was executed."""
 
     t0 = _require_int(manifest, "t0_monotonic_ns")
@@ -1084,6 +1174,7 @@ def _validate_pre_t0_establishment(
     physical_watcher_sequences: list[int] = []
     physical_baseline_scan_sequences: list[int] = []
     gap_reasons: set[str] = set()
+    installations: dict[int, _InstalledWatch] = {}
     prior_time = -1
     for record in records:
         sequence = _require_int(record, "establishment_sequence")
@@ -1105,13 +1196,43 @@ def _validate_pre_t0_establishment(
             prior_time = event_time
             if not _require_bool(record, "complete"):
                 raise CaptureError("pre_t0_watch_record_incomplete")
-            _validate_watch_path(
+            scope, _ = _validate_watch_path(
                 record,
                 task_tree,
                 f"pre_t0.watch:{watcher_sequence}",
                 root_event_with_bucket=event == "bucket_created",
             )
-            if event == "watch_event":
+            if event == "watch_installed":
+                _register_installed_watch(
+                    installations,
+                    record,
+                    task_tree,
+                    f"pre_t0.install:{watcher_sequence}",
+                    source="pre_t0",
+                    sequence=watcher_sequence,
+                )
+            elif event == "bucket_created":
+                masks = _validated_inotify_masks(
+                    record, f"pre_t0.bucket_created:{watcher_sequence}"
+                )
+                if (
+                    scope != "task_root"
+                    or _require_string(record, "filename") != record.get("bucket")
+                    or "IN_ISDIR" not in masks
+                    or not masks.intersection({"IN_CREATE", "IN_MOVED_TO"})
+                ):
+                    raise CaptureError("pre_t0_lazy_bucket_event_invalid")
+                installation = _bind_watch_event_to_installation(
+                    record,
+                    installations,
+                    task_tree,
+                    f"pre_t0.bucket_created:{watcher_sequence}",
+                    masks,
+                    root_event_with_bucket=True,
+                )
+                if installation is None or installation.watch_scope != "task_root":
+                    raise CaptureError("pre_t0_lazy_bucket_descriptor_invalid")
+            elif event == "watch_event":
                 masks = _validated_inotify_masks(
                     record, f"pre_t0.watch:{watcher_sequence}"
                 )
@@ -1121,7 +1242,14 @@ def _validate_pre_t0_establishment(
                     raise CaptureError(
                         "pre_t0_watch_queue_overflow_mismatch_raw_mask:"
                         f"{watcher_sequence}"
-                    )
+                )
+                _bind_watch_event_to_installation(
+                    record,
+                    installations,
+                    task_tree,
+                    f"pre_t0.watch:{watcher_sequence}",
+                    masks,
+                )
                 gap_reasons.update(_watch_gap_reasons({"_masks": masks}))
             watcher_records[watcher_sequence] = record
         elif event == "baseline_scan":
@@ -1207,6 +1335,8 @@ def _validate_pre_t0_establishment(
         }
         for bucket in buckets:
             _task_bucket_path(task_tree, bucket, "pre_t0.bucket_set")
+        if any(_decode_upid(upid)["task_bucket"] not in buckets for upid in normalized):
+            raise CaptureError("pre_t0_scan_upid_bucket_mismatch")
         watermark = _require_int(scan, "watch_drained_through_sequence")
         if (
             watermark == 0
@@ -1266,6 +1396,9 @@ def _validate_pre_t0_establishment(
         raise CaptureError("pre_t0_watch_event_after_terminal_fixed_point")
 
     first_scan_start = _require_int(selected_scans[0], "scan_start_monotonic_ns")
+    first_scan_establishment_sequence = _require_int(
+        selected_scans[0], "establishment_sequence"
+    )
     installed_buckets: dict[str, list[Mapping[str, Any]]] = {}
     for record in watcher_records.values():
         if record.get("event") == "watch_installed" and record.get("watch_scope") == "bucket":
@@ -1294,6 +1427,8 @@ def _validate_pre_t0_establishment(
         installs = installed_buckets.get(bucket, [])
         if not any(
             root_time <= _require_int(record, "monotonic_ns") <= first_scan_start
+            and _require_int(record, "establishment_sequence")
+            < first_scan_establishment_sequence
             for record in installs
         ):
             raise CaptureError(f"pre_t0_bucket_watch_missing:{bucket}")
@@ -1323,6 +1458,8 @@ def _validate_pre_t0_establishment(
             record
             for record in installed_buckets.get(bucket, [])
             if event_time <= _require_int(record, "monotonic_ns") <= first_scan_start
+            and _require_int(record, "establishment_sequence")
+            < first_scan_establishment_sequence
             and record.get("bucket_origin") == "root_event"
             and record.get("trigger_watcher_sequence") == trigger_sequence
         ]
@@ -1338,21 +1475,31 @@ def _validate_pre_t0_establishment(
         _task_bucket_path(task_tree, rescan.get("bucket"), "pre_t0.bucket_rescan")
         rescan_start = _require_int(rescan, "scan_start_monotonic_ns")
         rescan_end = _require_int(rescan, "scan_end_monotonic_ns")
-        {
+        rescan_upids = {
             _require_upid(value, "pre_t0.rescan.exact_normalized_upids")
             for value in _require_sequence(
                 rescan.get("exact_normalized_upids"),
                 "pre_t0.rescan.exact_normalized_upids",
             )
         }
+        if any(_decode_upid(upid)["task_bucket"] != bucket for upid in rescan_upids):
+            raise CaptureError("pre_t0_bucket_rescan_upid_bucket_mismatch")
         if (
             not _require_bool(rescan, "complete")
-            or _require_sequence(rescan.get("unreadable_entries"), "pre_t0.rescan.unreadable_entries")
-            or _require_sequence(rescan.get("malformed_entries"), "pre_t0.rescan.malformed_entries")
+            or _require_sequence(
+                rescan.get("unreadable_entries"),
+                "pre_t0.rescan.unreadable_entries",
+            )
+            or _require_sequence(
+                rescan.get("malformed_entries"),
+                "pre_t0.rescan.malformed_entries",
+            )
             or not _require_int(installs[0], "monotonic_ns")
             <= rescan_start
             <= rescan_end
             <= first_scan_start
+            or _require_int(rescan, "establishment_sequence")
+            >= first_scan_establishment_sequence
         ):
             raise CaptureError("pre_t0_lazy_bucket_rescan_invalid")
     if len(bucket_rescans) != len(lazy_events):
@@ -1371,7 +1518,149 @@ def _validate_pre_t0_establishment(
             ):
                 raise CaptureError("pre_t0_existing_bucket_watch_installed_too_late")
 
-    return (frozenset(gap_reasons), established_bucket_ids)
+    return (frozenset(gap_reasons), established_bucket_ids, installations)
+
+
+def _validate_post_t0_watch_lifecycle(
+    records: Sequence[Mapping[str, Any]],
+    watches: Mapping[int, Mapping[str, Any]],
+    installations: dict[int, _InstalledWatch],
+    pre_t0_buckets: frozenset[str],
+    task_tree: _TaskTreeContract,
+    t0_monotonic: int,
+    close_monotonic: int,
+) -> tuple[dict[str, Mapping[str, Any]], dict[int, Mapping[str, Any]]]:
+    """Seal every post-T0 root-event -> child-watch -> rescan handoff."""
+
+    physical_sequences: list[int] = []
+    installs_by_sequence: dict[int, tuple[_InstalledWatch, int]] = {}
+    dynamic_by_bucket: dict[str, Mapping[str, Any]] = {}
+    rescans_by_sequence: dict[int, Mapping[str, Any]] = {}
+    trigger_to_install: dict[int, int] = {}
+
+    for source_record in records:
+        record = dict(source_record)
+        sequence = _require_int(record, "lifecycle_sequence")
+        if (
+            sequence == 0
+            or sequence in rescans_by_sequence
+            or sequence in installs_by_sequence
+        ):
+            raise CaptureError("watch_lifecycle_sequence_zero_or_duplicate")
+        physical_sequences.append(sequence)
+        event = _require_text(record, "event")
+        if event == "watch_installed":
+            if record.get("phase") != "POST_T0_DYNAMIC_BUCKET":
+                raise CaptureError("post_t0_watch_install_phase_invalid")
+            if not _require_bool(record, "complete"):
+                raise CaptureError("post_t0_watch_install_incomplete")
+            installation = _register_installed_watch(
+                installations,
+                record,
+                task_tree,
+                f"watch_lifecycle.install:{sequence}",
+                source="post_t0",
+                sequence=sequence,
+            )
+            if installation.watch_scope != "bucket" or installation.bucket is None:
+                raise CaptureError("post_t0_watch_install_scope_invalid")
+            if not t0_monotonic < installation.monotonic_ns <= close_monotonic:
+                raise CaptureError("post_t0_watch_install_time_invalid")
+            if installation.bucket in pre_t0_buckets:
+                raise CaptureError("post_t0_watch_install_bucket_already_established")
+            trigger_sequence = _require_int(record, "trigger_watcher_sequence")
+            trigger = watches.get(trigger_sequence)
+            if trigger is None:
+                raise CaptureError("post_t0_watch_install_trigger_missing")
+            trigger_masks = frozenset(trigger["_masks"])
+            trigger_binding = _bind_watch_event_to_installation(
+                trigger,
+                installations,
+                task_tree,
+                f"watch_lifecycle.trigger:{trigger_sequence}",
+                trigger_masks,
+            )
+            if (
+                trigger_binding is None
+                or trigger_binding.source != "pre_t0"
+                or trigger_binding.watch_scope != "task_root"
+                or trigger.get("_watch_scope") != "task_root"
+                or _require_string(trigger, "filename") != installation.bucket
+                or "IN_ISDIR" not in trigger_masks
+                or not trigger_masks.intersection({"IN_CREATE", "IN_MOVED_TO"})
+                or not bool(trigger.get("_candidate_interval"))
+                or _require_int(trigger, "monotonic_ns") > installation.monotonic_ns
+            ):
+                raise CaptureError("post_t0_watch_install_trigger_invalid")
+            if trigger_sequence in trigger_to_install:
+                raise CaptureError("post_t0_watch_install_trigger_reused")
+            trigger_to_install[trigger_sequence] = sequence
+            installs_by_sequence[sequence] = (installation, trigger_sequence)
+        elif event == "bucket_rescan":
+            if record.get("phase") != "POST_T0_BUCKET_RESCAN":
+                raise CaptureError("post_t0_bucket_rescan_phase_invalid")
+            install_sequence = _require_int(record, "watch_installation_sequence")
+            install_entry = installs_by_sequence.get(install_sequence)
+            if install_entry is None or install_sequence >= sequence:
+                raise CaptureError("post_t0_bucket_rescan_install_reference_invalid")
+            installation, trigger_sequence = install_entry
+            bucket = _require_text(record, "bucket")
+            _task_bucket_path(task_tree, bucket, "watch_lifecycle.bucket_rescan")
+            if (
+                bucket != installation.bucket
+                or record.get("trigger_watcher_sequence") != trigger_sequence
+            ):
+                raise CaptureError("post_t0_bucket_rescan_binding_mismatch")
+            scan_start = _require_int(record, "scan_start_monotonic_ns")
+            scan_end = _require_int(record, "scan_end_monotonic_ns")
+            if not installation.monotonic_ns <= scan_start <= scan_end <= close_monotonic:
+                raise CaptureError("post_t0_bucket_rescan_time_invalid")
+            if (
+                not _require_bool(record, "complete")
+                or _require_sequence(
+                    record.get("unreadable_entries"),
+                    "watch_lifecycle.unreadable_entries",
+                )
+                or _require_sequence(
+                    record.get("malformed_entries"),
+                    "watch_lifecycle.malformed_entries",
+                )
+            ):
+                raise CaptureError("post_t0_bucket_rescan_incomplete")
+            upids = {
+                _require_upid(value, "watch_lifecycle.exact_normalized_upids")
+                for value in _require_sequence(
+                    record.get("exact_normalized_upids"),
+                    "watch_lifecycle.exact_normalized_upids",
+                )
+            }
+            if any(_decode_upid(upid)["task_bucket"] != bucket for upid in upids):
+                raise CaptureError("post_t0_bucket_rescan_upid_bucket_mismatch")
+            if bucket in dynamic_by_bucket:
+                raise CaptureError("post_t0_bucket_rescan_duplicate")
+            record["_normalized_upids"] = upids
+            dynamic_by_bucket[bucket] = record
+            rescans_by_sequence[sequence] = record
+        else:
+            raise CaptureError(f"unknown_watch_lifecycle_event:{event}")
+
+    if physical_sequences != list(range(1, len(records) + 1)):
+        raise CaptureError("watch_lifecycle_sequence_not_jsonl_ordered")
+    if len(dynamic_by_bucket) != len(installs_by_sequence):
+        raise CaptureError("post_t0_dynamic_bucket_rescan_missing")
+
+    dynamic_root_events = {
+        sequence
+        for sequence, watch in watches.items()
+        if watch.get("_candidate_interval")
+        and watch.get("_watch_scope") == "task_root"
+        and re.fullmatch(r"[0-9A-Fa-f]", str(watch.get("filename", "")))
+        and "IN_ISDIR" in watch["_masks"]
+        and set(watch["_masks"]).intersection({"IN_CREATE", "IN_MOVED_TO"})
+    }
+    if dynamic_root_events != set(trigger_to_install):
+        raise CaptureError("post_t0_dynamic_bucket_handoff_missing_or_unmatched")
+    return dynamic_by_bucket, rescans_by_sequence
 
 
 def _validate_t0_quiescence(
@@ -1711,7 +2000,11 @@ def _analyze_loaded(
     records: Mapping[str, Sequence[Mapping[str, Any]]],
     task_tree: _TaskTreeContract,
 ) -> AnalysisResult:
-    pre_t0_gap_reasons, established_bucket_ids = _validate_pre_t0_establishment(
+    (
+        pre_t0_gap_reasons,
+        established_bucket_ids,
+        installed_watches,
+    ) = _validate_pre_t0_establishment(
         manifest, records["pre_t0_establishment"], task_tree
     )
     gap_reasons = set(pre_t0_gap_reasons)
@@ -1853,8 +2146,6 @@ def _analyze_loaded(
         watch_scope, watch_bucket = _validate_watch_path(
             record, task_tree, f"watch:{watcher_sequence}"
         )
-        if watch_scope == "bucket" and watch_bucket not in established_bucket_ids:
-            raise CaptureError(f"watch_scope_not_established:{watcher_sequence}")
         record["_watch_scope"] = watch_scope
         record["_watch_bucket"] = watch_bucket
         _require_string(record, "filename")
@@ -1882,6 +2173,11 @@ def _analyze_loaded(
             )
         if parsed_upid is not None and watch_scope != "bucket":
             raise CaptureError(f"watch_upid_scope_invalid:{watcher_sequence}")
+        if (
+            parsed_upid is not None
+            and _decode_upid(parsed_upid)["task_bucket"] != watch_bucket
+        ):
+            raise CaptureError(f"watch_upid_bucket_mismatch:{watcher_sequence}")
         if filename in {"index", "index.1"} and watch_scope != "task_root":
             raise CaptureError(f"watch_index_scope_invalid:{watcher_sequence}")
         record["_normalized_upid"] = parsed_upid
@@ -1894,25 +2190,6 @@ def _analyze_loaded(
         )
         record["_candidate_interval"] = candidate_interval
         watches[watcher_sequence] = record
-        if candidate_interval:
-            gap_reasons.update(_watch_gap_reasons(record))
-        if parsed_upid is not None:
-            upid = parsed_upid
-            if candidate_interval:
-                _reject_generated_upids_not_strictly_after_request_start(
-                    {upid},
-                    event_time,
-                    operation_by_upid,
-                    f"watch_generated_upid:{watcher_sequence}",
-                )
-            if candidate_interval and masks.intersection(
-                {"IN_CREATE", "IN_MOVED_TO", "IN_CLOSE_WRITE"}
-            ):
-                watch_known.add(upid)
-            if candidate_interval and masks.intersection(
-                {"IN_DELETE", "IN_MOVED_FROM"}
-            ):
-                watch_deleted.add(upid)
     expected_watch_order = list(range(1, len(watches) + 1))
     if physical_watcher_sequences != expected_watch_order:
         raise CaptureError("watcher_sequence_not_contiguous_or_jsonl_ordered")
@@ -1923,6 +2200,64 @@ def _analyze_loaded(
     ]
     if watcher_times != sorted(watcher_times):
         raise CaptureError("watcher_sequence_time_reversed")
+
+    dynamic_buckets, lifecycle_rescans = _validate_post_t0_watch_lifecycle(
+        records["watch_lifecycle"],
+        watches,
+        installed_watches,
+        established_bucket_ids,
+        task_tree,
+        t0_monotonic,
+        close_monotonic,
+    )
+    covered_bucket_ids = established_bucket_ids | frozenset(dynamic_buckets)
+    for watcher_sequence, record in watches.items():
+        masks = frozenset(record["_masks"])
+        binding = _bind_watch_event_to_installation(
+            record,
+            installed_watches,
+            task_tree,
+            f"watch:{watcher_sequence}",
+            masks,
+        )
+        watch_bucket = record["_watch_bucket"]
+        if (
+            binding is not None
+            and binding.watch_scope == "bucket"
+            and watch_bucket not in covered_bucket_ids
+        ):
+            raise CaptureError(f"watch_scope_not_established:{watcher_sequence}")
+        candidate_interval = bool(record["_candidate_interval"])
+        if candidate_interval:
+            gap_reasons.update(_watch_gap_reasons(record))
+        parsed_upid = record["_normalized_upid"]
+        if parsed_upid is not None:
+            if candidate_interval:
+                _reject_generated_upids_not_strictly_after_request_start(
+                    {parsed_upid},
+                    _require_int(record, "monotonic_ns"),
+                    operation_by_upid,
+                    f"watch_generated_upid:{watcher_sequence}",
+                )
+            if candidate_interval and masks.intersection(
+                {"IN_CREATE", "IN_MOVED_TO", "IN_CLOSE_WRITE"}
+            ):
+                watch_known.add(parsed_upid)
+            if candidate_interval and masks.intersection(
+                {"IN_DELETE", "IN_MOVED_FROM"}
+            ):
+                watch_deleted.add(parsed_upid)
+
+    lifecycle_known: set[str] = set()
+    for sequence, rescan in lifecycle_rescans.items():
+        rescan_upids = set(rescan["_normalized_upids"])
+        _reject_generated_upids_not_strictly_after_request_start(
+            rescan_upids,
+            _require_int(rescan, "scan_end_monotonic_ns"),
+            operation_by_upid,
+            f"bucket_rescan_generated_upid:{sequence}",
+        )
+        lifecycle_known.update(rescan_upids)
 
     scan_known: set[str] = set()
     scans: dict[int, dict[str, Any]] = {}
@@ -1953,9 +2288,29 @@ def _analyze_loaded(
             f"scan_generated_upid:{sequence}",
         )
         record["_normalized_upids"] = current
-        for value in _require_sequence(record.get("bucket_set"), "scan.bucket_set"):
-            if not isinstance(value, str):
-                raise CaptureError("scan_bucket_not_string")
+        buckets = {
+            _require_text({"value": value}, "value")
+            for value in _require_sequence(record.get("bucket_set"), "scan.bucket_set")
+        }
+        for bucket in buckets:
+            _task_bucket_path(task_tree, bucket, "scan.bucket_set")
+        if buckets - covered_bucket_ids:
+            raise CaptureError("scan_bucket_without_watch_lifecycle")
+        if any(_decode_upid(upid)["task_bucket"] not in buckets for upid in current):
+            raise CaptureError("scan_upid_bucket_mismatch")
+        record["_bucket_set"] = buckets
+        record["_eligible_normalized_upids"] = {
+            upid
+            for upid in current
+            if (
+                _decode_upid(upid)["task_bucket"] in established_bucket_ids
+                or _require_int(
+                    dynamic_buckets[_decode_upid(upid)["task_bucket"]],
+                    "scan_end_monotonic_ns",
+                )
+                <= scan_end
+            )
+        }
         _require_mapping(record.get("stat_metadata"), "scan.stat_metadata")
         unreadable = _require_sequence(
             record.get("unreadable_entries"), "scan.unreadable_entries"
@@ -2008,12 +2363,21 @@ def _analyze_loaded(
         prior_scan = current
         prior_watermark = watermark
         prior_scan_end = scan_end
-        scan_known.update(current)
+        scan_known.update(record["_eligible_normalized_upids"])
     terminal_scans = [scans[len(scans) - 1], scans[len(scans)]]
     if not all(scan["complete"] for scan in terminal_scans):
         gap_reasons.add("terminal_scan_incomplete")
     if terminal_scans[0]["_normalized_upids"] != terminal_scans[1]["_normalized_upids"]:
         gap_reasons.add("terminal_scan_fixed_point_not_reached")
+    if dynamic_buckets and any(
+        _require_int(scan, "scan_end_monotonic_ns")
+        < max(
+            _require_int(rescan, "scan_end_monotonic_ns")
+            for rescan in dynamic_buckets.values()
+        )
+        for scan in terminal_scans
+    ):
+        raise CaptureError("terminal_scan_precedes_dynamic_bucket_handoff")
     relevant_watch_sequences = {
         sequence
         for sequence, watch in watches.items()
@@ -2120,7 +2484,7 @@ def _analyze_loaded(
     if api_sources != {"active", "archive", "all"}:
         raise CaptureError("required_api_profile_missing")
 
-    enumerated_known = watch_known | scan_known | surface_known
+    enumerated_known = watch_known | scan_known | lifecycle_known | surface_known
     exact_confirmed: set[str] = set()
     # `exact_final` stays UPID-level: post-T0 reconciliation legitimately asks
     # whether a task reached a final status at some point before close.
@@ -2171,8 +2535,17 @@ def _analyze_loaded(
             scan = scans.get(discovery_reference)
             provenance_valid = bool(
                 scan
-                and upid in set(scan["_normalized_upids"])
+                and upid in set(scan["_eligible_normalized_upids"])
                 and _require_int(scan, "scan_end_monotonic_ns") <= capture_start
+            )
+        elif discovery_source == "bucket_rescan" and isinstance(
+            discovery_reference, int
+        ):
+            rescan = lifecycle_rescans.get(discovery_reference)
+            provenance_valid = bool(
+                rescan
+                and upid in set(rescan["_normalized_upids"])
+                and _require_int(rescan, "scan_end_monotonic_ns") <= capture_start
             )
         elif discovery_source in {"active", "archive"} and isinstance(
             discovery_reference, int
