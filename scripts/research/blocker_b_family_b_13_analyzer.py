@@ -1386,6 +1386,16 @@ def _validate_pre_t0_establishment(
                 )
                 if installation is None or installation.watch_scope != "task_root":
                     raise CaptureError("pre_t0_lazy_bucket_descriptor_invalid")
+                # A lazy-bucket creation event is still a decoded raw watch
+                # event on the sealed task-root descriptor.  The event's own
+                # self-declared `event` label ("bucket_created" versus the
+                # generic "watch_event" sibling below) must never decide
+                # whether an authoritative decoded invalidation/loss bit
+                # carries its required GAP semantics -- the raw_mask already
+                # proved it occurred, and draining/rescanning afterwards
+                # cannot restore observations that may already have been
+                # lost.
+                gap_reasons.update(_watch_gap_reasons({"_masks": masks}))
             elif event == "watch_event":
                 masks = _validated_inotify_masks(
                     record, f"pre_t0.watch:{watcher_sequence}"

@@ -4280,6 +4280,186 @@ def test_watch_first_pre_t0_fixed_point_with_lazy_bucket_may_continue(
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+def _lazy_bucket_created_stream(
+    mask: list[str], *, watch_descriptor: int = 1
+) -> list[dict[str, Any]]:
+    """A structurally valid root->child->rescan lazy-bucket handoff whose
+    root ``bucket_created`` record carries the given raw mask."""
+
+    return [
+        {
+            "event": "bucket_created",
+            "watcher_sequence": 3,
+            "watch_scope": "task_root",
+            "watched_path": SYNTHETIC_TASK_ROOT,
+            "bucket": "f",
+            "filename": "f",
+            "watch_descriptor": watch_descriptor,
+            "mask": mask,
+            "raw_mask": _raw_mask(mask),
+            "monotonic_ns": 52,
+            "complete": True,
+        },
+        {
+            "event": "watch_installed",
+            "watcher_sequence": 4,
+            "watch_scope": "bucket",
+            "watched_path": _task_bucket_path("f"),
+            "bucket": "f",
+            "watch_descriptor": 3,
+            "bucket_origin": "root_event",
+            "trigger_watcher_sequence": 3,
+            "monotonic_ns": 53,
+            "complete": True,
+        },
+        {
+            "event": "bucket_rescan",
+            "phase": "PRE_T0_BUCKET_RESCAN",
+            "bucket": "f",
+            "trigger_watcher_sequence": 3,
+            "scan_start_monotonic_ns": 54,
+            "scan_end_monotonic_ns": 55,
+            "exact_normalized_upids": [],
+            "unreadable_entries": [],
+            "malformed_entries": [],
+            "complete": True,
+        },
+    ]
+
+
+def _apply_lazy_bucket_stream(
+    manifest: dict[str, Any],
+    records: dict[str, list[dict[str, Any]]],
+    stream: list[dict[str, Any]],
+) -> None:
+    records["pre_t0_establishment"][2:2] = stream
+    _resequence_pre_t0(records)
+    for scan in records["pre_t0_establishment"][-2:]:
+        scan["bucket_set"] = ["1", "f"]
+        scan["watch_drained_through_sequence"] = 4
+    manifest["t0_quiescence"]["pre_t0_establishment"][
+        "watch_drained_through_sequence"
+    ] = 4
+
+
+@pytest.mark.parametrize(
+    "loss_bit",
+    ["IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"],
+)
+def test_bucket_created_watch_loss_latches_gap(
+    tmp_path: Path, loss_bit: str
+) -> None:
+    """A decoded invalidation/loss bit on a lazy ``bucket_created`` record
+    must latch observer GAP exactly like the generic pre-T0 ``watch_event``
+    sibling does for the identical raw mask -- the self-declared record
+    ``event`` label must never select whether authoritative decoded raw
+    evidence carries its required semantics.  The rescan/watermark that
+    follow the loss bit in this fixture remain fully complete and drained,
+    proving draining cannot restore an observation that may already have
+    been lost."""
+
+    manifest, records = _default_capture()
+    _apply_lazy_bucket_stream(
+        manifest,
+        records,
+        _lazy_bucket_created_stream(["IN_CREATE", "IN_ISDIR", loss_bit]),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "watch_invalidation_or_loss" in result.reasons
+
+
+@pytest.mark.parametrize(
+    "loss_bit",
+    ["IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"],
+)
+def test_bucket_created_watch_loss_latches_gap_on_disposable_fixture(
+    tmp_path: Path, loss_bit: str
+) -> None:
+    """The same loss-bit latch applies on a ``disposable_pve`` fixture, not
+    only a synthetic one."""
+
+    manifest, records = _disposable_pve_capture()
+    task_root = "/var/log/pve/tasks"
+    stream = _lazy_bucket_created_stream(["IN_CREATE", "IN_ISDIR", loss_bit])
+    stream[0]["watched_path"] = task_root
+    stream[1]["watched_path"] = f"{task_root}/f"
+    _apply_lazy_bucket_stream(manifest, records, stream)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "watch_invalidation_or_loss" in result.reasons
+
+
+def test_bucket_created_overflow_extra_bits_stays_incomplete_not_gap(
+    tmp_path: Path,
+) -> None:
+    """Queue overflow is descriptor-global (``wd == -1``, no path-specific
+    discovery) and is never a bucket-created event.  A ``bucket_created``
+    record carrying ``IN_Q_OVERFLOW`` alongside real creation bits on a real
+    descriptor must remain a structurally invalid, fail-closed capture --
+    latching the new loss-bit GAP semantics must never rehabilitate malformed
+    overflow provenance into a valid GAP capture."""
+
+    manifest, records = _default_capture()
+    _apply_lazy_bucket_stream(
+        manifest,
+        records,
+        _lazy_bucket_created_stream(
+            ["IN_CREATE", "IN_ISDIR", "IN_Q_OVERFLOW"]
+        ),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "watch_overflow_descriptor_or_mask_invalid:"
+        "pre_t0.bucket_created:3",
+    )
+
+
+def test_bucket_created_overflow_only_mask_stays_incomplete(
+    tmp_path: Path,
+) -> None:
+    """A ``bucket_created`` record whose entire mask is ``IN_Q_OVERFLOW``
+    fails the existing creation-shape check before any gap-latch decision is
+    reached."""
+
+    manifest, records = _default_capture()
+    _apply_lazy_bucket_stream(
+        manifest, records, _lazy_bucket_created_stream(["IN_Q_OVERFLOW"])
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("pre_t0_lazy_bucket_event_invalid",)
+
+
+@pytest.mark.parametrize("creation_mask", ["IN_CREATE", "IN_MOVED_TO"])
+def test_bucket_created_without_loss_bit_may_still_reach_pass(
+    tmp_path: Path, creation_mask: str
+) -> None:
+    """A lazy ``bucket_created`` record carrying only a legitimate creation
+    mask -- no invalidation/loss bit -- must remain able to reach PASS; the
+    new loss-bit latch must not regress the ordinary positive path."""
+
+    manifest, records = _default_capture()
+    _apply_lazy_bucket_stream(
+        manifest,
+        records,
+        _lazy_bucket_created_stream([creation_mask, "IN_ISDIR"]),
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
 def test_t0_baseline_owner_classification_is_not_inferred_from_type_and_id(
     tmp_path: Path,
 ) -> None:
