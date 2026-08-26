@@ -2092,6 +2092,21 @@ def _analyze_loaded(
         raise CaptureError("harness_process_close_finalization_order_invalid")
     if not _require_bool(finalizers[0], "complete"):
         raise CaptureError("harness_capture_finalization_false")
+    # `process_start` opens the reader's append-only harness stream, and every
+    # record in that stream is already required to carry the same configured
+    # reader process identity, so no harness record can legitimately have been
+    # appended before the process that appends them started.  Without this a
+    # heartbeat, the analyzer-version record, or any other machine-bearing
+    # marker could sit physically ahead of the lifecycle opening and still
+    # satisfy every timestamp-based window, because it is free to declare a
+    # `monotonic_ns` inside the otherwise-valid reader interval.  Physical
+    # position is sealed; a self-declared time is not.  `harness_sequence` is
+    # already required to be contiguous and equal to physical JSONL order, so
+    # this equivalently pins `process_start` to `harness_sequence == 1`.  This
+    # is a lifecycle-boundary rule only: it deliberately does not order the
+    # interior of the stream by time, which the protocol leaves free.
+    if kinds[0] != "process_start":
+        raise CaptureError("harness_record_before_process_start")
     # `capture_finalized` closes semantic capture.  Every machine-bearing harness
     # record -- subrun markers, gap signals, heartbeats, the analyzer-version
     # record -- must already be sealed by then, so the only record permitted

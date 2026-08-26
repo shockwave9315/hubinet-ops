@@ -387,6 +387,18 @@ request was actually initiated. Overlapping in-flight requests remain legal:
 only the capture stream, not the operations, is ordered. This orders capture
 records only and never identifies worker body start.
 
+`process_start` opens that same stream. Every harness record is already
+required to carry the configured reader `process_identity`, so no record can
+legitimately have been appended before the process that appends them started:
+`process_start` must be the physically first record, and because
+`harness_sequence` is required to be contiguous and equal to physical JSONL
+order, that equivalently pins it to `harness_sequence == 1`. A heartbeat, the
+analyzer-version record, a subrun marker, or a gap signal placed ahead of it is
+`HARNESS_INCOMPLETE` even when its declared `monotonic_ns` falls inside the
+otherwise-valid reader/close interval -- physical position is sealed, a
+self-declared time is not. This is the opening half of one lifecycle boundary
+pair and constrains nothing about the interior of the stream.
+
 `capture_finalized` closes semantic capture in `harness-events.jsonl`. Every
 machine-bearing harness record -- subrun markers (`scheduled_interleaving`,
 `active_archive_handoff`, `index_rotation`, and the markers 13G inherits),

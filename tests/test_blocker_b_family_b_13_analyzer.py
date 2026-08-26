@@ -4939,6 +4939,86 @@ def test_default_harness_lifecycle_may_pass(tmp_path: Path) -> None:
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+@pytest.mark.parametrize(
+    "builder",
+    [
+        lambda manifest, records: records["harness_events"].pop(
+            [record["event"] for record in records["harness_events"]].index("heartbeat")
+        ),
+        lambda manifest, records: records["harness_events"].pop(
+            [record["event"] for record in records["harness_events"]].index(
+                "analyzer_version"
+            )
+        ),
+        _f13_marker,
+        _c13_marker,
+        _d13_marker,
+        lambda manifest, records: {
+            "event": "gap_signal",
+            "reason": "injected_loss",
+            "monotonic_ns": 260,
+        },
+    ],
+    ids=[
+        "heartbeat",
+        "analyzer-version",
+        "13f-marker",
+        "13c-marker",
+        "13d-marker",
+        "gap-signal",
+    ],
+)
+def test_harness_record_before_process_start_is_incomplete(
+    tmp_path: Path, builder: Any
+) -> None:
+    """`process_start` opens the stream, so nothing may physically precede it.
+
+    Each record keeps a `monotonic_ns` inside the otherwise-valid reader/close
+    interval and keeps its valid referenced evidence; only its physical
+    position moved ahead of the lifecycle opening.  The heartbeat and
+    analyzer-version cases relocate the capture's own sole record rather than
+    adding a second one, so nothing but physical order changes.
+    """
+
+    manifest, records = _default_capture()
+    records["harness_events"].insert(0, builder(manifest, records))
+    assert records["harness_events"][0]["event"] != "process_start"
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_record_before_process_start",)
+
+
+def test_process_start_first_keeps_interior_physical_order_free(
+    tmp_path: Path,
+) -> None:
+    """The opening boundary must not become a global timestamp ordering.
+
+    The protocol deliberately permits an interior harness record whose declared
+    `monotonic_ns` is earlier than a record physically preceding it, so a
+    capture whose interior contradicts its own timestamps must still pass while
+    both lifecycle boundaries hold.
+    """
+
+    manifest, records = _default_capture()
+    harness = records["harness_events"]
+    version_index = [record["event"] for record in harness].index("analyzer_version")
+    heartbeat_index = [record["event"] for record in harness].index("heartbeat")
+    harness[version_index], harness[heartbeat_index] = (
+        harness[heartbeat_index],
+        harness[version_index],
+    )
+    assert harness[0]["event"] == "process_start"
+    assert [record["monotonic_ns"] for record in harness] != sorted(
+        record["monotonic_ns"] for record in harness
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
 def test_subrun_13f_requires_referenced_watch_during_scan(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     evidence_ids = _set_subrun(manifest, "13F", ["watch_scan_creation_race"])
