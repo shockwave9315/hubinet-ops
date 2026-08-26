@@ -2834,6 +2834,101 @@ ERROR_RESULT = ("TASK ERROR: boom", "error")
 
 
 @pytest.mark.parametrize(
+    ("terminal_status", "interpretation"),
+    [
+        ("TASK OK", "not_final"),
+        ("TASK OK", "unknown"),
+        ("TASK WARNINGS: 2", "not_final"),
+        ("TASK WARNINGS: 2", "unknown"),
+        ("TASK ERROR: boom", "not_final"),
+        ("TASK ERROR: boom", "unknown"),
+    ],
+    ids=[
+        "ok-as-not-final",
+        "ok-as-unknown",
+        "warning-as-not-final",
+        "warning-as-unknown",
+        "error-as-not-final",
+        "error-as-unknown",
+    ],
+)
+def test_recognized_raw_terminal_status_cannot_be_declared_non_final(
+    tmp_path: Path,
+    terminal_status: str,
+    interpretation: str,
+) -> None:
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _final_exact(
+            1,
+            capture_start=225,
+            capture_end=230,
+            terminal_status=terminal_status,
+            interpretation=interpretation,
+        )
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "exact_upid_final_interpretation_inconsistent",
+    )
+
+
+@pytest.mark.parametrize("interpretation", ["not_final", "unknown"])
+def test_later_final_cannot_launder_relabelled_raw_terminal_status(
+    tmp_path: Path,
+    interpretation: str,
+) -> None:
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _final_exact(
+            1,
+            capture_start=205,
+            capture_end=210,
+            terminal_status="TASK OK",
+            interpretation=interpretation,
+        ),
+        _final_exact(
+            2,
+            capture_start=225,
+            capture_end=230,
+            terminal_status="TASK OK",
+            interpretation="ok",
+        ),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "exact_upid_final_interpretation_inconsistent",
+    )
+
+
+@pytest.mark.parametrize("interpretation", ["not_final", "unknown"])
+def test_unrecognized_non_terminal_raw_status_may_precede_final(
+    tmp_path: Path,
+    interpretation: str,
+) -> None:
+    manifest, records = _default_capture()
+    records["exact_upid"] = [
+        _running_exact(
+            1,
+            capture_start=205,
+            capture_end=210,
+            interpretation=interpretation,
+        ),
+        _generated_exact(2, capture_start=225, capture_end=230),
+    ]
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
     ("terminal_status", "interpretation", "expected"),
     [
         ("TASK OK", "ok", AnalyzerOutcome.PASS),

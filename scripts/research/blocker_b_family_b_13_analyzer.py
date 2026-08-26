@@ -2624,14 +2624,16 @@ def _analyze_loaded(
         raw_terminal_interpretation = _classify_exact_log_terminal_status(
             terminal_status
         )
-        interpretation_consistent = (
-            final_interpretation in {"not_final", "unknown"}
-            or (
-                final_interpretation in {"ok", "warning", "error"}
-                and task_state == "stopped"
-                and raw_terminal_interpretation == final_interpretation
+        if raw_terminal_interpretation is not None:
+            interpretation_consistent = (
+                task_state == "stopped"
+                and final_interpretation == raw_terminal_interpretation
             )
-        )
+        else:
+            interpretation_consistent = final_interpretation in {
+                "not_final",
+                "unknown",
+            }
         if not interpretation_consistent:
             raise CaptureError("exact_upid_final_interpretation_inconsistent")
         if final_interpretation in {"ok", "warning", "error"}:

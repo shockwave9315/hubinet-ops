@@ -285,7 +285,11 @@ nonempty raw line is classified only as `TASK OK` (`ok`),
 serialization. In particular, bare `WARNINGS: N` is a `read_status()` return
 projection and is not a valid raw task-log terminal line. An unknown raw line
 or a declared interpretation that disagrees with this classification is
-`HARNESS_INCOMPLETE`.
+`HARNESS_INCOMPLETE`. A recognized raw terminal line is authoritative finality:
+it cannot be relabelled `not_final` or `unknown`, and a later agreeing final
+read cannot rehabilitate that contradictory projection. Those two non-final
+interpretations are admissible only when the raw last line is not one of the
+recognized pinned terminal serializations.
 
 ### 4.2 Shared monotonic clock contract
 
