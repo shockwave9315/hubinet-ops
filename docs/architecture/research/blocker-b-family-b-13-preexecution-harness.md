@@ -138,13 +138,18 @@ An analyzer result distinguishes:
 
 None of these means `trusted`, `secure`, or “Family B solved.”
 
-## 4. Capture format: `family-b-13-capture-v4`
+## 4. Capture format: `family-b-13-capture-v5`
 
 One run is one explicit directory. JSON files are UTF-8; JSONL files contain
 one object per line. Every load-bearing monotonic timestamp is nanoseconds from
 one explicitly bound Linux `CLOCK_MONOTONIC` domain. UTC wall-clock strings are
 provenance only and are never a precision-ordering substitute. No field is
 described as a stock PVE cursor or generation number.
+
+Capture/protocol/analyzer revision v5 replaces v4 because mandatory sealed
+`disposable_pve` applicability provenance changes whether the same manifest can
+reach PASS; this is a semantic contract change, not a cosmetic edit. No
+authorized real Experiment #13 captures require backward compatibility.
 
 ```text
 run-<uuid>/
@@ -183,7 +188,7 @@ explicit directory's fixed file set. It is not imported by production code.
 | identity | `schema_revision`, `experiment_id`, `run_uuid`, exact `protocol_revision`, exact `expected_b_s1_revision` |
 | fixture | `fixture_kind`, placeholder-or-approved `fixture_id`, `node_identity`, `boot_id`; live analysis rejects a placeholder and CT112 |
 | versions | installed/source `version_ledger` and `loaded_code_status` |
-| environment | `kernel_context`, `filesystem_context` including a sealed `task_tree` contract, start/end timestamps |
+| environment | `kernel_context`, `filesystem_context` including sealed filesystem, mount, storage-backend, retention, and `task_tree` provenance, start/end timestamps |
 | processes | `reader_context`, `generator_context`, process identities and clock descriptions |
 | clock | complete `clock_contract`: `CLOCK_MONOTONIC`, one domain id, fixture/node/boot/time-namespace binding, correlation state, and the domain id used by every timestamp-producing plane |
 | boundary | quiescent candidate `t0_monotonic_ns`, candidate-close T1, a distinct bounded `experiment_generator_window`, committed `baseline_upids` plus hashed `baseline_observation`, and independently cross-checked `t0_quiescence` evidence |
@@ -200,6 +205,72 @@ captured as context, not treated as a PVE generation. Synthetic runs use
 real run uses `disposable_pve` only after the fixture contract is satisfied. A
 missing, incomplete, mismatched, or unapproved generator contract makes a
 disposable-PVE capture `ENVIRONMENT_INELIGIBLE`.
+
+For `fixture_kind=disposable_pve`, capture v5 uses this research-local sealed
+representation for the live applicability facts required by section 13:
+
+```json
+{
+  "node_identity": {
+    "kind": "pve_node_name",
+    "value": "pve-node-a"
+  },
+  "kernel_context": {
+    "release": "6.14.11-2-pve",
+    "source_commit": null
+  },
+  "filesystem_context": {
+    "type": "ext4",
+    "filesystem_id": "uuid:...",
+    "mount_topology": {
+      "mount_id": 42,
+      "parent_mount_id": 31,
+      "root": "/",
+      "mount_point": "/var/log/pve"
+    },
+    "storage_backend": {
+      "kind": "local_block_device",
+      "identifier": "pve-root"
+    },
+    "retention_configuration": {
+      "archive_rotation_max_bytes": 50000,
+      "exact_log_cleanup_schedule": {
+        "scheduler": "systemd_timer",
+        "schedule": "daily"
+      }
+    },
+    "task_tree": {
+      "task_root": "/var/log/pve/tasks",
+      "bucket_layout": "upid_starttime_final_hex_child"
+    }
+  }
+}
+```
+
+The `node_identity.value` is explicitly in the PVE node-name namespace and
+must equal `generator_contract.expected_node`; the existing UPID decoder then
+binds generated records to that same node name. It is not a backend `node_id`
+or durable node-binding identity. The clock contract continues to carry the
+same complete `node_identity` object and independently binds fixture, boot, and
+time namespace.
+
+The running kernel release is required, but an exact running-kernel source
+commit is deliberately not pinned. The mount IDs/root/mount point are the
+sealed Linux mount-topology observation, and the task root must be lexically
+within the recorded mount point. Filesystem and storage identifiers remain
+fixture provenance, never workload identity. The archive rotation threshold is
+bound to the pinned 50,000-byte source contract; the exact-log cleanup scheduler
+and schedule record the fixture's actual retention configuration. Retention
+values and surviving anchors do not prove enumeration completeness.
+
+Missing, empty, malformed, or placeholder live provenance makes a
+`disposable_pve` capture `ENVIRONMENT_INELIGIBLE`. The offline analyzer checks
+only sealed presence, shape, fixed source-bound values, and explicit bindings;
+it never dereferences host paths and does not claim the values prove their own
+truth. The later reviewed collector/preflight must obtain them from the approved
+fixture. Synthetic captures remain exempt from live PVE provenance and may keep
+their existing `kind=synthetic`, `release=synthetic`, `type=synthetic`, and
+`mount_id=fixture` representations.
 
 `baseline_upids` is the only allowed background category. Its complete
 `baseline_observation` carries capture start/end and commit times before T0,
@@ -302,7 +373,7 @@ API, exact, and harness timestamps to that same domain. Synthetic captures use a
 synthetic shared domain. A `disposable_pve` capture requires a verified single
 shared domain on the same fixture node, boot, and relevant time namespace.
 
-Missing or mismatched clock evidence is `ENVIRONMENT_INELIGIBLE`. v4 does not
+Missing or mismatched clock evidence is `ENVIRONMENT_INELIGIBLE`. v5 does not
 invent offsets between unrelated monotonic clocks and does not use UTC to
 repair them. A generator on another host or time namespace is ineligible until
 a separately reviewed cross-clock correlation protocol exists. The analyzer
@@ -477,7 +548,7 @@ inside the quiescent-T0/candidate-close envelope. Matching numeric boundaries
 does not merge their semantics. `after_generator_window` is outside the
 generator window even if the record claims otherwise; `ambiguous` is
 outside the positive set and latches a gap. The record separately carries
-`b_s1_body_start_membership=unknown` and `body_start_evidence=null`. This v4
+`b_s1_body_start_membership=unknown` and `body_start_evidence=null`. This v5
 protocol rejects a capture that tries to derive worker-body membership from
 request timing or self-assert it. The finalizer carries
 `last_sequence`, `total_operations`, generator identity, timestamps, and
@@ -525,7 +596,7 @@ grace interval. A candidate-interval record carrying an in-window generated
 UPID is incomplete when its event time is at or before that UPID's independent
 `request_start`; temporal eligibility requires a strictly later event.
 
-The Linux UAPI `struct inotify_event.mask` integer is the primitive. The v4
+The Linux UAPI `struct inotify_event.mask` integer is the primitive. The v5
 analyzer pins the numeric definitions from Linux
 `include/uapi/linux/inotify.h`: `IN_ACCESS=0x00000001`,
 `IN_MODIFY=0x00000002`, `IN_ATTRIB=0x00000004`,
@@ -549,7 +620,7 @@ omission or disagreement is incomplete. Pre-T0 lazy-bucket creation records
 likewise carry and decode `raw_mask`; their textual create/move plus
 `IN_ISDIR` names are cross-checks only.
 
-`raw_order` is a harness-assigned, one-based capture-order sequence. The v4
+`raw_order` is a harness-assigned, one-based capture-order sequence. The v5
 analyzer requires JSONL physical order, `watcher_sequence`, and `raw_order` to
 be the same contiguous `1..N` sequence. This checks that sealed records retain
 the observer's raw capture order; it is not a kernel cursor, an inotify
@@ -642,7 +713,7 @@ surface before first rotation, not silently omitted. The analyzer recomputes
 SHA-256 from the captured UTF-8 `raw_evidence`; hashes support comparison but
 do not prove an atomic snapshot.
 
-For v4, `raw_evidence` is exactly the captured UTF-8 file content, with no
+For v5, `raw_evidence` is exactly the captured UTF-8 file content, with no
 JSON wrapper, prefix, annotation, or collector-generated record envelope. The
 only accepted serializations are deliberately narrow and source-specific:
 
@@ -665,7 +736,7 @@ declared `normalized_upids` array is parsed separately, must contain no
 duplicates, and must equal the raw-derived set exactly. Only the raw-derived
 set enters enumeration, exact-UPID discovery provenance, T0 active quiescence,
 handoff, or rotation obligations. This format intentionally replaces the
-earlier ambiguous raw-content description; no real v4 capture exists and no
+earlier ambiguous raw-content description; no real v5 capture exists and no
 backward compatibility is required.
 
 A surface containing an in-window generated UPID is causally eligible for that
@@ -745,7 +816,7 @@ received a UPID during the experiment-generator window. It does not observe
 the worker operation body's first instruction. Request start/end, UPID
 starttime, exact-log creation, and fork time are therefore not relabeled as
 B-S1 body start. No safe body-start proof is implemented or accepted by this
-v4 analyzer.
+v5 analyzer.
 
 A future generator must satisfy all of these conditions:
 
@@ -1001,7 +1072,7 @@ body-start membership, baseline-only positive subruns, and baseline-only
 handoff/race targets. Positive controls exercise historical finalized baseline
 quiescence, computed drained equal scans, and raw-evidence-backed
 13B/13C/13D/13F/13G obligations.
-v4 regressions additionally reject post-T0 or missing root-watch establishment,
+v5 regressions additionally reject post-T0 or missing root-watch establishment,
 different pre-T0 baseline scan sets, an undrained pre-T0 event, and a lazy
 bucket without its child watch/rescan. A positive lazy-bucket control reaches a
 drained watch-first pre-T0 fixed point. Clock-contract regressions reject a
@@ -1064,7 +1135,7 @@ A B-S1-killing witness must preserve all of the following in the sealed run:
    evidence used for those facts.
 
 Requirement 6 is not available from the #13 operation initiator or current
-source evidence. This v4 analyzer therefore cannot emit a precise B-S1-killing
+source evidence. This v5 analyzer therefore cannot emit a precise B-S1-killing
 witness or exact-scope B-S1 rejection from request timing alone.
 
 Instead it preserves the UPID, generator sequence, derived generator-window
@@ -1084,7 +1155,7 @@ authenticates itself. The offline analyzer recomputes such projections from the
 sealed primitive whenever this harness defines a raw representation and
 requires exact raw/normalized agreement. A disagreement is
 `HARNESS_INCOMPLETE`, before the record can enter a PASS-bearing set or GAP
-obligation. In v4 this rule applies directly to local surface raw bytes versus
+obligation. In v5 this rule applies directly to local surface raw bytes versus
 `normalized_upids`, watch `raw_mask` versus textual `mask` and
 `queue_overflow`, watch filename versus `normalized_upid`, and exact status/log
 raw text versus parsed terminal fields.
@@ -1119,7 +1190,9 @@ name a fixture satisfying all of these requirements:
   integration, private workload, or real workload data;
 - exact target package/source and loaded-code baseline from section 2;
 - known and recorded kernel, boot ID, mount topology, filesystem, storage
-  backend, clock, and retention configuration;
+  backend, clock, and retention configuration, sealed using section 4.1's v5
+  representation and derived by the later collector/preflight from the actual
+  approved fixture rather than operator-entered eligibility assertions;
 - console/recovery access independent of the experiment;
 - explicit CPU, RAM, evidence-disk, log-space, task-count, task-rate, and total
   duration limits;
@@ -1158,15 +1231,18 @@ intentionally provides no executable generator or destructive cleanup command.
    subrun; record the approver and window.
 1. Verify fixture identity, isolation, absence of production dependencies, and
    that it is not CT112.
-2. Record installed packages, immutable source mapping, boot ID, and loaded-code
-   preflight. Record and verify the single-node/single-boot/single-time-namespace
+2. Record installed packages, immutable source mapping, PVE node identity,
+   running kernel release, boot ID, and loaded-code preflight. Record and verify
+   the single-node/single-boot/single-time-namespace
    `CLOCK_MONOTONIC` contract for every timestamp-producing participant before
    making any cross-plane ordering comparison; mismatch makes the run
    ineligible. The later reviewed collector/preflight must derive this evidence
    from the fixture environment, never accept operator-entered identifiers as
    proof.
-3. Record filesystem/mount context and disk/log free-space; set numeric stop
-   thresholds before starting any process.
+3. Record the v5 filesystem identity/type, mount IDs/root/mount point, storage
+   backend kind/identifier, task-tree contract, archive rotation threshold, and
+   exact-log cleanup scheduler/schedule; record disk/log free-space and set
+   numeric stop thresholds before starting any process.
 4. Start the independent ground-truth writer; verify durable test write,
    monotonic sequence initialization, generator-contract binding, and
    operation/duration caps.
@@ -1192,7 +1268,7 @@ intentionally provides no executable generator or destructive cleanup command.
    the immutable original.
 10. Move a copy to an offline workstation and invoke only the explicit
     `analyze --capture-dir` command from section 4.
-11. Record exactly one research-local classification and its evidence. A v4
+11. Record exactly one research-local classification and its evidence. A v5
     generator-window enumeration witness stops the sequence but does not claim
     an exact body-start-scoped B-S1 consequence; PASS only enumerates that
     interleaving.

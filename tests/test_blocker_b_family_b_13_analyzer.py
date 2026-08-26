@@ -606,6 +606,68 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
     return manifest, records
 
 
+def _disposable_pve_capture(
+) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
+    manifest, records = _default_capture()
+    fixture_id = "disposable-pve-family-b-13-node-fixture"
+    task_root = "/var/log/pve/tasks"
+    node_identity = {"kind": "pve_node_name", "value": "fixture"}
+
+    manifest["fixture_kind"] = "disposable_pve"
+    manifest["fixture_id"] = fixture_id
+    manifest["node_identity"] = node_identity
+    manifest["clock_contract"]["fixture_id"] = fixture_id
+    manifest["clock_contract"]["node_identity"] = dict(node_identity)
+    manifest["clock_contract"]["correlation_state"] = (
+        "verified_single_shared_domain"
+    )
+    manifest["generator_contract"]["fixture_id"] = fixture_id
+    manifest["generator_contract"]["approval_state"] = "approved"
+    manifest["kernel_context"] = {
+        "release": "6.14.11-2-pve",
+        "source_commit": None,
+    }
+    manifest["filesystem_context"] = {
+        "type": "ext4",
+        "filesystem_id": "uuid:11111111-2222-3333-4444-555555555555",
+        "mount_topology": {
+            "mount_id": 42,
+            "parent_mount_id": 31,
+            "root": "/",
+            "mount_point": "/var/log/pve",
+        },
+        "storage_backend": {
+            "kind": "local_block_device",
+            "identifier": "pve-root",
+        },
+        "retention_configuration": {
+            "archive_rotation_max_bytes": 50_000,
+            "exact_log_cleanup_schedule": {
+                "scheduler": "systemd_timer",
+                "schedule": "daily",
+            },
+        },
+        "task_tree": {
+            "task_root": task_root,
+            "bucket_layout": "upid_starttime_final_hex_child",
+        },
+    }
+
+    def rewrite_task_paths(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if isinstance(child, str) and child.startswith(SYNTHETIC_TASK_ROOT):
+                    value[key] = task_root + child[len(SYNTHETIC_TASK_ROOT) :]
+                else:
+                    rewrite_task_paths(child)
+        elif isinstance(value, list):
+            for child in value:
+                rewrite_task_paths(child)
+
+    rewrite_task_paths(records)
+    return manifest, records
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -5572,19 +5634,256 @@ def test_after_t1_operation_cannot_self_declare_in_generator_window(
 def test_disposable_fixture_without_generator_contract_is_ineligible(
     tmp_path: Path,
 ) -> None:
-    manifest, records = _default_capture()
-    manifest["fixture_kind"] = "disposable_pve"
-    manifest["fixture_id"] = "disposable-fixture-13"
-    manifest["clock_contract"]["fixture_id"] = "disposable-fixture-13"
-    manifest["clock_contract"]["correlation_state"] = (
-        "verified_single_shared_domain"
-    )
+    manifest, records = _disposable_pve_capture()
     del manifest["generator_contract"]
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.INELIGIBLE
     assert result.reasons[0].startswith("generator_contract_ineligible:")
+
+
+def test_complete_disposable_fixture_provenance_may_pass(tmp_path: Path) -> None:
+    manifest, records = _disposable_pve_capture()
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_official_review_empty_disposable_provenance_is_ineligible(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    task_tree = manifest["filesystem_context"]["task_tree"]
+    manifest["node_identity"] = {}
+    manifest["clock_contract"]["node_identity"] = {}
+    manifest["kernel_context"] = {}
+    manifest["filesystem_context"] = {"task_tree": task_tree}
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons == (
+        "disposable_fixture_provenance_ineligible:"
+        "node_identity_kind_not_pve_node_name",
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "node_mapping_empty",
+        "node_mapping_missing",
+        "node_kind_missing",
+        "node_value_missing",
+        "node_value_empty",
+        "kernel_mapping_empty",
+        "kernel_mapping_missing",
+        "kernel_release_missing",
+        "kernel_release_empty",
+        "filesystem_task_tree_only",
+        "filesystem_mapping_missing",
+        "filesystem_type_missing",
+        "filesystem_id_missing",
+        "mount_topology_missing",
+        "mount_topology_empty",
+        "mount_id_missing",
+        "mount_parent_id_missing",
+        "mount_root_missing",
+        "mount_point_missing",
+        "storage_backend_missing",
+        "storage_backend_empty",
+        "storage_kind_missing",
+        "storage_identifier_missing",
+        "retention_configuration_missing",
+        "retention_configuration_empty",
+        "retention_archive_threshold_missing",
+        "retention_cleanup_missing",
+        "retention_scheduler_missing",
+        "retention_schedule_missing",
+        "clock_node_binding_mismatch",
+        "fixture_id_placeholder",
+        "loaded_code_mismatch",
+    ],
+)
+def test_disposable_fixture_missing_or_empty_provenance_is_ineligible(
+    tmp_path: Path, case: str
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    filesystem = manifest["filesystem_context"]
+
+    if case == "node_mapping_empty":
+        manifest["node_identity"] = {}
+        manifest["clock_contract"]["node_identity"] = {}
+    elif case == "node_mapping_missing":
+        del manifest["node_identity"]
+        del manifest["clock_contract"]["node_identity"]
+    elif case == "node_kind_missing":
+        del manifest["node_identity"]["kind"]
+        manifest["clock_contract"]["node_identity"] = dict(
+            manifest["node_identity"]
+        )
+    elif case == "node_value_missing":
+        del manifest["node_identity"]["value"]
+        manifest["clock_contract"]["node_identity"] = dict(
+            manifest["node_identity"]
+        )
+    elif case == "node_value_empty":
+        manifest["node_identity"]["value"] = ""
+        manifest["clock_contract"]["node_identity"] = dict(
+            manifest["node_identity"]
+        )
+    elif case == "kernel_mapping_empty":
+        manifest["kernel_context"] = {}
+    elif case == "kernel_mapping_missing":
+        del manifest["kernel_context"]
+    elif case == "kernel_release_missing":
+        del manifest["kernel_context"]["release"]
+    elif case == "kernel_release_empty":
+        manifest["kernel_context"]["release"] = ""
+    elif case == "filesystem_task_tree_only":
+        manifest["filesystem_context"] = {"task_tree": filesystem["task_tree"]}
+    elif case == "filesystem_mapping_missing":
+        del manifest["filesystem_context"]
+    elif case == "filesystem_type_missing":
+        del filesystem["type"]
+    elif case == "filesystem_id_missing":
+        del filesystem["filesystem_id"]
+    elif case == "mount_topology_missing":
+        del filesystem["mount_topology"]
+    elif case == "mount_topology_empty":
+        filesystem["mount_topology"] = {}
+    elif case == "mount_id_missing":
+        del filesystem["mount_topology"]["mount_id"]
+    elif case == "mount_parent_id_missing":
+        del filesystem["mount_topology"]["parent_mount_id"]
+    elif case == "mount_root_missing":
+        del filesystem["mount_topology"]["root"]
+    elif case == "mount_point_missing":
+        del filesystem["mount_topology"]["mount_point"]
+    elif case == "storage_backend_missing":
+        del filesystem["storage_backend"]
+    elif case == "storage_backend_empty":
+        filesystem["storage_backend"] = {}
+    elif case == "storage_kind_missing":
+        del filesystem["storage_backend"]["kind"]
+    elif case == "storage_identifier_missing":
+        del filesystem["storage_backend"]["identifier"]
+    elif case == "retention_configuration_missing":
+        del filesystem["retention_configuration"]
+    elif case == "retention_configuration_empty":
+        filesystem["retention_configuration"] = {}
+    elif case == "retention_archive_threshold_missing":
+        del filesystem["retention_configuration"]["archive_rotation_max_bytes"]
+    elif case == "retention_cleanup_missing":
+        del filesystem["retention_configuration"]["exact_log_cleanup_schedule"]
+    elif case == "retention_scheduler_missing":
+        del filesystem["retention_configuration"]["exact_log_cleanup_schedule"][
+            "scheduler"
+        ]
+    elif case == "retention_schedule_missing":
+        del filesystem["retention_configuration"]["exact_log_cleanup_schedule"][
+            "schedule"
+        ]
+    elif case == "clock_node_binding_mismatch":
+        manifest["clock_contract"]["node_identity"]["value"] = "other-node"
+    elif case == "fixture_id_placeholder":
+        manifest["fixture_id"] = "placeholder-fixture"
+        manifest["clock_contract"]["fixture_id"] = "placeholder-fixture"
+        manifest["generator_contract"]["fixture_id"] = "placeholder-fixture"
+    elif case == "loaded_code_mismatch":
+        manifest["loaded_code_status"] = "mismatch"
+    else:
+        raise AssertionError(case)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "node",
+        "kernel",
+        "filesystem_type",
+        "filesystem_id",
+        "mount",
+        "storage_kind",
+        "storage_identifier",
+        "retention_scheduler",
+        "retention_schedule",
+    ],
+)
+def test_disposable_fixture_placeholder_provenance_is_ineligible(
+    tmp_path: Path, case: str
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    filesystem = manifest["filesystem_context"]
+
+    if case == "node":
+        manifest["node_identity"]["value"] = "unknown"
+        manifest["clock_contract"]["node_identity"] = dict(
+            manifest["node_identity"]
+        )
+        manifest["generator_contract"]["expected_node"] = "unknown"
+    elif case == "kernel":
+        manifest["kernel_context"]["release"] = "placeholder"
+    elif case == "filesystem_type":
+        filesystem["type"] = "unknown"
+    elif case == "filesystem_id":
+        filesystem["filesystem_id"] = "placeholder"
+    elif case == "mount":
+        filesystem["mount_topology"]["mount_point"] = "unknown"
+    elif case == "storage_kind":
+        filesystem["storage_backend"]["kind"] = "unknown"
+    elif case == "storage_identifier":
+        filesystem["storage_backend"]["identifier"] = "placeholder"
+    elif case == "retention_scheduler":
+        filesystem["retention_configuration"]["exact_log_cleanup_schedule"][
+            "scheduler"
+        ] = "unknown"
+    elif case == "retention_schedule":
+        filesystem["retention_configuration"]["exact_log_cleanup_schedule"][
+            "schedule"
+        ] = "placeholder"
+    else:
+        raise AssertionError(case)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+
+
+@pytest.mark.parametrize(
+    "case", ["node", "kernel", "filesystem", "mount", "storage", "retention"]
+)
+def test_disposable_fixture_malformed_provenance_is_ineligible(
+    tmp_path: Path, case: str
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    filesystem = manifest["filesystem_context"]
+
+    if case == "node":
+        manifest["node_identity"] = []
+        manifest["clock_contract"]["node_identity"] = []
+    elif case == "kernel":
+        manifest["kernel_context"] = []
+    elif case == "filesystem":
+        manifest["filesystem_context"] = []
+    elif case == "mount":
+        filesystem["mount_topology"] = []
+    elif case == "storage":
+        filesystem["storage_backend"] = []
+    elif case == "retention":
+        filesystem["retention_configuration"] = []
+    else:
+        raise AssertionError(case)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
 
 
 def test_generated_upid_must_match_approved_generator_owner(tmp_path: Path) -> None:

@@ -18,10 +18,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_REVISION = "family-b-13-capture-v4"
-PROTOCOL_REVISION = "family-b-13-preexecution-v4"
+SCHEMA_REVISION = "family-b-13-capture-v5"
+PROTOCOL_REVISION = "family-b-13-preexecution-v5"
 EXPECTED_B_S1_REVISION = "B-S1-2B-f2fd1ddb442fb1e0202a7a0800a05c330b6ac9cc"
-ANALYZER_REVISION = "family-b-13-analyzer-v4"
+ANALYZER_REVISION = "family-b-13-analyzer-v5"
 GENERATOR_CONTRACT_REVISION = "family-b-13-generator-contract-v1"
 SUBRUN_CONTRACT_REVISION = "family-b-13-subrun-contract-v1"
 CLOCK_CONTRACT_REVISION = "family-b-13-clock-contract-v1"
@@ -326,19 +326,137 @@ def _validated_inotify_masks(
     return decoded
 
 
-def _validated_canonical_absolute_path(value: Any, context: str) -> str:
+def _validated_canonical_absolute_path(
+    value: Any, context: str, *, allow_root: bool = False
+) -> str:
     """Validate one sealed POSIX path lexically without host dereferencing."""
 
     if not isinstance(value, str) or not value:
         raise CaptureError(f"task_tree_path_not_nonempty_string:{context}")
     if not value.startswith("/"):
         raise CaptureError(f"task_tree_path_not_absolute:{context}")
-    if value == "/" or value.endswith("/") or "//" in value or "\x00" in value:
+    if value == "/":
+        if allow_root:
+            return value
+        raise CaptureError(f"task_tree_path_not_canonical:{context}")
+    if value.endswith("/") or "//" in value or "\x00" in value:
         raise CaptureError(f"task_tree_path_not_canonical:{context}")
     components = value.split("/")[1:]
     if any(component in {"", ".", ".."} for component in components):
         raise CaptureError(f"task_tree_path_not_canonical:{context}")
     return value
+
+
+def _require_provenance_text(
+    record: Mapping[str, Any], field: str, context: str
+) -> str:
+    value = record.get(field)
+    if not isinstance(value, str) or not value.strip():
+        raise CaptureError(f"provenance_not_nonempty_string:{context}.{field}")
+    normalized = value.strip().casefold()
+    if "unknown" in normalized or "placeholder" in normalized:
+        raise CaptureError(f"provenance_placeholder:{context}.{field}")
+    return value
+
+
+def _path_is_within(path: str, parent: str) -> bool:
+    return parent == "/" or path == parent or path.startswith(f"{parent}/")
+
+
+def _validate_disposable_pve_provenance(
+    manifest: Mapping[str, Any]
+) -> _TaskTreeContract:
+    """Validate sealed live-fixture applicability without host dereferences."""
+
+    try:
+        task_tree = _validated_task_tree_contract(manifest)
+        node_identity = _require_mapping(
+            manifest.get("node_identity"), "node_identity"
+        )
+        if node_identity.get("kind") != "pve_node_name":
+            raise CaptureError("node_identity_kind_not_pve_node_name")
+        pve_node_name = _require_provenance_text(
+            node_identity, "value", "node_identity"
+        )
+
+        generator_contract = _require_mapping(
+            manifest.get("generator_contract"), "generator_contract"
+        )
+        if generator_contract.get("expected_node") != pve_node_name:
+            raise CaptureError("node_identity_generator_node_mismatch")
+
+        kernel_context = _require_mapping(
+            manifest.get("kernel_context"), "kernel_context"
+        )
+        _require_provenance_text(kernel_context, "release", "kernel_context")
+
+        filesystem_context = _require_mapping(
+            manifest.get("filesystem_context"), "filesystem_context"
+        )
+        _require_provenance_text(
+            filesystem_context, "type", "filesystem_context"
+        )
+        _require_provenance_text(
+            filesystem_context, "filesystem_id", "filesystem_context"
+        )
+
+        mount_topology = _require_mapping(
+            filesystem_context.get("mount_topology"),
+            "filesystem_context.mount_topology",
+        )
+        mount_id = _require_int(mount_topology, "mount_id")
+        parent_mount_id = _require_int(mount_topology, "parent_mount_id")
+        if mount_id == 0 or parent_mount_id == 0:
+            raise CaptureError("mount_topology_id_zero")
+        _validated_canonical_absolute_path(
+            mount_topology.get("root"),
+            "filesystem_context.mount_topology.root",
+            allow_root=True,
+        )
+        mount_point = _validated_canonical_absolute_path(
+            mount_topology.get("mount_point"),
+            "filesystem_context.mount_topology.mount_point",
+        )
+        if not _path_is_within(task_tree.task_root, mount_point):
+            raise CaptureError("task_tree_not_within_recorded_mount")
+        storage_backend = _require_mapping(
+            filesystem_context.get("storage_backend"),
+            "filesystem_context.storage_backend",
+        )
+        _require_provenance_text(
+            storage_backend, "kind", "filesystem_context.storage_backend"
+        )
+        _require_provenance_text(
+            storage_backend,
+            "identifier",
+            "filesystem_context.storage_backend",
+        )
+
+        retention = _require_mapping(
+            filesystem_context.get("retention_configuration"),
+            "filesystem_context.retention_configuration",
+        )
+        if _require_int(retention, "archive_rotation_max_bytes") != 50_000:
+            raise CaptureError("retention_archive_rotation_threshold_mismatch")
+        cleanup = _require_mapping(
+            retention.get("exact_log_cleanup_schedule"),
+            "filesystem_context.retention_configuration.exact_log_cleanup_schedule",
+        )
+        _require_provenance_text(
+            cleanup,
+            "scheduler",
+            "filesystem_context.retention_configuration.exact_log_cleanup_schedule",
+        )
+        _require_provenance_text(
+            cleanup,
+            "schedule",
+            "filesystem_context.retention_configuration.exact_log_cleanup_schedule",
+        )
+        return task_tree
+    except CaptureError as exc:
+        raise CaptureEnvironmentError(
+            f"disposable_fixture_provenance_ineligible:{exc}"
+        ) from exc
 
 
 def _validated_task_tree_contract(
@@ -467,7 +585,7 @@ def _bind_watch_event_to_installation(
 
 
 def _parse_surface_raw_evidence(source: str, raw_evidence: str) -> frozenset[str]:
-    """Parse the exact v4 UTF-8 serialization of one local PVE task surface."""
+    """Parse the exact v5 UTF-8 serialization of one local PVE task surface."""
 
     if source == "active":
         line_pattern = re.compile(
@@ -618,7 +736,7 @@ def _validate_clock_contract(
                 raise CaptureError(f"clock_domain_mismatch:{participant}")
         return contract
     except CaptureError as exc:
-        # Cross-process monotonic comparisons are load-bearing throughout v4.
+        # Cross-process monotonic comparisons are load-bearing throughout v5.
         # A missing or mismatched contract is therefore an environment
         # eligibility failure, including for synthetic captures.
         raise CaptureEnvironmentError(f"clock_contract_ineligible:{exc}") from exc
@@ -658,6 +776,13 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> _TaskTreeContract:
     # relation emitted by different capture participants.
     _validate_clock_contract(manifest, fixture_kind)
 
+    disposable_task_tree: _TaskTreeContract | None = None
+    if fixture_kind == "disposable_pve":
+        # Preserve the existing generator-specific ineligibility while making
+        # every live applicability-provenance failure environment-ineligible.
+        _validate_generator_contract(manifest, fixture_kind)
+        disposable_task_tree = _validate_disposable_pve_provenance(manifest)
+
     for field in (
         "node_identity",
         "kernel_context",
@@ -673,8 +798,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> _TaskTreeContract:
         "candidate_close",
     ):
         _require_mapping(manifest.get(field), field)
-    task_tree = _validated_task_tree_contract(manifest)
-
+    task_tree = disposable_task_tree or _validated_task_tree_contract(manifest)
     t0_monotonic_ns = _require_int(manifest, "t0_monotonic_ns")
     baseline_upids = {
         _require_upid(value, "baseline_upids")
@@ -744,7 +868,8 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> _TaskTreeContract:
     _require_text(generator, "process_identity")
     if generator.get("ground_truth_source") != "operation_initiator_return_value":
         raise CaptureError("ground_truth_not_independent")
-    _validate_generator_contract(manifest, fixture_kind)
+    if fixture_kind == "synthetic":
+        _validate_generator_contract(manifest, fixture_kind)
     _validate_subrun_contract(manifest)
     reader = _require_mapping(manifest["reader_context"], "reader_context")
     _require_text(reader, "process_identity")
