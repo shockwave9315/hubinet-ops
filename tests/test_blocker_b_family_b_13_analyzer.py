@@ -5652,6 +5652,55 @@ def test_complete_disposable_fixture_provenance_may_pass(tmp_path: Path) -> None
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("kernel_release", "kernel_release_is_synthetic_sentinel"),
+        ("filesystem_type", "filesystem_type_is_synthetic_sentinel"),
+    ],
+)
+def test_disposable_synthetic_only_provenance_sentinel_is_ineligible(
+    tmp_path: Path, field: str, reason: str
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    if field == "kernel_release":
+        manifest["kernel_context"]["release"] = "synthetic"
+    elif field == "filesystem_type":
+        manifest["filesystem_context"]["type"] = "synthetic"
+    else:
+        raise AssertionError(field)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons == (
+        f"disposable_fixture_provenance_ineligible:{reason}",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kernel_release", "synthetic-custom-release"),
+        ("filesystem_type", "syntheticfs"),
+    ],
+)
+def test_disposable_provenance_does_not_reject_synthetic_substrings(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    if field == "kernel_release":
+        manifest["kernel_context"]["release"] = value
+    elif field == "filesystem_type":
+        manifest["filesystem_context"]["type"] = value
+    else:
+        raise AssertionError(field)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
 def test_disposable_task_root_must_match_pinned_pve_source(tmp_path: Path) -> None:
     manifest, records = _disposable_pve_capture()
     old_root = manifest["filesystem_context"]["task_tree"]["task_root"]

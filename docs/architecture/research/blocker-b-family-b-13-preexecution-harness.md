@@ -284,7 +284,11 @@ it never dereferences host paths and does not claim the values prove their own
 truth. The later reviewed collector/preflight must obtain them from the approved
 fixture. Synthetic captures remain exempt from live PVE provenance and may keep
 their existing `kind=synthetic`, `release=synthetic`, `type=synthetic`, and
-`mount_id=fixture` representations.
+`mount_id=fixture` representations. Conversely, the exact synthetic-only
+sentinels `kernel_context.release="synthetic"` and
+`filesystem_context.type="synthetic"` are ineligible for `disposable_pve`;
+this rule is exact-value based and does not reject arbitrary live values merely
+because they contain the substring `synthetic`.
 
 `baseline_upids` is the only allowed background category. Its complete
 `baseline_observation` carries capture start/end and commit times before T0,

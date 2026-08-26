@@ -390,14 +390,20 @@ def _validate_disposable_pve_provenance(
         kernel_context = _require_mapping(
             manifest.get("kernel_context"), "kernel_context"
         )
-        _require_provenance_text(kernel_context, "release", "kernel_context")
+        kernel_release = _require_provenance_text(
+            kernel_context, "release", "kernel_context"
+        )
+        if kernel_release == "synthetic":
+            raise CaptureError("kernel_release_is_synthetic_sentinel")
 
         filesystem_context = _require_mapping(
             manifest.get("filesystem_context"), "filesystem_context"
         )
-        _require_provenance_text(
+        filesystem_type = _require_provenance_text(
             filesystem_context, "type", "filesystem_context"
         )
+        if filesystem_type == "synthetic":
+            raise CaptureError("filesystem_type_is_synthetic_sentinel")
         _require_provenance_text(
             filesystem_context, "filesystem_id", "filesystem_context"
         )
