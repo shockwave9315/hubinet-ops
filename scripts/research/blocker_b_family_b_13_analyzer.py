@@ -370,6 +370,8 @@ def _validate_disposable_pve_provenance(
 
     try:
         task_tree = _validated_task_tree_contract(manifest)
+        if task_tree.task_root != "/var/log/pve/tasks":
+            raise CaptureError("disposable_task_root_not_source_bound")
         node_identity = _require_mapping(
             manifest.get("node_identity"), "node_identity"
         )
@@ -416,6 +418,7 @@ def _validate_disposable_pve_provenance(
         mount_point = _validated_canonical_absolute_path(
             mount_topology.get("mount_point"),
             "filesystem_context.mount_topology.mount_point",
+            allow_root=True,
         )
         if not _path_is_within(task_tree.task_root, mount_point):
             raise CaptureError("task_tree_not_within_recorded_mount")
@@ -718,6 +721,14 @@ def _validate_clock_contract(
         if contract.get("node_identity") != manifest.get("node_identity"):
             raise CaptureError("clock_contract_node_identity_mismatch")
         _require_text(contract, "time_namespace_id")
+        if fixture_kind == "disposable_pve":
+            _require_provenance_text(manifest, "boot_id", "manifest")
+            _require_provenance_text(
+                contract, "clock_domain_id", "clock_contract"
+            )
+            _require_provenance_text(
+                contract, "time_namespace_id", "clock_contract"
+            )
         expected_correlation = (
             "synthetic_single_shared_domain"
             if fixture_kind == "synthetic"

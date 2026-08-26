@@ -606,6 +606,18 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
     return manifest, records
 
 
+def _rewrite_path_prefix(value: Any, old: str, new: str) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(child, str) and child.startswith(old):
+                value[key] = new + child[len(old) :]
+            else:
+                _rewrite_path_prefix(child, old, new)
+    elif isinstance(value, list):
+        for child in value:
+            _rewrite_path_prefix(child, old, new)
+
+
 def _disposable_pve_capture(
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     manifest, records = _default_capture()
@@ -653,18 +665,7 @@ def _disposable_pve_capture(
         },
     }
 
-    def rewrite_task_paths(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, child in value.items():
-                if isinstance(child, str) and child.startswith(SYNTHETIC_TASK_ROOT):
-                    value[key] = task_root + child[len(SYNTHETIC_TASK_ROOT) :]
-                else:
-                    rewrite_task_paths(child)
-        elif isinstance(value, list):
-            for child in value:
-                rewrite_task_paths(child)
-
-    rewrite_task_paths(records)
+    _rewrite_path_prefix(records, SYNTHETIC_TASK_ROOT, task_root)
     return manifest, records
 
 
@@ -5649,6 +5650,102 @@ def test_complete_disposable_fixture_provenance_may_pass(tmp_path: Path) -> None
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_disposable_task_root_must_match_pinned_pve_source(tmp_path: Path) -> None:
+    manifest, records = _disposable_pve_capture()
+    old_root = manifest["filesystem_context"]["task_tree"]["task_root"]
+    fake_root = "/tmp/fake/tasks"
+    manifest["filesystem_context"]["task_tree"]["task_root"] = fake_root
+    manifest["filesystem_context"]["mount_topology"]["mount_point"] = "/tmp/fake"
+    _rewrite_path_prefix(records, old_root, fake_root)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons == (
+        "disposable_fixture_provenance_ineligible:"
+        "disposable_task_root_not_source_bound",
+    )
+
+
+def test_synthetic_custom_task_root_remains_legal(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    custom_root = "/custom/synthetic/tasks"
+    manifest["filesystem_context"]["task_tree"]["task_root"] = custom_root
+    _rewrite_path_prefix(records, SYNTHETIC_TASK_ROOT, custom_root)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    "case", ["boot_id", "clock_domain_id", "time_namespace_id"]
+)
+def test_disposable_placeholder_boot_or_clock_provenance_is_ineligible(
+    tmp_path: Path, case: str
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    clock = manifest["clock_contract"]
+
+    if case == "boot_id":
+        manifest["boot_id"] = "placeholder"
+        clock["boot_id"] = "placeholder"
+    elif case == "clock_domain_id":
+        clock["clock_domain_id"] = "placeholder"
+        for participant in clock["participant_clock_domain_ids"]:
+            clock["participant_clock_domain_ids"][participant] = "placeholder"
+    elif case == "time_namespace_id":
+        clock["time_namespace_id"] = "placeholder"
+    else:
+        raise AssertionError(case)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons[0].startswith("clock_contract_ineligible:")
+
+
+def test_synthetic_placeholder_boot_and_clock_identifiers_remain_legal(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    clock = manifest["clock_contract"]
+    manifest["boot_id"] = "placeholder"
+    clock["boot_id"] = "placeholder"
+    clock["clock_domain_id"] = "placeholder"
+    clock["time_namespace_id"] = "placeholder"
+    for participant in clock["participant_clock_domain_ids"]:
+        clock["participant_clock_domain_ids"][participant] = "placeholder"
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_disposable_root_filesystem_mount_point_may_pass(tmp_path: Path) -> None:
+    manifest, records = _disposable_pve_capture()
+    manifest["filesystem_context"]["mount_topology"]["root"] = "/"
+    manifest["filesystem_context"]["mount_topology"]["mount_point"] = "/"
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    "mount_point", ["/srv/unrelated", "relative/path", "/var/log/pve/"]
+)
+def test_disposable_mount_point_must_canonically_contain_task_root(
+    tmp_path: Path, mount_point: str
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    manifest["filesystem_context"]["mount_topology"]["mount_point"] = mount_point
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
 
 
 def test_official_review_empty_disposable_provenance_is_ineligible(

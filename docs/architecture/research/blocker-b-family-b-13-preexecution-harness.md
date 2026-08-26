@@ -257,11 +257,25 @@ time namespace.
 The running kernel release is required, but an exact running-kernel source
 commit is deliberately not pinned. The mount IDs/root/mount point are the
 sealed Linux mount-topology observation, and the task root must be lexically
-within the recorded mount point. Filesystem and storage identifiers remain
-fixture provenance, never workload identity. The archive rotation threshold is
-bound to the pinned 50,000-byte source contract; the exact-log cleanup scheduler
-and schedule record the fixture's actual retention configuration. Retention
-values and surviving anchors do not prove enumeration completeness.
+within the recorded mount point. For `disposable_pve`, the task root is also
+fixed to `/var/log/pve/tasks`, matching pinned `pve-common` 9.2.1
+`PVE::UPID.pm`; a consistently rewritten arbitrary tree is not applicable to
+the source hypothesis. A root-filesystem mount point of `/` is valid and
+contains that task root. This live-only source binding does not constrain a
+synthetic capture's explicit synthetic task root. Filesystem and storage
+identifiers remain fixture provenance, never workload identity. The archive
+rotation threshold is bound to the pinned 50,000-byte source contract; the
+exact-log cleanup scheduler and schedule record the fixture's actual retention
+configuration. Retention values and surviving anchors do not prove enumeration
+completeness.
+
+For `disposable_pve`, `boot_id`, `clock_contract.clock_domain_id`, and
+`clock_contract.time_namespace_id` must also be nonempty, non-placeholder live
+provenance before their existing equality/domain bindings are useful. Capture
+v5 does not add a guessed boot-ID syntax or a self-asserted verification flag;
+the later collector derives these values from the approved fixture. Synthetic
+captures may retain explicit synthetic or placeholder identifiers because they
+do not claim live PVE applicability.
 
 Missing, empty, malformed, or placeholder live provenance makes a
 `disposable_pve` capture `ENVIRONMENT_INELIGIBLE`. The offline analyzer checks
