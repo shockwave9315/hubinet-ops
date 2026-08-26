@@ -773,8 +773,8 @@ def _add_finalized_historical_baseline(
         "known_upid": upid,
         "discovery_source": "baseline",
         "discovery_reference": "manifest.baseline_upids",
-        "capture_start_monotonic_ns": 83,
-        "capture_end_monotonic_ns": 84,
+        "capture_start_monotonic_ns": 91,
+        "capture_end_monotonic_ns": 92,
     }
     records["exact_upid"].insert(0, baseline_exact)
     manifest["t0_quiescence"]["baseline_classifications"] = [
@@ -2444,6 +2444,69 @@ def test_finalized_historical_baseline_allows_quiescent_t0(
     assert result.outcome is AnalyzerOutcome.PASS
 
 
+@pytest.mark.parametrize(
+    ("capture_start", "capture_end"),
+    [
+        (40, 41),  # before baseline capture starts
+        (70, 71),  # overlaps baseline capture
+        (85, 86),  # after capture end, before committed baseline handoff
+        (89, 90),  # begins one nanosecond before commit
+    ],
+)
+def test_baseline_discovery_must_be_committed_before_exact_capture(
+    tmp_path: Path, capture_start: int, capture_end: int
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    records["exact_upid"][0].update(
+        capture_start_monotonic_ns=capture_start,
+        capture_end_monotonic_ns=capture_end,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_baseline_discovery_not_prior",)
+
+
+@pytest.mark.parametrize(("capture_start", "capture_end"), [(90, 91), (91, 92)])
+def test_baseline_discovery_at_or_after_commit_allows_exact_capture(
+    tmp_path: Path, capture_start: int, capture_end: int
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    records["exact_upid"][0].update(
+        capture_start_monotonic_ns=capture_start,
+        capture_end_monotonic_ns=capture_end,
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_exact_observation_sequence_cannot_bypass_baseline_commit_order(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    baseline_exact, generated_exact = records["exact_upid"]
+    baseline_exact.update(
+        observation_sequence=2,
+        capture_start_monotonic_ns=85,
+        capture_end_monotonic_ns=86,
+    )
+    generated_exact["observation_sequence"] = 1
+    manifest["t0_quiescence"]["baseline_classifications"][0][
+        "exact_observation_sequence"
+    ] = 2
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("exact_baseline_discovery_not_prior",)
+
+
 def _raw_result(available: bool, raw_evidence: str, parsed_field: str, parsed: str) -> dict[str, Any]:
     return {
         "available": available,
@@ -2624,7 +2687,7 @@ def test_reference_to_late_exact_is_invalid_even_with_pre_t0_final_sibling(
         records, capture_start_monotonic_ns=240, capture_end_monotonic_ns=241
     )
     assert referenced["capture_end_monotonic_ns"] > manifest["t0_monotonic_ns"]
-    _append_baseline_exact(records, UPID_B, capture_start=83, capture_end=84)
+    _append_baseline_exact(records, UPID_B, capture_start=91, capture_end=92)
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 

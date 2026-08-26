@@ -2177,6 +2177,10 @@ def _analyze_loaded(
     close_monotonic = _require_int(close, "monotonic_ns")
     close_event_id = _require_text(close, "event_id")
     t0_monotonic = _require_int(manifest, "t0_monotonic_ns")
+    baseline_commit = _require_int(
+        _require_mapping(manifest["baseline_observation"], "baseline_observation"),
+        "committed_at_monotonic_ns",
+    )
     generator_window_operations = [
         operation for operation in operations if operation["within_generator_window"]
     ]
@@ -2702,6 +2706,8 @@ def _analyze_loaded(
             provenance_valid = (
                 discovery_reference == "manifest.baseline_upids" and upid in baseline_upids
             )
+            if provenance_valid and baseline_commit > capture_start:
+                raise CaptureError("exact_baseline_discovery_not_prior")
         elif discovery_source == "watch" and isinstance(discovery_reference, int):
             watch = watches.get(discovery_reference)
             provenance_valid = bool(

@@ -790,6 +790,10 @@ to the completeness-bearing enumeration set. Missing discovery provenance is
 
 Watch provenance additionally requires a strict candidate-interval watch.
 Scan and surface provenance inherits their respective end-time causal checks.
+Baseline provenance requires the committed-baseline handoff no later than the
+exact read begins: `baseline_observation.committed_at_monotonic_ns <=
+exact.capture_start_monotonic_ns`. Equality is a legal causal handoff. Set
+membership before that commit cannot establish prior discovery.
 Thus an exact record cannot rehabilitate temporally impossible discovery
 evidence and remains confirmation-only.
 
