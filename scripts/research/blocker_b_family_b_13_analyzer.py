@@ -1212,6 +1212,25 @@ def _validate_raw_result(
     return result
 
 
+def _without_trailing_line_terminator(raw: str) -> str:
+    """Strip at most one trailing line terminator, never line content.
+
+    The sealed raw evidence is authoritative task-log/status content, not a
+    normalized projection.  A file's own final line terminator (a single
+    trailing ``\\n`` or ``\\r\\n``) is a serialization artifact of capture,
+    not terminal-line content, so removing exactly one is legal.  Any other
+    leading/trailing/internal whitespace is content and must never be
+    stripped: doing so would let malformed bytes agree with a declared
+    projection instead of failing closed.
+    """
+
+    if raw.endswith("\r\n"):
+        return raw[:-2]
+    if raw.endswith("\n"):
+        return raw[:-1]
+    return raw
+
+
 def _classify_exact_log_terminal_status(terminal_status: str) -> str | None:
     """Classify one raw exact-log terminal line using pinned PVE syntax."""
 
@@ -2298,6 +2317,18 @@ def _analyze_loaded(
         heartbeat_times
     ):
         raise CaptureError("heartbeat_time_not_strictly_ordered")
+    # A heartbeat belongs to the reader participant, and every harness record
+    # is already required to carry that reader's configured process identity
+    # (checked above), so no heartbeat can legitimately declare a
+    # CLOCK_MONOTONIC time before the reader's own `process_start`.  This is
+    # contradictory sealed provenance, not observed runtime unhealthiness, so
+    # it must fail closed rather than being silently excluded from
+    # `relevant_heartbeats` and left for a later legitimate heartbeat to
+    # reach a positive close.  This checks every heartbeat, not only the ones
+    # already inside the reader/close window, and does not apply any new
+    # ordering to the interior of the stream beyond this one causal floor.
+    if any(time < process_start for time in heartbeat_times):
+        raise CaptureError("heartbeat_before_process_start")
     relevant_heartbeats = [
         record
         for record in heartbeats
@@ -2786,11 +2817,21 @@ def _analyze_loaded(
         exact_confirmed.add(upid)
         task_state = _require_text(status_result, "task_state")
         terminal_status = _require_text(log_result, "terminal_status")
-        status_raw = _require_string(status_result, "raw_evidence").strip()
+        # Sealed raw evidence is authoritative; only a file's own single
+        # trailing line terminator is a capture artifact, never content.
+        # Whitespace elsewhere in the line -- leading, trailing-without-a-
+        # terminator, or an interior whitespace-only line -- is raw content
+        # and must never be stripped into agreement with a declared
+        # projection.  "Last nonempty raw line" means the last line that is
+        # not the empty string produced by an actual blank line; a
+        # whitespace-only line is not empty and must not be skipped past.
+        status_raw = _without_trailing_line_terminator(
+            _require_string(status_result, "raw_evidence")
+        )
         log_lines = [
-            line.strip()
+            line
             for line in _require_string(log_result, "raw_evidence").splitlines()
-            if line.strip()
+            if line != ""
         ]
         if status_raw != task_state or not log_lines or log_lines[-1] != terminal_status:
             raise CaptureError("exact_upid_parsed_result_mismatches_raw_evidence")

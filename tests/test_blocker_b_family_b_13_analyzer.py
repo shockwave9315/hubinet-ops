@@ -5467,6 +5467,82 @@ def test_healthy_then_unhealthy_heartbeat_before_close_cannot_pass(
     assert "observer_unhealthy_heartbeat" in result.reasons
 
 
+def _replace_heartbeats(
+    records: dict[str, list[dict[str, Any]]], heartbeats: list[dict[str, Any]]
+) -> None:
+    records["harness_events"] = [
+        replacement
+        for event in records["harness_events"]
+        for replacement in (
+            heartbeats if event["event"] == "heartbeat" else [event]
+        )
+    ]
+
+
+@pytest.mark.parametrize("healthy", [True, False])
+def test_heartbeat_before_process_start_is_incomplete_not_excluded(
+    tmp_path: Path, healthy: bool
+) -> None:
+    """A heartbeat belongs to the reader participant and cannot legitimately
+    declare a CLOCK_MONOTONIC time before that reader's own `process_start`
+    (50 in the default fixture).  This is contradictory sealed provenance --
+    not observed runtime unhealthiness -- so it must fail closed regardless
+    of its own health flag, rather than being silently excluded from
+    `relevant_heartbeats` and left for the later legitimate healthy
+    heartbeat to reach a positive close."""
+
+    manifest, records = _default_capture()
+    _replace_heartbeats(
+        records,
+        [
+            {
+                "event": "heartbeat",
+                "healthy": healthy,
+                "process_identity": "synthetic-reader:1",
+                "monotonic_ns": 49,
+            },
+            {
+                "event": "heartbeat",
+                "healthy": True,
+                "process_identity": "synthetic-reader:1",
+                "monotonic_ns": 250,
+            },
+        ],
+    )
+    for index, event in enumerate(
+        (e for e in records["harness_events"] if e["event"] == "heartbeat"), 1
+    ):
+        event["heartbeat_sequence"] = index
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("heartbeat_before_process_start",)
+
+
+def test_heartbeat_exactly_at_process_start_is_legal(tmp_path: Path) -> None:
+    """The causal floor is inclusive: a heartbeat exactly at `process_start`
+    is legal sealed provenance, matching the reader/close window's own
+    inclusive lower bound."""
+
+    manifest, records = _default_capture()
+    _replace_heartbeats(
+        records,
+        [
+            {
+                "event": "heartbeat",
+                "healthy": True,
+                "process_identity": "synthetic-reader:1",
+                "monotonic_ns": 50,
+            },
+        ],
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is not AnalyzerOutcome.INCOMPLETE
+
+
 def test_structurally_valid_stale_heartbeat_is_gap(tmp_path: Path) -> None:
     manifest, records = _default_capture()
     manifest["reader_context"]["heartbeat_timeout_ns"] = 40
@@ -5537,6 +5613,133 @@ def test_exact_parsed_final_status_must_match_raw_evidence(tmp_path: Path) -> No
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
     assert "exact_upid_parsed_result_mismatches_raw_evidence" in result.reasons
+
+
+def _set_log_raw(records: dict[str, list[dict[str, Any]]], raw: str) -> None:
+    exact = records["exact_upid"][0]
+    exact["log_result"]["raw_evidence"] = raw
+    exact["log_result"]["sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _set_status_raw(records: dict[str, list[dict[str, Any]]], raw: str) -> None:
+    exact = records["exact_upid"][0]
+    exact["status_result"]["raw_evidence"] = raw
+    exact["status_result"]["sha256"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "raw", [" TASK OK ", "TASK OK ", "\tTASK OK", " TASK OK"]
+)
+def test_log_raw_whitespace_is_not_normalized_into_terminal_agreement(
+    tmp_path: Path, raw: str
+) -> None:
+    """Sealed raw log evidence is authoritative content, not a normalized
+    projection: padding or a leading tab around an otherwise-recognized
+    terminal line must not be stripped into matching the declared
+    `terminal_status="TASK OK"`."""
+
+    manifest, records = _default_capture()
+    _set_log_raw(records, raw)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "exact_upid_parsed_result_mismatches_raw_evidence" in result.reasons
+
+
+@pytest.mark.parametrize("raw", [" stopped ", "stopped "])
+def test_status_raw_whitespace_is_not_normalized_into_task_state_agreement(
+    tmp_path: Path, raw: str
+) -> None:
+    """Sealed raw status evidence must match the declared `task_state`
+    exactly; leading/trailing whitespace content must not be stripped into
+    agreement."""
+
+    manifest, records = _default_capture()
+    _set_status_raw(records, raw)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "exact_upid_parsed_result_mismatches_raw_evidence" in result.reasons
+
+
+def test_log_raw_normal_trailing_newline_remains_legal(tmp_path: Path) -> None:
+    """A file's own single trailing line terminator is a capture artifact,
+    not terminal-line content, and remains legal after the raw/declared
+    agreement check."""
+
+    manifest, records = _default_capture()
+    _set_log_raw(records, "TASK OK\n")
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_status_raw_normal_trailing_newline_remains_legal(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _set_status_raw(records, "stopped\n")
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_log_raw_whitespace_only_line_after_terminal_cannot_launder_earlier_line(
+    tmp_path: Path,
+) -> None:
+    """A whitespace-only line is raw content, not an empty line, and must not
+    be skipped past to let an earlier `TASK OK` line become terminal
+    authority for a malformed capture."""
+
+    manifest, records = _default_capture()
+    _set_log_raw(records, "TASK OK\n \n")
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "exact_upid_parsed_result_mismatches_raw_evidence" in result.reasons
+
+
+def test_log_raw_truly_empty_trailing_line_is_skipped_as_blank(
+    tmp_path: Path,
+) -> None:
+    """An actually empty line (from a genuine blank line, not whitespace
+    content) is distinct from a whitespace-only line and is correctly
+    skipped when locating the last nonempty raw line."""
+
+    manifest, records = _default_capture()
+    _set_log_raw(records, "TASK OK\n\n")
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+@pytest.mark.parametrize(
+    ("terminal_status", "interpretation"),
+    [
+        ("TASK OK", "ok"),
+        ("TASK WARNINGS: 3", "warning"),
+        ("TASK ERROR: boom", "error"),
+    ],
+)
+def test_canonical_terminal_serializations_remain_pass_eligible(
+    tmp_path: Path, terminal_status: str, interpretation: str
+) -> None:
+    """The raw-evidence tightening must not regress the three pinned
+    terminal serializations reaching PASS."""
+
+    manifest, records = _default_capture()
+    _set_log_raw(records, terminal_status)
+    exact = records["exact_upid"][0]
+    exact["log_result"]["terminal_status"] = terminal_status
+    exact["final_status_interpretation"] = interpretation
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.PASS
 
 
 def test_exact_final_status_captured_after_close_cannot_finalize_t1(tmp_path: Path) -> None:
