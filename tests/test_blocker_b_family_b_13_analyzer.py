@@ -5252,6 +5252,70 @@ def test_subrun_marker_before_capture_finalization_may_pass(
     assert result.outcome is outcome
 
 
+@pytest.mark.parametrize(
+    "builder",
+    [_c13_marker, _f13_marker, _d13_marker],
+    ids=["active-archive-handoff", "scheduled-interleaving", "index-rotation"],
+)
+def test_harness_marker_timestamp_after_process_stop_is_incomplete(
+    tmp_path: Path, builder: Any
+) -> None:
+    """Reproduces the official 13C value 10000 and closes its sibling family."""
+
+    manifest, records = _default_capture()
+    marker = builder(manifest, records)
+    marker["monotonic_ns"] = 10_000
+    records["harness_events"].insert(-2, marker)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_event_outside_reader_lifetime",)
+
+
+def test_handoff_timestamp_after_finalization_within_reader_lifetime_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    marker = _c13_marker(manifest, records)
+    marker["monotonic_ns"] = 315
+    records["harness_events"].insert(-2, marker)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_event_after_capture_finalized",)
+
+
+def test_gap_signal_timestamp_before_process_start_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"].insert(
+        -2,
+        {"event": "gap_signal", "reason": "injected_loss", "monotonic_ns": 49},
+    )
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_event_outside_reader_lifetime",)
+
+
+def test_non_heartbeat_marker_timestamp_before_process_start_is_incomplete(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    marker = _c13_marker(manifest, records)
+    marker["monotonic_ns"] = 49
+    records["harness_events"].insert(-2, marker)
+
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_event_outside_reader_lifetime",)
+
+
 @pytest.mark.parametrize("builder", [_f13_marker, _c13_marker, _d13_marker])
 def test_subrun_marker_after_capture_finalization_is_incomplete(
     tmp_path: Path, builder: Any
@@ -5602,7 +5666,7 @@ def test_heartbeat_before_process_start_is_incomplete_not_excluded(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.INCOMPLETE
-    assert result.reasons == ("heartbeat_before_process_start",)
+    assert result.reasons == ("harness_event_outside_reader_lifetime",)
 
 
 def test_heartbeat_exactly_at_process_start_is_legal(tmp_path: Path) -> None:

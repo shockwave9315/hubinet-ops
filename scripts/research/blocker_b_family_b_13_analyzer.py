@@ -2443,6 +2443,18 @@ def _analyze_loaded(
         or kinds.index("capture_finalized") != len(kinds) - 2
     ):
         raise CaptureError("harness_record_after_capture_finalized")
+    # Every record is emitted by the reader participant in the one bound
+    # CLOCK_MONOTONIC domain. Its event time must therefore remain inside that
+    # reader's lifetime. Semantic capture closes at `capture_finalized`, so
+    # only `process_stop` may carry a later (but still in-lifetime) timestamp.
+    # These are per-record lifecycle bounds, not a monotonic-order requirement
+    # on otherwise valid interior harness timestamps.
+    for record in harness:
+        event_time = _require_int(record, "monotonic_ns")
+        if not process_start <= event_time <= process_stop:
+            raise CaptureError("harness_event_outside_reader_lifetime")
+        if record["event"] != "process_stop" and event_time > capture_finalized:
+            raise CaptureError("harness_event_after_capture_finalized")
     if any(record["event"] == "process_crash" for record in harness):
         raise CaptureError("harness_process_crash")
     version_events = [record for record in harness if record["event"] == "analyzer_version"]
@@ -2465,18 +2477,6 @@ def _analyze_loaded(
         heartbeat_times
     ):
         raise CaptureError("heartbeat_time_not_strictly_ordered")
-    # A heartbeat belongs to the reader participant, and every harness record
-    # is already required to carry that reader's configured process identity
-    # (checked above), so no heartbeat can legitimately declare a
-    # CLOCK_MONOTONIC time before the reader's own `process_start`.  This is
-    # contradictory sealed provenance, not observed runtime unhealthiness, so
-    # it must fail closed rather than being silently excluded from
-    # `relevant_heartbeats` and left for a later legitimate heartbeat to
-    # reach a positive close.  This checks every heartbeat, not only the ones
-    # already inside the reader/close window, and does not apply any new
-    # ordering to the interior of the stream beyond this one causal floor.
-    if any(time < process_start for time in heartbeat_times):
-        raise CaptureError("heartbeat_before_process_start")
     relevant_heartbeats = [
         record
         for record in heartbeats
