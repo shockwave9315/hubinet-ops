@@ -22,13 +22,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_13f_creation_evidence_binding",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "subrun_watch_scan_race_marker_missing"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_13f_creation_evidence_binding",
@@ -59,13 +53,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_baseline_exact_causality_inversion",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "exact_baseline_discovery_not_prior"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_baseline_exact_causality_inversion",
@@ -96,13 +84,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_dynamic_watch_handoff_missing",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "post_t0_dynamic_bucket_handoff_missing_or_unmatched"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_dynamic_watch_handoff_missing",
@@ -133,13 +115,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_evidence_after_capture_finalized",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "harness_record_after_capture_finalized"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_evidence_after_capture_finalized",
@@ -170,13 +146,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_generator_window_relation_malformed",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "ground_truth_generator_window_relation_invalid"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_generator_window_relation_malformed",
@@ -207,13 +177,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_harness_event_outside_lifetime",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "harness_event_outside_reader_lifetime"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_harness_event_outside_lifetime",
@@ -244,13 +208,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_pre_t0_post_t0_discovery_partition",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "post_t0_watch_event_not_after_t0:1"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_pre_t0_post_t0_discovery_partition",
@@ -281,13 +239,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_pre_t0_watch_overflow",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "B_S1_GAP_DETECTED",
-      "reasons": [
-        "watch_queue_overflow"
-      ]
-    },
+    "intended_v7_outcome": "B_S1_GAP_DETECTED",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_pre_t0_watch_overflow",
@@ -318,13 +270,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_process_start_physical_first",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "harness_record_before_process_start"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_process_start_physical_first",
@@ -355,13 +301,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_reader_lifetime_invalid_evidence",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "harness_event_outside_reader_lifetime"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_reader_lifetime_invalid_evidence",
@@ -392,13 +332,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_scan_declared_upid_self_authentication",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "scan_declared_upids_mismatch_observations:scan_rounds:1"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_scan_declared_upid_self_authentication",
@@ -429,13 +363,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_surface_raw_projection_mismatch",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "surface_normalized_upids_mismatch_raw_evidence:active:7"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_surface_raw_projection_mismatch",
@@ -466,13 +394,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_t1_partition_error",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "ground_truth_generator_window_declaration_mismatch"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_t1_partition_error",
@@ -503,13 +425,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_terminal_exact_log_laundering",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "exact_upid_final_status_regressed"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_terminal_exact_log_laundering",
@@ -540,13 +456,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_unknown_harness_event",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "unknown_harness_event:gap_singal"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_unknown_harness_event",
@@ -577,13 +487,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "hist_watch_raw_mask_text_mismatch",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "inotify_mask_mismatch_raw_mask:watch:1"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": false,
     "relative_capture_path": "captures/hist_watch_raw_mask_text_mismatch",
@@ -619,13 +523,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "model_e1_pre_t0_surface_influences_candidate",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
-      "reasons": [
-        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
-      ]
-    },
+    "intended_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
     "kind": "model_derived_witness",
     "migration_required": true,
     "relative_capture_path": "captures/model_e1_pre_t0_surface_influences_candidate",
@@ -656,13 +554,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "model_e3_13c_handoff_after_t1",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "subrun_handoff_marker_outside_candidate_interval"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "model_derived_witness",
     "migration_required": true,
     "relative_capture_path": "captures/model_e3_13c_handoff_after_t1",
@@ -693,13 +585,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "positive_13a",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
-      "reasons": [
-        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
-      ]
-    },
+    "intended_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
     "kind": "positive_control",
     "migration_required": false,
     "relative_capture_path": "captures/positive_13a",
@@ -730,13 +616,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "positive_13b",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
-      "reasons": [
-        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
-      ]
-    },
+    "intended_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
     "kind": "positive_control",
     "migration_required": false,
     "relative_capture_path": "captures/positive_13b",
@@ -767,13 +647,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "positive_13c",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
-      "reasons": [
-        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
-      ]
-    },
+    "intended_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
     "kind": "positive_control",
     "migration_required": false,
     "relative_capture_path": "captures/positive_13c",
@@ -804,13 +678,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "positive_13d",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
-      "reasons": [
-        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
-      ]
-    },
+    "intended_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
     "kind": "positive_control",
     "migration_required": false,
     "relative_capture_path": "captures/positive_13d",
@@ -841,13 +709,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "positive_13e",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "B_S1_GAP_DETECTED",
-      "reasons": [
-        "watch_queue_overflow"
-      ]
-    },
+    "intended_v7_outcome": "B_S1_GAP_DETECTED",
     "kind": "positive_control",
     "migration_required": false,
     "relative_capture_path": "captures/positive_13e",
@@ -878,13 +740,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "positive_13f",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
-      "reasons": [
-        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
-      ]
-    },
+    "intended_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
     "kind": "positive_control",
     "migration_required": false,
     "relative_capture_path": "captures/positive_13f",
@@ -915,13 +771,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "positive_13g",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
-      "reasons": [
-        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
-      ]
-    },
+    "intended_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
     "kind": "positive_control",
     "migration_required": false,
     "relative_capture_path": "captures/positive_13g",
@@ -952,13 +802,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "stop_duplicate_subrun_evidence_ids",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "subrun_contract_evidence_ids_not_unique"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": true,
     "relative_capture_path": "captures/stop_duplicate_subrun_evidence_ids",
@@ -1014,13 +858,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "stop_generator_sequence_relabel",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "ground_truth_generator_sequence_not_physically_increasing"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": true,
     "relative_capture_path": "captures/stop_generator_sequence_relabel",
@@ -1051,13 +889,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "stop_post_t1_gap_signal_rewrites_t1",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
-      "reasons": [
-        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
-      ]
-    },
+    "intended_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
     "kind": "historical_witness",
     "migration_required": true,
     "relative_capture_path": "captures/stop_post_t1_gap_signal_rewrites_t1",
@@ -1088,13 +920,7 @@
       "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     "fixture_id": "stop_reader_pre_t0_before_process_start",
-    "intended_v7_result": {
-      "architecture_effect": "NONE",
-      "outcome": "HARNESS_INCOMPLETE",
-      "reasons": [
-        "reader_lifecycle_precedes_pre_t0_establishment_evidence"
-      ]
-    },
+    "intended_v7_outcome": "HARNESS_INCOMPLETE",
     "kind": "historical_witness",
     "migration_required": true,
     "relative_capture_path": "captures/stop_reader_pre_t0_before_process_start",

@@ -21,14 +21,31 @@ then copied in as plain files.
 (`positive_control` / `historical_witness` / `model_derived_witness`), the
 frozen oracle's actual `expected_v6_result` (the complete
 `AnalysisResult.as_dict()`, captured by replaying the vendored oracle against
-the checked-in bytes), the reconciled design's `intended_v7_result`, whether
+the checked-in bytes), the reconciled design's `intended_v7_outcome`, whether
 `migration_required`, and a `file_hashes` map binding every capture file to
 its checked-in SHA-256.
 
+**`expected_v6_result` vs. `intended_v7_outcome` are deliberately asymmetric.**
+`expected_v6_result` is the full, exact deterministic `AnalysisResult.as_dict()`
+— oracle replay is checked against it byte-for-byte, because the frozen v6
+oracle's behavior is fully known and must never silently drift.
+`intended_v7_outcome` is a single outcome string only (one of the five
+`AnalyzerOutcome` values) — it is migration/design metadata, not a frozen v7
+contract. G7 migration semantics are outcome-to-outcome: `migration_required`
+is computed as `expected_v6_result["outcome"] != intended_v7_outcome`. v7 has
+no designed reason-string/witness-body taxonomy yet, and S0.1 must not freeze
+one by implication — a future v7 that reaches the same *outcome* through
+different, better reasons is not a migration and needs no ledger row.
+
 `migration_expectations.json` (G7) lists only the fixtures where
-`intended_v7_result` intentionally differs from `expected_v6_result`, with an
-explicit `reason_class`, `source_ref`, and `explanation` per row. No wildcard
-fixture IDs or result pairs; no runtime/operator override field.
+`intended_v7_outcome` intentionally differs from `expected_v6_result`'s
+outcome, with an explicit `reason_class`, `source_ref`, and `explanation` per
+row, validated against a cause/cell-specific outcome-pair ->
+required-`reason_class` matrix (not merely checked for membership in the set
+of allowed reason classes) — see
+`docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md`
+§6.E. No wildcard fixture IDs or result pairs; no runtime/operator override
+field.
 
 ## Provenance
 
@@ -54,9 +71,9 @@ injected gap signal.
 
 Sixteen witnesses reproducing historical false-result classes that the frozen
 v6 oracle now handles correctly (each traces to an existing passing regression
-test at the frozen head). `intended_v7_result` is identical to
-`expected_v6_result` for all sixteen — the redesign does not loosen any of
-them.
+test at the frozen head). `intended_v7_outcome` is identical to
+`expected_v6_result["outcome"]` for all sixteen — the redesign does not loosen
+any of them.
 
 ### C. The latest stop-triggering four (frozen v6 is WRONG; unfixed)
 

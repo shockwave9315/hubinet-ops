@@ -12,9 +12,15 @@ It validates three checked-in S0.1 assets:
 - ``tests/oracles/family_b_13/v6/`` -- the byte-frozen v6 oracle and its
   provenance manifest (G10);
 - ``tests/fixtures/research/family_b_13/`` -- the declarative sealed-capture
-  witness corpus and its manifest;
+  witness corpus and its manifest. Each row's ``expected_v6_result`` is the
+  full, exact ``AnalysisResult.as_dict()`` (oracle replay must match it
+  exactly), but each row's ``intended_v7_outcome`` is outcome-only, non-
+  authoritative migration metadata -- v7's future reason strings/witness
+  bodies are undesigned and are deliberately not frozen here;
 - ``tests/fixtures/research/family_b_13/migration_expectations.json`` -- the
-  v6 -> v7 differential migration ledger (G7).
+  v6 -> v7 differential migration ledger (G7), validated against a
+  cause/cell-specific outcome-pair -> required-``reason_class`` matrix, not
+  merely against the set of allowed reason classes.
 
 See ``docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md``
 for the non-normative design record these assets support.
@@ -58,33 +64,27 @@ ALL_OUTCOMES = frozenset(
     }
 )
 
-# G7: absolute, never overridable by any ledger reason (including
-# CONTRACT_AMENDMENT).
+# G7: absolute / structural restrictions, current for this redesign, never
+# overridable by any ledger reason including CONTRACT_AMENDMENT. Written as
+# a direct, explicit set of concrete pairs -- not as an over-broad base rule
+# with exceptions subtracted out -- so nothing here can silently widen if a
+# new outcome is ever added to ALL_OUTCOMES.
 ABSOLUTE_FORBIDDEN_PAIRS = frozenset(
     {
-        # any non-PASS v6 outcome -> v7 PASS
-        *(
-            (outcome, "ANALYZER_PASS_TESTED_INTERLEAVING")
-            for outcome in ALL_OUTCOMES
-            if outcome != "ANALYZER_PASS_TESTED_INTERLEAVING"
-        ),
-        # v6 INELIGIBLE -> any non-INELIGIBLE outcome
-        *(
-            ("ENVIRONMENT_INELIGIBLE", outcome)
-            for outcome in ALL_OUTCOMES
-            if outcome != "ENVIRONMENT_INELIGIBLE"
-        ),
-        # v6 INCOMPLETE -> PASS
+        # v6 HARNESS_INCOMPLETE -> v7 PASS: forbidden for this redesign
+        # (G12: v7 integrity coverage must not convert an incoherent
+        # capture into positive evidence). GAP -> PASS and WITNESS ->
+        # INCOMPLETE-or-other transitions are NOT in this set -- only this
+        # exact incomplete-sourced cell is.
         ("HARNESS_INCOMPLETE", "ANALYZER_PASS_TESTED_INTERLEAVING"),
+        # v6 ENVIRONMENT_INELIGIBLE -> any non-INELIGIBLE v7 outcome:
+        # absolutely forbidden, applicability requirements are not loosened.
+        ("ENVIRONMENT_INELIGIBLE", "ANALYZER_PASS_TESTED_INTERLEAVING"),
+        ("ENVIRONMENT_INELIGIBLE", "B_S1_GAP_DETECTED"),
+        ("ENVIRONMENT_INELIGIBLE", "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS"),
+        ("ENVIRONMENT_INELIGIBLE", "HARNESS_INCOMPLETE"),
     }
-) - {
-    # GAP -> PASS and WITNESS -> PASS are legal (V6_INTERVAL_POLLUTION),
-    # per the corrected cause/cell-specific G7 matrix; only the two
-    # structural cells above (INELIGIBLE-sourced, and INCOMPLETE -> PASS)
-    # remain absolute.
-    ("B_S1_GAP_DETECTED", "ANALYZER_PASS_TESTED_INTERLEAVING"),
-    ("GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS", "ANALYZER_PASS_TESTED_INTERLEAVING"),
-}
+)
 
 # G7: contract-amendment-only cells. Legal only with reason_class ==
 # CONTRACT_AMENDMENT and a non-empty contract_amendment reference.
@@ -95,8 +95,10 @@ CONTRACT_ONLY_PAIRS = frozenset(
     }
 )
 
-# Not authorized by the G7 correction; must never appear regardless of
-# reason_class.
+# Not authorized by the G7 correction, and not to be inferred from the
+# separately-legal GAP -> PASS cell. Must never appear regardless of
+# reason_class -- including V6_INTERVAL_POLLUTION, which is exactly the
+# class that makes GAP -> PASS legal but does not extend to WITNESS -> PASS.
 NOT_AUTHORIZED_PAIRS = frozenset(
     {
         ("GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS", "ANALYZER_PASS_TESTED_INTERLEAVING"),
@@ -106,6 +108,93 @@ NOT_AUTHORIZED_PAIRS = frozenset(
 ALLOWED_REASON_CLASSES = frozenset(
     {"V6_UNSOUND", "V6_INTERVAL_POLLUTION", "V6_CRASH", "CONTRACT_AMENDMENT"}
 )
+
+# G7 cause/cell-specific matrix (redesign doc §6.E): the exact reason_class
+# required for each outcome-pair that is legal with a plain (non-contract)
+# ledger row. A pair not present here is either the same outcome twice (no
+# ledger row needed at all), one of ABSOLUTE_FORBIDDEN_PAIRS, one of
+# CONTRACT_ONLY_PAIRS, or one of NOT_AUTHORIZED_PAIRS -- never a fifth,
+# unclassified case (see test_every_differing_outcome_pair_is_classified).
+REQUIRED_REASON_CLASS_FOR_TRANSITION: dict[tuple[str, str], str] = {
+    ("ANALYZER_PASS_TESTED_INTERLEAVING", "HARNESS_INCOMPLETE"): "V6_UNSOUND",
+    ("ANALYZER_PASS_TESTED_INTERLEAVING", "B_S1_GAP_DETECTED"): "V6_UNSOUND",
+    (
+        "ANALYZER_PASS_TESTED_INTERLEAVING",
+        "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS",
+    ): "V6_UNSOUND",
+    ("ANALYZER_PASS_TESTED_INTERLEAVING", "ENVIRONMENT_INELIGIBLE"): "V6_UNSOUND",
+    ("B_S1_GAP_DETECTED", "ANALYZER_PASS_TESTED_INTERLEAVING"): "V6_INTERVAL_POLLUTION",
+    (
+        "B_S1_GAP_DETECTED",
+        "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS",
+    ): "V6_INTERVAL_POLLUTION",
+    ("B_S1_GAP_DETECTED", "HARNESS_INCOMPLETE"): "V6_UNSOUND",
+    ("B_S1_GAP_DETECTED", "ENVIRONMENT_INELIGIBLE"): "V6_UNSOUND",
+    (
+        "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS",
+        "B_S1_GAP_DETECTED",
+    ): "V6_UNSOUND",
+    (
+        "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS",
+        "HARNESS_INCOMPLETE",
+    ): "V6_UNSOUND",
+    (
+        "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS",
+        "ENVIRONMENT_INELIGIBLE",
+    ): "V6_UNSOUND",
+    ("HARNESS_INCOMPLETE", "ENVIRONMENT_INELIGIBLE"): "V6_UNSOUND",
+}
+
+# The subset of REQUIRED_REASON_CLASS_FOR_TRANSITION that targets
+# ENVIRONMENT_INELIGIBLE ("non-INELIGIBLE -> INELIGIBLE"): these additionally
+# require an exact nonempty source_ref describing the reviewed applicability
+# witness (redesign doc §6.E).
+NON_INELIGIBLE_TO_INELIGIBLE_PAIRS = frozenset(
+    {
+        pair
+        for pair in REQUIRED_REASON_CLASS_FOR_TRANSITION
+        if pair[1] == "ENVIRONMENT_INELIGIBLE"
+    }
+)
+
+
+def _check_reason_class_matches_matrix(row: dict[str, Any]) -> None:
+    """Raise AssertionError unless ``row``'s reason_class is exactly the one
+    required for its (from_v6_outcome, to_v7_outcome) pair. Shared by the
+    real-ledger integrity test and the synthetic negative-probe tests so
+    both exercise the identical validation path."""
+
+    pair = (row["from_v6_outcome"], row["to_v7_outcome"])
+    category = _classify_pair(*pair)
+    assert category == "ALLOWED_WITH_LEDGER", (row.get("fixture_id"), category)
+    required = REQUIRED_REASON_CLASS_FOR_TRANSITION[pair]
+    assert row["reason_class"] == required, (
+        row.get("fixture_id"),
+        pair,
+        "got",
+        row["reason_class"],
+        "required",
+        required,
+    )
+
+
+def _classify_pair(from_outcome: str, to_outcome: str) -> str:
+    """Classify one (from_v6_outcome, to_v7_outcome) pair into exactly one
+    G7 category. Every one of the 20 differing pairs over ALL_OUTCOMES must
+    land in exactly one category -- see
+    test_every_differing_outcome_pair_is_classified."""
+
+    if from_outcome == to_outcome:
+        return "SAME"
+    if (from_outcome, to_outcome) in ABSOLUTE_FORBIDDEN_PAIRS:
+        return "ABSOLUTE_FORBIDDEN"
+    if (from_outcome, to_outcome) in CONTRACT_ONLY_PAIRS:
+        return "CONTRACT_ONLY"
+    if (from_outcome, to_outcome) in NOT_AUTHORIZED_PAIRS:
+        return "NOT_AUTHORIZED"
+    if (from_outcome, to_outcome) in REQUIRED_REASON_CLASS_FOR_TRANSITION:
+        return "ALLOWED_WITH_LEDGER"
+    return "UNCLASSIFIED"
 
 # The six witnesses the S0.1 task requires to be materialized: the latest
 # stop-triggering four plus the two model-derived witnesses E1/E3. A typo or
@@ -341,19 +430,24 @@ def test_migration_ledger_from_outcome_matches_frozen_oracle(
         assert row["from_v6_outcome"] == fixture["expected_v6_result"]["outcome"]
 
 
-def test_migration_ledger_to_outcome_matches_intended_v7_result(
+def test_migration_ledger_to_outcome_matches_intended_v7_outcome(
     migration_rows: list[dict[str, Any]], corpus_by_id: dict[str, dict[str, Any]]
 ) -> None:
     for row in migration_rows:
         fixture = corpus_by_id[row["fixture_id"]]
-        assert row["to_v7_outcome"] == fixture["intended_v7_result"]["outcome"]
+        assert row["to_v7_outcome"] == fixture["intended_v7_outcome"]
 
 
 def test_migration_required_agrees_with_actual_difference(
     corpus_rows: list[dict[str, Any]],
 ) -> None:
+    """G7 migration semantics are outcome-to-outcome only: a fixture whose
+    ``intended_v7_outcome`` equals its frozen v6 outcome needs no migration,
+    regardless of any (undesigned, non-authoritative) reason-string detail
+    inside ``expected_v6_result``."""
+
     for row in corpus_rows:
-        differs = row["expected_v6_result"] != row["intended_v7_result"]
+        differs = row["expected_v6_result"]["outcome"] != row["intended_v7_outcome"]
         assert row["migration_required"] == differs, row["fixture_id"]
 
 
@@ -363,18 +457,18 @@ def test_every_differing_fixture_has_exactly_one_ledger_row(
     differing_ids = {
         row["fixture_id"]
         for row in corpus_rows
-        if row["expected_v6_result"] != row["intended_v7_result"]
+        if row["expected_v6_result"]["outcome"] != row["intended_v7_outcome"]
     }
     ledgered_ids = {row["fixture_id"] for row in migration_rows}
     assert differing_ids == ledgered_ids
 
 
-def test_no_ledger_row_for_identical_result(
+def test_no_ledger_row_for_identical_outcome(
     corpus_rows: list[dict[str, Any]], migration_rows: list[dict[str, Any]]
 ) -> None:
     ledgered_ids = {row["fixture_id"] for row in migration_rows}
     for row in corpus_rows:
-        if row["expected_v6_result"] == row["intended_v7_result"]:
+        if row["expected_v6_result"]["outcome"] == row["intended_v7_outcome"]:
             assert row["fixture_id"] not in ledgered_ids
 
 
@@ -383,6 +477,90 @@ def test_migration_ledger_reason_classes_are_allowed(
 ) -> None:
     for row in migration_rows:
         assert row["reason_class"] in ALLOWED_REASON_CLASSES, row["fixture_id"]
+
+
+def test_migration_ledger_reason_class_matches_the_cell_specific_matrix(
+    migration_rows: list[dict[str, Any]],
+) -> None:
+    """Membership in ALLOWED_REASON_CLASSES is not sufficient: each pair has
+    exactly one required reason_class (redesign doc §6.E), e.g. GAP -> PASS
+    must be V6_INTERVAL_POLLUTION, never V6_UNSOUND."""
+
+    for row in migration_rows:
+        _check_reason_class_matches_matrix(row)
+
+
+def test_non_ineligible_to_ineligible_rows_carry_a_source_ref(
+    migration_rows: list[dict[str, Any]],
+) -> None:
+    for row in migration_rows:
+        pair = (row["from_v6_outcome"], row["to_v7_outcome"])
+        if pair in NON_INELIGIBLE_TO_INELIGIBLE_PAIRS:
+            assert row["reason_class"] == "V6_UNSOUND"
+            assert isinstance(row["source_ref"], str) and row["source_ref"].strip()
+
+
+@pytest.mark.parametrize(
+    ("from_outcome", "to_outcome", "wrong_reason_class"),
+    [
+        ("B_S1_GAP_DETECTED", "ANALYZER_PASS_TESTED_INTERLEAVING", "V6_UNSOUND"),
+        ("ANALYZER_PASS_TESTED_INTERLEAVING", "HARNESS_INCOMPLETE", "V6_INTERVAL_POLLUTION"),
+        (
+            "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS",
+            "B_S1_GAP_DETECTED",
+            "V6_INTERVAL_POLLUTION",
+        ),
+    ],
+)
+def test_correct_pair_with_wrong_reason_class_is_rejected(
+    from_outcome: str, to_outcome: str, wrong_reason_class: str
+) -> None:
+    """A ledger row with the *correct* outcome pair but the *wrong*
+    reason_class must be rejected by the cell-specific matrix, even though
+    both outcomes and the reason_class are each individually valid values.
+    This exercises the exact same validation function the real ledger rows
+    are checked with, so weakening that matrix would fail this test."""
+
+    pair = (from_outcome, to_outcome)
+    assert _classify_pair(*pair) == "ALLOWED_WITH_LEDGER"
+    assert wrong_reason_class in ALLOWED_REASON_CLASSES
+    assert wrong_reason_class != REQUIRED_REASON_CLASS_FOR_TRANSITION[pair]
+    synthetic_row = {
+        "fixture_id": "synthetic-wrong-reason-class-probe",
+        "from_v6_outcome": from_outcome,
+        "to_v7_outcome": to_outcome,
+        "reason_class": wrong_reason_class,
+    }
+    with pytest.raises(AssertionError):
+        _check_reason_class_matches_matrix(synthetic_row)
+
+
+def test_every_differing_outcome_pair_is_classified(
+) -> None:
+    """Every (from, to) pair over ALL_OUTCOMES with from != to must land in
+    exactly one G7 category -- SAME is excluded by construction, so this
+    covers ABSOLUTE_FORBIDDEN, CONTRACT_ONLY, NOT_AUTHORIZED, and
+    ALLOWED_WITH_LEDGER. None may be UNCLASSIFIED, and none may belong to
+    more than one category."""
+
+    seen_pairs: dict[tuple[str, str], str] = {}
+    for from_outcome in ALL_OUTCOMES:
+        for to_outcome in ALL_OUTCOMES:
+            if from_outcome == to_outcome:
+                continue
+            pair = (from_outcome, to_outcome)
+            category = _classify_pair(*pair)
+            assert category != "UNCLASSIFIED", pair
+            seen_pairs[pair] = category
+    categories = [
+        ABSOLUTE_FORBIDDEN_PAIRS,
+        CONTRACT_ONLY_PAIRS,
+        NOT_AUTHORIZED_PAIRS,
+        frozenset(REQUIRED_REASON_CLASS_FOR_TRANSITION),
+    ]
+    for pair in seen_pairs:
+        membership_count = sum(1 for group in categories if pair in group)
+        assert membership_count == 1, pair
 
 
 def test_migration_ledger_rows_are_exact_single_fixture_bindings(

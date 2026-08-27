@@ -316,10 +316,13 @@ boundaries apply instead:
     Also corrected the over-broad S0.0 G7 rule (§6.E) after S0.1 corpus
     materialization surfaced the contradiction it caused.
 
-  After S0.1's commit, **S0's content is complete on this branch, but PR A
-  has not yet been created or merged.** Nothing in S0.0 or S0.1 implies PR A
-  exists yet, and neither implies CI has run green for this content — that
-  is PR A's merge-readiness evidence, gathered when PR A is actually opened.
+  Draft PR A — **PR #53, "Research: rebuild Family B #13 authority core"**
+  (base `main`, head `research/family-b-13-authority-core-redesign`) — was
+  opened at S0.0 and stays **draft** while S0/S1/... are developed and
+  reviewed on this branch. After S0.1's commit, **S0's content is present on
+  Draft PR #53; PR #53 remains draft and not merged.** Neither S0.0 nor
+  S0.1 implies CI has run green for this content, or that PR #53 has been
+  marked ready for review — those are separate, later steps.
 - **S1 / PR B** (next, not started): pure primitive parsers, parser-vector
   differential proof.
 - **S2–S6 / PR C**: dormant v7 authority core. No real experiment. No
@@ -359,7 +362,7 @@ This checkpoint:
 ## 11. What remains unresolved after this checkpoint
 
 Unchanged from the frozen status in §4, plus the v7 authority-core work
-itself: PR A has not yet been created or merged (§9); the actual
+itself: Draft PR #53 remains draft and unmerged (§9); the actual
 pure-primitive parsers (S1), the dormant v7 authority core (S2–S6), and the
 explicit cutover review (S7) are none of them started by this checkpoint.
 B-S1 remains a plausible, precisely falsifiable Phase-S candidate, not a
