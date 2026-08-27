@@ -325,28 +325,41 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
     asset-validation tests (`tests/test_blocker_b_family_b_13_s0_assets.py`).
     Also corrected the over-broad S0.0 G7 rule (§6.E) after S0.1 corpus
     materialization surfaced the contradiction it caused.
-- **S1** (current stage) — pure primitive parsers
-  (`scripts/research/family_b_13_primitives.py`), a declarative parser-vector
-  corpus (`tests/fixtures/research/family_b_13/parser_vectors.json`), and
-  their differential proof against the frozen v6 oracle
+- **S1** (`1d26b2216c01f2100f3dab703746ce503d10eaf0`) — pure primitive
+  parsers (`scripts/research/family_b_13_primitives.py`), a declarative
+  parser-vector corpus
+  (`tests/fixtures/research/family_b_13/parser_vectors.json`), and their
+  differential proof against the frozen v6 oracle
   (`tests/test_blocker_b_family_b_13_s1_primitives.py`). S1 builds only
   sealed-bytes-to-typed-primitive parsing; it does not implement, and must
-  not be read as implementing, any part of the v7 authority core (§5) —
+  not be read as implementing, any part of the v7 authority core (§5).
+  Includes a corrective review that tightened inotify raw-mask sealed-value
+  typing to compose the frozen contract exactly (`bool`/negative/non-int
+  fails closed identically to frozen v6), removed the semantic
+  inotify-mask-to-observer-gap-reason mapping (`watch_gap_reasons`) as
+  out-of-scope classification (reclassified `AUTHORITY_OR_CLASSIFICATION`,
+  deferred to S2+), and removed an unproven, vector-less path-composition
+  export (`task_bucket_path`), keeping only the bucket-identifier lexical
+  check the S1 vectors actually prove.
+- **S2** (current stage) — the first v7 authority-core foundation stage:
+  typed structural records, `PhysicalPos`, `ParticipantLifetime`, and
+  `ParticipantTable`
+  (`scripts/research/family_b_13_v7/physical.py`,`records.py`,
+  `participants.py`; `tests/test_blocker_b_family_b_13_s2_lifetimes.py`).
+  S2 answers only "what structurally exists in the sealed record history" —
+  physical stream order, a harness process's own lifecycle boundaries, and
+  pure fact queries against that lifetime. `ParticipantTable` construction
+  depends on typed harness lifecycle records alone: no ground truth, no
+  observer records, no manifest T0/T1/phase/interval context. S2 does not
+  implement, and must not be read as implementing, any part of `admit()`,
+  the observer ledger, `(ORIGIN x LEVEL)` state, `ChronologySpec`/
+  `PhaseSpec`, `IntegrityFinding`/`ObservationFinding`,
+  `CaptureValidity`/`T1Result`, or any analyzer-outcome projection —
   **IMPLEMENTED / AWAITING INDEPENDENT REVIEW**, not accepted, until that
-  review actually occurs. A subsequent S1 corrective review tightened the
-  parser boundary: inotify raw-mask decoding now composes the frozen
-  sealed-value contract exactly (nonnegative-integer typing before bit
-  decoding, so a `bool`/negative/non-int raw mask fails closed identically
-  to frozen v6, not just a valid-int one); the semantic
-  inotify-mask-to-observer-gap-reason mapping (`watch_gap_reasons`) was
-  removed from S1 as out-of-scope classification, not syntax decoding, and
-  reclassified `AUTHORITY_OR_CLASSIFICATION`, deferred to S2+; and an
-  unproven, vector-less path-composition export (`task_bucket_path`) was
-  removed, keeping only the bucket-identifier lexical check the S1 vectors
-  actually prove.
-- **S2–S6** (future, not started): dormant v7 authority core, each stage its
-  own independently SHA-gated/reviewed commit boundary on this same Draft
-  PR #53. No real experiment. No production authority.
+  review actually occurs.
+- **S3–S6** (future, not started): the remaining dormant v7 authority-core
+  stages, each its own independently SHA-gated/reviewed commit boundary on
+  this same Draft PR #53. No real experiment. No production authority.
 - **S7** (future, not started): explicit authority cutover, on this same
   Draft PR #53.
 
@@ -384,8 +397,11 @@ This checkpoint:
 
 Unchanged from the frozen status in §4, plus the v7 authority-core work
 itself: Draft PR #53 remains draft and unmerged (§9). S1's pure primitive
-parsers are implemented and awaiting independent review, not accepted; the
-dormant v7 authority core (S2–S6) and the explicit cutover review (S7)
-remain not started. B-S1 remains a plausible, precisely falsifiable Phase-S
-candidate, not a proven mechanism (Research #2B, §19). No experiment result
-exists to promote or demote that status.
+parsers are accepted (`1d26b2216c01f2100f3dab703746ce503d10eaf0`); S2's
+typed structural records/`PhysicalPos`/`ParticipantLifetime`/
+`ParticipantTable` foundation is implemented and awaiting independent
+review, not accepted; the remaining dormant v7 authority core (S3–S6) and
+the explicit cutover review (S7) remain not started. B-S1 remains a
+plausible, precisely falsifiable Phase-S candidate, not a proven mechanism
+(Research #2B, §19). No experiment result exists to promote or demote that
+status.
