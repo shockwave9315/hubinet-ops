@@ -26,7 +26,8 @@ import collections.abc
 import inspect
 import json
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Sequence
 
 import pytest
 
@@ -82,12 +83,64 @@ def _discover_python_modules(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
 
 
-# Every implementation module under the S2 package, discovered from the
+# Every implementation module under the v7 package, discovered from the
 # filesystem (never a hard-coded list of today's filenames -- see
-# _discover_python_modules above). Every package-wide architecture gate
-# below is parametrized over this same discovered set, so a future S3+
-# module added under this package automatically enters every one of them.
+# _discover_python_modules above).
+#
+# R1 correction (stage-scope vs. package-wide gates): an earlier pass
+# parametrized EVERY architecture gate below over this discovered set. That
+# was wrong for the subset of gates that only hold while S2 is the sole
+# implemented stage (no-authority-vocabulary, no-verdict-prefix,
+# stdlib/S1-only imports, S2's own relative-import allowlist, the
+# clock/manifest identifier gate) -- applying them package-wide would
+# permanently forbid the very vocabulary (``admit``, ``ChronologySpec``,
+# ``PhaseSpec``, ``observer_ledger``, ``manifest``, ...) and the
+# ``from .participants import ParticipantTable`` relative import the
+# accepted redesign (see
+# docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md
+# section 5/9) requires of S3+. Two disjoint scopes now exist:
+#
+#   V7_MODULE_PATHS  -- every discovered module. PERMANENT v7 package
+#                        invariants apply here and only here (frozen-oracle
+#                        import prohibition, designated-constructor
+#                        ownership, no-external-outcome-string,
+#                        no-production-import): these hold regardless of
+#                        which stage owns a module, so a not-yet-classified
+#                        future module is still bound by them.
+#
+#   S2_MODULE_PATHS  -- only the modules S2_OWNED_MODULE_FILENAMES
+#                        explicitly declares as S2's own. S2-STAGE-SCOPE
+#                        gates (vocabulary, verdict-prefixes, import
+#                        allowlist, relative-import allowlist, clock/
+#                        manifest identifiers) apply only here -- they say
+#                        nothing about what a correctly-classified later
+#                        stage may do.
+#
+# A module discovered on disk that is in neither classification is not
+# silently exempted from anything nor silently subjected to S2's rules --
+# see test_every_discovered_v7_module_is_explicitly_classified, which fails
+# loudly until a human makes that explicit ownership decision (S3's own
+# future test pass would add its filenames to a parallel declared set, the
+# same way this one declares S2's).
 V7_MODULE_PATHS = _discover_python_modules(V7_PACKAGE_DIR)
+
+S2_OWNED_MODULE_FILENAMES: frozenset[str] = frozenset(
+    {"__init__.py", "physical.py", "records.py", "participants.py"}
+)
+
+
+def _unclassified_modules(
+    discovered: Sequence[Path], owned_filenames: frozenset[str]
+) -> list[Path]:
+    """Every discovered module whose filename is not in an explicit
+    ownership set -- the shared fail-closed classification-gate logic, used
+    both by the real S2 gate below and by its hermetic proof against a
+    temporary package."""
+
+    return [p for p in discovered if p.name not in owned_filenames]
+
+
+S2_MODULE_PATHS = [p for p in V7_MODULE_PATHS if p.name in S2_OWNED_MODULE_FILENAMES]
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -495,6 +548,137 @@ def test_physical_stream_snapshot_is_immutable() -> None:
     snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, [{}])
     with pytest.raises(Exception):
         snapshot.records = ()  # type: ignore[misc]
+
+
+# --- R2 correction: snapshot content ownership (mutable-alias closure) ----
+
+
+def test_snapshot_physical_stream_content_survives_top_level_mutation() -> None:
+    """R2 correction, adversarial proof (point 1): mutating the caller's
+    original top-level mapping after ``snapshot_physical_stream`` returns
+    must not change the already-captured snapshot content."""
+
+    raw = [{"event": "process_start", "harness_sequence": 0, "monotonic_ns": 100}]
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw)
+
+    assert snapshot.records[0] is not raw[0]  # no shared alias
+    raw[0]["event"] = "process_crash"
+    raw[0]["harness_sequence"] = 999
+
+    assert snapshot.records[0]["event"] == "process_start"
+    assert snapshot.records[0]["harness_sequence"] == 0
+
+
+def test_snapshot_physical_stream_content_survives_nested_mutation() -> None:
+    """R2 correction, adversarial proof (point 2): mutating a NESTED
+    mapping/list reachable from the caller's original record after
+    ``snapshot_physical_stream`` returns must not change the snapshot's
+    content either -- a shallow ``tuple(records)`` alone would still share
+    every nested container by reference."""
+
+    raw = [
+        {
+            "event": "heartbeat",
+            "payload": {"nested_list": [1, 2, {"deep": "original"}]},
+        }
+    ]
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw)
+
+    # Mutate every nesting level of the ORIGINAL object after the snapshot
+    # was taken.
+    raw[0]["payload"]["nested_list"].append("tampered")
+    raw[0]["payload"]["nested_list"][2]["deep"] = "tampered"
+    raw[0]["payload"]["new_key"] = "tampered"
+
+    snapshot_payload = snapshot.records[0]["payload"]
+    assert snapshot_payload["nested_list"] == (1, 2, MappingProxyType({"deep": "original"}))
+    assert "new_key" not in snapshot_payload
+
+    # The snapshot's own nested containers are themselves immutable, not
+    # merely disconnected from the original -- closing the mutation path at
+    # every level, not only the top one.
+    with pytest.raises(TypeError):
+        snapshot_payload["new_key"] = "tampered"  # type: ignore[index]
+    with pytest.raises(AttributeError):
+        snapshot_payload["nested_list"].append("tampered")  # type: ignore[union-attr]
+
+
+def test_snapshot_physical_stream_positions_remain_paired_with_frozen_content() -> None:
+    """R2 correction, adversarial proof (point 3): physical positions stay
+    correctly paired with the content captured during the ORIGINAL single
+    observation, even after that content has been frozen and the caller's
+    own objects have since been mutated."""
+
+    raw = [
+        {"event": "process_start", "harness_sequence": 0},
+        {"event": "heartbeat", "harness_sequence": 1},
+        {"event": "process_stop", "harness_sequence": 2},
+    ]
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw)
+
+    for record in raw:
+        record["event"] = "tampered"
+
+    assert [r["event"] for r in snapshot.records] == [
+        "process_start",
+        "heartbeat",
+        "process_stop",
+    ]
+    assert [p.ordinal for p in snapshot.positions] == [1, 2, 3]
+    for record, pos in zip(snapshot.records, snapshot.positions):
+        assert pos.stream is StreamName.HARNESS_EVENTS
+        assert record["event"] != "tampered"
+
+
+def test_snapshot_physical_stream_still_observes_caller_sequence_exactly_once_after_freezing() -> None:
+    """R2 correction, adversarial proof (point 4): content-freezing must
+    not introduce a second observation of the caller's top-level
+    ``Sequence`` -- the exact property
+    test_snapshot_physical_stream_observes_caller_sequence_exactly_once
+    already proves for position derivation must keep holding once content
+    is frozen too."""
+
+    calls = {"n": 0}
+
+    class _CountingSequence(collections.abc.Sequence):
+        def __len__(self) -> int:
+            return 2
+
+        def __getitem__(self, index: int) -> dict:
+            return [{"event": "process_start"}, {"event": "process_stop"}][index]
+
+        def __iter__(self):
+            calls["n"] += 1
+            return iter([{"event": "process_start"}, {"event": "process_stop"}])
+
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, _CountingSequence())
+    assert calls["n"] == 1
+    assert [r["event"] for r in snapshot.records] == ["process_start", "process_stop"]
+
+
+def test_freeze_record_value_leaves_scalars_unchanged() -> None:
+    """S1 remains the sole scalar-syntax authority: freezing changes
+    container identity only, never a scalar's type or value."""
+
+    for scalar in ("text", 7, 7.5, True, False, None):
+        assert physical_module._freeze_record_value(scalar) is scalar or physical_module._freeze_record_value(scalar) == scalar
+
+
+def test_freeze_record_value_produces_independent_immutable_containers() -> None:
+    original = {"a": [1, {"b": 2}], "c": "text"}
+    frozen = physical_module._freeze_record_value(original)
+
+    assert isinstance(frozen, MappingProxyType)
+    assert isinstance(frozen["a"], tuple)
+    assert isinstance(frozen["a"][1], MappingProxyType)
+    assert frozen["a"][1]["b"] == 2
+    assert frozen["c"] == "text"
+
+    # Independent of the original: mutating the original after freezing
+    # must not reach the frozen value.
+    original["a"].append("tampered")
+    original["a"][1]["b"] = "tampered"
+    assert frozen["a"] == (1, MappingProxyType({"b": 2}))
 
 
 # --- Metamorphic gates (S2 task section 9) ---------------------------------
@@ -1478,7 +1662,7 @@ def test_participants_module_does_not_import_ground_truth_or_observer_parsers() 
     assert identifiers.isdisjoint(forbidden)
 
 
-@pytest.mark.parametrize("path", V7_MODULE_PATHS, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", S2_MODULE_PATHS, ids=lambda p: p.name)
 def test_v7_package_has_no_clock_contract_parser_or_context(path: Path) -> None:
     """S2 clock-domain boundary (section 6): the S2 package defines no
     clock_contract parser/validator/context anywhere -- checked at the
@@ -1486,9 +1670,13 @@ def test_v7_package_has_no_clock_contract_parser_or_context(path: Path) -> None:
     modules' own docstring prose (which legitimately *names*
     manifest.clock_contract while explaining that S2 depends on none of
     it) do not trip this gate. Proving/consuming manifest.clock_contract
-    remains future work for a later stage. Parametrized over the
-    dynamically-discovered V7_MODULE_PATHS (see _discover_python_modules)
-    so a future S3+ module automatically enters this gate too."""
+    is exactly what a later stage's own explicit clock-domain proof
+    requires -- an S2-STAGE-SCOPE restriction (R1 correction), not a
+    permanent v7 package invariant. Parametrized over S2_MODULE_PATHS
+    (declared S2 ownership, cross-checked against discovery -- see
+    test_every_discovered_v7_module_is_explicitly_classified), never over
+    the full discovered V7_MODULE_PATHS: a correctly-classified later stage
+    is exactly where this vocabulary is expected to appear."""
 
     identifiers = _code_identifiers(path.read_text(encoding="utf-8"))
     forbidden = {
@@ -1571,12 +1759,14 @@ EXTERNAL_OUTCOME_STRINGS = frozenset(
 )
 
 def test_v7_module_paths_matches_filesystem_exactly() -> None:
-    """The discovered set every package-wide gate below is parametrized
-    over must equal the Python implementation files actually present
-    under the package root -- not a hard-coded list that could silently
-    drift from the filesystem in either direction. Cross-checked against
-    an independent traversal method (``iterdir``, not ``rglob``) so this
-    isn't just re-asserting _discover_python_modules against itself."""
+    """The discovered set every PERMANENT package-wide gate below is
+    parametrized over (R1 correction: no longer every gate -- see
+    S2_MODULE_PATHS above for the disjoint S2-stage-scope set) must equal
+    the Python implementation files actually present under the package
+    root -- not a hard-coded list that could silently drift from the
+    filesystem in either direction. Cross-checked against an independent
+    traversal method (``iterdir``, not ``rglob``) so this isn't just
+    re-asserting _discover_python_modules against itself."""
 
     on_disk = {
         p for p in V7_PACKAGE_DIR.iterdir() if p.is_file() and p.suffix == ".py"
@@ -1594,6 +1784,164 @@ def test_v7_module_paths_matches_filesystem_exactly() -> None:
     }
 
 
+def test_every_discovered_v7_module_is_explicitly_classified() -> None:
+    """R1 correction, fail-closed classification gate (point 6): every
+    module V7_MODULE_PATHS discovers on disk today must be an explicitly
+    declared S2-owned module (S2_OWNED_MODULE_FILENAMES) -- a module that
+    is neither classified S2-owned nor recognized here is not silently
+    exempted from S2-stage-scope gates (which would wrongly let it dodge
+    S2's own rules while still masquerading as S2 code) nor silently
+    subjected to them (which would reintroduce the R1 defect for a real
+    future stage). It must instead fail this test loudly until a human
+    makes that explicit ownership decision -- for a real future stage, by
+    adding its filenames to a parallel declared set the same way this one
+    declares S2's, not by relaxing this one. See
+    test_unclassified_future_module_fails_the_classification_gate for the
+    hermetic proof of this same mechanism against a module that does not
+    exist anywhere in this repository."""
+
+    unclassified = _unclassified_modules(V7_MODULE_PATHS, S2_OWNED_MODULE_FILENAMES)
+    assert unclassified == [], [p.name for p in unclassified]
+    # Concrete, currently-true equality alongside the structural check
+    # above: today every discovered module is S2-owned (S3+ is not
+    # started), so the two sets coincide exactly.
+    assert S2_MODULE_PATHS == V7_MODULE_PATHS
+
+
+def test_unclassified_future_module_fails_the_classification_gate(tmp_path: Path) -> None:
+    """R1 correction hermetic proof (point 6): a module discovered under a
+    package that an ownership set does not recognize must fail the
+    classification gate loudly -- reusing the exact same
+    ``_unclassified_modules`` helper the real gate above uses, not a
+    reimplementation. Never a real tracked module anywhere in this
+    repository; a temporary directory only."""
+
+    fake_package = tmp_path / "family_b_13_v7_fake"
+    fake_package.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py"):
+        (fake_package / name).write_text("# stub\n", encoding="utf-8")
+    (fake_package / "mystery.py").write_text("# not yet classified\n", encoding="utf-8")
+
+    discovered = _discover_python_modules(fake_package)
+    fake_s2_owned = frozenset({"__init__.py", "physical.py", "records.py", "participants.py"})
+    unclassified = _unclassified_modules(discovered, fake_s2_owned)
+
+    assert {p.name for p in unclassified} == {"mystery.py"}
+    with pytest.raises(AssertionError):
+        assert unclassified == [], [p.name for p in unclassified]
+
+
+def test_hypothetical_future_stage_module_is_not_rejected_for_using_accepted_later_stage_vocabulary(
+    tmp_path: Path,
+) -> None:
+    """R1 correction hermetic proof (point 7): a hypothetical future-stage
+    module correctly classified as NOT S2-owned may legally use
+    accepted-design vocabulary an S2-stage-scope gate forbids for S2 itself
+    (``admit``, ``ChronologySpec``, ``PhaseSpec``) -- the S2-scope gates
+    are parametrized over S2_MODULE_PATHS only, so they never even run
+    against it. Never a real tracked module; a temporary directory only."""
+
+    fake_package = tmp_path / "family_b_13_v7_fake"
+    fake_package.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py"):
+        (fake_package / name).write_text("# stub\n", encoding="utf-8")
+
+    hypothetical_s3 = (
+        "from dataclasses import dataclass\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class ChronologySpec:\n"
+        "    t0_ns: int\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class PhaseSpec:\n"
+        "    name: str\n"
+        "\n"
+        "\n"
+        "def admit(spec: ChronologySpec) -> bool:\n"
+        "    return True\n"
+    )
+    (fake_package / "s3.py").write_text(hypothetical_s3, encoding="utf-8")
+
+    discovered = _discover_python_modules(fake_package)
+    fake_s2_owned = frozenset({"__init__.py", "physical.py", "records.py", "participants.py"})
+    fake_s2_paths = [p for p in discovered if p.name in fake_s2_owned]
+    fake_future_paths = _unclassified_modules(discovered, fake_s2_owned)
+    assert {p.name for p in fake_future_paths} == {"s3.py"}
+    assert (fake_package / "s3.py") not in fake_s2_paths
+
+    # Positive control: the vocabulary really is present (proving this
+    # test would have caught the R1 defect), it just belongs to the
+    # future-stage module the S2-scope gate never parametrizes over.
+    identifiers = _code_identifiers(hypothetical_s3)
+    assert identifiers & FORBIDDEN_AUTHORITY_IDENTIFIERS == {
+        "ChronologySpec",
+        "PhaseSpec",
+        "admit",
+    }
+    # The real S2-scope gate (test_v7_module_contains_no_authority_stage_vocabulary)
+    # is parametrized over S2_MODULE_PATHS -- fake_s2_paths's real-package
+    # analogue -- which this module is correctly excluded from, so it is
+    # never even collected as a test case against it.
+
+
+def test_hypothetical_future_stage_module_may_legally_consume_participant_table(
+    tmp_path: Path,
+) -> None:
+    """R1 correction hermetic proof (point 9): a hypothetical future-stage
+    module correctly classified as NOT S2-owned may legally
+    ``from .participants import ParticipantTable`` -- the accepted
+    redesign's own designed consumer past S2's STOP -- without being
+    rejected by S2's own relative-import allowlist, which is
+    S2_MODULE_PATHS-scoped only. Never a real tracked module; a temporary
+    directory only."""
+
+    fake_package = tmp_path / "family_b_13_v7_fake"
+    fake_package.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py"):
+        (fake_package / name).write_text("# stub\n", encoding="utf-8")
+
+    hypothetical_s3 = "from .participants import ParticipantTable\n"
+    (fake_package / "s3.py").write_text(hypothetical_s3, encoding="utf-8")
+
+    discovered = _discover_python_modules(fake_package)
+    fake_s2_owned = frozenset({"__init__.py", "physical.py", "records.py", "participants.py"})
+    fake_future_paths = _unclassified_modules(discovered, fake_s2_owned)
+    assert {p.name for p in fake_future_paths} == {"s3.py"}
+
+    tree = ast.parse(hypothetical_s3)
+    relative_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level > 0 and node.module
+    }
+    # Positive control: this really would fail the S2-scope relative-import
+    # allowlist (`{"physical", "records"}`) if that gate ran against it --
+    # proving this test would have caught the R1 defect.
+    assert relative_modules == {"participants"}
+    assert not relative_modules <= {"physical", "records"}
+    # But s3.py is not in fake_s2_owned, so the real
+    # test_v7_modules_relative_imports_stay_within_the_s2_package (scoped to
+    # S2_MODULE_PATHS) never parametrizes over it and never rejects this
+    # legal edge.
+
+
+def test_v7_module_contains_no_authority_stage_vocabulary_still_applies_to_s2_modules() -> None:
+    """R1 correction proof (point 8): the S2-stage-scope vocabulary gate
+    still genuinely binds S2 itself -- S2_MODULE_PATHS is nonempty and
+    equals the real S2 package's modules today, so
+    test_v7_module_contains_no_authority_stage_vocabulary is not vacuously
+    parametrized over an empty list."""
+
+    assert S2_MODULE_PATHS
+    assert {p.name for p in S2_MODULE_PATHS} == S2_OWNED_MODULE_FILENAMES
+    for path in S2_MODULE_PATHS:
+        identifiers = _code_identifiers(path.read_text(encoding="utf-8"))
+        assert identifiers.isdisjoint(FORBIDDEN_AUTHORITY_IDENTIFIERS), path.name
+
+
 def test_discovery_finds_a_hypothetical_future_module_without_editing_a_hard_coded_list(
     tmp_path: Path,
 ) -> None:
@@ -1604,11 +1952,26 @@ def test_discovery_finds_a_hypothetical_future_module_without_editing_a_hard_cod
     tracked ``s3.py`` under the repository -- and confirms the SAME
     discovery function (``_discover_python_modules``) every real gate
     above uses finds a hypothetical future module automatically, with no
-    edit to any hard-coded list. It then feeds that hypothetical module's
-    source through the SAME gate-logic helpers the real gates use
-    (``_code_identifiers``, ``_direct_call_names``,
-    ``FORBIDDEN_AUTHORITY_IDENTIFIERS``) to confirm the underlying
-    mechanism -- not merely discovery -- would flag its violations too."""
+    edit to any hard-coded list.
+
+    R1 correction note (point 5): this hypothetical module is a genuinely
+    BAD future module by any classification -- it directly calls
+    ``ParticipantLifetime``/``ParticipantTable`` from outside their owning
+    module and imports the frozen oracle, both PERMANENT v7 package
+    invariants that bind every discovered module regardless of S2/future-
+    stage ownership. It also happens to use vocabulary
+    (``admit``/``observer_ledger``/``authority_level``) an S2-STAGE-SCOPE
+    gate would additionally flag if this module were classified S2-owned;
+    that half of the check below is retained as a positive control on the
+    shared ``_code_identifiers``/``FORBIDDEN_AUTHORITY_IDENTIFIERS`` helper
+    logic itself (proving it can still detect the vocabulary), not as a
+    claim that the real parametrized
+    ``test_v7_module_contains_no_authority_stage_vocabulary`` pytest gate
+    runs against this specific module -- it wouldn't, once correctly
+    classified as a future stage. See
+    test_hypothetical_future_stage_module_is_not_rejected_for_using_accepted_later_stage_vocabulary
+    for a module that uses that same vocabulary LEGALLY, and is correctly
+    not flagged."""
 
     fake_package = tmp_path / "family_b_13_v7_fake"
     fake_package.mkdir()
@@ -1693,15 +2056,35 @@ def _code_identifiers(source: str) -> set[str]:
     return identifiers
 
 
-@pytest.mark.parametrize("path", V7_MODULE_PATHS, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", S2_MODULE_PATHS, ids=lambda p: p.name)
 def test_v7_module_contains_no_authority_stage_vocabulary(path: Path) -> None:
+    """S2-STAGE-SCOPE gate (R1 correction): parametrized over
+    S2_MODULE_PATHS, never the full discovered V7_MODULE_PATHS -- a
+    correctly-classified later stage is the accepted-design *owner* of
+    ``admit``/``ChronologySpec``/``PhaseSpec``/``observer_ledger``/etc (see
+    docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md
+    section 5), so this must never reject it merely for existing under this
+    package. See
+    test_hypothetical_future_stage_module_is_not_rejected_for_using_accepted_later_stage_vocabulary
+    for the hermetic proof, and
+    test_v7_module_contains_no_authority_stage_vocabulary_still_applies_to_s2_modules
+    for proof S2 itself remains bound."""
+
     identifiers = _code_identifiers(path.read_text(encoding="utf-8"))
     present = identifiers & FORBIDDEN_AUTHORITY_IDENTIFIERS
     assert present == set(), (path.name, present)
 
 
-@pytest.mark.parametrize("path", V7_MODULE_PATHS, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", S2_MODULE_PATHS, ids=lambda p: p.name)
 def test_v7_module_public_names_avoid_verdict_like_prefixes(path: Path) -> None:
+    """S2-STAGE-SCOPE gate (R1 correction): S2 itself may not export a
+    ``classify_``/``verdict_``/``outcome_``/``promote_``/``admit_`` name
+    (S2 stops before any such decision), but this says nothing about a
+    correctly-classified later stage, which is the accepted design's own
+    owner of exactly that vocabulary (section 5.18, centralized
+    classification precedence). Parametrized over S2_MODULE_PATHS, not
+    V7_MODULE_PATHS."""
+
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -1728,8 +2111,15 @@ def _imported_module_roots(source: str) -> set[str]:
     return roots
 
 
-@pytest.mark.parametrize("path", V7_MODULE_PATHS, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", S2_MODULE_PATHS, ids=lambda p: p.name)
 def test_v7_modules_import_only_stdlib_and_s1(path: Path) -> None:
+    """S2-STAGE-SCOPE gate (R1 correction): S2's own import surface is
+    pinned to stdlib + S1 because S2 has no legitimate reason to reach
+    wider. A later stage importing, say, ``json`` for its own sealed-value
+    handling is an S3+ design decision, not something this S2-only gate has
+    any basis to forbid. Parametrized over S2_MODULE_PATHS, not
+    V7_MODULE_PATHS."""
+
     source = path.read_text(encoding="utf-8")
     roots = _imported_module_roots(source)
     allowed = {
@@ -1744,11 +2134,21 @@ def test_v7_modules_import_only_stdlib_and_s1(path: Path) -> None:
     assert roots <= allowed, roots - allowed
 
 
-@pytest.mark.parametrize("path", V7_MODULE_PATHS, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", S2_MODULE_PATHS, ids=lambda p: p.name)
 def test_v7_modules_relative_imports_stay_within_the_s2_package(path: Path) -> None:
-    """The only intra-package (relative) imports allowed are of S2's own
-    ``physical``/``records`` submodules -- confirms the one-way
-    physical -> records -> participants layering has no back-reference."""
+    """The only intra-package (relative) imports S2's OWN modules may make
+    are of S2's own ``physical``/``records`` submodules -- confirms the
+    one-way physical -> records -> participants layering has no
+    back-reference. S2-STAGE-SCOPE gate (R1 correction): parametrized over
+    S2_MODULE_PATHS, not the full discovered V7_MODULE_PATHS -- a
+    correctly-classified later stage importing
+    ``from .participants import ParticipantTable`` to consume S2's own
+    output is exactly the accepted layering (the redesign checkpoint's own
+    ``sealed values -> ... -> ParticipantTable -> STOP`` diagram; S3+ is the
+    designed consumer past that STOP), never a violation this gate has any
+    basis to reject. See
+    test_hypothetical_future_stage_module_may_legally_consume_participant_table
+    for the hermetic proof."""
 
     tree = ast.parse(path.read_text(encoding="utf-8"))
     relative_modules = {
@@ -1761,6 +2161,12 @@ def test_v7_modules_relative_imports_stay_within_the_s2_package(path: Path) -> N
 
 @pytest.mark.parametrize("path", V7_MODULE_PATHS, ids=lambda p: p.name)
 def test_v7_modules_do_not_import_the_frozen_oracle(path: Path) -> None:
+    """PERMANENT v7 package invariant (unaffected by the R1 correction):
+    parametrized over the full discovered V7_MODULE_PATHS, not
+    S2_MODULE_PATHS -- G10's byte-frozen oracle prohibition holds
+    regardless of which stage owns a module, so a not-yet-classified future
+    module is bound by it too."""
+
     targets = set()
     tree = ast.parse(path.read_text(encoding="utf-8"))
     for node in ast.walk(tree):
@@ -1815,9 +2221,10 @@ def test_designated_constructors_are_not_called_outside_their_owning_module(
     derivation path (the designated builder proves derivation from a
     one-time frozen/snapshotted observation; a public constructor proves
     only local structural well-formedness), never an authority token.
-    Parametrized over the dynamically-discovered V7_MODULE_PATHS (see
-    _discover_python_modules), so a future S3+ module added under this
-    same package automatically enters this gate too -- see
+    PERMANENT v7 package invariant (unaffected by the R1 correction):
+    parametrized over the dynamically-discovered V7_MODULE_PATHS (see
+    _discover_python_modules), not S2_MODULE_PATHS, so a future S3+ module
+    added under this same package automatically enters this gate too -- see
     test_discovery_finds_a_hypothetical_future_module_without_editing_a_hard_coded_list
     for a hermetic proof of that claim. Applies to the implementation
     package, not this test module, which exercises the type-boundary

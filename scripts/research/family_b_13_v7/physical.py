@@ -48,6 +48,35 @@ is traversed EXACTLY ONCE, and every provenance-bearing fact derived from it
 (here, physical position) is paired with the content from that SAME
 traversal -- never a second, independent observation of the original
 object.
+
+Snapshot content ownership (R1/R2 corrective pass, local stop-patching rule)
+---------------------------------------------------------------------------
+A subsequent compliance audit found the single-traversal guarantee above
+incomplete: ``tuple(records)`` freezes the snapshot's own *arity and order*,
+but each element it held remained the SAME mutable dict/list object the
+caller still held a reference to. A caller mutating its own original record
+mapping (or a nested mapping/list inside it) after
+:func:`snapshot_physical_stream` returned could therefore silently change
+what the already-returned :class:`PhysicalStreamSnapshot` represents --
+exactly the ownership violation "immutable snapshot" was meant to rule out,
+even though no second *observation* of the caller's ``Sequence`` itself ever
+occurred. :func:`snapshot_physical_stream` now additionally converts each
+record's own content, recursively, into an immutable JSON-compatible
+equivalent (:func:`_freeze_record_value`) as part of that SAME single
+traversal -- a ``dict`` becomes a fresh, independent
+:class:`types.MappingProxyType` (never a view over the caller's own dict),
+a ``list`` becomes a fresh ``tuple``, and every other value (already
+immutable, or opaque to this layer) passes through unchanged. This changes
+container *identity* only, never scalar type or value -- S1 remains the
+sole scalar-syntax authority. Once content crosses this boundary, no
+caller-owned mutable object remains authoritative for it. This guarantee is
+:func:`snapshot_physical_stream`'s alone: :class:`PhysicalStreamSnapshot`'s
+own ``__post_init__`` continues to prove only local structural
+well-formedness (types, lengths, sequential ordinals) for *any* construction
+path -- the same well-formed-vs-established distinction already documented
+on that class below -- so a test exercising that type's own invariants by
+direct construction may still pass a live, unfrozen dict, exactly as it
+could before this pass.
 """
 
 from __future__ import annotations
@@ -55,6 +84,7 @@ from __future__ import annotations
 import collections.abc
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import Sequence
 
 __all__ = [
@@ -149,6 +179,14 @@ class PhysicalStreamSnapshot:
     *content* be derived from two different histories -- silently dropping
     or shuffling sealed evidence a downstream validator never sees.
 
+    When built by :func:`snapshot_physical_stream` (the normal path),
+    ``records``' own elements are additionally content-immutable -- see the
+    module docstring's "Snapshot content ownership" section -- so mutating
+    the caller's original mapping/list after the call returns cannot change
+    what this snapshot represents, closing the same ownership boundary for
+    record *content* that this type already closed for record *arity and
+    order*.
+
     Preferably constructed only by :func:`snapshot_physical_stream` (see the
     package-wide architecture gate enforcing this in the S2 test file), but
     ``__post_init__`` defends this type's own internal consistency for
@@ -157,10 +195,13 @@ class PhysicalStreamSnapshot:
     ``stream``; and position ``i`` (1-based) must have ``ordinal == i``,
     sequential and gapless, matching its paired record's index. This proves
     only that the value is internally self-consistent, never that
-    ``records`` is the genuine result of one real external observation --
-    that provenance is :func:`snapshot_physical_stream`'s job alone (the
-    same well-formed-constructor-vs-established-derivation distinction as
-    :class:`~scripts.research.family_b_13_v7.participants.ParticipantLifetime`).
+    ``records`` is the genuine result of one real external observation, and
+    never that its elements are content-immutable -- both are
+    :func:`snapshot_physical_stream`'s job alone (the same
+    well-formed-constructor-vs-established-derivation distinction as
+    :class:`~scripts.research.family_b_13_v7.participants.ParticipantLifetime`);
+    a direct construction may still pass a live, caller-owned dict, exactly
+    as before this pass.
     """
 
     stream: StreamName
@@ -190,6 +231,30 @@ class PhysicalStreamSnapshot:
                 )
 
 
+def _freeze_record_value(value: object) -> object:
+    """Recursively convert one JSON-compatible value into an immutable
+    equivalent, so that later mutation of a caller-owned mutable container
+    cannot change what a :class:`PhysicalStreamSnapshot` already captured
+    (see the module docstring's "Snapshot content ownership" section).
+
+    A ``dict`` becomes a fresh :class:`types.MappingProxyType` wrapping a
+    fresh ``dict`` of recursively-frozen values -- never a proxy VIEW over
+    the caller's own dict object, which would still silently reflect the
+    caller's later mutation of it. A ``list`` becomes a ``tuple`` of
+    recursively-frozen elements. Every other value (``str``, ``int``,
+    ``float``, ``bool``, ``None``, or anything already immutable, or
+    opaque data this layer has no basis to interpret) is returned
+    unchanged. This changes container *identity* only -- never a scalar's
+    type or value -- so it neither reimplements nor overrides any S1
+    scalar-syntax check."""
+
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_record_value(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_record_value(item) for item in value)
+    return value
+
+
 def snapshot_physical_stream(
     stream: StreamName, records: Sequence[object]
 ) -> PhysicalStreamSnapshot:
@@ -200,13 +265,21 @@ def snapshot_physical_stream(
     real :class:`collections.abc.Sequence` (never a one-shot iterator/
     generator, and never an arbitrary ``Sized``+``Iterable`` container that
     only happens to define ``__len__``/``__iter__`` without actually being a
-    ``Sequence``), then traverses ``records`` EXACTLY ONCE --
-    ``tuple(records)`` -- into an immutable snapshot. Every
-    :class:`PhysicalPos` this function returns is derived from ``len()`` of
-    THAT SAME snapshot tuple, never from the original ``records`` argument
-    again, so the returned :class:`PhysicalStreamSnapshot`'s
-    ``records``/``positions`` are truthfully paired: position ``i`` really
-    does describe ``snapshot.records[i - 1]``'s physical order in the one
+    ``Sequence``), then traverses ``records`` EXACTLY ONCE -- via one
+    generator expression consumed by ``tuple(...)``, one call to
+    ``iter(records)`` -- into an immutable snapshot. Each element observed
+    during that same traversal is additionally passed through
+    :func:`_freeze_record_value`, so the snapshot's own records are content-
+    immutable, not merely arity/order-immutable: this is still exactly one
+    observation of the caller's top-level ``Sequence``; only each element's
+    OWN nested structure is (independently, recursively) copied into an
+    immutable equivalent as part of materializing that one observation, not
+    a second observation of ``records`` itself. Every :class:`PhysicalPos`
+    this function returns is derived from ``len()`` of THAT SAME snapshot
+    tuple, never from the original ``records`` argument again, so the
+    returned :class:`PhysicalStreamSnapshot`'s ``records``/``positions`` are
+    truthfully paired: position ``i`` really does describe
+    ``snapshot.records[i - 1]``'s physical order and content in the one
     observation that was actually made.
 
     A caller that needs records paired with their physical positions (e.g.
@@ -229,7 +302,12 @@ def snapshot_physical_stream(
     if not isinstance(records, collections.abc.Sequence):
         raise TypeError("snapshot_physical_stream requires a Sequence")
 
-    snapshot_records: tuple[object, ...] = tuple(records)  # exactly one traversal
+    # Exactly one traversal of `records` (one `iter(records)` call, fully
+    # consumed): freezing each element's own nested content happens inline,
+    # not as a separate pass over `records` itself.
+    snapshot_records: tuple[object, ...] = tuple(
+        _freeze_record_value(record) for record in records
+    )
     positions = tuple(
         PhysicalPos(stream=stream, ordinal=index)
         for index in range(1, len(snapshot_records) + 1)
