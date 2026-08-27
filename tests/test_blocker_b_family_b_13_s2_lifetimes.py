@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import collections.abc
+from collections import UserDict
 import inspect
 import json
 from pathlib import Path
@@ -338,16 +339,16 @@ def test_snapshot_physical_stream_observes_caller_sequence_exactly_once() -> Non
         def __len__(self) -> int:
             return 3
 
-        def __getitem__(self, index: int) -> str:
-            return ("a", "b", "c")[index]
+        def __getitem__(self, index: int) -> dict[str, str]:
+            return ({"value": "a"}, {"value": "b"}, {"value": "c"})[index]
 
         def __iter__(self):
             calls["n"] += 1
-            return iter(("a", "b", "c"))
+            return iter(({"value": "a"}, {"value": "b"}, {"value": "c"}))
 
     snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, _CountingSequence())
     assert calls["n"] == 1
-    assert snapshot.records == ("a", "b", "c")
+    assert [record["value"] for record in snapshot.records] == ["a", "b", "c"]
     assert [p.ordinal for p in snapshot.positions] == [1, 2, 3]
 
 
@@ -695,12 +696,117 @@ def test_snapshot_physical_stream_still_observes_caller_sequence_exactly_once_af
     assert [r["event"] for r in snapshot.records] == ["process_start", "process_stop"]
 
 
+@pytest.mark.parametrize(
+    "record",
+    [
+        MappingProxyType(_harness_dict("process_start", 0, 100)),
+        UserDict(_harness_dict("process_start", 0, 100)),
+        type("CustomDict", (dict,), {})(_harness_dict("process_start", 0, 100)),
+    ],
+    ids=["mapping-proxy", "user-dict", "dict-subclass"],
+)
+def test_decode_harness_stream_rejects_non_plain_top_level_mappings(
+    record: object,
+) -> None:
+    """The raw-record boundary accepts the exact S1 object type, not the
+    broader Mapping ABC previously advertised."""
+
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        decode_harness_stream([record])  # type: ignore[list-item]
+    assert str(exc_info.value) == "harness_record_not_decoded_json"
+
+
+class _CustomMapping(collections.abc.Mapping):
+    def __init__(self, values: dict[str, object]) -> None:
+        self._values = values
+
+    def __getitem__(self, key: str) -> object:
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+class _CustomSequence(collections.abc.Sequence):
+    def __init__(self, values: list[object]) -> None:
+        self._values = values
+
+    def __getitem__(self, index: int) -> object:
+        return self._values[index]
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+@pytest.mark.parametrize(
+    "nested",
+    [
+        MappingProxyType({"value": "original"}),
+        UserDict({"value": "original"}),
+        _CustomMapping({"value": "original"}),
+    ],
+    ids=["mapping-proxy", "user-dict", "custom-mapping"],
+)
+def test_decode_harness_stream_rejects_non_plain_nested_mappings(nested: object) -> None:
+    record = _harness_dict("process_start", 0, 100)
+    record["payload"] = nested
+
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        decode_harness_stream([record])
+    assert str(exc_info.value) == "harness_record_not_decoded_json"
+
+
+@pytest.mark.parametrize(
+    "nested",
+    [
+        ("not", "a", "json", "array"),
+        _CustomSequence(["not", "a", "json", "array"]),
+        type("CustomList", (list,), {})(["not", "a", "json", "array"]),
+        object(),
+    ],
+    ids=["tuple", "custom-sequence", "list-subclass", "opaque-object"],
+)
+def test_decode_harness_stream_rejects_non_json_nested_values(nested: object) -> None:
+    record = _harness_dict("process_start", 0, 100)
+    record["payload"] = nested
+
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        decode_harness_stream([record])
+    assert str(exc_info.value) == "harness_record_not_decoded_json"
+
+
+def test_decode_jsonl_line_output_still_decodes_as_a_normal_harness_stream() -> None:
+    """The exact S1 decoded-JSON producer remains the supported S2 path."""
+
+    raw_records: list[dict[str, Any]] = []
+    for raw_line in (
+        b'{"event":"process_start","harness_sequence":0,"monotonic_ns":100,'
+        b'"process_identity":"synthetic-reader:1","payload":{"items":[1,true,null]}}\n',
+        b'{"event":"process_stop","harness_sequence":1,"monotonic_ns":200,'
+        b'"process_identity":"synthetic-reader:1"}\n',
+    ):
+        decoded = decode_jsonl_line(raw_line)
+        assert decoded.ok
+        assert type(decoded.value) is dict
+        raw_records.append(decoded.value)
+
+    headers = decode_harness_stream(raw_records)
+    assert [header.kind for header in headers] == [
+        HarnessEventKind.PROCESS_START,
+        HarnessEventKind.PROCESS_STOP,
+    ]
+
+
 def test_freeze_record_value_leaves_scalars_unchanged() -> None:
     """S1 remains the sole scalar-syntax authority: freezing changes
     container identity only, never a scalar's type or value."""
 
     for scalar in ("text", 7, 7.5, True, False, None):
-        assert physical_module._freeze_record_value(scalar) is scalar or physical_module._freeze_record_value(scalar) == scalar
+        frozen = physical_module._freeze_record_value(scalar)
+        assert frozen is scalar or frozen == scalar
 
 
 def test_freeze_record_value_produces_independent_immutable_containers() -> None:

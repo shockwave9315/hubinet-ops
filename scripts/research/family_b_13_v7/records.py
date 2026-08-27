@@ -1,6 +1,6 @@
 """Typed structural record/header decoding (S2 foundation layer).
 
-Decodes a sealed decoded JSON Mapping (already produced by an S1 primitive
+Decodes a sealed decoded JSON object (already produced by an S1 primitive
 such as ``decode_jsonl_line``) into a small, immutable, typed structural
 value. This module answers only "what structurally exists in this sealed
 record" -- never "does this count as evidence," "is this authoritative," or
@@ -33,7 +33,12 @@ from scripts.research.family_b_13_primitives import (
     require_nonnegative_int,
 )
 
-from .physical import PhysicalPos, StreamName, snapshot_physical_stream
+from .physical import (
+    PhysicalPos,
+    StreamName,
+    _freeze_record_value,
+    snapshot_physical_stream,
+)
 
 __all__ = [
     "HarnessEventKind",
@@ -123,21 +128,10 @@ def _require_field(raw: Mapping[str, Any], field: str) -> Any:
     return raw[field]
 
 
-def decode_harness_record_header(
+def _decode_frozen_harness_record_header(
     raw: Mapping[str, Any], pos: PhysicalPos
 ) -> HarnessRecordHeader:
-    """Decode one sealed ``harness-events.jsonl`` record's structural
-    header. ``raw`` is a plain decoded JSON object (e.g. from an S1
-    ``decode_jsonl_line`` success value); ``pos`` is that record's already
-    independently-assigned :class:`PhysicalPos` (never derived here).
-
-    Only the ``event`` string -> :class:`HarnessEventKind` translation
-    happens here (it needs the raw string to distinguish "not a string at
-    all" from "a string outside the closed vocabulary"); every other
-    structural invariant -- including on ``pos`` itself -- is enforced once,
-    by :meth:`HarnessRecordHeader.__post_init__`, for every construction
-    path.
-    """
+    """Decode one already-validated and frozen raw record."""
 
     event_value = _require_field(raw, "event")
     event_result = require_nonempty_string(event_value)
@@ -157,7 +151,39 @@ def decode_harness_record_header(
     )
 
 
-def decode_harness_stream(raw_records: Sequence[Mapping[str, Any]]) -> list[HarnessRecordHeader]:
+def decode_harness_record_header(
+    raw: dict[str, Any], pos: PhysicalPos
+) -> HarnessRecordHeader:
+    """Decode one sealed ``harness-events.jsonl`` record's structural
+    header. ``raw`` must be a plain decoded JSON object (e.g. from an S1
+    ``decode_jsonl_line`` success value); ``pos`` is that record's already
+    independently-assigned :class:`PhysicalPos` (never derived here).
+
+    Only the ``event`` string -> :class:`HarnessEventKind` translation
+    happens here (it needs the raw string to distinguish "not a string at
+    all" from "a string outside the closed vocabulary"); every other
+    structural invariant -- including on ``pos`` itself -- is enforced once,
+    by :meth:`HarnessRecordHeader.__post_init__`, for every construction
+    path. The entire raw graph must use the exact decoded-JSON container
+    family: plain ``dict``/``list`` containers and JSON scalars.
+    Mapping/Sequence substitutes and opaque/custom values fail closed even
+    in fields this S2 structural projection does not otherwise retain.
+    """
+
+    if type(raw) is not dict:
+        raise StructuralDecodeError("record_input_not_plain_dict")
+    try:
+        frozen = _freeze_record_value(raw)
+    except TypeError as exc:
+        raise StructuralDecodeError("record_value_not_decoded_json") from exc
+    if not isinstance(frozen, Mapping):  # pragma: no cover - guaranteed above
+        raise StructuralDecodeError("record_input_not_plain_dict")
+    return _decode_frozen_harness_record_header(frozen, pos)
+
+
+def decode_harness_stream(
+    raw_records: Sequence[dict[str, Any]],
+) -> list[HarnessRecordHeader]:
     """Decode a full ``harness-events.jsonl`` stream (already JSON-decoded,
     e.g. one dict per line from S1) into typed headers, one per physical
     record, in the stream's own physical order.
@@ -188,8 +214,11 @@ def decode_harness_stream(raw_records: Sequence[Mapping[str, Any]]) -> list[Harn
     if not isinstance(raw_records, collections.abc.Sequence):
         raise StructuralDecodeError("harness_stream_input_not_sequence")
 
-    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw_records)
+    try:
+        snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw_records)
+    except TypeError as exc:
+        raise StructuralDecodeError("harness_record_not_decoded_json") from exc
     return [
-        decode_harness_record_header(raw, pos)
+        _decode_frozen_harness_record_header(raw, pos)
         for raw, pos in zip(snapshot.records, snapshot.positions)
     ]

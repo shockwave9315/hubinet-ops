@@ -60,16 +60,20 @@ mapping (or a nested mapping/list inside it) after
 what the already-returned :class:`PhysicalStreamSnapshot` represents --
 exactly the ownership violation "immutable snapshot" was meant to rule out,
 even though no second *observation* of the caller's ``Sequence`` itself ever
-occurred. :func:`snapshot_physical_stream` now additionally converts each
-record's own content, recursively, into an immutable JSON-compatible
-equivalent (:func:`_freeze_record_value`) as part of that SAME single
-traversal -- a ``dict`` becomes a fresh, independent
+occurred. :func:`snapshot_physical_stream` now additionally requires each
+top-level record to be a plain ``dict`` and every nested value to belong to
+the exact decoded-JSON family S1 produces: plain ``dict``/``list``
+containers plus ``str``/``int``/``float``/``bool``/``None`` scalars. Each
+accepted record is recursively converted into an immutable equivalent
+(:func:`_freeze_record_value`) as part of that SAME single traversal -- a
+``dict`` becomes a fresh, independent
 :class:`types.MappingProxyType` (never a view over the caller's own dict),
-a ``list`` becomes a fresh ``tuple``, and every other value (already
-immutable, or opaque to this layer) passes through unchanged. This changes
-container *identity* only, never scalar type or value -- S1 remains the
-sole scalar-syntax authority. Once content crosses this boundary, no
-caller-owned mutable object remains authoritative for it. This guarantee is
+a ``list`` becomes a fresh ``tuple``, accepted scalars pass through
+unchanged, and every Mapping/Sequence substitute or opaque/custom object is
+rejected. This changes container *identity* only, never scalar type or value
+-- S1 remains the sole scalar-syntax authority. Once content crosses this
+boundary, no caller-owned mutable object remains authoritative for it. This
+guarantee is
 :func:`snapshot_physical_stream`'s alone: :class:`PhysicalStreamSnapshot`'s
 own ``__post_init__`` continues to prove only local structural
 well-formedness (types, lengths, sequential ordinals) for *any* construction
@@ -232,31 +236,41 @@ class PhysicalStreamSnapshot:
 
 
 def _freeze_record_value(value: object) -> object:
-    """Recursively convert one JSON-compatible value into an immutable
-    equivalent, so that later mutation of a caller-owned mutable container
+    """Validate and freeze one exact S1-decoded JSON value.
+
+    Recursively convert one accepted value into an immutable equivalent,
+    so that later mutation of a caller-owned mutable container
     cannot change what a :class:`PhysicalStreamSnapshot` already captured
     (see the module docstring's "Snapshot content ownership" section).
 
-    A ``dict`` becomes a fresh :class:`types.MappingProxyType` wrapping a
+    Only the exact container/scalar family produced by S1's accepted
+    ``json.loads`` path is admitted: plain ``dict``/``list`` containers,
+    exact ``str``/``int``/``float``/``bool`` scalars, and ``None``. A
+    ``dict`` becomes a fresh :class:`types.MappingProxyType` wrapping a
     fresh ``dict`` of recursively-frozen values -- never a proxy VIEW over
     the caller's own dict object, which would still silently reflect the
     caller's later mutation of it. A ``list`` becomes a ``tuple`` of
-    recursively-frozen elements. Every other value (``str``, ``int``,
-    ``float``, ``bool``, ``None``, or anything already immutable, or
-    opaque data this layer has no basis to interpret) is returned
-    unchanged. This changes container *identity* only -- never a scalar's
-    type or value -- so it neither reimplements nor overrides any S1
-    scalar-syntax check."""
+    recursively-frozen elements. Mapping/Sequence substitutes, subclasses,
+    tuples, and opaque/custom objects are rejected rather than retained by
+    alias. Accepted scalar syntax and values are not reinterpreted here, so
+    S1 remains their sole syntax authority."""
 
-    if isinstance(value, dict):
-        return MappingProxyType({key: _freeze_record_value(item) for key, item in value.items()})
-    if isinstance(value, list):
+    if type(value) is dict:
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("raw JSON object keys must be plain str values")
+            frozen[key] = _freeze_record_value(item)
+        return MappingProxyType(frozen)
+    if type(value) is list:
         return tuple(_freeze_record_value(item) for item in value)
-    return value
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    raise TypeError("raw record value is outside the exact decoded-JSON domain")
 
 
 def snapshot_physical_stream(
-    stream: StreamName, records: Sequence[object]
+    stream: StreamName, records: Sequence[dict[str, object]]
 ) -> PhysicalStreamSnapshot:
     """The sole point where an external caller-supplied ``Sequence`` of
     sealed records is observed to derive :class:`PhysicalPos` values.
@@ -269,12 +283,14 @@ def snapshot_physical_stream(
     generator expression consumed by ``tuple(...)``, one call to
     ``iter(records)`` -- into an immutable snapshot. Each element observed
     during that same traversal is additionally passed through
-    :func:`_freeze_record_value`, so the snapshot's own records are content-
-    immutable, not merely arity/order-immutable: this is still exactly one
-    observation of the caller's top-level ``Sequence``; only each element's
-    OWN nested structure is (independently, recursively) copied into an
-    immutable equivalent as part of materializing that one observation, not
-    a second observation of ``records`` itself. Every :class:`PhysicalPos`
+    :func:`_freeze_record_value`, after requiring that each observed
+    top-level value is a plain ``dict``, so the snapshot's own records are
+    content-immutable, not merely arity/order-immutable: this is still
+    exactly one observation of the caller's top-level ``Sequence``; only
+    each element's OWN nested structure is (independently, recursively)
+    copied into an immutable equivalent as part of materializing that one
+    observation, not a second observation of ``records`` itself. Every
+    :class:`PhysicalPos`
     this function returns is derived from ``len()`` of THAT SAME snapshot
     tuple, never from the original ``records`` argument again, so the
     returned :class:`PhysicalStreamSnapshot`'s ``records``/``positions`` are
@@ -305,8 +321,13 @@ def snapshot_physical_stream(
     # Exactly one traversal of `records` (one `iter(records)` call, fully
     # consumed): freezing each element's own nested content happens inline,
     # not as a separate pass over `records` itself.
+    def freeze_record(record: object) -> object:
+        if type(record) is not dict:
+            raise TypeError("snapshot_physical_stream requires plain dict records")
+        return _freeze_record_value(record)
+
     snapshot_records: tuple[object, ...] = tuple(
-        _freeze_record_value(record) for record in records
+        freeze_record(record) for record in records
     )
     positions = tuple(
         PhysicalPos(stream=stream, ordinal=index)
