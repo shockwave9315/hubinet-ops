@@ -138,7 +138,7 @@ An analyzer result distinguishes:
 
 None of these means `trusted`, `secure`, or “Family B solved.”
 
-## 4. Capture format: `family-b-13-capture-v5`
+## 4. Capture format: `family-b-13-capture-v6`
 
 One run is one explicit directory. JSON files are UTF-8; JSONL files contain
 one object per line. Every load-bearing monotonic timestamp is nanoseconds from
@@ -146,10 +146,13 @@ one explicitly bound Linux `CLOCK_MONOTONIC` domain. UTC wall-clock strings are
 provenance only and are never a precision-ordering substitute. No field is
 described as a stock PVE cursor or generation number.
 
-Capture/protocol/analyzer revision v5 replaces v4 because mandatory sealed
-`disposable_pve` applicability provenance changes whether the same manifest can
-reach PASS; this is a semantic contract change, not a cosmetic edit. No
-authorized real Experiment #13 captures require backward compatibility.
+Capture/protocol/analyzer revision v6 replaces v5 because mandatory scan-entry
+evidence changes whether a previously passing sealed capture can reach PASS.
+The analyzer now derives scan UPIDs from sealed directory-entry transcriptions
+instead of trusting a declared normalized projection. This is a semantic
+evidence-contract change, not a cosmetic edit. The live generator operation
+vocabulary is also deliberately closed and empty. No authorized real
+Experiment #13 captures require backward compatibility.
 
 ```text
 run-<uuid>/
@@ -206,7 +209,7 @@ real run uses `disposable_pve` only after the fixture contract is satisfied. A
 missing, incomplete, mismatched, or unapproved generator contract makes a
 disposable-PVE capture `ENVIRONMENT_INELIGIBLE`.
 
-For `fixture_kind=disposable_pve`, capture v5 uses this research-local sealed
+For `fixture_kind=disposable_pve`, capture v6 uses this research-local sealed
 representation for the live applicability facts required by section 13:
 
 ```json
@@ -272,7 +275,7 @@ completeness.
 For `disposable_pve`, `boot_id`, `clock_contract.clock_domain_id`, and
 `clock_contract.time_namespace_id` must also be nonempty, non-placeholder live
 provenance before their existing equality/domain bindings are useful. Capture
-v5 does not add a guessed boot-ID syntax or a self-asserted verification flag;
+v6 does not add a guessed boot-ID syntax or a self-asserted verification flag;
 the later collector derives these values from the approved fixture. Synthetic
 captures may retain explicit synthetic or placeholder identifiers because they
 do not claim live PVE applicability.
@@ -391,7 +394,7 @@ API, exact, and harness timestamps to that same domain. Synthetic captures use a
 synthetic shared domain. A `disposable_pve` capture requires a verified single
 shared domain on the same fixture node, boot, and relevant time namespace.
 
-Missing or mismatched clock evidence is `ENVIRONMENT_INELIGIBLE`. v5 does not
+Missing or mismatched clock evidence is `ENVIRONMENT_INELIGIBLE`. v6 does not
 invent offsets between unrelated monotonic clocks and does not use UTC to
 repair them. A generator on another host or time namespace is ineligible until
 a separately reviewed cross-clock correlation protocol exists. The analyzer
@@ -560,13 +563,15 @@ Each request record carries `generator_sequence`, `request_id`, `operation`,
 `expected_task_id`, `outcome`, checked `within_generator_window`, and
 `generator_window_relation` (`inside_generator_window`,
 `after_generator_window`, or
-`ambiguous`). The analyzer derives this experiment-generator relation from
+`ambiguous`). The field must be a string before membership in that closed enum
+is tested; objects, arrays, integers, and null are `HARNESS_INCOMPLETE` with
+`ground_truth_generator_window_relation_invalid`. The analyzer derives this experiment-generator relation from
 request timestamps and the explicit generator-window bounds, which must fit
 inside the quiescent-T0/candidate-close envelope. Matching numeric boundaries
 does not merge their semantics. `after_generator_window` is outside the
 generator window even if the record claims otherwise; `ambiguous` is
 outside the positive set and latches a gap. The record separately carries
-`b_s1_body_start_membership=unknown` and `body_start_evidence=null`. This v5
+`b_s1_body_start_membership=unknown` and `body_start_evidence=null`. This v6
 protocol rejects a capture that tries to derive worker-body membership from
 request timing or self-assert it. The finalizer carries
 `last_sequence`, `total_operations`, generator identity, timestamps, and
@@ -614,7 +619,7 @@ grace interval. A candidate-interval record carrying an in-window generated
 UPID is incomplete when its event time is at or before that UPID's independent
 `request_start`; temporal eligibility requires a strictly later event.
 
-The Linux UAPI `struct inotify_event.mask` integer is the primitive. The v5
+The Linux UAPI `struct inotify_event.mask` integer is the primitive. The v6
 analyzer pins the numeric definitions from Linux
 `include/uapi/linux/inotify.h`: `IN_ACCESS=0x00000001`,
 `IN_MODIFY=0x00000002`, `IN_ATTRIB=0x00000004`,
@@ -638,7 +643,7 @@ omission or disagreement is incomplete. Pre-T0 lazy-bucket creation records
 likewise carry and decode `raw_mask`; their textual create/move plus
 `IN_ISDIR` names are cross-checks only.
 
-`raw_order` is a harness-assigned, one-based capture-order sequence. The v5
+`raw_order` is a harness-assigned, one-based capture-order sequence. The v6
 analyzer requires JSONL physical order, `watcher_sequence`, and `raw_order` to
 be the same contiguous `1..N` sequence. This checks that sealed records retain
 the observer's raw capture order; it is not a kernel cursor, an inotify
@@ -660,9 +665,11 @@ installation sequence and its root-event sequence. Shared CLOCK_MONOTONIC time
 must satisfy root event `<=` installation `<=` rescan start `<=` rescan end;
 the explicit references and lifecycle physical order provide causality when
 clock values are equal. The rescan is complete only with no unreadable or
-malformed entries, and every exact UPID it reports must source-derive to that
-same bucket. This immediate rescan reconciles files created between the root
-event and child-watch installation.
+malformed entries. It carries exactly one v6 `bucket_observations` item whose
+bucket equals the record bucket; every entry-derived UPID must source-derive to
+that same bucket. This immediate rescan reconciles files created between the
+root event and child-watch installation. `PRE_T0_BUCKET_RESCAN` uses the same
+one-observation cardinality and exact record-bucket binding.
 
 Every post-T0 root bucket-creation event must have exactly one complete
 install/rescan handoff, and no lifecycle record may invent one without its
@@ -683,19 +690,74 @@ without a larger generation model.
 
 ### 4.6 Scan rounds
 
-`scan-rounds.jsonl` records a contiguous monotonic `scan_sequence`, `round_id`,
-start/end times, the sorted exact normalized UPID set, bucket set,
-per-directory and per-file stat/inode metadata, unreadable and malformed
-entries, `complete`, and `watch_drained_through_sequence`. A capture-supplied
-consistency marker is annotation only; the analyzer computes the terminal
-fixed point. Positive close requires two consecutive terminal complete scans
-with identical normalized sets and no relevant watcher sequence left undrained.
-Its bucket set is observation only, not installation authority: each bucket
-must be covered by the sealed pre-T0 or dynamic lifecycle, and every reported
-UPID must source-derive to a bucket in that scan.
+All four scan-bearing planes -- `scan-rounds.jsonl`, `PRE_T0_BASELINE`,
+`PRE_T0_BUCKET_RESCAN`, and `POST_T0_BUCKET_RESCAN` -- use this one v6 shape;
+the v5 shape-only `stat_metadata` field is removed:
+
+```json
+{
+  "bucket_observations": [
+    {
+      "bucket": "a",
+      "path": "/sealed/task/root/a",
+      "stat": {"device": 1, "inode": 1001},
+      "entries": [
+        {
+          "entry_name": "UPID:node:00000001:00000001:0000000a:type:id:user:",
+          "stat": {"device": 1, "inode": 2001}
+        }
+      ]
+    }
+  ],
+  "exact_normalized_upids": [
+    "UPID:node:00000001:00000001:0000000a:type:id:user:"
+  ],
+  "bucket_set": ["a"]
+}
+```
+
+`bucket_observations[].entries[].entry_name` is the sealed collector
+transcription of the directory entry as observed. The offline analyzer parses
+the normalized UPID from that exact string and derives the completeness-bearing
+UPID set only from those names. `exact_normalized_upids` and `bucket_set` are
+duplicate-free declared projections/cross-checks; neither can add authority.
+Changing a projection without changing the observations is
+`HARNESS_INCOMPLETE`.
+
+The common validator requires an observations array; object records; unique
+source-valid hex buckets; exact analyzer-derived bucket paths; nonnegative
+device and positive inode integers; entry arrays of objects; unique nonempty
+exact normalized UPID filenames; matching UPID-derived buckets; matching entry
+and directory devices; unique derived UPIDs across the record; and exact set
+equality for both declared projections. Rescans additionally require exactly
+one observation matching the record bucket. Validation completes before any
+derived set can enter request-start chronology, eligible normalized sets,
+`scan_known`, `lifecycle_known`, `baseline_upids`, fixed-point logic, or exact
+scan provenance. A foreign name in `entries` is incomplete; a foreign or
+unparseable entry honestly acknowledged through `malformed_entries` retains
+GAP semantics.
+
+`scan-rounds.jsonl` also records a contiguous monotonic `scan_sequence`,
+`round_id`, start/end times, unreadable and malformed entries, `complete`, and
+`watch_drained_through_sequence`. A capture-supplied consistency marker is
+annotation only; the analyzer computes the terminal fixed point. Positive close
+requires two consecutive terminal complete scans with identical derived sets
+and no relevant watcher sequence left undrained. Each observed bucket must be
+covered by sealed pre-T0 or dynamic lifecycle evidence.
 Watcher sequence/time and each scan's drain watermark are cross-checked so a
 scan cannot claim an event that occurred after it ended. A disappearing exact
-log or unreadable/malformed/inconsistent scan latches a gap.
+log or unreadable/malformed/inconsistent scan latches a gap. If the same
+derived UPID occurs in consecutive post-T0 global scans with a different entry
+`(device, inode)`, the analyzer latches
+`exact_log_identity_changed_between_scans`. Directory inode change alone has no
+new rule.
+
+Directory and entry stat metadata is corroboration and internal-consistency
+evidence only. The scan is non-atomic. The sealed `entry_name` transcription is
+not independent filesystem proof or raw-evidence-grade evidence: a collector
+capable of omitting or fabricating an entry can still omit or fabricate the
+transcription and its metadata. This unavoidable collector limitation remains
+explicit and unchanged by v6.
 
 A scan containing an in-window generated UPID is causally eligible for that
 UPID only when `scan_end_monotonic_ns > request_start_monotonic_ns`. Its start
@@ -731,7 +793,7 @@ surface before first rotation, not silently omitted. The analyzer recomputes
 SHA-256 from the captured UTF-8 `raw_evidence`; hashes support comparison but
 do not prove an atomic snapshot.
 
-For v5, `raw_evidence` is exactly the captured UTF-8 file content, with no
+For v6, `raw_evidence` is exactly the captured UTF-8 file content, with no
 JSON wrapper, prefix, annotation, or collector-generated record envelope. The
 only accepted serializations are deliberately narrow and source-specific:
 
@@ -754,7 +816,7 @@ declared `normalized_upids` array is parsed separately, must contain no
 duplicates, and must equal the raw-derived set exactly. Only the raw-derived
 set enters enumeration, exact-UPID discovery provenance, T0 active quiescence,
 handoff, or rotation obligations. This format intentionally replaces the
-earlier ambiguous raw-content description; no real v5 capture exists and no
+earlier ambiguous raw-content description; no real v6 capture exists and no
 backward compatibility is required.
 
 A surface containing an in-window generated UPID is causally eligible for that
@@ -809,11 +871,27 @@ reconciled.
 
 ### 4.10 Harness events
 
-`harness-events.jsonl` records a contiguous `harness_sequence`, observer
-process identity, process start/stop/crash, sequenced heartbeats, capture
-finalization, analyzer version, scheduled interleavings, injected synthetic
-overflow, dropped-input simulation, and explicit gap signals. Every event must
-bind to `reader_context.process_identity`. The analyzer considers every
+`harness-events.jsonl` records a contiguous `harness_sequence` and uses one
+closed event vocabulary only:
+
+```text
+process_start
+process_stop
+process_crash
+heartbeat
+capture_finalized
+analyzer_version
+gap_signal
+scheduled_interleaving
+active_archive_handoff
+index_rotation
+```
+
+Every record is checked against this set during ingest; an unknown value is
+`HARNESS_INCOMPLETE` with `unknown_harness_event:<event>`. No decorative event
+kind, injected-overflow label, or dropped-input-simulation label is admitted.
+Observer-loss evidence uses the existing raw watch and `gap_signal` contracts.
+Every event must bind to `reader_context.process_identity`. The analyzer considers every
 heartbeat in the open interval, requires the last pre-close heartbeat to be
 healthy and fresh, and enforces start <= T0 < close < finalization <= stop. An
 explicit structurally valid unhealthy or stale heartbeat is observer-health
@@ -838,7 +916,7 @@ received a UPID during the experiment-generator window. It does not observe
 the worker operation body's first instruction. Request start/end, UPID
 starttime, exact-log creation, and fork time are therefore not relabeled as
 B-S1 body start. No safe body-start proof is implemented or accepted by this
-v5 analyzer.
+v6 analyzer.
 
 A future generator must satisfy all of these conditions:
 
@@ -862,8 +940,19 @@ A future generator must satisfy all of these conditions:
 
 The synthetic suite uses the explicit `synthetic` approval state. A future
 `disposable_pve` run requires a separately approved complete contract for that
-exact fixture/subrun. This schema does not approve `stopall` or any other live
-operation; the candidate selection below remains conditional.
+exact fixture/subrun. V6 closes the operation vocabulary as follows:
+
+```text
+SYNTHETIC_OPERATIONS = {synthetic_task_generator}
+APPROVED_LIVE_OPERATIONS = {}
+```
+
+A synthetic contract must name `synthetic_task_generator`. Its returned
+synthetic UPIDs retain the pinned task type/id/node/owner semantics needed by
+the offline analyzer tests; the operation label itself grants no PVE action. A
+`disposable_pve` contract cannot currently name any eligible operation. In
+particular `stopall`, `qmstart`, `startall`, `vncshell`, and the former
+`stopall_reserved_absent_vmid` label are not live authorization.
 
 Durable here means flushed to the approved fixture evidence volume and copied
 into the sealed capture; it is not a claim of crash-proof distributed commit.
@@ -888,13 +977,17 @@ stock candidate identified for task-record pressure because it reaches the
 same RESTEnvironment worker/log/archive machinery without intended guest or
 storage mutation.
 
-Selection is therefore **CONDITIONAL CANDIDATE / NOT YET AUTHORIZED**:
-`stopall` with a fixture-reserved absent slot, `force-stop=false`, and
-independent pre-request and post-request proof that the slot remained absent.
-Any observed guest, unexpected task type, or inability to make that absence
-check independent and race-safe stops the run. Fixture review may reject the
-candidate and leave generator selection open; no fallback generator is
-preapproved.
+The research result is deliberately dormant:
+
+```text
+stopall = CONDITIONAL CANDIDATE / NOT AUTHORIZED / NOT USABLE BY V6
+```
+
+A future design would need a separately reviewed absence-guard schema binding
+a fixture-reserved absent slot, `force-stop=false`, and independent pre-request
+and post-request proof that the slot remained absent. V6 does not implement or
+activate that proposed schema. `APPROVED_LIVE_OPERATIONS` remains empty; there
+is no fallback generator.
 
 ## 7. Index-rotation volume estimate
 
@@ -1069,7 +1162,7 @@ exercise a collector.
 | 6 | Offset omission repeated without independent evidence | generator-window enumeration witness, not pagination healing |
 | 7 | Task absent from temporary active/archive surfaces but legitimately scan/watch-discovered and retained in exact evidence | Not missing merely due to surface handoff |
 | 8 | Known exact log deleted by cleanup | `B_S1_GAP_DETECTED` |
-| 9 | Unknown pre-enumeration log deleted without watch signal | generator-window enumeration witness |
+| 9 | Generator-returned UPID absent from every observer plane with no valid gap signal | generator-window enumeration witness |
 | 10 | Surviving overlap anchors around a removed unknown intermediate log | generator-window enumeration witness; anchors do not clean the run |
 | 11 | Valid heartbeat explicitly unhealthy/stale before close | `B_S1_GAP_DETECTED` |
 | 11a | Missing/malformed/wrong-identity heartbeat evidence or incoherent process lifecycle | `HARNESS_INCOMPLETE` |
@@ -1094,7 +1187,7 @@ body-start membership, baseline-only positive subruns, and baseline-only
 handoff/race targets. Positive controls exercise historical finalized baseline
 quiescence, computed drained equal scans, and raw-evidence-backed
 13B/13C/13D/13F/13G obligations.
-v5 regressions additionally reject post-T0 or missing root-watch establishment,
+v6 regressions additionally reject post-T0 or missing root-watch establishment,
 different pre-T0 baseline scan sets, an undrained pre-T0 event, and a lazy
 bucket without its child watch/rescan. A positive lazy-bucket control reaches a
 drained watch-first pre-T0 fixed point. Clock-contract regressions reject a
@@ -1134,6 +1227,19 @@ fail closed on a missing watcher referenced by a nonzero watermark, enforce
 raw watch capture order, and distinguish valid stale-heartbeat GAP from missing
 heartbeat-stream incompleteness.
 
+V6 regressions additionally close the harness vocabulary (including the
+`gap_singal` typo and arbitrary unknown kinds), require the generator-window
+relation to be a string before enum membership, keep the live operation set
+empty, and migrate synthetic captures to `synthetic_task_generator`. The scan
+matrix repeats projection-mismatch anti-bypass tests on all four scan-bearing
+planes and covers wrong bucket/path, foreign and duplicate entries, duplicate
+bucket observations, stat/device/inode failures, bucket projection mismatch,
+and rescan cardinality. GAP controls retain acknowledged malformed/unreadable
+loss and disappearance, add changed entry identity across consecutive post-T0
+scans, and preserve stable-identity, empty-bucket, populated four-plane, and
+multi-bucket positive controls. Stale v5 manifest, seal, and analyzer-version
+bindings are rejected under the v6 revisions.
+
 ## 11. Exact false-clean witness boundary
 
 A B-S1-killing witness must preserve all of the following in the sealed run:
@@ -1157,7 +1263,7 @@ A B-S1-killing witness must preserve all of the following in the sealed run:
    evidence used for those facts.
 
 Requirement 6 is not available from the #13 operation initiator or current
-source evidence. This v5 analyzer therefore cannot emit a precise B-S1-killing
+source evidence. This v6 analyzer therefore cannot emit a precise B-S1-killing
 witness or exact-scope B-S1 rejection from request timing alone.
 
 Instead it preserves the UPID, generator sequence, derived generator-window
@@ -1177,7 +1283,7 @@ authenticates itself. The offline analyzer recomputes such projections from the
 sealed primitive whenever this harness defines a raw representation and
 requires exact raw/normalized agreement. A disagreement is
 `HARNESS_INCOMPLETE`, before the record can enter a PASS-bearing set or GAP
-obligation. In v5 this rule applies directly to local surface raw bytes versus
+obligation. In v6 this rule applies directly to local surface raw bytes versus
 `normalized_upids`, watch `raw_mask` versus textual `mask` and
 `queue_overflow`, watch filename versus `normalized_upid`, and exact status/log
 raw text versus parsed terminal fields.
@@ -1212,7 +1318,7 @@ name a fixture satisfying all of these requirements:
   integration, private workload, or real workload data;
 - exact target package/source and loaded-code baseline from section 2;
 - known and recorded kernel, boot ID, mount topology, filesystem, storage
-  backend, clock, and retention configuration, sealed using section 4.1's v5
+  backend, clock, and retention configuration, sealed using section 4.1's v6
   representation and derived by the later collector/preflight from the actual
   approved fixture rather than operator-entered eligibility assertions;
 - console/recovery access independent of the experiment;
@@ -1261,7 +1367,7 @@ intentionally provides no executable generator or destructive cleanup command.
    ineligible. The later reviewed collector/preflight must derive this evidence
    from the fixture environment, never accept operator-entered identifiers as
    proof.
-3. Record the v5 filesystem identity/type, mount IDs/root/mount point, storage
+3. Record the v6 filesystem identity/type, mount IDs/root/mount point, storage
    backend kind/identifier, task-tree contract, archive rotation threshold, and
    exact-log cleanup scheduler/schedule; record disk/log free-space and set
    numeric stop thresholds before starting any process.
@@ -1290,7 +1396,7 @@ intentionally provides no executable generator or destructive cleanup command.
    the immutable original.
 10. Move a copy to an offline workstation and invoke only the explicit
     `analyze --capture-dir` command from section 4.
-11. Record exactly one research-local classification and its evidence. A v5
+11. Record exactly one research-local classification and its evidence. A v6
     generator-window enumeration witness stops the sequence but does not claim
     an exact body-start-scoped B-S1 consequence; PASS only enumerates that
     interleaving.
@@ -1460,8 +1566,9 @@ The following remain open and require a separate reviewed approval:
 - name and validate a disposable fixture satisfying section 13;
 - prove installed and loaded-code context, kernel/filesystem/mount topology, and
   reader permissions for that fixture;
-- accept or reject the conditional absent-slot `stopall` generator, including
-  a race-safe absence guard and exact request method;
+- design and separately review the dormant conditional absent-slot `stopall`
+  schema, including a race-safe absence guard and exact request method; until
+  then it remains not authorized and unusable by v6;
 - select non-production identifiers only after fixture allocation;
 - implement and review a fixture-only collector/generator; this PR intentionally
   implements neither;

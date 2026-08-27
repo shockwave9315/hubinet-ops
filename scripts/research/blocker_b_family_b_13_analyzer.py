@@ -18,14 +18,32 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_REVISION = "family-b-13-capture-v5"
-PROTOCOL_REVISION = "family-b-13-preexecution-v5"
+SCHEMA_REVISION = "family-b-13-capture-v6"
+PROTOCOL_REVISION = "family-b-13-preexecution-v6"
 EXPECTED_B_S1_REVISION = "B-S1-2B-f2fd1ddb442fb1e0202a7a0800a05c330b6ac9cc"
-ANALYZER_REVISION = "family-b-13-analyzer-v5"
+ANALYZER_REVISION = "family-b-13-analyzer-v6"
 GENERATOR_CONTRACT_REVISION = "family-b-13-generator-contract-v1"
 SUBRUN_CONTRACT_REVISION = "family-b-13-subrun-contract-v1"
 CLOCK_CONTRACT_REVISION = "family-b-13-clock-contract-v1"
 MAX_JSONL_LINE_BYTES = 1_048_576
+
+HARNESS_EVENTS = frozenset(
+    {
+        "process_start",
+        "process_stop",
+        "process_crash",
+        "heartbeat",
+        "capture_finalized",
+        "analyzer_version",
+        "gap_signal",
+        "scheduled_interleaving",
+        "active_archive_handoff",
+        "index_rotation",
+    }
+)
+SYNTHETIC_OPERATIONS = frozenset({"synthetic_task_generator"})
+# Deliberately closed: v6 authorizes no operation against a disposable PVE.
+APPROVED_LIVE_OPERATIONS: frozenset[str] = frozenset()
 
 # Linux inotify event-mask values from the UAPI contract in
 # include/uapi/linux/inotify.h.  Only event-output bits used by this bounded
@@ -155,6 +173,13 @@ class _InstalledWatch:
     watched_path: str
     bucket: str | None
     monotonic_ns: int
+
+
+@dataclass(frozen=True)
+class _DerivedScanObservations:
+    normalized_upids: frozenset[str]
+    buckets: frozenset[str]
+    entry_identities: Mapping[str, tuple[int, int]]
 
 
 class CaptureError(ValueError):
@@ -494,6 +519,120 @@ def _task_bucket_path(
     return f"{task_tree.task_root}/{bucket}"
 
 
+def _derived_scan_observations(
+    record: Mapping[str, Any],
+    task_tree: _TaskTreeContract,
+    context: str,
+    *,
+    rescan_bucket: str | None = None,
+) -> _DerivedScanObservations:
+    """Validate v6 scan evidence and derive its authoritative projections."""
+
+    observation_values = _require_sequence(
+        record.get("bucket_observations"), f"{context}.bucket_observations"
+    )
+    buckets: set[str] = set()
+    normalized_upids: set[str] = set()
+    entry_identities: dict[str, tuple[int, int]] = {}
+    for observation_index, observation_value in enumerate(observation_values):
+        observation = _require_mapping(
+            observation_value,
+            f"{context}.bucket_observations[{observation_index}]",
+        )
+        bucket = _require_text(observation, "bucket")
+        expected_path = _task_bucket_path(
+            task_tree, bucket, f"{context}.bucket_observations[{observation_index}]"
+        )
+        if _require_text(observation, "path") != expected_path:
+            raise CaptureError(f"scan_bucket_path_mismatch:{context}:{bucket}")
+        if bucket in buckets:
+            raise CaptureError(f"scan_duplicate_bucket_observation:{context}:{bucket}")
+        buckets.add(bucket)
+
+        directory_stat = _require_mapping(
+            observation.get("stat"),
+            f"{context}.bucket_observations[{observation_index}].stat",
+        )
+        directory_device = _require_int(directory_stat, "device")
+        directory_inode = _require_int(directory_stat, "inode")
+        if directory_inode == 0:
+            raise CaptureError(f"scan_bucket_inode_zero:{context}:{bucket}")
+
+        entry_names: set[str] = set()
+        entry_values = _require_sequence(
+            observation.get("entries"),
+            f"{context}.bucket_observations[{observation_index}].entries",
+        )
+        for entry_index, entry_value in enumerate(entry_values):
+            entry = _require_mapping(
+                entry_value,
+                f"{context}.bucket_observations[{observation_index}].entries[{entry_index}]",
+            )
+            entry_name = _require_text(entry, "entry_name")
+            upid = _require_upid(
+                entry_name,
+                f"{context}.bucket_observations[{observation_index}].entries[{entry_index}].entry_name",
+            )
+            if entry_name in entry_names:
+                raise CaptureError(
+                    f"scan_duplicate_entry_name:{context}:{bucket}:{entry_name}"
+                )
+            entry_names.add(entry_name)
+            if _decode_upid(upid)["task_bucket"] != bucket:
+                raise CaptureError(f"scan_entry_upid_bucket_mismatch:{context}:{upid}")
+
+            entry_stat = _require_mapping(
+                entry.get("stat"),
+                f"{context}.bucket_observations[{observation_index}].entries[{entry_index}].stat",
+            )
+            entry_device = _require_int(entry_stat, "device")
+            entry_inode = _require_int(entry_stat, "inode")
+            if entry_inode == 0:
+                raise CaptureError(f"scan_entry_inode_zero:{context}:{upid}")
+            if entry_device != directory_device:
+                raise CaptureError(f"scan_entry_device_mismatch:{context}:{upid}")
+            if upid in normalized_upids:
+                raise CaptureError(f"scan_duplicate_derived_upid:{context}:{upid}")
+            normalized_upids.add(upid)
+            entry_identities[upid] = (entry_device, entry_inode)
+
+    if rescan_bucket is not None:
+        _task_bucket_path(task_tree, rescan_bucket, context)
+        if len(observation_values) != 1 or buckets != {rescan_bucket}:
+            raise CaptureError(f"scan_rescan_bucket_cardinality_mismatch:{context}")
+
+    declared_values = _require_sequence(
+        record.get("exact_normalized_upids"), f"{context}.exact_normalized_upids"
+    )
+    declared_upids = {
+        _require_upid(value, f"{context}.exact_normalized_upids")
+        for value in declared_values
+    }
+    if len(declared_upids) != len(declared_values):
+        raise CaptureError(f"scan_duplicate_declared_upid:{context}")
+    if declared_upids != normalized_upids:
+        raise CaptureError(f"scan_declared_upids_mismatch_observations:{context}")
+
+    declared_bucket_values = _require_sequence(
+        record.get("bucket_set"), f"{context}.bucket_set"
+    )
+    declared_buckets = {
+        _require_text({"value": value}, "value") for value in declared_bucket_values
+    }
+    if len(declared_buckets) != len(declared_bucket_values):
+        raise CaptureError(f"scan_duplicate_declared_bucket:{context}")
+    for bucket in declared_buckets:
+        _task_bucket_path(task_tree, bucket, f"{context}.bucket_set")
+    if declared_buckets != buckets:
+        raise CaptureError(f"scan_declared_bucket_set_mismatch_observations:{context}")
+
+    return _DerivedScanObservations(
+        normalized_upids=frozenset(normalized_upids),
+        buckets=frozenset(buckets),
+        entry_identities=dict(entry_identities),
+    )
+
+
 def _validate_watch_path(
     record: Mapping[str, Any],
     task_tree: _TaskTreeContract,
@@ -653,6 +792,14 @@ def _validate_generator_contract(
             "expected_owner",
         ):
             _require_text(contract, field)
+        approved_operation = str(contract["approved_operation"])
+        allowed_operations = (
+            SYNTHETIC_OPERATIONS
+            if fixture_kind == "synthetic"
+            else APPROVED_LIVE_OPERATIONS
+        )
+        if approved_operation not in allowed_operations:
+            raise CaptureError("generator_approved_operation_not_allowed")
         task_id_policy = _require_mapping(
             contract.get("expected_task_id_policy"),
             "generator_contract.expected_task_id_policy",
@@ -797,8 +944,8 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> _TaskTreeContract:
     if fixture_kind == "disposable_pve":
         # Preserve the existing generator-specific ineligibility while making
         # every live applicability-provenance failure environment-ineligible.
-        _validate_generator_contract(manifest, fixture_kind)
         disposable_task_tree = _validate_disposable_pve_provenance(manifest)
+        _validate_generator_contract(manifest, fixture_kind)
 
     for field in (
         "node_identity",
@@ -1094,9 +1241,11 @@ def _ground_truth(
             if start[field] != end.get(field):
                 raise CaptureError(f"ground_truth_request_pair_mismatch:{sequence}:{field}")
         if end["operation"] != generator_contract["approved_operation"]:
-            raise CaptureEnvironmentError(
-                "generated_operation_outside_approved_contract"
-            )
+            if fixture_kind == "disposable_pve":
+                raise CaptureEnvironmentError(
+                    "generated_operation_outside_approved_contract"
+                )
+            raise CaptureError("generated_operation_outside_approved_contract")
         if end.get("outcome") != "success":
             raise CaptureError(f"ground_truth_request_not_successful:{sequence}")
         upid = _require_upid(end.get("returned_upid"), "returned_upid")
@@ -1125,7 +1274,7 @@ def _ground_truth(
         ):
             raise CaptureEnvironmentError("generated_upid_outside_approved_contract")
         relation = end.get("generator_window_relation")
-        if relation not in {
+        if not isinstance(relation, str) or relation not in {
             "inside_generator_window",
             "after_generator_window",
             "ambiguous",
@@ -1509,27 +1658,18 @@ def _validate_pre_t0_establishment(
             <= committed == t0
         ):
             raise CaptureError("pre_t0_baseline_scan_time_invalid")
-        if (
-            not _require_bool(scan, "complete")
-            or _require_sequence(scan.get("unreadable_entries"), "pre_t0.unreadable_entries")
-            or _require_sequence(scan.get("malformed_entries"), "pre_t0.malformed_entries")
-        ):
-            raise CaptureError("pre_t0_baseline_scan_incomplete")
-        normalized = {
-            _require_upid(value, "pre_t0.exact_normalized_upids")
-            for value in _require_sequence(
-                scan.get("exact_normalized_upids"),
-                "pre_t0.exact_normalized_upids",
-            )
-        }
-        buckets = {
-            _require_text({"value": value}, "value")
-            for value in _require_sequence(scan.get("bucket_set"), "pre_t0.bucket_set")
-        }
-        for bucket in buckets:
-            _task_bucket_path(task_tree, bucket, "pre_t0.bucket_set")
-        if any(_decode_upid(upid)["task_bucket"] not in buckets for upid in normalized):
-            raise CaptureError("pre_t0_scan_upid_bucket_mismatch")
+        complete = _require_bool(scan, "complete")
+        unreadable = _require_sequence(
+            scan.get("unreadable_entries"), "pre_t0.unreadable_entries"
+        )
+        malformed = _require_sequence(
+            scan.get("malformed_entries"), "pre_t0.malformed_entries"
+        )
+        if not complete or unreadable or malformed:
+            gap_reasons.add("scan_unreadable_malformed_or_inconsistent")
+        derived = _derived_scan_observations(scan, task_tree, "pre_t0.baseline")
+        normalized = set(derived.normalized_upids)
+        buckets = set(derived.buckets)
         watermark = _require_int(scan, "watch_drained_through_sequence")
         if (
             watermark == 0
@@ -1668,15 +1808,21 @@ def _validate_pre_t0_establishment(
         _task_bucket_path(task_tree, rescan.get("bucket"), "pre_t0.bucket_rescan")
         rescan_start = _require_int(rescan, "scan_start_monotonic_ns")
         rescan_end = _require_int(rescan, "scan_end_monotonic_ns")
-        rescan_upids = {
-            _require_upid(value, "pre_t0.rescan.exact_normalized_upids")
-            for value in _require_sequence(
-                rescan.get("exact_normalized_upids"),
-                "pre_t0.rescan.exact_normalized_upids",
-            )
-        }
-        if any(_decode_upid(upid)["task_bucket"] != bucket for upid in rescan_upids):
-            raise CaptureError("pre_t0_bucket_rescan_upid_bucket_mismatch")
+        _derived_scan_observations(
+            rescan,
+            task_tree,
+            "pre_t0.bucket_rescan",
+            rescan_bucket=bucket,
+        )
+        if (
+            not _require_int(installs[0], "monotonic_ns")
+            <= rescan_start
+            <= rescan_end
+            <= first_scan_start
+            or _require_int(rescan, "establishment_sequence")
+            >= first_scan_establishment_sequence
+        ):
+            raise CaptureError("pre_t0_lazy_bucket_rescan_invalid")
         if (
             not _require_bool(rescan, "complete")
             or _require_sequence(
@@ -1687,14 +1833,8 @@ def _validate_pre_t0_establishment(
                 rescan.get("malformed_entries"),
                 "pre_t0.rescan.malformed_entries",
             )
-            or not _require_int(installs[0], "monotonic_ns")
-            <= rescan_start
-            <= rescan_end
-            <= first_scan_start
-            or _require_int(rescan, "establishment_sequence")
-            >= first_scan_establishment_sequence
         ):
-            raise CaptureError("pre_t0_lazy_bucket_rescan_invalid")
+            gap_reasons.add("scan_unreadable_malformed_or_inconsistent")
     if len(bucket_rescans) != len(lazy_events):
         raise CaptureError("pre_t0_bucket_rescan_without_unique_lazy_event")
 
@@ -1808,30 +1948,26 @@ def _validate_post_t0_watch_lifecycle(
             scan_end = _require_int(record, "scan_end_monotonic_ns")
             if not installation.monotonic_ns <= scan_start <= scan_end <= close_monotonic:
                 raise CaptureError("post_t0_bucket_rescan_time_invalid")
-            if (
-                not _require_bool(record, "complete")
-                or _require_sequence(
-                    record.get("unreadable_entries"),
-                    "watch_lifecycle.unreadable_entries",
-                )
-                or _require_sequence(
-                    record.get("malformed_entries"),
-                    "watch_lifecycle.malformed_entries",
-                )
-            ):
-                raise CaptureError("post_t0_bucket_rescan_incomplete")
-            upids = {
-                _require_upid(value, "watch_lifecycle.exact_normalized_upids")
-                for value in _require_sequence(
-                    record.get("exact_normalized_upids"),
-                    "watch_lifecycle.exact_normalized_upids",
-                )
-            }
-            if any(_decode_upid(upid)["task_bucket"] != bucket for upid in upids):
-                raise CaptureError("post_t0_bucket_rescan_upid_bucket_mismatch")
+            complete = _require_bool(record, "complete")
+            unreadable = _require_sequence(
+                record.get("unreadable_entries"),
+                "watch_lifecycle.unreadable_entries",
+            )
+            malformed = _require_sequence(
+                record.get("malformed_entries"),
+                "watch_lifecycle.malformed_entries",
+            )
+            derived = _derived_scan_observations(
+                record,
+                task_tree,
+                "watch_lifecycle.bucket_rescan",
+                rescan_bucket=bucket,
+            )
             if bucket in dynamic_by_bucket:
                 raise CaptureError("post_t0_bucket_rescan_duplicate")
-            record["_normalized_upids"] = upids
+            record["_normalized_upids"] = set(derived.normalized_upids)
+            record["_entry_identities"] = dict(derived.entry_identities)
+            record["_scan_gap"] = bool(not complete or unreadable or malformed)
             dynamic_by_bucket[bucket] = record
             rescans_by_sequence[sequence] = record
         else:
@@ -2248,6 +2384,8 @@ def _analyze_loaded(
     for record in harness:
         harness_sequences.append(_require_int(record, "harness_sequence"))
         event = _require_text(record, "event")
+        if event not in HARNESS_EVENTS:
+            raise CaptureError(f"unknown_harness_event:{event}")
         kinds.append(event)
         _require_int(record, "monotonic_ns")
         if record.get("process_identity") != reader_identity:
@@ -2489,6 +2627,8 @@ def _analyze_loaded(
             f"bucket_rescan_generated_upid:{sequence}",
         )
         lifecycle_known.update(rescan_upids)
+        if rescan.get("_scan_gap"):
+            gap_reasons.add("scan_unreadable_malformed_or_inconsistent")
 
     scan_known: set[str] = set()
     scans: dict[int, dict[str, Any]] = {}
@@ -2508,12 +2648,10 @@ def _analyze_loaded(
             raise CaptureError("scan_time_invalid_for_close")
         if scan_end <= t0_monotonic:
             raise CaptureError(f"scan_round_not_after_t0:{sequence}")
-        current = {
-            _require_upid(value, "scan.exact_normalized_upids")
-            for value in _require_sequence(
-                record.get("exact_normalized_upids"), "scan.exact_normalized_upids"
-            )
-        }
+        derived = _derived_scan_observations(
+            record, task_tree, f"scan_rounds:{sequence}"
+        )
+        current = set(derived.normalized_upids)
         _reject_generated_upids_not_strictly_after_request_start(
             current,
             scan_end,
@@ -2521,12 +2659,8 @@ def _analyze_loaded(
             f"scan_generated_upid:{sequence}",
         )
         record["_normalized_upids"] = current
-        buckets = {
-            _require_text({"value": value}, "value")
-            for value in _require_sequence(record.get("bucket_set"), "scan.bucket_set")
-        }
-        for bucket in buckets:
-            _task_bucket_path(task_tree, bucket, "scan.bucket_set")
+        record["_entry_identities"] = dict(derived.entry_identities)
+        buckets = set(derived.buckets)
         if buckets - covered_bucket_ids:
             raise CaptureError("scan_bucket_without_watch_lifecycle")
         if any(_decode_upid(upid)["task_bucket"] not in buckets for upid in current):
@@ -2544,7 +2678,6 @@ def _analyze_loaded(
                 <= scan_end
             )
         }
-        _require_mapping(record.get("stat_metadata"), "scan.stat_metadata")
         unreadable = _require_sequence(
             record.get("unreadable_entries"), "scan.unreadable_entries"
         )
@@ -2566,6 +2699,7 @@ def _analyze_loaded(
     # Phase 2: every adjacency, disappearance, watermark, and timing decision
     # follows declared scan_sequence, never JSONL iteration order.
     prior_scan: set[str] | None = None
+    prior_entry_identities: Mapping[str, tuple[int, int]] | None = None
     prior_watermark = 0
     prior_scan_end: int | None = None
     for sequence in sorted(scans):
@@ -2593,7 +2727,14 @@ def _analyze_loaded(
             gap_reasons.add("scan_unreadable_malformed_or_inconsistent")
         if prior_scan is not None and prior_scan - current:
             gap_reasons.add("exact_log_disappeared_between_scans")
+        current_entry_identities = record["_entry_identities"]
+        if prior_entry_identities is not None and any(
+            prior_entry_identities[upid] != current_entry_identities[upid]
+            for upid in prior_scan & current
+        ):
+            gap_reasons.add("exact_log_identity_changed_between_scans")
         prior_scan = current
+        prior_entry_identities = current_entry_identities
         prior_watermark = watermark
         prior_scan_end = scan_end
         scan_known.update(record["_eligible_normalized_upids"])
@@ -3072,6 +3213,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "APPROVED_LIVE_OPERATIONS",
     "ANALYZER_REVISION",
     "AnalyzerOutcome",
     "AnalysisResult",
@@ -3080,8 +3222,10 @@ __all__ = [
     "EXPECTED_B_S1_REVISION",
     "EXPECTED_SOURCE_LEDGER",
     "GENERATOR_CONTRACT_REVISION",
+    "HARNESS_EVENTS",
     "PROTOCOL_REVISION",
     "SCHEMA_REVISION",
     "SUBRUN_CONTRACT_REVISION",
+    "SYNTHETIC_OPERATIONS",
     "analyze_capture",
 ]

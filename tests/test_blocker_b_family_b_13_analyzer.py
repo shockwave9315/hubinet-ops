@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from scripts.research.blocker_b_family_b_13_analyzer import (
+    APPROVED_LIVE_OPERATIONS,
     ANALYZER_REVISION,
     CAPTURE_FILES,
     CLOCK_CONTRACT_REVISION,
@@ -62,6 +63,47 @@ def _task_bucket_path(bucket: str) -> str:
 
 def _upid_bucket(upid: str) -> str:
     return upid.split(":")[4][-1]
+
+
+def _bucket_observations(
+    upids: list[str], buckets: list[str], *, task_root: str = SYNTHETIC_TASK_ROOT
+) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for bucket in buckets:
+        entries = []
+        for upid in upids:
+            if _upid_bucket(upid) == bucket:
+                entries.append(
+                    {
+                        "entry_name": upid,
+                        "stat": {
+                            "device": 1,
+                            "inode": int(upid.split(":")[4], 16) + 100,
+                        },
+                    }
+                )
+        observations.append(
+            {
+                "bucket": bucket,
+                "path": f"{task_root}/{bucket}",
+                "stat": {"device": 1, "inode": int(bucket, 16) + 1},
+                "entries": entries,
+            }
+        )
+    return observations
+
+
+def _set_scan_observations(
+    record: dict[str, Any], upids: list[str], buckets: list[str] | None = None
+) -> None:
+    selected_buckets = (
+        buckets
+        if buckets is not None
+        else sorted({_upid_bucket(upid) for upid in upids})
+    )
+    record["exact_normalized_upids"] = list(upids)
+    record["bucket_set"] = list(selected_buckets)
+    record["bucket_observations"] = _bucket_observations(upids, selected_buckets)
 
 
 def _active_raw(*upids: str) -> str:
@@ -236,7 +278,7 @@ def _ground_truth_operation(sequence: int, upid: str) -> list[dict[str, Any]]:
             "event": "request_start",
             "generator_sequence": sequence,
             "request_id": request_id,
-            "operation": "stopall_reserved_absent_vmid",
+            "operation": "synthetic_task_generator",
             "monotonic_ns": 100 + sequence * 10,
             "wall_timestamp": f"2026-08-25T00:00:{sequence:02d}Z",
             "generator_process_identity": "synthetic-generator:1",
@@ -245,7 +287,7 @@ def _ground_truth_operation(sequence: int, upid: str) -> list[dict[str, Any]]:
             "event": "request_end",
             "generator_sequence": sequence,
             "request_id": request_id,
-            "operation": "stopall_reserved_absent_vmid",
+            "operation": "synthetic_task_generator",
             "returned_upid": upid,
             "expected_task_type": "stopall",
             "expected_task_id": "",
@@ -360,7 +402,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
             "approval_state": "synthetic",
             "fixture_id": "synthetic-fixture-13",
             "subrun_id": "13A",
-            "approved_operation": "stopall_reserved_absent_vmid",
+            "approved_operation": "synthetic_task_generator",
             "expected_task_type": "stopall",
             "expected_task_id_policy": {"kind": "exact", "value": ""},
             "expected_node": "fixture",
@@ -443,6 +485,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "scan_end_monotonic_ns": 65,
                 "exact_normalized_upids": [],
                 "bucket_set": ["1"],
+                "bucket_observations": _bucket_observations([], ["1"]),
                 "watch_drained_through_sequence": 2,
                 "unreadable_entries": [],
                 "malformed_entries": [],
@@ -457,6 +500,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "scan_end_monotonic_ns": 75,
                 "exact_normalized_upids": [],
                 "bucket_set": ["1"],
+                "bucket_observations": _bucket_observations([], ["1"]),
                 "watch_drained_through_sequence": 2,
                 "unreadable_entries": [],
                 "malformed_entries": [],
@@ -491,7 +535,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "scan_end_monotonic_ns": 190,
                 "exact_normalized_upids": [UPID_A],
                 "bucket_set": ["1"],
-                "stat_metadata": {},
+                "bucket_observations": _bucket_observations([UPID_A], ["1"]),
                 "unreadable_entries": [],
                 "malformed_entries": [],
                 "complete": True,
@@ -505,7 +549,7 @@ def _default_capture() -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]
                 "scan_end_monotonic_ns": 210,
                 "exact_normalized_upids": [UPID_A],
                 "bucket_set": ["1"],
-                "stat_metadata": {},
+                "bucket_observations": _bucket_observations([UPID_A], ["1"]),
                 "unreadable_entries": [],
                 "malformed_entries": [],
                 "complete": True,
@@ -710,6 +754,42 @@ def _materialize(
 ) -> Path:
     capture_dir = tmp_path / "capture"
     capture_dir.mkdir()
+    scan_bearing_records = [
+        record
+        for record in records["pre_t0_establishment"]
+        if record.get("event") in {"baseline_scan", "bucket_rescan"}
+    ] + [
+        record
+        for record in records["watch_lifecycle"]
+        if record.get("event") == "bucket_rescan"
+    ] + list(records["scan_rounds"])
+    filesystem_context = manifest.get("filesystem_context")
+    task_tree = (
+        filesystem_context.get("task_tree")
+        if isinstance(filesystem_context, dict)
+        else None
+    )
+    task_root = (
+        task_tree.get("task_root")
+        if isinstance(task_tree, dict) and isinstance(task_tree.get("task_root"), str)
+        else (
+            "/var/log/pve/tasks"
+            if manifest.get("fixture_kind") == "disposable_pve"
+            else SYNTHETIC_TASK_ROOT
+        )
+    )
+    for record in scan_bearing_records:
+        preserve_observations = record.pop("_preserve_bucket_observations", False)
+        if not preserve_observations:
+            buckets = record.get("bucket_set")
+            if buckets is None:
+                buckets = [record["bucket"]]
+                record["bucket_set"] = buckets
+            record["bucket_observations"] = _bucket_observations(
+                list(record.get("exact_normalized_upids", [])),
+                list(buckets),
+                task_root=task_root,
+            )
     for sequence, event in enumerate(records["harness_events"], 1):
         event["harness_sequence"] = sequence
         event.setdefault("process_identity", "synthetic-reader:1")
@@ -817,7 +897,7 @@ def _set_scan_history(
             "scan_end_monotonic_ns": 190 + (sequence - 1) * 20,
             "exact_normalized_upids": upids,
             "bucket_set": ["1"],
-            "stat_metadata": {},
+            "bucket_observations": _bucket_observations(upids, ["1"]),
             "unreadable_entries": [],
             "malformed_entries": [],
             "complete": True,
@@ -902,14 +982,15 @@ def _set_dynamic_bucket_capture(
             "scan_start_monotonic_ns": 145,
             "scan_end_monotonic_ns": 150,
             "exact_normalized_upids": [UPID_HEX_A],
+            "bucket_set": ["A"],
+            "bucket_observations": _bucket_observations([UPID_HEX_A], ["A"]),
             "unreadable_entries": [],
             "malformed_entries": [],
             "complete": True,
         },
     ]
     for scan in records["scan_rounds"]:
-        scan["bucket_set"] = ["1", "A"]
-        scan["exact_normalized_upids"] = [UPID_HEX_A]
+        _set_scan_observations(scan, [UPID_HEX_A], ["1", "A"])
         scan["watch_drained_through_sequence"] = 1
     records["exact_upid"][0]["discovery_source"] = "bucket_rescan"
     records["exact_upid"][0]["discovery_reference"] = 2
@@ -2073,7 +2154,7 @@ def test_cleanup_deleting_known_exact_log_is_gap(tmp_path: Path) -> None:
     assert result.outcome is AnalyzerOutcome.GAP
 
 
-def test_unknown_pre_enumeration_cleanup_preserves_generator_window_witness(
+def test_arbitrary_unknown_harness_event_is_incomplete(
     tmp_path: Path,
 ) -> None:
     manifest, records = _default_capture()
@@ -2087,7 +2168,10 @@ def test_unknown_pre_enumeration_cleanup_preserves_generator_window_witness(
         },
     )
     result = analyze_capture(_materialize(tmp_path, manifest, records))
-    assert result.outcome is AnalyzerOutcome.ENUMERATION_WITNESS
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (
+        "unknown_harness_event:synthetic_unknown_pre_enumeration_log_deleted",
+    )
 
 
 def test_surviving_anchors_do_not_hide_unknown_intermediate_loss(tmp_path: Path) -> None:
@@ -4375,11 +4459,10 @@ def test_bucket_created_watch_loss_latches_gap(
     "loss_bit",
     ["IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"],
 )
-def test_bucket_created_watch_loss_latches_gap_on_disposable_fixture(
+def test_disposable_fixture_is_ineligible_before_watch_loss_can_authorize_result(
     tmp_path: Path, loss_bit: str
 ) -> None:
-    """The same loss-bit latch applies on a ``disposable_pve`` fixture, not
-    only a synthetic one."""
+    """V6 has no approved disposable-PVE operation vocabulary."""
 
     manifest, records = _disposable_pve_capture()
     task_root = "/var/log/pve/tasks"
@@ -4390,8 +4473,10 @@ def test_bucket_created_watch_loss_latches_gap_on_disposable_fixture(
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
-    assert result.outcome is AnalyzerOutcome.GAP
-    assert "watch_invalidation_or_loss" in result.reasons
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons == (
+        "generator_contract_ineligible:generator_approved_operation_not_allowed",
+    )
 
 
 def test_bucket_created_overflow_extra_bits_stays_incomplete_not_gap(
@@ -6140,15 +6225,18 @@ def test_disposable_fixture_without_generator_contract_is_ineligible(
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
     assert result.outcome is AnalyzerOutcome.INELIGIBLE
-    assert result.reasons[0].startswith("generator_contract_ineligible:")
+    assert result.reasons[0].endswith("field_not_object:generator_contract")
 
 
-def test_complete_disposable_fixture_provenance_may_pass(tmp_path: Path) -> None:
+def test_complete_disposable_fixture_is_ineligible_without_live_operation(
+    tmp_path: Path,
+) -> None:
     manifest, records = _disposable_pve_capture()
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
-    assert result.outcome is AnalyzerOutcome.PASS
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert APPROVED_LIVE_OPERATIONS == frozenset()
 
 
 @pytest.mark.parametrize(
@@ -6197,7 +6285,10 @@ def test_disposable_provenance_does_not_reject_synthetic_substrings(
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
-    assert result.outcome is AnalyzerOutcome.PASS
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons == (
+        "generator_contract_ineligible:generator_approved_operation_not_allowed",
+    )
 
 
 def test_disposable_task_root_must_match_pinned_pve_source(tmp_path: Path) -> None:
@@ -6272,14 +6363,19 @@ def test_synthetic_placeholder_boot_and_clock_identifiers_remain_legal(
     assert result.outcome is AnalyzerOutcome.PASS
 
 
-def test_disposable_root_filesystem_mount_point_may_pass(tmp_path: Path) -> None:
+def test_disposable_root_filesystem_mount_point_preserves_operation_ineligibility(
+    tmp_path: Path,
+) -> None:
     manifest, records = _disposable_pve_capture()
     manifest["filesystem_context"]["mount_topology"]["root"] = "/"
     manifest["filesystem_context"]["mount_topology"]["mount_point"] = "/"
 
     result = analyze_capture(_materialize(tmp_path, manifest, records))
 
-    assert result.outcome is AnalyzerOutcome.PASS
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons == (
+        "generator_contract_ineligible:generator_approved_operation_not_allowed",
+    )
 
 
 @pytest.mark.parametrize(
@@ -6591,3 +6687,305 @@ def test_analysis_attempts_no_network_or_subprocess(
 
     result = analyze_capture(capture_dir)
     assert result.outcome is AnalyzerOutcome.PASS
+
+
+def _v6_scan_plane(
+    manifest: dict[str, Any],
+    records: dict[str, list[dict[str, Any]]],
+    plane: str,
+) -> dict[str, Any]:
+    if plane == "scan_rounds":
+        return records["scan_rounds"][0]
+    if plane == "pre_t0_baseline":
+        return next(
+            record
+            for record in records["pre_t0_establishment"]
+            if record.get("phase") == "PRE_T0_BASELINE"
+        )
+    if plane == "pre_t0_bucket_rescan":
+        stream = _lazy_bucket_created_stream(["IN_CREATE", "IN_ISDIR"])
+        _apply_lazy_bucket_stream(manifest, records, stream)
+        return next(
+            record
+            for record in records["pre_t0_establishment"]
+            if record.get("phase") == "PRE_T0_BUCKET_RESCAN"
+        )
+    if plane == "post_t0_bucket_rescan":
+        _set_dynamic_bucket_capture(manifest, records)
+        return next(
+            record
+            for record in records["watch_lifecycle"]
+            if record.get("phase") == "POST_T0_BUCKET_RESCAN"
+        )
+    raise AssertionError(plane)
+
+
+@pytest.mark.parametrize("event", ["gap_singal", "decorative_marker"])
+def test_v6_unknown_harness_event_vocabulary_is_incomplete(
+    tmp_path: Path, event: str
+) -> None:
+    manifest, records = _default_capture()
+    records["harness_events"].insert(-2, {"event": event, "monotonic_ns": 260})
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == (f"unknown_harness_event:{event}",)
+
+
+@pytest.mark.parametrize("relation", [{}, [], 7, None])
+def test_v6_generator_window_relation_must_be_string(
+    tmp_path: Path, relation: Any
+) -> None:
+    manifest, records = _default_capture()
+    records["ground_truth"][1]["generator_window_relation"] = relation
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("ground_truth_generator_window_relation_invalid",)
+
+
+@pytest.mark.parametrize(
+    ("relation", "outcome"),
+    [
+        ("inside_generator_window", AnalyzerOutcome.PASS),
+        ("ambiguous", AnalyzerOutcome.GAP),
+        ("after_generator_window", AnalyzerOutcome.GAP),
+    ],
+)
+def test_v6_generator_window_relation_valid_values_preserve_outcomes(
+    tmp_path: Path, relation: str, outcome: AnalyzerOutcome
+) -> None:
+    manifest, records = _default_capture()
+    if relation == "ambiguous":
+        records["ground_truth"][1]["generator_window_relation"] = relation
+        records["ground_truth"][1]["within_generator_window"] = False
+    elif relation == "after_generator_window":
+        manifest["experiment_generator_window"]["end_monotonic_ns"] = 110
+        records["ground_truth"][1]["generator_window_relation"] = relation
+        records["ground_truth"][1]["within_generator_window"] = False
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is outcome
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["stopall", "stopall_reserved_absent_vmid", "qmstart", "startall", "vncshell"],
+)
+def test_v6_disposable_operations_are_ineligible(
+    tmp_path: Path, operation: str
+) -> None:
+    manifest, records = _disposable_pve_capture()
+    manifest["generator_contract"]["approved_operation"] = operation
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert APPROVED_LIVE_OPERATIONS == frozenset()
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons == (
+        "generator_contract_ineligible:generator_approved_operation_not_allowed",
+    )
+
+
+def test_v6_synthetic_stopall_label_is_incomplete(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    manifest["generator_contract"]["approved_operation"] = (
+        "stopall_reserved_absent_vmid"
+    )
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("generator_approved_operation_not_allowed",)
+
+
+@pytest.mark.parametrize(
+    "plane",
+    [
+        "scan_rounds",
+        "pre_t0_baseline",
+        "pre_t0_bucket_rescan",
+        "post_t0_bucket_rescan",
+    ],
+)
+def test_v6_declared_projection_cannot_bypass_observations_on_any_plane(
+    tmp_path: Path, plane: str
+) -> None:
+    manifest, records = _default_capture()
+    record = _v6_scan_plane(manifest, records, plane)
+    buckets = record.get("bucket_set", [record.get("bucket")])
+    record["bucket_observations"] = _bucket_observations(
+        list(record["exact_normalized_upids"]),
+        list(buckets),
+        task_root=manifest["filesystem_context"]["task_tree"]["task_root"],
+    )
+    record["exact_normalized_upids"] = (
+        [] if record["exact_normalized_upids"] else [UPID_A]
+    )
+    record["_preserve_bucket_observations"] = True
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "scan_declared_upids_mismatch_observations" in result.reasons[0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "observed_a_declared_b",
+        "observed_declared_empty",
+        "empty_observed_declared_upid",
+        "wrong_bucket",
+        "wrong_path",
+        "foreign_entry",
+        "duplicate_entry",
+        "duplicate_bucket",
+        "device_mismatch",
+        "bucket_set_mismatch",
+        "bucket_inode_zero",
+        "entry_inode_zero",
+    ],
+)
+def test_v6_scan_observation_core_fail_closed(
+    tmp_path: Path, mutation: str
+) -> None:
+    manifest, records = _default_capture()
+    scan = records["scan_rounds"][0]
+    scan["bucket_observations"] = _bucket_observations([UPID_A], ["1"])
+    if mutation == "observed_a_declared_b":
+        scan["exact_normalized_upids"] = [UPID_B]
+    elif mutation == "observed_declared_empty":
+        scan["exact_normalized_upids"] = []
+    elif mutation == "empty_observed_declared_upid":
+        scan["bucket_observations"][0]["entries"] = []
+    elif mutation == "wrong_bucket":
+        scan["bucket_observations"][0]["bucket"] = "0"
+        scan["bucket_observations"][0]["path"] = _task_bucket_path("0")
+        scan["bucket_set"] = ["0"]
+    elif mutation == "wrong_path":
+        scan["bucket_observations"][0]["path"] = _task_bucket_path("0")
+    elif mutation == "foreign_entry":
+        scan["bucket_observations"][0]["entries"][0]["entry_name"] = "README"
+    elif mutation == "duplicate_entry":
+        scan["bucket_observations"][0]["entries"].append(
+            dict(scan["bucket_observations"][0]["entries"][0])
+        )
+    elif mutation == "duplicate_bucket":
+        scan["bucket_observations"].append(dict(scan["bucket_observations"][0]))
+    elif mutation == "device_mismatch":
+        scan["bucket_observations"][0]["entries"][0]["stat"]["device"] = 2
+    elif mutation == "bucket_set_mismatch":
+        scan["bucket_set"] = ["0"]
+    elif mutation == "bucket_inode_zero":
+        scan["bucket_observations"][0]["stat"]["inode"] = 0
+    elif mutation == "entry_inode_zero":
+        scan["bucket_observations"][0]["entries"][0]["stat"]["inode"] = 0
+    else:
+        raise AssertionError(mutation)
+    scan["_preserve_bucket_observations"] = True
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+
+
+def test_v6_post_t0_rescan_requires_exactly_one_matching_bucket(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    rescan = _v6_scan_plane(manifest, records, "post_t0_bucket_rescan")
+    rescan["bucket_observations"].append(_bucket_observations([], ["1"])[0])
+    rescan["bucket_set"] = ["A", "1"]
+    rescan["_preserve_bucket_observations"] = True
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert "scan_rescan_bucket_cardinality_mismatch" in result.reasons[0]
+
+
+@pytest.mark.parametrize("field", ["malformed_entries", "unreadable_entries"])
+def test_v6_acknowledged_scan_loss_remains_gap(tmp_path: Path, field: str) -> None:
+    manifest, records = _default_capture()
+    records["scan_rounds"][0][field] = ["acknowledged-entry"]
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "scan_unreadable_malformed_or_inconsistent" in result.reasons
+
+
+def test_v6_changed_exact_log_identity_between_scans_is_gap(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    second = records["scan_rounds"][1]
+    second["bucket_observations"][0]["entries"][0]["stat"]["inode"] += 1
+    second["_preserve_bucket_observations"] = True
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.GAP
+    assert "exact_log_identity_changed_between_scans" in result.reasons
+
+
+def test_v6_legitimate_empty_bucket_observations_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    for scan in records["scan_rounds"]:
+        _set_scan_observations(scan, [], ["1"])
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_v6_populated_observations_on_all_four_planes_may_pass(
+    tmp_path: Path,
+) -> None:
+    manifest, records = _default_capture()
+    _apply_lazy_bucket_stream(
+        manifest,
+        records,
+        _lazy_bucket_created_stream(["IN_CREATE", "IN_ISDIR"]),
+    )
+    _set_dynamic_bucket_capture(manifest, records)
+    records["watch_lifecycle"][0]["watch_descriptor"] = 4
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_v6_multi_bucket_scan_with_derived_upids_may_pass(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    _add_finalized_historical_baseline(manifest, records, UPID_B)
+    _set_dynamic_bucket_capture(manifest, records)
+    for scan in records["scan_rounds"]:
+        _set_scan_observations(scan, [UPID_B, UPID_HEX_A], ["1", "A"])
+    for exact in records["exact_upid"]:
+        if exact["known_upid"] == UPID_B:
+            exact["discovery_source"] = "baseline"
+            exact["discovery_reference"] = "manifest.baseline_upids"
+        else:
+            exact["discovery_source"] = "bucket_rescan"
+            exact["discovery_reference"] = 2
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.PASS
+
+
+def test_v6_revision_constants_and_stale_v5_manifest_are_rejected(
+    tmp_path: Path,
+) -> None:
+    assert SCHEMA_REVISION == "family-b-13-capture-v6"
+    assert PROTOCOL_REVISION == "family-b-13-preexecution-v6"
+    assert ANALYZER_REVISION == "family-b-13-analyzer-v6"
+    assert GENERATOR_CONTRACT_REVISION == "family-b-13-generator-contract-v1"
+    assert SUBRUN_CONTRACT_REVISION == "family-b-13-subrun-contract-v1"
+    assert CLOCK_CONTRACT_REVISION == "family-b-13-clock-contract-v1"
+    manifest, records = _default_capture()
+    manifest["schema_revision"] = "family-b-13-capture-v5"
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.INELIGIBLE
+    assert result.reasons == ("context_mismatch:schema_revision",)
+
+
+def test_v6_stale_v5_seal_is_rejected(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    capture_dir = _materialize(tmp_path, manifest, records)
+    seal = json.loads((capture_dir / "seal.json").read_text(encoding="utf-8"))
+    seal["schema_revision"] = "family-b-13-capture-v5"
+    _write_json(capture_dir / "seal.json", seal)
+    result = analyze_capture(capture_dir)
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("seal_schema_mismatch",)
+
+
+def test_v6_stale_v5_analyzer_version_event_is_rejected(tmp_path: Path) -> None:
+    manifest, records = _default_capture()
+    version = next(
+        record
+        for record in records["harness_events"]
+        if record["event"] == "analyzer_version"
+    )
+    version["analyzer_revision"] = "family-b-13-analyzer-v5"
+    result = analyze_capture(_materialize(tmp_path, manifest, records))
+    assert result.outcome is AnalyzerOutcome.INCOMPLETE
+    assert result.reasons == ("harness_analyzer_version_missing_or_mismatch",)
