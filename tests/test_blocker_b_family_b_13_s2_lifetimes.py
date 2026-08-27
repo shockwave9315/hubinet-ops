@@ -493,30 +493,62 @@ def test_build_participant_table_accepts_normal_decode_output() -> None:
     assert len(table) == 1
 
 
-def test_lifetime_pure_containment_query() -> None:
-    headers = _harness_headers("positive_13a")
-    table = build_participant_table(headers)
-    lifetime = table.get(ParticipantIdentity(READER))
-    assert lifetime.contains_ns(50) is True
-    assert lifetime.contains_ns(320) is True
-    assert lifetime.contains_ns(49) is False
-    assert lifetime.contains_ns(321) is False
-
-
-@pytest.mark.parametrize("invalid_ns", [True, False, -1, "50", None])
-def test_lifetime_containment_query_rejects_invalid_scalars(invalid_ns) -> None:
-    """P2 corrective decision (section 6): contains_ns must not perform a
-    bare Python numeric comparison -- bool would otherwise satisfy an
-    integer interval via True == 1, manufacturing a positive structural
-    fact from a scalar S1/S2 otherwise reject. An invalid scalar must fail
-    closed, never silently return False."""
+def test_lifetime_boundaries_are_stored_as_plain_structural_data() -> None:
+    """ParticipantLifetime remains an immutable structural fact holder: its
+    boundaries are readable fields, established solely by
+    build_participant_table from this single participant's own harness
+    records (see the module docstring's frozen capture-v6 single-identity/
+    single-writer contract)."""
 
     headers = _harness_headers("positive_13a")
     table = build_participant_table(headers)
     lifetime = table.get(ParticipantIdentity(READER))
-    with pytest.raises(ParticipantLifetimeError) as exc_info:
-        lifetime.contains_ns(invalid_ns)
-    assert str(exc_info.value) == "lifetime_query_ns_invalid"
+    assert lifetime.start_ns == 50
+    assert lifetime.end_ns == 320
+
+
+def test_participant_lifetime_exposes_no_timestamp_relation_helper() -> None:
+    """S2 clock-domain boundary corrective decision (local stop-patching
+    rule): the frozen v6 oracle validates an explicit
+    manifest.clock_contract -- one bound CLOCK_MONOTONIC domain shared
+    across every plane/participant -- BEFORE trusting any cross-process/
+    cross-stream monotonic relation; a missing or mismatched contract is
+    an unconditional environment-ineligibility failure there. S2 has no
+    manifest and therefore no clock_contract context, so it cannot prove
+    an externally-supplied monotonic_ns was captured in the same clock
+    domain as a given lifetime's own boundaries. ParticipantLifetime
+    therefore exposes no contains_ns (or any replacement helper under
+    another name) in S2 -- proving clock-domain compatibility, and
+    whatever cross-stream temporal relation it then licenses, is deferred
+    to a later stage that actually has manifest.clock_contract."""
+
+    for forbidden_name in (
+        "contains_ns",
+        "contains_time",
+        "before_start",
+        "after_start",
+        "in_lifetime",
+        "timestamp_within",
+        "compare_ns",
+    ):
+        assert not hasattr(ParticipantLifetime, forbidden_name)
+
+
+def test_no_s2_public_function_derives_a_temporal_relation_from_an_external_timestamp() -> None:
+    """No exported S2 function or type accepts a ParticipantLifetime
+    together with an external monotonic_ns to produce a temporal relation
+    -- the only functions/types build_participant_table's own module
+    exports are the ones __all__ declares, none of which is such a
+    relation-producing call."""
+
+    forbidden = {
+        "contains_ns",
+        "lifetime_contains_ns",
+        "timestamp_in_lifetime",
+        "relate_timestamp",
+    }
+    exported = set(participants_module.__all__)
+    assert forbidden.isdisjoint(exported)
 
 
 def test_build_participant_table_rejects_two_distinct_identities_in_one_stream() -> None:
@@ -606,10 +638,8 @@ def test_all_captured_harness_streams_have_a_singleton_process_identity() -> Non
 
 def test_participant_lifetime_exposes_no_record_containment_helper() -> None:
     """P1 corrective decision (local stop-patching rule), rationale
-    corrected during S2 contract reconciliation: S2's own accepted
-    contract only ever needs the narrow numeric fact contains_ns provides
-    -- a full harness stream already carries exactly one participant
-    identity (see
+    corrected during S2 contract reconciliation: a full harness stream
+    already carries exactly one participant identity (see
     test_all_captured_harness_streams_have_a_singleton_process_identity and
     test_build_participant_table_rejects_two_distinct_identities_in_one_stream),
     so there is no second identity for an ownership-aware relation to
@@ -832,11 +862,17 @@ def test_hist_harness_event_outside_lifetime_produces_structural_error() -> None
 def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
     """The harness-events stream is self-consistent; the invalid record
     lives in a different sealed stream. ParticipantTable construction
-    succeeds; the only S2 fact this witness needs -- and the only one this
-    package offers for a cross-stream record -- is the pure numeric
-    contains_ns query (see
-    test_participant_lifetime_exposes_no_record_containment_helper for why
-    there is no record-ownership/containment helper to ask instead)."""
+    succeeds. S2 can establish only two independent structural facts here
+    -- the reader lifetime's own start_ns, and the pre-T0 observer
+    record's own monotonic_ns -- never a relation between them: doing so
+    would require proving both were captured in the same CLOCK_MONOTONIC
+    domain (manifest.clock_contract in the frozen v6 oracle), which is
+    manifest-derived context S2 intentionally never has (see
+    test_participant_lifetime_exposes_no_timestamp_relation_helper). This
+    historical witness therefore remains UNRESOLVED AT S2 RELATION LEVEL
+    -- not GAP, not INCOMPLETE -- and is discharged only once a later
+    stage has validated the shared clock-domain contract; that later
+    stage is not implemented here."""
 
     headers = _harness_headers("stop_reader_pre_t0_before_process_start")
     table = build_participant_table(headers)  # must NOT raise
@@ -849,8 +885,8 @@ def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
     positions = assign_physical_positions(StreamName.PRE_T0_ESTABLISHMENT, pre_t0_raw)
     ref = decode_timed_record_ref(pre_t0_raw[0], positions[0])
     assert ref.monotonic_ns == 50
-
-    assert lifetime.contains_ns(ref.monotonic_ns) is False
+    # Two independent structural facts only -- no cross-stream relation is
+    # derived between lifetime.start_ns and ref.monotonic_ns.
 
 
 def test_stop_generator_sequence_relabel_physical_pos_is_unrelabelable() -> None:
@@ -890,6 +926,8 @@ def test_build_participant_table_signature_has_no_ground_truth_or_authority_para
         "ground_truth",
         "observer_records",
         "manifest_context",
+        "manifest",
+        "clock_contract",
         "t0",
         "t1",
         "phase",
@@ -917,6 +955,38 @@ def test_participants_module_does_not_import_ground_truth_or_observer_parsers() 
         "exact_upid",
     }
     assert identifiers.isdisjoint(forbidden)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        V7_PACKAGE_DIR / "__init__.py",
+        V7_PACKAGE_DIR / "physical.py",
+        V7_PACKAGE_DIR / "records.py",
+        V7_PACKAGE_DIR / "participants.py",
+    ],
+    ids=lambda p: p.name,
+)
+def test_v7_package_has_no_clock_contract_parser_or_context(path: Path) -> None:
+    """S2 clock-domain boundary (section 6): the S2 package defines no
+    clock_contract parser/validator/context anywhere -- checked at the
+    identifier level, not raw text, so this test's own name and the
+    modules' own docstring prose (which legitimately *names*
+    manifest.clock_contract while explaining that S2 depends on none of
+    it) do not trip this gate. Proving/consuming manifest.clock_contract
+    remains future work for a later stage."""
+
+    identifiers = _code_identifiers(path.read_text(encoding="utf-8"))
+    forbidden = {
+        "clock_contract",
+        "ClockDomain",
+        "ClockContract",
+        "validate_clock_contract",
+        "_validate_clock_contract",
+        "clock_domain_id",
+        "manifest",
+    }
+    assert identifiers.isdisjoint(forbidden), (path.name, identifiers & forbidden)
 
 
 def test_modifying_generator_sequence_cannot_alter_a_table_built_from_unchanged_harness_records() -> None:
@@ -951,6 +1021,10 @@ FORBIDDEN_AUTHORITY_IDENTIFIERS = frozenset(
         "observer_ledger",
         "authority_level",
         "ParticipantTable_",  # never a v2/renamed escape hatch
+        "clock_contract",
+        "ClockDomain",
+        "ClockContract",
+        "manifest",
     }
 )
 
@@ -1120,11 +1194,13 @@ def test_gap_signal_kind_is_only_a_label_not_a_gap_classification() -> None:
     headers = _harness_headers("stop_post_t1_gap_signal_rewrites_t1")
     gap_signal_headers = [h for h in headers if h.kind is HarnessEventKind.GAP_SIGNAL]
     assert len(gap_signal_headers) == 1
-    table = build_participant_table(headers)
+    table = build_participant_table(headers)  # succeeds: the builder already
+    # enforces that every singleton-harness record's own monotonic_ns lies
+    # inside the reader lifetime -- no external timestamp-query helper is
+    # needed (or reintroduced) here to prove that.
     assert len(table) == 1
     lifetime = table.get(ParticipantIdentity(READER))
     assert lifetime is not None
-    assert lifetime.contains_ns(gap_signal_headers[0].monotonic_ns) is True
 
 
 # ---------------------------------------------------------------------------

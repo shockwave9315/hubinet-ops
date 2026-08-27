@@ -121,16 +121,24 @@ class HarnessRecordHeader:
 @dataclass(frozen=True)
 class TimedRecordRef:
     """A minimal structural reference into ANY sealed stream: just its
-    physical position and its declared ``monotonic_ns``. Used to ask a pure
-    structural fact question about a record without modeling that record's
-    full semantics -- e.g. "does this pre-T0-establishment record's
-    timestamp fall inside the reader's structural lifetime?" (a
-    :class:`~scripts.research.family_b_13_v7.participants.ParticipantLifetime`
-    ``contains_ns`` query), never an admission or authority decision.
+    physical position and its declared ``monotonic_ns``. A pure structural
+    projection of one record, holding data only -- it never models that
+    record's full semantics, and never itself performs or licenses any
+    comparison.
 
-    Carries no participant-identity/ownership binding of its own -- a bare
-    (position, timestamp) match is never evidence that a record belongs to
-    (or was produced by) any particular participant.
+    ``monotonic_ns`` is a sealed scalar: a value the record declares about
+    itself, validated only for S1 scalar shape (nonnegative int, bool
+    rejected). ``TimedRecordRef`` establishes NO comparability between that
+    value and a timestamp from another stream or another participant --
+    doing so honestly would require proving both were captured in the same
+    ``CLOCK_MONOTONIC`` domain (the frozen v6 oracle's explicit
+    ``manifest.clock_contract``; see
+    :class:`~scripts.research.family_b_13_v7.participants.ParticipantLifetime`'s
+    clock-domain boundary note), which is manifest-derived context S2
+    intentionally never has. This type is data only; it carries no
+    participant-identity/ownership binding either -- a bare (position,
+    timestamp) match is never evidence that a record belongs to (or was
+    produced by) any particular participant.
 
     ``__post_init__`` enforces this type's own structural invariants --
     ``pos`` is a real :class:`PhysicalPos`, ``monotonic_ns`` satisfies S1

@@ -131,35 +131,59 @@ class ParticipantLifetimeError(ValueError):
 class ParticipantLifetime:
     """One participant's structural process lifetime, as established
     solely by its own explicit sealed ``harness-events.jsonl`` lifecycle
-    records.
+    records: an immutable structural fact holder -- ``identity``,
+    ``start_ns``, ``end_ns``, ``start_pos``, ``end_pos``,
+    ``termination_kind`` -- exposing NO query method in S2. What its own
+    boundaries mean, and what may be compared against them, is a later-
+    stage (``admit()``, S3+) question this type never answers itself; see
+    :func:`build_participant_table` for how the boundaries themselves are
+    established.
 
-    Exposes only one pure structural-fact query, :meth:`contains_ns` --
-    never an admission, authority, or verdict decision. "A timestamp lies
-    outside this lifetime" is a fact this type can state; what that fact
-    *means* is a later-stage (``admit()``, S3+) question this type never
-    answers.
-
-    S2 corrective decision (local stop-patching rule): this type
-    deliberately exposes no record-ownership/containment query -- no
-    ``contains_record``, and no replacement under another name such as
-    ``record_within_lifetime``, ``contains_timed_record``, ``owns_record``,
-    or ``participant_contains`` (see
-    ``test_participant_lifetime_exposes_no_record_containment_helper``).
-    S2's own accepted contract only ever needs the narrow numeric fact
-    :meth:`contains_ns` provides: a full harness stream already carries
-    exactly one participant identity (see the module docstring's frozen
-    capture-v6 single-identity contract), so there is no second identity
-    for an ownership-aware relation to disambiguate in the first place.
-    Separately,
+    S2 corrective decision (local stop-patching rule) -- record-ownership
+    containment: this type exposes no ``contains_record`` (or a
+    replacement under another name: ``record_within_lifetime``,
+    ``contains_timed_record``, ``owns_record``, ``participant_contains``;
+    see ``test_participant_lifetime_exposes_no_record_containment_helper``).
+    A full harness stream already carries exactly one participant identity
+    (see the module docstring's frozen capture-v6 single-identity
+    contract), so there is no second identity for an ownership-aware
+    relation to disambiguate in the first place. Separately,
     :class:`~scripts.research.family_b_13_v7.records.TimedRecordRef` is
-    generic across every sealed stream (not only ``harness-events.jsonl``)
-    and carries no participant-identity/ownership binding of its own, so a
-    bare (position, timestamp) match could never honestly answer a
-    record-ownership question even if S2 needed one. Both reasons hold
-    independently; neither is grounds to introduce such a relation here
-    under any name. A later stage may combine ownership, lifetime,
-    ``PhysicalPos``, and phase/interval together through its own explicit
-    authority gate; S2 must not pre-combine those concepts.
+    generic across every sealed stream and carries no participant-
+    identity/ownership binding of its own, so a bare (position, timestamp)
+    match could never honestly answer a record-ownership question even if
+    S2 needed one. Both reasons hold independently.
+
+    S2 corrective decision (local stop-patching rule) -- clock-domain
+    boundary: this type ALSO exposes no cross-record timestamp-relation
+    query -- no ``contains_ns``, and no replacement under another name
+    such as ``contains_time``, ``before_start``, ``after_start``,
+    ``in_lifetime``, ``timestamp_within``, or ``compare_ns`` (see
+    ``test_participant_lifetime_exposes_no_timestamp_relation_helper``).
+    The frozen v6 oracle validates an explicit ``manifest.clock_contract``
+    -- one bound ``CLOCK_MONOTONIC`` domain, shared across every plane/
+    participant -- BEFORE trusting any cross-process/cross-stream
+    monotonic relation; a missing or mismatched contract is an
+    unconditional environment-ineligibility failure there, never a
+    silently-accepted default (see ``_validate_clock_contract`` in the
+    frozen oracle). S2 has no manifest and therefore no ``clock_contract``
+    context, so it cannot prove that an arbitrary externally-supplied
+    ``monotonic_ns`` was even captured in the same clock domain as this
+    lifetime's own boundaries. Exposing a ``contains_ns``-shaped query
+    would let a caller derive a cross-stream/cross-participant temporal
+    relation S2 has no basis to assert. This does not affect
+    :func:`build_participant_table`'s own internal validation: every
+    record inside one ``harness-events.jsonl`` stream is emitted by the
+    same single writer process (the singleton ``process_identity`` S2's
+    contract-reconciliation pass already established), so ordering those
+    records' own ``monotonic_ns`` values against each other needs no
+    external clock-domain proof -- there is exactly one writer, one clock.
+    A caller supplying an *unrelated* naked timestamp is asking S2 to
+    assume domain-sharing it cannot prove. Clock-domain proof, and
+    whatever cross-stream temporal relation it then licenses, is deferred
+    to a later stage that actually has ``manifest.clock_contract`` --
+    never assigned automatically to ``admit()``; whatever consumes the
+    relation must be preceded by that proof.
 
     ``__post_init__`` enforces this type's own internal structural
     consistency -- a real ``ParticipantIdentity``, S1-valid nonnegative
@@ -207,24 +231,6 @@ class ParticipantLifetime:
 
         if not isinstance(self.termination_kind, TerminationKind):
             raise ParticipantLifetimeError("lifetime_termination_kind_invalid")
-
-    def contains_ns(self, monotonic_ns: int) -> bool:
-        """Whether ``monotonic_ns`` falls within this lifetime's declared
-        ``[start_ns, end_ns]`` interval. A pure numeric fact -- carries no
-        opinion about phase, interval, or evidence admissibility.
-
-        ``monotonic_ns`` must itself satisfy S1 ``require_nonnegative_int``
-        semantics (bool rejected); an invalid scalar raises
-        :class:`ParticipantLifetimeError` rather than silently returning
-        ``False`` -- a caller passing ``True`` must not have it manufacture
-        a positive numeric match against this lifetime's interval via
-        Python's ``True == 1`` coercion.
-        """
-
-        result = require_nonnegative_int(monotonic_ns)
-        if not result.ok:
-            raise ParticipantLifetimeError("lifetime_query_ns_invalid")
-        return self.start_ns <= result.value <= self.end_ns
 
 
 @dataclass(frozen=True)

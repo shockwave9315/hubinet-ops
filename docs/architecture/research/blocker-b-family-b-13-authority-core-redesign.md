@@ -462,12 +462,50 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
   itself was not reopened — its corrected rationale is simply that S2's
   own contract never has a second identity to disambiguate, and
   `TimedRecordRef`'s lack of an ownership binding holds independently of
-  that. `ParticipantLifetime.contains_ns` was additionally hardened to
-  reject an invalid scalar (`bool`, negative, non-int) via S1
+  that. `ParticipantLifetime.contains_ns` was at that point additionally
+  hardened to reject an invalid scalar (`bool`, negative, non-int) via S1
   `require_nonnegative_int` rather than performing a bare Python numeric
   comparison, closing a path where `True == 1` could manufacture a
-  positive numeric match. Still **IMPLEMENTED / AWAITING INDEPENDENT
-  REVIEW**, not accepted.
+  positive numeric match.
+
+  A **third S2 corrective pass — the clock-domain boundary** (same
+  anti-loop decision, still Draft PR #53, no v8) then found that hardening
+  `contains_ns` was not enough: the full acceptance audit identified one
+  further incorrect S2 boundary assumption, that S2 may compare a bare
+  `monotonic_ns` originating from another sealed stream against a
+  `ParticipantLifetime` without first proving a shared `CLOCK_MONOTONIC`
+  clock domain. That is also false for frozen capture-v6 — the byte-frozen
+  v6 oracle's `_validate_clock_contract` requires an explicit
+  `manifest.clock_contract` (one bound `CLOCK_MONOTONIC` domain, shared
+  across every plane/participant) *before* trusting any cross-process/
+  cross-stream monotonic relation, treating a missing or mismatched
+  contract as an unconditional environment-ineligibility failure, never a
+  silently-accepted default. S2 has no manifest and therefore no
+  `clock_contract` context, so `ParticipantLifetime.contains_ns` was
+  **deleted outright** (local stop-patching rule: no replacement under
+  another name such as `contains_time`, `before_start`, `after_start`,
+  `in_lifetime`, `timestamp_within`, or `compare_ns`).
+  `ParticipantLifetime` is now purely immutable structural data (identity,
+  `start_ns`/`end_ns`, `start_pos`/`end_pos`, `termination_kind`) with no
+  query method at all in S2. This does not touch
+  `build_participant_table`'s own internal validation: every record inside
+  one `harness-events.jsonl` stream is emitted by the same single writer
+  process (the singleton `process_identity` the prior reconciliation pass
+  established), so ordering those records' own `monotonic_ns` values
+  against each other needs no external clock-domain proof — there is
+  exactly one writer, one clock. The historical
+  `stop_reader_pre_t0_before_process_start` witness is represented in S2
+  as two independent structural facts only — the reader lifetime's own
+  `start_ns` and the pre-T0 observer record's own `monotonic_ns` — with no
+  relation derived between them; it is **UNRESOLVED AT S2 RELATION
+  LEVEL**, not `GAP`/`INCOMPLETE`, discharged only once a later stage has
+  validated the shared clock-domain contract (that later stage is not
+  implemented here, and clock-domain proof is never assigned automatically
+  to `admit()` — whatever consumes the relation must be preceded by that
+  proof). `TimedRecordRef` remains data-only (`pos`, `monotonic_ns`); its
+  documentation now states explicitly that it establishes no comparability
+  with a timestamp from another stream or participant. Still
+  **IMPLEMENTED / AWAITING INDEPENDENT REVIEW**, not accepted.
 - **S3–S6** (future, not started): the remaining dormant v7 authority-core
   stages, each its own independently SHA-gated/reviewed commit boundary on
   this same Draft PR #53. No real experiment. No production authority.
