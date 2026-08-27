@@ -83,6 +83,28 @@ def _discover_python_modules(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
 
 
+def _module_identity(path: Path, package_root: Path) -> str:
+    """Canonical module ownership identity: ``path`` expressed as a
+    forward-slash POSIX path relative to ``package_root`` -- NEVER
+    ``Path.name`` / a bare basename.
+
+    Ownership-identity correction (this pass): because
+    :func:`_discover_python_modules` is recursive, a bare basename is not a
+    module identity -- ``physical.py`` at the package root and
+    ``nested_stage/physical.py`` in a nested subpackage share a basename
+    but are two entirely different modules. Comparing ownership by
+    basename alone would let a future nested module silently inherit a
+    root module's S2 ownership, or a root type's designated-constructor
+    ownership, merely by choosing a colliding filename. Every ownership
+    comparison in this file (S2 classification via
+    :data:`S2_OWNED_MODULE_IDENTITIES`/:func:`_unclassified_modules`, and
+    the designated-constructor-owner exemption in
+    ``test_designated_constructors_are_not_called_outside_their_owning_module``)
+    must use this canonical identity instead."""
+
+    return path.relative_to(package_root).as_posix()
+
+
 # Every implementation module under the v7 package, discovered from the
 # filesystem (never a hard-coded list of today's filenames -- see
 # _discover_python_modules above).
@@ -108,7 +130,7 @@ def _discover_python_modules(root: Path) -> list[Path]:
 #                        which stage owns a module, so a not-yet-classified
 #                        future module is still bound by them.
 #
-#   S2_MODULE_PATHS  -- only the modules S2_OWNED_MODULE_FILENAMES
+#   S2_MODULE_PATHS  -- only the modules S2_OWNED_MODULE_IDENTITIES
 #                        explicitly declares as S2's own. S2-STAGE-SCOPE
 #                        gates (vocabulary, verdict-prefixes, import
 #                        allowlist, relative-import allowlist, clock/
@@ -120,27 +142,44 @@ def _discover_python_modules(root: Path) -> list[Path]:
 # silently exempted from anything nor silently subjected to S2's rules --
 # see test_every_discovered_v7_module_is_explicitly_classified, which fails
 # loudly until a human makes that explicit ownership decision (S3's own
-# future test pass would add its filenames to a parallel declared set, the
+# future test pass would add its identities to a parallel declared set, the
 # same way this one declares S2's).
+#
+# Ownership-identity correction (this pass): classification below is keyed
+# on _module_identity (a package-relative path), never Path.name. A future
+# nested module such as ``nested_stage/physical.py`` shares a basename with
+# the real ``physical.py`` but is a different module and must not silently
+# inherit its ownership -- see
+# test_nested_module_with_colliding_basename_is_not_classified_as_root_s2_module
+# for the hermetic proof.
 V7_MODULE_PATHS = _discover_python_modules(V7_PACKAGE_DIR)
 
-S2_OWNED_MODULE_FILENAMES: frozenset[str] = frozenset(
+S2_OWNED_MODULE_IDENTITIES: frozenset[str] = frozenset(
     {"__init__.py", "physical.py", "records.py", "participants.py"}
 )
 
 
 def _unclassified_modules(
-    discovered: Sequence[Path], owned_filenames: frozenset[str]
+    discovered: Sequence[Path], owned_identities: frozenset[str], package_root: Path
 ) -> list[Path]:
-    """Every discovered module whose filename is not in an explicit
-    ownership set -- the shared fail-closed classification-gate logic, used
-    both by the real S2 gate below and by its hermetic proof against a
-    temporary package."""
+    """Every discovered module whose canonical package-relative identity
+    (see :func:`_module_identity`) is not in an explicit ownership set --
+    the shared fail-closed classification-gate logic, used both by the
+    real S2 gate below and by its hermetic proof against a temporary
+    package. Never compares by ``Path.name`` alone -- a nested module
+    sharing a basename with an owned root module (e.g.
+    ``nested_stage/physical.py`` vs. ``physical.py``) is a distinct
+    identity and must not be silently classified as owned merely because
+    its basename matches."""
 
-    return [p for p in discovered if p.name not in owned_filenames]
+    return [
+        p for p in discovered if _module_identity(p, package_root) not in owned_identities
+    ]
 
 
-S2_MODULE_PATHS = [p for p in V7_MODULE_PATHS if p.name in S2_OWNED_MODULE_FILENAMES]
+S2_MODULE_PATHS = [
+    p for p in V7_MODULE_PATHS if _module_identity(p, V7_PACKAGE_DIR) in S2_OWNED_MODULE_IDENTITIES
+]
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1787,20 +1826,24 @@ def test_v7_module_paths_matches_filesystem_exactly() -> None:
 def test_every_discovered_v7_module_is_explicitly_classified() -> None:
     """R1 correction, fail-closed classification gate (point 6): every
     module V7_MODULE_PATHS discovers on disk today must be an explicitly
-    declared S2-owned module (S2_OWNED_MODULE_FILENAMES) -- a module that
-    is neither classified S2-owned nor recognized here is not silently
-    exempted from S2-stage-scope gates (which would wrongly let it dodge
-    S2's own rules while still masquerading as S2 code) nor silently
-    subjected to them (which would reintroduce the R1 defect for a real
-    future stage). It must instead fail this test loudly until a human
-    makes that explicit ownership decision -- for a real future stage, by
-    adding its filenames to a parallel declared set the same way this one
-    declares S2's, not by relaxing this one. See
+    declared S2-owned module (S2_OWNED_MODULE_IDENTITIES, keyed on the
+    canonical package-relative :func:`_module_identity`, never a bare
+    basename) -- a module that is neither classified S2-owned nor
+    recognized here is not silently exempted from S2-stage-scope gates
+    (which would wrongly let it dodge S2's own rules while still
+    masquerading as S2 code) nor silently subjected to them (which would
+    reintroduce the R1 defect for a real future stage). It must instead
+    fail this test loudly until a human makes that explicit ownership
+    decision -- for a real future stage, by adding its identities to a
+    parallel declared set the same way this one declares S2's, not by
+    relaxing this one. See
     test_unclassified_future_module_fails_the_classification_gate for the
     hermetic proof of this same mechanism against a module that does not
     exist anywhere in this repository."""
 
-    unclassified = _unclassified_modules(V7_MODULE_PATHS, S2_OWNED_MODULE_FILENAMES)
+    unclassified = _unclassified_modules(
+        V7_MODULE_PATHS, S2_OWNED_MODULE_IDENTITIES, V7_PACKAGE_DIR
+    )
     assert unclassified == [], [p.name for p in unclassified]
     # Concrete, currently-true equality alongside the structural check
     # above: today every discovered module is S2-owned (S3+ is not
@@ -1824,11 +1867,271 @@ def test_unclassified_future_module_fails_the_classification_gate(tmp_path: Path
 
     discovered = _discover_python_modules(fake_package)
     fake_s2_owned = frozenset({"__init__.py", "physical.py", "records.py", "participants.py"})
-    unclassified = _unclassified_modules(discovered, fake_s2_owned)
+    unclassified = _unclassified_modules(discovered, fake_s2_owned, fake_package)
 
     assert {p.name for p in unclassified} == {"mystery.py"}
     with pytest.raises(AssertionError):
         assert unclassified == [], [p.name for p in unclassified]
+
+
+# --- Ownership-identity correction: basename is not module identity ------
+
+
+def test_module_identity_is_package_relative_path_not_basename() -> None:
+    """Ownership-identity correction, direct unit proof: canonical module
+    identity is the path relative to the package root, never
+    ``Path.name``. Two paths sharing a basename
+    (``physical.py`` at the package root vs. a hypothetical
+    ``nested_stage/physical.py``) must resolve to distinct identities."""
+
+    root_physical = V7_PACKAGE_DIR / "physical.py"
+    nested_physical = V7_PACKAGE_DIR / "nested_stage" / "physical.py"
+
+    assert _module_identity(root_physical, V7_PACKAGE_DIR) == "physical.py"
+    assert _module_identity(nested_physical, V7_PACKAGE_DIR) == "nested_stage/physical.py"
+    assert root_physical.name == nested_physical.name  # same basename ...
+    assert _module_identity(root_physical, V7_PACKAGE_DIR) != _module_identity(
+        nested_physical, V7_PACKAGE_DIR
+    )  # ... but distinct canonical identity
+
+
+def test_nested_module_with_colliding_basename_is_not_classified_as_root_s2_module(
+    tmp_path: Path,
+) -> None:
+    """Ownership-identity correction, adversarial proof (points 1, 2, 5, 6):
+    a nested future-stage module sharing a basename with a real root S2
+    module (``nested_stage/__init__.py`` vs. ``__init__.py``,
+    ``nested_stage/records.py`` vs. ``records.py``, and similarly for
+    ``physical.py``/``participants.py``) must NOT be classified as that
+    root module -- only the root-level modules are genuinely S2-owned; the
+    nested ones are correctly unclassified (failing the classification
+    gate loudly, exactly like any other unrecognized future module). Never
+    a real tracked module; a temporary directory only."""
+
+    fake_package = tmp_path / "family_b_13_v7_fake"
+    fake_package.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py"):
+        (fake_package / name).write_text("# stub\n", encoding="utf-8")
+
+    nested = fake_package / "nested_stage"
+    nested.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py", "mystery.py"):
+        (nested / name).write_text("# stub\n", encoding="utf-8")
+
+    discovered = _discover_python_modules(fake_package)
+    fake_s2_owned = frozenset({"__init__.py", "physical.py", "records.py", "participants.py"})
+
+    fake_s2_paths = [
+        p for p in discovered if _module_identity(p, fake_package) in fake_s2_owned
+    ]
+    # Point 5: the four ROOT modules remain correctly classified S2-owned --
+    # exactly the same four identities as before, never fewer, never more.
+    assert {_module_identity(p, fake_package) for p in fake_s2_paths} == fake_s2_owned
+    assert all(p.parent == fake_package for p in fake_s2_paths)
+
+    # Points 1, 2, 6: every NESTED module -- including __init__.py and
+    # records.py, which literally share a basename with an owned root
+    # module -- is unclassified, not silently treated as the root module it
+    # collides with.
+    unclassified = _unclassified_modules(discovered, fake_s2_owned, fake_package)
+    assert {_module_identity(p, fake_package) for p in unclassified} == {
+        "nested_stage/__init__.py",
+        "nested_stage/physical.py",
+        "nested_stage/records.py",
+        "nested_stage/participants.py",
+        "nested_stage/mystery.py",
+    }
+    with pytest.raises(AssertionError):
+        assert unclassified == [], [p.name for p in unclassified]
+
+    # Positive control proving the basename-only bug this pass corrects:
+    # under Path.name alone, every nested module WOULD have matched a root
+    # owned name except mystery.py -- showing this test would have failed
+    # to catch the regression if identity had stayed basename-based.
+    basename_only_owned = {p.name for p in unclassified if p.name != "mystery.py"}
+    assert basename_only_owned == fake_s2_owned
+
+
+def test_nested_module_with_colliding_basename_is_not_treated_as_designated_constructor_owner(
+    tmp_path: Path,
+) -> None:
+    """Ownership-identity correction, adversarial proof (points 3, 4): a
+    nested future-stage module sharing a basename with a real S2 module
+    (``nested_stage/physical.py`` vs. ``physical.py``;
+    ``nested_stage/participants.py`` vs. ``participants.py``) must NOT
+    inherit that real module's designated-constructor ownership merely
+    because ``Path.name`` matches -- reproducing the corrected comparison
+    the real
+    ``test_designated_constructors_are_not_called_outside_their_owning_module``
+    gate uses. Never a real tracked module; a temporary directory only."""
+
+    fake_package = tmp_path / "family_b_13_v7_fake"
+    fake_package.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py"):
+        (fake_package / name).write_text("# stub\n", encoding="utf-8")
+
+    nested = fake_package / "nested_stage"
+    nested.mkdir()
+    (nested / "__init__.py").write_text("# stub\n", encoding="utf-8")
+    (nested / "records.py").write_text("# stub\n", encoding="utf-8")
+    nested_physical_source = (
+        "from ..physical import PhysicalStreamSnapshot\n\n"
+        "def rogue():\n"
+        "    return PhysicalStreamSnapshot(1, 2, 3)\n"
+    )
+    (nested / "physical.py").write_text(nested_physical_source, encoding="utf-8")
+    nested_participants_source = (
+        "from ..participants import ParticipantLifetime, ParticipantTable\n\n"
+        "def rogue():\n"
+        "    ParticipantLifetime(1, 2, 3, 4, 5, 6)\n"
+        "    return ParticipantTable({})\n"
+    )
+    (nested / "participants.py").write_text(nested_participants_source, encoding="utf-8")
+
+    discovered = _discover_python_modules(fake_package)
+    nested_physical = nested / "physical.py"
+    nested_participants = nested / "participants.py"
+    assert nested_physical in discovered
+    assert nested_participants in discovered
+
+    fake_designated_owners = {
+        "ParticipantLifetime": "participants.py",
+        "ParticipantTable": "participants.py",
+        "PhysicalStreamSnapshot": "physical.py",
+    }
+
+    physical_identity = _module_identity(nested_physical, fake_package)
+    participants_identity = _module_identity(nested_participants, fake_package)
+    assert physical_identity == "nested_stage/physical.py"
+    assert participants_identity == "nested_stage/participants.py"
+
+    # Positive control proving the basename-only bug this pass corrects:
+    # under Path.name alone, both nested modules WOULD have matched their
+    # real owner's filename and been silently exempted.
+    assert nested_physical.name == fake_designated_owners["PhysicalStreamSnapshot"]
+    assert nested_participants.name == fake_designated_owners["ParticipantLifetime"]
+
+    # The CORRECTED comparison: canonical package-relative identity, never
+    # a bare basename -- neither nested module equals its real owner's
+    # identity, so neither is exempted.
+    assert physical_identity != fake_designated_owners["PhysicalStreamSnapshot"]
+    assert participants_identity != fake_designated_owners["ParticipantLifetime"]
+    assert participants_identity != fake_designated_owners["ParticipantTable"]
+
+    # Reproducing the real gate's own logic against these nested modules:
+    # with no exemption granted, their illegal direct-construction calls
+    # are correctly still detectable.
+    physical_tree = ast.parse(nested_physical_source)
+    physical_called = _direct_call_names(physical_tree)
+    assert "PhysicalStreamSnapshot" in physical_called
+    is_physical_exempted = physical_identity == fake_designated_owners["PhysicalStreamSnapshot"]
+    assert not is_physical_exempted
+    # -> the real gate's `assert type_name not in called` would run (never
+    # skipped by a `continue`) and correctly FAIL here.
+
+    participants_tree = ast.parse(nested_participants_source)
+    participants_called = _direct_call_names(participants_tree)
+    assert "ParticipantLifetime" in participants_called
+    assert "ParticipantTable" in participants_called
+    is_participants_exempted = (
+        participants_identity == fake_designated_owners["ParticipantLifetime"]
+    )
+    assert not is_participants_exempted
+
+
+def test_permanent_gates_still_discover_nested_modules_recursively(tmp_path: Path) -> None:
+    """Ownership-identity correction, adversarial proof (point 7): the
+    ownership-identity fix only changes HOW ownership is compared, never
+    WHETHER a nested module is discovered -- recursive discovery
+    (unaffected by this pass) still finds a nested future-stage module, so
+    the PERMANENT package-wide gates (which parametrize over the full
+    discovered set, not the S2-classified subset) still see it and can
+    still flag its violations. Never a real tracked module; a temporary
+    directory only."""
+
+    fake_package = tmp_path / "family_b_13_v7_fake"
+    fake_package.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py"):
+        (fake_package / name).write_text("# stub\n", encoding="utf-8")
+    nested = fake_package / "nested_stage"
+    nested.mkdir()
+    (nested / "__init__.py").write_text("# stub\n", encoding="utf-8")
+    nested_source = (
+        "from tests.oracles.family_b_13.v6 import blocker_b_family_b_13_analyzer\n"
+    )
+    (nested / "physical.py").write_text(nested_source, encoding="utf-8")
+
+    discovered = _discover_python_modules(fake_package)
+    nested_physical = nested / "physical.py"
+    # Discovery scope (permanent-gate scope) is unaffected by the
+    # ownership-identity fix: the nested module is still found.
+    assert nested_physical in discovered
+
+    # The permanent frozen-oracle-import-prohibition gate's own detection
+    # logic still flags it, regardless of ownership classification --
+    # unlike the S2-scope/designated-constructor gates, this one never
+    # exempts by identity at all.
+    tree = ast.parse(nested_source)
+    targets: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            targets.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            targets.add(node.module)
+    assert any("oracle" in t or "analyzer" in t for t in targets)
+
+
+def test_nested_future_stage_module_remains_free_of_s2_scope_restrictions_despite_colliding_basename(
+    tmp_path: Path,
+) -> None:
+    """Ownership-identity correction, adversarial proof (point 8): a
+    correctly-classified future-stage module using accepted-design
+    vocabulary remains free of S2-stage-scope restrictions even when it
+    happens to share a basename with a real S2 module
+    (``nested_stage/physical.py`` vs. root ``physical.py``) -- proving the
+    ownership-identity fix does not accidentally widen S2-scope
+    enforcement onto it merely because of the name collision. Never a real
+    tracked module; a temporary directory only."""
+
+    fake_package = tmp_path / "family_b_13_v7_fake"
+    fake_package.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py"):
+        (fake_package / name).write_text("# stub\n", encoding="utf-8")
+    nested = fake_package / "nested_stage"
+    nested.mkdir()
+    (nested / "__init__.py").write_text("# stub\n", encoding="utf-8")
+    hypothetical_source = (
+        "from dataclasses import dataclass\n"
+        "\n"
+        "\n"
+        "@dataclass(frozen=True)\n"
+        "class ChronologySpec:\n"
+        "    t0_ns: int\n"
+        "\n"
+        "\n"
+        "def admit(spec: ChronologySpec) -> bool:\n"
+        "    return True\n"
+    )
+    (nested / "physical.py").write_text(hypothetical_source, encoding="utf-8")
+
+    discovered = _discover_python_modules(fake_package)
+    fake_s2_owned = frozenset({"__init__.py", "physical.py", "records.py", "participants.py"})
+    nested_physical = nested / "physical.py"
+
+    # Positive control: the vocabulary really is present.
+    identifiers = _code_identifiers(hypothetical_source)
+    assert identifiers & FORBIDDEN_AUTHORITY_IDENTIFIERS == {"ChronologySpec", "admit"}
+
+    # Despite sharing a basename with the real S2 physical.py, its
+    # canonical package-relative identity is NOT in the S2-owned set, so
+    # the S2-scope gate never parametrizes over it.
+    identity = _module_identity(nested_physical, fake_package)
+    assert identity == "nested_stage/physical.py"
+    assert identity not in fake_s2_owned
+    fake_s2_paths = [
+        p for p in discovered if _module_identity(p, fake_package) in fake_s2_owned
+    ]
+    assert nested_physical not in fake_s2_paths
 
 
 def test_hypothetical_future_stage_module_is_not_rejected_for_using_accepted_later_stage_vocabulary(
@@ -1867,8 +2170,10 @@ def test_hypothetical_future_stage_module_is_not_rejected_for_using_accepted_lat
 
     discovered = _discover_python_modules(fake_package)
     fake_s2_owned = frozenset({"__init__.py", "physical.py", "records.py", "participants.py"})
-    fake_s2_paths = [p for p in discovered if p.name in fake_s2_owned]
-    fake_future_paths = _unclassified_modules(discovered, fake_s2_owned)
+    fake_s2_paths = [
+        p for p in discovered if _module_identity(p, fake_package) in fake_s2_owned
+    ]
+    fake_future_paths = _unclassified_modules(discovered, fake_s2_owned, fake_package)
     assert {p.name for p in fake_future_paths} == {"s3.py"}
     assert (fake_package / "s3.py") not in fake_s2_paths
 
@@ -1908,7 +2213,7 @@ def test_hypothetical_future_stage_module_may_legally_consume_participant_table(
 
     discovered = _discover_python_modules(fake_package)
     fake_s2_owned = frozenset({"__init__.py", "physical.py", "records.py", "participants.py"})
-    fake_future_paths = _unclassified_modules(discovered, fake_s2_owned)
+    fake_future_paths = _unclassified_modules(discovered, fake_s2_owned, fake_package)
     assert {p.name for p in fake_future_paths} == {"s3.py"}
 
     tree = ast.parse(hypothetical_s3)
@@ -1936,7 +2241,7 @@ def test_v7_module_contains_no_authority_stage_vocabulary_still_applies_to_s2_mo
     parametrized over an empty list."""
 
     assert S2_MODULE_PATHS
-    assert {p.name for p in S2_MODULE_PATHS} == S2_OWNED_MODULE_FILENAMES
+    assert {p.name for p in S2_MODULE_PATHS} == S2_OWNED_MODULE_IDENTITIES
     for path in S2_MODULE_PATHS:
         identifiers = _code_identifiers(path.read_text(encoding="utf-8"))
         assert identifiers.isdisjoint(FORBIDDEN_AUTHORITY_IDENTIFIERS), path.name
@@ -2202,6 +2507,16 @@ def _direct_call_names(tree: ast.AST) -> set[str]:
 # which are deliberately NOT restricted here because no concrete
 # false-authority path requires it (S2 final finite corrective, section
 # 20).
+#
+# Ownership-identity correction (this pass): keys are canonical
+# package-relative identities (see _module_identity), never bare
+# basenames. Both real owners here happen to sit at the package root, so
+# their identity equals their filename today -- but the comparison below
+# must not degrade to Path.name, or a nested future module sharing a
+# basename (e.g. a hypothetical nested_stage/physical.py) would silently
+# inherit root physical.py's ownership of PhysicalStreamSnapshot. See
+# test_nested_module_with_colliding_basename_is_not_treated_as_designated_constructor_owner
+# for the hermetic proof.
 _DESIGNATED_CONSTRUCTOR_OWNERS: dict[str, str] = {
     "ParticipantLifetime": "participants.py",
     "ParticipantTable": "participants.py",
@@ -2226,14 +2541,20 @@ def test_designated_constructors_are_not_called_outside_their_owning_module(
     _discover_python_modules), not S2_MODULE_PATHS, so a future S3+ module
     added under this same package automatically enters this gate too -- see
     test_discovery_finds_a_hypothetical_future_module_without_editing_a_hard_coded_list
-    for a hermetic proof of that claim. Applies to the implementation
-    package, not this test module, which exercises the type-boundary
-    invariants by direct construction by design."""
+    for a hermetic proof of that claim. The owner exemption below compares
+    canonical package-relative identity (see _module_identity), never
+    Path.name, so a nested future module cannot inherit ownership merely by
+    sharing a root module's basename -- see
+    test_nested_module_with_colliding_basename_is_not_treated_as_designated_constructor_owner.
+    Applies to the implementation package, not this test module, which
+    exercises the type-boundary invariants by direct construction by
+    design."""
 
     tree = ast.parse(path.read_text(encoding="utf-8"))
     called = _direct_call_names(tree)
-    for type_name, owner_filename in _DESIGNATED_CONSTRUCTOR_OWNERS.items():
-        if path.name == owner_filename:
+    module_identity = _module_identity(path, V7_PACKAGE_DIR)
+    for type_name, owner_identity in _DESIGNATED_CONSTRUCTOR_OWNERS.items():
+        if module_identity == owner_identity:
             continue
         assert type_name not in called, (path.name, type_name)
 
