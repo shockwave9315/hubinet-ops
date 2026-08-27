@@ -60,11 +60,28 @@ frozen v6 helper                        category                 in S1?
 ``_require_signed_int``                 LEXICAL_VALIDATOR        yes -- ``require_signed_int``
 ``_require_bool``                       LEXICAL_VALIDATOR        yes -- ``require_bool``
 ``_require_upid`` / ``_decode_upid``    PURE_DECODER             yes -- ``parse_upid``
-``_task_bucket_path`` (bucket half)     LEXICAL_VALIDATOR        yes -- ``validate_task_bucket_identifier``
-``_decode_inotify_raw_mask``            PURE_DECODER             yes -- ``decode_inotify_raw_mask``
-``_validated_inotify_masks``            PURE_DECODER             yes -- ``inotify_masks_agree`` (raw/declared agreement only;
-                                                                        no chronology/record beyond the one mask pair)
-``_watch_gap_reasons``                  PURE_DECODER             yes -- ``watch_gap_reasons`` (name-set -> reason-set only)
+``_task_bucket_path`` (identifier half) LEXICAL_VALIDATOR        yes -- ``validate_task_bucket_identifier`` (bucket-identifier
+                                                                        lexical check only; the path-join half is unchecked
+                                                                        string composition with no S1 vector/differential
+                                                                        target and no S1 consumer, so it is intentionally
+                                                                        not exported here)
+``_require_int`` + ``_decode_inotify_raw_mask``
+                                         PURE_DECODER             yes -- ``decode_inotify_raw_mask`` (the full sealed-value
+                                                                        primitive: nonnegative-integer typing, exactly as
+                                                                        frozen v6 composes them, then unknown-bit decoding)
+``_validated_inotify_masks``            PURE_DECODER             yes -- ``inotify_masks_agree`` (sealed-value raw/declared
+                                                                        agreement only; no chronology/record beyond the one
+                                                                        mask pair)
+``_watch_gap_reasons``                  AUTHORITY_OR_CLASSIFICATION no -- maps an already-valid decoded inotify name set to
+                                                                        a *result-bearing observer-gap reason* label
+                                                                        (``watch_queue_overflow`` /
+                                                                        ``watch_invalidation_or_loss``). That is semantic
+                                                                        observation classification, not syntax/serialization
+                                                                        decoding -- it answers "does this evidence count as a
+                                                                        gap," which S1's core design rule (module docstring,
+                                                                        "Scope boundary") explicitly excludes. Deferred to
+                                                                        S2+, where the typed observation/finding model exists
+                                                                        to hold it correctly.
 ``_validated_canonical_absolute_path``  LEXICAL_VALIDATOR        yes -- ``validate_canonical_absolute_path``
 ``_without_trailing_line_terminator``   PURE_PARSER              yes -- ``strip_trailing_line_terminator``
 ``_split_lf_crlf_lines``                PURE_PARSER              yes -- ``split_lines_lf_crlf``
@@ -136,10 +153,8 @@ __all__ = [
     "require_bool",
     "parse_upid",
     "validate_task_bucket_identifier",
-    "task_bucket_path",
     "decode_inotify_raw_mask",
     "inotify_masks_agree",
-    "watch_gap_reasons",
     "validate_canonical_absolute_path",
     "strip_trailing_line_terminator",
     "split_lines_lf_crlf",
@@ -365,39 +380,38 @@ def validate_task_bucket_identifier(value: Any) -> ParseResult:
     return ParseResult.success(value)
 
 
-def task_bucket_path(task_root: str, bucket: str) -> str:
-    """Join an already-validated task root and bucket identifier.
-
-    Pure string composition -- this does not itself validate either input;
-    callers validate ``task_root`` with ``validate_canonical_absolute_path``
-    and ``bucket`` with ``validate_task_bucket_identifier`` first.
-    """
-
-    return f"{task_root}/{bucket}"
-
-
 # ---------------------------------------------------------------------------
 # inotify
 # ---------------------------------------------------------------------------
 
 
-def decode_inotify_raw_mask(raw_mask: int) -> ParseResult:
-    """Decode a raw inotify event mask into its known event-name set.
+def decode_inotify_raw_mask(raw_mask: Any) -> ParseResult:
+    """Decode a sealed raw inotify event mask value into its known
+    event-name set.
 
-    An unknown bit fails closed rather than being silently dropped.
+    This is the full sealed-value primitive: the input is first required to
+    be a nonnegative integer (matching frozen v6's
+    ``_require_int`` + ``_decode_inotify_raw_mask`` composition -- a
+    ``bool`` is rejected even though it is an ``int`` subclass, and a
+    negative value is rejected), and only then decoded. An unknown bit
+    fails closed rather than being silently dropped.
     """
 
-    unknown_bits = raw_mask & ~INOTIFY_KNOWN_RAW_MASK
+    typed = require_nonnegative_int(raw_mask)
+    if not typed.ok:
+        return typed
+    unknown_bits = typed.value & ~INOTIFY_KNOWN_RAW_MASK
     if unknown_bits:
         return ParseResult.failure("inotify_raw_mask_unknown_bits")
     return ParseResult.success(
-        frozenset(name for name, bit in INOTIFY_EVENT_MASKS.items() if raw_mask & bit)
+        frozenset(name for name, bit in INOTIFY_EVENT_MASKS.items() if typed.value & bit)
     )
 
 
-def inotify_masks_agree(raw_mask: int, declared_mask: list[Any]) -> ParseResult:
-    """Decode ``raw_mask`` and require it to exactly agree with the declared
-    textual mask list (no duplicates, same event-name set either direction).
+def inotify_masks_agree(raw_mask: Any, declared_mask: list[Any]) -> ParseResult:
+    """Decode ``raw_mask`` (a sealed value, validated as above) and require
+    it to exactly agree with the declared textual mask list (no
+    duplicates, same event-name set either direction).
 
     The raw mask remains authoritative; a declared textual mask can never
     introduce an event the raw mask does not carry, and vice versa.
@@ -416,20 +430,6 @@ def inotify_masks_agree(raw_mask: int, declared_mask: list[Any]) -> ParseResult:
     if declared_set != decoded.value:
         return ParseResult.failure("inotify_mask_mismatch_raw_mask")
     return ParseResult.success(decoded.value)
-
-
-def watch_gap_reasons(masks: frozenset[str]) -> frozenset[str]:
-    """Map a decoded inotify event-name set to structural observer-gap
-    reason keywords. Purely a name-set -> name-set mapping; carries no
-    opinion about whether the owning watch record is itself in scope for
-    any particular interval or run."""
-
-    reasons: set[str] = set()
-    if "IN_Q_OVERFLOW" in masks:
-        reasons.add("watch_queue_overflow")
-    if masks.intersection({"IN_IGNORED", "IN_UNMOUNT", "IN_DELETE_SELF", "IN_MOVE_SELF"}):
-        reasons.add("watch_invalidation_or_loss")
-    return frozenset(reasons)
 
 
 # ---------------------------------------------------------------------------

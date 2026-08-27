@@ -842,64 +842,6 @@
     "description": "An unknown raw bit is rejected before the declared mask is even inspected."
   },
   {
-    "vector_id": "watch_gap_reasons_queue_overflow",
-    "parser_family": "watch_gap_reasons",
-    "primitive_function": "watch_gap_reasons",
-    "frozen_equivalent": "_watch_gap_reasons",
-    "input": {
-      "kind": "masks_set",
-      "names": [
-        "IN_Q_OVERFLOW"
-      ]
-    },
-    "expected": {
-      "category": "success",
-      "value": [
-        "watch_queue_overflow"
-      ]
-    },
-    "provenance": "frozen_v6",
-    "description": "IN_Q_OVERFLOW alone maps to the queue-overflow reason keyword."
-  },
-  {
-    "vector_id": "watch_gap_reasons_invalidation_bits",
-    "parser_family": "watch_gap_reasons",
-    "primitive_function": "watch_gap_reasons",
-    "frozen_equivalent": "_watch_gap_reasons",
-    "input": {
-      "kind": "masks_set",
-      "names": [
-        "IN_DELETE_SELF"
-      ]
-    },
-    "expected": {
-      "category": "success",
-      "value": [
-        "watch_invalidation_or_loss"
-      ]
-    },
-    "provenance": "frozen_v6",
-    "description": "Any of IN_IGNORED/IN_UNMOUNT/IN_DELETE_SELF/IN_MOVE_SELF maps to the invalidation-or-loss reason keyword."
-  },
-  {
-    "vector_id": "watch_gap_reasons_benign_bits",
-    "parser_family": "watch_gap_reasons",
-    "primitive_function": "watch_gap_reasons",
-    "frozen_equivalent": "_watch_gap_reasons",
-    "input": {
-      "kind": "masks_set",
-      "names": [
-        "IN_CREATE"
-      ]
-    },
-    "expected": {
-      "category": "success",
-      "value": []
-    },
-    "provenance": "frozen_v6",
-    "description": "An ordinary creation event carries no structural gap reason."
-  },
-  {
     "vector_id": "posix_path_canonical_absolute",
     "parser_family": "posix_path",
     "primitive_function": "validate_canonical_absolute_path",
@@ -1249,5 +1191,108 @@
     },
     "provenance": "historical_regression",
     "description": "A bare CR not immediately followed by an LF boundary is never a line delimiter by itself and is preserved as content."
+  },
+  {
+    "vector_id": "inotify_decode_bool_true_rejected",
+    "parser_family": "inotify_decode",
+    "primitive_function": "decode_inotify_raw_mask",
+    "frozen_equivalent": "_require_int+_decode_inotify_raw_mask",
+    "input": {
+      "kind": "value",
+      "value": true
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonnegative_integer"
+    },
+    "provenance": "boundary_case",
+    "description": "bool is an int subclass in Python; the sealed-value inotify decoder must reject it exactly like every other nonnegative-integer field, matching frozen v6's _require_int + _decode_inotify_raw_mask composition."
+  },
+  {
+    "vector_id": "inotify_decode_negative_rejected",
+    "parser_family": "inotify_decode",
+    "primitive_function": "decode_inotify_raw_mask",
+    "frozen_equivalent": "_require_int+_decode_inotify_raw_mask",
+    "input": {
+      "kind": "value",
+      "value": -1
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonnegative_integer"
+    },
+    "provenance": "boundary_case",
+    "description": "A negative raw_mask is rejected before any bit decoding is attempted."
+  },
+  {
+    "vector_id": "inotify_decode_string_rejected",
+    "parser_family": "inotify_decode",
+    "primitive_function": "decode_inotify_raw_mask",
+    "frozen_equivalent": "_require_int+_decode_inotify_raw_mask",
+    "input": {
+      "kind": "value",
+      "value": "256"
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonnegative_integer"
+    },
+    "provenance": "boundary_case",
+    "description": "A textual '256' is not an integer; raw_mask must be sealed as an int, never coerced from a numeric-looking string."
+  },
+  {
+    "vector_id": "inotify_agreement_raw_mask_bool_true_rejected",
+    "parser_family": "inotify_agreement",
+    "primitive_function": "inotify_masks_agree",
+    "frozen_equivalent": "_validated_inotify_masks",
+    "input": {
+      "kind": "mask_pair",
+      "raw_mask": true,
+      "declared_mask": [
+        "IN_ACCESS"
+      ]
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonnegative_integer"
+    },
+    "provenance": "boundary_case",
+    "description": "A boolean raw_mask is rejected before the declared mask is even inspected."
+  },
+  {
+    "vector_id": "inotify_agreement_raw_mask_negative_rejected",
+    "parser_family": "inotify_agreement",
+    "primitive_function": "inotify_masks_agree",
+    "frozen_equivalent": "_validated_inotify_masks",
+    "input": {
+      "kind": "mask_pair",
+      "raw_mask": -1,
+      "declared_mask": []
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonnegative_integer"
+    },
+    "provenance": "boundary_case",
+    "description": "A negative raw_mask is rejected before the declared mask is even inspected."
+  },
+  {
+    "vector_id": "inotify_agreement_raw_mask_string_rejected",
+    "parser_family": "inotify_agreement",
+    "primitive_function": "inotify_masks_agree",
+    "frozen_equivalent": "_validated_inotify_masks",
+    "input": {
+      "kind": "mask_pair",
+      "raw_mask": "256",
+      "declared_mask": [
+        "IN_CREATE"
+      ]
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonnegative_integer"
+    },
+    "provenance": "boundary_case",
+    "description": "A textual raw_mask is rejected before the declared mask is even inspected."
   }
 ]

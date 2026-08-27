@@ -182,6 +182,38 @@ def test_every_vector_names_a_real_primitive_function(vectors: list[dict[str, An
         assert hasattr(primitives, name), (vector["vector_id"], name)
 
 
+def test_every_exported_function_has_vector_coverage(vectors: list[dict[str, Any]]) -> None:
+    """The converse of the check above: every public parsing FUNCTION this
+    module exports must be exercised by at least one parser-vector /
+    direct differential -- derived structurally from ``__all__`` and
+    ``inspect``, never a hard-coded function-name list, so adding an
+    uncovered export fails this test rather than silently shipping unproven.
+    Dataclasses/result types and constants are excluded: they carry no
+    parsing behavior of their own to differentially prove."""
+
+    import inspect
+
+    exported_functions = {
+        name for name in primitives.__all__ if inspect.isfunction(getattr(primitives, name))
+    }
+    covered_functions = {vector["primitive_function"] for vector in vectors}
+    uncovered = exported_functions - covered_functions
+    assert uncovered == set()
+
+
+def test_exported_function_count_is_seventeen() -> None:
+    """A concrete, currently-true number alongside the structural check
+    above (not instead of it) -- catches an export silently added or
+    removed without anyone noticing either way."""
+
+    import inspect
+
+    exported_functions = [
+        name for name in primitives.__all__ if inspect.isfunction(getattr(primitives, name))
+    ]
+    assert len(exported_functions) == 17
+
+
 # ---------------------------------------------------------------------------
 # Differential proof: same declarative input through both implementations
 # ---------------------------------------------------------------------------
@@ -253,12 +285,10 @@ def _run_new(vector: dict[str, Any]) -> dict[str, Any]:
         result = fn(input_spec["value"])
     elif family == "inotify_agreement":
         result = fn(input_spec["raw_mask"], input_spec["declared_mask"])
-    elif family == "watch_gap_reasons":
-        result = fn(frozenset(input_spec["names"]))
     else:
         raise AssertionError(f"unhandled parser_family: {family}")
 
-    if family in {"line_terminator_strip", "line_split", "terminal_status", "watch_gap_reasons"}:
+    if family in {"line_terminator_strip", "line_split", "terminal_status"}:
         # These primitives return a plain value directly (no ParseResult
         # envelope) -- they cannot fail; there is no error case to model.
         # classify_terminal_status returning None is a legitimate "not a
@@ -350,7 +380,11 @@ def _run_frozen(
             return {"category": "success", "value": bucket}
 
         if family == "inotify_decode":
-            decoded = oracle._decode_inotify_raw_mask(input_spec["value"], "v")
+            # Exact frozen sealed-value composition -- never call the
+            # internal unchecked decoder directly: _require_int first
+            # (rejects bool/negative/non-int), then _decode_inotify_raw_mask.
+            raw_mask = oracle._require_int({"raw_mask": input_spec["value"]}, "raw_mask")
+            decoded = oracle._decode_inotify_raw_mask(raw_mask, "v")
             return {"category": "success", "value": sorted(decoded)}
 
         if family == "inotify_agreement":
@@ -360,11 +394,6 @@ def _run_frozen(
             }
             decoded = oracle._validated_inotify_masks(record, "v")
             return {"category": "success", "value": sorted(decoded)}
-
-        if family == "watch_gap_reasons":
-            record = {"_masks": tuple(input_spec["names"])}
-            reasons = oracle._watch_gap_reasons(record)
-            return {"category": "success", "value": sorted(reasons)}
 
         if family == "posix_path":
             value = oracle._validated_canonical_absolute_path(

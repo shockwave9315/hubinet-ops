@@ -333,7 +333,17 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
   sealed-bytes-to-typed-primitive parsing; it does not implement, and must
   not be read as implementing, any part of the v7 authority core (§5) —
   **IMPLEMENTED / AWAITING INDEPENDENT REVIEW**, not accepted, until that
-  review actually occurs.
+  review actually occurs. A subsequent S1 corrective review tightened the
+  parser boundary: inotify raw-mask decoding now composes the frozen
+  sealed-value contract exactly (nonnegative-integer typing before bit
+  decoding, so a `bool`/negative/non-int raw mask fails closed identically
+  to frozen v6, not just a valid-int one); the semantic
+  inotify-mask-to-observer-gap-reason mapping (`watch_gap_reasons`) was
+  removed from S1 as out-of-scope classification, not syntax decoding, and
+  reclassified `AUTHORITY_OR_CLASSIFICATION`, deferred to S2+; and an
+  unproven, vector-less path-composition export (`task_bucket_path`) was
+  removed, keeping only the bucket-identifier lexical check the S1 vectors
+  actually prove.
 - **S2–S6** (future, not started): dormant v7 authority core, each stage its
   own independently SHA-gated/reviewed commit boundary on this same Draft
   PR #53. No real experiment. No production authority.
