@@ -1,6 +1,6 @@
 # NON-NORMATIVE RESEARCH / EVIDENCE
 
-# Family B experiment #13 harness — authority-core redesign checkpoint (S0.0)
+# Family B experiment #13 harness — authority-core redesign checkpoint (S0.0 + S0.1)
 
 This document is a checkpoint/design record for the Family B experiment #13
 pre-execution harness analyzer. It is **not** an ADR, **not** architecture
@@ -185,16 +185,85 @@ parser-vector differential tests, not by making the oracle use new code.
 
 **E. Differential gate G7.** Do not encode the old naive rule "v7 must
 always be `>=`/stricter than v6" — v6 is known-unsound. Differences require
-a checked-in migration expectation ledger. Absolutely forbidden without
-exception, and not overridable by any contract amendment:
+a checked-in migration expectation ledger. Known intentional old/new
+differences must be explicit, typed, and checked in. No runtime/operator
+override exists for any cell of this gate.
+
+**PREVIOUS G7 DECISION RETRACTED — over-broad differential rule.** S0.0
+stated an absolute, no-exception rule: *any* `v6 non-PASS -> v7 PASS`
+transition is forbidden. S0.1 corpus materialization found this over-broad:
+it collided with this checkpoint's own §5.13/§6.B, which requires v7 to
+recover `ANALYZER_PASS_TESTED_INTERLEAVING` for the fourth stop-triggering
+P1 (§3) — a post-T1 `gap_signal` that frozen v6 wrongly turns into
+`B_S1_GAP_DETECTED`. That is a v6 interval-partition bug (evidence from the
+wrong interval polluting the candidate result), not a contract loosening,
+and the reconciled design already required v7 to correct it. The
+contradiction was found and reported before any commit, before any v7 code
+existed — this is the declarative migration corpus doing its intended job.
+The over-broad rule is retracted and replaced below with a cause/cell-
+specific matrix. This is a correction to the differential migration gate,
+not a capture-v6 contract amendment.
+
+Differential legality is cause/cell-specific. `PASS`, `GAP`, `WITNESS`,
+`INCOMPLETE`, and `INELIGIBLE` below abbreviate `ANALYZER_PASS_TESTED_
+INTERLEAVING`, `B_S1_GAP_DETECTED`, `GENERATOR_WINDOW_ENUMERATION_OMISSION_
+WITNESS`, `HARNESS_INCOMPLETE`, and `ENVIRONMENT_INELIGIBLE`.
+
+Allowed without a ledger row: `same outcome -> same outcome`.
+
+Allowed with an exact checked-in ledger entry:
 
 ```text
-- any v6 non-PASS -> v7 PASS transition
-- v6 INELIGIBLE -> any non-INELIGIBLE result
+PASS      -> INCOMPLETE   reason_class = V6_UNSOUND
+PASS      -> GAP          reason_class = V6_UNSOUND
+PASS      -> WITNESS      reason_class = V6_UNSOUND
+GAP       -> PASS         reason_class = V6_INTERVAL_POLLUTION
+GAP       -> WITNESS      reason_class = V6_INTERVAL_POLLUTION
+GAP       -> INCOMPLETE   reason_class = V6_UNSOUND
+WITNESS   -> INCOMPLETE   reason_class = V6_UNSOUND
+WITNESS   -> GAP          reason_class = V6_UNSOUND
+non-INELIGIBLE -> INELIGIBLE   only with an exact reviewed V6_UNSOUND
+                                applicability witness
 ```
 
-Known intentional old/new differences must be explicit, typed, and checked
-in. No runtime/operator override exists for either forbidden cell.
+`V6_CRASH` remains a separately ledgered historical-oracle failure class,
+used only when the frozen oracle actually raises rather than returning an
+`AnalysisResult` for that fixture.
+
+Absolute / structural restrictions, current for this redesign, not
+overridable by any ledger reason including `CONTRACT_AMENDMENT`:
+
+```text
+1. INELIGIBLE -> any non-INELIGIBLE outcome        absolutely forbidden
+2. INCOMPLETE -> PASS                              forbidden for this
+                                                    redesign (G12: v7
+                                                    integrity coverage must
+                                                    not convert an
+                                                    incoherent capture into
+                                                    positive evidence)
+```
+
+Contract-amendment-only cells — legal only with `reason_class =
+CONTRACT_AMENDMENT` and a non-empty reference to a separately accepted
+contract change; the current redesign does not loosen capture-v6, so no such
+row exists yet:
+
+```text
+3. INCOMPLETE -> GAP        contract-amendment-only, no such amendment exists
+   INCOMPLETE -> WITNESS    contract-amendment-only, no such amendment exists
+```
+
+Not authorized by this correction, and not to be inferred from `GAP ->
+PASS`:
+
+```text
+4. WITNESS -> PASS   not authorized; a required witness apparently needing
+                     this transition must STOP and be reported separately
+```
+
+The migration ledger remains closed and explicit either way: no wildcard
+fixture IDs, no wildcard result pairs, no runtime/operator override field.
+Each row binds exactly one fixture and one expected transition.
 
 ## 7. Kill switch / gates
 
@@ -233,10 +302,26 @@ boundaries apply instead:
 
 - **Historical PR #52**: frozen / superseded research record. Not mutated by
   this checkpoint or this task.
-- **S0 / PR A** (this checkpoint): redesign/checkpoint documentation,
-  declarative witness corpus, frozen v6 oracle, migration expectation
-  ledger.
-- **S1 / PR B**: pure primitive parsers, parser-vector differential proof.
+- **S0 / PR A** — redesign checkpoint documentation, frozen v6 oracle,
+  declarative witness corpus, migration expectation ledger, and hermetic
+  asset gates. Staged in two sub-steps on this branch:
+  - **S0.0** (done at `702d4286dcbc2d2042a4d665a911841c8b282bb3`): the
+    redesign/project-tree checkpoint — this document (§1–§8) and the Family-B
+    S0 status entry in `docs/architecture/0.5-implementation-status.md`. The
+    oracle, corpus, and ledger did not yet exist at S0.0.
+  - **S0.1**: the byte-frozen v6 oracle (`tests/oracles/family_b_13/v6/`),
+    the declarative sealed-capture witness corpus and migration expectation
+    ledger (`tests/fixtures/research/family_b_13/`), and the hermetic S0
+    asset-validation tests (`tests/test_blocker_b_family_b_13_s0_assets.py`).
+    Also corrected the over-broad S0.0 G7 rule (§6.E) after S0.1 corpus
+    materialization surfaced the contradiction it caused.
+
+  After S0.1's commit, **S0's content is complete on this branch, but PR A
+  has not yet been created or merged.** Nothing in S0.0 or S0.1 implies PR A
+  exists yet, and neither implies CI has run green for this content — that
+  is PR A's merge-readiness evidence, gathered when PR A is actually opened.
+- **S1 / PR B** (next, not started): pure primitive parsers, parser-vector
+  differential proof.
 - **S2–S6 / PR C**: dormant v7 authority core. No real experiment. No
   production authority.
 - **S7 / PR D**: explicit authority cutover.
@@ -274,8 +359,9 @@ This checkpoint:
 ## 11. What remains unresolved after this checkpoint
 
 Unchanged from the frozen status in §4, plus the v7 authority-core work
-itself: the actual pure-primitive parsers (S1), the dormant v7 authority
-core (S2–S6), and the explicit cutover review (S7) are none of them started
-by this checkpoint. B-S1 remains a plausible, precisely falsifiable Phase-S
-candidate, not a proven mechanism (Research #2B, §19). No experiment result
-exists to promote or demote that status.
+itself: PR A has not yet been created or merged (§9); the actual
+pure-primitive parsers (S1), the dormant v7 authority core (S2–S6), and the
+explicit cutover review (S7) are none of them started by this checkpoint.
+B-S1 remains a plausible, precisely falsifiable Phase-S candidate, not a
+proven mechanism (Research #2B, §19). No experiment result exists to promote
+or demote that status.

@@ -1,0 +1,1105 @@
+[
+  {
+    "description": "13F scheduled_interleaving marker's phenomenon_id does not match the subrun contract's declared evidence id.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "subrun_watch_scan_race_marker_missing"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "79605ee1b655acbcd3444f7f2d68ff9526dbfae554403273e0ec48283a4471a2",
+      "manifest.json": "fb41a139cf2de103ec6f6de89009b6a01971f5c230443787377265d2cc3847cb",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "981911a89de7e1cfb1dfd4079ca39eb1c9b4a019b318a9896736ee99b2fecdab",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "d032ad79b19fe7aacd3f2159643ee2f2c2ffdf89b98db837a84c824b42450de6",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_13f_creation_evidence_binding",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "subrun_watch_scan_race_marker_missing"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_13f_creation_evidence_binding",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_13f_marker_requires_exact_phenomenon_binding",
+    "subrun": "13F"
+  },
+  {
+    "description": "Referenced exact confirmation capture (40-41) precedes the baseline observation window (60-80) it claims to confirm.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "exact_baseline_discovery_not_prior"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "cef42c96fa0247437bb17e6cbe080f5aa5fabc4da58143d337ca49b10fa0c522",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "9ad1258c634126e2649fc8aa3cf92154a2bcbfe9fadbf5fe1f8e47d5afcfbd9e",
+      "pre-t0-establishment.jsonl": "5027ed47a1850b9f847724625f8244d9e2fe5e90dc2d4d5fd3eb00a6b786c7bd",
+      "scan-rounds.jsonl": "c5745777bd5b2370553c326cf138c514ad1e0fd514a866e26e52c4b321971500",
+      "seal.json": "fdb13cd77570d3adf792c781228882bef454b15f4cac813304f13d912cdfccd7",
+      "surface-observations.jsonl": "75170664d6c502960edf3ad24d8615b0ee5d43d2ff8524be19f6291829a798c8",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_baseline_exact_causality_inversion",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "exact_baseline_discovery_not_prior"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_baseline_exact_causality_inversion",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "PR#52 review comment on 56723770b5 (\"Validate baseline timing before exact confirmation\"); tests/test_blocker_b_family_b_13_analyzer.py::test_baseline_discovery_must_be_committed_before_exact_capture[40-41]",
+    "subrun": "13A"
+  },
+  {
+    "description": "Dynamic post-T0 bucket watch install event present with no matching watch_lifecycle rescan record.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "post_t0_dynamic_bucket_handoff_missing_or_unmatched"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "7fb54a23971f82dbee43e0bf24ba6f8a587893b02561ab0e68332168db7f5e22",
+      "ground-truth.jsonl": "c6b11ddfa39af5c6418110fcd6143051f95befb21cd6bfc5031747041d44619b",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "cdf2de3f7772c1422d2f10f996d0d5fedb773ce2912925662d8324c4aba2cba7",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "c41aa5aa1ef0d5d163c0a654de2375834d82d159a0af63f84dca925d8f1a7854",
+      "seal.json": "f05de9b0956dc967faa07d0fe8728e6d34119afc2553a6fc3f56b924e89c0260",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "2d8ef2f44c60faca6ed62fcbddbc574cbc9dec6e6c90a5263c2364099698c068",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_dynamic_watch_handoff_missing",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "post_t0_dynamic_bucket_handoff_missing_or_unmatched"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_dynamic_watch_handoff_missing",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_post_t0_bucket_root_event_without_child_install_cannot_pass",
+    "subrun": "13A"
+  },
+  {
+    "description": "A gap_signal physically inserted after capture_finalized (before process_stop).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "harness_record_after_capture_finalized"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "683e4d64127d9c84eafc614bcc2e0c8be88d865b0db171fc1af33cf4cc4b9df9",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "d3e025c2f7f693eb379605de6518ce705071192847de319a8008de04d4add575",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_evidence_after_capture_finalized",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "harness_record_after_capture_finalized"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_evidence_after_capture_finalized",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_gap_signal_after_capture_finalization_is_incomplete_not_gap",
+    "subrun": "13A"
+  },
+  {
+    "description": "ground_truth request_end declares a non-string generator_window_relation.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "ground_truth_generator_window_relation_invalid"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "5e7107609f1e658a36e3850d8c22b2e560ed668017f583b9dc6cfa5989b069b9",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "5bf3885db7d3d1e96c6858f0968d649c4b788b84301ba3a08d7f9655e163f18c",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_generator_window_relation_malformed",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "ground_truth_generator_window_relation_invalid"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_generator_window_relation_malformed",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_v6_generator_window_relation_must_be_string[None]",
+    "subrun": "13A"
+  },
+  {
+    "description": "gap_signal timestamped before process_start (outside the reader's CLOCK_MONOTONIC lifetime).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "harness_event_outside_reader_lifetime"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "95a67425fadaf8771565cd085fa37db15250760327b2b83a2a9e10e10dcce523",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "93067f4b60df0e1240c6db23d03443f594aea3b6fbd8c8a8a01fdb2c8e77255f",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_harness_event_outside_lifetime",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "harness_event_outside_reader_lifetime"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_harness_event_outside_lifetime",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_gap_signal_timestamp_before_process_start_is_incomplete",
+    "subrun": "13A"
+  },
+  {
+    "description": "A watch event timestamped before T0 misused as the sole post-T0 candidate-interval discovery.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "post_t0_watch_event_not_after_t0:1"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "63556744d5169ba4832d71bb08fb5f1dbe63c63051030852873a6c9d56e45127",
+      "seal.json": "df063996ff8cfcc857b82b291b8c78e05b56887d8eb304c3e9fe68b65157f984",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "f24c4b818b2eb88814ddd9cf8630a57c09582ac3218939f3dc904cc263f4b3b9",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_pre_t0_post_t0_discovery_partition",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "post_t0_watch_event_not_after_t0:1"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_pre_t0_post_t0_discovery_partition",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_pre_t0_watch_cannot_manufacture_post_t0_discovery",
+    "subrun": "13A"
+  },
+  {
+    "description": "Drained pre-T0 watch stream carrying an IN_Q_OVERFLOW loss signal before the fixed point.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "B_S1_GAP_DETECTED",
+      "reasons": [
+        "watch_queue_overflow"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "1dc480e3ee07e390945d992d3d01ad09c95767cd3f276936d2419892ac86b778",
+      "pre-t0-establishment.jsonl": "2dc1f109888ff395ec86626cec429e834338cadc5f3b1c0aa4c6bd7dbf296040",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "31d42e0afdc00eb07e66583f99a5227058f5f593154968fce349be29d7861594",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_pre_t0_watch_overflow",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "B_S1_GAP_DETECTED",
+      "reasons": [
+        "watch_queue_overflow"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_pre_t0_watch_overflow",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "PR#52 review comment on 56723770b5 (\"Reject pre-T0 watch loss before accepting the fixed point\"); tests/test_blocker_b_family_b_13_analyzer.py::test_drained_pre_t0_observer_loss_prevents_positive_close",
+    "subrun": "13A"
+  },
+  {
+    "description": "A heartbeat record physically relocated ahead of process_start in the harness stream.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "harness_record_before_process_start"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "b937743f3feb7f2dc64e8f5e9dabafafb181168f47194ff67789cfa8c5dc577d",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "ebc5350e50bf421570e15d7d5f3b4f4f7df62f6825f88b2eca4872dc0b806a3e",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_process_start_physical_first",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "harness_record_before_process_start"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_process_start_physical_first",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "PR#52 review comment on 56723770b5 (\"Require process_start to be physically first\"); tests/test_blocker_b_family_b_13_analyzer.py::test_harness_record_before_process_start_is_incomplete[heartbeat]",
+    "subrun": "13A"
+  },
+  {
+    "description": "Reader-owned pre-startup heartbeat evidence (declares CLOCK_MONOTONIC time before process_start).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "harness_event_outside_reader_lifetime"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "cb45c04b57ba698bcd25df052c94e8315305de8c949981753073265adb3d57a6",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "ba7600c33a1a3c2d7b1fb983b358893da8c1ffa883ccfdf44a773eab85fd8b54",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_reader_lifetime_invalid_evidence",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "harness_event_outside_reader_lifetime"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_reader_lifetime_invalid_evidence",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "PR#52 review comment on 56723770b5 (\"Reject heartbeats predating reader startup\"); tests/test_blocker_b_family_b_13_analyzer.py::test_heartbeat_before_process_start_is_incomplete_not_excluded",
+    "subrun": "13A"
+  },
+  {
+    "description": "scan_rounds declares exact_normalized_upids not backed by its own bucket_observations entries.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "scan_declared_upids_mismatch_observations:scan_rounds:1"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "8bde72e0f228cb8d5cfe0cf5f2a1bde169245dd1fdfe7e3fb4a9c2aa0ef67366",
+      "seal.json": "b1eef9183b4d8d2aac354a41649d889f8f2b9b8923bb8481d29354a76e0dbfd9",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_scan_declared_upid_self_authentication",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "scan_declared_upids_mismatch_observations:scan_rounds:1"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_scan_declared_upid_self_authentication",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_v6_declared_projection_cannot_bypass_observations_on_any_plane[scan_rounds]",
+    "subrun": "13A"
+  },
+  {
+    "description": "Surface observation's declared normalized_upids disagrees with its own raw_evidence projection.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "surface_normalized_upids_mismatch_raw_evidence:active:7"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "e3c812262432d37bd93681292f45283ede5b99311e34aaec1f0665bbf2a81f26",
+      "manifest.json": "6ab9e71dba39a059e0a3f091b6c95013316244b7e6422ced5ae07575a1c8d127",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "81bc1ff9578f1e9a9d4dd052eb38f395a3d7622e0666fa749301c2aade2a0d9e",
+      "surface-observations.jsonl": "93d1ab21560db4156e144c1d7bb404bfc23c4ad7bcc053604ee0c3ee80168afc",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_surface_raw_projection_mismatch",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "surface_normalized_upids_mismatch_raw_evidence:active:7"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_surface_raw_projection_mismatch",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_subrun_13c_requires_raw_referenced_handoff_evidence (mismatch variant)",
+    "subrun": "13C"
+  },
+  {
+    "description": "A ground-truth operation physically after T1 self-declares within_generator_window=True.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "ground_truth_generator_window_declaration_mismatch"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "608c0ed9252c126d8c1b271a9bdf81c6a21716019d7c28c1e9da81af55384dae",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "0e4c49b09798a44920103aea4555f963e82cfb8ce03b61113934a39a39bef7c5",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_t1_partition_error",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "ground_truth_generator_window_declaration_mismatch"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_t1_partition_error",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_after_t1_operation_cannot_self_declare_in_generator_window",
+    "subrun": "13A"
+  },
+  {
+    "description": "A later independently-valid final exact read attempts to launder an earlier terminal-status regression.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "exact_upid_final_status_regressed"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "97a63a239d05b206ea96520c403a9c3caf24e520cdf95d8a56d0bb08e81ab3d7",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "f3b20a3d1d0c8508eda124547605f381a83e3127ec83c951009274f1609744af",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_terminal_exact_log_laundering",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "exact_upid_final_status_regressed"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_terminal_exact_log_laundering",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_later_final_sibling_cannot_launder_intermediate_regression",
+    "subrun": "13A"
+  },
+  {
+    "description": "A misspelled/unknown harness event kind (gap_singal) inserted into the harness stream.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "unknown_harness_event:gap_singal"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "1161aa604a8eca32d56bb19830bba99b672a9cfc332156036fd9ec7476fafd40",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "b51c8db746ec53fb548ca335c0b7ded7fdf805d996b69a0ec141e5df0ed28627",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_unknown_harness_event",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "unknown_harness_event:gap_singal"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_unknown_harness_event",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "PR#52 review comment on 56723770b5 (\"Reject unknown harness event kinds\"); tests/test_blocker_b_family_b_13_analyzer.py::test_v6_unknown_harness_event_vocabulary_is_incomplete[gap_singal]",
+    "subrun": "13A"
+  },
+  {
+    "description": "Watch event's raw_mask integer disagrees with its declared textual mask list.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "inotify_mask_mismatch_raw_mask:watch:1"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "63556744d5169ba4832d71bb08fb5f1dbe63c63051030852873a6c9d56e45127",
+      "seal.json": "58a498ed4a32c48b0a8d4dea0b23b6829d09c6e90ff12dc9cde44961a0d24d0a",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "27b1281ecd72ff837bc5126be14467089ebe5d692b2bb41ca912cdfdf0bf30fe",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "hist_watch_raw_mask_text_mismatch",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "inotify_mask_mismatch_raw_mask:watch:1"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": false,
+    "relative_capture_path": "captures/hist_watch_raw_mask_text_mismatch",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_watch_raw_mask_text_disagreement_cannot_manufacture_discovery",
+    "subrun": "13A"
+  },
+  {
+    "description": "E1: pre-T0-timed (85-86) surface observation of an unrelated valid UPID feeds the post-T0 completeness/gap computation, which has an upper (close_monotonic) but no lower (t0_monotonic_ns) time bound.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "B_S1_GAP_DETECTED",
+      "reasons": [
+        "candidate_close_omits_observed_post_t0_upid",
+        "unexpected_post_t0_node",
+        "unexpected_post_t0_owner",
+        "unexpected_post_t0_task_id",
+        "unexpected_post_t0_task_type",
+        "unexpected_post_t0_upid"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "ecf5b94a8fc0e4829f20a705ed4ad79b6cf8bd01741f02f6767d1800da3cd757",
+      "surface-observations.jsonl": "7cf2235235d50aff8f89ad02a81fdd669e26139bef73d7ffcb6f18f1c3b5c02c",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "model_e1_pre_t0_surface_influences_candidate",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "kind": "model_derived_witness",
+    "migration_required": true,
+    "relative_capture_path": "captures/model_e1_pre_t0_surface_influences_candidate",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a78 (E1)",
+    "subrun": "13A"
+  },
+  {
+    "description": "E3: the 13C active_archive_handoff marker's monotonic_ns (305) is after candidate close (300) but the obligation check never inspects marker time.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "5ab3a1d113098c70a40e6d52731bf99b706cd3ecf81897cf6103a97de7ed9ee7",
+      "manifest.json": "6ab9e71dba39a059e0a3f091b6c95013316244b7e6422ced5ae07575a1c8d127",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "42e852e0092b4eae5679a75d912a2fb108d7adbf503d8f27077fa2ba28d49302",
+      "surface-observations.jsonl": "92ad6d82093298df084f5de6921712cb6a375bd2b14e141d664b3e6ce5cf1e62",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "model_e3_13c_handoff_after_t1",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "subrun_handoff_marker_outside_candidate_interval"
+      ]
+    },
+    "kind": "model_derived_witness",
+    "migration_required": true,
+    "relative_capture_path": "captures/model_e3_13c_handoff_after_t1",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a78 (E3)",
+    "subrun": "13C"
+  },
+  {
+    "description": "Perfect single-operation enumeration/reconciliation (13A obligation).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "44eab89e24fad69ea1641d9cf54d002464fb2d6ef6e1e65e1368edc76a4fd44c",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "positive_13a",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "kind": "positive_control",
+    "migration_required": false,
+    "relative_capture_path": "captures/positive_13a",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_perfect_enumeration_is_only_tested_interleaving",
+    "subrun": "13A"
+  },
+  {
+    "description": "Sequenced archive pages with one genuine half-open interval overlap (13B obligation).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "1b10111c1ad875850375f5e096b78e2d9422e9b3d77f884fa76d9294ae3a3ebb",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "3503eb3b5d1a7a7305f060a0efe74f23e7308f62942e8c2684da55a7389442d5",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "d863bed808c3a5a83d4100fdbbd2882f5c8147c572cfcb1f51ed95d79c9f70a1",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "positive_13b",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "kind": "positive_control",
+    "migration_required": false,
+    "relative_capture_path": "captures/positive_13b",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_13b_one_genuine_overlap_preserves_positive_control",
+    "subrun": "13B"
+  },
+  {
+    "description": "Raw-referenced active/archive handoff for the generated UPID (13C obligation).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "e3c812262432d37bd93681292f45283ede5b99311e34aaec1f0665bbf2a81f26",
+      "manifest.json": "6ab9e71dba39a059e0a3f091b6c95013316244b7e6422ced5ae07575a1c8d127",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "ea2483ff739626b4cbba40a18adbf9fe9c4e0e8a2eec33344ad255edbfe29f2b",
+      "surface-observations.jsonl": "92ad6d82093298df084f5de6921712cb6a375bd2b14e141d664b3e6ce5cf1e62",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "positive_13c",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "kind": "positive_control",
+    "migration_required": false,
+    "relative_capture_path": "captures/positive_13c",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_subrun_13c_requires_raw_referenced_handoff_evidence",
+    "subrun": "13C"
+  },
+  {
+    "description": "Raw rotation identity (index -> index.1) plus matching watch evidence (13D obligation).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "1e1c7245a514282fc915c28497aff68f61f6fe952c46cd04ba46f2b1c3d2e75d",
+      "harness-events.jsonl": "fd5ea8a16325fae4e16c41c4f5d319cfd260d337a25c8dc913e9a6eca3943842",
+      "manifest.json": "ab05193c22c273d8834ebdd9961b57d15c7e1e523e1db56a8aa0de66a46b2dfb",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "efb59c2e77d9a5b366b87003168409e4bb2e708bf2f3e8efb22aa2320f72285f",
+      "seal.json": "050eea84e747c22117272dfc51f7ead5edde5c40c164953ba9a011334d3ba521",
+      "surface-observations.jsonl": "88d0cc6da42a9053d2c80a391f509d621271c8fb74c62c6bfd347b5319789fc9",
+      "watch-events.jsonl": "eaea695c2c6895998dea874efeab3133ca1e41740ffebd0a6e4be0918fc38170",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "positive_13d",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "kind": "positive_control",
+    "migration_required": false,
+    "relative_capture_path": "captures/positive_13d",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_subrun_13d_requires_raw_rotation_identity_and_watch_evidence",
+    "subrun": "13D"
+  },
+  {
+    "description": "Approved injected watch-queue-overflow signal; 13E's positive control is B_S1_GAP_DETECTED, not PASS.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "B_S1_GAP_DETECTED",
+      "reasons": [
+        "watch_queue_overflow"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ground-truth.jsonl": "38caf94b441e31952914892b23c68d5ccbd3875b5cc4e360a7d18562458e1700",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "e60d4d4fb1ff94b8064fe0e31750fbdcb2259cb94efc7a8077bb822ed9e49c32",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "63556744d5169ba4832d71bb08fb5f1dbe63c63051030852873a6c9d56e45127",
+      "seal.json": "2b6b5d7fea75bdc7f4ccb9a4aa24f25c937a0b67c2e3bdaa1b94d5cb987a69ec",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "ae19c18f4c3a09ba18e92c1847662fcb526813ab5935e8ad3cb0ed16bdd80823",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "positive_13e",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "B_S1_GAP_DETECTED",
+      "reasons": [
+        "watch_queue_overflow"
+      ]
+    },
+    "kind": "positive_control",
+    "migration_required": false,
+    "relative_capture_path": "captures/positive_13e",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_subrun_13e_signal_does_not_require_unrelated_generated_work",
+    "subrun": "13E"
+  },
+  {
+    "description": "Task-tree-bound watch/scan creation race for the generated UPID (13F obligation).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "f81ca2253fd81ccc788b54c6a892e66fc00ad769c0295c58c9ae68724c8d1103",
+      "manifest.json": "fb41a139cf2de103ec6f6de89009b6a01971f5c230443787377265d2cc3847cb",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "18bc92866a4299e9b2f90a4cbc6b3d82ff7aadf2ed1d59671cf84acf6a14b73e",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "d032ad79b19fe7aacd3f2159643ee2f2c2ffdf89b98db837a84c824b42450de6",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "positive_13f",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "kind": "positive_control",
+    "migration_required": false,
+    "relative_capture_path": "captures/positive_13f",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_task_tree_bound_13f_watch_scan_race_may_pass",
+    "subrun": "13F"
+  },
+  {
+    "description": "Combined pagination_movement + active_archive_handoff, both independently evidenced (13G obligation).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "a57d91157a907221a1edf9f123d6b3bb6795b36c199427c84e4a21622d29fed8",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "930ef581d2c337a38f8e21af1feb46cb0094046d02f7b71100e91a0c7a992b23",
+      "manifest.json": "2d2f8bbd953cb71a7155e19dd02f55b7fd4288c7295a172efe743cfdf3f3063a",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "df1511abef054f15399ce7243bb3aaedffb53882edd9122ad11f4817a871b13f",
+      "surface-observations.jsonl": "92ad6d82093298df084f5de6921712cb6a375bd2b14e141d664b3e6ce5cf1e62",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "positive_13g",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "kind": "positive_control",
+    "migration_required": false,
+    "relative_capture_path": "captures/positive_13g",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "tests/test_blocker_b_family_b_13_analyzer.py::test_subrun_13g_requires_every_declared_combined_phenomenon",
+    "subrun": "13G"
+  },
+  {
+    "description": "STOP-4 #3: a valid combined 13G capture where both declared phenomena share one evidence id.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "a0ad31e6d8e7f53792f013be0cee005ac2b75d95c2db62bfd4532c5dc5361f64",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "6f568f8316243f502062a93d44ad95a2ba3a8789f50603e890b889126abe714c",
+      "manifest.json": "80238b13436b798cca293a2d8d672a3b3da20aa578c4c8022be3a1e433a4614b",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "94b6e09e6655c7d8221ba3df909b99eb68958f2e6e4c71b48be0642b574d24a7",
+      "surface-observations.jsonl": "92ad6d82093298df084f5de6921712cb6a375bd2b14e141d664b3e6ce5cf1e62",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "stop_duplicate_subrun_evidence_ids",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "subrun_contract_evidence_ids_not_unique"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": true,
+    "relative_capture_path": "captures/stop_duplicate_subrun_evidence_ids",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a73; PR#52 review comment on 56723770b5 (\"Reject reused subrun evidence IDs\")",
+    "subrun": "13G"
+  },
+  {
+    "description": "STOP-4 #2: physically-first operation labeled generator_sequence=2, physically-second labeled 1; the physically-second operation's UPID is never discovered.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS",
+      "reasons": [
+        "generator_window_upid_missing_without_gap"
+      ],
+      "witness": {
+        "b_s1_body_start_membership": "UNKNOWN",
+        "candidate_close_event_id": "close-1",
+        "candidate_close_state": "CLOSED_COMPLETE",
+        "classification": "ENUMERATION OMISSION FOR TESTED GENERATOR WINDOW",
+        "ground_truth_generator_sequence": 1,
+        "ground_truth_upid": "UPID:fixture:00000002:00000002:00000001:stopall::generator@pve:",
+        "omitted_from_b_s1_enumeration_set": true,
+        "operation": "synthetic_task_generator",
+        "preserved_evidence_files": [
+          "manifest.json",
+          "api-pages.jsonl",
+          "exact-upid.jsonl",
+          "ground-truth.jsonl",
+          "harness-events.jsonl",
+          "pre-t0-establishment.jsonl",
+          "scan-rounds.jsonl",
+          "surface-observations.jsonl",
+          "watch-events.jsonl",
+          "watch-lifecycle.jsonl",
+          "seal.json"
+        ],
+        "required_gap_signal_recorded": false,
+        "within_experiment_generator_window": true
+      }
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "09257a394cca0f77c8c6ea418c2bc15d29494df3021b43393dfc2abd9c06b714",
+      "harness-events.jsonl": "a8482424e2a1b52aeb98d57f1227ce950725d50c812498b0bd5f5e261bf6e207",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "14044f052d703321a4a5388d8ea17f9aa0da167ed17e1115285203d0bf85a63d",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "stop_generator_sequence_relabel",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "ground_truth_generator_sequence_not_physically_increasing"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": true,
+    "relative_capture_path": "captures/stop_generator_sequence_relabel",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a73; PR#52 review comment on 56723770b5 (\"Enforce physical generator-sequence order\")",
+    "subrun": "13A"
+  },
+  {
+    "description": "STOP-4 #4: a physically pre-finalization gap_signal at t=305 (candidate close=300, capture_finalized=310).",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "B_S1_GAP_DETECTED",
+      "reasons": [
+        "injected_loss"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "2ef569cc0e63431fc6a9f5a511c1373b14bf56d8463a604678a20977f34eac17",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "664f0a553fa8371ab4b205097bc33011724681b09317487b570d0f8c7c179128",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "stop_post_t1_gap_signal_rewrites_t1",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": true,
+    "relative_capture_path": "captures/stop_post_t1_gap_signal_rewrites_t1",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a73, \u00a75.13, \u00a76.B; PR#52 review comment on 56723770b5 (\"Exclude post-close gap signals from the T1 result\")",
+    "subrun": "13A"
+  },
+  {
+    "description": "STOP-4 #1: root/bucket watch installs and baseline scans dated before a process_start moved to 90.",
+    "expected_v6_result": {
+      "architecture_effect": "NONE",
+      "outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+      "reasons": [
+        "generator_window_ground_truth_equals_reconciled_enumeration_set_for_tested_interleaving"
+      ]
+    },
+    "file_hashes": {
+      "api-pages.jsonl": "4635d89050622ff4e7df147cf410560f48357d64b19d4f723eb4a64a55a1fade",
+      "exact-upid.jsonl": "d71aba1f260634d84f6f1144e5d019def2c373c517763d9ff2e89714487a9799",
+      "ground-truth.jsonl": "f41bd405582665cefd5e5bfaca800fd53fa91e04467832d07d6de993a8e01456",
+      "harness-events.jsonl": "d6b87c9cab9a2c0e1f93447efa012088286d085285010839f66ec372855ef065",
+      "manifest.json": "8eab26567fa4d030047abeb22f6ccb0d7957bf929e62100808fd0758ffaab8ba",
+      "pre-t0-establishment.jsonl": "d6920fc1a9165712ec13e0c07e79309d3db13e270637bb9c4fe02e735710785b",
+      "scan-rounds.jsonl": "eef8801a2cc9b4f6f327c30b87fbd7891ab77ee85e81cb4fb9927ab074d4c78e",
+      "seal.json": "8a8f85c8e5c9fc271e7730b3dda6e9f204627e5a4f767cc3e1f6976b901ffbec",
+      "surface-observations.jsonl": "2a2257a426f07c6d1d2d340cd728f0613da87ec0079e245bd393814b8ff5b340",
+      "watch-events.jsonl": "71c652831a1a4a9c0a571dca49eb6b1478941231490a22d057855296f302fa44",
+      "watch-lifecycle.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "fixture_id": "stop_reader_pre_t0_before_process_start",
+    "intended_v7_result": {
+      "architecture_effect": "NONE",
+      "outcome": "HARNESS_INCOMPLETE",
+      "reasons": [
+        "reader_lifecycle_precedes_pre_t0_establishment_evidence"
+      ]
+    },
+    "kind": "historical_witness",
+    "migration_required": true,
+    "relative_capture_path": "captures/stop_reader_pre_t0_before_process_start",
+    "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a73; PR#52 review comment on 56723770b5 (\"Start the reader before pre-T0 observer evidence\")",
+    "subrun": "13A"
+  }
+]

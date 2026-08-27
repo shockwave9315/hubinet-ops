@@ -1,0 +1,1 @@
+{"cookie": 0, "event_type": "bucket_event", "filename": "A", "mask": ["IN_CREATE", "IN_ISDIR"], "monotonic_ns": 130, "queue_overflow": false, "raw_mask": 1073742080, "raw_order": 1, "wall_timestamp": "2026-08-25T00:00:03Z", "watch_descriptor": 1, "watch_scope": "task_root", "watched_path": "/synthetic/pve/tasks", "watcher_sequence": 1}

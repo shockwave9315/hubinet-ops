@@ -1,0 +1,1 @@
+{"durable_flush_complete": true, "event": "generator_finalized", "generator_process_identity": "synthetic-generator:1", "last_sequence": 0, "monotonic_ns": 150, "total_operations": 0, "wall_timestamp": "2026-08-25T00:00:02Z"}

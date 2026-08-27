@@ -1,0 +1,6 @@
+{"event": "process_start", "harness_sequence": 1, "monotonic_ns": 50, "process_identity": "synthetic-reader:1"}
+{"analyzer_revision": "family-b-13-analyzer-v6", "event": "analyzer_version", "harness_sequence": 2, "monotonic_ns": 51, "process_identity": "synthetic-reader:1"}
+{"event": "heartbeat", "harness_sequence": 3, "healthy": true, "heartbeat_sequence": 1, "monotonic_ns": 250, "process_identity": "synthetic-reader:1"}
+{"event": "scheduled_interleaving", "harness_sequence": 4, "kind": "watch_scan_creation_race", "monotonic_ns": 170, "phenomenon_id": "13f-watch_scan_creation_race", "process_identity": "synthetic-reader:1", "scan_sequence": 1, "target_upid": "UPID:fixture:00000001:00000001:00000001:stopall::generator@pve:", "watcher_sequence": 1}
+{"complete": true, "event": "capture_finalized", "harness_sequence": 5, "monotonic_ns": 310, "process_identity": "synthetic-reader:1"}
+{"event": "process_stop", "harness_sequence": 6, "monotonic_ns": 320, "process_identity": "synthetic-reader:1"}

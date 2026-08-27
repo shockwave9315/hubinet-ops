@@ -1,0 +1,56 @@
+[
+  {
+    "contract_amendment": null,
+    "explanation": "The extra surface observation is timestamped capture_start/capture_end = 85/86, strictly before t0_monotonic_ns=100, so it belongs to the PRE_T0 interval. Frozen v6's post-T0 completeness/gap computation bounds surface evidence only above (capture_end <= close_monotonic) and never below (capture_start >= t0_monotonic_ns), so this PRE_T0-interval observation of an unrelated valid UPID is folded into the same post-T0 completeness set used for the T1 result, wrongly latching B_S1_GAP_DETECTED (unexpected_post_t0_upid and related reasons) for what is otherwise a clean 13A positive-control capture. v7's phase x interval admission model requires phase and interval to agree before admission (\u00a75.12): PRE_T0-interval evidence carried on the surface_observations (candidate) plane is not admitted into the CANDIDATE-interval computation, so v7 recovers the underlying ANALYZER_PASS_TESTED_INTERLEAVING result. This is model-derived evidence of the same class of interval-pollution bug as the post-T1 gap_signal witness, not a contract loosening.",
+    "fixture_id": "model_e1_pre_t0_surface_influences_candidate",
+    "from_v6_outcome": "B_S1_GAP_DETECTED",
+    "reason_class": "V6_INTERVAL_POLLUTION",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a78 (E1), \u00a75.11, \u00a75.12",
+    "to_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING"
+  },
+  {
+    "contract_amendment": null,
+    "explanation": "The active_archive_handoff marker's monotonic_ns is moved to 305, strictly after candidate close (T1=300). Frozen v6's 13C obligation check validates the referenced active/archive surface records' relative ordering and target UPID membership but never checks the marker's own monotonic_ns against close_monotonic (unlike the already-correct 13F watch/scan-race check, which does apply _is_candidate_interval_watch), so a handoff marker recorded after T1 still discharges the 13C candidate-interval obligation and reaches ANALYZER_PASS_TESTED_INTERLEAVING. v7's phase x interval admission model requires the marker's own interval to agree with the CANDIDATE phase before it can discharge a candidate-interval obligation, so v7 fails closed to HARNESS_INCOMPLETE instead of certifying a post-T1 marker as legitimate in-candidate-interval evidence.",
+    "fixture_id": "model_e3_13c_handoff_after_t1",
+    "from_v6_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+    "reason_class": "V6_UNSOUND",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a78 (E3), \u00a75.12",
+    "to_v7_outcome": "HARNESS_INCOMPLETE"
+  },
+  {
+    "contract_amendment": null,
+    "explanation": "Frozen v6 validates each declared phenomenon's evidence id independently but never checks that a combined-subrun manifest's evidence_ids mapping assigns distinct ids to distinct phenomena, so two phenomena sharing one evidence id still reach ANALYZER_PASS_TESTED_INTERLEAVING with ambiguous per-phenomenon provenance. v7's centralized admit() gate requires unambiguous evidence-id binding before a combined-subrun obligation is treated as discharged.",
+    "fixture_id": "stop_duplicate_subrun_evidence_ids",
+    "from_v6_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+    "reason_class": "V6_UNSOUND",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a73",
+    "to_v7_outcome": "HARNESS_INCOMPLETE"
+  },
+  {
+    "contract_amendment": null,
+    "explanation": "Frozen v6 validates only that the set of generator_sequence labels forms a contiguous 1..N range and that per-pair physical monotonic times are nondecreasing; it never checks that generator_sequence labels themselves are assigned in the same order as physical stream position. A physically-first request pair may therefore carry a higher sequence label than a physically-second pair, letting a corrupted/relabeled generator stream produce GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS -- a negative experiment result -- from malformed provenance. v7's ChronologySpec derives PhysicalPos from sealed stream order and requires generator_sequence to agree with it, so malformed ground truth fails closed to HARNESS_INCOMPLETE instead of certifying an omission witness.",
+    "fixture_id": "stop_generator_sequence_relabel",
+    "from_v6_outcome": "GENERATOR_WINDOW_ENUMERATION_OMISSION_WITNESS",
+    "reason_class": "V6_UNSOUND",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a73, \u00a75.3",
+    "to_v7_outcome": "HARNESS_INCOMPLETE"
+  },
+  {
+    "contract_amendment": null,
+    "explanation": "The gap_signal at t=305 originates strictly after logical T1 (candidate close at t=300) and therefore belongs to the POST_T1_DIAGNOSTIC interval, not the CANDIDATE interval that determines the T1 result. Frozen v6 latches every gap_signal without an interval bound, so this out-of-scope diagnostic event retroactively rewrites an otherwise-genuine PASS interleaving into B_S1_GAP_DETECTED. v7's phase x interval admission model consumes T1 evidence under t<=T1 semantics only; a coherent post-T1 diagnostic signal may not retroactively rewrite the T1 verdict already reached, so v7 recovers the correct ANALYZER_PASS_TESTED_INTERLEAVING result. This is a v6 interval-partition bug (evidence from the wrong interval polluting the candidate result), not a loosening of capture-v6 or of applicability requirements.",
+    "fixture_id": "stop_post_t1_gap_signal_rewrites_t1",
+    "from_v6_outcome": "B_S1_GAP_DETECTED",
+    "reason_class": "V6_INTERVAL_POLLUTION",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a73, \u00a75.13, \u00a76.B",
+    "to_v7_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING"
+  },
+  {
+    "contract_amendment": null,
+    "explanation": "Pre-T0 establishment evidence (root/bucket watch installs, baseline scans) is reader-owned CLOCK_MONOTONIC evidence and cannot legitimately predate that reader's own process_start. Frozen v6 only requires process_start <= T0 and never checks process_start against the pre-T0 establishment stream it is supposed to have produced, so a physically-late process_start still reaches ANALYZER_PASS_TESTED_INTERLEAVING. v7's phase x interval admission model requires reader lifecycle to bound every reader-owned observation it accepts.",
+    "fixture_id": "stop_reader_pre_t0_before_process_start",
+    "from_v6_outcome": "ANALYZER_PASS_TESTED_INTERLEAVING",
+    "reason_class": "V6_UNSOUND",
+    "source_ref": "docs/architecture/research/blocker-b-family-b-13-authority-core-redesign.md \u00a75.1, \u00a75.12",
+    "to_v7_outcome": "HARNESS_INCOMPLETE"
+  }
+]

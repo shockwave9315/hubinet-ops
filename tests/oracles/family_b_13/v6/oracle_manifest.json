@@ -1,0 +1,10 @@
+{
+  "source_commit": "56723770b5edb3a574a16c9b73d2ad5f668d903c",
+  "source_path": "scripts/research/blocker_b_family_b_13_analyzer.py",
+  "source_git_blob_sha1": "36be20097d01e7d86a76261ba35ca260df817b26",
+  "sha256": "db26374e1bd3ba9ee1c4793a40dc3754e4a0fc384583b0b794dd8538a4b29068",
+  "schema_revision": "family-b-13-capture-v6",
+  "protocol_revision": "family-b-13-preexecution-v6",
+  "analyzer_revision": "family-b-13-analyzer-v6",
+  "role": "historical_differential_oracle_only"
+}
