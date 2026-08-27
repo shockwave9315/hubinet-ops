@@ -84,6 +84,14 @@ class HarnessRecordHeader:
     ``harness_sequence`` is kept as declared data only -- it is never used
     to derive, check, or substitute for ``pos`` (see
     ``scripts.research.family_b_13_v7.physical`` for why).
+
+    ``__post_init__`` enforces every structural invariant this type
+    requires -- stream-bound position, a real event kind, and S1 scalar
+    typing on the remaining fields -- so these invariants hold for *any*
+    construction path, not just :func:`decode_harness_record_header`. A
+    ``harness-events.jsonl`` record type existing with, say, a
+    ``StreamName.GROUND_TRUTH`` position is a structural impossibility this
+    type refuses to represent at all, regardless of how it was built.
     """
 
     pos: PhysicalPos
@@ -91,6 +99,23 @@ class HarnessRecordHeader:
     harness_sequence: int
     monotonic_ns: int
     process_identity: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pos, PhysicalPos):
+            raise StructuralDecodeError("record_position_invalid")
+        if self.pos.stream is not StreamName.HARNESS_EVENTS:
+            raise StructuralDecodeError("record_position_stream_mismatch")
+        if not isinstance(self.kind, HarnessEventKind):
+            raise StructuralDecodeError("record_event_unknown")
+        sequence_result = require_nonnegative_int(self.harness_sequence)
+        if not sequence_result.ok:
+            raise StructuralDecodeError("record_harness_sequence_invalid")
+        monotonic_result = require_nonnegative_int(self.monotonic_ns)
+        if not monotonic_result.ok:
+            raise StructuralDecodeError("record_monotonic_ns_invalid")
+        identity_result = require_nonempty_string(self.process_identity)
+        if not identity_result.ok:
+            raise StructuralDecodeError("record_process_identity_invalid")
 
 
 @dataclass(frozen=True)
@@ -120,34 +145,30 @@ def decode_harness_record_header(
     """Decode one sealed ``harness-events.jsonl`` record's structural
     header. ``raw`` is a plain decoded JSON object (e.g. from an S1
     ``decode_jsonl_line`` success value); ``pos`` is that record's already
-    independently-assigned :class:`PhysicalPos` (never derived here)."""
+    independently-assigned :class:`PhysicalPos` (never derived here).
 
-    event_result = require_nonempty_string(_require_field(raw, "event"))
-    if not event_result.ok:
+    Only the ``event`` string -> :class:`HarnessEventKind` translation
+    happens here (it needs the raw string to distinguish "not a string at
+    all" from "a string outside the closed vocabulary"); every other
+    structural invariant -- including on ``pos`` itself -- is enforced once,
+    by :meth:`HarnessRecordHeader.__post_init__`, for every construction
+    path.
+    """
+
+    event_value = _require_field(raw, "event")
+    if not isinstance(event_value, str) or not event_value:
         raise StructuralDecodeError("record_event_invalid")
     try:
-        kind = HarnessEventKind(event_result.value)
+        kind = HarnessEventKind(event_value)
     except ValueError as exc:
         raise StructuralDecodeError("record_event_unknown") from exc
-
-    sequence_result = require_nonnegative_int(_require_field(raw, "harness_sequence"))
-    if not sequence_result.ok:
-        raise StructuralDecodeError("record_harness_sequence_invalid")
-
-    monotonic_result = require_nonnegative_int(_require_field(raw, "monotonic_ns"))
-    if not monotonic_result.ok:
-        raise StructuralDecodeError("record_monotonic_ns_invalid")
-
-    identity_result = require_nonempty_string(_require_field(raw, "process_identity"))
-    if not identity_result.ok:
-        raise StructuralDecodeError("record_process_identity_invalid")
 
     return HarnessRecordHeader(
         pos=pos,
         kind=kind,
-        harness_sequence=sequence_result.value,
-        monotonic_ns=monotonic_result.value,
-        process_identity=identity_result.value,
+        harness_sequence=_require_field(raw, "harness_sequence"),
+        monotonic_ns=_require_field(raw, "monotonic_ns"),
+        process_identity=_require_field(raw, "process_identity"),
     )
 
 

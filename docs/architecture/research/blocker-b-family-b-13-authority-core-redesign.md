@@ -356,7 +356,18 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
   `PhaseSpec`, `IntegrityFinding`/`ObservationFinding`,
   `CaptureValidity`/`T1Result`, or any analyzer-outcome projection —
   **IMPLEMENTED / AWAITING INDEPENDENT REVIEW**, not accepted, until that
-  review actually occurs.
+  review actually occurs. A subsequent S2 corrective review found and
+  closed a real positive-fact-manufacturing gap: `ParticipantLifetime.
+  contains_record` previously returned `True` for a cross-stream record
+  whenever its timestamp alone fell in-bounds, even though a
+  `TimedRecordRef` carries no participant-ownership binding to justify
+  that; it now fails closed (`CrossStreamComparisonError`) for any
+  cross-stream request, checked before the timestamp bound so the behavior
+  never depends on where that timestamp happens to fall. The same review
+  closed the type boundary so `HarnessRecordHeader` cannot exist with a
+  non-`HARNESS_EVENTS` position through any construction path (not only
+  the decoder), and made `ParticipantTable` copy and validate any input
+  mapping rather than trust or alias it.
 - **S3–S6** (future, not started): the remaining dormant v7 authority-core
   stages, each its own independently SHA-gated/reviewed commit boundary on
   this same Draft PR #53. No real experiment. No production authority.

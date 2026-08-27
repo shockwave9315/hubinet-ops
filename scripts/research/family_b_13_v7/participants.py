@@ -47,7 +47,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
-from .physical import PhysicalPos
+from .physical import CrossStreamComparisonError, PhysicalPos
 from .records import HarnessEventKind, HarnessRecordHeader, TimedRecordRef
 
 __all__ = [
@@ -117,30 +117,38 @@ class ParticipantLifetime:
         return self.start_ns <= monotonic_ns <= self.end_ns
 
     def contains_record(self, ref: TimedRecordRef) -> bool:
-        """Whether ``ref`` structurally falls within this lifetime.
+        """Whether ``ref`` structurally falls within this lifetime -- both
+        its timestamp AND its physical position, since a
+        :class:`~scripts.research.family_b_13_v7.records.TimedRecordRef`
+        carries no participant-identity/ownership binding of its own: a
+        bare timestamp match is not evidence that ``ref`` belongs to (or
+        was produced by) this lifetime's participant at all.
 
-        If ``ref`` belongs to the same stream this lifetime's own
-        boundaries were established in (``harness-events.jsonl``), both the
-        timestamp bound and the physical-position bound are checked. A
-        record from a different sealed stream (e.g. a
-        ``pre-t0-establishment.jsonl`` reference) has no physical position
-        comparable to this lifetime's ``harness-events.jsonl``-scoped
-        ``start_pos``/``end_pos`` (see
-        ``scripts.research.family_b_13_v7.physical`` on cross-stream
-        incomparability), so only the timestamp bound applies. This is
-        exactly the fact the ``stop_reader_pre_t0_before_process_start``
-        historical witness needs: a pre-T0-establishment record's
-        timestamp can be shown to fall outside the reader's structural
-        lifetime without ever comparing physical positions across streams.
+        Raises :class:`~scripts.research.family_b_13_v7.physical.CrossStreamComparisonError`
+        if ``ref`` belongs to a different sealed stream than the one this
+        lifetime's own boundaries were established in
+        (``harness-events.jsonl``) -- checked *before* the timestamp bound,
+        so the exception is raised whether or not ``ref``'s timestamp
+        happens to fall inside ``[start_ns, end_ns]``. A cross-stream
+        record's physical position is simply not comparable to this
+        lifetime's ``start_pos``/``end_pos`` (see
+        ``scripts.research.family_b_13_v7.physical``), so this method
+        cannot honestly answer "does it structurally fall within this
+        lifetime" for it at all -- it must fail closed rather than
+        approximate that answer from the timestamp alone. Callers that only
+        have (and only need) a cross-stream timestamp fact must use
+        :meth:`contains_ns` directly, exactly as the
+        ``stop_reader_pre_t0_before_process_start`` historical witness
+        does.
         """
 
+        if self.start_pos.stream is not ref.pos.stream:
+            raise CrossStreamComparisonError(
+                f"{ref.pos.stream!r} is not comparable to this lifetime's "
+                f"{self.start_pos.stream!r} boundaries"
+            )
         if not self.contains_ns(ref.monotonic_ns):
             return False
-        if self.start_pos.stream is not ref.pos.stream:
-            # No physical position is comparable across streams (see
-            # `physical.PhysicalPos.precedes`); the timestamp bound above
-            # is the only structural fact available for a cross-stream ref.
-            return True
         return not ref.pos.precedes(self.start_pos) and not self.end_pos.precedes(ref.pos)
 
 
@@ -148,9 +156,31 @@ class ParticipantLifetime:
 class ParticipantTable:
     """An immutable collection of every participant's
     :class:`ParticipantLifetime`, keyed by :class:`ParticipantIdentity`.
-    Constructed solely by :func:`build_participant_table`."""
+
+    Preferably constructed by :func:`build_participant_table`, but
+    ``__post_init__`` defends the immutability/type invariants for *any*
+    construction path: the incoming mapping is copied (never aliased back
+    to caller-held state -- mutating the caller's original dict/mapping
+    after construction cannot change this table), every key must be a
+    :class:`ParticipantIdentity`, every value a :class:`ParticipantLifetime`,
+    and every key must equal that lifetime's own ``identity``.
+    """
 
     _by_identity: Mapping[ParticipantIdentity, ParticipantLifetime]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self._by_identity, Mapping):
+            raise TypeError("ParticipantTable requires a mapping")
+        copied: dict[ParticipantIdentity, ParticipantLifetime] = {}
+        for key, lifetime in self._by_identity.items():
+            if not isinstance(key, ParticipantIdentity):
+                raise TypeError("ParticipantTable keys must be ParticipantIdentity")
+            if not isinstance(lifetime, ParticipantLifetime):
+                raise TypeError("ParticipantTable values must be ParticipantLifetime")
+            if lifetime.identity != key:
+                raise ValueError("ParticipantTable key must equal lifetime.identity")
+            copied[key] = lifetime
+        object.__setattr__(self, "_by_identity", MappingProxyType(copied))
 
     def get(self, identity: ParticipantIdentity) -> ParticipantLifetime | None:
         return self._by_identity.get(identity)

@@ -380,11 +380,164 @@ def test_lifetime_pure_containment_query() -> None:
     assert lifetime.contains_ns(321) is False
 
 
+def test_contains_record_cross_stream_timestamp_inside_still_raises() -> None:
+    """P1 adversarial case 1: a cross-stream ref whose timestamp DOES fall
+    inside the lifetime's numeric interval must still raise -- a bare
+    timestamp match is not evidence of participant-record ownership, since
+    TimedRecordRef carries no such binding. contains_ns alone answers the
+    numeric question; contains_record must not manufacture a stronger
+    positive fact from it."""
+
+    headers = _harness_headers("positive_13a")
+    table = build_participant_table(headers)
+    lifetime = table.get(ParticipantIdentity(READER))
+    ref = TimedRecordRef(
+        pos=PhysicalPos(StreamName.GROUND_TRUTH, 1),
+        monotonic_ns=100,
+    )
+    assert lifetime.contains_ns(ref.monotonic_ns) is True
+    with pytest.raises(CrossStreamComparisonError):
+        lifetime.contains_record(ref)
+
+
+def test_contains_record_cross_stream_always_raises_even_when_ns_outside() -> None:
+    """P1 adversarial case 2: cross-stream incomparability must be checked
+    BEFORE the timestamp bound, so contains_record's behavior never depends
+    on where the timestamp happens to fall -- otherwise it would still leak
+    a partial cross-stream relation (raise only sometimes)."""
+
+    headers = _harness_headers("positive_13a")
+    table = build_participant_table(headers)
+    lifetime = table.get(ParticipantIdentity(READER))
+    ref = TimedRecordRef(
+        pos=PhysicalPos(StreamName.GROUND_TRUTH, 1),
+        monotonic_ns=1,  # well outside [50, 320]
+    )
+    assert lifetime.contains_ns(ref.monotonic_ns) is False
+    with pytest.raises(CrossStreamComparisonError):
+        lifetime.contains_record(ref)
+
+
+def test_contains_record_same_stream_still_checks_physical_position() -> None:
+    """Sanity check that the same-stream path is untouched by the P1 fix:
+    a same-stream ref with an in-bounds timestamp but an out-of-bounds
+    physical position is still rejected."""
+
+    headers = _harness_headers("positive_13a")
+    table = build_participant_table(headers)
+    lifetime = table.get(ParticipantIdentity(READER))
+    out_of_bounds_ref = TimedRecordRef(
+        pos=PhysicalPos(StreamName.HARNESS_EVENTS, lifetime.end_pos.ordinal + 1),
+        monotonic_ns=200,
+    )
+    assert lifetime.contains_record(out_of_bounds_ref) is False
+    in_bounds_ref = TimedRecordRef(
+        pos=PhysicalPos(StreamName.HARNESS_EVENTS, lifetime.start_pos.ordinal + 1),
+        monotonic_ns=200,
+    )
+    assert lifetime.contains_record(in_bounds_ref) is True
+
+
+def test_harness_record_header_cannot_carry_a_non_harness_stream_via_decode() -> None:
+    """P2-1 adversarial case: decoding a valid process_start payload against
+    a GROUND_TRUTH-stream position must still be rejected."""
+
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        decode_harness_record_header(
+            {"event": "process_start", "harness_sequence": 1, "monotonic_ns": 1, "process_identity": READER},
+            PhysicalPos(StreamName.GROUND_TRUTH, 1),
+        )
+    assert str(exc_info.value) == "record_position_stream_mismatch"
+
+
+def test_harness_record_header_cannot_carry_a_non_harness_stream_via_direct_construction() -> None:
+    """P2-1 adversarial case: the type itself refuses a non-HARNESS_EVENTS
+    position even when the dataclass constructor is called directly,
+    bypassing decode_harness_record_header entirely."""
+
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        HarnessRecordHeader(
+            pos=PhysicalPos(StreamName.GROUND_TRUTH, 1),
+            kind=HarnessEventKind.PROCESS_START,
+            harness_sequence=1,
+            monotonic_ns=1,
+            process_identity=READER,
+        )
+    assert str(exc_info.value) == "record_position_stream_mismatch"
+
+
+def test_harness_record_header_direct_construction_enforces_s1_scalar_semantics() -> None:
+    """Direct construction also gets the same nonnegative-int/nonempty-
+    string enforcement decode_harness_record_header relies on -- including
+    rejecting bool for monotonic_ns, exactly like S1."""
+
+    valid_pos = PhysicalPos(StreamName.HARNESS_EVENTS, 1)
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        HarnessRecordHeader(
+            pos=valid_pos,
+            kind=HarnessEventKind.PROCESS_START,
+            harness_sequence=1,
+            monotonic_ns=True,  # bool must not satisfy nonnegative-int
+            process_identity=READER,
+        )
+    assert str(exc_info.value) == "record_monotonic_ns_invalid"
+
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        HarnessRecordHeader(
+            pos=valid_pos,
+            kind=HarnessEventKind.PROCESS_START,
+            harness_sequence=1,
+            monotonic_ns=1,
+            process_identity="",
+        )
+    assert str(exc_info.value) == "record_process_identity_invalid"
+
+
 def test_participant_table_is_immutable() -> None:
     headers = _harness_headers("positive_13a")
     table = build_participant_table(headers)
     with pytest.raises(Exception):
         table._by_identity["new"] = None  # type: ignore[index]
+
+
+def test_participant_table_copies_input_mapping_not_aliases_it() -> None:
+    """P2-2 adversarial case: mutating the caller's original mapping after
+    construction must not be visible through the table."""
+
+    headers = _harness_headers("positive_13a")
+    table_source = build_participant_table(headers)
+    identity = ParticipantIdentity(READER)
+    lifetime = table_source.get(identity)
+
+    source = {identity: lifetime}
+    table = ParticipantTable(source)
+    assert table.get(identity) == lifetime
+
+    source.clear()
+    assert len(source) == 0
+    assert table.get(identity) == lifetime  # unchanged
+    assert len(table) == 1
+
+
+def test_participant_table_rejects_non_identity_key() -> None:
+    headers = _harness_headers("positive_13a")
+    lifetime = build_participant_table(headers).get(ParticipantIdentity(READER))
+    with pytest.raises(TypeError):
+        ParticipantTable({"not-an-identity": lifetime})
+
+
+def test_participant_table_rejects_non_lifetime_value() -> None:
+    identity = ParticipantIdentity(READER)
+    with pytest.raises(TypeError):
+        ParticipantTable({identity: "not-a-lifetime"})
+
+
+def test_participant_table_rejects_key_lifetime_identity_mismatch() -> None:
+    headers = _harness_headers("positive_13a")
+    lifetime = build_participant_table(headers).get(ParticipantIdentity(READER))
+    other_identity = ParticipantIdentity("someone-else")
+    with pytest.raises(ValueError):
+        ParticipantTable({other_identity: lifetime})
 
 
 def test_participant_lifetime_has_no_mutation_methods() -> None:
@@ -415,7 +568,10 @@ def test_hist_harness_event_outside_lifetime_produces_structural_error() -> None
 def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
     """The harness-events stream is self-consistent; the invalid record
     lives in a different sealed stream. ParticipantTable construction
-    succeeds; the cross-stream fact query is what shows the violation."""
+    succeeds; the S2 fact this witness needs is the pure numeric
+    contains_ns query -- NOT contains_record, which cannot honestly answer
+    a cross-stream question at all and must fail closed instead (see
+    test_contains_record_cross_stream_always_raises_even_when_ns_outside)."""
 
     headers = _harness_headers("stop_reader_pre_t0_before_process_start")
     table = build_participant_table(headers)  # must NOT raise
@@ -430,7 +586,8 @@ def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
     assert ref.monotonic_ns == 50
 
     assert lifetime.contains_ns(ref.monotonic_ns) is False
-    assert lifetime.contains_record(ref) is False
+    with pytest.raises(CrossStreamComparisonError):
+        lifetime.contains_record(ref)
 
 
 def test_stop_generator_sequence_relabel_physical_pos_is_unrelabelable() -> None:
@@ -736,16 +893,70 @@ def test_every_s2_module_declares_all() -> None:
         assert hasattr(module, "__all__") and module.__all__
 
 
-def test_every_exported_s2_function_has_direct_test_coverage() -> None:
-    """Derived structurally (module __all__ + inspect), not hard-coded: the
-    exact set of function names this test file's own source text mentions
-    must be a superset of every module's exported functions."""
+def _direct_call_targets(node: ast.AST) -> set[str]:
+    """Every name actually invoked as a call (``ast.Call``) inside ``node``
+    -- a plain ``Name`` reference (an import, an assignment target, a
+    mention in a comment/docstring/assert message) never counts, only
+    ``foo(...)`` or ``module.foo(...)``/``obj.method(...)`` call sites."""
 
-    this_file_source = Path(__file__).read_text(encoding="utf-8")
+    targets: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            func = child.func
+            if isinstance(func, ast.Name):
+                targets.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                targets.add(func.attr)
+    return targets
+
+
+def _call_targets_reachable_from_tests(source: str) -> set[str]:
+    """The set of names actually called, directly or transitively through
+    this module's own local helper functions, starting only from a
+    ``test_*`` function body. A helper's calls count only because -- and
+    only if -- that helper is itself reachable from some test; an unused
+    helper's calls (or a helper only ever imported/mentioned, never called)
+    contribute nothing."""
+
+    tree = ast.parse(source)
+    top_level_funcs = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    direct_calls = {
+        name: _direct_call_targets(node) for name, node in top_level_funcs.items()
+    }
+    test_functions = [name for name in top_level_funcs if name.startswith("test_")]
+
+    reachable: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(func_name: str) -> None:
+        if func_name in visited:
+            return
+        visited.add(func_name)
+        for called in direct_calls.get(func_name, set()):
+            reachable.add(called)
+            if called in top_level_funcs:
+                visit(called)
+
+    for test_name in test_functions:
+        visit(test_name)
+    return reachable
+
+
+def test_every_exported_s2_function_has_actual_call_coverage() -> None:
+    """Derived structurally (module __all__ + inspect) against an AST call
+    graph rooted at this file's own test_* functions -- not a hard-coded
+    list, and not merely a textual name occurrence (an import statement
+    alone does not satisfy this)."""
+
+    reachable = _call_targets_reachable_from_tests(Path(__file__).read_text(encoding="utf-8"))
     exported: set[str] = set()
     for module in ALL_S2_MODULES:
         exported |= _public_functions(module)
-    missing = {name for name in exported if name not in this_file_source}
+    missing = exported - reachable
     assert missing == set()
 
 
