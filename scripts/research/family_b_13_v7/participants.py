@@ -9,6 +9,33 @@ inferred from naming convention (a value like ``"synthetic-reader:1"`` is
 not interpreted as "this is the reader"; it is only ever the literal
 identity string a lifecycle actually belongs to).
 
+Frozen capture-v6 harness-stream contract: single identity (load-bearing)
+---------------------------------------------------------------------------
+The byte-frozen v6 oracle
+(``tests/oracles/family_b_13/v6/blocker_b_family_b_13_analyzer.py``, its
+harness-lifecycle validation block) requires every
+``harness-events.jsonl`` record's ``process_identity`` to equal one single
+``manifest.reader_context.process_identity`` value -- any disagreement is
+an unconditional ``harness_reader_process_identity_mismatch`` rejection. A
+full ``harness-events.jsonl`` stream therefore describes exactly **one**
+participant identity, never an arbitrary set of independent identities.
+Every one of the 29 checked-in S0 sealed captures independently agrees
+(see ``test_all_captured_harness_streams_have_a_singleton_process_identity``
+in the S2 test file).
+
+S2 has no ``manifest`` and therefore never attempts to prove that the
+singleton identity it observes structurally equals
+``manifest.reader_context.process_identity`` itself -- that binding is
+intentionally outside S2 (see this module's own kill-switch note below).
+What S2 *can* and *must* prove, from the sealed harness records alone, is
+the structural shape of the frozen contract: the stream is nonempty, every
+record shares the exact same ``process_identity``, and
+:func:`build_participant_table` therefore builds exactly one
+:class:`ParticipantLifetime`. A physically coherent stream containing two
+different ``process_identity`` values is not a valid capture-v6 harness
+history; it is a structural rejection, never grouped into two independent
+lifecycles the way an unbounded multi-participant model would.
+
 Ground truth, observer-stream records, UPIDs, phase/interval classification,
 and T0/T1 play no part anywhere in this module.
 :func:`build_participant_table` takes only harness records; it has no
@@ -21,8 +48,13 @@ oracle's own harness-lifecycle validation --
 ``tests/oracles/family_b_13/v6/blocker_b_family_b_13_analyzer.py``, the
 ``_analyze_loaded`` harness-boundary block):
 
-- exactly one ``process_start`` and exactly one ``process_stop`` per
-  participant (frozen v6: ``kinds.count("process_start") != 1 or
+- the full harness stream is nonempty and carries exactly one
+  ``process_identity`` value (frozen v6's structural analogue of requiring
+  every record's ``process_identity`` to equal the single
+  ``reader_context.process_identity``, without S2 consulting that
+  manifest value itself -- see above);
+- exactly one ``process_start`` and exactly one ``process_stop`` for that
+  identity (frozen v6: ``kinds.count("process_start") != 1 or
   kinds.count("process_stop") != 1`` fails closed -- a missing or
   duplicated boundary is always rejected, never left optional);
 - any ``process_crash`` record is an unconditional structural rejection,
@@ -32,8 +64,8 @@ oracle's own harness-lifecycle validation --
   position or count). This resolves a design question with direct sourced
   evidence rather than a guess: :class:`TerminationKind` therefore has
   exactly one legal value;
-- ``process_start`` must be physically first among that participant's
-  records (physical order, never timestamp or ``harness_sequence`` order);
+- ``process_start`` must be physically first in the stream (physical order,
+  never timestamp or ``harness_sequence`` order);
 - ``process_stop`` must be physically last;
 - every record's ``monotonic_ns`` must fall within
   ``[start_ns, end_ns]`` inclusive, and every record's physical position
@@ -47,7 +79,10 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
-from scripts.research.family_b_13_primitives import require_nonnegative_int
+from scripts.research.family_b_13_primitives import (
+    require_nonempty_string,
+    require_nonnegative_int,
+)
 
 from .physical import PhysicalPos, StreamName
 from .records import HarnessEventKind, HarnessRecordHeader
@@ -70,7 +105,8 @@ class ParticipantIdentity:
     value: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.value, str) or not self.value:
+        result = require_nonempty_string(self.value)
+        if not result.ok:
             raise ValueError("ParticipantIdentity.value must be a nonempty string")
 
 
@@ -107,20 +143,23 @@ class ParticipantLifetime:
     deliberately exposes no record-ownership/containment query -- no
     ``contains_record``, and no replacement under another name such as
     ``record_within_lifetime``, ``contains_timed_record``, ``owns_record``,
-    or ``participant_contains``. A
-    :class:`~scripts.research.family_b_13_v7.records.TimedRecordRef` carries
-    no participant-identity/ownership binding of its own, so a bare
-    (position, timestamp) match -- even one that falls entirely inside this
-    lifetime's own ``[start_pos, end_pos]``/``[start_ns, end_ns]``
-    boundaries -- is never evidence that a given record was produced by
-    this lifetime's participant: two participants can legitimately
-    interleave inside one physically-coherent ``harness-events.jsonl``
-    stream (see
+    or ``participant_contains`` (see
     ``test_participant_lifetime_exposes_no_record_containment_helper``).
-    Ownership-aware record containment is deferred to a later stage with
-    its own explicit authority gate combining ownership, lifetime,
-    ``PhysicalPos``, and phase/interval together; S2 must not pre-combine
-    those concepts under any name.
+    S2's own accepted contract only ever needs the narrow numeric fact
+    :meth:`contains_ns` provides: a full harness stream already carries
+    exactly one participant identity (see the module docstring's frozen
+    capture-v6 single-identity contract), so there is no second identity
+    for an ownership-aware relation to disambiguate in the first place.
+    Separately,
+    :class:`~scripts.research.family_b_13_v7.records.TimedRecordRef` is
+    generic across every sealed stream (not only ``harness-events.jsonl``)
+    and carries no participant-identity/ownership binding of its own, so a
+    bare (position, timestamp) match could never honestly answer a
+    record-ownership question even if S2 needed one. Both reasons hold
+    independently; neither is grounds to introduce such a relation here
+    under any name. A later stage may combine ownership, lifetime,
+    ``PhysicalPos``, and phase/interval together through its own explicit
+    authority gate; S2 must not pre-combine those concepts.
 
     ``__post_init__`` enforces this type's own internal structural
     consistency -- a real ``ParticipantIdentity``, S1-valid nonnegative
@@ -172,15 +211,37 @@ class ParticipantLifetime:
     def contains_ns(self, monotonic_ns: int) -> bool:
         """Whether ``monotonic_ns`` falls within this lifetime's declared
         ``[start_ns, end_ns]`` interval. A pure numeric fact -- carries no
-        opinion about phase, interval, or evidence admissibility."""
+        opinion about phase, interval, or evidence admissibility.
 
-        return self.start_ns <= monotonic_ns <= self.end_ns
+        ``monotonic_ns`` must itself satisfy S1 ``require_nonnegative_int``
+        semantics (bool rejected); an invalid scalar raises
+        :class:`ParticipantLifetimeError` rather than silently returning
+        ``False`` -- a caller passing ``True`` must not have it manufacture
+        a positive numeric match against this lifetime's interval via
+        Python's ``True == 1`` coercion.
+        """
+
+        result = require_nonnegative_int(monotonic_ns)
+        if not result.ok:
+            raise ParticipantLifetimeError("lifetime_query_ns_invalid")
+        return self.start_ns <= result.value <= self.end_ns
 
 
 @dataclass(frozen=True)
 class ParticipantTable:
     """An immutable collection of every participant's
     :class:`ParticipantLifetime`, keyed by :class:`ParticipantIdentity`.
+
+    For the accepted S2 model, this table represents the harness-lifecycle
+    table established from one capture-v6 ``harness-events.jsonl`` stream,
+    which the frozen oracle's contract fixes to exactly one participant
+    identity (see the module docstring). ``ParticipantTable`` therefore
+    represents exactly one entry -- never zero, never more than one -- and
+    ``__post_init__`` enforces that for *any* construction path, not only
+    :func:`build_participant_table`. This is not a general-purpose registry
+    a future stage can silently broaden: a stage that genuinely needs
+    lifetimes for other explicitly-proven participants must design its own
+    composition mechanism rather than relaxing this type's own invariant.
 
     Preferably constructed by :func:`build_participant_table`, but
     ``__post_init__`` defends the immutability/type invariants for *any*
@@ -205,6 +266,10 @@ class ParticipantTable:
             if lifetime.identity != key:
                 raise ValueError("ParticipantTable key must equal lifetime.identity")
             copied[key] = lifetime
+        if len(copied) != 1:
+            raise ValueError(
+                "ParticipantTable must contain exactly one participant lifetime"
+            )
         object.__setattr__(self, "_by_identity", MappingProxyType(copied))
 
     def get(self, identity: ParticipantIdentity) -> ParticipantLifetime | None:
@@ -220,6 +285,21 @@ class ParticipantTable:
         return len(self._by_identity)
 
 
+def _require_typed_harness_records(
+    harness_records: Sequence[HarnessRecordHeader],
+) -> None:
+    """Fail closed with a stable S2-local structural error if any element
+    of ``harness_records`` is not actually a :class:`HarnessRecordHeader`
+    -- local input typing, never authority logic. Without this, an
+    arbitrary duck-typed object reaching ``record.pos.ordinal`` or
+    ``record.process_identity`` downstream would fail with an accidental
+    ``AttributeError`` instead of a stable, catchable structural error."""
+
+    for record in harness_records:
+        if not isinstance(record, HarnessRecordHeader):
+            raise ParticipantLifetimeError("harness_stream_record_type_invalid")
+
+
 def _require_physically_coherent_harness_stream(
     harness_records: Sequence[HarnessRecordHeader],
 ) -> None:
@@ -231,23 +311,34 @@ def _require_physically_coherent_harness_stream(
     ``ChronologySpec`` -- it never inspects ``harness_sequence``, timestamp
     ordering, T0/T1, or phase/interval; it only confirms the typed sequence
     is a coherent representation of one physical sealed stream before
-    anything downstream groups or trusts it by participant identity.
-    ``HarnessRecordHeader.__post_init__`` already rejects a non-
-    ``HARNESS_EVENTS`` position, so that case is not re-checked here."""
+    anything downstream trusts it. ``HarnessRecordHeader.__post_init__``
+    already rejects a non-``HARNESS_EVENTS`` position, so that case is not
+    re-checked here."""
 
     for index, record in enumerate(harness_records, start=1):
         if record.pos.ordinal != index:
             raise ParticipantLifetimeError("harness_stream_physical_position_incoherent")
 
 
-def _group_by_identity(
+def _require_singleton_process_identity(
     harness_records: Sequence[HarnessRecordHeader],
-) -> dict[ParticipantIdentity, list[HarnessRecordHeader]]:
-    groups: dict[ParticipantIdentity, list[HarnessRecordHeader]] = {}
-    for record in harness_records:
-        identity = ParticipantIdentity(record.process_identity)
-        groups.setdefault(identity, []).append(record)
-    return groups
+) -> ParticipantIdentity:
+    """Fail closed unless ``harness_records`` is nonempty and every record
+    shares the exact same ``process_identity`` -- the structural shape S2
+    can prove of the frozen capture-v6 single-identity harness contract
+    (see the module docstring). Returns the one
+    :class:`ParticipantIdentity` found. This never infers a role and never
+    consults a manifest: the identity value comes only from the sealed
+    records themselves."""
+
+    if not harness_records:
+        raise ParticipantLifetimeError("harness_stream_empty")
+
+    identity_values = {record.process_identity for record in harness_records}
+    if len(identity_values) != 1:
+        raise ParticipantLifetimeError("harness_process_identity_not_singleton")
+
+    return ParticipantIdentity(next(iter(identity_values)))
 
 
 def _build_one_lifetime(
@@ -301,23 +392,30 @@ def build_participant_table(
     harness_records: Sequence[HarnessRecordHeader],
 ) -> ParticipantTable:
     """Build a :class:`ParticipantTable` solely from typed harness
-    lifecycle records -- one :class:`ParticipantLifetime` per distinct
-    ``process_identity`` found in ``harness_records``.
+    lifecycle records -- exactly one :class:`ParticipantLifetime`, for the
+    single ``process_identity`` the frozen capture-v6 harness contract
+    fixes every ``harness-events.jsonl`` stream to (see the module
+    docstring). A stream carrying more than one distinct
+    ``process_identity`` is not a valid capture-v6 harness history and is
+    rejected as a structural error, never grouped into independent
+    per-identity lifecycles.
 
     Deliberately takes no other parameter. If building a correct table ever
     seems to require ground truth, observer records, a manifest, T0/T1, or
     a phase/interval, that is a sign this layering is wrong -- it must not
     be added here (see the package/module docstrings' kill-switch note).
 
-    Before grouping by participant identity, fails closed unless the full
-    supplied stream is itself physically coherent (see
-    :func:`_require_physically_coherent_harness_stream`).
+    Checks, each failing closed in order: every element is actually a
+    :class:`HarnessRecordHeader` (:func:`_require_typed_harness_records`);
+    the full supplied stream is itself physically coherent
+    (:func:`_require_physically_coherent_harness_stream`); the stream is
+    nonempty and carries exactly one ``process_identity``
+    (:func:`_require_singleton_process_identity`).
     """
 
+    _require_typed_harness_records(harness_records)
     _require_physically_coherent_harness_stream(harness_records)
-    groups = _group_by_identity(harness_records)
-    lifetimes = {
-        identity: _build_one_lifetime(identity, records)
-        for identity, records in groups.items()
-    }
-    return ParticipantTable(_by_identity=MappingProxyType(lifetimes))
+    identity = _require_singleton_process_identity(harness_records)
+
+    lifetime = _build_one_lifetime(identity, list(harness_records))
+    return ParticipantTable(_by_identity=MappingProxyType({identity: lifetime}))

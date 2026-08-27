@@ -503,22 +503,32 @@ def test_lifetime_pure_containment_query() -> None:
     assert lifetime.contains_ns(321) is False
 
 
-def test_participant_lifetime_exposes_no_record_containment_helper() -> None:
-    """P1 corrective decision (local stop-patching rule): TimedRecordRef
-    carries no participant-identity/ownership binding (see
-    records.TimedRecordRef), so a bare (position, timestamp) match can
-    never honestly prove a record belongs to one particular participant's
-    lifetime -- not even when the two lifetimes come from the SAME
-    harness-events stream. Two participants can legitimately interleave
-    inside one physically-coherent HARNESS_EVENTS stream (A starts, B
-    starts, B heartbeats, B stops, A stops); B's heartbeat then lands
-    physically and temporally inside A's own [start_pos, end_pos] /
-    [start_ns, end_ns] boundaries even though it was never produced by A.
-    ParticipantLifetime therefore exposes no contains_record (or any
-    replacement helper under another name) in S2 -- ownership-aware record
-    containment is deferred to a later stage with its own explicit
-    authority gate that combines ownership, lifetime, PhysicalPos, and
-    phase/interval together. S2 must not pre-combine those concepts."""
+@pytest.mark.parametrize("invalid_ns", [True, False, -1, "50", None])
+def test_lifetime_containment_query_rejects_invalid_scalars(invalid_ns) -> None:
+    """P2 corrective decision (section 6): contains_ns must not perform a
+    bare Python numeric comparison -- bool would otherwise satisfy an
+    integer interval via True == 1, manufacturing a positive structural
+    fact from a scalar S1/S2 otherwise reject. An invalid scalar must fail
+    closed, never silently return False."""
+
+    headers = _harness_headers("positive_13a")
+    table = build_participant_table(headers)
+    lifetime = table.get(ParticipantIdentity(READER))
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        lifetime.contains_ns(invalid_ns)
+    assert str(exc_info.value) == "lifetime_query_ns_invalid"
+
+
+def test_build_participant_table_rejects_two_distinct_identities_in_one_stream() -> None:
+    """S2 contract reconciliation: the frozen capture-v6 harness contract
+    fixes a full harness-events.jsonl stream to exactly one participant
+    identity (manifest.reader_context.process_identity, mismatch ->
+    harness_reader_process_identity_mismatch) -- it is NOT an arbitrary
+    multi-participant stream. A physically coherent HARNESS_EVENTS sequence
+    containing two different process_identity values is therefore not a
+    valid capture-v6 harness history and must be rejected with the
+    singleton-identity structural error, never grouped into two
+    independent lifecycles."""
 
     raw_records = [
         {
@@ -552,21 +562,68 @@ def test_participant_lifetime_exposes_no_record_containment_helper() -> None:
             "process_identity": "participant-a",
         },
     ]
-    headers = decode_harness_stream(raw_records)
-    table = build_participant_table(headers)  # both lifetimes are individually coherent
-    assert len(table) == 2
+    headers = decode_harness_stream(raw_records)  # physically coherent: ordinals 1..5
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(headers)
+    assert str(exc_info.value) == "harness_process_identity_not_singleton"
 
-    lifetime_a = table.get(ParticipantIdentity("participant-a"))
-    lifetime_b = table.get(ParticipantIdentity("participant-b"))
-    assert lifetime_a is not None
-    assert lifetime_b is not None
 
-    # B's heartbeat is physically and temporally inside A's own boundaries,
-    # even though it was produced by B, not A.
-    b_heartbeat = headers[2]
-    assert b_heartbeat.process_identity == "participant-b"
-    assert lifetime_a.contains_ns(b_heartbeat.monotonic_ns) is True
-    assert lifetime_a.start_pos.ordinal <= b_heartbeat.pos.ordinal <= lifetime_a.end_pos.ordinal
+def test_build_participant_table_rejects_empty_harness_stream() -> None:
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table([])
+    assert str(exc_info.value) == "harness_stream_empty"
+
+
+def test_build_participant_table_rejects_non_harness_record_header_elements() -> None:
+    """P2 type boundary (section 10): a duck-typed non-HarnessRecordHeader
+    element must fail closed with a stable structural error, never an
+    accidental AttributeError from deeper in the builder."""
+
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(["not-a-header"])  # type: ignore[list-item]
+    assert str(exc_info.value) == "harness_stream_record_type_invalid"
+
+
+def test_all_captured_harness_streams_have_a_singleton_process_identity() -> None:
+    """Inventory regression (S2 task section 8G): every one of the
+    checked-in S0 sealed captures' harness-events.jsonl streams carries
+    exactly one process_identity, matching the frozen capture-v6 harness
+    contract. A future fixture addition cannot silently introduce a second
+    harness identity without this test failing and forcing an explicit
+    design decision. synthetic-reader:1 is reported diagnostically only --
+    it is not asserted as the required value."""
+
+    fixture_dirs = sorted(
+        p for p in CAPTURES_ROOT.iterdir() if (p / "harness-events.jsonl").exists()
+    )
+    assert len(fixture_dirs) == 29, "unexpected checked-in capture count"
+
+    for fixture_dir in fixture_dirs:
+        raw = _load_jsonl(fixture_dir / "harness-events.jsonl")
+        observed_identities = {record.get("process_identity") for record in raw}
+        assert len(observed_identities) == 1, (fixture_dir.name, observed_identities)
+
+
+def test_participant_lifetime_exposes_no_record_containment_helper() -> None:
+    """P1 corrective decision (local stop-patching rule), rationale
+    corrected during S2 contract reconciliation: S2's own accepted
+    contract only ever needs the narrow numeric fact contains_ns provides
+    -- a full harness stream already carries exactly one participant
+    identity (see
+    test_all_captured_harness_streams_have_a_singleton_process_identity and
+    test_build_participant_table_rejects_two_distinct_identities_in_one_stream),
+    so there is no second identity for an ownership-aware relation to
+    disambiguate in the first place. Separately, TimedRecordRef (see
+    records.TimedRecordRef) is generic across every sealed stream and
+    carries no participant-identity/ownership binding of its own, so a
+    bare (position, timestamp) match could never honestly answer a
+    record-ownership question even if S2 needed one. Both reasons hold
+    independently. ParticipantLifetime therefore exposes no
+    contains_record (or any replacement helper under another name) in S2
+    -- ownership-aware record containment is deferred to a later stage
+    with its own explicit authority gate that combines ownership,
+    lifetime, PhysicalPos, and phase/interval together. S2 must not
+    pre-combine those concepts."""
 
     for forbidden_name in (
         "contains_record",

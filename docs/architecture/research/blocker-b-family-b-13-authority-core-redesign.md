@@ -424,21 +424,49 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
   `contains_record` abstraction itself invalid for S2, since
   `TimedRecordRef` carries no participant-identity/ownership binding at
   all, so a bare in-bounds (position, timestamp) match can never honestly
-  prove a record belongs to a given participant — even within one
-  physically-coherent `harness-events.jsonl` stream, one participant's
-  lifetime can legitimately contain another's record (two interleaved
-  process lifecycles). `ParticipantLifetime.contains_record` was therefore
-  **deleted outright** (local stop-patching rule: no replacement helper
-  under any name such as `record_within_lifetime`, `contains_timed_record`,
-  `owns_record`, or `participant_contains`); `contains_ns` remains as the
-  intentionally narrow numeric-only fact. That same pass closed the
-  `TimedRecordRef` and `ParticipantLifetime` type boundaries with
-  `__post_init__` invariants so neither can be directly constructed
-  internally inconsistent (bypassing their decoder/builder), and added a
-  full-stream `PhysicalPos` coherence gate to `build_participant_table` —
-  checked before grouping by participant identity — that fails closed on a
-  duplicate, missing, or stale/reordered physical ordinal anywhere in the
-  supplied harness stream. Still **IMPLEMENTED / AWAITING INDEPENDENT
+  prove a record belongs to a given participant. `ParticipantLifetime.
+  contains_record` was therefore **deleted outright** (local stop-patching
+  rule: no replacement helper under any name such as
+  `record_within_lifetime`, `contains_timed_record`, `owns_record`, or
+  `participant_contains`); `contains_ns` remains as the intentionally
+  narrow numeric-only fact. That same pass closed the `TimedRecordRef` and
+  `ParticipantLifetime` type boundaries with `__post_init__` invariants so
+  neither can be directly constructed internally inconsistent (bypassing
+  their decoder/builder), and added a full-stream `PhysicalPos` coherence
+  gate to `build_participant_table` — checked before grouping by
+  participant identity — that fails closed on a duplicate, missing, or
+  stale/reordered physical ordinal anywhere in the supplied harness stream.
+  A **subsequent S2 contract-reconciliation pass** (same anti-loop
+  decision, still Draft PR #53) found and corrected one incorrect S2 model
+  assumption surfaced by that boundary-closure work: the multi-participant
+  framing used above ("two interleaved process lifecycles ... one
+  participant's lifetime can legitimately contain another's record") is
+  **false** for frozen capture-v6. The byte-frozen v6 oracle requires every
+  `harness-events.jsonl` record's `process_identity` to equal one single
+  `manifest.reader_context.process_identity` value, else an unconditional
+  `harness_reader_process_identity_mismatch` rejection — a full harness
+  stream therefore describes exactly **one** participant identity, never
+  an arbitrary multi-participant set (independently confirmed: all 29
+  checked-in S0 captures carry exactly one `process_identity` each). S2
+  does not consult `manifest.reader_context` itself (that binding stays
+  intentionally outside S2), but it now proves the structural shape of
+  that same contract from the sealed records alone:
+  `build_participant_table` rejects an empty harness stream
+  (`harness_stream_empty`), rejects a stream carrying more than one
+  distinct `process_identity` (`harness_process_identity_not_singleton`)
+  rather than grouping it into independent per-identity lifecycles, and
+  rejects a non-`HarnessRecordHeader` element
+  (`harness_stream_record_type_invalid`). `ParticipantTable.__post_init__`
+  now requires exactly one entry for any construction path, matching that
+  same singleton contract at the type level. `contains_record`'s deletion
+  itself was not reopened — its corrected rationale is simply that S2's
+  own contract never has a second identity to disambiguate, and
+  `TimedRecordRef`'s lack of an ownership binding holds independently of
+  that. `ParticipantLifetime.contains_ns` was additionally hardened to
+  reject an invalid scalar (`bool`, negative, non-int) via S1
+  `require_nonnegative_int` rather than performing a bare Python numeric
+  comparison, closing a path where `True == 1` could manufacture a
+  positive numeric match. Still **IMPLEMENTED / AWAITING INDEPENDENT
   REVIEW**, not accepted.
 - **S3–S6** (future, not started): the remaining dormant v7 authority-core
   stages, each its own independently SHA-gated/reviewed commit boundary on
