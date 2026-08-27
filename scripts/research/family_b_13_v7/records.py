@@ -126,11 +126,27 @@ class TimedRecordRef:
     full semantics -- e.g. "does this pre-T0-establishment record's
     timestamp fall inside the reader's structural lifetime?" (a
     :class:`~scripts.research.family_b_13_v7.participants.ParticipantLifetime`
-    query), never an admission or authority decision.
+    ``contains_ns`` query), never an admission or authority decision.
+
+    Carries no participant-identity/ownership binding of its own -- a bare
+    (position, timestamp) match is never evidence that a record belongs to
+    (or was produced by) any particular participant.
+
+    ``__post_init__`` enforces this type's own structural invariants --
+    ``pos`` is a real :class:`PhysicalPos`, ``monotonic_ns`` satisfies S1
+    ``require_nonnegative_int`` semantics (bool rejected) -- for *any*
+    construction path, not just :func:`decode_timed_record_ref`.
     """
 
     pos: PhysicalPos
     monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pos, PhysicalPos):
+            raise StructuralDecodeError("record_position_invalid")
+        monotonic_result = require_nonnegative_int(self.monotonic_ns)
+        if not monotonic_result.ok:
+            raise StructuralDecodeError("record_monotonic_ns_invalid")
 
 
 def _require_field(raw: Mapping[str, Any], field: str) -> Any:
@@ -156,10 +172,11 @@ def decode_harness_record_header(
     """
 
     event_value = _require_field(raw, "event")
-    if not isinstance(event_value, str) or not event_value:
+    event_result = require_nonempty_string(event_value)
+    if not event_result.ok:
         raise StructuralDecodeError("record_event_invalid")
     try:
-        kind = HarnessEventKind(event_value)
+        kind = HarnessEventKind(event_result.value)
     except ValueError as exc:
         raise StructuralDecodeError("record_event_unknown") from exc
 

@@ -273,6 +273,52 @@ def test_timed_record_ref_is_immutable() -> None:
         ref.monotonic_ns = 6  # type: ignore[misc]
 
 
+def test_timed_record_ref_direct_construction_rejects_invalid_pos() -> None:
+    """P2 type-boundary closure: TimedRecordRef must reject a non-
+    PhysicalPos ``pos`` even via direct construction, bypassing
+    decode_timed_record_ref entirely."""
+
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        TimedRecordRef(pos="not-a-PhysicalPos", monotonic_ns=1)  # type: ignore[arg-type]
+    assert str(exc_info.value) == "record_position_invalid"
+
+
+def test_timed_record_ref_direct_construction_rejects_bool_monotonic_ns() -> None:
+    """bool must not satisfy S1 nonnegative-int semantics here either."""
+
+    pos = PhysicalPos(StreamName.PRE_T0_ESTABLISHMENT, 1)
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        TimedRecordRef(pos=pos, monotonic_ns=True)
+    assert str(exc_info.value) == "record_monotonic_ns_invalid"
+
+
+def test_timed_record_ref_direct_construction_rejects_negative_monotonic_ns() -> None:
+    pos = PhysicalPos(StreamName.PRE_T0_ESTABLISHMENT, 1)
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        TimedRecordRef(pos=pos, monotonic_ns=-1)
+    assert str(exc_info.value) == "record_monotonic_ns_invalid"
+
+
+def test_timed_record_ref_direct_construction_rejects_string_monotonic_ns() -> None:
+    pos = PhysicalPos(StreamName.PRE_T0_ESTABLISHMENT, 1)
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        TimedRecordRef(pos=pos, monotonic_ns="50")  # type: ignore[arg-type]
+    assert str(exc_info.value) == "record_monotonic_ns_invalid"
+
+
+def test_timed_record_ref_direct_construction_still_accepts_valid_values() -> None:
+    """Positive control alongside the rejection cases above: a genuinely
+    valid direct construction must still succeed, and decode_timed_record_ref
+    must continue to produce an equal object for the same inputs."""
+
+    pos = PhysicalPos(StreamName.PRE_T0_ESTABLISHMENT, 1)
+    ref = TimedRecordRef(pos=pos, monotonic_ns=50)
+    assert ref.pos == pos
+    assert ref.monotonic_ns == 50
+    decoded = decode_timed_record_ref({"monotonic_ns": 50}, pos)
+    assert decoded == ref
+
+
 # ---------------------------------------------------------------------------
 # C. ParticipantLifetime / ParticipantTable
 # ---------------------------------------------------------------------------
@@ -292,16 +338,36 @@ def test_positive_control_builds_a_coherent_participant_table() -> None:
 
 
 def test_duplicate_process_start_rejected() -> None:
+    """The duplicate start record must itself sit at a new, physically
+    coherent position (one past the fixture's last record) so this test
+    keeps exercising the intended lifecycle invariant rather than
+    incidentally tripping the physical-coherence gate (see section E)."""
+
+    from dataclasses import replace
+
     headers = _harness_headers("positive_13a")
-    duplicated = list(headers) + [headers[0]]
+    extra_start = replace(
+        headers[0],
+        pos=PhysicalPos(StreamName.HARNESS_EVENTS, headers[-1].pos.ordinal + 1),
+    )
+    duplicated = list(headers) + [extra_start]
     with pytest.raises(ParticipantLifetimeError) as exc_info:
         build_participant_table(duplicated)
     assert str(exc_info.value) == "participant_process_start_missing_or_duplicate"
 
 
 def test_conflicting_terminal_rejected() -> None:
+    """Same physical-coherence note as test_duplicate_process_start_rejected
+    above -- the extra stop record gets a new coherent position."""
+
+    from dataclasses import replace
+
     headers = _harness_headers("positive_13a")
-    duplicated = list(headers) + [headers[-1]]
+    extra_stop = replace(
+        headers[-1],
+        pos=PhysicalPos(StreamName.HARNESS_EVENTS, headers[-1].pos.ordinal + 1),
+    )
+    duplicated = list(headers) + [extra_stop]
     with pytest.raises(ParticipantLifetimeError) as exc_info:
         build_participant_table(duplicated)
     assert str(exc_info.value) == "participant_process_stop_missing_or_duplicate"
@@ -313,7 +379,7 @@ def test_process_crash_present_is_unconditionally_rejected() -> None:
     headers = _harness_headers("positive_13a")
     crash = replace(
         headers[2],
-        pos=PhysicalPos(StreamName.HARNESS_EVENTS, 99),
+        pos=PhysicalPos(StreamName.HARNESS_EVENTS, headers[-1].pos.ordinal + 1),
         kind=HarnessEventKind.PROCESS_CRASH,
     )
     with pytest.raises(ParticipantLifetimeError) as exc_info:
@@ -370,6 +436,63 @@ def test_physical_record_after_terminal_rejected() -> None:
     assert str(exc_info.value) == "participant_process_stop_not_physically_last"
 
 
+# --- Full-stream PhysicalPos coherence gate (P2, S2 task section 5) --------
+
+
+def test_build_participant_table_rejects_duplicate_physical_ordinal() -> None:
+    """Adversarial case A: a duplicate physical ordinal anywhere in the
+    supplied stream is a structural rejection, checked before grouping by
+    participant identity."""
+
+    from dataclasses import replace
+
+    headers = _harness_headers("positive_13a")
+    mutated = list(headers)
+    mutated[1] = replace(mutated[1], pos=headers[0].pos)
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(mutated)
+    assert str(exc_info.value) == "harness_stream_physical_position_incoherent"
+
+
+def test_build_participant_table_rejects_missing_physical_ordinal() -> None:
+    """Adversarial case B: a gap in the physical ordinal sequence is a
+    structural rejection."""
+
+    from dataclasses import replace
+
+    headers = _harness_headers("positive_13a")
+    mutated = list(headers[:-1]) + [
+        replace(
+            headers[-1],
+            pos=PhysicalPos(StreamName.HARNESS_EVENTS, headers[-1].pos.ordinal + 1),
+        )
+    ]
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(mutated)
+    assert str(exc_info.value) == "harness_stream_physical_position_incoherent"
+
+
+def test_build_participant_table_rejects_reversed_physical_sequence() -> None:
+    """Adversarial case C: reversing the supplied sequence while retaining
+    each record's original PhysicalPos values is a structural rejection --
+    the stale/reordered positions no longer match the supplied order."""
+
+    headers = _harness_headers("positive_13a")
+    mutated = list(reversed(headers))
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(mutated)
+    assert str(exc_info.value) == "harness_stream_physical_position_incoherent"
+
+
+def test_build_participant_table_accepts_normal_decode_output() -> None:
+    """Adversarial case D: normal decode_harness_stream output is already
+    physically coherent by construction and must still build."""
+
+    headers = _harness_headers("positive_13a")
+    table = build_participant_table(headers)  # must NOT raise
+    assert len(table) == 1
+
+
 def test_lifetime_pure_containment_query() -> None:
     headers = _harness_headers("positive_13a")
     table = build_participant_table(headers)
@@ -380,62 +503,79 @@ def test_lifetime_pure_containment_query() -> None:
     assert lifetime.contains_ns(321) is False
 
 
-def test_contains_record_cross_stream_timestamp_inside_still_raises() -> None:
-    """P1 adversarial case 1: a cross-stream ref whose timestamp DOES fall
-    inside the lifetime's numeric interval must still raise -- a bare
-    timestamp match is not evidence of participant-record ownership, since
-    TimedRecordRef carries no such binding. contains_ns alone answers the
-    numeric question; contains_record must not manufacture a stronger
-    positive fact from it."""
+def test_participant_lifetime_exposes_no_record_containment_helper() -> None:
+    """P1 corrective decision (local stop-patching rule): TimedRecordRef
+    carries no participant-identity/ownership binding (see
+    records.TimedRecordRef), so a bare (position, timestamp) match can
+    never honestly prove a record belongs to one particular participant's
+    lifetime -- not even when the two lifetimes come from the SAME
+    harness-events stream. Two participants can legitimately interleave
+    inside one physically-coherent HARNESS_EVENTS stream (A starts, B
+    starts, B heartbeats, B stops, A stops); B's heartbeat then lands
+    physically and temporally inside A's own [start_pos, end_pos] /
+    [start_ns, end_ns] boundaries even though it was never produced by A.
+    ParticipantLifetime therefore exposes no contains_record (or any
+    replacement helper under another name) in S2 -- ownership-aware record
+    containment is deferred to a later stage with its own explicit
+    authority gate that combines ownership, lifetime, PhysicalPos, and
+    phase/interval together. S2 must not pre-combine those concepts."""
 
-    headers = _harness_headers("positive_13a")
-    table = build_participant_table(headers)
-    lifetime = table.get(ParticipantIdentity(READER))
-    ref = TimedRecordRef(
-        pos=PhysicalPos(StreamName.GROUND_TRUTH, 1),
-        monotonic_ns=100,
-    )
-    assert lifetime.contains_ns(ref.monotonic_ns) is True
-    with pytest.raises(CrossStreamComparisonError):
-        lifetime.contains_record(ref)
+    raw_records = [
+        {
+            "event": "process_start",
+            "harness_sequence": 1,
+            "monotonic_ns": 0,
+            "process_identity": "participant-a",
+        },
+        {
+            "event": "process_start",
+            "harness_sequence": 1,
+            "monotonic_ns": 10,
+            "process_identity": "participant-b",
+        },
+        {
+            "event": "heartbeat",
+            "harness_sequence": 2,
+            "monotonic_ns": 20,
+            "process_identity": "participant-b",
+        },
+        {
+            "event": "process_stop",
+            "harness_sequence": 3,
+            "monotonic_ns": 30,
+            "process_identity": "participant-b",
+        },
+        {
+            "event": "process_stop",
+            "harness_sequence": 2,
+            "monotonic_ns": 40,
+            "process_identity": "participant-a",
+        },
+    ]
+    headers = decode_harness_stream(raw_records)
+    table = build_participant_table(headers)  # both lifetimes are individually coherent
+    assert len(table) == 2
 
+    lifetime_a = table.get(ParticipantIdentity("participant-a"))
+    lifetime_b = table.get(ParticipantIdentity("participant-b"))
+    assert lifetime_a is not None
+    assert lifetime_b is not None
 
-def test_contains_record_cross_stream_always_raises_even_when_ns_outside() -> None:
-    """P1 adversarial case 2: cross-stream incomparability must be checked
-    BEFORE the timestamp bound, so contains_record's behavior never depends
-    on where the timestamp happens to fall -- otherwise it would still leak
-    a partial cross-stream relation (raise only sometimes)."""
+    # B's heartbeat is physically and temporally inside A's own boundaries,
+    # even though it was produced by B, not A.
+    b_heartbeat = headers[2]
+    assert b_heartbeat.process_identity == "participant-b"
+    assert lifetime_a.contains_ns(b_heartbeat.monotonic_ns) is True
+    assert lifetime_a.start_pos.ordinal <= b_heartbeat.pos.ordinal <= lifetime_a.end_pos.ordinal
 
-    headers = _harness_headers("positive_13a")
-    table = build_participant_table(headers)
-    lifetime = table.get(ParticipantIdentity(READER))
-    ref = TimedRecordRef(
-        pos=PhysicalPos(StreamName.GROUND_TRUTH, 1),
-        monotonic_ns=1,  # well outside [50, 320]
-    )
-    assert lifetime.contains_ns(ref.monotonic_ns) is False
-    with pytest.raises(CrossStreamComparisonError):
-        lifetime.contains_record(ref)
-
-
-def test_contains_record_same_stream_still_checks_physical_position() -> None:
-    """Sanity check that the same-stream path is untouched by the P1 fix:
-    a same-stream ref with an in-bounds timestamp but an out-of-bounds
-    physical position is still rejected."""
-
-    headers = _harness_headers("positive_13a")
-    table = build_participant_table(headers)
-    lifetime = table.get(ParticipantIdentity(READER))
-    out_of_bounds_ref = TimedRecordRef(
-        pos=PhysicalPos(StreamName.HARNESS_EVENTS, lifetime.end_pos.ordinal + 1),
-        monotonic_ns=200,
-    )
-    assert lifetime.contains_record(out_of_bounds_ref) is False
-    in_bounds_ref = TimedRecordRef(
-        pos=PhysicalPos(StreamName.HARNESS_EVENTS, lifetime.start_pos.ordinal + 1),
-        monotonic_ns=200,
-    )
-    assert lifetime.contains_record(in_bounds_ref) is True
+    for forbidden_name in (
+        "contains_record",
+        "record_within_lifetime",
+        "contains_timed_record",
+        "owns_record",
+        "participant_contains",
+    ):
+        assert not hasattr(ParticipantLifetime, forbidden_name)
 
 
 def test_harness_record_header_cannot_carry_a_non_harness_stream_via_decode() -> None:
@@ -546,6 +686,73 @@ def test_participant_lifetime_has_no_mutation_methods() -> None:
     assert present == set()
 
 
+# --- ParticipantLifetime direct-construction type boundary (P2, section 4) -
+
+
+def _valid_lifetime_kwargs() -> dict:
+    return dict(
+        identity=ParticipantIdentity(READER),
+        start_ns=50,
+        end_ns=320,
+        start_pos=PhysicalPos(StreamName.HARNESS_EVENTS, 1),
+        end_pos=PhysicalPos(StreamName.HARNESS_EVENTS, 5),
+        termination_kind=TerminationKind.PROCESS_STOP,
+    )
+
+
+def test_participant_lifetime_direct_construction_accepts_valid_values() -> None:
+    """Positive control: a genuinely self-consistent direct construction
+    must still succeed."""
+
+    lifetime = ParticipantLifetime(**_valid_lifetime_kwargs())
+    assert lifetime.start_ns == 50
+    assert lifetime.end_ns == 320
+
+
+def test_participant_lifetime_direct_construction_rejects_inverted_timestamps() -> None:
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["start_ns"] = 320
+    kwargs["end_ns"] = 50
+    with pytest.raises(ParticipantLifetimeError):
+        ParticipantLifetime(**kwargs)
+
+
+def test_participant_lifetime_direct_construction_rejects_bool_timestamp() -> None:
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["start_ns"] = True
+    with pytest.raises(ParticipantLifetimeError):
+        ParticipantLifetime(**kwargs)
+
+
+def test_participant_lifetime_direct_construction_rejects_non_harness_position() -> None:
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["start_pos"] = PhysicalPos(StreamName.GROUND_TRUTH, 1)
+    with pytest.raises(ParticipantLifetimeError):
+        ParticipantLifetime(**kwargs)
+
+
+def test_participant_lifetime_direct_construction_rejects_reversed_positions() -> None:
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["start_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 5)
+    kwargs["end_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 1)
+    with pytest.raises(ParticipantLifetimeError):
+        ParticipantLifetime(**kwargs)
+
+
+def test_participant_lifetime_direct_construction_rejects_invalid_termination_kind() -> None:
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["termination_kind"] = "process_stop"  # a plain string, not TerminationKind
+    with pytest.raises(ParticipantLifetimeError):
+        ParticipantLifetime(**kwargs)
+
+
+def test_participant_lifetime_direct_construction_rejects_non_identity() -> None:
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["identity"] = "not-an-identity"
+    with pytest.raises(ParticipantLifetimeError):
+        ParticipantLifetime(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # D. Historical fixtures (structural facts only)
 # ---------------------------------------------------------------------------
@@ -568,10 +775,11 @@ def test_hist_harness_event_outside_lifetime_produces_structural_error() -> None
 def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
     """The harness-events stream is self-consistent; the invalid record
     lives in a different sealed stream. ParticipantTable construction
-    succeeds; the S2 fact this witness needs is the pure numeric
-    contains_ns query -- NOT contains_record, which cannot honestly answer
-    a cross-stream question at all and must fail closed instead (see
-    test_contains_record_cross_stream_always_raises_even_when_ns_outside)."""
+    succeeds; the only S2 fact this witness needs -- and the only one this
+    package offers for a cross-stream record -- is the pure numeric
+    contains_ns query (see
+    test_participant_lifetime_exposes_no_record_containment_helper for why
+    there is no record-ownership/containment helper to ask instead)."""
 
     headers = _harness_headers("stop_reader_pre_t0_before_process_start")
     table = build_participant_table(headers)  # must NOT raise
@@ -586,8 +794,6 @@ def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
     assert ref.monotonic_ns == 50
 
     assert lifetime.contains_ns(ref.monotonic_ns) is False
-    with pytest.raises(CrossStreamComparisonError):
-        lifetime.contains_record(ref)
 
 
 def test_stop_generator_sequence_relabel_physical_pos_is_unrelabelable() -> None:

@@ -47,8 +47,10 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, Sequence
 
-from .physical import CrossStreamComparisonError, PhysicalPos
-from .records import HarnessEventKind, HarnessRecordHeader, TimedRecordRef
+from scripts.research.family_b_13_primitives import require_nonnegative_int
+
+from .physical import PhysicalPos, StreamName
+from .records import HarnessEventKind, HarnessRecordHeader
 
 __all__ = [
     "ParticipantIdentity",
@@ -95,11 +97,41 @@ class ParticipantLifetime:
     solely by its own explicit sealed ``harness-events.jsonl`` lifecycle
     records.
 
-    Exposes only pure structural-fact queries
-    (:meth:`contains_ns`, :meth:`contains_record`) -- never an admission,
-    authority, or verdict decision. "A timestamp lies outside this
-    lifetime" is a fact this type can state; what that fact *means* is a
-    later-stage (``admit()``, S3+) question this type never answers.
+    Exposes only one pure structural-fact query, :meth:`contains_ns` --
+    never an admission, authority, or verdict decision. "A timestamp lies
+    outside this lifetime" is a fact this type can state; what that fact
+    *means* is a later-stage (``admit()``, S3+) question this type never
+    answers.
+
+    S2 corrective decision (local stop-patching rule): this type
+    deliberately exposes no record-ownership/containment query -- no
+    ``contains_record``, and no replacement under another name such as
+    ``record_within_lifetime``, ``contains_timed_record``, ``owns_record``,
+    or ``participant_contains``. A
+    :class:`~scripts.research.family_b_13_v7.records.TimedRecordRef` carries
+    no participant-identity/ownership binding of its own, so a bare
+    (position, timestamp) match -- even one that falls entirely inside this
+    lifetime's own ``[start_pos, end_pos]``/``[start_ns, end_ns]``
+    boundaries -- is never evidence that a given record was produced by
+    this lifetime's participant: two participants can legitimately
+    interleave inside one physically-coherent ``harness-events.jsonl``
+    stream (see
+    ``test_participant_lifetime_exposes_no_record_containment_helper``).
+    Ownership-aware record containment is deferred to a later stage with
+    its own explicit authority gate combining ownership, lifetime,
+    ``PhysicalPos``, and phase/interval together; S2 must not pre-combine
+    those concepts under any name.
+
+    ``__post_init__`` enforces this type's own internal structural
+    consistency -- a real ``ParticipantIdentity``, S1-valid nonnegative
+    ``start_ns``/``end_ns`` with ``start_ns <= end_ns``, ``start_pos``/
+    ``end_pos`` both ``PhysicalPos`` in ``StreamName.HARNESS_EVENTS`` with
+    ``start_pos.ordinal <= end_pos.ordinal``, and a real
+    :class:`TerminationKind` -- for *any* construction path. It does not,
+    and cannot, prove that lifecycle records actually existed to justify
+    those boundaries; that proof remains :func:`build_participant_table`'s
+    job. ``ParticipantTable`` can then trust that any actual
+    ``ParticipantLifetime`` instance it holds is internally self-consistent.
     """
 
     identity: ParticipantIdentity
@@ -109,47 +141,40 @@ class ParticipantLifetime:
     end_pos: PhysicalPos
     termination_kind: TerminationKind
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.identity, ParticipantIdentity):
+            raise ParticipantLifetimeError("lifetime_identity_invalid")
+
+        start_result = require_nonnegative_int(self.start_ns)
+        if not start_result.ok:
+            raise ParticipantLifetimeError("lifetime_start_ns_invalid")
+        end_result = require_nonnegative_int(self.end_ns)
+        if not end_result.ok:
+            raise ParticipantLifetimeError("lifetime_end_ns_invalid")
+        if self.start_ns > self.end_ns:
+            raise ParticipantLifetimeError("lifetime_interval_inverted")
+
+        if not isinstance(self.start_pos, PhysicalPos) or not isinstance(
+            self.end_pos, PhysicalPos
+        ):
+            raise ParticipantLifetimeError("lifetime_position_invalid")
+        if (
+            self.start_pos.stream is not StreamName.HARNESS_EVENTS
+            or self.end_pos.stream is not StreamName.HARNESS_EVENTS
+        ):
+            raise ParticipantLifetimeError("lifetime_position_stream_mismatch")
+        if self.start_pos.ordinal > self.end_pos.ordinal:
+            raise ParticipantLifetimeError("lifetime_position_inverted")
+
+        if not isinstance(self.termination_kind, TerminationKind):
+            raise ParticipantLifetimeError("lifetime_termination_kind_invalid")
+
     def contains_ns(self, monotonic_ns: int) -> bool:
         """Whether ``monotonic_ns`` falls within this lifetime's declared
         ``[start_ns, end_ns]`` interval. A pure numeric fact -- carries no
         opinion about phase, interval, or evidence admissibility."""
 
         return self.start_ns <= monotonic_ns <= self.end_ns
-
-    def contains_record(self, ref: TimedRecordRef) -> bool:
-        """Whether ``ref`` structurally falls within this lifetime -- both
-        its timestamp AND its physical position, since a
-        :class:`~scripts.research.family_b_13_v7.records.TimedRecordRef`
-        carries no participant-identity/ownership binding of its own: a
-        bare timestamp match is not evidence that ``ref`` belongs to (or
-        was produced by) this lifetime's participant at all.
-
-        Raises :class:`~scripts.research.family_b_13_v7.physical.CrossStreamComparisonError`
-        if ``ref`` belongs to a different sealed stream than the one this
-        lifetime's own boundaries were established in
-        (``harness-events.jsonl``) -- checked *before* the timestamp bound,
-        so the exception is raised whether or not ``ref``'s timestamp
-        happens to fall inside ``[start_ns, end_ns]``. A cross-stream
-        record's physical position is simply not comparable to this
-        lifetime's ``start_pos``/``end_pos`` (see
-        ``scripts.research.family_b_13_v7.physical``), so this method
-        cannot honestly answer "does it structurally fall within this
-        lifetime" for it at all -- it must fail closed rather than
-        approximate that answer from the timestamp alone. Callers that only
-        have (and only need) a cross-stream timestamp fact must use
-        :meth:`contains_ns` directly, exactly as the
-        ``stop_reader_pre_t0_before_process_start`` historical witness
-        does.
-        """
-
-        if self.start_pos.stream is not ref.pos.stream:
-            raise CrossStreamComparisonError(
-                f"{ref.pos.stream!r} is not comparable to this lifetime's "
-                f"{self.start_pos.stream!r} boundaries"
-            )
-        if not self.contains_ns(ref.monotonic_ns):
-            return False
-        return not ref.pos.precedes(self.start_pos) and not self.end_pos.precedes(ref.pos)
 
 
 @dataclass(frozen=True)
@@ -193,6 +218,26 @@ class ParticipantTable:
 
     def __len__(self) -> int:
         return len(self._by_identity)
+
+
+def _require_physically_coherent_harness_stream(
+    harness_records: Sequence[HarnessRecordHeader],
+) -> None:
+    """Fail closed unless ``harness_records`` is, in its own supplied
+    (physical-stream) order, a coherent representation of one sealed
+    ``harness-events.jsonl`` stream: ordinal 1, then 2, then 3, ... with no
+    duplicate, no gap, and no stale/reordered ``PhysicalPos`` left over from
+    a different arrangement. This is deliberately not
+    ``ChronologySpec`` -- it never inspects ``harness_sequence``, timestamp
+    ordering, T0/T1, or phase/interval; it only confirms the typed sequence
+    is a coherent representation of one physical sealed stream before
+    anything downstream groups or trusts it by participant identity.
+    ``HarnessRecordHeader.__post_init__`` already rejects a non-
+    ``HARNESS_EVENTS`` position, so that case is not re-checked here."""
+
+    for index, record in enumerate(harness_records, start=1):
+        if record.pos.ordinal != index:
+            raise ParticipantLifetimeError("harness_stream_physical_position_incoherent")
 
 
 def _group_by_identity(
@@ -263,8 +308,13 @@ def build_participant_table(
     seems to require ground truth, observer records, a manifest, T0/T1, or
     a phase/interval, that is a sign this layering is wrong -- it must not
     be added here (see the package/module docstrings' kill-switch note).
+
+    Before grouping by participant identity, fails closed unless the full
+    supplied stream is itself physically coherent (see
+    :func:`_require_physically_coherent_harness_stream`).
     """
 
+    _require_physically_coherent_harness_stream(harness_records)
     groups = _group_by_identity(harness_records)
     lifetimes = {
         identity: _build_one_lifetime(identity, records)

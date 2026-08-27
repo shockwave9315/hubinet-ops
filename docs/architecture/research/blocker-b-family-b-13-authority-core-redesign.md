@@ -282,6 +282,57 @@ positive evidence.
 No additional normative meaning is invented beyond what the prior design
 material already establishes for these gates.
 
+## 7a. Anti-loop / continuity decision (S2 final boundary corrective pass)
+
+**This is a durably recorded operator decision, load-bearing for every
+subsequent implementation and review pass on this checkpoint.**
+
+Draft PR #53 is the **only** active implementation PR for this checkpoint.
+A difficult implementation, or a G8 trigger, does **not** by itself imply:
+
+- a v8;
+- a new PR #54 or any other new implementation PR;
+- another clean rewrite;
+- moving the same mechanism under new names to route around a stop.
+
+What **G8 means, exactly**, restated for this pass:
+
+```text
+STOP IMPLEMENTATION
+IDENTIFY THE BROKEN MECHANISM ASSUMPTION
+RETURN TO MECHANISM RESEARCH
+```
+
+A new implementation PR requires a **separate, explicit operator decision**,
+made only after the failed mechanism assumption has actually been
+identified — never as a default reaction to difficulty.
+
+Also recorded here, durably, as standing rules for this checkpoint:
+
+- accepted stage boundary SHAs (§9) are immutable inputs — never rewritten
+  or reinterpreted to make a later stage easier;
+- a current stage may not import semantics from a later, not-yet-built
+  stage to make itself work (S2 may not reach for S3+ authority concepts —
+  see §5/§9's kill-switch note, repeated at the S2 stage level in the
+  package docstring);
+- witness-specific exceptions are forbidden — a fix must close the bounded
+  contract family a witness belongs to, never carve out a special case for
+  that one witness alone;
+- missing provenance may never be replaced by a positive fact — an absence
+  of evidence stays an absence, never silently upgraded to a "yes";
+- if the accepted design, the current stage's own contract, and a witness
+  cannot all be satisfied together: **STOP BEFORE COMMIT** and report the
+  conflict, rather than bending any of the three to make the other two fit;
+- green tests do not override a semantic-layer violation — passing tests
+  are evidence, not proof of architectural correctness;
+- do not silently amend the frozen design (§9's accepted stage boundaries,
+  §4's frozen classifications) — any actual amendment is reported as an
+  explicit, separately-flagged decision, never folded silently into a
+  routine corrective pass.
+
+This continuity guard applies to future implementation **and** review on
+this checkpoint, not only to this pass.
+
 ## 8. Two model-derived leaks found before implementation
 
 Applying the new model to the frozen v6 oracle surfaced two additional
@@ -367,7 +418,28 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
   closed the type boundary so `HarnessRecordHeader` cannot exist with a
   non-`HARNESS_EVENTS` position through any construction path (not only
   the decoder), and made `ParticipantTable` copy and validate any input
-  mapping rather than trust or alias it.
+  mapping rather than trust or alias it. A **final S2 boundary corrective
+  pass** (§7a anti-loop decision, same Draft PR #53, no v8) went further
+  than patching that gap again: independent review found the
+  `contains_record` abstraction itself invalid for S2, since
+  `TimedRecordRef` carries no participant-identity/ownership binding at
+  all, so a bare in-bounds (position, timestamp) match can never honestly
+  prove a record belongs to a given participant — even within one
+  physically-coherent `harness-events.jsonl` stream, one participant's
+  lifetime can legitimately contain another's record (two interleaved
+  process lifecycles). `ParticipantLifetime.contains_record` was therefore
+  **deleted outright** (local stop-patching rule: no replacement helper
+  under any name such as `record_within_lifetime`, `contains_timed_record`,
+  `owns_record`, or `participant_contains`); `contains_ns` remains as the
+  intentionally narrow numeric-only fact. That same pass closed the
+  `TimedRecordRef` and `ParticipantLifetime` type boundaries with
+  `__post_init__` invariants so neither can be directly constructed
+  internally inconsistent (bypassing their decoder/builder), and added a
+  full-stream `PhysicalPos` coherence gate to `build_participant_table` —
+  checked before grouping by participant identity — that fails closed on a
+  duplicate, missing, or stale/reordered physical ordinal anywhere in the
+  supplied harness stream. Still **IMPLEMENTED / AWAITING INDEPENDENT
+  REVIEW**, not accepted.
 - **S3–S6** (future, not started): the remaining dormant v7 authority-core
   stages, each its own independently SHA-gated/reviewed commit boundary on
   this same Draft PR #53. No real experiment. No production authority.
