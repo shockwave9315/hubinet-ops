@@ -11,13 +11,18 @@ one in the guise of a "validator."
 It validates ``scripts/research/family_b_13_v7/`` (S2): typed structural
 records, ``PhysicalPos``, ``ParticipantLifetime``, and ``ParticipantTable``.
 Every fact this file checks is a structural fact (physical order, a
-lifecycle boundary, a timestamp-in-interval query) -- never an admission,
-authority, or verdict decision.
+lifecycle boundary) -- never an admission, authority, or verdict decision.
+S2 derives no timestamp-order relation of any kind (see the S2 final
+boundary corrective pass in ``participants.py``'s module docstring); an
+earlier revision of this file's own docstring described a
+"timestamp-in-interval query" as a current S2 fact, which is no longer
+true and was corrected here rather than left to mislead a future reader.
 """
 
 from __future__ import annotations
 
 import ast
+import collections.abc
 import inspect
 import json
 from pathlib import Path
@@ -25,7 +30,10 @@ from typing import Any
 
 import pytest
 
-from scripts.research.family_b_13_primitives import decode_jsonl_line
+from scripts.research.family_b_13_primitives import (
+    decode_jsonl_line,
+    require_nonnegative_int,
+)
 from scripts.research.family_b_13_v7 import participants as participants_module
 from scripts.research.family_b_13_v7 import physical as physical_module
 from scripts.research.family_b_13_v7 import records as records_module
@@ -47,10 +55,8 @@ from scripts.research.family_b_13_v7.records import (
     HarnessEventKind,
     HarnessRecordHeader,
     StructuralDecodeError,
-    TimedRecordRef,
     decode_harness_record_header,
     decode_harness_stream,
-    decode_timed_record_ref,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -123,6 +129,50 @@ def test_physical_pos_has_no_cross_stream_total_ordering_operator() -> None:
     fail-closed `precedes()`."""
 
     assert not hasattr(PhysicalPos, "__lt__") or PhysicalPos.__lt__ is object.__lt__
+
+
+# --- P2 type-boundary hardening (S2 final boundary corrective pass) -------
+
+
+def test_physical_pos_precedes_rejects_duck_typed_fake() -> None:
+    """A duck-typed object exposing the right attributes must not
+    manufacture a positive physical-order fact -- `precedes` must check
+    real PhysicalPos-ness before any field access."""
+
+    class _FakePhysicalPos:
+        stream = StreamName.HARNESS_EVENTS
+        ordinal = 99
+
+    pos = PhysicalPos(StreamName.HARNESS_EVENTS, 1)
+    with pytest.raises(TypeError):
+        pos.precedes(_FakePhysicalPos())  # type: ignore[arg-type]
+
+
+def test_physical_pos_precedes_rejects_object() -> None:
+    pos = PhysicalPos(StreamName.HARNESS_EVENTS, 1)
+    with pytest.raises(TypeError):
+        pos.precedes(object())  # type: ignore[arg-type]
+
+
+def test_assign_physical_positions_rejects_invalid_stream_with_empty_records() -> None:
+    """API hygiene (S2 final boundary corrective pass): an invalid stream
+    must be rejected even when there are no records to assign positions
+    to -- it must not silently pass through merely because the list
+    comprehension would have produced nothing anyway."""
+
+    with pytest.raises(TypeError):
+        assign_physical_positions("invalid", [])  # type: ignore[arg-type]
+
+
+def test_assign_physical_positions_rejects_invalid_stream_with_nonempty_records() -> None:
+    """Same stable error class, whether records is empty or not."""
+
+    with pytest.raises(TypeError):
+        assign_physical_positions("invalid", [{}])  # type: ignore[arg-type]
+
+
+def test_assign_physical_positions_valid_stream_with_empty_records_returns_empty_list() -> None:
+    assert assign_physical_positions(StreamName.HARNESS_EVENTS, []) == []
 
 
 # --- Metamorphic gates (S2 task section 9) ---------------------------------
@@ -266,59 +316,6 @@ def test_harness_record_header_is_immutable() -> None:
         header.monotonic_ns = 2  # type: ignore[misc]
 
 
-def test_timed_record_ref_is_immutable() -> None:
-    pos = PhysicalPos(stream=StreamName.PRE_T0_ESTABLISHMENT, ordinal=1)
-    ref = decode_timed_record_ref({"monotonic_ns": 5}, pos)
-    with pytest.raises(Exception):
-        ref.monotonic_ns = 6  # type: ignore[misc]
-
-
-def test_timed_record_ref_direct_construction_rejects_invalid_pos() -> None:
-    """P2 type-boundary closure: TimedRecordRef must reject a non-
-    PhysicalPos ``pos`` even via direct construction, bypassing
-    decode_timed_record_ref entirely."""
-
-    with pytest.raises(StructuralDecodeError) as exc_info:
-        TimedRecordRef(pos="not-a-PhysicalPos", monotonic_ns=1)  # type: ignore[arg-type]
-    assert str(exc_info.value) == "record_position_invalid"
-
-
-def test_timed_record_ref_direct_construction_rejects_bool_monotonic_ns() -> None:
-    """bool must not satisfy S1 nonnegative-int semantics here either."""
-
-    pos = PhysicalPos(StreamName.PRE_T0_ESTABLISHMENT, 1)
-    with pytest.raises(StructuralDecodeError) as exc_info:
-        TimedRecordRef(pos=pos, monotonic_ns=True)
-    assert str(exc_info.value) == "record_monotonic_ns_invalid"
-
-
-def test_timed_record_ref_direct_construction_rejects_negative_monotonic_ns() -> None:
-    pos = PhysicalPos(StreamName.PRE_T0_ESTABLISHMENT, 1)
-    with pytest.raises(StructuralDecodeError) as exc_info:
-        TimedRecordRef(pos=pos, monotonic_ns=-1)
-    assert str(exc_info.value) == "record_monotonic_ns_invalid"
-
-
-def test_timed_record_ref_direct_construction_rejects_string_monotonic_ns() -> None:
-    pos = PhysicalPos(StreamName.PRE_T0_ESTABLISHMENT, 1)
-    with pytest.raises(StructuralDecodeError) as exc_info:
-        TimedRecordRef(pos=pos, monotonic_ns="50")  # type: ignore[arg-type]
-    assert str(exc_info.value) == "record_monotonic_ns_invalid"
-
-
-def test_timed_record_ref_direct_construction_still_accepts_valid_values() -> None:
-    """Positive control alongside the rejection cases above: a genuinely
-    valid direct construction must still succeed, and decode_timed_record_ref
-    must continue to produce an equal object for the same inputs."""
-
-    pos = PhysicalPos(StreamName.PRE_T0_ESTABLISHMENT, 1)
-    ref = TimedRecordRef(pos=pos, monotonic_ns=50)
-    assert ref.pos == pos
-    assert ref.monotonic_ns == 50
-    decoded = decode_timed_record_ref({"monotonic_ns": 50}, pos)
-    assert decoded == ref
-
-
 # ---------------------------------------------------------------------------
 # C. ParticipantLifetime / ParticipantTable
 # ---------------------------------------------------------------------------
@@ -387,7 +384,14 @@ def test_process_crash_present_is_unconditionally_rejected() -> None:
     assert str(exc_info.value) == "participant_process_crash_present"
 
 
-def test_event_timestamp_before_start_rejected() -> None:
+def test_event_timestamp_before_start_no_longer_rejected() -> None:
+    """S2 final boundary corrective pass: S2 derives no timestamp-order
+    relation at all now (see the module docstring's clock-boundary
+    reconciliation), so an interior record's monotonic_ns lying numerically
+    before start_ns is not a structural rejection -- it is exactly the
+    kind of relation frozen v6 can only make after proving
+    manifest.clock_contract, which S2 never has."""
+
     from dataclasses import replace
 
     headers = _harness_headers("positive_13a")
@@ -395,12 +399,14 @@ def test_event_timestamp_before_start_rejected() -> None:
         replace(h, monotonic_ns=49) if h.kind is HarnessEventKind.HEARTBEAT else h
         for h in headers
     ]
-    with pytest.raises(ParticipantLifetimeError) as exc_info:
-        build_participant_table(mutated)
-    assert str(exc_info.value) == "participant_record_timestamp_outside_lifetime"
+    table = build_participant_table(mutated)  # must NOT raise
+    assert len(table) == 1
 
 
-def test_event_timestamp_after_end_rejected() -> None:
+def test_event_timestamp_after_end_no_longer_rejected() -> None:
+    """Same reconciliation as the "before start" case above, mirrored for
+    a timestamp numerically after end_ns."""
+
     from dataclasses import replace
 
     headers = _harness_headers("positive_13a")
@@ -408,9 +414,8 @@ def test_event_timestamp_after_end_rejected() -> None:
         replace(h, monotonic_ns=321) if h.kind is HarnessEventKind.HEARTBEAT else h
         for h in headers
     ]
-    with pytest.raises(ParticipantLifetimeError) as exc_info:
-        build_participant_table(mutated)
-    assert str(exc_info.value) == "participant_record_timestamp_outside_lifetime"
+    table = build_participant_table(mutated)  # must NOT raise
+    assert len(table) == 1
 
 
 def test_physical_record_before_start_rejected() -> None:
@@ -490,6 +495,104 @@ def test_build_participant_table_accepts_normal_decode_output() -> None:
 
     headers = _harness_headers("positive_13a")
     table = build_participant_table(headers)  # must NOT raise
+    assert len(table) == 1
+
+
+# --- P1 snapshot boundary (S2 final boundary corrective pass) -------------
+
+
+def _two_record_stream(start_ns: int, stop_ns: int) -> list[HarnessRecordHeader]:
+    return decode_harness_stream(
+        [
+            {
+                "event": "process_start",
+                "harness_sequence": 1,
+                "monotonic_ns": start_ns,
+                "process_identity": READER,
+            },
+            {
+                "event": "process_stop",
+                "harness_sequence": 2,
+                "monotonic_ns": stop_ns,
+                "process_identity": READER,
+            },
+        ]
+    )
+
+
+class _AdversarialVaryingSequence(collections.abc.Sequence):
+    """A genuine ``collections.abc.Sequence`` (so it passes the builder's
+    Sequence type gate) whose distinct FULL iterations return different
+    content: the first full traversal yields the "validated" (start=100,
+    stop=200) two-record stream; every traversal after the first yields a
+    "forged" (start=0, stop=10**18) stream instead. Exercises the P1
+    snapshot-boundary fix directly -- before the fix,
+    ``build_participant_table`` traversed its caller-supplied
+    ``harness_records`` repeatedly (once per validator, again inside the
+    lifetime builder), so a validator could see one history while the
+    final lifetime was assembled from a different, later traversal."""
+
+    def __init__(self, generations: list[list[HarnessRecordHeader]]) -> None:
+        self._generations = generations
+        self.iteration_count = 0
+        self._active: list[HarnessRecordHeader] | None = None
+
+    def __len__(self) -> int:
+        return len(self._generations[0])
+
+    def __getitem__(self, index: int) -> HarnessRecordHeader:
+        if index == 0:
+            self.iteration_count += 1
+            generation = min(self.iteration_count, len(self._generations)) - 1
+            self._active = self._generations[generation]
+        assert self._active is not None
+        if index >= len(self._active):
+            raise IndexError(index)
+        return self._active[index]
+
+
+def test_build_participant_table_snapshots_adversarial_sequence_exactly_once() -> None:
+    """P1 corrective decision (local stop-patching rule): the caller-
+    supplied ``harness_records`` is traversed EXACTLY ONCE, immediately, in
+    ``build_participant_table``, into an immutable tuple snapshot that
+    every validator and the lifetime builder then consumes -- the original
+    object is never traversed again. Before the fix, this adversarial
+    object would have been traversed four times (once per validator, once
+    more inside the lifetime builder), and the final lifetime would have
+    been built from the forged (later) generation instead of the validated
+    (first) one."""
+
+    validated = _two_record_stream(start_ns=100, stop_ns=200)
+    forged = _two_record_stream(start_ns=0, stop_ns=10**18)
+    adversarial = _AdversarialVaryingSequence([validated, forged])
+
+    table = build_participant_table(adversarial)
+
+    assert adversarial.iteration_count == 1
+    lifetime = table.get(ParticipantIdentity(READER))
+    assert lifetime is not None
+    assert lifetime.start_ns == 100
+    assert lifetime.end_ns == 200
+
+
+def test_build_participant_table_rejects_non_sequence_iterator() -> None:
+    """A plain one-shot iterator/generator must not silently become part
+    of this public contract merely because ``tuple()`` can consume it --
+    it fails closed with a stable, local error instead."""
+
+    headers = _harness_headers("positive_13a")
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(iter(headers))  # type: ignore[arg-type]
+    assert str(exc_info.value) == "harness_stream_input_not_sequence"
+
+
+def test_build_participant_table_still_accepts_a_plain_list() -> None:
+    """Positive control alongside the Sequence-type gate above: the
+    ordinary case (a plain list, as every other test in this file passes)
+    must keep working."""
+
+    headers = _harness_headers("positive_13a")
+    table = build_participant_table(list(headers))  # must NOT raise
     assert len(table) == 1
 
 
@@ -767,6 +870,26 @@ def test_participant_table_rejects_key_lifetime_identity_mismatch() -> None:
         ParticipantTable({other_identity: lifetime})
 
 
+def test_participant_table_iteration_and_membership_are_mapping_consistent() -> None:
+    """S2 final boundary corrective pass (section 20): __iter__ yields
+    ParticipantIdentity keys -- consistent with __contains__ and get(),
+    never the lifetime values. Before the fix, list(table)[0] returned a
+    ParticipantLifetime while `identity in table` tested keys -- mixed
+    key/value semantics on the same type."""
+
+    headers = _harness_headers("positive_13a")
+    table = build_participant_table(headers)
+
+    identity = next(iter(table))
+    assert isinstance(identity, ParticipantIdentity)
+    assert identity == ParticipantIdentity(READER)
+    assert identity in table
+    expected_lifetime = table.get(identity)
+    assert expected_lifetime is not None
+    assert table.get(identity) is expected_lifetime
+    assert list(table) == [identity]
+
+
 def test_participant_lifetime_has_no_mutation_methods() -> None:
     forbidden = {"set_start", "set_end", "promote", "mark_valid", "mark_authoritative"}
     present = forbidden & set(dir(ParticipantLifetime))
@@ -796,12 +919,19 @@ def test_participant_lifetime_direct_construction_accepts_valid_values() -> None
     assert lifetime.end_ns == 320
 
 
-def test_participant_lifetime_direct_construction_rejects_inverted_timestamps() -> None:
+def test_participant_lifetime_direct_construction_does_not_reject_inverted_timestamps() -> None:
+    """S2 final boundary corrective pass: S2 derives no relation between
+    start_ns and end_ns at all (see the class docstring's clock-domain
+    boundary note) -- a numerically "inverted" pair of otherwise-valid
+    scalars is NOT rejected merely because of that numeric relation. This
+    is an important proof of the new clock boundary, not an oversight."""
+
     kwargs = _valid_lifetime_kwargs()
     kwargs["start_ns"] = 320
     kwargs["end_ns"] = 50
-    with pytest.raises(ParticipantLifetimeError):
-        ParticipantLifetime(**kwargs)
+    lifetime = ParticipantLifetime(**kwargs)  # must NOT raise
+    assert lifetime.start_ns == 320
+    assert lifetime.end_ns == 50
 
 
 def test_participant_lifetime_direct_construction_rejects_bool_timestamp() -> None:
@@ -824,6 +954,47 @@ def test_participant_lifetime_direct_construction_rejects_reversed_positions() -
     kwargs["end_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 1)
     with pytest.raises(ParticipantLifetimeError):
         ParticipantLifetime(**kwargs)
+
+
+def test_participant_lifetime_direct_construction_requires_start_position_physically_first() -> None:
+    """Section 12 matrix: start_pos=2, end_pos=5 -> reject (start must be
+    ordinal 1, the physically-first record; a lifetime cannot legitimately
+    begin partway through a stream)."""
+
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["start_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 2)
+    kwargs["end_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 5)
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        ParticipantLifetime(**kwargs)
+    assert str(exc_info.value) == "lifetime_start_position_not_physically_first"
+
+
+def test_participant_lifetime_direct_construction_rejects_equal_start_and_end_position() -> None:
+    """Section 12 matrix: start_pos=1, end_pos=1 -> reject. process_start
+    and process_stop are distinct event records; one physical record
+    cannot simultaneously serve as both."""
+
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["start_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 1)
+    kwargs["end_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 1)
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        ParticipantLifetime(**kwargs)
+    assert str(exc_info.value) == "lifetime_end_position_not_after_start"
+
+
+def test_participant_lifetime_direct_construction_accepts_minimal_valid_positions() -> None:
+    """Section 12 matrix: start_pos=1, end_pos=2 -> accept, even though
+    start_ns > end_ns here -- proving the physical-position invariant and
+    the (now-removed) timestamp relation are fully independent checks."""
+
+    kwargs = _valid_lifetime_kwargs()
+    kwargs["start_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 1)
+    kwargs["end_pos"] = PhysicalPos(StreamName.HARNESS_EVENTS, 2)
+    kwargs["start_ns"] = 999
+    kwargs["end_ns"] = 1
+    lifetime = ParticipantLifetime(**kwargs)  # must NOT raise
+    assert lifetime.start_pos.ordinal == 1
+    assert lifetime.end_pos.ordinal == 2
 
 
 def test_participant_lifetime_direct_construction_rejects_invalid_termination_kind() -> None:
@@ -852,11 +1023,29 @@ def test_hist_process_start_physical_first_produces_structural_error() -> None:
     assert str(exc_info.value) == "participant_process_start_not_physically_first"
 
 
-def test_hist_harness_event_outside_lifetime_produces_structural_error() -> None:
+def test_hist_harness_event_outside_lifetime_no_longer_produces_a_structural_error() -> None:
+    """S2 final boundary corrective pass: this fixture's gap_signal record
+    declares monotonic_ns=49, numerically before the reader lifetime's own
+    start_ns=50. Frozen v6 rejects this only after separately proving
+    manifest.clock_contract; S2 has no manifest and derives no timestamp
+    relation at all now (see the module docstring's clock-boundary
+    reconciliation), so this fixture builds a coherent ParticipantTable
+    from the sealed records alone. This historical witness is UNRESOLVED
+    AT S2 CLOCK-RELATION LEVEL -- not PASS, not GAP, not INCOMPLETE, not a
+    structural rejection -- and is discharged only once a later stage has
+    validated the shared clock-domain contract; that later stage is not
+    implemented here."""
+
     headers = _harness_headers("hist_harness_event_outside_lifetime")
-    with pytest.raises(ParticipantLifetimeError) as exc_info:
-        build_participant_table(headers)
-    assert str(exc_info.value) == "participant_record_timestamp_outside_lifetime"
+    table = build_participant_table(headers)  # must NOT raise
+    lifetime = table.get(ParticipantIdentity(READER))
+    assert lifetime is not None
+    assert lifetime.start_ns == 50
+    assert lifetime.end_ns == 320
+    # The gap_signal's own out-of-bounds scalar is preserved as sealed data
+    # only -- no relation to lifetime.start_ns/end_ns is derived anywhere.
+    gap_signal = next(h for h in headers if h.kind is HarnessEventKind.GAP_SIGNAL)
+    assert gap_signal.monotonic_ns == 49
 
 
 def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
@@ -882,11 +1071,18 @@ def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
     pre_t0_raw = _load_jsonl(
         CAPTURES_ROOT / "stop_reader_pre_t0_before_process_start" / "pre-t0-establishment.jsonl"
     )
-    positions = assign_physical_positions(StreamName.PRE_T0_ESTABLISHMENT, pre_t0_raw)
-    ref = decode_timed_record_ref(pre_t0_raw[0], positions[0])
-    assert ref.monotonic_ns == 50
+    # The pre-T0 observer record's own monotonic_ns is preserved via the
+    # accepted S1 scalar primitive directly -- S2 no longer has a
+    # TimedRecordRef-shaped wrapper type at all (see the S2 final boundary
+    # corrective pass); its PhysicalPos, if needed, is assigned separately
+    # and independently.
+    observer_result = require_nonnegative_int(pre_t0_raw[0]["monotonic_ns"])
+    assert observer_result.ok
+    assert observer_result.value == 50
+    observer_pos = assign_physical_positions(StreamName.PRE_T0_ESTABLISHMENT, pre_t0_raw)[0]
+    assert observer_pos.ordinal == 1
     # Two independent structural facts only -- no cross-stream relation is
-    # derived between lifetime.start_ns and ref.monotonic_ns.
+    # derived between lifetime.start_ns and the observer's own monotonic_ns.
 
 
 def test_stop_generator_sequence_relabel_physical_pos_is_unrelabelable() -> None:
@@ -1000,6 +1196,22 @@ def test_modifying_generator_sequence_cannot_alter_a_table_built_from_unchanged_
     lifetime_before = table_before.get(ParticipantIdentity(READER))
     lifetime_after = table_after.get(ParticipantIdentity(READER))
     assert lifetime_before == lifetime_after
+
+
+def test_participant_lifetime_equality_is_structural_value_equality_only() -> None:
+    """Documented, not "fixed" (section 19): structurally identical
+    ParticipantLifetime/ParticipantTable values from independent builds
+    compare equal by design -- this is ordinary frozen-dataclass value
+    equality, and it proves nothing about same-capture/same-run/same-
+    sealed-provenance/same-authority-context. A later composition stage
+    must carry capture identity externally; S2 values must never be used
+    alone as a cross-capture provenance key."""
+
+    headers = _harness_headers("positive_13a")
+    lifetime_a = build_participant_table(list(headers)).get(ParticipantIdentity(READER))
+    lifetime_b = build_participant_table(list(headers)).get(ParticipantIdentity(READER))
+    assert lifetime_a is not lifetime_b
+    assert lifetime_a == lifetime_b
 
 
 # ---------------------------------------------------------------------------
@@ -1136,6 +1348,62 @@ def test_v7_modules_do_not_import_the_frozen_oracle(path: Path) -> None:
     assert not any("oracle" in t or "analyzer" in t for t in targets)
 
 
+def _direct_call_names(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                names.add(func.id)
+            elif isinstance(func, ast.Attribute):
+                names.add(func.attr)
+    return names
+
+
+@pytest.mark.parametrize(
+    "path",
+    [p for p in V7_MODULE_PATHS if p.name != "participants.py"],
+    ids=lambda p: p.name,
+)
+def test_only_participants_module_constructs_lifetime_or_table(path: Path) -> None:
+    """Architecture AST gate (section 18 of the S2 final boundary
+    corrective pass): no v7 package module OTHER THAN participants.py may
+    directly call ParticipantLifetime(...) or ParticipantTable(...) --
+    this is enforcement of the already-designed derivation path (the
+    designated builder proves derivation from the one-time frozen harness
+    snapshot; a public constructor proves only local structural
+    well-formedness), never an authority token. This guards future S3+
+    modules added under the same package, not only the current ones; it
+    applies to the implementation package, not this test module, which
+    exercises the type-boundary invariants by direct construction by
+    design."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    called = _direct_call_names(tree)
+    assert "ParticipantLifetime" not in called, path.name
+    assert "ParticipantTable" not in called, path.name
+
+
+def test_participants_module_centralizes_its_own_constructor_calls() -> None:
+    """Within participants.py itself, only _build_one_lifetime constructs
+    ParticipantLifetime and only build_participant_table constructs
+    ParticipantTable -- those constructor calls are not scattered to other
+    helpers unless structurally necessary."""
+
+    source = (V7_PACKAGE_DIR / "participants.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    callers_of: dict[str, set[str]] = {"ParticipantLifetime": set(), "ParticipantTable": set()}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        called = _direct_call_names(node)
+        for target in callers_of:
+            if target in called:
+                callers_of[target].add(node.name)
+    assert callers_of["ParticipantLifetime"] == {"_build_one_lifetime"}
+    assert callers_of["ParticipantTable"] == {"build_participant_table"}
+
+
 def test_frozen_oracle_does_not_import_s2() -> None:
     oracle_path = (
         REPO_ROOT / "tests" / "oracles" / "family_b_13" / "v6" / "blocker_b_family_b_13_analyzer.py"
@@ -1175,13 +1443,17 @@ def test_no_s2_function_returns_a_frozen_external_outcome_string() -> None:
     for value in observed_strings:
         assert value not in EXTERNAL_OUTCOME_STRINGS
 
-    for fixture_id in (
-        "hist_process_start_physical_first",
-        "hist_harness_event_outside_lifetime",
-    ):
-        with pytest.raises(ParticipantLifetimeError) as exc_info:
-            build_participant_table(_harness_headers(fixture_id))
-        assert str(exc_info.value) not in EXTERNAL_OUTCOME_STRINGS
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(_harness_headers("hist_process_start_physical_first"))
+    assert str(exc_info.value) not in EXTERNAL_OUTCOME_STRINGS
+
+    # hist_harness_event_outside_lifetime no longer raises at S2 (see the
+    # clock-boundary reconciliation) -- confirm its own event-kind values
+    # still never surface an external outcome string either.
+    outside_lifetime_headers = _harness_headers("hist_harness_event_outside_lifetime")
+    build_participant_table(outside_lifetime_headers)  # must NOT raise
+    for header in outside_lifetime_headers:
+        assert header.kind.value not in EXTERNAL_OUTCOME_STRINGS
 
 
 def test_gap_signal_kind_is_only_a_label_not_a_gap_classification() -> None:
@@ -1194,10 +1466,10 @@ def test_gap_signal_kind_is_only_a_label_not_a_gap_classification() -> None:
     headers = _harness_headers("stop_post_t1_gap_signal_rewrites_t1")
     gap_signal_headers = [h for h in headers if h.kind is HarnessEventKind.GAP_SIGNAL]
     assert len(gap_signal_headers) == 1
-    table = build_participant_table(headers)  # succeeds: the builder already
-    # enforces that every singleton-harness record's own monotonic_ns lies
-    # inside the reader lifetime -- no external timestamp-query helper is
-    # needed (or reintroduced) here to prove that.
+    table = build_participant_table(headers)  # succeeds: S2 derives no
+    # timestamp relation for any record (see the clock-boundary
+    # reconciliation), so this fixture's gap_signal -- structurally just
+    # another event-kind label -- poses no obstacle here either way.
     assert len(table) == 1
     lifetime = table.get(ParticipantIdentity(READER))
     assert lifetime is not None
@@ -1299,12 +1571,89 @@ def test_every_exported_s2_function_has_actual_call_coverage() -> None:
     assert missing == set()
 
 
-def test_every_exported_s2_type_has_direct_test_coverage() -> None:
-    this_file_source = Path(__file__).read_text(encoding="utf-8")
+def _functions_reachable_from_tests(source: str) -> set[str]:
+    """The set of top-level function names reachable from some test_*
+    function, INCLUDING the test functions themselves (a test is always
+    reachable from itself); a helper is reachable only if some reachable
+    function actually calls it -- the same reachability rule
+    ``_call_targets_reachable_from_tests`` above uses for call coverage,
+    generalized to name the functions themselves rather than their call
+    targets."""
+
+    tree = ast.parse(source)
+    top_level_funcs = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    direct_calls = {
+        name: _direct_call_targets(node) for name, node in top_level_funcs.items()
+    }
+    test_functions = [name for name in top_level_funcs if name.startswith("test_")]
+
+    reachable_funcs: set[str] = set()
+
+    def visit(func_name: str) -> None:
+        if func_name in reachable_funcs:
+            return
+        reachable_funcs.add(func_name)
+        for called in direct_calls.get(func_name, set()):
+            if called in top_level_funcs:
+                visit(called)
+
+    for test_name in test_functions:
+        visit(test_name)
+    return reachable_funcs
+
+
+def _name_loads_in_functions(source: str, func_names: set[str]) -> set[str]:
+    """Every identifier referenced as an ``ast.Name`` in a load context --
+    a constructor call (``ParticipantLifetime(...)``), an enum member
+    access's object (``StreamName.HARNESS_EVENTS``), an isinstance/
+    pytest.raises argument (``isinstance(x, ParticipantTable)``,
+    ``pytest.raises(StructuralDecodeError)``), ... -- anywhere inside the
+    given top-level function bodies. Excludes imports (an ``ast.alias``
+    string, never an ``ast.Name`` node), comments (not part of the AST at
+    all), and docstrings/string literals (an ``ast.Constant``, never an
+    ``ast.Name`` node) -- a type that is only imported, or only named in
+    prose, contributes nothing here."""
+
+    tree = ast.parse(source)
+    top_level_funcs = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    loaded: set[str] = set()
+    for name in func_names:
+        node = top_level_funcs.get(name)
+        if node is None:
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                loaded.add(child.id)
+    return loaded
+
+
+def test_every_exported_s2_type_has_actual_executable_use_coverage() -> None:
+    """Executable-AST-use gate (section 21 of the S2 final boundary
+    corrective pass): replaces the prior raw-text/substring type-coverage
+    check, which an import statement alone could satisfy (the type's own
+    name appearing anywhere in this file's source text, including in an
+    import line or a docstring). An exported type must actually be
+    exercised -- constructed, an enum member accessed off it, passed to
+    isinstance/pytest.raises, etc. -- by some function reachable from a
+    test_* function; being imported or merely mentioned in prose is not
+    enough to satisfy this gate."""
+
+    source = Path(__file__).read_text(encoding="utf-8")
+    reachable_funcs = _functions_reachable_from_tests(source)
+    used_names = _name_loads_in_functions(source, reachable_funcs)
+
     exported: set[str] = set()
     for module in ALL_S2_MODULES:
         exported |= _public_types(module)
-    missing = {name for name in exported if name not in this_file_source}
+    missing = exported - used_names
     assert missing == set()
 
 
@@ -1316,11 +1665,13 @@ def test_exported_function_and_type_counts() -> None:
     total_functions = sum(len(_public_functions(m)) for m in ALL_S2_MODULES)
     total_types = sum(len(_public_types(m)) for m in ALL_S2_MODULES)
     # functions: assign_physical_positions, decode_harness_record_header,
-    # decode_harness_stream, decode_timed_record_ref, build_participant_table
-    assert total_functions == 5
+    # decode_harness_stream, build_participant_table. decode_timed_record_ref
+    # was removed in the S2 final boundary corrective pass alongside
+    # TimedRecordRef (see records.py).
+    assert total_functions == 4
     # types: StreamName, PhysicalPos, CrossStreamComparisonError (physical);
-    # HarnessEventKind, StructuralDecodeError, HarnessRecordHeader,
-    # TimedRecordRef (records); ParticipantIdentity, TerminationKind,
-    # ParticipantLifetimeError, ParticipantLifetime, ParticipantTable
-    # (participants)
-    assert total_types == 12
+    # HarnessEventKind, StructuralDecodeError, HarnessRecordHeader (records);
+    # ParticipantIdentity, TerminationKind, ParticipantLifetimeError,
+    # ParticipantLifetime, ParticipantTable (participants). TimedRecordRef
+    # was removed in the S2 final boundary corrective pass.
+    assert total_types == 11

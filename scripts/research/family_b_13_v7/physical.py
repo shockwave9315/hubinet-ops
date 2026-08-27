@@ -82,10 +82,16 @@ class PhysicalPos:
 
     def precedes(self, other: "PhysicalPos") -> bool:
         """Whether this position is physically before ``other`` in the
-        same stream. Raises :class:`CrossStreamComparisonError` if the two
-        positions belong to different streams -- there is deliberately no
-        silent cross-stream ordering."""
+        same stream. Raises :class:`TypeError` if ``other`` is not itself a
+        real :class:`PhysicalPos` -- checked before any field access, so a
+        duck-typed object exposing ``stream``/``ordinal`` attributes can
+        never manufacture a positive physical-order fact by impersonating
+        one. Raises :class:`CrossStreamComparisonError` if the two positions
+        belong to different streams -- there is deliberately no silent
+        cross-stream ordering."""
 
+        if not isinstance(other, PhysicalPos):
+            raise TypeError("PhysicalPos.precedes requires another PhysicalPos")
         if self.stream is not other.stream:
             raise CrossStreamComparisonError(
                 f"positions in {self.stream!r} and {other.stream!r} are not comparable"
@@ -102,6 +108,13 @@ def assign_physical_positions(
     record's *position in the sequence* only; it never inspects the record's
     own content, so nothing a record declares about itself (a sequence
     number, a timestamp) can influence the assignment.
+
+    ``stream`` must be a real :class:`StreamName`, checked before anything
+    else -- including when ``records`` is empty, so an invalid stream can
+    never silently pass through merely because there was nothing to assign
+    positions to.
     """
 
+    if not isinstance(stream, StreamName):
+        raise TypeError("assign_physical_positions requires a StreamName")
     return [PhysicalPos(stream=stream, ordinal=index) for index in range(1, len(records) + 1)]

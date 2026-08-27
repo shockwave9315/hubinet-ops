@@ -428,8 +428,10 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
   contains_record` was therefore **deleted outright** (local stop-patching
   rule: no replacement helper under any name such as
   `record_within_lifetime`, `contains_timed_record`, `owns_record`, or
-  `participant_contains`); `contains_ns` remains as the intentionally
-  narrow numeric-only fact. That same pass closed the `TimedRecordRef` and
+  `participant_contains`). At that intermediate point, `contains_ns`
+  temporarily remained as the intentionally narrow numeric-only fact; the
+  clock-boundary corrective pass further below deleted it too. That same
+  pass closed the `TimedRecordRef` and
   `ParticipantLifetime` type boundaries with `__post_init__` invariants so
   neither can be directly constructed internally inconsistent (bypassing
   their decoder/builder), and added a full-stream `PhysicalPos` coherence
@@ -487,25 +489,152 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
   `in_lifetime`, `timestamp_within`, or `compare_ns`).
   `ParticipantLifetime` is now purely immutable structural data (identity,
   `start_ns`/`end_ns`, `start_pos`/`end_pos`, `termination_kind`) with no
-  query method at all in S2. This does not touch
-  `build_participant_table`'s own internal validation: every record inside
-  one `harness-events.jsonl` stream is emitted by the same single writer
-  process (the singleton `process_identity` the prior reconciliation pass
-  established), so ordering those records' own `monotonic_ns` values
-  against each other needs no external clock-domain proof — there is
-  exactly one writer, one clock. The historical
-  `stop_reader_pre_t0_before_process_start` witness is represented in S2
-  as two independent structural facts only — the reader lifetime's own
-  `start_ns` and the pre-T0 observer record's own `monotonic_ns` — with no
-  relation derived between them; it is **UNRESOLVED AT S2 RELATION
-  LEVEL**, not `GAP`/`INCOMPLETE`, discharged only once a later stage has
-  validated the shared clock-domain contract (that later stage is not
-  implemented here, and clock-domain proof is never assigned automatically
-  to `admit()` — whatever consumes the relation must be preceded by that
-  proof). `TimedRecordRef` remains data-only (`pos`, `monotonic_ns`); its
-  documentation now states explicitly that it establishes no comparability
-  with a timestamp from another stream or participant. Still
-  **IMPLEMENTED / AWAITING INDEPENDENT REVIEW**, not accepted.
+  query method at all in S2. That pass's own remaining internal reasoning
+  still held that every record inside one `harness-events.jsonl` stream is
+  emitted by the same single writer process (the singleton
+  `process_identity` the prior reconciliation pass established), so
+  `build_participant_table` kept ordering those records' own
+  `monotonic_ns` values against each other and against the reader
+  lifetime boundary, on the theory that this needed no external
+  clock-domain proof. `TimedRecordRef` remained data-only (`pos`,
+  `monotonic_ns`), documented as establishing no comparability with a
+  timestamp from another stream or participant. Still **IMPLEMENTED /
+  AWAITING INDEPENDENT REVIEW**, not accepted.
+
+  An independent adversarial review of this exact S2 candidate (run before
+  accepting S2 as a stage boundary) found P1: 0, P2: 4, P3: 5, G8 not
+  triggered, and confirmed the S2 mechanism itself — sealed values →
+  structural facts → STOP before authority/meaning — survived intact.
+  Three boundaries remained insufficiently sealed, reconciled together in
+  one **final S2 boundary corrective pass** (same §7a anti-loop decision,
+  still Draft PR #53, no v8, no S3):
+
+  1. **Snapshot boundary (P1).** `build_participant_table` traversed its
+     caller-supplied `harness_records` repeatedly — once per validator,
+     again inside the lifetime builder — without ever snapshotting it, so
+     a `Sequence`-conforming object whose successive full iterations
+     returned different content could be validated against one history
+     and have its lifetime built from a different, later one. Fixed by
+     requiring a real `Sequence` (`harness_stream_input_not_sequence`
+     otherwise — a plain one-shot iterator/generator does not silently
+     satisfy this contract merely because `tuple()` can consume it) and
+     traversing it exactly once, immediately, into an immutable tuple
+     snapshot that every validator and the lifetime builder consume; the
+     caller's own object is never traversed again. Proven by an
+     adversarial regression object that returns a validated
+     (`start=100`, `stop=200`) history on its first full iteration and a
+     forged (`start=0`, `stop=10**18`) one on every iteration after —
+     asserting the object's own iteration count is exactly `1` and the
+     built lifetime's boundaries come from the first (validated) history.
+
+  2. **Clock boundary — the remaining internal warrant was itself wrong.**
+     The second corrective pass's own residual reasoning ("every record
+     inside one harness stream is emitted by the same single writer
+     process ... needs no external clock-domain proof — there is exactly
+     one writer, one clock") is exactly the chain this final pass found
+     unproven: a self-declared singleton `process_identity` is structural
+     equality only, never proof of a shared `CLOCK_MONOTONIC` domain — the
+     frozen v6 oracle proves that domain via an explicit
+     `manifest.clock_contract` S2 does not have, singleton identity or
+     not. S2 therefore now derives **no timestamp-order relation of any
+     kind**, cross-stream or within one harness stream: not
+     `start_ns <= end_ns` on `ParticipantLifetime` (direct construction or
+     via the builder), and not any record's `monotonic_ns` against the
+     reader lifetime boundary inside `build_participant_table`. Every
+     `monotonic_ns`/`start_ns`/`end_ns` value remains an individually
+     S1-validated scalar only. A direct `ParticipantLifetime` construction
+     with `start_ns > end_ns` is therefore **not** rejected merely because
+     of that numeric relation — both scalars individually satisfying S1
+     nonnegative-int semantics is all this type now proves about them.
+     The historical `hist_harness_event_outside_lifetime` witness —
+     previously a structural rejection because a `gap_signal`'s declared
+     `monotonic_ns` fell numerically before `start_ns` — now builds a
+     coherent `ParticipantTable`, since its rejection depended on exactly
+     this retracted relation; like `stop_reader_pre_t0_before_process_start`,
+     it is **UNRESOLVED AT S2 CLOCK-RELATION LEVEL**, not `PASS`/`GAP`/
+     `INCOMPLETE`/a structural rejection, discharged only once a later
+     stage has validated the shared clock-domain contract (not implemented
+     here; clock-domain proof is never assigned automatically to
+     `admit()` — whatever consumes the relation must be preceded by that
+     proof). `TimedRecordRef`/`decode_timed_record_ref` were removed
+     outright (local stop-patching rule: no replacement under any name):
+     their only remaining S2 use had become demonstrating exactly the
+     cross-stream relation S2 forbids. A historical fixture that needs to
+     preserve an observer record's bare `monotonic_ns` now uses the
+     accepted S1 `require_nonnegative_int` primitive directly, and its
+     `PhysicalPos` separately if its physical position is itself being
+     tested.
+
+  3. **Well-formed vs. established, made structural (P2s).** Physical
+     lifecycle invariants were tightened rather than loosened:
+     `ParticipantLifetime.__post_init__` now requires
+     `start_pos.ordinal == 1` (the lifetime must begin at the
+     physically-first record) and `end_pos.ordinal > start_pos.ordinal`
+     strictly (one physical record cannot serve as both `process_start`
+     and `process_stop`) — proven by a `start_pos=1, end_pos=2` direct
+     construction succeeding even with `start_ns > end_ns`, showing the
+     physical-position and (now-removed) timestamp checks are fully
+     independent. `_build_one_lifetime` now checks physical first/last
+     directly against ordinals `1`/`len(records)` against the
+     already-snapshotted, already-coherence-proven stream, removing a
+     tautological re-derived min/max check and its now-unreachable
+     `participant_record_outside_lifetime_physical_position` error path.
+     `PhysicalPos.precedes` now requires `isinstance(other, PhysicalPos)`
+     before any field access (`TypeError` otherwise), closing a
+     false-positive physical-order fact a duck-typed fake exposing
+     `stream`/`ordinal` attributes could otherwise manufacture;
+     `assign_physical_positions` now rejects an invalid `StreamName` even
+     when `records` is empty. `ParticipantTable`'s `__iter__` was made
+     mapping-consistent with `__contains__`/`get` (all three now key on
+     `ParticipantIdentity`; iteration previously yielded lifetime values
+     while membership tested identity keys). A new package-scoped AST gate
+     enforces that no v7 module other than `participants.py` may directly
+     construct `ParticipantLifetime`/`ParticipantTable` — architecture
+     enforcement of the already-designed derivation path (a public
+     constructor proves only local structural well-formedness; the
+     designated builder proves derivation from the one-time frozen harness
+     snapshot), never an authority token; equality of every S2 value
+     remains documented as structural value equality only, proving nothing
+     about same-capture/same-run/same-sealed-provenance/same-authority-
+     context. The prior raw-text/substring exported-type coverage check
+     (which an import statement alone could satisfy) was replaced with an
+     executable-AST-use gate requiring a real constructor call, enum
+     member access, `isinstance`, or `pytest.raises` reachable from a
+     test.
+
+  **Deferred frozen-v6 constraints (DEFERRED MANDATORY VALIDATION, not
+  removed/relaxed/accepted divergence/a capture-v6 contract amendment).**
+  Because S2 deliberately stops before authority/meaning, it does not
+  enforce every requirement the frozen v6 oracle enforces on the same
+  sealed captures. At minimum, still outstanding for a later stage:
+
+  - `harness_sequence` contiguous/ordered (S2 keeps it as declared data
+    only; frozen v6's `harness_sequence_not_contiguous_or_ordered` check
+    is not reproduced here);
+  - `capture_finalized` requirements (presence, count, ordering relative
+    to `process_start`/`process_stop`, and its own timestamp bounds);
+  - `complete == true` on `capture_finalized`/observer records;
+  - `analyzer_version`/`analyzer_revision` requirements;
+  - heartbeat sequence/time/healthy requirements (contiguity, strict time
+    ordering, in-lifetime relevance, timeout-based staleness);
+  - `manifest.reader_context` identity binding (S2 proves only the
+    structural *shape* of the singleton-identity contract from the sealed
+    harness records themselves — see the module docstring — never that
+    the identity equals `manifest.reader_context.process_identity`);
+  - `manifest.clock_contract` binding (the entire subject of this pass);
+  - every timestamp lifetime relation this pass removed, including
+    `process_start <= event <= process_stop` and `start_ns <= end_ns`;
+  - any other manifest/T0/T1-dependent temporal ordering.
+
+  S2 accepting a structurally partial history under this deferred list
+  does not mean a future v7 stage may accept a history frozen v6 declares
+  incoherent (G12) — each item above remains a mandatory validation a
+  later stage must restore before any admission/authority decision may
+  consume the facts S2 establishes.
+
+  This reconciliation did not trigger G8 and did not reach for any S3+
+  authority concept. Still **IMPLEMENTED / AWAITING INDEPENDENT REVIEW**,
+  not accepted.
 - **S3–S6** (future, not started): the remaining dormant v7 authority-core
   stages, each its own independently SHA-gated/reviewed commit boundary on
   this same Draft PR #53. No real experiment. No production authority.

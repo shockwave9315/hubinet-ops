@@ -38,10 +38,8 @@ __all__ = [
     "HarnessEventKind",
     "StructuralDecodeError",
     "HarnessRecordHeader",
-    "TimedRecordRef",
     "decode_harness_record_header",
     "decode_harness_stream",
-    "decode_timed_record_ref",
 ]
 
 
@@ -118,45 +116,6 @@ class HarnessRecordHeader:
             raise StructuralDecodeError("record_process_identity_invalid")
 
 
-@dataclass(frozen=True)
-class TimedRecordRef:
-    """A minimal structural reference into ANY sealed stream: just its
-    physical position and its declared ``monotonic_ns``. A pure structural
-    projection of one record, holding data only -- it never models that
-    record's full semantics, and never itself performs or licenses any
-    comparison.
-
-    ``monotonic_ns`` is a sealed scalar: a value the record declares about
-    itself, validated only for S1 scalar shape (nonnegative int, bool
-    rejected). ``TimedRecordRef`` establishes NO comparability between that
-    value and a timestamp from another stream or another participant --
-    doing so honestly would require proving both were captured in the same
-    ``CLOCK_MONOTONIC`` domain (the frozen v6 oracle's explicit
-    ``manifest.clock_contract``; see
-    :class:`~scripts.research.family_b_13_v7.participants.ParticipantLifetime`'s
-    clock-domain boundary note), which is manifest-derived context S2
-    intentionally never has. This type is data only; it carries no
-    participant-identity/ownership binding either -- a bare (position,
-    timestamp) match is never evidence that a record belongs to (or was
-    produced by) any particular participant.
-
-    ``__post_init__`` enforces this type's own structural invariants --
-    ``pos`` is a real :class:`PhysicalPos`, ``monotonic_ns`` satisfies S1
-    ``require_nonnegative_int`` semantics (bool rejected) -- for *any*
-    construction path, not just :func:`decode_timed_record_ref`.
-    """
-
-    pos: PhysicalPos
-    monotonic_ns: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.pos, PhysicalPos):
-            raise StructuralDecodeError("record_position_invalid")
-        monotonic_result = require_nonnegative_int(self.monotonic_ns)
-        if not monotonic_result.ok:
-            raise StructuralDecodeError("record_monotonic_ns_invalid")
-
-
 def _require_field(raw: Mapping[str, Any], field: str) -> Any:
     if not isinstance(raw, Mapping) or field not in raw:
         raise StructuralDecodeError(f"record_field_missing:{field}")
@@ -207,13 +166,3 @@ def decode_harness_stream(raw_records: Sequence[Mapping[str, Any]]) -> list[Harn
         decode_harness_record_header(raw, pos)
         for raw, pos in zip(raw_records, positions)
     ]
-
-
-def decode_timed_record_ref(raw: Mapping[str, Any], pos: PhysicalPos) -> TimedRecordRef:
-    """Decode the minimal structural (position, timestamp) reference for
-    one sealed record from any stream, ignoring every other field."""
-
-    monotonic_result = require_nonnegative_int(_require_field(raw, "monotonic_ns"))
-    if not monotonic_result.ok:
-        raise StructuralDecodeError("record_monotonic_ns_invalid")
-    return TimedRecordRef(pos=pos, monotonic_ns=monotonic_result.value)

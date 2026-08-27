@@ -66,10 +66,53 @@ oracle's own harness-lifecycle validation --
   exactly one legal value;
 - ``process_start`` must be physically first in the stream (physical order,
   never timestamp or ``harness_sequence`` order);
-- ``process_stop`` must be physically last;
-- every record's ``monotonic_ns`` must fall within
-  ``[start_ns, end_ns]`` inclusive, and every record's physical position
-  must fall within ``[start_pos, end_pos]`` inclusive.
+- ``process_stop`` must be physically last.
+
+S2 final boundary corrective pass -- no timestamp-order relation anywhere
+in S2 (load-bearing correction)
+---------------------------------------------------------------------------
+An independent adversarial review of the clock-domain boundary (the third
+S2 corrective pass, above) found its own remaining justification for
+comparing timestamps still overreached. That pass deleted
+``ParticipantLifetime.contains_ns`` (a *cross-stream* relation) but kept
+comparing a single harness stream's own records' ``monotonic_ns`` values
+against each other inside :func:`build_participant_table`, reasoning that
+"every record inside one ``harness-events.jsonl`` stream is emitted by the
+same single writer process ... so ordering those records' own
+``monotonic_ns`` values against each other needs no external clock-domain
+proof -- there is exactly one writer, one clock." That chain --
+singleton ``process_identity`` implies one writer implies one clock implies
+timestamp comparison is safe -- is exactly the warrant this final pass
+found unproven and retracts. A self-declared ``process_identity`` string is
+structural equality only; it is not the frozen v6 oracle's
+``manifest.clock_contract`` (one bound ``CLOCK_MONOTONIC`` domain, proven
+before any monotonic relation is trusted -- see
+``_validate_clock_contract`` in the frozen oracle), and S2 has no manifest
+to derive that proof from, singleton identity or not.
+
+Consequently S2 now performs NO timestamp-order relation of any kind,
+cross-stream or within one harness stream: not ``start_ns <= end_ns``, not
+``start_ns <= event.monotonic_ns <= end_ns``, nothing equivalent. Every
+``monotonic_ns``/``start_ns``/``end_ns`` value remains only an individually
+S1-validated scalar fact -- never compared against another. Physical
+lifecycle boundaries (process_start physically first, process_stop
+physically last, and :class:`ParticipantLifetime`'s own
+``start_pos``/``end_pos`` invariants) are unaffected: they are derived from
+sealed physical stream order, never from a timestamp, so no clock-domain
+proof is needed to establish them. See ``build_participant_table`` and
+``ParticipantLifetime`` below for exactly what is (and is not) checked now,
+and the redesign checkpoint doc (S2, final boundary corrective pass) for
+the full record, including the historical witnesses this reclassifies as
+UNRESOLVED AT S2 CLOCK-RELATION LEVEL rather than a structural rejection.
+
+This same pass also removed ``records.TimedRecordRef`` and
+``records.decode_timed_record_ref`` outright (local stop-patching rule: no
+replacement under another name) -- their only remaining S2 use had become
+demonstrating exactly the cross-stream timestamp relation this pass
+forbids. A historical fixture that needs to preserve an observer record's
+``monotonic_ns`` as a bare fact uses the accepted S1 scalar primitive
+directly (``require_nonnegative_int``) and, separately, ``PhysicalPos`` if
+its physical position is itself being tested.
 """
 
 from __future__ import annotations
@@ -147,12 +190,13 @@ class ParticipantLifetime:
     A full harness stream already carries exactly one participant identity
     (see the module docstring's frozen capture-v6 single-identity
     contract), so there is no second identity for an ownership-aware
-    relation to disambiguate in the first place. Separately,
-    :class:`~scripts.research.family_b_13_v7.records.TimedRecordRef` is
-    generic across every sealed stream and carries no participant-
-    identity/ownership binding of its own, so a bare (position, timestamp)
-    match could never honestly answer a record-ownership question even if
-    S2 needed one. Both reasons hold independently.
+    relation to disambiguate in the first place. Separately, the
+    now-removed ``TimedRecordRef`` type (see the S2 final boundary
+    corrective pass below and the redesign checkpoint doc) was generic
+    across every sealed stream and carried no participant-identity/
+    ownership binding of its own, so a bare (position, timestamp) match
+    could never honestly answer a record-ownership question even if S2
+    needed one. Both reasons hold independently.
 
     S2 corrective decision (local stop-patching rule) -- clock-domain
     boundary: this type ALSO exposes no cross-record timestamp-relation
@@ -171,29 +215,35 @@ class ParticipantLifetime:
     ``monotonic_ns`` was even captured in the same clock domain as this
     lifetime's own boundaries. Exposing a ``contains_ns``-shaped query
     would let a caller derive a cross-stream/cross-participant temporal
-    relation S2 has no basis to assert. This does not affect
-    :func:`build_participant_table`'s own internal validation: every
-    record inside one ``harness-events.jsonl`` stream is emitted by the
-    same single writer process (the singleton ``process_identity`` S2's
-    contract-reconciliation pass already established), so ordering those
-    records' own ``monotonic_ns`` values against each other needs no
-    external clock-domain proof -- there is exactly one writer, one clock.
-    A caller supplying an *unrelated* naked timestamp is asking S2 to
-    assume domain-sharing it cannot prove. Clock-domain proof, and
-    whatever cross-stream temporal relation it then licenses, is deferred
-    to a later stage that actually has ``manifest.clock_contract`` --
-    never assigned automatically to ``admit()``; whatever consumes the
-    relation must be preceded by that proof.
+    relation S2 has no basis to assert.
+
+    S2 final boundary corrective pass -- the type itself derives NO
+    timestamp relation either, not even between its own ``start_ns`` and
+    ``end_ns``: a self-declared singleton ``process_identity`` is
+    structural equality only, never proof of "one writer, one clock" (see
+    the module docstring's final corrective-pass note; a prior pass's
+    "same single writer process ... needs no external clock-domain proof"
+    reasoning is exactly the retracted warrant). ``start_ns`` and
+    ``end_ns`` therefore remain two independently validated scalars only;
+    direct construction with ``start_ns > end_ns`` is NOT rejected by this
+    type merely because of that numeric relation -- both scalars
+    individually satisfying S1 nonnegative-int semantics is all this type
+    proves about them.
 
     ``__post_init__`` enforces this type's own internal structural
-    consistency -- a real ``ParticipantIdentity``, S1-valid nonnegative
-    ``start_ns``/``end_ns`` with ``start_ns <= end_ns``, ``start_pos``/
-    ``end_pos`` both ``PhysicalPos`` in ``StreamName.HARNESS_EVENTS`` with
-    ``start_pos.ordinal <= end_pos.ordinal``, and a real
-    :class:`TerminationKind` -- for *any* construction path. It does not,
-    and cannot, prove that lifecycle records actually existed to justify
-    those boundaries; that proof remains :func:`build_participant_table`'s
-    job. ``ParticipantTable`` can then trust that any actual
+    consistency -- a real ``ParticipantIdentity``; S1-valid nonnegative
+    ``start_ns``/``end_ns`` as independent scalars (no relation derived
+    between them); ``start_pos``/``end_pos`` both ``PhysicalPos`` in
+    ``StreamName.HARNESS_EVENTS`` with ``start_pos.ordinal == 1`` (a
+    process's lifetime must start at the physically-first record) and
+    ``end_pos.ordinal > start_pos.ordinal`` (strictly after -- one physical
+    record cannot serve as both ``process_start`` and ``process_stop``);
+    and a real :class:`TerminationKind` -- for *any* construction path.
+    This physical invariant is derived from sealed physical order, never
+    from a timestamp, so it needs no clock-domain proof. It does not, and
+    cannot, prove that lifecycle records actually existed to justify those
+    boundaries; that proof remains :func:`build_participant_table`'s job.
+    ``ParticipantTable`` can then trust that any actual
     ``ParticipantLifetime`` instance it holds is internally self-consistent.
     """
 
@@ -214,8 +264,10 @@ class ParticipantLifetime:
         end_result = require_nonnegative_int(self.end_ns)
         if not end_result.ok:
             raise ParticipantLifetimeError("lifetime_end_ns_invalid")
-        if self.start_ns > self.end_ns:
-            raise ParticipantLifetimeError("lifetime_interval_inverted")
+        # No relation is derived between start_ns and end_ns here -- see the
+        # class docstring's S2 final boundary corrective-pass note. A
+        # numerically "inverted" (start_ns > end_ns) pair of otherwise-valid
+        # scalars is NOT rejected by this type.
 
         if not isinstance(self.start_pos, PhysicalPos) or not isinstance(
             self.end_pos, PhysicalPos
@@ -226,8 +278,10 @@ class ParticipantLifetime:
             or self.end_pos.stream is not StreamName.HARNESS_EVENTS
         ):
             raise ParticipantLifetimeError("lifetime_position_stream_mismatch")
-        if self.start_pos.ordinal > self.end_pos.ordinal:
-            raise ParticipantLifetimeError("lifetime_position_inverted")
+        if self.start_pos.ordinal != 1:
+            raise ParticipantLifetimeError("lifetime_start_position_not_physically_first")
+        if self.end_pos.ordinal <= self.start_pos.ordinal:
+            raise ParticipantLifetimeError("lifetime_end_position_not_after_start")
 
         if not isinstance(self.termination_kind, TerminationKind):
             raise ParticipantLifetimeError("lifetime_termination_kind_invalid")
@@ -285,7 +339,12 @@ class ParticipantTable:
         return identity in self._by_identity
 
     def __iter__(self):
-        return iter(self._by_identity.values())
+        """Yields :class:`ParticipantIdentity` keys -- mapping-consistent
+        with :meth:`__contains__` and :meth:`get`, never the lifetime
+        values. Use :meth:`get` to look up the corresponding
+        :class:`ParticipantLifetime`."""
+
+        return iter(self._by_identity)
 
     def __len__(self) -> int:
         return len(self._by_identity)
@@ -348,8 +407,24 @@ def _require_singleton_process_identity(
 
 
 def _build_one_lifetime(
-    identity: ParticipantIdentity, records: list[HarnessRecordHeader]
+    identity: ParticipantIdentity, records: Sequence[HarnessRecordHeader]
 ) -> ParticipantLifetime:
+    """Build the one :class:`ParticipantLifetime` this identity's records
+    describe. ``records`` must already be the full, physically-coherent
+    snapshot (ordinals ``1..len(records)`` in that order) that
+    :func:`build_participant_table` validated -- this function does not
+    re-derive that coherence, only relies on it for the physical
+    first/last checks below, so ``records[0]``/``records[-1]`` (equivalently,
+    ordinal ``1``/``len(records)``) are already known to be the physically
+    first/last records without recomputing a min/max over ordinals.
+
+    No timestamp relation is derived anywhere in this function -- not
+    ``start_ns <= end_ns``, not any record's ``monotonic_ns`` against the
+    lifetime boundary. See the module docstring's S2 final boundary
+    corrective-pass note for why that reasoning ("singleton
+    process_identity implies one writer implies one clock") is retracted.
+    """
+
     crash_count = sum(1 for r in records if r.kind is HarnessEventKind.PROCESS_CRASH)
     if crash_count > 0:
         raise ParticipantLifetimeError("participant_process_crash_present")
@@ -364,30 +439,15 @@ def _build_one_lifetime(
         raise ParticipantLifetimeError("participant_process_stop_missing_or_duplicate")
     stop_record = stop_records[0]
 
-    first_ordinal = min(r.pos.ordinal for r in records)
-    last_ordinal = max(r.pos.ordinal for r in records)
-    if start_record.pos.ordinal != first_ordinal:
+    if start_record.pos.ordinal != 1:
         raise ParticipantLifetimeError("participant_process_start_not_physically_first")
-    if stop_record.pos.ordinal != last_ordinal:
+    if stop_record.pos.ordinal != len(records):
         raise ParticipantLifetimeError("participant_process_stop_not_physically_last")
-
-    start_ns = start_record.monotonic_ns
-    end_ns = stop_record.monotonic_ns
-    if start_ns > end_ns:
-        raise ParticipantLifetimeError("participant_lifetime_interval_inverted")
-
-    for record in records:
-        if not (start_ns <= record.monotonic_ns <= end_ns):
-            raise ParticipantLifetimeError("participant_record_timestamp_outside_lifetime")
-        if not (first_ordinal <= record.pos.ordinal <= last_ordinal):
-            raise ParticipantLifetimeError(
-                "participant_record_outside_lifetime_physical_position"
-            )
 
     return ParticipantLifetime(
         identity=identity,
-        start_ns=start_ns,
-        end_ns=end_ns,
+        start_ns=start_record.monotonic_ns,
+        end_ns=stop_record.monotonic_ns,
         start_pos=start_record.pos,
         end_pos=stop_record.pos,
         termination_kind=TerminationKind.PROCESS_STOP,
@@ -411,6 +471,21 @@ def build_participant_table(
     a phase/interval, that is a sign this layering is wrong -- it must not
     be added here (see the package/module docstrings' kill-switch note).
 
+    Snapshot boundary (P1 corrective decision, local stop-patching rule):
+    ``harness_records`` must be a real :class:`~typing.Sequence` (rejected
+    with a stable ``harness_stream_input_not_sequence`` error otherwise --
+    a plain one-shot iterator/generator does not silently become part of
+    this public contract merely because ``tuple()`` can consume it), and is
+    traversed EXACTLY ONCE, immediately, into an immutable ``tuple``
+    snapshot. Every validator below, and the lifetime builder, consumes
+    only that same snapshot -- the caller-supplied object itself is never
+    traversed again. Without this, a Sequence-conforming object whose
+    successive iterations return different content could let one validator
+    see one history while the lifetime is built from a different one; see
+    ``test_build_participant_table_snapshots_adversarial_sequence_exactly_once``.
+    No future validator may re-traverse the caller object -- add any new
+    check against ``snapshot`` instead.
+
     Checks, each failing closed in order: every element is actually a
     :class:`HarnessRecordHeader` (:func:`_require_typed_harness_records`);
     the full supplied stream is itself physically coherent
@@ -419,9 +494,13 @@ def build_participant_table(
     (:func:`_require_singleton_process_identity`).
     """
 
-    _require_typed_harness_records(harness_records)
-    _require_physically_coherent_harness_stream(harness_records)
-    identity = _require_singleton_process_identity(harness_records)
+    if not isinstance(harness_records, Sequence):
+        raise ParticipantLifetimeError("harness_stream_input_not_sequence")
+    snapshot: tuple[HarnessRecordHeader, ...] = tuple(harness_records)
 
-    lifetime = _build_one_lifetime(identity, list(harness_records))
+    _require_typed_harness_records(snapshot)
+    _require_physically_coherent_harness_stream(snapshot)
+    identity = _require_singleton_process_identity(snapshot)
+
+    lifetime = _build_one_lifetime(identity, snapshot)
     return ParticipantTable(_by_identity=MappingProxyType({identity: lifetime}))
