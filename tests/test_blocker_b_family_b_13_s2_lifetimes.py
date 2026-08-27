@@ -48,8 +48,9 @@ from scripts.research.family_b_13_v7.participants import (
 from scripts.research.family_b_13_v7.physical import (
     CrossStreamComparisonError,
     PhysicalPos,
+    PhysicalStreamSnapshot,
     StreamName,
-    assign_physical_positions,
+    snapshot_physical_stream,
 )
 from scripts.research.family_b_13_v7.records import (
     HarnessEventKind,
@@ -63,6 +64,30 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 V7_PACKAGE_DIR = REPO_ROOT / "scripts" / "research" / "family_b_13_v7"
 CAPTURES_ROOT = REPO_ROOT / "tests" / "fixtures" / "research" / "family_b_13" / "captures"
 READER = "synthetic-reader:1"
+
+
+def _discover_python_modules(root: Path) -> list[Path]:
+    """Every ``*.py`` file under ``root`` (recursive, so a future nested
+    subpackage is covered too), excluding ``__pycache__`` -- the shared
+    discovery mechanism every package-wide S2 architecture gate below uses,
+    so a future implementation module added under the package is
+    automatically in scope without editing a hard-coded list of today's
+    filenames. See
+    test_discovery_finds_a_hypothetical_future_module_without_editing_a_hard_coded_list
+    for a hermetic proof this actually happens for a module that does not
+    exist anywhere in this repository, and
+    test_v7_module_paths_matches_filesystem_exactly for a proof this
+    matches the real package on disk."""
+
+    return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+
+
+# Every implementation module under the S2 package, discovered from the
+# filesystem (never a hard-coded list of today's filenames -- see
+# _discover_python_modules above). Every package-wide architecture gate
+# below is parametrized over this same discovered set, so a future S3+
+# module added under this package automatically enters every one of them.
+V7_MODULE_PATHS = _discover_python_modules(V7_PACKAGE_DIR)
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -90,8 +115,9 @@ def _harness_headers(fixture_id: str) -> list[HarnessRecordHeader]:
 
 
 def test_physical_pos_ordinal_is_one_based() -> None:
-    positions = assign_physical_positions(StreamName.HARNESS_EVENTS, [{}, {}, {}])
-    assert [p.ordinal for p in positions] == [1, 2, 3]
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, [{}, {}, {}])
+    assert isinstance(snapshot, PhysicalStreamSnapshot)
+    assert [p.ordinal for p in snapshot.positions] == [1, 2, 3]
 
 
 def test_physical_pos_ordinal_must_be_at_least_one() -> None:
@@ -154,25 +180,321 @@ def test_physical_pos_precedes_rejects_object() -> None:
         pos.precedes(object())  # type: ignore[arg-type]
 
 
-def test_assign_physical_positions_rejects_invalid_stream_with_empty_records() -> None:
+def test_snapshot_physical_stream_rejects_invalid_stream_with_empty_records() -> None:
     """API hygiene (S2 final boundary corrective pass): an invalid stream
-    must be rejected even when there are no records to assign positions
-    to -- it must not silently pass through merely because the list
-    comprehension would have produced nothing anyway."""
+    must be rejected even when there are no records to snapshot -- it must
+    not silently pass through merely because there was nothing to
+    traverse anyway."""
 
     with pytest.raises(TypeError):
-        assign_physical_positions("invalid", [])  # type: ignore[arg-type]
+        snapshot_physical_stream("invalid", [])  # type: ignore[arg-type]
 
 
-def test_assign_physical_positions_rejects_invalid_stream_with_nonempty_records() -> None:
+def test_snapshot_physical_stream_rejects_invalid_stream_with_nonempty_records() -> None:
     """Same stable error class, whether records is empty or not."""
 
     with pytest.raises(TypeError):
-        assign_physical_positions("invalid", [{}])  # type: ignore[arg-type]
+        snapshot_physical_stream("invalid", [{}])  # type: ignore[arg-type]
 
 
-def test_assign_physical_positions_valid_stream_with_empty_records_returns_empty_list() -> None:
-    assert assign_physical_positions(StreamName.HARNESS_EVENTS, []) == []
+def test_snapshot_physical_stream_valid_stream_with_empty_records_returns_empty_snapshot() -> None:
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, [])
+    assert snapshot.records == ()
+    assert snapshot.positions == ()
+
+
+# --- Raw-record snapshot boundary (S2 final finite corrective, P1) --------
+
+
+def test_snapshot_physical_stream_rejects_a_generator() -> None:
+    """A plain one-shot generator/iterator must not silently become part
+    of this public contract merely because ``tuple()`` can consume it."""
+
+    with pytest.raises(TypeError):
+        snapshot_physical_stream(StreamName.HARNESS_EVENTS, (x for x in []))  # type: ignore[arg-type]
+
+
+def test_snapshot_physical_stream_rejects_sized_iterable_that_is_not_a_sequence() -> None:
+    """An arbitrary ``Sized``+``Iterable`` container that is not actually a
+    ``collections.abc.Sequence`` (e.g. arbitrary iteration order, no
+    ``__getitem__``) must not silently become a physical stream: the whole
+    point of ``PhysicalPos`` is *sealed physical order*, which such a
+    container cannot honestly provide."""
+
+    class _Bag:
+        def __init__(self, items: list[object]) -> None:
+            self._items = items
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+        def __iter__(self):
+            return iter(self._items)
+
+    with pytest.raises(TypeError):
+        snapshot_physical_stream(StreamName.HARNESS_EVENTS, _Bag([{}, {}]))  # type: ignore[arg-type]
+
+
+def test_snapshot_physical_stream_observes_caller_sequence_exactly_once() -> None:
+    """The whole point of the snapshot boundary: a genuine
+    ``collections.abc.Sequence`` is traversed (``__iter__``) exactly once
+    by ``snapshot_physical_stream``, never re-observed afterward."""
+
+    calls = {"n": 0}
+
+    class _CountingSequence(collections.abc.Sequence):
+        def __len__(self) -> int:
+            return 3
+
+        def __getitem__(self, index: int) -> str:
+            return ("a", "b", "c")[index]
+
+        def __iter__(self):
+            calls["n"] += 1
+            return iter(("a", "b", "c"))
+
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, _CountingSequence())
+    assert calls["n"] == 1
+    assert snapshot.records == ("a", "b", "c")
+    assert [p.ordinal for p in snapshot.positions] == [1, 2, 3]
+
+
+class _LyingLengthRawSequence(collections.abc.Sequence):
+    """A genuine ``collections.abc.Sequence`` (so it passes the Sequence
+    type gate) whose ``__len__`` disagrees with what a full ``__iter__``
+    traversal actually yields. Exercises the raw-record snapshot-boundary
+    fix directly: before this corrective, ``decode_harness_stream`` derived
+    ``PhysicalPos`` count from ``len(raw_records)`` (via the removed
+    ``assign_physical_positions``) and separately zipped the original
+    ``raw_records`` object for content -- two independent observations
+    that, for an object like this one, describe different histories.
+    ``zip`` then silently truncated to the shorter of the two, discarding
+    sealed evidence no downstream validator ever saw."""
+
+    def __init__(self, declared_len: int, iterated_items: list[Any]) -> None:
+        self._declared_len = declared_len
+        self._iterated_items = iterated_items
+        self.iter_call_count = 0
+
+    def __len__(self) -> int:
+        return self._declared_len
+
+    def __getitem__(self, index: int) -> Any:
+        return self._iterated_items[index]
+
+    def __iter__(self):
+        self.iter_call_count += 1
+        return iter(self._iterated_items)
+
+
+def _harness_dict(event: str, seq: int, ns: int) -> dict[str, Any]:
+    return {
+        "event": event,
+        "harness_sequence": seq,
+        "monotonic_ns": ns,
+        "process_identity": READER,
+    }
+
+
+def test_decode_harness_stream_does_not_silently_truncate_a_lying_sequence() -> None:
+    """Raw-record snapshot boundary (S2 final finite corrective, P1): a
+    genuine ``collections.abc.Sequence`` whose ``__len__`` (3) disagrees
+    with what its ``__iter__`` actually yields (5 records, including two
+    sealed records AFTER process_stop) must not let those two records
+    silently disappear. Before this corrective, ``decode_harness_stream``
+    derived PhysicalPos count from len() (3) and separately zipped the
+    caller object for content, so ``zip`` truncated to 3 records and the
+    honest process_stop-not-physically-last rejection never fired -- lost
+    sealed evidence was silently converted into a positive structural
+    derivation."""
+
+    honest_five = [
+        _harness_dict("process_start", 0, 100),
+        _harness_dict("heartbeat", 1, 200),
+        _harness_dict("process_stop", 2, 300),
+        _harness_dict("gap_signal", 3, 400),
+        _harness_dict("capture_finalized", 4, 500),
+    ]
+
+    # Positive control: the honest 5-record list is correctly rejected,
+    # because process_stop is not physically last.
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(decode_harness_stream(honest_five))
+    assert str(exc_info.value) == "participant_process_stop_not_physically_last"
+
+    lying = _LyingLengthRawSequence(declared_len=3, iterated_items=honest_five)
+    headers = decode_harness_stream(lying)  # type: ignore[arg-type]
+
+    # The lying Sequence's own single full iteration is authoritative --
+    # ALL 5 sealed records must be preserved, never silently truncated to
+    # match the (wrong) declared __len__.
+    assert lying.iter_call_count == 1
+    assert [h.kind.value for h in headers] == [
+        "process_start",
+        "heartbeat",
+        "process_stop",
+        "gap_signal",
+        "capture_finalized",
+    ]
+    assert [h.pos.ordinal for h in headers] == [1, 2, 3, 4, 5]
+
+    with pytest.raises(ParticipantLifetimeError) as exc_info:
+        build_participant_table(headers)
+    assert str(exc_info.value) == "participant_process_stop_not_physically_last"
+
+
+def test_decode_harness_stream_does_not_pad_when_declared_length_overstates_iteration() -> None:
+    """The symmetric case: ``__len__`` overstates what ``__iter__``
+    actually yields. The single traversal materializes exactly the 3
+    iterated records; nothing is silently padded to match the lying
+    declared length, and no synthetic 4th/5th position is invented."""
+
+    three = [
+        _harness_dict("process_start", 0, 100),
+        _harness_dict("heartbeat", 1, 200),
+        _harness_dict("process_stop", 2, 300),
+    ]
+    lying = _LyingLengthRawSequence(declared_len=5, iterated_items=three)
+    headers = decode_harness_stream(lying)  # type: ignore[arg-type]
+    assert lying.iter_call_count == 1
+    assert len(headers) == 3
+    assert [h.pos.ordinal for h in headers] == [1, 2, 3]
+
+
+class _ShiftingRawSequence(collections.abc.Sequence):
+    """A genuine ``collections.abc.Sequence`` whose distinct FULL
+    ``__iter__`` traversals return different content -- the first
+    traversal yields ``generations[0]``; every traversal after the first
+    yields ``generations[-1]`` instead. Proves ``decode_harness_stream``
+    observes its caller exactly once: if it did not, position assignment
+    and record decoding could see different generations of the same
+    caller-supplied object."""
+
+    def __init__(self, generations: list[list[Any]]) -> None:
+        self._generations = generations
+        self.full_iterations = 0
+
+    def __len__(self) -> int:
+        return len(self._generations[0])
+
+    def __getitem__(self, index: int) -> Any:
+        return self._generations[0][index]
+
+    def __iter__(self):
+        generation = self._generations[min(self.full_iterations, len(self._generations) - 1)]
+        self.full_iterations += 1
+        return iter(generation)
+
+
+def test_decode_harness_stream_observes_caller_sequence_exactly_once() -> None:
+    validated = [
+        _harness_dict("process_start", 0, 100),
+        _harness_dict("heartbeat", 1, 200),
+        _harness_dict("process_stop", 2, 300),
+    ]
+    forged = [
+        _harness_dict("process_start", 0, 100),
+        _harness_dict("gap_signal", 1, 200),
+        _harness_dict("process_stop", 2, 300),
+    ]
+    shifting = _ShiftingRawSequence([validated, forged])
+    headers = decode_harness_stream(shifting)  # type: ignore[arg-type]
+    assert shifting.full_iterations == 1
+    assert [h.kind.value for h in headers] == ["process_start", "heartbeat", "process_stop"]
+
+
+def test_decode_harness_stream_rejects_a_generator() -> None:
+    def gen():
+        yield _harness_dict("process_start", 0, 100)
+
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        decode_harness_stream(gen())  # type: ignore[arg-type]
+    assert str(exc_info.value) == "harness_stream_input_not_sequence"
+
+
+def test_decode_harness_stream_rejects_a_plain_iterator() -> None:
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        decode_harness_stream(iter([_harness_dict("process_start", 0, 100)]))  # type: ignore[arg-type]
+    assert str(exc_info.value) == "harness_stream_input_not_sequence"
+
+
+def test_decode_harness_stream_rejects_sized_iterable_that_is_not_a_sequence() -> None:
+    class _Bag:
+        def __init__(self, items: list[Any]) -> None:
+            self._items = items
+
+        def __len__(self) -> int:
+            return len(self._items)
+
+        def __iter__(self):
+            return iter(self._items)
+
+    bag = _Bag([_harness_dict("process_start", 0, 100)])
+    with pytest.raises(StructuralDecodeError) as exc_info:
+        decode_harness_stream(bag)  # type: ignore[arg-type]
+    assert str(exc_info.value) == "harness_stream_input_not_sequence"
+
+
+def test_decode_harness_stream_preserves_a_plain_list_exactly() -> None:
+    """Positive control alongside the Sequence-type gate above: the
+    ordinary case (a plain list) must keep working exactly as before."""
+
+    raw = [
+        _harness_dict("process_start", 0, 100),
+        _harness_dict("heartbeat", 1, 200),
+        _harness_dict("process_stop", 2, 300),
+    ]
+    headers = decode_harness_stream(raw)
+    assert [h.kind.value for h in headers] == ["process_start", "heartbeat", "process_stop"]
+    assert [h.pos.ordinal for h in headers] == [1, 2, 3]
+
+
+# --- PhysicalStreamSnapshot well-formedness (any construction path) -------
+
+
+def test_physical_stream_snapshot_rejects_mismatched_lengths() -> None:
+    with pytest.raises(ValueError):
+        PhysicalStreamSnapshot(
+            stream=StreamName.HARNESS_EVENTS,
+            records=({}, {}),
+            positions=(PhysicalPos(StreamName.HARNESS_EVENTS, 1),),
+        )
+
+
+def test_physical_stream_snapshot_rejects_non_tuple_records() -> None:
+    with pytest.raises(TypeError):
+        PhysicalStreamSnapshot(
+            stream=StreamName.HARNESS_EVENTS,
+            records=[{}],  # type: ignore[arg-type]
+            positions=(PhysicalPos(StreamName.HARNESS_EVENTS, 1),),
+        )
+
+
+def test_physical_stream_snapshot_rejects_position_stream_mismatch() -> None:
+    with pytest.raises(ValueError):
+        PhysicalStreamSnapshot(
+            stream=StreamName.HARNESS_EVENTS,
+            records=({},),
+            positions=(PhysicalPos(StreamName.GROUND_TRUTH, 1),),
+        )
+
+
+def test_physical_stream_snapshot_rejects_non_sequential_ordinals() -> None:
+    with pytest.raises(ValueError):
+        PhysicalStreamSnapshot(
+            stream=StreamName.HARNESS_EVENTS,
+            records=({}, {}),
+            positions=(
+                PhysicalPos(StreamName.HARNESS_EVENTS, 1),
+                PhysicalPos(StreamName.HARNESS_EVENTS, 3),
+            ),
+        )
+
+
+def test_physical_stream_snapshot_is_immutable() -> None:
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, [{}])
+    with pytest.raises(Exception):
+        snapshot.records = ()  # type: ignore[misc]
 
 
 # --- Metamorphic gates (S2 task section 9) ---------------------------------
@@ -182,7 +504,7 @@ def test_metamorphic_generator_sequence_relabel_does_not_move_physical_pos() -> 
     raw = _load_jsonl(
         CAPTURES_ROOT / "stop_generator_sequence_relabel" / "ground-truth.jsonl"
     )
-    original = assign_physical_positions(StreamName.GROUND_TRUTH, raw)
+    original = snapshot_physical_stream(StreamName.GROUND_TRUTH, raw).positions
 
     import copy
 
@@ -194,13 +516,13 @@ def test_metamorphic_generator_sequence_relabel_does_not_move_physical_pos() -> 
             record["generator_sequence"] = 1
     assert relabeled != raw  # the mutation actually changed something
 
-    after = assign_physical_positions(StreamName.GROUND_TRUTH, relabeled)
+    after = snapshot_physical_stream(StreamName.GROUND_TRUTH, relabeled).positions
     assert after == original
 
 
 def test_metamorphic_harness_sequence_relabel_does_not_move_physical_pos() -> None:
     raw = _load_jsonl(CAPTURES_ROOT / "positive_13a" / "harness-events.jsonl")
-    original = assign_physical_positions(StreamName.HARNESS_EVENTS, raw)
+    original = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw).positions
 
     import copy
 
@@ -209,13 +531,13 @@ def test_metamorphic_harness_sequence_relabel_does_not_move_physical_pos() -> No
         record["harness_sequence"] = 999
     assert relabeled != raw
 
-    after = assign_physical_positions(StreamName.HARNESS_EVENTS, relabeled)
+    after = snapshot_physical_stream(StreamName.HARNESS_EVENTS, relabeled).positions
     assert after == original
 
 
 def test_metamorphic_monotonic_ns_relabel_does_not_move_physical_pos() -> None:
     raw = _load_jsonl(CAPTURES_ROOT / "positive_13a" / "harness-events.jsonl")
-    original = assign_physical_positions(StreamName.HARNESS_EVENTS, raw)
+    original = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw).positions
 
     import copy
 
@@ -224,16 +546,16 @@ def test_metamorphic_monotonic_ns_relabel_does_not_move_physical_pos() -> None:
         record["monotonic_ns"] = 0
     assert relabeled != raw
 
-    after = assign_physical_positions(StreamName.HARNESS_EVENTS, relabeled)
+    after = snapshot_physical_stream(StreamName.HARNESS_EVENTS, relabeled).positions
     assert after == original
 
 
 def test_metamorphic_reordering_physical_records_does_change_physical_pos() -> None:
     raw = _load_jsonl(CAPTURES_ROOT / "positive_13a" / "harness-events.jsonl")
-    original = assign_physical_positions(StreamName.HARNESS_EVENTS, raw)
+    original = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw).positions
 
     reversed_raw = list(reversed(raw))
-    after = assign_physical_positions(StreamName.HARNESS_EVENTS, reversed_raw)
+    after = snapshot_physical_stream(StreamName.HARNESS_EVENTS, reversed_raw).positions
 
     # Same set of ordinals, but bound to a different record than before --
     # demonstrated by the fact the physically-first record is now a
@@ -746,10 +1068,11 @@ def test_participant_lifetime_exposes_no_record_containment_helper() -> None:
     test_all_captured_harness_streams_have_a_singleton_process_identity and
     test_build_participant_table_rejects_two_distinct_identities_in_one_stream),
     so there is no second identity for an ownership-aware relation to
-    disambiguate in the first place. Separately, TimedRecordRef (see
-    records.TimedRecordRef) is generic across every sealed stream and
-    carries no participant-identity/ownership binding of its own, so a
-    bare (position, timestamp) match could never honestly answer a
+    disambiguate in the first place. Separately, the now-removed
+    TimedRecordRef (see the S2 final boundary corrective pass in
+    participants.py's module docstring) was generic across every sealed
+    stream and carried no participant-identity/ownership binding of its
+    own, so a bare (position, timestamp) match could never honestly answer a
     record-ownership question even if S2 needed one. Both reasons hold
     independently. ParticipantLifetime therefore exposes no
     contains_record (or any replacement helper under another name) in S2
@@ -1079,7 +1402,9 @@ def test_stop_reader_pre_t0_before_process_start_structural_facts() -> None:
     observer_result = require_nonnegative_int(pre_t0_raw[0]["monotonic_ns"])
     assert observer_result.ok
     assert observer_result.value == 50
-    observer_pos = assign_physical_positions(StreamName.PRE_T0_ESTABLISHMENT, pre_t0_raw)[0]
+    observer_pos = snapshot_physical_stream(
+        StreamName.PRE_T0_ESTABLISHMENT, pre_t0_raw
+    ).positions[0]
     assert observer_pos.ordinal == 1
     # Two independent structural facts only -- no cross-stream relation is
     # derived between lifetime.start_ns and the observer's own monotonic_ns.
@@ -1095,7 +1420,7 @@ def test_stop_generator_sequence_relabel_physical_pos_is_unrelabelable() -> None
     raw = _load_jsonl(
         CAPTURES_ROOT / "stop_generator_sequence_relabel" / "ground-truth.jsonl"
     )
-    positions = assign_physical_positions(StreamName.GROUND_TRUTH, raw)
+    positions = snapshot_physical_stream(StreamName.GROUND_TRUTH, raw).positions
     declared_sequences = [record.get("generator_sequence") for record in raw]
 
     # The physically-first record (ordinal 1) declares generator_sequence=2
@@ -1153,16 +1478,7 @@ def test_participants_module_does_not_import_ground_truth_or_observer_parsers() 
     assert identifiers.isdisjoint(forbidden)
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        V7_PACKAGE_DIR / "__init__.py",
-        V7_PACKAGE_DIR / "physical.py",
-        V7_PACKAGE_DIR / "records.py",
-        V7_PACKAGE_DIR / "participants.py",
-    ],
-    ids=lambda p: p.name,
-)
+@pytest.mark.parametrize("path", V7_MODULE_PATHS, ids=lambda p: p.name)
 def test_v7_package_has_no_clock_contract_parser_or_context(path: Path) -> None:
     """S2 clock-domain boundary (section 6): the S2 package defines no
     clock_contract parser/validator/context anywhere -- checked at the
@@ -1170,7 +1486,9 @@ def test_v7_package_has_no_clock_contract_parser_or_context(path: Path) -> None:
     modules' own docstring prose (which legitimately *names*
     manifest.clock_contract while explaining that S2 depends on none of
     it) do not trip this gate. Proving/consuming manifest.clock_contract
-    remains future work for a later stage."""
+    remains future work for a later stage. Parametrized over the
+    dynamically-discovered V7_MODULE_PATHS (see _discover_python_modules)
+    so a future S3+ module automatically enters this gate too."""
 
     identifiers = _code_identifiers(path.read_text(encoding="utf-8"))
     forbidden = {
@@ -1252,12 +1570,116 @@ EXTERNAL_OUTCOME_STRINGS = frozenset(
     }
 )
 
-V7_MODULE_PATHS = [
-    V7_PACKAGE_DIR / "__init__.py",
-    V7_PACKAGE_DIR / "physical.py",
-    V7_PACKAGE_DIR / "records.py",
-    V7_PACKAGE_DIR / "participants.py",
-]
+def test_v7_module_paths_matches_filesystem_exactly() -> None:
+    """The discovered set every package-wide gate below is parametrized
+    over must equal the Python implementation files actually present
+    under the package root -- not a hard-coded list that could silently
+    drift from the filesystem in either direction. Cross-checked against
+    an independent traversal method (``iterdir``, not ``rglob``) so this
+    isn't just re-asserting _discover_python_modules against itself."""
+
+    on_disk = {
+        p for p in V7_PACKAGE_DIR.iterdir() if p.is_file() and p.suffix == ".py"
+    }
+    assert set(V7_MODULE_PATHS) == on_disk
+    # A concrete, currently-true set alongside the structural check above
+    # (not instead of it) -- catches a module silently added or removed
+    # without anyone noticing either way (mirrors
+    # test_exported_function_and_type_counts's same pattern).
+    assert {p.name for p in V7_MODULE_PATHS} == {
+        "__init__.py",
+        "physical.py",
+        "records.py",
+        "participants.py",
+    }
+
+
+def test_discovery_finds_a_hypothetical_future_module_without_editing_a_hard_coded_list(
+    tmp_path: Path,
+) -> None:
+    """Hermetic proof for the package-wide bypass concern an independent
+    adversarial review raised: a hard-coded module list does not protect a
+    future S3+ module added under this package. This test creates a
+    TEMPORARY directory mirroring the real S2 package -- NEVER a real
+    tracked ``s3.py`` under the repository -- and confirms the SAME
+    discovery function (``_discover_python_modules``) every real gate
+    above uses finds a hypothetical future module automatically, with no
+    edit to any hard-coded list. It then feeds that hypothetical module's
+    source through the SAME gate-logic helpers the real gates use
+    (``_code_identifiers``, ``_direct_call_names``,
+    ``FORBIDDEN_AUTHORITY_IDENTIFIERS``) to confirm the underlying
+    mechanism -- not merely discovery -- would flag its violations too."""
+
+    fake_package = tmp_path / "family_b_13_v7_fake"
+    fake_package.mkdir()
+    for name in ("__init__.py", "physical.py", "records.py", "participants.py"):
+        (fake_package / name).write_text("# stub\n", encoding="utf-8")
+
+    discovered_before = _discover_python_modules(fake_package)
+    assert {p.name for p in discovered_before} == {
+        "__init__.py",
+        "physical.py",
+        "records.py",
+        "participants.py",
+    }
+
+    hypothetical_s3 = (
+        "from .participants import ParticipantLifetime, ParticipantTable\n"
+        "from tests.oracles.family_b_13.v6 import blocker_b_family_b_13_analyzer\n"
+        "\n"
+        "admit = True\n"
+        "observer_ledger = {}\n"
+        "authority_level = 'CONFIRMED'\n"
+        "\n"
+        "\n"
+        "def classify_capture():\n"
+        "    lifetime = ParticipantLifetime(1, 2, 3, 4, 5, 6)\n"
+        "    table = ParticipantTable({})\n"
+        "    return lifetime, table\n"
+    )
+    (fake_package / "s3.py").write_text(hypothetical_s3, encoding="utf-8")
+
+    discovered_after = _discover_python_modules(fake_package)
+    assert {p.name for p in discovered_after} == {
+        "__init__.py",
+        "physical.py",
+        "records.py",
+        "participants.py",
+        "s3.py",
+    }
+    s3_path = fake_package / "s3.py"
+    assert s3_path in discovered_after
+
+    # The generalized gate LOGIC (the same helpers every real package-wide
+    # gate above uses) must flag this hypothetical module's violations
+    # once it is part of the discovered set -- this is not re-running a
+    # specific pytest test against it, but proving the shared mechanism
+    # those tests are built on would catch it.
+    identifiers = _code_identifiers(hypothetical_s3)
+    assert identifiers & FORBIDDEN_AUTHORITY_IDENTIFIERS == {
+        "admit",
+        "observer_ledger",
+        "authority_level",
+    }
+
+    tree = ast.parse(hypothetical_s3)
+    called = _direct_call_names(tree)
+    assert "ParticipantLifetime" in called
+    assert "ParticipantTable" in called
+
+    verdict_like = [
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name.startswith(FORBIDDEN_PUBLIC_NAME_PREFIXES)
+    ]
+    assert verdict_like == ["classify_capture"]
+
+    import_targets: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            import_targets.add(node.module)
+    assert any("oracle" in t or "analyzer" in t for t in import_targets)
 
 
 def _code_identifiers(source: str) -> set[str]:
@@ -1312,6 +1734,7 @@ def test_v7_modules_import_only_stdlib_and_s1(path: Path) -> None:
     roots = _imported_module_roots(source)
     allowed = {
         "__future__",
+        "collections",  # collections.abc.Sequence runtime-isinstance checks
         "dataclasses",
         "enum",
         "types",
@@ -1360,28 +1783,52 @@ def _direct_call_names(tree: ast.AST) -> set[str]:
     return names
 
 
-@pytest.mark.parametrize(
-    "path",
-    [p for p in V7_MODULE_PATHS if p.name != "participants.py"],
-    ids=lambda p: p.name,
-)
-def test_only_participants_module_constructs_lifetime_or_table(path: Path) -> None:
+# Designated-derivation-path constructor gate (S2 final finite corrective,
+# generalized): each of these types proves only local structural
+# well-formedness via its own bare constructor -- derivation from a real
+# sealed/snapshotted observation is proven only by its designated builder,
+# owned by exactly one module. PhysicalStreamSnapshot (physical.py) is
+# included here for the same reason ParticipantLifetime/ParticipantTable
+# (participants.py) are: it is the type this corrective introduced to prove
+# single-observation derivation, and leaving its constructor unrestricted
+# would reintroduce the identical well-formed-vs-established ambiguity for
+# it. Never an authority token -- see PhysicalPos/HarnessRecordHeader,
+# which are deliberately NOT restricted here because no concrete
+# false-authority path requires it (S2 final finite corrective, section
+# 20).
+_DESIGNATED_CONSTRUCTOR_OWNERS: dict[str, str] = {
+    "ParticipantLifetime": "participants.py",
+    "ParticipantTable": "participants.py",
+    "PhysicalStreamSnapshot": "physical.py",
+}
+
+
+@pytest.mark.parametrize("path", V7_MODULE_PATHS, ids=lambda p: p.name)
+def test_designated_constructors_are_not_called_outside_their_owning_module(
+    path: Path,
+) -> None:
     """Architecture AST gate (section 18 of the S2 final boundary
-    corrective pass): no v7 package module OTHER THAN participants.py may
-    directly call ParticipantLifetime(...) or ParticipantTable(...) --
-    this is enforcement of the already-designed derivation path (the
-    designated builder proves derivation from the one-time frozen harness
-    snapshot; a public constructor proves only local structural
-    well-formedness), never an authority token. This guards future S3+
-    modules added under the same package, not only the current ones; it
-    applies to the implementation package, not this test module, which
-    exercises the type-boundary invariants by direct construction by
-    design."""
+    corrective pass; generalized to dynamic discovery and to
+    PhysicalStreamSnapshot in the S2 final finite corrective): no v7
+    package module OTHER THAN a type's designated owner may directly call
+    its constructor -- this is enforcement of the already-designed
+    derivation path (the designated builder proves derivation from a
+    one-time frozen/snapshotted observation; a public constructor proves
+    only local structural well-formedness), never an authority token.
+    Parametrized over the dynamically-discovered V7_MODULE_PATHS (see
+    _discover_python_modules), so a future S3+ module added under this
+    same package automatically enters this gate too -- see
+    test_discovery_finds_a_hypothetical_future_module_without_editing_a_hard_coded_list
+    for a hermetic proof of that claim. Applies to the implementation
+    package, not this test module, which exercises the type-boundary
+    invariants by direct construction by design."""
 
     tree = ast.parse(path.read_text(encoding="utf-8"))
     called = _direct_call_names(tree)
-    assert "ParticipantLifetime" not in called, path.name
-    assert "ParticipantTable" not in called, path.name
+    for type_name, owner_filename in _DESIGNATED_CONSTRUCTOR_OWNERS.items():
+        if path.name == owner_filename:
+            continue
+        assert type_name not in called, (path.name, type_name)
 
 
 def test_participants_module_centralizes_its_own_constructor_calls() -> None:
@@ -1402,6 +1849,22 @@ def test_participants_module_centralizes_its_own_constructor_calls() -> None:
                 callers_of[target].add(node.name)
     assert callers_of["ParticipantLifetime"] == {"_build_one_lifetime"}
     assert callers_of["ParticipantTable"] == {"build_participant_table"}
+
+
+def test_physical_module_centralizes_its_own_constructor_calls() -> None:
+    """Within physical.py itself, only snapshot_physical_stream constructs
+    PhysicalStreamSnapshot -- the same centralization discipline as
+    participants.py's designated builders above."""
+
+    source = (V7_PACKAGE_DIR / "physical.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    callers_of: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if "PhysicalStreamSnapshot" in _direct_call_names(node):
+            callers_of.add(node.name)
+    assert callers_of == {"snapshot_physical_stream"}
 
 
 def test_frozen_oracle_does_not_import_s2() -> None:
@@ -1606,17 +2069,25 @@ def _functions_reachable_from_tests(source: str) -> set[str]:
     return reachable_funcs
 
 
-def _name_loads_in_functions(source: str, func_names: set[str]) -> set[str]:
-    """Every identifier referenced as an ``ast.Name`` in a load context --
-    a constructor call (``ParticipantLifetime(...)``), an enum member
-    access's object (``StreamName.HARNESS_EVENTS``), an isinstance/
-    pytest.raises argument (``isinstance(x, ParticipantTable)``,
-    ``pytest.raises(StructuralDecodeError)``), ... -- anywhere inside the
-    given top-level function bodies. Excludes imports (an ``ast.alias``
-    string, never an ``ast.Name`` node), comments (not part of the AST at
-    all), and docstrings/string literals (an ``ast.Constant``, never an
-    ``ast.Name`` node) -- a type that is only imported, or only named in
-    prose, contributes nothing here."""
+def _meaningful_type_uses_in_functions(source: str, func_names: set[str]) -> set[str]:
+    """Identifiers considered ACTUAL runtime use of a type, anywhere inside
+    the given top-level function bodies: a direct constructor call
+    (``ParticipantLifetime(...)``), the object of an attribute access --
+    e.g. an enum member access (``StreamName.HARNESS_EVENTS``) --, an
+    argument to ``isinstance``/``issubclass``/``pytest.raises``
+    (including inside a tuple of types), or an ``ast.ExceptHandler``'s
+    exception type.
+
+    S2 final finite corrective (tightening section 16/21's executable-
+    AST-use gate): a bare ``ast.Name`` Load with no runtime role does NOT
+    count -- in particular a parameter/variable type ANNOTATION
+    (``def helper(x: SomeType)``) is an ``ast.Name`` Load too, but carries
+    no runtime role, so it must not satisfy this gate merely because the
+    type's name happens to be syntactically present. Imports (an
+    ``ast.alias`` string, never an ``ast.Name`` node), comments (not part
+    of the AST), docstrings/``__all__`` (``ast.Constant`` string literals,
+    never ``ast.Name``), and an unreachable helper's uses (never walked,
+    since ``func_names`` is the test-reachable set) also do not count."""
 
     tree = ast.parse(source)
     top_level_funcs = {
@@ -1624,37 +2095,131 @@ def _name_loads_in_functions(source: str, func_names: set[str]) -> set[str]:
         for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    loaded: set[str] = set()
+    used: set[str] = set()
     for name in func_names:
         node = top_level_funcs.get(name)
         if node is None:
             continue
         for child in ast.walk(node):
-            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
-                loaded.add(child.id)
-    return loaded
+            if isinstance(child, ast.Call):
+                if isinstance(child.func, ast.Name):
+                    used.add(child.func.id)  # constructor call: TypeName(...)
+                call_target = (
+                    child.func.id
+                    if isinstance(child.func, ast.Name)
+                    else child.func.attr
+                    if isinstance(child.func, ast.Attribute)
+                    else None
+                )
+                if call_target in {"isinstance", "issubclass", "raises"}:
+                    for arg in list(child.args) + [kw.value for kw in child.keywords]:
+                        if isinstance(arg, ast.Name):
+                            used.add(arg.id)
+                        elif isinstance(arg, ast.Tuple):
+                            for elt in arg.elts:
+                                if isinstance(elt, ast.Name):
+                                    used.add(elt.id)
+            elif isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
+                used.add(child.value.id)  # enum member access: SomeEnum.MEMBER
+            elif isinstance(child, ast.ExceptHandler) and child.type is not None:
+                if isinstance(child.type, ast.Name):
+                    used.add(child.type.id)
+                elif isinstance(child.type, ast.Tuple):
+                    for elt in child.type.elts:
+                        if isinstance(elt, ast.Name):
+                            used.add(elt.id)
+    return used
 
 
 def test_every_exported_s2_type_has_actual_executable_use_coverage() -> None:
     """Executable-AST-use gate (section 21 of the S2 final boundary
-    corrective pass): replaces the prior raw-text/substring type-coverage
-    check, which an import statement alone could satisfy (the type's own
-    name appearing anywhere in this file's source text, including in an
-    import line or a docstring). An exported type must actually be
-    exercised -- constructed, an enum member accessed off it, passed to
-    isinstance/pytest.raises, etc. -- by some function reachable from a
-    test_* function; being imported or merely mentioned in prose is not
-    enough to satisfy this gate."""
+    corrective pass; tightened in the S2 final finite corrective -- see
+    _meaningful_type_uses_in_functions): replaces the prior raw-text/
+    substring type-coverage check, which an import statement alone could
+    satisfy. An exported type must actually be exercised -- constructed,
+    an enum member accessed off it, passed to isinstance/issubclass/
+    pytest.raises, or named as an except-handler type -- by some function
+    reachable from a test_* function; being imported, merely annotated
+    with, or merely mentioned in prose is not enough to satisfy this
+    gate."""
 
     source = Path(__file__).read_text(encoding="utf-8")
     reachable_funcs = _functions_reachable_from_tests(source)
-    used_names = _name_loads_in_functions(source, reachable_funcs)
+    used_names = _meaningful_type_uses_in_functions(source, reachable_funcs)
 
     exported: set[str] = set()
     for module in ALL_S2_MODULES:
         exported |= _public_types(module)
     missing = exported - used_names
     assert missing == set()
+
+
+# --- Adversarial proof of the type-use gate's own logic (section 16) ------
+
+
+def test_type_use_gate_annotation_only_does_not_count_as_use() -> None:
+    source = (
+        "class SomeType:\n    pass\n\n"
+        "def helper(x: SomeType) -> None:\n    pass\n\n"
+        "def test_case() -> None:\n    helper(1)\n"
+    )
+    reachable = _functions_reachable_from_tests(source)
+    used = _meaningful_type_uses_in_functions(source, reachable)
+    assert "SomeType" not in used
+
+
+def test_type_use_gate_import_only_does_not_count_as_use() -> None:
+    source = "from module import SomeType\n\ndef test_case() -> None:\n    pass\n"
+    reachable = _functions_reachable_from_tests(source)
+    used = _meaningful_type_uses_in_functions(source, reachable)
+    assert "SomeType" not in used
+
+
+def test_type_use_gate_unreachable_helper_does_not_count_as_use() -> None:
+    source = (
+        "class SomeType:\n    pass\n\n"
+        "def unused_helper() -> None:\n    SomeType()\n\n"
+        "def test_case() -> None:\n    pass\n"
+    )
+    reachable = _functions_reachable_from_tests(source)
+    used = _meaningful_type_uses_in_functions(source, reachable)
+    assert "SomeType" not in used
+
+
+def test_type_use_gate_constructor_call_counts_as_use() -> None:
+    source = "class SomeType:\n    pass\n\ndef test_case() -> None:\n    SomeType()\n"
+    reachable = _functions_reachable_from_tests(source)
+    used = _meaningful_type_uses_in_functions(source, reachable)
+    assert "SomeType" in used
+
+
+def test_type_use_gate_enum_member_access_counts_as_use() -> None:
+    source = (
+        "import enum\n\n"
+        "class SomeEnum(enum.Enum):\n    A = 1\n\n"
+        "def test_case() -> None:\n    x = SomeEnum.A\n"
+    )
+    reachable = _functions_reachable_from_tests(source)
+    used = _meaningful_type_uses_in_functions(source, reachable)
+    assert "SomeEnum" in used
+
+
+def test_type_use_gate_pytest_raises_argument_counts_as_use() -> None:
+    """Isolated from constructor-call detection on purpose: SomeError is
+    never directly called (only named as pytest.raises's argument), so a
+    positive result here can only come from the isinstance/issubclass/
+    raises-argument detection path, not the constructor-call path."""
+
+    source = (
+        "import pytest\n\n"
+        "class SomeError(Exception):\n    pass\n\n"
+        "def test_case() -> None:\n"
+        "    with pytest.raises(SomeError):\n"
+        "        1 / 0\n"
+    )
+    reachable = _functions_reachable_from_tests(source)
+    used = _meaningful_type_uses_in_functions(source, reachable)
+    assert "SomeError" in used
 
 
 def test_exported_function_and_type_counts() -> None:
@@ -1664,14 +2229,18 @@ def test_exported_function_and_type_counts() -> None:
 
     total_functions = sum(len(_public_functions(m)) for m in ALL_S2_MODULES)
     total_types = sum(len(_public_types(m)) for m in ALL_S2_MODULES)
-    # functions: assign_physical_positions, decode_harness_record_header,
-    # decode_harness_stream, build_participant_table. decode_timed_record_ref
-    # was removed in the S2 final boundary corrective pass alongside
-    # TimedRecordRef (see records.py).
+    # functions: snapshot_physical_stream (physical; replaces the removed,
+    # untruthful-contract assign_physical_positions -- S2 final finite
+    # corrective), decode_harness_record_header, decode_harness_stream
+    # (records), build_participant_table (participants).
+    # decode_timed_record_ref was removed in the S2 final boundary
+    # corrective pass alongside TimedRecordRef (see records.py).
     assert total_functions == 4
-    # types: StreamName, PhysicalPos, CrossStreamComparisonError (physical);
-    # HarnessEventKind, StructuralDecodeError, HarnessRecordHeader (records);
+    # types: StreamName, PhysicalPos, CrossStreamComparisonError,
+    # PhysicalStreamSnapshot (physical -- PhysicalStreamSnapshot added in
+    # the S2 final finite corrective); HarnessEventKind,
+    # StructuralDecodeError, HarnessRecordHeader (records);
     # ParticipantIdentity, TerminationKind, ParticipantLifetimeError,
     # ParticipantLifetime, ParticipantTable (participants). TimedRecordRef
     # was removed in the S2 final boundary corrective pass.
-    assert total_types == 11
+    assert total_types == 12

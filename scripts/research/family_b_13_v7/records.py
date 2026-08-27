@@ -23,6 +23,7 @@ rather than smuggled through as an unrestricted raw mapping.
 
 from __future__ import annotations
 
+import collections.abc
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Mapping, Sequence
@@ -32,7 +33,7 @@ from scripts.research.family_b_13_primitives import (
     require_nonnegative_int,
 )
 
-from .physical import PhysicalPos, StreamName, assign_physical_positions
+from .physical import PhysicalPos, StreamName, snapshot_physical_stream
 
 __all__ = [
     "HarnessEventKind",
@@ -159,10 +160,36 @@ def decode_harness_record_header(
 def decode_harness_stream(raw_records: Sequence[Mapping[str, Any]]) -> list[HarnessRecordHeader]:
     """Decode a full ``harness-events.jsonl`` stream (already JSON-decoded,
     e.g. one dict per line from S1) into typed headers, one per physical
-    record, in the stream's own physical order."""
+    record, in the stream's own physical order.
 
-    positions = assign_physical_positions(StreamName.HARNESS_EVENTS, raw_records)
+    Raw-record snapshot boundary (S2 final finite corrective, local
+    stop-patching rule -- generalizing the same rule
+    :func:`~scripts.research.family_b_13_v7.participants.build_participant_table`
+    already enforces for typed records): ``raw_records`` must be a real
+    :class:`collections.abc.Sequence` (rejected with a stable
+    ``harness_stream_input_not_sequence`` error otherwise -- a plain
+    one-shot iterator/generator, or an arbitrary ``Sized``+``Iterable``
+    container that is not actually a ``Sequence``, does not silently
+    satisfy this contract). ``raw_records`` is then handed to
+    :func:`~scripts.research.family_b_13_v7.physical.snapshot_physical_stream`,
+    which traverses it EXACTLY ONCE into an immutable snapshot and returns
+    that snapshot's records paired, from that SAME observation, with their
+    :class:`~scripts.research.family_b_13_v7.physical.PhysicalPos` values.
+    This function then decodes only that returned snapshot -- ``raw_records``
+    itself is never traversed, indexed, or measured again after the
+    snapshot call. Without this, a ``Sequence``-conforming object whose
+    ``__len__`` and ``__iter__`` (or successive full iterations) described
+    different histories could let physical positions be counted from one
+    observation while record content came from another -- silently
+    truncating or reordering sealed evidence before any downstream
+    validator ever sees it.
+    """
+
+    if not isinstance(raw_records, collections.abc.Sequence):
+        raise StructuralDecodeError("harness_stream_input_not_sequence")
+
+    snapshot = snapshot_physical_stream(StreamName.HARNESS_EVENTS, raw_records)
     return [
         decode_harness_record_header(raw, pos)
-        for raw, pos in zip(raw_records, positions)
+        for raw, pos in zip(snapshot.records, snapshot.positions)
     ]

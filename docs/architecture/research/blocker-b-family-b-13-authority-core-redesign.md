@@ -635,6 +635,114 @@ SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
   This reconciliation did not trigger G8 and did not reach for any S3+
   authority concept. Still **IMPLEMENTED / AWAITING INDEPENDENT REVIEW**,
   not accepted.
+
+  **S2 final finite corrective (raw-record snapshot boundary + package-wide
+  gate discovery, same anti-loop decision, still Draft PR #53, no v8, no
+  S3).** A final independent adversarial S2 acceptance review found the P1
+  snapshot-boundary rule closed above for typed harness records
+  (`build_participant_table`) had not been propagated to the earlier
+  raw-record boundary: `records.decode_harness_stream` derived
+  `PhysicalPos` *count* from `assign_physical_positions`'s `len(records)`
+  and separately re-iterated its own `raw_records` argument for record
+  *content* -- two independent observations of one external caller-supplied
+  object. For a `Sequence` whose `__len__` and `__iter__` described
+  different histories, this let sealed evidence silently disappear (e.g.
+  records after `process_stop`) before any validator ever saw it,
+  converting the honest `participant_process_stop_not_physically_last`
+  rejection into an accepted `ParticipantTable` -- the same root
+  derivation-boundary class as the P1 above, one propagation short of
+  complete, not a new mechanism (G8: one finite propagation of an already-
+  identified rule across an enumerable, now-closed set of two boundaries,
+  not evidence of scattered derivation logic).
+
+  This pass removed `assign_physical_positions` outright -- its own public
+  contract was untruthful (it claimed positions were "derived from actual
+  iteration order" while the implementation only read `len()`) -- and
+  replaced it with `physical.snapshot_physical_stream`/
+  `PhysicalStreamSnapshot`: the sole point where an external `Sequence` is
+  observed, traversed EXACTLY ONCE into an immutable snapshot, with
+  positions derived from -- and returned paired with -- that same
+  snapshot's records, never the original caller object again.
+  `decode_harness_stream` now validates
+  `isinstance(raw_records, collections.abc.Sequence)` up front
+  (`harness_stream_input_not_sequence` otherwise, mirroring
+  `build_participant_table`'s existing guard) and consumes only the
+  returned snapshot; `raw_records` itself is never traversed, indexed, or
+  measured again after the snapshot call. The same runtime-type-discipline
+  pass switched `build_participant_table`'s own isinstance check from
+  `typing.Sequence` to `collections.abc.Sequence` (behaviorally identical
+  for `isinstance` -- `typing.Sequence` already delegated to the same ABC
+  -- but now explicit, applied consistently to both boundaries).
+
+  This pass also closed the package-wide architecture-gate discovery gap
+  the same review found: every S2 test-file gate that claimed to guard
+  "future S3+ modules added under this same package" was in fact
+  parametrized over a hard-coded four-filename list (`V7_MODULE_PATHS`)
+  that a new module -- e.g. a hypothetical `s3.py` importing the frozen
+  oracle, using forbidden authority vocabulary, and directly constructing
+  `ParticipantLifetime`/`ParticipantTable` -- would never enter, silently
+  bypassing all seven gates the independent review enumerated.
+  `V7_MODULE_PATHS` is now derived by `_discover_python_modules`, a
+  recursive filesystem scan of the package directory (excluding
+  `__pycache__`), cross-checked against an independent `iterdir()`
+  traversal so the discovered set cannot silently drift from the
+  filesystem in either direction; every package-wide gate (authority
+  vocabulary, verdict-like prefixes, stdlib/S1-only import scope,
+  relative-import boundaries, frozen-oracle import prohibition, the
+  clock/manifest gate, and the designated-constructor gate) is now
+  parametrized over that same discovered set. A hermetic test builds a
+  temporary directory (never a real tracked `s3.py` anywhere in this
+  repository) mirroring the real package, adds a hypothetical future
+  module, and proves both that discovery finds it with no edit to any
+  hard-coded list and that the shared gate-logic helpers
+  (`_code_identifiers`, `_direct_call_names`, the forbidden-vocabulary/
+  prefix sets) would flag its violations.
+
+  The designated-constructor gate (previously `ParticipantLifetime`/
+  `ParticipantTable`, owned by `participants.py` alone) was generalized to
+  a table of type -> owning module and extended to cover the new
+  `PhysicalStreamSnapshot`, owned by `physical.py`, for the identical
+  well-formed-constructor-vs-established-derivation reason section 7
+  above already established for the other two types; `PhysicalPos`/
+  `HarnessRecordHeader` remain deliberately unrestricted, since no
+  concrete false-authority path requires it (independent review agreed).
+
+  The executable-AST-use exported-type coverage gate (section 15 above)
+  was tightened: a parameter/variable type *annotation* is an `ast.Name`
+  Load like any other, but it carries no runtime role, so it no longer
+  counts as meaningful use. Only a direct constructor call, an enum-member
+  attribute access, an `isinstance`/`issubclass`/`pytest.raises` argument,
+  or an `except`-handler type count now. Six adversarial unit tests prove
+  the gate's own logic: annotation-only, import-only, and unreachable-
+  helper uses are correctly excluded; constructor-call, enum-member-
+  access, and `pytest.raises`-argument uses are correctly included (the
+  latter isolated from constructor-call detection so it cannot pass for
+  the wrong reason).
+
+  `ParticipantTable`'s wrong-type `__contains__`/`get` behavior (a
+  duck-typed or wrong-type key returning `False`/`None` rather than
+  raising) was reviewed against this design's own mapping-like contract
+  and deliberately kept as ordinary mapping semantics -- documented, not
+  changed: it fails only in the safe direction (a caller under-reads,
+  never over-reads a positive fact), unlike `PhysicalPos.precedes`'s
+  fail-closed `TypeError`, which exists specifically because a duck-typed
+  fake there could otherwise manufacture a positive physical-order fact.
+
+  Stale present-tense documentation the review found was corrected: a
+  test docstring that still described the removed `TimedRecordRef` as
+  "is generic across every sealed stream" in the present tense now reads
+  as historical; `docs/architecture/0.5-implementation-status.md`'s S2
+  entry no longer lists "lifetime-containment queries" as a current S2
+  capability (it never was, post-dating the S2 final boundary corrective
+  pass above that removed `contains_record`/`contains_ns`); and an
+  unscoped "`contains_ns` remains" pass-history mention in that same
+  status entry now explicitly reads as a superseded intermediate-pass
+  fact, not current contract.
+
+  This pass added no timestamp relation, no clock-contract implementation,
+  and no S3/authority concept, and did not trigger G8. Still
+  **IMPLEMENTED / AWAITING FINAL INDEPENDENT ACCEPTANCE REVIEW**, not
+  accepted.
 - **S3–S6** (future, not started): the remaining dormant v7 authority-core
   stages, each its own independently SHA-gated/reviewed commit boundary on
   this same Draft PR #53. No real experiment. No production authority.

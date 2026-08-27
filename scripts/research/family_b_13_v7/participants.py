@@ -117,6 +117,7 @@ its physical position is itself being tested.
 
 from __future__ import annotations
 
+import collections.abc
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
@@ -472,19 +473,30 @@ def build_participant_table(
     be added here (see the package/module docstrings' kill-switch note).
 
     Snapshot boundary (P1 corrective decision, local stop-patching rule):
-    ``harness_records`` must be a real :class:`~typing.Sequence` (rejected
-    with a stable ``harness_stream_input_not_sequence`` error otherwise --
-    a plain one-shot iterator/generator does not silently become part of
-    this public contract merely because ``tuple()`` can consume it), and is
-    traversed EXACTLY ONCE, immediately, into an immutable ``tuple``
-    snapshot. Every validator below, and the lifetime builder, consumes
-    only that same snapshot -- the caller-supplied object itself is never
-    traversed again. Without this, a Sequence-conforming object whose
-    successive iterations return different content could let one validator
-    see one history while the lifetime is built from a different one; see
+    ``harness_records`` must be a real :class:`collections.abc.Sequence`
+    (rejected with a stable ``harness_stream_input_not_sequence`` error
+    otherwise -- a plain one-shot iterator/generator, or an arbitrary
+    ``Sized``+``Iterable`` container that is not actually a ``Sequence``,
+    does not silently become part of this public contract merely because
+    ``tuple()`` can consume it), and is traversed EXACTLY ONCE, immediately,
+    into an immutable ``tuple`` snapshot. Every validator below, and the
+    lifetime builder, consumes only that same snapshot -- the caller-
+    supplied object itself is never traversed again. Without this, a
+    Sequence-conforming object whose successive iterations return different
+    content could let one validator see one history while the lifetime is
+    built from a different one; see
     ``test_build_participant_table_snapshots_adversarial_sequence_exactly_once``.
     No future validator may re-traverse the caller object -- add any new
-    check against ``snapshot`` instead.
+    check against ``snapshot`` instead. The runtime check itself is against
+    :class:`collections.abc.Sequence` rather than :class:`typing.Sequence`
+    (the S2 final finite corrective's runtime-type-discipline pass; the two
+    were behaviorally equivalent for ``isinstance`` even before this
+    change, since ``typing.Sequence`` delegates its own ``isinstance``
+    check to the same ABC, but the explicit ABC import removes any
+    ambiguity about what is actually being checked at runtime -- see the
+    same discipline applied to
+    :func:`~scripts.research.family_b_13_v7.records.decode_harness_stream`
+    and :func:`~scripts.research.family_b_13_v7.physical.snapshot_physical_stream`).
 
     Checks, each failing closed in order: every element is actually a
     :class:`HarnessRecordHeader` (:func:`_require_typed_harness_records`);
@@ -494,7 +506,7 @@ def build_participant_table(
     (:func:`_require_singleton_process_identity`).
     """
 
-    if not isinstance(harness_records, Sequence):
+    if not isinstance(harness_records, collections.abc.Sequence):
         raise ParticipantLifetimeError("harness_stream_input_not_sequence")
     snapshot: tuple[HarnessRecordHeader, ...] = tuple(harness_records)
 
