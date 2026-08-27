@@ -1,0 +1,1253 @@
+[
+  {
+    "vector_id": "json_document_valid_object",
+    "parser_family": "json_document",
+    "primitive_function": "parse_json_document",
+    "frozen_equivalent": "_load_json",
+    "input": {
+      "kind": "text",
+      "value": "{\"a\": 1, \"b\": [1, 2, 3]}"
+    },
+    "expected": {
+      "category": "success",
+      "value": {
+        "a": 1,
+        "b": [
+          1,
+          2,
+          3
+        ]
+      }
+    },
+    "provenance": "frozen_v6",
+    "description": "A syntactically valid JSON document decodes to its plain Python value."
+  },
+  {
+    "vector_id": "json_document_malformed",
+    "parser_family": "json_document",
+    "primitive_function": "parse_json_document",
+    "frozen_equivalent": "_load_json",
+    "input": {
+      "kind": "text",
+      "value": "{\"a\": }"
+    },
+    "expected": {
+      "category": "error",
+      "error": "invalid_json"
+    },
+    "provenance": "frozen_v6",
+    "description": "Malformed JSON syntax fails closed rather than partially decoding."
+  },
+  {
+    "vector_id": "jsonl_line_valid_object",
+    "parser_family": "jsonl_line",
+    "primitive_function": "decode_jsonl_line",
+    "frozen_equivalent": "_load_jsonl",
+    "input": {
+      "kind": "bytes_utf8",
+      "text": "{\"a\": 1}\n"
+    },
+    "expected": {
+      "category": "success",
+      "value": {
+        "a": 1
+      }
+    },
+    "provenance": "frozen_v6",
+    "description": "One well-formed JSONL object line decodes to its record."
+  },
+  {
+    "vector_id": "jsonl_line_non_object_array",
+    "parser_family": "jsonl_line",
+    "primitive_function": "decode_jsonl_line",
+    "frozen_equivalent": "_load_jsonl",
+    "input": {
+      "kind": "bytes_utf8",
+      "text": "[1, 2, 3]\n"
+    },
+    "expected": {
+      "category": "error",
+      "error": "jsonl_record_not_object"
+    },
+    "provenance": "frozen_v6",
+    "description": "Every JSONL record in this protocol must be a JSON object, never a bare array."
+  },
+  {
+    "vector_id": "jsonl_line_non_object_scalar",
+    "parser_family": "jsonl_line",
+    "primitive_function": "decode_jsonl_line",
+    "frozen_equivalent": "_load_jsonl",
+    "input": {
+      "kind": "bytes_utf8",
+      "text": "42\n"
+    },
+    "expected": {
+      "category": "error",
+      "error": "jsonl_record_not_object"
+    },
+    "provenance": "boundary_case",
+    "description": "A bare scalar JSON value is syntactically valid JSON but not an object record."
+  },
+  {
+    "vector_id": "jsonl_line_malformed_json",
+    "parser_family": "jsonl_line",
+    "primitive_function": "decode_jsonl_line",
+    "frozen_equivalent": "_load_jsonl",
+    "input": {
+      "kind": "bytes_utf8",
+      "text": "{\"a\":\n"
+    },
+    "expected": {
+      "category": "error",
+      "error": "invalid_jsonl"
+    },
+    "provenance": "frozen_v6",
+    "description": "A truncated/malformed JSONL line fails closed."
+  },
+  {
+    "vector_id": "jsonl_line_invalid_utf8",
+    "parser_family": "jsonl_line",
+    "primitive_function": "decode_jsonl_line",
+    "frozen_equivalent": "_load_jsonl",
+    "input": {
+      "kind": "bytes_int_list",
+      "bytes": [
+        123,
+        34,
+        97,
+        34,
+        58,
+        255,
+        10
+      ]
+    },
+    "expected": {
+      "category": "error",
+      "error": "invalid_jsonl"
+    },
+    "provenance": "frozen_v6",
+    "description": "0xFF is not a valid UTF-8 continuation/lead byte inside `{\"a\":<0xFF>\\n`; decoding fails closed before JSON parsing, sharing the same invalid_jsonl identifier frozen v6 uses for any line that fails to decode."
+  },
+  {
+    "vector_id": "jsonl_line_blank",
+    "parser_family": "jsonl_line",
+    "primitive_function": "decode_jsonl_line",
+    "frozen_equivalent": "_load_jsonl",
+    "input": {
+      "kind": "bytes_utf8",
+      "text": "   \n"
+    },
+    "expected": {
+      "category": "error",
+      "error": "blank_jsonl_line"
+    },
+    "provenance": "frozen_v6",
+    "description": "A whitespace-only physical line is rejected rather than silently skipped."
+  },
+  {
+    "vector_id": "jsonl_line_at_max_bytes_boundary",
+    "parser_family": "jsonl_line",
+    "primitive_function": "decode_jsonl_line",
+    "frozen_equivalent": "_load_jsonl",
+    "input": {
+      "kind": "padded_object_line",
+      "total_bytes": 1048576
+    },
+    "expected": {
+      "category": "success"
+    },
+    "provenance": "frozen_v6",
+    "description": "A physical line whose byte length is exactly MAX_JSONL_LINE_BYTES (1048576) is accepted. The line is constructed via the padded_object_line recipe: prefix {\"a\":\" + N repetitions of the character x + suffix \"} + a trailing LF, with N chosen so the encoded byte length is exactly total_bytes. expected has no value key here (only category is checked): the padded content itself is not worth freezing verbatim, but the differential test still requires the new primitive and the frozen oracle to independently agree with each other on the actual decoded value."
+  },
+  {
+    "vector_id": "jsonl_line_over_max_bytes_boundary",
+    "parser_family": "jsonl_line",
+    "primitive_function": "decode_jsonl_line",
+    "frozen_equivalent": "_load_jsonl",
+    "input": {
+      "kind": "padded_object_line",
+      "total_bytes": 1048577
+    },
+    "expected": {
+      "category": "error",
+      "error": "jsonl_line_too_large"
+    },
+    "provenance": "frozen_v6",
+    "description": "One byte over MAX_JSONL_LINE_BYTES is rejected before any JSON decoding is attempted."
+  },
+  {
+    "vector_id": "scalar_bool_rejected_as_nonnegative_int",
+    "parser_family": "scalar_nonnegative_int",
+    "primitive_function": "require_nonnegative_int",
+    "frozen_equivalent": "_require_int",
+    "input": {
+      "kind": "value",
+      "value": true
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonnegative_integer"
+    },
+    "provenance": "frozen_v6",
+    "description": "bool is an int subclass in Python; the frozen contract never lets a boolean satisfy an integer field."
+  },
+  {
+    "vector_id": "scalar_zero_is_nonnegative_int",
+    "parser_family": "scalar_nonnegative_int",
+    "primitive_function": "require_nonnegative_int",
+    "frozen_equivalent": "_require_int",
+    "input": {
+      "kind": "value",
+      "value": 0
+    },
+    "expected": {
+      "category": "success",
+      "value": 0
+    },
+    "provenance": "frozen_v6",
+    "description": "Zero is a legal nonnegative integer."
+  },
+  {
+    "vector_id": "scalar_negative_rejected_as_nonnegative_int",
+    "parser_family": "scalar_nonnegative_int",
+    "primitive_function": "require_nonnegative_int",
+    "frozen_equivalent": "_require_int",
+    "input": {
+      "kind": "value",
+      "value": -1
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonnegative_integer"
+    },
+    "provenance": "frozen_v6",
+    "description": "Negative values are rejected by the nonnegative-integer primitive."
+  },
+  {
+    "vector_id": "scalar_negative_signed_int_accepted",
+    "parser_family": "scalar_signed_int",
+    "primitive_function": "require_signed_int",
+    "frozen_equivalent": "_require_signed_int",
+    "input": {
+      "kind": "value",
+      "value": -1
+    },
+    "expected": {
+      "category": "success",
+      "value": -1
+    },
+    "provenance": "frozen_v6",
+    "description": "The signed-integer primitive accepts negative values (used for fields with no sign constraint)."
+  },
+  {
+    "vector_id": "scalar_bool_rejected_as_signed_int",
+    "parser_family": "scalar_signed_int",
+    "primitive_function": "require_signed_int",
+    "frozen_equivalent": "_require_signed_int",
+    "input": {
+      "kind": "value",
+      "value": false
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_integer"
+    },
+    "provenance": "boundary_case",
+    "description": "bool must not satisfy the signed-integer primitive either."
+  },
+  {
+    "vector_id": "scalar_empty_text_rejected_as_nonempty",
+    "parser_family": "scalar_nonempty_text",
+    "primitive_function": "require_nonempty_string",
+    "frozen_equivalent": "_require_text",
+    "input": {
+      "kind": "value",
+      "value": ""
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_nonempty_string"
+    },
+    "provenance": "frozen_v6",
+    "description": "An empty string is not a nonempty string."
+  },
+  {
+    "vector_id": "scalar_empty_text_accepted_as_string",
+    "parser_family": "scalar_text",
+    "primitive_function": "require_string",
+    "frozen_equivalent": "_require_string",
+    "input": {
+      "kind": "value",
+      "value": ""
+    },
+    "expected": {
+      "category": "success",
+      "value": ""
+    },
+    "provenance": "frozen_v6",
+    "description": "The plain string primitive (used e.g. for raw_evidence, which may legitimately be empty) accepts an empty string."
+  },
+  {
+    "vector_id": "scalar_nonempty_text_accepted",
+    "parser_family": "scalar_nonempty_text",
+    "primitive_function": "require_nonempty_string",
+    "frozen_equivalent": "_require_text",
+    "input": {
+      "kind": "value",
+      "value": "hello"
+    },
+    "expected": {
+      "category": "success",
+      "value": "hello"
+    },
+    "provenance": "frozen_v6",
+    "description": "A nonempty string is accepted."
+  },
+  {
+    "vector_id": "scalar_sequence_rejects_mapping",
+    "parser_family": "scalar_sequence",
+    "primitive_function": "require_sequence",
+    "frozen_equivalent": "_require_sequence",
+    "input": {
+      "kind": "value",
+      "value": {
+        "a": 1
+      }
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_array"
+    },
+    "provenance": "frozen_v6",
+    "description": "A mapping is not a sequence."
+  },
+  {
+    "vector_id": "scalar_mapping_rejects_sequence",
+    "parser_family": "scalar_mapping",
+    "primitive_function": "require_mapping",
+    "frozen_equivalent": "_require_mapping",
+    "input": {
+      "kind": "value",
+      "value": [
+        1,
+        2
+      ]
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_object"
+    },
+    "provenance": "frozen_v6",
+    "description": "A sequence is not a mapping."
+  },
+  {
+    "vector_id": "scalar_mapping_accepted",
+    "parser_family": "scalar_mapping",
+    "primitive_function": "require_mapping",
+    "frozen_equivalent": "_require_mapping",
+    "input": {
+      "kind": "value",
+      "value": {
+        "a": 1
+      }
+    },
+    "expected": {
+      "category": "success",
+      "value": {
+        "a": 1
+      }
+    },
+    "provenance": "frozen_v6",
+    "description": "A JSON object is a mapping."
+  },
+  {
+    "vector_id": "scalar_bool_true_accepted",
+    "parser_family": "scalar_bool",
+    "primitive_function": "require_bool",
+    "frozen_equivalent": "_require_bool",
+    "input": {
+      "kind": "value",
+      "value": true
+    },
+    "expected": {
+      "category": "success",
+      "value": true
+    },
+    "provenance": "frozen_v6",
+    "description": "A JSON true value is accepted as a boolean."
+  },
+  {
+    "vector_id": "scalar_int_rejected_as_bool",
+    "parser_family": "scalar_bool",
+    "primitive_function": "require_bool",
+    "frozen_equivalent": "_require_bool",
+    "input": {
+      "kind": "value",
+      "value": 1
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_boolean"
+    },
+    "provenance": "boundary_case",
+    "description": "An integer 1 must not satisfy a boolean field even though bool is an int subclass in the other direction."
+  },
+  {
+    "vector_id": "upid_valid_generated_style",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid+_decode_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:00000001:00000001:00000001:stopall::generator@pve:"
+    },
+    "expected": {
+      "category": "success",
+      "value": {
+        "node": "fixture",
+        "pid": "00000001",
+        "pstart": "00000001",
+        "starttime": "00000001",
+        "task_type": "stopall",
+        "task_id": "",
+        "owner": "generator@pve",
+        "task_bucket": "1"
+      }
+    },
+    "provenance": "capture_fixture",
+    "description": "A well-formed generated-style UPID with an empty task_id (legal for stopall) decodes fully; the bucket is the starttime's final hex nibble."
+  },
+  {
+    "vector_id": "upid_uppercase_starttime_nibble_preserved",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid+_decode_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:0000000A:0000000A:0000000A:stopall::generator@pve:"
+    },
+    "expected": {
+      "category": "success",
+      "value": {
+        "node": "fixture",
+        "pid": "0000000A",
+        "pstart": "0000000A",
+        "starttime": "0000000A",
+        "task_type": "stopall",
+        "task_id": "",
+        "owner": "generator@pve",
+        "task_bucket": "A"
+      }
+    },
+    "provenance": "historical_regression",
+    "description": "An uppercase A-F starttime nibble is preserved verbatim as the bucket, matching pve-common 9.2.1's substr()-based decode which never lowercases."
+  },
+  {
+    "vector_id": "upid_lowercase_starttime_nibble_preserved",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid+_decode_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:0000000a:0000000a:0000000a:stopall::generator@pve:"
+    },
+    "expected": {
+      "category": "success",
+      "value": {
+        "node": "fixture",
+        "pid": "0000000a",
+        "pstart": "0000000a",
+        "starttime": "0000000a",
+        "task_type": "stopall",
+        "task_id": "",
+        "owner": "generator@pve",
+        "task_bucket": "a"
+      }
+    },
+    "provenance": "boundary_case",
+    "description": "A lowercase textual a-f starttime nibble is lexically legal and preserved verbatim, not uppercased."
+  },
+  {
+    "vector_id": "upid_invalid_node_character",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fix_ture:00000001:00000001:00000001:stopall::generator@pve:"
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_normalized_upid"
+    },
+    "provenance": "boundary_case",
+    "description": "An underscore is not a legal node-name character in the frozen node pattern."
+  },
+  {
+    "vector_id": "upid_invalid_pid_width",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:0000001:00000001:00000001:stopall::generator@pve:"
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_normalized_upid"
+    },
+    "provenance": "boundary_case",
+    "description": "pid must be exactly 8 hex digits; 7 digits is rejected."
+  },
+  {
+    "vector_id": "upid_pstart_nine_hex_digits_accepted",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid+_decode_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:00000001:123456789:00000001:stopall::generator@pve:"
+    },
+    "expected": {
+      "category": "success",
+      "value": {
+        "node": "fixture",
+        "pid": "00000001",
+        "pstart": "123456789",
+        "starttime": "00000001",
+        "task_type": "stopall",
+        "task_id": "",
+        "owner": "generator@pve",
+        "task_bucket": "1"
+      }
+    },
+    "provenance": "historical_regression",
+    "description": "pstart may be 8 or 9 hex digits (PVE widened this field); 9 digits is legal."
+  },
+  {
+    "vector_id": "upid_pstart_ten_hex_digits_rejected",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:00000001:1234567890:00000001:stopall::generator@pve:"
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_normalized_upid"
+    },
+    "provenance": "boundary_case",
+    "description": "pstart is bounded at 9 hex digits; 10 digits is rejected."
+  },
+  {
+    "vector_id": "upid_invalid_starttime_width",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:00000001:00000001:0000001:stopall::generator@pve:"
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_normalized_upid"
+    },
+    "provenance": "boundary_case",
+    "description": "starttime must be exactly 8 hex digits; 7 digits is rejected."
+  },
+  {
+    "vector_id": "upid_forbidden_slash_in_task_type",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:00000001:00000001:00000001:stop/all::generator@pve:"
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_normalized_upid"
+    },
+    "provenance": "boundary_case",
+    "description": "A slash is forbidden inside task_type."
+  },
+  {
+    "vector_id": "upid_forbidden_colon_in_owner",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:00000001:00000001:00000001:stopall::gener:ator@pve:"
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_normalized_upid"
+    },
+    "provenance": "boundary_case",
+    "description": "A colon is forbidden inside owner (it is the field delimiter)."
+  },
+  {
+    "vector_id": "upid_forbidden_whitespace_in_task_type",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:00000001:00000001:00000001:stop all::generator@pve:"
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_normalized_upid"
+    },
+    "provenance": "boundary_case",
+    "description": "Whitespace is forbidden inside task_type."
+  },
+  {
+    "vector_id": "upid_empty_task_id_permitted",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid+_decode_upid",
+    "input": {
+      "kind": "value",
+      "value": "UPID:fixture:00000001:00000001:00000001:qmstart:100:generator@pve:"
+    },
+    "expected": {
+      "category": "success",
+      "value": {
+        "node": "fixture",
+        "pid": "00000001",
+        "pstart": "00000001",
+        "starttime": "00000001",
+        "task_type": "qmstart",
+        "task_id": "100",
+        "owner": "generator@pve",
+        "task_bucket": "1"
+      }
+    },
+    "provenance": "capture_fixture",
+    "description": "A nonempty task_id (e.g. a VMID) is also legal; contrasts with the empty-task_id vector above."
+  },
+  {
+    "vector_id": "upid_non_string_rejected",
+    "parser_family": "upid",
+    "primitive_function": "parse_upid",
+    "frozen_equivalent": "_require_upid",
+    "input": {
+      "kind": "value",
+      "value": 12345
+    },
+    "expected": {
+      "category": "error",
+      "error": "field_not_normalized_upid"
+    },
+    "provenance": "boundary_case",
+    "description": "A non-string value is rejected before any regex is attempted."
+  },
+  {
+    "vector_id": "task_bucket_identifier_valid_hex_nibble",
+    "parser_family": "task_bucket_identifier",
+    "primitive_function": "validate_task_bucket_identifier",
+    "frozen_equivalent": "_task_bucket_path",
+    "input": {
+      "kind": "value",
+      "value": "A"
+    },
+    "expected": {
+      "category": "success",
+      "value": "A"
+    },
+    "provenance": "frozen_v6",
+    "description": "A single uppercase hex nibble is a legal task bucket identifier."
+  },
+  {
+    "vector_id": "task_bucket_identifier_rejects_multi_character",
+    "parser_family": "task_bucket_identifier",
+    "primitive_function": "validate_task_bucket_identifier",
+    "frozen_equivalent": "_task_bucket_path",
+    "input": {
+      "kind": "value",
+      "value": "AB"
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_bucket_identifier_invalid"
+    },
+    "provenance": "boundary_case",
+    "description": "A task bucket identifier must be exactly one character."
+  },
+  {
+    "vector_id": "task_bucket_identifier_rejects_non_hex",
+    "parser_family": "task_bucket_identifier",
+    "primitive_function": "validate_task_bucket_identifier",
+    "frozen_equivalent": "_task_bucket_path",
+    "input": {
+      "kind": "value",
+      "value": "G"
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_bucket_identifier_invalid"
+    },
+    "provenance": "boundary_case",
+    "description": "'G' is outside the hex alphabet."
+  },
+  {
+    "vector_id": "inotify_decode_single_known_bit",
+    "parser_family": "inotify_decode",
+    "primitive_function": "decode_inotify_raw_mask",
+    "frozen_equivalent": "_decode_inotify_raw_mask",
+    "input": {
+      "kind": "int",
+      "value": 256
+    },
+    "expected": {
+      "category": "success",
+      "value": [
+        "IN_CREATE"
+      ]
+    },
+    "provenance": "frozen_v6",
+    "description": "0x100 decodes to exactly IN_CREATE."
+  },
+  {
+    "vector_id": "inotify_decode_combined_known_bits",
+    "parser_family": "inotify_decode",
+    "primitive_function": "decode_inotify_raw_mask",
+    "frozen_equivalent": "_decode_inotify_raw_mask",
+    "input": {
+      "kind": "int",
+      "value": 1073742080
+    },
+    "expected": {
+      "category": "success",
+      "value": [
+        "IN_CREATE",
+        "IN_ISDIR"
+      ]
+    },
+    "provenance": "capture_fixture",
+    "description": "0x40000100 (IN_CREATE | IN_ISDIR) decodes to both names -- a lazily-created directory bucket."
+  },
+  {
+    "vector_id": "inotify_decode_zero_mask",
+    "parser_family": "inotify_decode",
+    "primitive_function": "decode_inotify_raw_mask",
+    "frozen_equivalent": "_decode_inotify_raw_mask",
+    "input": {
+      "kind": "int",
+      "value": 0
+    },
+    "expected": {
+      "category": "success",
+      "value": []
+    },
+    "provenance": "boundary_case",
+    "description": "A raw mask of zero decodes to the empty event-name set, not an error."
+  },
+  {
+    "vector_id": "inotify_decode_unknown_bit_rejected",
+    "parser_family": "inotify_decode",
+    "primitive_function": "decode_inotify_raw_mask",
+    "frozen_equivalent": "_decode_inotify_raw_mask",
+    "input": {
+      "kind": "int",
+      "value": 2147483648
+    },
+    "expected": {
+      "category": "error",
+      "error": "inotify_raw_mask_unknown_bits"
+    },
+    "provenance": "frozen_v6",
+    "description": "Bit 31 (0x80000000) is not one of the accepted UAPI event-output bits and fails closed."
+  },
+  {
+    "vector_id": "inotify_agreement_matching",
+    "parser_family": "inotify_agreement",
+    "primitive_function": "inotify_masks_agree",
+    "frozen_equivalent": "_validated_inotify_masks",
+    "input": {
+      "kind": "mask_pair",
+      "raw_mask": 256,
+      "declared_mask": [
+        "IN_CREATE"
+      ]
+    },
+    "expected": {
+      "category": "success",
+      "value": [
+        "IN_CREATE"
+      ]
+    },
+    "provenance": "frozen_v6",
+    "description": "Declared textual mask exactly matches the decoded raw mask."
+  },
+  {
+    "vector_id": "inotify_agreement_raw_declared_mismatch",
+    "parser_family": "inotify_agreement",
+    "primitive_function": "inotify_masks_agree",
+    "frozen_equivalent": "_validated_inotify_masks",
+    "input": {
+      "kind": "mask_pair",
+      "raw_mask": 256,
+      "declared_mask": [
+        "IN_ACCESS"
+      ]
+    },
+    "expected": {
+      "category": "error",
+      "error": "inotify_mask_mismatch_raw_mask"
+    },
+    "provenance": "frozen_v6",
+    "description": "A declared textual mask disagreeing with the raw mask is rejected; raw_mask remains authoritative."
+  },
+  {
+    "vector_id": "inotify_agreement_declared_duplicate",
+    "parser_family": "inotify_agreement",
+    "primitive_function": "inotify_masks_agree",
+    "frozen_equivalent": "_validated_inotify_masks",
+    "input": {
+      "kind": "mask_pair",
+      "raw_mask": 256,
+      "declared_mask": [
+        "IN_CREATE",
+        "IN_CREATE"
+      ]
+    },
+    "expected": {
+      "category": "error",
+      "error": "inotify_declared_mask_duplicate"
+    },
+    "provenance": "frozen_v6",
+    "description": "A duplicated declared mask name is rejected even though the set would otherwise agree."
+  },
+  {
+    "vector_id": "inotify_agreement_raw_carries_unknown_bit",
+    "parser_family": "inotify_agreement",
+    "primitive_function": "inotify_masks_agree",
+    "frozen_equivalent": "_validated_inotify_masks",
+    "input": {
+      "kind": "mask_pair",
+      "raw_mask": 2147483648,
+      "declared_mask": [
+        "IN_CREATE"
+      ]
+    },
+    "expected": {
+      "category": "error",
+      "error": "inotify_raw_mask_unknown_bits"
+    },
+    "provenance": "boundary_case",
+    "description": "An unknown raw bit is rejected before the declared mask is even inspected."
+  },
+  {
+    "vector_id": "watch_gap_reasons_queue_overflow",
+    "parser_family": "watch_gap_reasons",
+    "primitive_function": "watch_gap_reasons",
+    "frozen_equivalent": "_watch_gap_reasons",
+    "input": {
+      "kind": "masks_set",
+      "names": [
+        "IN_Q_OVERFLOW"
+      ]
+    },
+    "expected": {
+      "category": "success",
+      "value": [
+        "watch_queue_overflow"
+      ]
+    },
+    "provenance": "frozen_v6",
+    "description": "IN_Q_OVERFLOW alone maps to the queue-overflow reason keyword."
+  },
+  {
+    "vector_id": "watch_gap_reasons_invalidation_bits",
+    "parser_family": "watch_gap_reasons",
+    "primitive_function": "watch_gap_reasons",
+    "frozen_equivalent": "_watch_gap_reasons",
+    "input": {
+      "kind": "masks_set",
+      "names": [
+        "IN_DELETE_SELF"
+      ]
+    },
+    "expected": {
+      "category": "success",
+      "value": [
+        "watch_invalidation_or_loss"
+      ]
+    },
+    "provenance": "frozen_v6",
+    "description": "Any of IN_IGNORED/IN_UNMOUNT/IN_DELETE_SELF/IN_MOVE_SELF maps to the invalidation-or-loss reason keyword."
+  },
+  {
+    "vector_id": "watch_gap_reasons_benign_bits",
+    "parser_family": "watch_gap_reasons",
+    "primitive_function": "watch_gap_reasons",
+    "frozen_equivalent": "_watch_gap_reasons",
+    "input": {
+      "kind": "masks_set",
+      "names": [
+        "IN_CREATE"
+      ]
+    },
+    "expected": {
+      "category": "success",
+      "value": []
+    },
+    "provenance": "frozen_v6",
+    "description": "An ordinary creation event carries no structural gap reason."
+  },
+  {
+    "vector_id": "posix_path_canonical_absolute",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "/synthetic/pve/tasks/1",
+      "allow_root": false
+    },
+    "expected": {
+      "category": "success",
+      "value": "/synthetic/pve/tasks/1"
+    },
+    "provenance": "frozen_v6",
+    "description": "A canonical absolute path with no trailing slash, no doubled slash, and no dot components is accepted."
+  },
+  {
+    "vector_id": "posix_path_root_rejected_without_allow_root",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "/",
+      "allow_root": false
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_path_not_canonical"
+    },
+    "provenance": "frozen_v6",
+    "description": "Root is not canonical for a task-tree path unless the caller explicitly allows it."
+  },
+  {
+    "vector_id": "posix_path_root_accepted_with_allow_root",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "/",
+      "allow_root": true
+    },
+    "expected": {
+      "category": "success",
+      "value": "/"
+    },
+    "provenance": "frozen_v6",
+    "description": "Root is legal where the caller (e.g. a mount-topology root field) explicitly allows it."
+  },
+  {
+    "vector_id": "posix_path_relative_rejected",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "synthetic/pve/tasks",
+      "allow_root": false
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_path_not_absolute"
+    },
+    "provenance": "frozen_v6",
+    "description": "A relative path is rejected."
+  },
+  {
+    "vector_id": "posix_path_trailing_slash_rejected",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "/synthetic/pve/tasks/1/",
+      "allow_root": false
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_path_not_canonical"
+    },
+    "provenance": "frozen_v6",
+    "description": "A trailing slash on a non-root path is not canonical."
+  },
+  {
+    "vector_id": "posix_path_double_slash_rejected",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "/synthetic//pve/tasks",
+      "allow_root": false
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_path_not_canonical"
+    },
+    "provenance": "frozen_v6",
+    "description": "A doubled slash is not canonical."
+  },
+  {
+    "vector_id": "posix_path_dot_component_rejected",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "/synthetic/./pve/tasks",
+      "allow_root": false
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_path_not_canonical"
+    },
+    "provenance": "frozen_v6",
+    "description": "A `.` path component is not canonical."
+  },
+  {
+    "vector_id": "posix_path_dotdot_component_rejected",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "/synthetic/../pve/tasks",
+      "allow_root": false
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_path_not_canonical"
+    },
+    "provenance": "frozen_v6",
+    "description": "A `..` path component is not canonical -- this is a lexical rejection, never a host-resolved traversal check."
+  },
+  {
+    "vector_id": "posix_path_nul_byte_rejected",
+    "parser_family": "posix_path",
+    "primitive_function": "validate_canonical_absolute_path",
+    "frozen_equivalent": "_validated_canonical_absolute_path",
+    "input": {
+      "kind": "value",
+      "value": "/synthetic/pve\u0000/tasks",
+      "allow_root": false
+    },
+    "expected": {
+      "category": "error",
+      "error": "task_tree_path_not_canonical"
+    },
+    "provenance": "boundary_case",
+    "description": "An embedded NUL byte is not canonical."
+  },
+  {
+    "vector_id": "terminal_status_ok",
+    "parser_family": "terminal_status",
+    "primitive_function": "classify_terminal_status",
+    "frozen_equivalent": "_classify_exact_log_terminal_status",
+    "input": {
+      "kind": "value",
+      "value": "TASK OK"
+    },
+    "expected": {
+      "category": "success",
+      "value": "ok"
+    },
+    "provenance": "frozen_v6",
+    "description": "The exact `TASK OK` line classifies as ok."
+  },
+  {
+    "vector_id": "terminal_status_warnings",
+    "parser_family": "terminal_status",
+    "primitive_function": "classify_terminal_status",
+    "frozen_equivalent": "_classify_exact_log_terminal_status",
+    "input": {
+      "kind": "value",
+      "value": "TASK WARNINGS: 2"
+    },
+    "expected": {
+      "category": "success",
+      "value": "warning"
+    },
+    "provenance": "frozen_v6",
+    "description": "`TASK WARNINGS: N` (raw exact-log line syntax) classifies as warning."
+  },
+  {
+    "vector_id": "terminal_status_error",
+    "parser_family": "terminal_status",
+    "primitive_function": "classify_terminal_status",
+    "frozen_equivalent": "_classify_exact_log_terminal_status",
+    "input": {
+      "kind": "value",
+      "value": "TASK ERROR: boom"
+    },
+    "expected": {
+      "category": "success",
+      "value": "error"
+    },
+    "provenance": "frozen_v6",
+    "description": "`TASK ERROR: message` classifies as error."
+  },
+  {
+    "vector_id": "terminal_status_unsupported_delimiter",
+    "parser_family": "terminal_status",
+    "primitive_function": "classify_terminal_status",
+    "frozen_equivalent": "_classify_exact_log_terminal_status",
+    "input": {
+      "kind": "value",
+      "value": "TASK WARNINGS:2"
+    },
+    "expected": {
+      "category": "success",
+      "value": null
+    },
+    "provenance": "boundary_case",
+    "description": "A missing space after the colon does not match the pinned syntax and classifies as unrecognized (None), not warning."
+  },
+  {
+    "vector_id": "terminal_status_case_sensitive",
+    "parser_family": "terminal_status",
+    "primitive_function": "classify_terminal_status",
+    "frozen_equivalent": "_classify_exact_log_terminal_status",
+    "input": {
+      "kind": "value",
+      "value": "task ok"
+    },
+    "expected": {
+      "category": "success",
+      "value": null
+    },
+    "provenance": "boundary_case",
+    "description": "Classification is case-sensitive; lowercase does not match."
+  },
+  {
+    "vector_id": "terminal_status_bare_warning_is_not_raw_line",
+    "parser_family": "terminal_status",
+    "primitive_function": "classify_terminal_status",
+    "frozen_equivalent": "_classify_exact_log_terminal_status",
+    "input": {
+      "kind": "value",
+      "value": "WARNINGS: 2"
+    },
+    "expected": {
+      "category": "success",
+      "value": null
+    },
+    "provenance": "historical_regression",
+    "description": "Bare `WARNINGS: N` is the return value of PVE::UPID::read_status(), not the raw exact-log line, and must not be classified as if it were one."
+  },
+  {
+    "vector_id": "strip_trailing_terminator_lf",
+    "parser_family": "line_terminator_strip",
+    "primitive_function": "strip_trailing_line_terminator",
+    "frozen_equivalent": "_without_trailing_line_terminator",
+    "input": {
+      "kind": "value",
+      "value": "TASK OK\n"
+    },
+    "expected": {
+      "category": "success",
+      "value": "TASK OK"
+    },
+    "provenance": "frozen_v6",
+    "description": "A single trailing LF is stripped."
+  },
+  {
+    "vector_id": "strip_trailing_terminator_crlf",
+    "parser_family": "line_terminator_strip",
+    "primitive_function": "strip_trailing_line_terminator",
+    "frozen_equivalent": "_without_trailing_line_terminator",
+    "input": {
+      "kind": "value",
+      "value": "TASK OK\r\n"
+    },
+    "expected": {
+      "category": "success",
+      "value": "TASK OK"
+    },
+    "provenance": "frozen_v6",
+    "description": "A single trailing CRLF is stripped as one unit."
+  },
+  {
+    "vector_id": "strip_trailing_terminator_none",
+    "parser_family": "line_terminator_strip",
+    "primitive_function": "strip_trailing_line_terminator",
+    "frozen_equivalent": "_without_trailing_line_terminator",
+    "input": {
+      "kind": "value",
+      "value": "TASK OK"
+    },
+    "expected": {
+      "category": "success",
+      "value": "TASK OK"
+    },
+    "provenance": "frozen_v6",
+    "description": "No trailing terminator means nothing is stripped."
+  },
+  {
+    "vector_id": "strip_trailing_terminator_only_one",
+    "parser_family": "line_terminator_strip",
+    "primitive_function": "strip_trailing_line_terminator",
+    "frozen_equivalent": "_without_trailing_line_terminator",
+    "input": {
+      "kind": "value",
+      "value": "TASK OK\n\n"
+    },
+    "expected": {
+      "category": "success",
+      "value": "TASK OK\n"
+    },
+    "provenance": "historical_regression",
+    "description": "At most one trailing terminator is stripped; a second trailing LF is content, not a serialization artifact."
+  },
+  {
+    "vector_id": "split_lines_lf_crlf_mixed",
+    "parser_family": "line_split",
+    "primitive_function": "split_lines_lf_crlf",
+    "frozen_equivalent": "_split_lf_crlf_lines",
+    "input": {
+      "kind": "value",
+      "value": "a\r\nb\nc"
+    },
+    "expected": {
+      "category": "success",
+      "value": [
+        "a",
+        "b",
+        "c"
+      ]
+    },
+    "provenance": "frozen_v6",
+    "description": "Mixed CRLF and bare LF boundaries both split correctly."
+  },
+  {
+    "vector_id": "split_lines_bare_cr_is_content",
+    "parser_family": "line_split",
+    "primitive_function": "split_lines_lf_crlf",
+    "frozen_equivalent": "_split_lf_crlf_lines",
+    "input": {
+      "kind": "value",
+      "value": "a\rb"
+    },
+    "expected": {
+      "category": "success",
+      "value": [
+        "a\rb"
+      ]
+    },
+    "provenance": "historical_regression",
+    "description": "A bare CR not immediately followed by an LF boundary is never a line delimiter by itself and is preserved as content."
+  }
+]

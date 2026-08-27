@@ -298,36 +298,47 @@ in v7:
 ## 9. Delivery plan
 
 The project has rejected literal in-place reduction of PR #52. Clean review
-boundaries apply instead:
+boundaries apply instead — as **one long-lived Draft PR**, not the separate
+PR A/B/C/D sequence an earlier planning pass in this document used. That
+wording is superseded; boundaries between stages are now **pinned commit
+SHAs inside that one draft PR**, reviewed incrementally, not separate PRs:
 
 - **Historical PR #52**: frozen / superseded research record. Not mutated by
-  this checkpoint or this task.
-- **S0 / PR A** — redesign checkpoint documentation, frozen v6 oracle,
-  declarative witness corpus, migration expectation ledger, and hermetic
-  asset gates. Staged in two sub-steps on this branch:
-  - **S0.0** (done at `702d4286dcbc2d2042a4d665a911841c8b282bb3`): the
+  this checkpoint or any later stage.
+- **Draft PR #53, "Research: rebuild Family B #13 authority core"** (base
+  `main`, head `research/family-b-13-authority-core-redesign`) is the single
+  development PR for every stage below. It was opened at S0.0 and **stays
+  draft** while S0 through S7 are developed and reviewed on this branch; a
+  separate, later operator decision changes that.
+- **S0** — redesign checkpoint documentation, frozen v6 oracle, declarative
+  witness corpus, migration expectation ledger, and hermetic asset gates.
+  **Accepted stage boundary: `f40aa5c123abec8f8bfb00f6bb5d2701f20bcad5`.**
+  Staged in two sub-steps:
+  - **S0.0** (`702d4286dcbc2d2042a4d665a911841c8b282bb3`): the
     redesign/project-tree checkpoint — this document (§1–§8) and the Family-B
     S0 status entry in `docs/architecture/0.5-implementation-status.md`. The
     oracle, corpus, and ledger did not yet exist at S0.0.
-  - **S0.1**: the byte-frozen v6 oracle (`tests/oracles/family_b_13/v6/`),
-    the declarative sealed-capture witness corpus and migration expectation
-    ledger (`tests/fixtures/research/family_b_13/`), and the hermetic S0
+  - **S0.1** (`f40aa5c123abec8f8bfb00f6bb5d2701f20bcad5`): the byte-frozen v6
+    oracle (`tests/oracles/family_b_13/v6/`), the declarative sealed-capture
+    witness corpus and migration expectation ledger
+    (`tests/fixtures/research/family_b_13/`), and the hermetic S0
     asset-validation tests (`tests/test_blocker_b_family_b_13_s0_assets.py`).
     Also corrected the over-broad S0.0 G7 rule (§6.E) after S0.1 corpus
     materialization surfaced the contradiction it caused.
-
-  Draft PR A — **PR #53, "Research: rebuild Family B #13 authority core"**
-  (base `main`, head `research/family-b-13-authority-core-redesign`) — was
-  opened at S0.0 and stays **draft** while S0/S1/... are developed and
-  reviewed on this branch. After S0.1's commit, **S0's content is present on
-  Draft PR #53; PR #53 remains draft and not merged.** Neither S0.0 nor
-  S0.1 implies CI has run green for this content, or that PR #53 has been
-  marked ready for review — those are separate, later steps.
-- **S1 / PR B** (next, not started): pure primitive parsers, parser-vector
-  differential proof.
-- **S2–S6 / PR C**: dormant v7 authority core. No real experiment. No
-  production authority.
-- **S7 / PR D**: explicit authority cutover.
+- **S1** (current stage) — pure primitive parsers
+  (`scripts/research/family_b_13_primitives.py`), a declarative parser-vector
+  corpus (`tests/fixtures/research/family_b_13/parser_vectors.json`), and
+  their differential proof against the frozen v6 oracle
+  (`tests/test_blocker_b_family_b_13_s1_primitives.py`). S1 builds only
+  sealed-bytes-to-typed-primitive parsing; it does not implement, and must
+  not be read as implementing, any part of the v7 authority core (§5) —
+  **IMPLEMENTED / AWAITING INDEPENDENT REVIEW**, not accepted, until that
+  review actually occurs.
+- **S2–S6** (future, not started): dormant v7 authority core, each stage its
+  own independently SHA-gated/reviewed commit boundary on this same Draft
+  PR #53. No real experiment. No production authority.
+- **S7** (future, not started): explicit authority cutover, on this same
+  Draft PR #53.
 
 Only after S7, required independent review, and every gate above passes does
 a **separate operator decision** determine whether to authorize real
@@ -362,9 +373,9 @@ This checkpoint:
 ## 11. What remains unresolved after this checkpoint
 
 Unchanged from the frozen status in §4, plus the v7 authority-core work
-itself: Draft PR #53 remains draft and unmerged (§9); the actual
-pure-primitive parsers (S1), the dormant v7 authority core (S2–S6), and the
-explicit cutover review (S7) are none of them started by this checkpoint.
-B-S1 remains a plausible, precisely falsifiable Phase-S candidate, not a
-proven mechanism (Research #2B, §19). No experiment result exists to promote
-or demote that status.
+itself: Draft PR #53 remains draft and unmerged (§9). S1's pure primitive
+parsers are implemented and awaiting independent review, not accepted; the
+dormant v7 authority core (S2–S6) and the explicit cutover review (S7)
+remain not started. B-S1 remains a plausible, precisely falsifiable Phase-S
+candidate, not a proven mechanism (Research #2B, §19). No experiment result
+exists to promote or demote that status.
