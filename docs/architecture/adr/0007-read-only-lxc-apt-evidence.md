@@ -71,14 +71,14 @@ change persistent package, system, or APT configuration state. Scratch is
 deleted on completion and lives in a transient location, so an interrupted
 probe can never become durable package state.
 
-**Executable-path fail-closed rule.** APT configuration can redirect
-execution-bearing paths such as `Dir::Bin::Methods`. Normal Debian/Ubuntu APT
-acquire and GPG-verification executables are supported; unexpected or custom
-overrides of the execution-bearing `Dir::Bin` paths the scan depends on are
-**unsupported**. If the probe cannot establish that the effective execution
-path stays within the supported APT shape, package evidence is unavailable: an
-arbitrary guest-configured helper is never executed merely to obtain an update
-count, and custom APT transport plugins are a non-goal.
+**Guest-controlled execution fail-closed rule.** The probe may preserve guest repository
+semantics: sources/source parts, preferences/pinning, auth configuration, trusted keys,
+ordinary proxy URI configuration, and non-executable Acquire/network settings. It supports
+only a fixed, reviewed APT execution profile. Any guest-controlled configuration capable of
+launching an external command or selecting an unexpected executable/helper is **unsupported**
+unless that exact mechanism is explicitly in that profile, including, but not limited to,
+custom `Dir::Bin` paths, `Acquire::*::Proxy-Auto-Detect`, and custom `APT::Compressor::*::Binary`.
+Before APT runs, the probe must reject such out-of-profile behavior as unavailable without executing the configured helper; ordinary proxy URIs remain supported, while proxy auto-detection commands require explicit admission to the fixed profile.
 
 ## 5. Evidence consistency and resource binding
 
@@ -132,9 +132,9 @@ approval.
 
 ## 8. Implementation acceptance gate
 
-Later implementation/test gates, not further research: root-side execution of
-the fixed probe confirmed in a disposable Debian environment; Ubuntu 24.04
-compatibility tested before claiming that platform supported; tests proving
-hooks do not execute and persistent APT/dpkg state is unchanged, that
-concurrent package-manager or config changes discard evidence, and that
-arbitrary command text is unreachable through the channel.
+Later implementation/test gates, not further research: root-side execution of the fixed probe
+confirmed in a disposable Debian environment; Ubuntu 24.04 compatibility tested before
+claiming that platform supported; tests prove hooks do not execute, persistent APT/dpkg state
+is unchanged, concurrent package-manager or config changes discard evidence, and guest-configured
+external helpers (at minimum `Proxy-Auto-Detect`) are rejected or suppressed before APT runs;
+arbitrary command text remains unreachable through the channel.
