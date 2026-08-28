@@ -1,7 +1,7 @@
-"""WAVE R0-B Family 1 -- R0 source bootstrap / configuration model.
+"""R0 source bootstrap / configuration model.
 
-Covers §28 tests #5, #6, #7, #8 of
-docs/architecture/0.5-r0-read-only-runtime-activation.md, plus fail-closed
+Covers tests #5, #6, #7, #8 of
+ARCHITECTURE.md, plus fail-closed
 coverage for malformed/missing configuration and secrets.
 """
 
@@ -165,7 +165,7 @@ def test_load_from_disk_roundtrip(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #5 -- empty-DB initial source bootstrap
+# test #5 -- empty-DB initial source bootstrap
 # ---------------------------------------------------------------------------
 
 
@@ -194,7 +194,7 @@ def test_5_empty_db_bootstraps_exactly_one_source(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #6 -- restart with matching exact source context (no-op path)
+# test #6 -- restart with matching exact source context (no-op path)
 # ---------------------------------------------------------------------------
 
 
@@ -218,7 +218,7 @@ def test_6_restart_with_matching_context_is_a_no_op(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #7 -- restart with endpoint config drift fails closed
+# test #7 -- restart with endpoint config drift fails closed
 # ---------------------------------------------------------------------------
 
 
@@ -274,7 +274,7 @@ def test_7_second_durable_source_is_out_of_scope_and_fails_closed(tmp_path: Path
 
 
 # ---------------------------------------------------------------------------
-# §28 test #8 -- credential-version drift behavior
+# test #8 -- credential-version drift behavior
 # ---------------------------------------------------------------------------
 
 

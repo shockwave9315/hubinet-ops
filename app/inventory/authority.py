@@ -32,7 +32,7 @@ from .store import InventoryAuthorityStore
 
 
 class InventoryAuthority:
-    """Expose explicit dormant Phase 1 source and reconciliation transitions."""
+    """The typed mutation boundary for every durable authority state change."""
 
     def __init__(
         self,
@@ -616,7 +616,7 @@ class InventoryAuthority:
             )
 
     def source_is_fresh_for_future_mutation(self, inventory_source_id: str) -> bool:
-        """Read-only Phase 1C precondition guard; grants no mutation authority."""
+        """Read-only precondition guard; grants no mutation authority."""
 
         source_id = _require_uuid(inventory_source_id, "inventory_source_id")
         with self._store._transaction() as connection:

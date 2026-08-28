@@ -414,7 +414,7 @@ INVALID_UUID_TEXT = (
 
 
 def construct_published_uuid_field(field_name: str, value: str) -> object:
-    """Construct one Phase 0 record with a selected UUID field value."""
+    """Construct one contract record with a selected UUID field value."""
 
     if field_name == "backend_instance_id":
         return BackendInformation(value, "Backend", "0.5.0", "0.5-draft")

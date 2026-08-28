@@ -1,4 +1,4 @@
-"""Read-only API surface and compatibility facade for Hubinet Ops Phase 0."""
+"""Read-only API surface and compatibility facade for Hubinet Ops."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ class _UnconfiguredPhaseZeroTransport:
     @staticmethod
     def _error() -> HubinetOpsCannotConnect:
         return HubinetOpsCannotConnect(
-            "Hubinet Ops 0.5 backend transport is not configured in Phase 0"
+            "Hubinet Ops backend transport is not configured"
         )
 
     async def validate_connection(self) -> BackendInformation:
@@ -117,7 +117,7 @@ class _UnconfiguredPhaseZeroTransport:
 def phase_zero_api_factory(
     *, base_url: str, api_token: str, verify_tls: bool
 ) -> HubinetOpsApi:
-    """Create the fail-closed Phase 0 client without inventing HTTP endpoints."""
+    """Create the fail-closed client without inventing HTTP endpoints."""
 
     return HubinetOpsApi(
         base_url=base_url,

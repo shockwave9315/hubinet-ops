@@ -218,7 +218,7 @@ class ResourceLocatorBinding:
 
 @dataclass(frozen=True, slots=True)
 class ResourceTermination:
-    """Retained terminal/tombstone record (ADR 0001).
+    """Retained terminal/tombstone record.
 
     The terminal/tombstone owner for direct replacement
     (``reason='replaced'``). ``run_sequence`` is always the exact discovery

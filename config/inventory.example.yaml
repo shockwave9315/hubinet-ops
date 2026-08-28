@@ -4,7 +4,7 @@
 # workloads. There is no VMID list, LXC/QEMU list, node membership, or
 # per-resource field anywhere in this file: every node/LXC/QEMU is
 # discovered dynamically through the Proxmox API after bootstrap (see
-# docs/architecture/0.5-r0-read-only-runtime-activation.md, section 5).
+# ARCHITECTURE.md).
 # Adding or removing a guest in Proxmox requires zero changes here.
 #
 # Secrets (the PVE API token, the R0 API bearer token) are never written to

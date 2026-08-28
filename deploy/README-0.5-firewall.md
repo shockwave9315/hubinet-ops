@@ -2,7 +2,7 @@
 
 This document is the mandatory, non-optional network policy paired with
 `deploy/hubinet-ops-0.5.service`'s `0.0.0.0:8787` bind, per
-`docs/architecture/0.5-r0-read-only-runtime-activation.md` sections 10,
+`ARCHITECTURE.md` and
 25, and 26. The reachable bind is only safe together with this policy --
 do not start the service before applying it.
 
@@ -26,7 +26,7 @@ R0 needs network access only for:
 
 R0 needs no network access for SSH, `pct`/`qm`, hostd/forced-command, MQTT,
 or any direct guest connection -- it has no dependency on any of those at
-all (see `docs/architecture/0.5-r0-read-only-runtime-activation.md`
+all (see `ARCHITECTURE.md`
 section 2's import denylist and section 26).
 
 This policy must ALSO account for two things a naive "only the explicit

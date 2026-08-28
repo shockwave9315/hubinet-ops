@@ -1,4 +1,4 @@
-"""Canonical enumerations for the Phase 0 snapshot contract."""
+"""Canonical enumerations for the snapshot contract."""
 
 from enum import StrEnum
 

@@ -1,7 +1,7 @@
-"""WAVE R0-B Family 3 -- discovery runtime, scheduler, restart recovery.
+"""Discovery runtime, scheduler, restart recovery.
 
-Covers §28 tests #20, #21, #22, #23, #24, #25, #26, #41, #42 of
-docs/architecture/0.5-r0-read-only-runtime-activation.md. No real network
+Covers tests #20, #21, #22, #23, #24, #25, #26, #41, #42 of
+ARCHITECTURE.md. No real network
 access anywhere in this file: every PVE request is intercepted in-process
 by ``httpx.MockTransport``.
 """
@@ -129,7 +129,7 @@ def _bootstrap(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# §28 test #20 -- per-source single-flight
+# test #20 -- per-source single-flight
 # ---------------------------------------------------------------------------
 
 
@@ -164,7 +164,7 @@ def test_20_scheduler_run_once_never_overlaps_itself(tmp_path: Path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# §28 test #21 -- process crash after issuance, restart recovery
+# test #21 -- process crash after issuance, restart recovery
 # ---------------------------------------------------------------------------
 
 
@@ -189,7 +189,7 @@ def test_21_crash_after_issuance_is_recovered_on_restart(tmp_path: Path, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# §28 test #22 -- abandoned-run restart recovery: sequence non-reuse, no
+# test #22 -- abandoned-run restart recovery: sequence non-reuse, no
 # fabricated observation
 # ---------------------------------------------------------------------------
 
@@ -238,7 +238,7 @@ def test_22_abandoned_run_sequence_is_never_reused_and_nothing_is_fabricated(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #23 -- ordinary read-only discovery has no trust precondition
+# Ordinary read-only discovery has no trust precondition
 # ---------------------------------------------------------------------------
 
 
@@ -260,12 +260,13 @@ def test_23_discovery_needs_no_trust_or_enrollment_precondition(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #24/#25/#26 -- adversarial: no forbidden authority surface
+# Adversarial: no forbidden authority surface
 # ---------------------------------------------------------------------------
 
-# These are the removed security-proof and mutation-shaped operations. They
-# must not exist on the authority at all -- a structural guarantee, stronger
-# than "R0 happens not to call them".
+# The retired security-proof and mutation-shaped operations, named here only so
+# reintroducing one fails a test (AGENTS.md, "Threat model"). They must not
+# exist on the authority at all -- a structural guarantee, stronger than
+# "the scheduler happens not to call them".
 _FORBIDDEN_AUTHORITY_METHODS = (
     "enroll_source_attestation",
     "reattest_source",
@@ -319,7 +320,7 @@ def test_25_no_endpoint_activation_shaped_method_exists_on_the_authority() -> No
 
 
 # ---------------------------------------------------------------------------
-# §28 test #41 -- scheduler shutdown does not force-abandon an in-flight run
+# test #41 -- scheduler shutdown does not force-abandon an in-flight run
 # ---------------------------------------------------------------------------
 
 
@@ -354,7 +355,7 @@ def test_41_shutdown_does_not_force_abandon_an_in_flight_run(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #42 -- startup ordering: recovery -> config drift -> scheduling
+# test #42 -- startup ordering: recovery -> config drift -> scheduling
 # ---------------------------------------------------------------------------
 
 

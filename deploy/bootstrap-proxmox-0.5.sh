@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Hubinet Ops 0.5 R0 -- one-shot Proxmox bootstrap.
 #
 # Automates the manual procedure documented in
-# docs/operations/0.5-r0-operational-activation.md sections 1-4: creates a
+# deploy/README-bootstrap-proxmox-0.5.md: creates a
 # fresh unprivileged Debian 13 LXC, deploys the R0 read-only runtime into
 # it (deploy/install-0.5.0-fresh.sh, unmodified), provisions a
 # least-privilege PVE read-only identity (exactly Sys.Audit+VM.Audit,
@@ -29,7 +29,7 @@ set -Eeuo pipefail
 # near the bottom of this file. Everything before it is read-only
 # planning; everything after it may mutate.
 #
-# See docs/operations/0.5-r0-operational-activation.md for the full
+# See deploy/README-bootstrap-proxmox-0.5.md for the full
 # reference procedure this automates, including everything an operator
 # may still want to inspect/verify by hand.
 

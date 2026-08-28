@@ -1,9 +1,9 @@
-"""WAVE R0-B Family 7 -- runtime/adversarial coverage closure.
+"""Runtime/adversarial architecture regression coverage.
 
-Closure family: no new production behavior, only remaining §28 test-matrix
+Closure family: no new production behavior, only remaining test-matrix
 coverage (#34, #39) and adversarial regression checks proving R0-B cannot
 silently regress into legacy/mutation/static-inventory behavior.
-docs/architecture/0.5-r0-read-only-runtime-activation.md.
+ARCHITECTURE.md.
 """
 
 from __future__ import annotations
@@ -119,7 +119,7 @@ def _patch_transport(monkeypatch, handler) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #34 -- source unavailable retains inventory correctly, end-to-end
+# test #34 -- source unavailable retains inventory correctly, end-to-end
 # through the real transport against a simulated-down PVE fixture
 # ---------------------------------------------------------------------------
 
@@ -156,7 +156,7 @@ def test_34_source_unavailable_retains_prior_inventory_end_to_end(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #39 -- no real Proxmox/private network in CI
+# test #39 -- no real Proxmox/private network in CI
 # ---------------------------------------------------------------------------
 
 
@@ -272,7 +272,7 @@ def test_r0_ha_transport_never_references_pve_or_imports_app_inventory() -> None
     # "never connects directly to Proxmox" -- what must never appear is an
     # actual PVE-shaped dependency: the PVE auth header format, PVE's
     # default port, or any import from the backend-only app.inventory*
-    # subsystem (a different process/host boundary entirely, §21).
+    # subsystem (a different process/host boundary entirely).
     assert "PVEAPIToken" not in text
     assert "8006" not in text
     assert "app.inventory" not in text

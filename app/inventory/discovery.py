@@ -1,4 +1,4 @@
-"""Immutable normalized discovery values for the dormant Phase 1B backend."""
+"""Immutable normalized discovery values for the inventory backend."""
 
 from __future__ import annotations
 
@@ -129,13 +129,6 @@ class ProviderGuestLocatorSet:
         if len(locators) != len(guest_rows):
             raise ValueError("provider guest baseline contains a duplicate locator")
         return cls(locators, _PROVIDER_GUEST_LOCATOR_SET_TOKEN)
-
-
-class ContinuityEvidenceKind(StrEnum):
-    RESOURCE_TYPE_CHANGE = "resource_type_change"
-    CONTINUITY_ANCHOR_MISMATCH = "continuity_anchor_mismatch"
-    TRUSTED_EVENT_CHAIN = "trusted_event_chain"
-    OPERATOR_REPLACEMENT = "operator_replacement"
 
 
 def _freeze(value: Any) -> Any:

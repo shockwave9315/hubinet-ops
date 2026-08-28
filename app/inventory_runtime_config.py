@@ -1,13 +1,8 @@
 """R0 source bootstrap / configuration loader for the 0.5 read-only runtime.
 
-This module implements exactly the §5/§7/§8 contract of
-``docs/architecture/0.5-r0-read-only-runtime-activation.md`` (WAVE R0-B,
-Family 1). It is a small, R0-dedicated settings loader — deliberately
-**not** ``app.config.Settings`` (that type's shape is coupled to the legacy
-0.4 mutation runtime: ``executor``/``host_control``/``mqtt``/``resources``,
-none of which R0 needs or should parse; importing it would also risk
-pulling the legacy runtime dependency graph into the R0 composition root,
-which §2 of the design document forbids).
+See ``ARCHITECTURE.md``. This is a small, R0-dedicated settings loader —
+deliberately not a general application-settings type, so the composition
+root never pulls in configuration shapes it does not need.
 
 Configuration here describes a Proxmox **source**, never workloads: there
 is no configured list of VMIDs, LXC containers, QEMU VMs, or per-resource
@@ -21,13 +16,12 @@ Two functions matter to callers:
 - :func:`load_r0_runtime_config` parses the YAML config file plus the
   process environment (secrets never live in the YAML file) into an
   immutable :class:`R0RuntimeConfig`.
-- :func:`bootstrap_or_reconcile_source` performs steps 2-4 of §8's exact
+- :func:`bootstrap_or_reconcile_source` performs steps 2-4 of's exact
   startup decision sequence (empty-DB bootstrap, or restart comparison
   against the durable source with explicit controlled-transition/fail-
   closed handling). It deliberately does **not** perform startup discovery-
-  run recovery (§13) — that is Family 3's (``app/inventory_scheduler.py``)
-  responsibility and must run *before* this function is called, exactly as
-  §8 step 4 requires ("perform startup discovery-run recovery BEFORE any
+  run recovery — that is Family 3's (``app/inventory_scheduler.py``)
+  responsibility and must run *before* this function is called, exactly as step 4 requires ("perform startup discovery-run recovery BEFORE any
   configuration comparison").
 """
 
@@ -50,7 +44,7 @@ from app.inventory import (
 
 PROVIDER_KIND_PROXMOX_VE = "proxmox_ve"
 
-# Recommended minimum entropy for the R0 API bearer token (§20). Not
+# Recommended minimum entropy for the R0 API bearer token. Not
 # mechanically enforced beyond a floor on length: the credential is opaque
 # and operator-controlled either way, so this is guidance, not a security
 # boundary.
@@ -64,7 +58,7 @@ class R0ConfigError(ValueError):
 
 class R0ConfigDriftError(RuntimeError):
     """A durable source field differs from the configured value in a way
-    that is not an explicitly-permitted controlled transition (§6/§8).
+    that is not an explicitly-permitted controlled transition.
 
     The exact mismatched field is always named in the message so an
     operator can either revert their config change or perform the correct
@@ -74,8 +68,8 @@ class R0ConfigDriftError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class R0TlsConfig:
-    """PVE endpoint TLS trust configuration (§9). Distinct from, and never
-    conflated with, HA<->R0's own transport trust (§10)."""
+    """PVE endpoint TLS trust configuration. Distinct from, and never
+    conflated with, HA<->R0's own transport trust."""
 
     verify: bool = True
     ca_bundle_path: str | None = None
@@ -86,7 +80,7 @@ class R0SourceConfig:
     """Exactly the source-level fields ``create_inventory_source`` accepts.
 
     No VMID, LXC/QEMU list, node membership, or per-resource field exists
-    here by design (§5).
+    here by design.
     """
 
     display_name: str
@@ -103,7 +97,7 @@ class R0RuntimeConfig:
 
     Never serialize this object, log it, or persist ``pve_api_token``/
     ``api_bearer_token`` anywhere — they are process-memory-only secrets
-    read once from the environment at startup (§5/§20).
+    read once from the environment at startup.
     """
 
     source: R0SourceConfig
@@ -164,7 +158,7 @@ def parse_r0_runtime_config(
 
     Fails closed (raises :class:`R0ConfigError`) on any malformed, missing,
     or empty required field or secret. Never falls back to a default for a
-    security-relevant field (§5 requires an explicit operator freshness
+    security-relevant field (requires an explicit operator freshness
     value rather than silently relying on the authority's own default).
     """
 
@@ -208,7 +202,7 @@ def parse_r0_runtime_config(
         raise R0ConfigError("source.tls must be a mapping")
     tls_verify = _require_bool(tls_raw.get("verify"), "source.tls.verify", default=True)
     if not tls_verify:
-        # §9/§10: mandatory strict TLS verification, no operator-facing
+        #: mandatory strict TLS verification, no operator-facing
         # "skip verification" flag. The field is accepted (and must default
         # True) only so a future explicit CA-bundle-only shape has a stable
         # place to live; it must never be used to disable verification.
@@ -220,7 +214,7 @@ def parse_r0_runtime_config(
     if ca_bundle_path is not None:
         _require_text(ca_bundle_path, "source.tls.ca_bundle_path")
         # Fail closed at startup rather than at first discovery-run
-        # transport construction (§9/§12): a missing/unreadable CA bundle
+        # transport construction: a missing/unreadable CA bundle
         # must never be discovered only after a durable run has already
         # been issued. This does not eliminate the runtime race (the file
         # can still disappear between startup and a later cycle) -- that
@@ -294,19 +288,19 @@ def bootstrap_or_reconcile_source(
     store: InventoryAuthorityStore,
     config: R0RuntimeConfig,
 ) -> InventorySourceState:
-    """Perform §8 steps 2-4 (excluding startup recovery, owned by Family 3).
+    """Perform steps 2-4 (excluding startup recovery, owned by Family 3).
 
     - zero durable sources: create exactly one, per the configured values;
     - exactly one durable source: compare field-by-field and either proceed
       unchanged, apply an explicitly-permitted controlled transition
       (credential rotation, freshness-duration change), or fail closed with
-      :class:`R0ConfigDriftError` naming the exact mismatched field (§6);
+      :class:`R0ConfigDriftError` naming the exact mismatched field;
     - more than one durable source: out of scope for this R0-B package
-      (§5's single-source decision) — fails closed rather than guessing
+      ('s single-source decision) — fails closed rather than guessing
       which source the configuration describes.
 
     Callers must ensure any active discovery-run ownership for the source
-    has already been cleared (Family 3's startup recovery, §13) before
+    has already been cleared (Family 3's startup recovery) before
     calling this function — the underlying ``rotate_credential_reference``/
     ``configure_freshness_duration`` authority methods themselves refuse to
     proceed while a run is active (``AuthorityConflict``), so this ordering
@@ -325,7 +319,7 @@ def bootstrap_or_reconcile_source(
     if len(states) > 1:
         raise R0ConfigDriftError(
             "multi-source authority database is out of scope for this R0-B "
-            "package (§5 single-source decision); refusing to guess which "
+            "package (single-source decision); refusing to guess which "
             "source the configuration describes"
         )
 
@@ -338,7 +332,7 @@ def bootstrap_or_reconcile_source(
         raise R0ConfigDriftError(
             "configured source.pve_endpoint does not match the durable active "
             "endpoint's canonical_transport_locator; bootstrap is not "
-            "endpoint failover (§6) -- revert the config change or perform "
+            "endpoint failover -- revert the config change or perform "
             "the correct explicit operator procedure"
         )
     if config.source.provider_kind != source.provider_kind:
@@ -348,7 +342,7 @@ def bootstrap_or_reconcile_source(
     if config.source.display_name != source.display_name:
         raise R0ConfigDriftError(
             "configured source.display_name does not match the durable source; "
-            "rename is not an automatic config-drift transition (§6)"
+            "rename is not an automatic config-drift transition"
         )
 
     changed = False

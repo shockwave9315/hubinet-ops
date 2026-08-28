@@ -1,8 +1,8 @@
-"""WAVE R0-B Family 6 -- fresh 0.5 production deployment/service.
+"""Fresh production deployment/service.
 
-Covers §28 tests #40 (deployment-smoke portion) and #43 (listen-address/
+Covers tests #40 (deployment-smoke portion) and #43 (listen-address/
 firewall-pairing documentation check) of
-docs/architecture/0.5-r0-read-only-runtime-activation.md.
+ARCHITECTURE.md.
 
 Per AGENTS.md's hermetic test-boundary rules, a production deployment
 script may only ever be *executed* inside the repository's CI-only Docker
@@ -43,7 +43,7 @@ def test_install_script_syntax_is_valid() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #40 (deployment-smoke portion) -- never touches an unrelated DB /
+# test #40 (deployment-smoke portion) -- never touches an unrelated DB /
 # legacy path
 # ---------------------------------------------------------------------------
 
@@ -54,7 +54,7 @@ def test_40_install_script_never_copies_the_legacy_04_service_source() -> None:
     # The legacy repo-relative unit source file must never be referenced
     # as something this installer copies/installs (the *destination*
     # path on the target host, /etc/systemd/system/hubinet-ops.service,
-    # is intentionally shared -- see the module docstring / §3).
+    # is intentionally shared -- see the module docstring /).
     assert f"{'${SOURCE_DIR}'}/deploy/hubinet-ops.service" not in text
     assert "install -m 0644 \"${SOURCE_DIR}/deploy/hubinet-ops-0.5.service\"" in text
 
@@ -93,7 +93,7 @@ def test_40_install_script_uses_the_r0_config_and_env_paths() -> None:
 
 
 # The legacy 0.4 installer (`deploy/install-agent.sh`) and service unit
-# (`deploy/hubinet-ops.service`) that WAVE R0-B confirmed it never edited
+# (`deploy/hubinet-ops.service`) that the current runtime never edited
 # have since been retired from the current 0.5-only tree by the repository
 # cleanup; the invariant "R0-B's fresh installer never touches the legacy
 # 0.4 installer/service source" is now vacuously true (neither file exists)
@@ -104,7 +104,7 @@ def test_40_install_script_uses_the_r0_config_and_env_paths() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #43 -- listen-address / firewall-pairing documentation check
+# test #43 -- listen-address / firewall-pairing documentation check
 # ---------------------------------------------------------------------------
 
 
@@ -114,7 +114,7 @@ def test_43_service_binds_all_interfaces_on_the_documented_port() -> None:
     assert "--port 8787" in text
     assert "app.inventory_runtime:create_app_from_env" in text
     assert "--factory" in text
-    # Never revert to a loopback-only default (§10/§25).
+    # Never revert to a loopback-only default.
     assert "127.0.0.1" not in text
     assert "localhost" not in text
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Clean-install-only installer for the Hubinet Ops 0.5 R0 read-only
-# runtime, per docs/architecture/0.5-r0-read-only-runtime-activation.md
+# runtime; see ARCHITECTURE.md
 # section 3/25/26. Intended for a freshly rebuilt host (e.g. a rebuilt
 # CT110) that has never run the 0.4 production service.
 #
@@ -30,7 +30,7 @@ LEGACY_UNIT_PATH="/etc/systemd/system/hubinet-ops.service"
 if [[ -e "${LEGACY_UNIT_PATH}" ]]; then
   echo "Refusing to install: ${LEGACY_UNIT_PATH} already exists." >&2
   echo "This installer targets a clean rebuilt host with no prior 0.4" >&2
-  echo "Hubinet Ops installation -- see docs/architecture/0.5-r0-read-only-runtime-activation.md section 3." >&2
+  echo "Hubinet Ops installation -- see deploy/README-bootstrap-proxmox-0.5.md." >&2
   exit 1
 fi
 
@@ -46,7 +46,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv ca-certif
 
 id hubinetops >/dev/null 2>&1 || useradd --system --home /opt/hubinet-ops --shell /usr/sbin/nologin hubinetops
 install -d -o hubinetops -g hubinetops /opt/hubinet-ops
-# The authority directory holds the R0 SQLite database; §4 requires an
+# The authority directory holds the R0 SQLite database; requires an
 # explicit restrictive mode rather than relying on the process umask or
 # a distribution default.
 install -d -m 0750 -o hubinetops -g hubinetops /var/lib/hubinet-ops

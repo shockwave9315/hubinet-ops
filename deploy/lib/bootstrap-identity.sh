@@ -2,7 +2,7 @@
 # Phase 6 -- dedicated read-only PVE identity (user/role/token).
 # Phase 7 -- PVE TLS trust material.
 #
-# Exact shape mirrors docs/operations/0.5-r0-operational-activation.md
+# Exact shape mirrors deploy/README-bootstrap-proxmox-0.5.md
 # section 2, automated: user hubinetops@pve, role HubinetOpsR0Auditor with
 # privileges exactly Sys.Audit,VM.Audit, token r0-readonly with privsep=1,
 # ACL granted to BOTH the user and the token at path / with propagate 1.
@@ -227,7 +227,7 @@ _assert_pve_object_absent() {
 # precheck against Proxmox VE 9.2.3 disproved that -- the real command
 # returns a path-keyed object instead ({"/": {"Sys.Audit": 1, ...}}, an
 # empty grant observed literally as `{"/":{}}`). See
-# docs/architecture/0.5-implementation-status.md's real-PVE precheck
+# The real-PVE precheck
 # notes for the exact observed command/output. Privilege names are now
 # read only from the object at the exact requested path "/" via
 # _json_truthy_keys_sorted_at_path (bootstrap-common.sh) -- never
@@ -260,7 +260,7 @@ _verify_effective_permissions() {
   actual_keys="$(_json_truthy_keys_sorted_at_path "${perms_file}" "/")" && parse_status=0 || parse_status=$?
   rm -f "${perms_file}"
   (( parse_status == 0 )) \
-    || die "could not verify effective permissions for ${PVE_FULL_TOKEN_ID}: 'pveum user token permissions --path /' did not produce the expected path-keyed JSON shape {\"/\": {<privilege>: 1, ...}} (confirmed against a real PVE 9.2.3 host -- see docs/architecture/0.5-implementation-status.md's real-PVE precheck notes) -- refusing to continue with an unverifiable privilege set"
+    || die "could not verify effective permissions for ${PVE_FULL_TOKEN_ID}: 'pveum user token permissions --path /' did not produce the expected path-keyed JSON shape {\"/\": {<privilege>: 1, ...}} (confirmed against a real PVE 9.2.3 host) -- refusing to continue with an unverifiable privilege set"
 
   local expected_keys
   expected_keys="$(printf '%s\n' "${PVE_REQUIRED_PRIVS//,/$'\n'}" | LC_ALL=C sort)"

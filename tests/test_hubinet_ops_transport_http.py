@@ -1,14 +1,14 @@
-"""WAVE R0-B Family 5 -- native Home Assistant HTTP transport.
+"""Native Home Assistant HTTP transport.
 
-Covers §28 tests #29 (HA-side half), #31, #32, #33 (transport
+Covers tests #29 (HA-side half), #31, #32, #33 (transport
 contribution), #36, #37, #38 of
-docs/architecture/0.5-r0-read-only-runtime-activation.md.
+ARCHITECTURE.md.
 
 Like every other ``test_hubinet_ops_*.py`` file in this repository, this
 suite requires the pinned Home Assistant test environment
 (``requirements-ha-test.txt``, Linux CI / devcontainer / WSL) and is
 skipped at collection time wherever ``homeassistant`` is not installed
-(including native Windows -- see CLAUDE.md's documented, accepted
+(including native Windows -- see STATUS.md's documented, accepted
 ``fcntl`` import limitation). No real network access anywhere in this
 file: every backend request is intercepted by the ``aioclient_mock``
 fixture.
@@ -195,7 +195,7 @@ def _fixture_snapshot(*resources) -> HubinetOpsSnapshot:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #29 (HA-side half) -- publication -> HTTP -> HA round trip
+# test #29 (HA-side half) -- publication -> HTTP -> HA round trip
 # ---------------------------------------------------------------------------
 
 
@@ -236,7 +236,7 @@ async def test_29_authorization_header_sent_on_every_request(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #31 -- wrong backend on reauth rejected, via the real transport
+# test #31 -- wrong backend on reauth rejected, via the real transport
 # ---------------------------------------------------------------------------
 
 
@@ -271,7 +271,7 @@ async def test_31_reauth_rejects_wrong_backend_via_real_http_transport(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #32 (transport contribution) -- exception mapping
+# test #32 (transport contribution) -- exception mapping
 # ---------------------------------------------------------------------------
 
 
@@ -373,7 +373,7 @@ async def test_32_correct_token_and_200_succeeds(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #33 (transport contribution) -- diagnostics redact both HA and
+# test #33 (transport contribution) -- diagnostics redact both HA and
 # PVE secrets even after round-tripping through the real transport
 # ---------------------------------------------------------------------------
 
@@ -409,7 +409,7 @@ async def test_33_diagnostics_redact_secrets_reaching_it_via_real_transport(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #36 -- dynamic new resource appears without reload
+# test #36 -- dynamic new resource appears without reload
 # ---------------------------------------------------------------------------
 
 
@@ -447,7 +447,7 @@ async def test_36_new_resource_appears_via_real_transport_without_reload(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #37 -- resource replacement preserves accepted HA identity
+# test #37 -- resource replacement preserves accepted HA identity
 # semantics, via the real transport
 # ---------------------------------------------------------------------------
 
@@ -501,7 +501,7 @@ async def test_37_replacement_preserves_old_and_successor_via_real_transport(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #38 -- terminal retained resource presentation, via the real
+# test #38 -- terminal retained resource presentation, via the real
 # transport
 # ---------------------------------------------------------------------------
 

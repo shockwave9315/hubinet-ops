@@ -1,8 +1,6 @@
 """R0 composition root: the final, sole production 0.5 read-only runtime.
 
-Implements exactly §2 and §§17-20 of
-``docs/architecture/0.5-r0-read-only-runtime-activation.md`` (WAVE R0-B,
-Family 4).
+See ``ARCHITECTURE.md``.
 
 This module is the only production entrypoint for Hubinet Ops 0.5's R0
 read-only runtime. It constructs exactly:
@@ -13,7 +11,7 @@ read-only runtime. It constructs exactly:
 - ``app.inventory.publication.InventoryPublication``;
 - the R0 discovery scheduler (``app.inventory_scheduler.R0Scheduler``, via
   ``bootstrap_and_start_r0_runtime`` -- recovery, then config-drift
-  reconciliation, then scheduling, in that exact order, §42);
+  reconciliation, then scheduling, in that exact order);
 - the read-only HTTP route table below.
 
 Import denylist (never import, directly or transitively, from this
@@ -86,7 +84,7 @@ def create_read_only_app(
     if not config.api_bearer_token or not config.api_bearer_token.strip():
         # Family 1 already guarantees this via R0ConfigError; this is a
         # defensive, redundant fail-closed check at the actual point the
-        # token becomes security-relevant (§20: "reject empty/missing
+        # token becomes security-relevant ("reject empty/missing
         # configured API token at startup").
         raise RuntimeError("R0 API bearer token must not be empty")
 
@@ -126,7 +124,7 @@ def create_read_only_app(
     expected_authorization = f"Bearer {config.api_bearer_token}"
 
     def _require_bearer_token(request: Request) -> None:
-        # Constant-time comparison (§20); the Authorization header value
+        # Constant-time comparison; the Authorization header value
         # itself is never logged anywhere in this module.
         provided = request.headers.get("authorization", "")
         if not hmac.compare_digest(provided, expected_authorization):
@@ -134,7 +132,7 @@ def create_read_only_app(
 
     @app.get(f"{API_PREFIX}/health")
     def health() -> JSONResponse:
-        """Unauthenticated minimal liveness probe (§19).
+        """Unauthenticated minimal liveness probe.
 
         Proves the process is alive and the authority DB is reachable.
         Must never leak inventory contents, credentials, or any other
@@ -152,18 +150,18 @@ def create_read_only_app(
     @app.get(f"{API_PREFIX}/backend", dependencies=[Depends(_require_bearer_token)])
     def backend() -> dict[str, Any]:
         """Backend identity (the shared shape for both HA transport methods
-        ``validate_connection`` and ``fetch_backend_information``, §19)."""
+        ``validate_connection`` and ``fetch_backend_information``)."""
 
         view = publication.read()
         return _thaw(view.backend)
 
     @app.get(f"{API_PREFIX}/snapshot", dependencies=[Depends(_require_bearer_token)])
     def snapshot() -> dict[str, Any]:
-        """The full published read-only inventory snapshot (§17/§19).
+        """The full published read-only inventory snapshot.
 
         Pure type conversion of ``InventoryPublication.read()``'s already-
         assembled, already-consistent view -- no new reconciliation,
-        aggregation, or business logic belongs here. Note (§18): this GET
+        aggregation, or business logic belongs here. Note: this GET
         may itself cause a backend-owned local freshness transition
         (fresh -> stale on an elapsed deadline) as a side effect of
         ``InventoryPublication.read()`` -- entirely by design, not a bug.
@@ -184,7 +182,7 @@ def create_read_only_app(
 
 
 def create_app_from_env() -> FastAPI:
-    """Zero-argument production factory for ``uvicorn --factory`` (§25).
+    """Zero-argument production factory for ``uvicorn --factory``.
 
     ``ExecStart=... uvicorn app.inventory_runtime:create_app_from_env
     --factory --host 0.0.0.0 --port 8787`` -- deliberately a separate
