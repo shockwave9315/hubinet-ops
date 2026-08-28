@@ -149,12 +149,21 @@ Blocker B:                    OPEN
 security_continuity=trusted:  GRANTED NOWHERE
 ```
 
-Nothing in this document changes any of those. Read-only discovery, current
-Home Assistant visibility, read-only package scanning, and package-detail
-presentation are not gated on Blocker B in the first place — they are read-only
-and belong to the existing accepted discovery model. **Update execution,
-snapshots, jobs, health checking as a job step, and rollback are all Phase 1C
-and remain BLOCKED. None of them is authorized to begin.**
+Nothing in this document changes any of those.
+
+Read-only discovery and current Home Assistant visibility are implemented and
+are not gated on Blocker B.
+
+Read-only package scanning and package-detail presentation are **also not gated
+on Blocker B** — but "not gated on Blocker B" is not the same as "already
+covered". They are **not** part of the existing accepted PVE inventory discovery
+contract, and the current R0 PVE transport has no guest-agent, SSH, or in-guest
+package evidence channel of any kind. Package scanning therefore still requires
+its own separately designed, reviewed, and accepted **read-only evidence and
+transport contract** before any implementation may begin.
+
+**Update execution, snapshots, jobs, health checking as a job step, and rollback
+are all Phase 1C and remain BLOCKED. None of them is authorized to begin.**
 
 ### OPERATOR TARGET
 

@@ -73,7 +73,8 @@ scanning, update plans, jobs, snapshots, and rollback are **not implemented**.
 ## 2. Authority hierarchy
 
 ```text
-explicit operator decisions
+explicit operator decisions       (see the note directly below — this is not a
+                                   licence to bypass an ACCEPTED ADR)
 > ACCEPTED ADRs / accepted architecture
 > AGENTS.md
 > docs/product-intent.md          (ACTIVE PRODUCT INTENT: binding for product
@@ -87,6 +88,14 @@ explicit operator decisions
 
 Rules that follow from this:
 
+- **What an operator decision does, and does not, do.** An operator decision sets
+  product direction, and authorizes a task or action **where the accepted
+  architecture already permits it**. It does **not** silently override an
+  ACCEPTED ADR invariant. When an operator wants behavior that conflicts with an
+  ACCEPTED ADR, the outcome is an explicit architecture-change / supersession
+  process (§7, and `.agents/skills/hubinet-architecture-change`) — not immediate
+  permission to ignore the ADR. An operator may of course explicitly *request*
+  that architecture change; that request starts the process, it does not skip it.
 - An ACCEPTED ADR beats the status document, the skills, the code, and any
   research. If implementation conflicts with an accepted ADR, **stop and report
   the conflict**; do not adapt the architecture to fit.
