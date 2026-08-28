@@ -61,3 +61,13 @@ jobs:
           python -c "import sys; assert sys.version_info >= (3, 14, 2)"
       - name: Test native Home Assistant integration
         run: python -m pytest -q --tb=short -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
+
+  bootstrap-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      HUBINET_OPS_EPHEMERAL_CI: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the whole bootstrap smoke matrix through the compliant sandbox
+        run: bash tests/shell/run_bootstrap_smoke_sandbox.sh
