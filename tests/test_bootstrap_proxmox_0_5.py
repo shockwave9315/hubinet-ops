@@ -293,14 +293,26 @@ def test_ci_workflow_path_filter_covers_every_bootstrap_production_dependency():
     )
 
 
-def test_ci_workflow_has_concurrency_cancellation():
+def test_ci_workflow_scopes_concurrency_cancellation_to_smoke_job():
     import yaml
 
     with CI_WORKFLOW.open(encoding="utf-8") as fh:
         doc = yaml.safe_load(fh)
-    concurrency = doc.get("concurrency")
-    assert concurrency is not None, "workflow should cancel superseded runs to avoid burning CI minutes"
-    assert concurrency.get("cancel-in-progress") is True
+
+    assert "concurrency" not in doc
+
+    jobs = doc["jobs"]
+    scope = jobs["scope"]
+    scope_concurrency = scope.get("concurrency", {})
+    assert scope_concurrency.get("cancel-in-progress") is not True
+
+    smoke = jobs["bootstrap-smoke"]
+    assert smoke["needs"] == "scope"
+    assert smoke["if"] == "needs.scope.outputs.run_smoke == 'true'"
+    assert smoke["concurrency"] == {
+        "group": "bootstrap-smoke-${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": True,
+    }
 
 
 def test_sandbox_runner_fails_closed_outside_ephemeral_ci():
