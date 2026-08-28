@@ -11,32 +11,42 @@ API consumed by the native Home Assistant integration. It has no policy, jobs, m
 endpoint activation/failover, or attestation enrollment automation, and no code path in
 this release can grant `security_continuity=trusted`. R0 has been merged into `main` and
 is implemented and constructible in this repository. It has since been installed and
-genuinely exercised in a real container (CT110) via three explicitly-authorized manual
-dogfood runs of the automated Proxmox bootstrap, all against the same physical PVE host
-(dogfood #1 stopped at Phase 10; dogfood #2 reached Phase 12, and a later read-only
-forensic replay proved the production provider and the exact Phase-12 acceptance path
-both succeed once an environmental PVE root CA issue was corrected). **Dogfood #3, run
-from commit `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2` (merged into `main` at the time),
-completed the full bootstrap through Phase 13**: backend
-`source_health=healthy`/`source_freshness=fresh`, `last_committed_run_sequence=1`,
-`node_count=1`, `resource_count=11`, firewall verification PASS, mutation authority
-confirmed NONE, and CT `onboot` enabled. This repository's own automated tests/CI remain
-fully hermetic throughout — none of the above was exercised by CI, only by a real,
-manual, explicitly-authorized operator run. Real-host **operational activation**
-has since taken place as its own separate, later step
-(`docs/operations/0.5-r0-operational-activation.md`): the first real Home
-Assistant enrollment and its observed R0 acceptance checks **PASSED** against
-the real R0 backend. The operator has since confirmed that the runbook's
-recommended >=24-hour observation window completed and that the
-single-node topology leaves the node-migration check N/A. A CT110 host
-reboot with normal service recovery was also observed. On 2026-08-23 the
-operator performed the scheduled re-check: disposable new-LXC discovery,
-rename/identity preservation, synthetic PVE API outage and recovery,
-forced freshness expiry and recovery, and an actual stranded-run
-SIGKILL/startup-fencing recovery all passed. The current R0 operational
-decision is **GO**. This closes only the read-only operational observation
-gate; Blocker B remains open and mutation authority remains none. See
-`docs/architecture/0.5-implementation-status.md` for the full chronology.
+genuinely exercised on a real Proxmox host through explicitly-authorized manual dogfood
+runs of the automated bootstrap, the first real Home Assistant enrollment passed its R0
+acceptance checks, the recommended observation window completed, and the scheduled
+2026-08-23 operator re-check passed every remaining observation. **The current R0
+operational decision is GO**, strictly read-only, mutation authority NONE. This closes
+only the read-only operational observation gate; Blocker B remains open. This
+repository's own automated tests/CI remain fully hermetic throughout — none of the
+real-host work was exercised by CI. See
+`docs/architecture/0.5-implementation-status.md` for current status and
+`docs/archive/project-history/0.5-r0-activation-chronology.md` for the full historical
+chronology.
+
+## What it does today, and where it is going
+
+Implemented and running today, strictly read-only:
+
+- PVE autodiscovery — every node/LXC/QEMU resource is discovered dynamically;
+- dynamic backend inventory in the durable SQLite authority database;
+- dynamic Home Assistant representation of that inventory.
+
+The intended next step is a **safe, operator-driven update workflow**. Its hard rules,
+stated in full in [`docs/product-intent.md`](docs/product-intent.md):
+
+- package/update **scanning** may run automatically, but only **read-only**, and the
+  operator is shown the exact package detail (name, installed and candidate version,
+  origin, description, and further metadata where it can be established reliably);
+- **NO AUTO-UPDATE** — installing updates always requires explicit operator review and
+  approval of the current update plan, and a material change to that plan after approval
+  invalidates the approval;
+- each approved run creates a fresh, **job-owned** pre-update snapshot on the actual
+  current guest, and may roll back only to **its own** snapshot;
+- automatic snapshot cleanup touches only Hubinet-managed snapshots — operator snapshots
+  are never touched.
+
+None of that update surface is implemented yet, and none of it is authorized to begin;
+each piece needs its own accepted architecture first.
 
 ## Safety model
 
@@ -117,22 +127,20 @@ method — use HACS for real deployments.
   for system-trust fallback), git-commit-provenance-gated source deployment via
   the in-CT install above, source-centric config, and the mandatory firewall
   boundary (exact rule content/order verified), ending with CT boot enabled only
-  after a real discovery-acceptance check passes. Exercised three times against a
-  real Proxmox host (the same host all three times; dogfood #1 stopped at Phase 10,
-  dogfood #2 reached Phase 12 but was not itself a full bootstrap PASS, and
-  **dogfood #3, run from commit `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2`
-  (merged into `main` at the time), achieved a fresh, clean Phase 1-13 PASS
-  with no manual repair mid-run**). This proves the automated
-  bootstrap completes successfully on the real host; it did not by itself
-  establish operational activation. HA acceptance and the observation window
-  were completed separately, and the five remaining operational observations
-  subsequently passed during the 2026-08-23 re-check; the current decision is
-  GO. See
-  `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script proves, and what
-  it does not" section for the exact evidence boundary.
-- `docs/architecture/`: ADRs and implementation status (see `CLAUDE.md`/`AGENTS.md` for
-  the authority order). `docs/operations/`: the R0 operational activation runbook and the
-  Home Assistant clean-break/purge plan for a real deployed instance.
+  after a real discovery-acceptance check passes. Exercised against a real Proxmox
+  host through explicitly-authorized manual dogfood runs, the last of which achieved a
+  fresh, clean Phase 1-13 PASS with no manual repair mid-run. Home Assistant acceptance
+  and the observation window were completed separately; the current R0 operational
+  decision is GO. See `deploy/README-bootstrap-proxmox-0.5.md`'s "What this script
+  proves, and what it does not" section for the exact evidence boundary, and
+  `docs/archive/project-history/0.5-r0-activation-chronology.md` for the dogfood
+  chronology.
+- `docs/architecture/`: the documentation index (`README.md`), ADRs, and implementation
+  status (see `CLAUDE.md`/`AGENTS.md` for the authority order). `docs/operations/`: the
+  R0 operational activation runbook and the Home Assistant clean-break/purge plan for a
+  real deployed instance. `docs/product-intent.md`: the current product target.
+  `docs/archive/`: non-authoritative history (superseded research, postmortems, project
+  chronology).
 
 ## Local validation
 
@@ -148,6 +156,14 @@ python scripts/check_tracked_files.py
 
 Repository tests use a fake `ReadOnlyProviderTransport`, fake clocks, and temporary
 SQLite authority databases. They do not contact Proxmox or Home Assistant.
+
+## Documentation
+
+Start at [`docs/architecture/README.md`](docs/architecture/README.md) — the documentation
+index, authority hierarchy, default agent reading set, task-to-document matrix, and
+archive policy. [`docs/product-intent.md`](docs/product-intent.md) states the current
+product target. Anything under `docs/archive/` is non-authoritative history and is not a
+roadmap.
 
 See [`CLAUDE.md`](CLAUDE.md) and [`AGENTS.md`](AGENTS.md) for the full architecture
 authority order, [`docs/architecture/0.5-implementation-status.md`](docs/architecture/0.5-implementation-status.md)
