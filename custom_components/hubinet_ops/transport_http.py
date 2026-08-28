@@ -122,7 +122,15 @@ def _node_snapshot(payload: Mapping[str, Any]) -> NodeSnapshot:
     )
 
 
-def _package_scan_snapshot(payload: Mapping[str, Any]) -> PackageScanSnapshot:
+def _package_scan_snapshot(payload: Mapping[str, Any] | None) -> PackageScanSnapshot:
+    if payload is None:
+        # Backward compatibility: an older 0.5 backend predating package
+        # scanning publishes resources with no ``package_scan`` field at
+        # all. That is a missing field, not a malformed one -- synthesize
+        # the same NOT_SCANNED shape the current backend would publish for
+        # an unattempted scan. A field that is *present* but malformed
+        # still fails validation below; this fallback never widens that.
+        return PackageScanSnapshot()
     os_payload = payload.get("os")
     error_payload = payload.get("error")
     return PackageScanSnapshot(
@@ -191,7 +199,7 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
         # JSON has no frozenset type -- explicit conversion (mismatch 2).
         effective_capabilities=frozenset(payload.get("effective_capabilities") or ()),
         state=payload.get("state") or {},
-        package_scan=_package_scan_snapshot(payload["package_scan"]),
+        package_scan=_package_scan_snapshot(payload.get("package_scan")),
         termination_reason=payload.get("termination_reason"),
         successor_resource_id=payload.get("successor_resource_id"),
     )

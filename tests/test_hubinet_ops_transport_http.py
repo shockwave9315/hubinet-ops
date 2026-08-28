@@ -37,6 +37,9 @@ from custom_components.hubinet_ops.api import (
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     NodeSnapshot,
+    PackageScanError,
+    PackageScanSnapshot,
+    PackageScanStatus,
     PresenceState,
     ResourceSnapshot,
     ResourceType,
@@ -194,6 +197,39 @@ def _fixture_snapshot(*resources) -> HubinetOpsSnapshot:
     return snapshot(resources, sources=(source(),), nodes=(node(),))
 
 
+def _package_scan_json(scan: PackageScanSnapshot) -> dict[str, Any]:
+    return {
+        "status": scan.status.value,
+        "scan_run_id": scan.scan_run_id,
+        "started_at": scan.started_at,
+        "completed_at": scan.completed_at,
+        "os": (
+            {"id": scan.os.os_id, "version": scan.os.version}
+            if scan.os is not None
+            else None
+        ),
+        "pending_count": scan.pending_count,
+        "plan_fingerprint": scan.plan_fingerprint,
+        "reboot_required": scan.reboot_required,
+        "packages": [
+            {
+                "name": item.name,
+                "installed_version": item.installed_version,
+                "candidate_version": item.candidate_version,
+                "origin": item.origin,
+                "description": item.description,
+                "security": item.security,
+            }
+            for item in scan.packages
+        ],
+        "error": (
+            {"classification": scan.error.classification, "message": scan.error.message}
+            if scan.error is not None
+            else None
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # test #29 (HA-side half) -- publication -> HTTP -> HA round trip
 # ---------------------------------------------------------------------------
@@ -216,6 +252,95 @@ async def test_29_snapshot_round_trip_matches_typed_contract(
 
     assert result == expected
     assert isinstance(result.resources[0].effective_capabilities, frozenset)
+
+
+# ---------------------------------------------------------------------------
+# Corrective pass, Finding 3 -- an old 0.5 backend predating package scanning
+# publishes resources with no "package_scan" field at all. That must parse
+# as a backward-compatible NOT_SCANNED, never a KeyError that fails the
+# whole coordinator refresh. A field that IS present but malformed must
+# still be rejected exactly as before.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finding3_missing_package_scan_field_is_backward_compatible_not_scanned(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    expected = _fixture_snapshot(
+        resource(RESOURCE_CT, ResourceType.LXC, 101, "Cloudflared")
+    )
+    payload = _snapshot_json(expected)
+    assert "package_scan" not in payload["resources"][0]  # old-backend wire shape
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=payload)
+
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+    result = await transport.fetch_resource_snapshot()
+
+    scan = result.resources[0].package_scan
+    assert scan == PackageScanSnapshot()
+    assert scan.status is PackageScanStatus.NOT_SCANNED
+    assert scan.scan_run_id is None
+    assert scan.started_at is None
+    assert scan.completed_at is None
+    assert scan.os is None
+    assert scan.packages == ()
+    assert scan.pending_count is None
+    assert scan.plan_fingerprint is None
+    assert scan.reboot_required is None
+    assert scan.error is None
+    # The rest of the resource -- ordinary inventory data -- is unaffected.
+    assert result.resources[0].name == "Cloudflared"
+
+
+@pytest.mark.asyncio
+async def test_finding3_present_valid_package_scan_field_still_parses(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    scan = PackageScanSnapshot(
+        status=PackageScanStatus.FAILED,
+        scan_run_id="11111111-1111-1111-1111-111111111111",
+        started_at="2026-08-28T12:00:00+00:00",
+        completed_at="2026-08-28T12:05:00+00:00",
+        error=PackageScanError(
+            classification="metadata_refresh_failed",
+            message="APT metadata refresh failed",
+        ),
+    )
+    ct = resource(RESOURCE_CT, ResourceType.LXC, 101, "Cloudflared", package_scan=scan)
+    expected = _fixture_snapshot(ct)
+    payload = _snapshot_json(expected)
+    payload["resources"][0]["package_scan"] = _package_scan_json(scan)
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=payload)
+
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+    result = await transport.fetch_resource_snapshot()
+
+    assert result.resources[0].package_scan == scan
+
+
+@pytest.mark.asyncio
+async def test_finding3_present_but_malformed_package_scan_field_still_fails(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    ct = resource(RESOURCE_CT, ResourceType.LXC, 101, "Cloudflared")
+    expected = _fixture_snapshot(ct)
+    payload = _snapshot_json(expected)
+    # A status of "success" requires OS/fingerprint/exact package evidence;
+    # this field is present but incomplete, so it must still be rejected --
+    # the missing-field compatibility fallback must never widen to cover it.
+    payload["resources"][0]["package_scan"] = {"status": "success"}
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=payload)
+
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+    with pytest.raises(HubinetOpsInvalidResponse):
+        await transport.fetch_resource_snapshot()
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,7 @@ if [[ -e "${LEGACY_DB_PATH}" ]]; then
 fi
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv ca-certificates
+DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-venv ca-certificates openssh-client
 
 id hubinetops >/dev/null 2>&1 || useradd --system --home /opt/hubinet-ops --shell /usr/sbin/nologin hubinetops
 install -d -o hubinetops -g hubinetops /opt/hubinet-ops

@@ -354,7 +354,10 @@ def test_helper_success_uses_only_fixed_pvesh_and_pct_shapes() -> None:
     assert response["ok"] is True
     assert response["reboot_required"] is None
     assert all(call[0] in {"pvesh", "pct"} for call in runner.calls)
-    assert any(call[-3:] == ("apt-get", "update", "-qq") for call in runner.calls)
+    assert any(
+        call[-4:] == ("apt-get", "update", "-qq", "--error-on=any")
+        for call in runner.calls
+    )
     assert any(call[-3:] == ("apt-get", "-s", "upgrade") for call in runner.calls)
     assert not any("eval" in argument for call in runner.calls for argument in call)
 
@@ -390,6 +393,33 @@ def test_helper_classifies_ordinary_failures(runner, classification: str) -> Non
     assert response["error"]["classification"] == classification
     assert "stdout" not in response["error"]
     assert "stderr" not in response["error"]
+    if classification in {"metadata_refresh_failed", "package_manager_busy"}:
+        # Corrective pass, Finding 1: a partial/failing metadata refresh
+        # must never proceed to the upgrade simulation -- the resulting
+        # scan must be a failure, never a successful (and possibly stale)
+        # "0 updates" plan.
+        assert not any("upgrade" in " ".join(call) for call in runner.calls)
+
+
+def test_helper_metadata_refresh_uses_fail_on_any_error_and_never_simulates_on_failure() -> None:
+    # Corrective pass, Finding 1 witness: prove (1) the actual fixed argv
+    # sent to the guest carries APT's own fail-on-any-error option, and
+    # (2) a refresh APT reports as failed because of it never reaches the
+    # simulation stage, so the scan is a hard failure rather than a
+    # successful exact plan against stale/incomplete indexes.
+    runner = FakeHelperRunner(
+        update_returncode=100,
+        update_stderr="E: Some index files failed to download",
+    )
+    response = helper.handle_request(_request(), runner=runner)
+    update_calls = [
+        call for call in runner.calls if call[0] == "pct" and "update" in call and "apt-get" in call
+    ]
+    assert update_calls, "expected the fixed apt-get update argv to be issued"
+    assert update_calls[0][-4:] == ("apt-get", "update", "-qq", "--error-on=any")
+    assert not any("upgrade" in call for call in runner.calls)
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "metadata_refresh_failed"
 
 
 def test_helper_runs_local_node_lxc_directly_without_ssh() -> None:

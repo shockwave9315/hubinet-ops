@@ -353,6 +353,7 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
             (
                 "env", "LC_ALL=C",
                 "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-qq",
+                "--error-on=any",
             ),
         )
         _, update_stderr = _decode_output(update)

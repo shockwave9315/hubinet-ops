@@ -88,4 +88,8 @@ def test_host_helper_is_executable_and_not_a_generic_command_framework() -> None
     assert '"pvesh", "get", "/cluster/resources"' in text
     assert "apt-get\", \"update\", \"-qq" in text
     assert "apt-get\", \"-s\", \"upgrade" in text
+    # Corrective pass, Finding 1: APT's own fail-on-any-error option must be
+    # in the fixed metadata-refresh argv so a partial/stale index refresh
+    # is a hard failure rather than a silently-accepted stale cache.
+    assert "--error-on=any" in text
     assert "request.get(\"command\")" not in text
