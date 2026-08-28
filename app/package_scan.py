@@ -19,7 +19,8 @@ from app.inventory import (
 
 _INST_RE = re.compile(
     r"^Inst (?P<name>\S+) \[(?P<installed>[^\]\s]+)\] "
-    r"\((?P<candidate>\S+)(?: (?P<origin>.*))?\)$"
+    r"\((?P<candidate>\S+)(?: (?P<origin>.*?))?\)"
+    r"(?: \[[^\[\]\r\n]*\])*$"
 )
 _SUMMARY_RE = re.compile(
     r"^(?P<upgraded>\d+) upgraded, (?P<new>\d+) newly installed, "

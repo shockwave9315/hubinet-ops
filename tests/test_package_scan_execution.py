@@ -13,6 +13,7 @@ from app.inventory import (
     PackageScanFailure,
     PackageScanLifecycle,
     PackageScanRun,
+    package_plan_fingerprint,
 )
 from app.package_scan import (
     HostScanFailure,
@@ -104,10 +105,100 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
 
 
 @pytest.mark.parametrize(
+    (
+        "change",
+        "expected_name",
+        "expected_installed",
+        "expected_candidate",
+        "expected_origin",
+        "expected_security",
+    ),
+    (
+        (
+            "Inst foo [1.0] (1.1 Debian:stable [amd64])",
+            "foo",
+            "1.0",
+            "1.1",
+            "Debian:stable [amd64]",
+            None,
+        ),
+        (
+            "Inst foo [1.0] (1.1 Debian:stable [amd64]) []",
+            "foo",
+            "1.0",
+            "1.1",
+            "Debian:stable [amd64]",
+            None,
+        ),
+        (
+            "Inst liblastlog2-2 [2.41-5] "
+            "(2.41.5-0+deb13u1 Debian-Security:13/stable-security [amd64]) "
+            "[util-linux:amd64 on liblastlog2-2:amd64] [util-linux:amd64 ]",
+            "liblastlog2-2",
+            "2.41-5",
+            "2.41.5-0+deb13u1",
+            "Debian-Security:13/stable-security [amd64]",
+            True,
+        ),
+        (
+            "Inst foo [1.0] (1.1 Debian:stable [amd64]) "
+            "[util-linux:amd64 on foo:amd64]",
+            "foo",
+            "1.0",
+            "1.1",
+            "Debian:stable [amd64]",
+            None,
+        ),
+        (
+            "Inst bind9-host [1:9.20.23-1~deb13u1] "
+            "(1:9.20.26-1~deb13u1 Debian-Security:13/stable-security [amd64]) []",
+            "bind9-host",
+            "1:9.20.23-1~deb13u1",
+            "1:9.20.26-1~deb13u1",
+            "Debian-Security:13/stable-security [amd64]",
+            True,
+        ),
+    ),
+)
+def test_realistic_apt_shortbreaks_suffix_is_not_material_plan_data(
+    change: str,
+    expected_name: str,
+    expected_installed: str,
+    expected_candidate: str,
+    expected_origin: str,
+    expected_security: bool | None,
+) -> None:
+    parsed = parse_apt_simulation(
+        f"{change}\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    assert parsed[0].package_name == expected_name
+    assert parsed[0].installed_version == expected_installed
+    assert parsed[0].candidate_version == expected_candidate
+    assert parsed[0].origin == expected_origin
+    assert parsed[0].security is expected_security
+
+
+def test_shortbreaks_suffix_does_not_change_material_fingerprint() -> None:
+    plain = parse_apt_simulation(
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    shortbreaks = parse_apt_simulation(
+        "Inst foo [1.0] (1.1 Debian:stable [amd64]) "
+        "[util-linux:amd64 on foo:amd64] [util-linux:amd64 ]\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    assert plain == shortbreaks
+    assert package_plan_fingerprint(plain) == package_plan_fingerprint(shortbreaks)
+
+
+@pytest.mark.parametrize(
     "text",
     (
         "Inst apt (2.6.2 Debian:12/stable [amd64])\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
         "Inst apt [2.6.1] broken\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        "Inst foo [1.0] (1.1 Debian:stable [amd64]) [unclosed\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        "Inst foo [1.0] (1.1 Debian:stable [amd64]) stray\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
         "Inst apt [2.6.1] (2.6.2 Debian:12/stable [amd64])\n0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
         "Remv obsolete [1.0]\n0 upgraded, 0 newly installed, 1 to remove and 0 not upgraded.\n",
         "Reading package lists...\n",
@@ -161,6 +252,8 @@ class FakeHelperRunner:
         simulation_stderr: str = "",
         remote_returncode: int | None = None,
         remote_stderr: str = "",
+        remote_failure_command: str | None = None,
+        os_returncode: int = 0,
         timed_out_command: str | None = None,
     ) -> None:
         self.resource_type = resource_type
@@ -176,6 +269,8 @@ class FakeHelperRunner:
         self.simulation_stderr = simulation_stderr
         self.remote_returncode = remote_returncode
         self.remote_stderr = remote_stderr
+        self.remote_failure_command = remote_failure_command
+        self.os_returncode = os_returncode
         self.timed_out_command = timed_out_command
         self.calls: list[tuple[str, ...]] = []
         self._target_checks = 0
@@ -213,12 +308,19 @@ class FakeHelperRunner:
                 }
             ]
             return helper.CommandResult(0, json.dumps(rows).encode(), b"")
-        if self.remote_returncode is not None and argv[0] == "ssh":
+        if (
+            self.remote_returncode is not None
+            and argv[0] == "ssh"
+            and (
+                self.remote_failure_command is None
+                or self.remote_failure_command in rendered
+            )
+        ):
             return helper.CommandResult(
                 self.remote_returncode, b"", self.remote_stderr.encode()
             )
         if "/etc/os-release" in rendered:
-            return helper.CommandResult(0, self.os_release.encode(), b"")
+            return helper.CommandResult(self.os_returncode, self.os_release.encode(), b"")
         if "update" in rendered and "apt-get" in rendered:
             return helper.CommandResult(
                 self.update_returncode, b"", self.update_stderr.encode()
@@ -337,22 +439,28 @@ def test_helper_migration_between_validations_fails_closed_never_success() -> No
     assert sum(1 for call in runner.calls if call[0] == "ssh") == 1
 
 
-def test_helper_remote_node_transport_failure_is_reported_never_zero() -> None:
+@pytest.mark.parametrize(
+    "failed_command", ("/etc/os-release", "apt-get update -qq", "apt-get -s upgrade")
+)
+def test_helper_remote_node_transport_failure_is_execution_failed(
+    failed_command: str,
+) -> None:
     runner = FakeHelperRunner(
         node="pve-b",
         local_node="pve-a",
         remote_returncode=255,
         remote_stderr="ssh: connect to host pve-b port 22: Connection refused",
+        remote_failure_command=failed_command,
     )
     response = helper.handle_request(_request(expected_node="pve-b"), runner=runner)
     assert response["ok"] is False
-    assert response["error"]["classification"] != ""
-    assert response["error"]["classification"] in {
-        "unsupported_os",
-        "metadata_refresh_failed",
-        "package_manager_busy",
-        "simulation_failed",
-    }
+    assert response["error"]["classification"] == "execution_failed"
+
+
+def test_helper_failed_os_release_retrieval_is_not_unsupported_os() -> None:
+    response = helper.handle_request(_request(), runner=FakeHelperRunner(os_returncode=1))
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "guest_unavailable"
 
 
 def test_helper_rejects_expected_node_with_shell_metacharacters() -> None:

@@ -49,6 +49,11 @@ def test_rollback_filters_only_unique_hubinet_authorization_and_artifacts() -> N
     assert "index($0, marker) == 0" in host_control
     assert "HOST_CONTROL_AUTH_MARKER" in host_control
     assert 'rm -f "${helper_path}"' in host_control
+    assert 'cat "${filtered}" >"${authorized_keys_path}"' in host_control
+    assert 'mv "${filtered}" "${authorized_keys_path}"' not in host_control
+    assert '_host_control_secure_root_file "${authorized_keys_path}"' not in host_control
+    assert 'chown root:root "${authorized_keys_path}"' not in host_control
+    assert 'chmod 0600 "${authorized_keys_path}"' not in host_control
     assert 'rm -rf "${HOST_CONTROL_CT_DIR}"' in host_control
     assert "rm -rf /root/.ssh" not in host_control
     assert "rm -f /root/.ssh/authorized_keys" not in host_control

@@ -40,12 +40,14 @@ _host_control_install_file() {
   fi
 }
 
-_host_control_secure_root_file() {
+_host_control_validate_authorized_keys() {
   local path="$1"
-  if [[ -z "${HOST_CONTROL_HOST_ROOT}" ]]; then
-    chown root:root "${path}"
+  if [[ -L "${path}" && ! -e "${path}" ]]; then
+    die "${HOST_CONTROL_AUTHORIZED_KEYS} is a dangling symlink; refusing to modify it"
   fi
-  chmod 0600 "${path}"
+  if [[ -e "${path}" && ! -f "${path}" ]]; then
+    die "${HOST_CONTROL_AUTHORIZED_KEYS} exists but is not a usable regular file; refusing to modify it"
+  fi
 }
 
 phase2c_plan_host_control() {
@@ -66,9 +68,7 @@ phase2c_plan_host_control() {
     || die "PVE host has no supported SSH host public key to pin"
   local authorized_keys_path
   authorized_keys_path="$(_host_control_host_path "${HOST_CONTROL_AUTHORIZED_KEYS}")"
-  if [[ -e "${authorized_keys_path}" && ! -f "${authorized_keys_path}" ]]; then
-    die "${HOST_CONTROL_AUTHORIZED_KEYS} exists but is not a regular file; refusing to modify it"
-  fi
+  _host_control_validate_authorized_keys "${authorized_keys_path}"
 
   HOST_CONTROL_AUTH_MARKER="hubinet-ops-package-scan-vmid-${VMID}-${BOOTSTRAP_RUN_ID}"
   HOST_CONTROL_HELPER_PATH="/usr/local/libexec/hubinet-package-scan-helper-${BOOTSTRAP_RUN_ID}"
@@ -124,8 +124,7 @@ phase8c_provision_host_control() {
       || die "failed to create ${HOST_CONTROL_AUTHORIZED_KEYS}"
     ledger_record host-control-authorized-keys-file "${authorized_keys_path}"
   fi
-  _host_control_secure_root_file "${authorized_keys_path}" \
-    || die "failed to secure ${HOST_CONTROL_AUTHORIZED_KEYS} ownership/mode"
+  _host_control_validate_authorized_keys "${authorized_keys_path}"
   if grep -qF " ${HOST_CONTROL_AUTH_MARKER}" "${authorized_keys_path}"; then
     die "forced-command authorization marker already exists unexpectedly"
   fi
@@ -187,11 +186,15 @@ rollback_host_control() {
       filtered=""
     }
     if [[ -n "${filtered}" ]]; then
-      awk -v marker=" ${HOST_CONTROL_AUTH_MARKER}" 'index($0, marker) == 0 { print }' \
+      if awk -v marker=" ${HOST_CONTROL_AUTH_MARKER}" 'index($0, marker) == 0 { print }' \
         "${authorized_keys_path}" >"${filtered}" \
-        && _host_control_secure_root_file "${filtered}" \
-        && mv "${filtered}" "${authorized_keys_path}" \
-        || log_warn "could not remove the Hubinet-owned forced-command authorization"
+        && cat "${filtered}" >"${authorized_keys_path}"; then
+        rm -f "${filtered}" \
+          || log_warn "could not remove the temporary authorized_keys cleanup file"
+      else
+        log_warn "could not remove the Hubinet-owned forced-command authorization"
+        rm -f "${filtered}" >/dev/null 2>&1 || true
+      fi
     fi
   fi
   if ledger_has host-control-authorized-keys-file "${authorized_keys_path}" \

@@ -1791,6 +1791,40 @@ class TestPackageScanHostControlProvisioning:
         ruleset = fake_env_obj.ct_file_text("110", "/etc/nftables.conf")
         assert f"ip daddr {FAKE_PVE_ENDPOINT_HOST} tcp dport 22 accept" in ruleset
 
+    def test_success_appends_to_pve_authorized_keys_symlink_target(
+        self, tmp_path, source_checkout
+    ):
+        scenario = default_scenario()
+        fake_env_obj = build_fake_pve_environment(tmp_path, scenario)
+        host_root = Path(fake_env_obj.env["HUBINET_OPS_TEST_HOST_ROOT"])
+        ssh_dir = host_root / "root" / ".ssh"
+        pve_priv = host_root / "etc" / "pve" / "priv"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        pve_priv.mkdir(parents=True, exist_ok=True)
+        target = pve_priv / "authorized_keys"
+        unrelated = "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFB pve-operator\n"
+        target.write_text(unrelated, encoding="utf-8")
+        target.chmod(0o640)
+        original_target_inode = target.stat().st_ino
+        authorized = ssh_dir / "authorized_keys"
+        link_target = "../../etc/pve/priv/authorized_keys"
+        authorized.symlink_to(link_target)
+
+        result = _run(
+            fake_env_obj.env,
+            _base_args(source_checkout),
+            source_dir=source_checkout,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert authorized.is_symlink()
+        assert authorized.readlink() == Path(link_target)
+        contents = target.read_text(encoding="utf-8")
+        assert contents.startswith(unrelated)
+        assert contents.count("hubinet-ops-package-scan-vmid-110-") == 1
+        assert target.stat().st_ino == original_target_inode
+        assert target.stat().st_mode & 0o777 == 0o640
+
     def test_failure_removes_only_hubinet_owned_host_control_artifacts(
         self, tmp_path, source_checkout
     ):
@@ -1803,6 +1837,8 @@ class TestPackageScanHostControlProvisioning:
         authorized = ssh_dir / "authorized_keys"
         unrelated = "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFB unrelated-operator\n"
         authorized.write_text(unrelated, encoding="utf-8")
+        authorized.chmod(0o640)
+        original_inode = authorized.stat().st_ino
         result = _run(
             fake_env_obj.env,
             _base_args(source_checkout),
@@ -1810,11 +1846,68 @@ class TestPackageScanHostControlProvisioning:
         )
         assert result.returncode != 0
         assert authorized.read_text(encoding="utf-8") == unrelated
+        assert authorized.stat().st_ino == original_inode
+        assert authorized.stat().st_mode & 0o777 == 0o640
         helper_dir = host_root / "usr" / "local" / "libexec"
         assert not list(helper_dir.glob("hubinet-package-scan-helper-*"))
         assert not fake_env_obj.ct_file(
             "110", "/etc/hubinet-ops/host-control"
         ).exists()
+
+    def test_failure_removes_empty_hubinet_created_authorized_keys(
+        self, tmp_path, source_checkout
+    ):
+        scenario = default_scenario()
+        scenario["fail"] = ["nft_syntax"]
+        fake_env_obj = build_fake_pve_environment(tmp_path, scenario)
+        host_root = Path(fake_env_obj.env["HUBINET_OPS_TEST_HOST_ROOT"])
+        authorized = host_root / "root" / ".ssh" / "authorized_keys"
+
+        result = _run(
+            fake_env_obj.env,
+            _base_args(source_checkout),
+            source_dir=source_checkout,
+        )
+
+        assert result.returncode != 0
+        assert not authorized.exists()
+        assert not authorized.is_symlink()
+
+    def test_failure_preserves_pve_authorized_keys_symlink_and_target(
+        self, tmp_path, source_checkout
+    ):
+        scenario = default_scenario()
+        scenario["fail"] = ["nft_syntax"]
+        fake_env_obj = build_fake_pve_environment(tmp_path, scenario)
+        host_root = Path(fake_env_obj.env["HUBINET_OPS_TEST_HOST_ROOT"])
+        ssh_dir = host_root / "root" / ".ssh"
+        pve_priv = host_root / "etc" / "pve" / "priv"
+        ssh_dir.mkdir(parents=True, exist_ok=True)
+        pve_priv.mkdir(parents=True, exist_ok=True)
+        target = pve_priv / "authorized_keys"
+        unrelated = "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFB pve-operator\n"
+        target.write_text(unrelated, encoding="utf-8")
+        target.chmod(0o640)
+        original_target_inode = target.stat().st_ino
+        authorized = ssh_dir / "authorized_keys"
+        link_target = "../../etc/pve/priv/authorized_keys"
+        authorized.symlink_to(link_target)
+
+        result = _run(
+            fake_env_obj.env,
+            _base_args(source_checkout),
+            source_dir=source_checkout,
+        )
+
+        assert result.returncode != 0
+        assert authorized.is_symlink()
+        assert authorized.readlink() == Path(link_target)
+        assert target.read_text(encoding="utf-8") == unrelated
+        assert "hubinet-ops-package-scan-vmid-110-" not in target.read_text(
+            encoding="utf-8"
+        )
+        assert target.stat().st_ino == original_target_inode
+        assert target.stat().st_mode & 0o777 == 0o640
 
 
 # ---------------------------------------------------------------------------

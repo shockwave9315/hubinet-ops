@@ -237,16 +237,22 @@ def _run_guest_command(
 
     inner = ("pct", "exec", str(vmid), "--", *tail)
     if expected_node == local_node:
-        return _command(runner, inner, max_output=max_output)
-    argv = (
-        "ssh",
-        "-T",
-        "-o", "BatchMode=yes",
-        "-o", "StrictHostKeyChecking=yes",
-        f"root@{expected_node}",
-        shlex.join(inner),
-    )
-    return _command(runner, argv, max_output=max_output)
+        result = _command(runner, inner, max_output=max_output)
+    else:
+        argv = (
+            "ssh",
+            "-T",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            f"root@{expected_node}",
+            shlex.join(inner),
+        )
+        result = _command(runner, argv, max_output=max_output)
+    if result.returncode == 255:
+        raise ScanError(
+            "execution_failed", "could not execute package scan command in guest"
+        )
+    return result
 
 
 def _current_target(
@@ -338,7 +344,7 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         )
         os_release, _ = _decode_output(os_result)
         if os_result.returncode != 0:
-            raise ScanError("unsupported_os", "guest OS release metadata is unavailable")
+            raise ScanError("guest_unavailable", "guest OS release metadata is unavailable")
         os_id, os_version = _parse_os_release(os_release)
 
         _current_target(runner, vmid, expected_node)
