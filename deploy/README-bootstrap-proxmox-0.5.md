@@ -229,8 +229,8 @@ script from a real, trusted git checkout of this repository.
 
 - **Least privilege by construction, verified as an exact set**: the PVE
   role created is exactly `Sys.Audit,VM.Audit`, matching
-  `app.inventory.provider.ENDPOINT_ACL_MATRIX`'s actual requirement (see
-  the operational-activation runbook section 2.1). Verification asserts
+  `app.inventory.provider.ENDPOINT_ACL_MATRIX`'s actual requirement.
+  Verification asserts
   the token's actual effective privilege set equals that pair exactly —
   any missing required privilege OR any unexpected extra one (of any
   name) fails the run closed.

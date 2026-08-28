@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # Clean-install-only installer for the Hubinet Ops 0.5 R0 read-only
-# runtime; see ARCHITECTURE.md
-# section 3/25/26. Intended for a freshly rebuilt host (e.g. a rebuilt
+# runtime; see ARCHITECTURE.md. Intended for a freshly rebuilt host (e.g. a rebuilt
 # CT110) that has never run the 0.4 production service.
 #
 # This script does NOT:

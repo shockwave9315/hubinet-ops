@@ -1,9 +1,7 @@
 """Runtime/adversarial architecture regression coverage.
 
-Closure family: no new production behavior, only remaining test-matrix
-coverage (#34, #39) and adversarial regression checks proving R0-B cannot
-silently regress into legacy/mutation/static-inventory behavior.
-ARCHITECTURE.md.
+Adversarial regression checks proving the runtime cannot silently regress
+into legacy, mutation, or static-inventory behavior. See ARCHITECTURE.md.
 """
 
 from __future__ import annotations
@@ -193,7 +191,7 @@ def test_39_production_pve_transport_never_hardcodes_a_real_reachable_host() -> 
 
 
 # ---------------------------------------------------------------------------
-# Adversarial regression checks (mission section 10/12)
+# Adversarial regression checks
 # ---------------------------------------------------------------------------
 
 _FORBIDDEN_SYMBOLS_AS_IMPORTS = (

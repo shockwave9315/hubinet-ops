@@ -20,9 +20,9 @@ Two functions matter to callers:
   startup decision sequence (empty-DB bootstrap, or restart comparison
   against the durable source with explicit controlled-transition/fail-
   closed handling). It deliberately does **not** perform startup discovery-
-  run recovery — that is Family 3's (``app/inventory_scheduler.py``)
-  responsibility and must run *before* this function is called, exactly as step 4 requires ("perform startup discovery-run recovery BEFORE any
-  configuration comparison").
+  run recovery — that is ``app/inventory_scheduler.py``'s responsibility,
+  and it must run *before* this function is called: startup discovery-run
+  recovery always precedes any configuration comparison.
 """
 
 from __future__ import annotations
@@ -170,7 +170,7 @@ def parse_r0_runtime_config(
     if provider_kind != PROVIDER_KIND_PROXMOX_VE:
         raise R0ConfigError(
             "source.provider_kind must be exactly "
-            f"{PROVIDER_KIND_PROXMOX_VE!r} for R0-B's only supported provider"
+            f"{PROVIDER_KIND_PROXMOX_VE!r} -- the only supported provider"
         )
     transport_locator = _require_text(source_raw.get("pve_endpoint"), "source.pve_endpoint")
     # Fail closed immediately on a syntactically invalid/non-HTTPS locator
@@ -288,19 +288,22 @@ def bootstrap_or_reconcile_source(
     store: InventoryAuthorityStore,
     config: R0RuntimeConfig,
 ) -> InventorySourceState:
-    """Perform steps 2-4 (excluding startup recovery, owned by Family 3).
+    """Bootstrap or reconcile the single configured source.
+
+    Startup discovery-run recovery is excluded; ``app/inventory_scheduler.py``
+    owns it and must have run first.
 
     - zero durable sources: create exactly one, per the configured values;
     - exactly one durable source: compare field-by-field and either proceed
       unchanged, apply an explicitly-permitted controlled transition
       (credential rotation, freshness-duration change), or fail closed with
       :class:`R0ConfigDriftError` naming the exact mismatched field;
-    - more than one durable source: out of scope for this R0-B package
-      ('s single-source decision) — fails closed rather than guessing
-      which source the configuration describes.
+    - more than one durable source: out of scope for this single-source
+      runtime — fails closed rather than guessing which source the
+      configuration describes.
 
     Callers must ensure any active discovery-run ownership for the source
-    has already been cleared (Family 3's startup recovery) before
+    has already been cleared by the scheduler's startup recovery before
     calling this function — the underlying ``rotate_credential_reference``/
     ``configure_freshness_duration`` authority methods themselves refuse to
     proceed while a run is active (``AuthorityConflict``), so this ordering
@@ -318,9 +321,9 @@ def bootstrap_or_reconcile_source(
         )
     if len(states) > 1:
         raise R0ConfigDriftError(
-            "multi-source authority database is out of scope for this R0-B "
-            "package (single-source decision); refusing to guess which "
-            "source the configuration describes"
+            "multi-source authority database is out of scope for this "
+            "single-source runtime; refusing to guess which source the "
+            "configuration describes"
         )
 
     state = states[0]

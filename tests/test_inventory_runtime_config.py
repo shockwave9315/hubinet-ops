@@ -260,7 +260,7 @@ def test_7_second_durable_source_is_out_of_scope_and_fails_closed(tmp_path: Path
     config = parse_r0_runtime_config(_raw(), env=VALID_ENV)
     bootstrap_or_reconcile_source(authority, store, config)
     # Directly create a second source through the authority to simulate an
-    # out-of-band multi-source database; R0-B's single-source bootstrap must
+    # out-of-band multi-source database; the single-source bootstrap must
     # refuse to guess which source the configuration describes.
     authority.create_inventory_source(
         provider_kind=PROVIDER_KIND_PROXMOX_VE,

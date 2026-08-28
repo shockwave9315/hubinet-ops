@@ -82,10 +82,9 @@ def create_read_only_app(
     """
 
     if not config.api_bearer_token or not config.api_bearer_token.strip():
-        # Family 1 already guarantees this via R0ConfigError; this is a
-        # defensive, redundant fail-closed check at the actual point the
-        # token becomes security-relevant ("reject empty/missing
-        # configured API token at startup").
+        # The config loader already guarantees this via R0ConfigError;
+        # this is a defensive, redundant fail-closed check at the actual
+        # point the token becomes security-relevant.
         raise RuntimeError("R0 API bearer token must not be empty")
 
     store = InventoryAuthorityStore(config.authority_db_path)

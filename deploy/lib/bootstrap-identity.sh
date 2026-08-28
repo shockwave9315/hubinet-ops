@@ -2,12 +2,13 @@
 # Phase 6 -- dedicated read-only PVE identity (user/role/token).
 # Phase 7 -- PVE TLS trust material.
 #
-# Exact shape mirrors deploy/README-bootstrap-proxmox-0.5.md
-# section 2, automated: user hubinetops@pve, role HubinetOpsR0Auditor with
+# Exact shape mirrors deploy/README-bootstrap-proxmox-0.5.md, automated:
+# user hubinetops@pve, role HubinetOpsR0Auditor with
 # privileges exactly Sys.Audit,VM.Audit, token r0-readonly with privsep=1,
 # ACL granted to BOTH the user and the token at path / with propagate 1.
 #
-# Fresh-install semantics only (see docs/README section "Idempotency"):
+# Fresh-install semantics only (see deploy/README-bootstrap-proxmox-0.5.md,
+# "Retrying"):
 # any pre-existing user/role/token with these exact names is a conflict
 # and STOPs the run -- this bootstrap never silently adopts an existing
 # identity of unknown provenance.
@@ -150,8 +151,8 @@ phase6_pve_identity() {
   [[ -s "${PVE_TOKEN_SECRET_FILE}" ]] || die "PVE token secret was empty after creation -- refusing to continue"
 
   # privsep=1 means the token has NO effective permissions of its own
-  # until it receives its own ACL grant (runbook section 2.4 step 4) --
-  # skipping this step produces an authenticated-but-zero-privilege token.
+  # until it receives its own ACL grant -- skipping this step produces an
+  # authenticated-but-zero-privilege token.
   run_logged pveum acl modify / --tokens "${PVE_FULL_TOKEN_ID}" --roles "${PVE_ROLE}" --propagate 1 \
     || die "failed to grant role ${PVE_ROLE} to token ${PVE_FULL_TOKEN_ID} at /"
   ledger_record pve-acl-token "${PVE_FULL_TOKEN_ID}"

@@ -7,11 +7,10 @@ ARCHITECTURE.md.
 Per AGENTS.md's hermetic test-boundary rules, a production deployment
 script may only ever be *executed* inside the repository's CI-only Docker
 smoke sandbox on an ephemeral GitHub-hosted runner -- never here. This
-file therefore performs exactly the kind of check the mission's Family 6
-section explicitly sanctions for this reason: "Text checks are acceptable
-for deployment/document contracts where runtime execution would require
-host privileges." No command in this file is ever executed against a real
-host, real systemd, or a real firewall.
+file therefore uses text-level checks instead: they are the right tool for
+deployment/document contracts whose runtime execution would require host
+privileges. No command in this file is ever executed against a real host,
+real systemd, or a real firewall.
 """
 
 from __future__ import annotations
@@ -95,7 +94,7 @@ def test_40_install_script_uses_the_r0_config_and_env_paths() -> None:
 # The legacy 0.4 installer (`deploy/install-agent.sh`) and service unit
 # (`deploy/hubinet-ops.service`) that the current runtime never edited
 # have since been retired from the current 0.5-only tree by the repository
-# cleanup; the invariant "R0-B's fresh installer never touches the legacy
+# cleanup; the invariant "the fresh installer never touches the legacy
 # 0.4 installer/service source" is now vacuously true (neither file exists)
 # and is superseded by the positive checks above, which verify the current
 # 0.5 installer's own text/behavior without depending on the legacy files'

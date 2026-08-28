@@ -202,7 +202,7 @@ def test_2_only_get_head_options_routes_exist(tmp_path: Path) -> None:
 # The legacy 0.2.x-0.4.x runtime (app/main.py, app/service.py, app/database.py,
 # etc.) has been retired from the current tree as part of the 0.5-only
 # repository cleanup; its historical source remains available through Git
-# history/tags. The invariant this test protected -- "R0-B never edits the
+# history/tags. The invariant this test protected -- "the runtime never edits the
 # legacy composition root" -- is now vacuously true (the file no longer
 # exists) and is superseded by the AST-based forbidden-legacy-import guard
 # below (`test_r0_production_modules_import_no_forbidden_legacy_symbol` in

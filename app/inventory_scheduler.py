@@ -180,9 +180,9 @@ def _discovered_resources(
 ) -> tuple[DiscoveredResource, ...]:
     # Per-guest detail reads (the optional
     # "/nodes/{node}/{type}/{vmid}/config" endpoint) are not implemented by
-    # this R0-B package -- every discovered guest is recorded as detail_
-    # status=OK from the baseline read alone, matching the accepted MVP
-    # scope ('s ENDPOINT_ACL_MATRIX marks that endpoint
+    # this runtime -- every discovered guest is recorded as detail_
+    # status=OK from the baseline read alone, matching the current scope
+    # (ENDPOINT_ACL_MATRIX marks that endpoint
     # baseline_prerequisite=False).
     resources = []
     for row in result.guest_rows:
@@ -390,10 +390,10 @@ def perform_startup_recovery(
 ) -> tuple[str, ...]:
     """Clear any stale active-run ownership left by a prior crash.
 
-    Must run before any configuration-drift comparison (Family 1's
-    ``bootstrap_or_reconcile_source``) and before the first scheduled
-    discovery issuance (step 4 /). Returns the run ids abandoned,
-    for logging/test observability only.
+    Must run before any configuration-drift comparison
+    (``bootstrap_or_reconcile_source``) and before the first scheduled
+    discovery issuance. Returns the run ids abandoned, for logging/test
+    observability only.
 
     Uses only the existing, already-tested ``abandon_discovery_run``
     method -- no raw SQL, no invented recovery mechanism, no fabricated
@@ -423,10 +423,10 @@ def bootstrap_and_start_r0_runtime(
     start: bool = True,
     now: Callable[[], datetime] = _default_now,
 ) -> "R0Scheduler":
-    """Exact startup order, in one place: recovery, then config-
-    drift comparison, then scheduling. Family 4's composition root calls
-    only this function to wire startup together -- it does not reimplement
-    or reorder any of these three steps itself."""
+    """Exact startup order, in one place: recovery, then config-drift
+    comparison, then scheduling. ``app/inventory_runtime.py`` calls only
+    this function to wire startup together -- it does not reimplement or
+    reorder any of these three steps itself."""
 
     from app.inventory_runtime_config import bootstrap_or_reconcile_source
 
@@ -447,8 +447,8 @@ class R0Scheduler:
     """Single background thread driving's exact call chain on a timer.
 
     The smallest safe scheduler: no framework beyond the standard
-    library. Single-source in this R0-B package; a future multi-source
-    package would run one independent instance of this per source.
+    library. Single-source today; a future multi-source runtime would run
+    one independent instance of this per source.
     """
 
     def __init__(

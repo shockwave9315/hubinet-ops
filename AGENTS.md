@@ -87,12 +87,18 @@ PVE guest must never require a repository or config change.
 
 - Verify a clean worktree, fetch `origin`, and confirm the branch and its
   remote head before starting. Stop and ask if the worktree is dirty or history
-  has diverged. Never `rebase`, `reset --hard`, force-push, or auto-`stash`
-  unless explicitly asked.
-- Commit or push only when asked. Branch first if on `main`.
-- Being asked to do code work is not permission to change review state: do not
-  mark a PR ready/draft, resolve review threads, edit PR title/body, merge, or
-  open unrelated issues/PRs unless explicitly asked.
+  has diverged. If you are on `main`, create or switch to a feature branch
+  before implementing anything.
+- **Delivering assigned implementation work includes shipping it.** Once you
+  have been explicitly assigned work on a feature branch, finishing it means
+  making coherent commits, pushing them to that remote feature branch, and
+  using the stage's existing Draft PR. Do not leave completed assigned work
+  sitting only in the local worktree, and do not open a second PR when the
+  current stage already has one.
+- **Do not change review state or rewrite history unless explicitly told to:**
+  no merging, marking ready for review, closing/reopening PRs, resolving review
+  threads, editing PR title/body, `rebase`, `reset --hard`, force-push,
+  auto-`stash`, or opening unrelated issues/PRs.
 - Never commit tokens, passwords, webhook IDs, SSH keys, production addresses,
   runtime databases, or logs. `scripts/check_tracked_files.py` enforces this.
 

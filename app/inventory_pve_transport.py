@@ -43,8 +43,8 @@ _PVE_API_PREFIX = "/api2/json"
 class PveTransportError(ProviderContractError):
     """The production PVE transport failed at the HTTP boundary.
 
-    Carries a :class:`ProviderFailureKind` so callers (the R0 scheduler,
-    Family 3) can classify the failure using the exact existing
+    Carries a :class:`ProviderFailureKind` so ``app/inventory_scheduler.py``
+    can classify the failure using the exact existing
     ``classify_provider_failure`` mapping without re-deriving it from a
     plain exception message.
     """
@@ -176,8 +176,8 @@ class ProxmoxHttpTransport:
     Constructed fresh per discovery run from that run's own captured
     ``expected_canonical_transport_locator`` -- never a long-lived
     client pointed at a value that could go stale mid-run without the run
-    knowing. Callers (Family 3's scheduler) are expected to use this as a
-    context manager or call :meth:`close` once per run.
+    knowing. ``app/inventory_scheduler.py`` uses this as a context manager
+    or calls :meth:`close` once per run.
     """
 
     __slots__ = ("_client", "_max_response_bytes")
