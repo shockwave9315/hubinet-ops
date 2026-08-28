@@ -15,10 +15,9 @@ and ``abandon_discovery_run`` -- used both for startup crash/abandoned-run
 recovery (:func:`perform_startup_recovery`, §13) and as the uniform
 post-issuance safety net inside :func:`run_discovery_cycle` that fences a
 run on an unexpected or unclassifiable failure rather than leaving it
-stranded (§12). It never calls any attestation-shaped, candidate-
-activation-shaped, or confirmed-removal-shaped authority method -- there
-is no code path here that could, by construction, not merely by
-convention.
+stranded (§12). It never calls any mutation-shaped or
+endpoint-activation-shaped authority method -- there is no code path here
+that could, by construction, not merely by convention.
 """
 
 from __future__ import annotations
@@ -152,7 +151,6 @@ def _failure_snapshot(
         failed_detail_scopes=(),
         nodes=(),
         resources=(),
-        expected_source_attestation_epoch=run.expected_source_attestation_epoch,
         provider_node_scope=None,
         provider_guest_locators=None,
     )
@@ -248,7 +246,6 @@ def _normalize_result(
         failed_detail_scopes=(),
         nodes=nodes,
         resources=resources,
-        expected_source_attestation_epoch=run.expected_source_attestation_epoch,
     )
 
 
@@ -402,8 +399,7 @@ def perform_startup_recovery(
 
     Uses only the existing, already-tested ``abandon_discovery_run``
     method -- no raw SQL, no invented recovery mechanism, no fabricated
-    observation/completion/health, and no interaction with confirmed
-    removal or attestation of any kind.
+    observation/completion/health.
     """
 
     abandoned: list[str] = []
