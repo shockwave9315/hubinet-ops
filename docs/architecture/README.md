@@ -130,8 +130,9 @@ Rules that follow from this:
 
 ### ADR register
 
-Every ADR below is **ACCEPTED** and none is archived. Acceptance is authority; it is not
-a reading obligation.
+Every ADR below is **ACCEPTED** and none is archived, except ADR 0007, which is
+**PROPOSED** and is authority for nothing until it is accepted. Acceptance is authority; it
+is not a reading obligation.
 
 | ADR | Status | Authority | Who needs to read it |
 | --- | --- | --- | --- |
@@ -141,9 +142,10 @@ a reading obligation.
 | 0004 — confirmed removal / operator absence | **ACCEPTED** | normative | confirmed removal, authoritative absence proof |
 | 0005 — workload continuity enrollment | **ACCEPTED**, *scoped*: the negative stock-PVE trust boundary and R0 safety decision only. Does not close Blocker B, does not authorize WAVE B1, grants `trusted` nowhere | normative within that scope | continuity/trust questions; anyone proposing mutation authority |
 | 0006 — workload continuity, stronger proof | **ACCEPTED**, *scoped*: negative/unresolved research record plus normative requirements for any future positive mechanism. Selects no mechanism | normative within that scope | continuity-proof research; anyone proposing a Blocker-B mechanism |
+| 0007 — read-only LXC APT package evidence | **PROPOSED** — not accepted, authorizes no implementation | none while PROPOSED | anyone reviewing the proposed read-only package-evidence transport/contract |
 | future positive Blocker-B mechanism ADR | **NOT STARTED** — a different, later ADR | — | — |
 
-There is no PROPOSED or SUPERSEDED ADR in this repository.
+ADR 0007 is the only PROPOSED ADR; there is no SUPERSEDED ADR in this repository.
 
 ---
 
@@ -267,7 +269,7 @@ docs/
     0.5-inventory-model.md                 ACCEPTED inventory model
     0.5-implementation-status.md           current implementation map
     0.5-r0-read-only-runtime-activation.md live R0 design contract
-    adr/0001..0006                         ACCEPTED ADRs
+    adr/0001..0006                         ACCEPTED ADRs; 0007 PROPOSED — no authority
     research/
       adr0006-workload-continuity-evidence.md   non-normative, ADR-referenced
   operations/
