@@ -44,6 +44,8 @@ from fastapi.responses import JSONResponse
 from app.inventory import InventoryAuthority, InventoryAuthorityStore, InventoryPublication
 from app.inventory_runtime_config import R0RuntimeConfig, load_r0_runtime_config
 from app.inventory_scheduler import R0Scheduler, bootstrap_and_start_r0_runtime
+from app.package_scan_host_control import SshPackageScanHostControl
+from app.package_scan_scheduler import PackageScanScheduler
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -89,12 +91,32 @@ def create_read_only_app(
 
     store = InventoryAuthorityStore(config.authority_db_path)
     authority = InventoryAuthority(store, now=now)
+    authority.recover_interrupted_package_scans()
     scheduler_kwargs: dict[str, Any] = {"start": start_scheduler}
     if now is not None:
         scheduler_kwargs["now"] = now
     scheduler: R0Scheduler = bootstrap_and_start_r0_runtime(
         authority, store, config, **scheduler_kwargs
     )
+    host_config = config.package_scan.host_control
+    host_control = SshPackageScanHostControl(
+        host=host_config.host,
+        port=host_config.port,
+        user=host_config.user,
+        private_key_path=host_config.private_key_path,
+        known_hosts_path=host_config.known_hosts_path,
+        timeout_seconds=host_config.timeout_seconds,
+        max_result_bytes=host_config.max_result_bytes,
+    )
+    package_scan_scheduler = PackageScanScheduler(
+        authority,
+        store,
+        host_control,
+        interval_seconds=config.package_scan.interval_seconds,
+        initial_delay_seconds=config.package_scan.initial_delay_seconds,
+    )
+    if start_scheduler:
+        package_scan_scheduler.start()
     publication = InventoryPublication(store, authority)
 
     @asynccontextmanager
@@ -102,6 +124,7 @@ def create_read_only_app(
         try:
             yield
         finally:
+            package_scan_scheduler.stop()
             scheduler.stop()
             store.close()
 
@@ -117,6 +140,8 @@ def create_read_only_app(
     app.state.store = store
     app.state.authority = authority
     app.state.scheduler = scheduler
+    app.state.package_scan_scheduler = package_scan_scheduler
+    app.state.package_scan_host_control = host_control
     app.state.publication = publication
     app.state.config = config
 

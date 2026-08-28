@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -14,6 +15,7 @@ from app.inventory import (
     DiscoveredResource,
     InventoryAuthority,
     InventoryAuthorityStore,
+    InventoryPublication,
     NormalizedDiscoverySnapshot,
     PackageScanFailure,
     PackageScanOutcome,
@@ -22,6 +24,8 @@ from app.inventory import (
     package_plan_fingerprint,
 )
 from app.inventory.discovery import ProviderGuestLocatorSet, ProviderNodeScope
+from app.package_scan import HostScanFailure, HostScanResult, expected_host_context
+from app.package_scan_scheduler import PackageScanScheduler
 
 
 START = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
@@ -190,6 +194,45 @@ def test_failed_latest_attempt_has_unknown_count_and_does_not_reuse_success(tmp_
     assert failed.pending_count is None
     assert failed.plan_fingerprint is None
     assert store.list_package_scan_runs(resource.resource_id)[0].pending_count == 2
+    published = dict(InventoryPublication(store, authority).read().resources[0])[
+        "package_scan"
+    ]
+    assert published["status"] == "failed"
+    assert published["pending_count"] is None
+    assert published["plan_fingerprint"] is None
+    assert published["packages"] == ()
+    assert published["error"]["classification"] == "metadata_refresh_failed"
+
+
+def test_publication_exposes_full_exact_plan_but_suppresses_stale_success(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    run = authority.issue_package_scan(resource.resource_id)
+    authority.finalize_successful_package_scan(
+        run.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=_packages(),
+        reboot_required=True,
+    )
+    published = dict(InventoryPublication(store, authority).read().resources[0])[
+        "package_scan"
+    ]
+    assert published["status"] == "success"
+    assert published["pending_count"] == 2
+    assert tuple(package["name"] for package in published["packages"]) == (
+        "apt",
+        "zlib1g",
+    )
+
+    _reconcile(authority, resource.inventory_source_id, status="stopped")
+    unavailable = dict(InventoryPublication(store, authority).read().resources[0])[
+        "package_scan"
+    ]
+    assert unavailable["status"] == "unavailable"
+    assert unavailable["pending_count"] is None
+    assert unavailable["packages"] == ()
 
 
 def test_per_resource_single_flight_and_qemu_rejection(tmp_path: Path) -> None:
@@ -231,3 +274,104 @@ def test_restart_recovery_marks_running_attempt_interrupted_and_allows_retry(
     assert recovered.pending_count is None
     retry = authority.issue_package_scan(resource.resource_id)
     assert retry.attempt_sequence == 2
+
+
+class SuccessfulHostControl:
+    def scan_packages(self, run):
+        return HostScanResult(
+            context=expected_host_context(run),
+            os_release='ID=debian\nVERSION_ID="12"\n',
+            simulation_stdout=(
+                "Reading package lists...\n"
+                "Building dependency tree...\n"
+                "Reading state information...\n"
+                "Calculating upgrade...\n"
+                "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+            ),
+            reboot_required=None,
+        )
+
+
+def test_automatic_scheduler_scans_current_lxc_and_uses_runtime_interval(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        SuccessfulHostControl(),
+        interval_seconds=21_600,
+        initial_delay_seconds=30,
+    )
+    outcome = scheduler.run_once()
+    assert len(outcome) == 1
+    assert outcome[0].resource_id == resource.resource_id
+    assert outcome[0].status == "success"
+    assert store.list_package_scan_runs(resource.resource_id)[-1].pending_count == 0
+    scheduler.configure_interval_seconds(3600)
+    assert scheduler.interval_seconds == 3600
+    with pytest.raises(ValueError):
+        scheduler.configure_interval_seconds(59)
+
+
+def test_scheduler_skips_qemu_without_inventory_error(tmp_path: Path) -> None:
+    _, store, authority, _ = _system(tmp_path, resource_type="qemu")
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        SuccessfulHostControl(),
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    assert scheduler.run_once() == ()
+    assert store.list_package_scan_runs() == ()
+
+
+def test_scheduler_global_worker_prevents_overlapping_cycles(tmp_path: Path) -> None:
+    _, store, authority, _ = _system(tmp_path)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingHostControl(SuccessfulHostControl):
+        def scan_packages(self, run):
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().scan_packages(run)
+
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        BlockingHostControl(),
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    thread = threading.Thread(target=scheduler.run_once)
+    thread.start()
+    assert entered.wait(timeout=5)
+    assert scheduler.run_once() == ()
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+
+def test_scheduler_persists_host_failure_as_unknown_not_zero(tmp_path: Path) -> None:
+    _, store, authority, resource = _system(tmp_path)
+
+    class StoppedHostControl:
+        def scan_packages(self, _run):
+            raise HostScanFailure(
+                PackageScanFailure.GUEST_UNAVAILABLE,
+                "guest is not running",
+            )
+
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        StoppedHostControl(),
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+    scheduler.run_once()
+    failed = store.list_package_scan_runs(resource.resource_id)[-1]
+    assert failed.failure_class is PackageScanFailure.GUEST_UNAVAILABLE
+    assert failed.pending_count is None
