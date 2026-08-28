@@ -368,6 +368,9 @@ class TestSourceProvenance:
         (non_git / "app" / "__init__.py").write_text("", encoding="utf-8")
         (non_git / "requirements.txt").write_text("x==1\n", encoding="utf-8")
         (non_git / "deploy" / "install-0.5.0-fresh.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        (non_git / "deploy" / "hubinet-package-scan-helper.py").write_text(
+            "#!/usr/bin/env python3\n", encoding="utf-8"
+        )
         result = _run(fake_env.env, _base_args(non_git, **{"--expected-sha": False}), source_dir=non_git)
         assert result.returncode != 0
         assert "is not a git checkout" in result.stderr

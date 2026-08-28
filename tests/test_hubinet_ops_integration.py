@@ -732,6 +732,10 @@ async def test_devices_and_entities_are_keyed_by_backend_resource_id(
             "lifecycle",
             "observational_continuity",
             "security_continuity",
+            "package_scan_status",
+            "pending_updates",
+            "last_package_scan",
+            "reboot_required",
         }
     }
 
@@ -967,6 +971,10 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "lifecycle",
         "observational_continuity",
         "security_continuity",
+        "package_scan_status",
+        "pending_updates",
+        "last_package_scan",
+        "reboot_required",
     }
     assert set(states.values()) == {STATE_UNAVAILABLE}
 
@@ -1113,7 +1121,10 @@ async def test_pending_updates_distinguishes_exact_zero_from_failed_unknown(
     first = snapshot((replace(INITIAL_RESOURCES[1], package_scan=success),))
     second = snapshot(
         (replace(INITIAL_RESOURCES[1], package_scan=failure),),
-        sources=(successful_source(6),),
+        # Package-scan-only transition: no new inventory commit, so the
+        # source/inventory state (and inventory_revision) is unchanged from
+        # `first` -- only the published-state revision/timestamp and the
+        # resource's package_scan advance.
         published_state_revision=21,
         published_at="2026-08-08T13:00:05+00:00",
     )
