@@ -1,18 +1,19 @@
 # Hubinet Ops 0.5 — current product intent
 
-Status: **ACTIVE PRODUCT INTENT** (operator-stated product target). Recorded 2026-08-28.
+Status: **ACTIVE PRODUCT INTENT** (operator-stated product target). Recorded 2026-08-28;
+threat model reset 2026-08-28.
 
 This document records **what the operator wants the product to do**. It is the
 authority for *product direction and priority*.
 
-It is **not** an ADR and **not** an architecture authority:
+It is **not** an ADR. Where it and an ACCEPTED ADR (0001, 0002) disagree about
+an architectural invariant, **the ADR wins** and the conflict must be reported,
+not quietly resolved.
 
-- It does not amend, weaken, or override any ACCEPTED ADR. Where it and an
-  ACCEPTED ADR disagree about an architectural or security invariant, **the ADR
-  wins** and the conflict must be reported, not quietly resolved.
-- It authorizes **no** implementation. Every item below that is not already
-  implemented still needs its own accepted architecture before code exists.
-- It grants `security_continuity=trusted` nowhere and does not close Blocker B.
+It **does** authorize the roadmap below as ordinary implementation work. An item
+that is not yet built is unbuilt, not forbidden: no new ADR is required merely
+because a feature touches a managed guest. See `AGENTS.md`, "When to write an
+ADR".
 
 ## 1. The product in one line
 
@@ -80,8 +81,8 @@ These are requirements, not suggestions.
    Hubinet's safety here must not depend on assumptions about ZFS, LVM, RBD, or
    any other backend's deletion semantics. The rule holds regardless of backend
    details.
-9. **Persistent workload-incarnation proof is not solved and must not be assumed
-   solved.** See §4.
+9. **A failed, partial, or unavailable package scan is never "zero updates."**
+   Absence of evidence is reported as unknown, never as "nothing to do".
 
 ## 3. What the operator wants to see
 
@@ -91,7 +92,7 @@ Discovery and presentation are the visible half of the product.
   Assistant, with no repository or config change.
 - A successful, complete discovery/reconciliation scan that no longer contains a
   CT/VM may establish current absence, per the accepted discovery/reconciliation
-  architecture (ADR 0002, ADR 0004).
+  architecture (ADR 0002).
 - **A failed, partial, or unavailable PVE scan is never resource deletion.**
 - Resources confirmed absent are **no longer shown as current/active resources**
   in the dynamic Home Assistant view, according to the designed
@@ -102,8 +103,8 @@ Discovery and presentation are the visible half of the product.
   accepted architecture may legitimately retain historical backend resource
   identity and leave a Home Assistant registry entity present-but-unavailable.
   Registry and history lifecycle remain governed by the accepted inventory/HA
-  architecture (ADR 0001, ADR 0002, ADR 0004, `0.5-inventory-model.md`), which
-  this document does not redesign.
+  architecture (ADR 0001, ADR 0002, `0.5-inventory-model.md`), which this
+  document does not redesign.
 
 For packages/updates, the operator wants to see, where the information can be
 obtained reliably:
@@ -120,70 +121,52 @@ obtained reliably:
 Where a field cannot be established reliably, it must be reported as unknown,
 never guessed.
 
-## 4. The unresolved incarnation question (Blocker B)
+## 4. Threat model and the VMID-reuse case
 
-The theoretical case that remains unsolved:
+Hubinet Ops targets a **trusted, self-administered** Proxmox environment. The
+binding statement is `AGENTS.md`, "Threat model": the Proxmox administrator/root,
+the Proxmox host, root inside a managed LXC, the Hubinet operator, and normal
+`apt`/`dpkg` behavior are TRUSTED. Defending against a hostile administrator of
+the environment being managed is **out of scope**, and no feature is gated on a
+proof that survives full administrative compromise.
+
+The VMID-reuse case is still handled, but as an **ordinary correctness concern**,
+not a security proof:
 
 ```text
 scan sees occupant A at VMID 112
 A is destroyed between scans
 occupant B is recreated as VMID 112
 next scan sees 112 again
-Hubinet never observed ABSENT
 ```
 
-Without a stronger primitive, Hubinet cannot prove A and B are the same
-incarnation. **This must never silently transfer long-lived destructive
-authority or policy from A to B.**
+The accepted identity model (ADR 0001, ADR 0002) already covers this the right
+way: a VMID is a reusable slot locator, durable identity is the opaque backend
+`resource_id`, and a resource incarnation returning after an observation gap is
+marked `quarantined`/`uncertain` rather than being silently treated as
+continuous. Long-lived policy and destructive authority are never transferred
+across that gap by default. That is enough for a trusted environment.
 
-**Blocker B remains OPEN as its own separate question.**
+**Blocker B — a persistent cryptographic workload-incarnation proof — is no
+longer a prerequisite for anything on this roadmap.** The architecture that
+existed to close it is superseded and archived under
+`docs/archive/superseded-security-model/`.
 
-### CURRENT AUTHORITY
-
-Under the currently ACCEPTED architecture (ADR 0005 §26, ADR 0006):
+### What is implemented, and what is next
 
 ```text
-Phase 1C:                     BLOCKED
-mutation authority:           NONE
-Blocker B:                    OPEN
-security_continuity=trusted:  GRANTED NOWHERE
+implemented, read-only:   PVE autodiscovery, dynamic backend inventory,
+                          dynamic Home Assistant representation
+next:                     read-only package/update scanning and presentation
+then:                     operator-reviewed update plan -> approval
+                          -> fresh job-owned snapshot -> update
+                          -> healthcheck -> same-job rollback
 ```
 
-Nothing in this document changes any of those.
-
-Read-only discovery and current Home Assistant visibility are implemented and
-are not gated on Blocker B.
-
-Read-only package scanning and package-detail presentation are **also not gated
-on Blocker B** — but "not gated on Blocker B" is not the same as "already
-covered". They are **not** part of the existing accepted PVE inventory discovery
-contract, and the current R0 PVE transport has no guest-agent, SSH, or in-guest
-package evidence channel of any kind. Package scanning therefore still requires
-its own separately designed, reviewed, and accepted **read-only evidence and
-transport contract** before any implementation may begin.
-
-**Update execution, snapshots, jobs, health checking as a job step, and rollback
-are all Phase 1C and remain BLOCKED. None of them is authorized to begin.**
-
-### OPERATOR TARGET
-
-The operator's stated direction is deliberately narrower than "unblock
-mutation": Blocker B **should not remain a blanket prerequisite** for a future,
-operator-reviewed, job-scoped path of exactly this shape:
-
-```text
-plan -> approval -> fresh job-owned snapshot -> update -> healthcheck
-     -> same-job rollback
-```
-
-Whether that narrow path can be authorized **without** first closing persistent
-Blocker B is a **NEW ARCHITECTURAL DECISION**. It requires its own ADR,
-separately reviewed and accepted.
-
-This document records the operator's intent to pursue that question. It does not
-decide it, does not unblock anything, and must not be read by an implementation
-agent as present authorization. Until that ADR exists and is ACCEPTED, the
-CURRENT AUTHORITY block above is the only operative one.
+Each step is ordinary implementation work under the accepted inventory
+architecture and the hard rules in §2. It does not need a new ADR merely because
+it touches a guest. What each step **does** need is real design, real tests, and
+the §2 rules honored exactly — in particular **NO AUTO-UPDATE**.
 
 ## 5. Intended update workflow (target shape, not yet designed)
 
@@ -207,13 +190,14 @@ None of this is implemented. None of it is authorized to begin.
 
 ## 6. What is explicitly not the current path
 
-- **Family B / B-S1** (proving continuity through complete PVE task/history
-  observation) is **not** the current implementation path. It was explored, it
-  produced two unmerged research branches (PR #52, PR #53), Experiment #13 was
-  never executed, and the recovery review returned NO-GO. See
-  `docs/archive/postmortems/blocker-b-family-b-13.md`.
-- Reviving that research, executing Experiment #13, or continuing PR #53's
-  architecture is not current work.
+- Designing a replacement workload-incarnation proof, reviving Family B / B-S1,
+  or researching pmxcfs/task-history completeness. All of it belonged to a
+  threat model this product no longer has.
+- Building defenses against a hostile Proxmox root, a hostile root inside a
+  managed guest, or an administrator replacing Hubinet-owned state.
+- New attestation concepts or a new security-evidence taxonomy.
+- Broadening the PVE credential beyond `{Sys.Audit, VM.Audit}` without a
+  concrete, stated need for the exact additional privilege.
 
 ## 7. Where this fits
 

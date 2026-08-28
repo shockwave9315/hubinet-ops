@@ -331,8 +331,8 @@ missing or mismatched committed context, zero nodes, a terminal failure
 health state, an authentication failure, or a TLS failure never yields
 `Discovery: PASS`, and CT `onboot` is never enabled unless this check
 actually returns success. This script only ever reads the already-
-published snapshot (`app/inventory/publication.py`'s read side) — it does
-not activate attestation and does not change runtime architecture.
+published snapshot (`app/inventory/publication.py`'s read side) — it changes
+no runtime state.
 
 ## Ownership and rollback (PVE identity)
 

@@ -39,38 +39,46 @@ Hard product rules — full statement in `docs/product-intent.md`:
   may only roll back to **its own** snapshot.
 - Retention/cleanup touches **only Hubinet-managed snapshots**; operator
   snapshots are never touched.
-- **Persistent workload-incarnation proof (Blocker B) is not solved** and must
-  not be assumed solved. It must never silently transfer long-lived destructive
-  authority from a destroyed occupant to its replacement.
-- **Family B / B-S1 is not the current implementation path.**
+- A failed, partial, or unavailable scan is **never** deletion, and a failed
+  package scan is **never** "zero updates".
 
 Current implemented state: PVE autodiscovery, dynamic backend inventory, and
 dynamic Home Assistant representation are **live and read-only**. Package
 scanning, update plans, jobs, snapshots, and rollback are **not implemented**.
 
-### Current authority vs. operator target — do not confuse these
+### Threat model
 
-> **CURRENT AUTHORITY.** Under the ACCEPTED ADRs today:
-> **Phase 1C is BLOCKED**, **mutation authority is NONE**, **Blocker B is OPEN**,
-> and **`security_continuity=trusted` is GRANTED NOWHERE**. Nothing in this index
-> or in `docs/product-intent.md` authorizes package scanning, mutation, jobs,
-> snapshots, update execution, or rollback. Read-only package/update scanning is
-> not gated on Blocker B, but it still needs its own accepted read-only
-> evidence/transport contract before implementation may begin — it is not
-> already covered by the existing accepted PVE inventory discovery contract.
-> No implementation of any of these items may begin.
->
-> **OPERATOR TARGET.** The operator's stated direction is narrower than "unblock
-> mutation": Blocker B *should not remain a blanket prerequisite* for a future,
-> operator-reviewed, job-scoped
-> `plan -> approval -> fresh snapshot -> update -> healthcheck -> same-job rollback`.
-> Deciding whether that narrow path can be authorized **without** closing
-> persistent Blocker B requires a **new, explicit architecture decision** — its
-> own ADR, separately reviewed and accepted.
->
-> Until that ADR exists and is ACCEPTED, the CURRENT AUTHORITY line above is the
-> only operative one. An implementation agent must read the operator target as
-> *a question for a future ADR*, never as present authorization.
+Hubinet Ops is an application for a **trusted, self-administered** Proxmox
+environment. The full statement is in `AGENTS.md`, "Threat model". In short:
+
+- **TRUSTED** — the Proxmox administrator/root, the Proxmox host, root inside a
+  managed LXC, the Hubinet operator, normal `apt`/`dpkg` behavior.
+- **OUT OF SCOPE** — a malicious root inside a managed guest racing or editing
+  files to fool Hubinet; a malicious or compromised Proxmox root; an
+  administrator deliberately replacing Hubinet-owned state; any security proof
+  intended to survive full administrative compromise of the managed environment.
+
+Do not design defenses for the out-of-scope cases. This is **not** a licence to
+weaken ordinary application safety — see the KEEP list in `AGENTS.md`.
+
+The former security-proof architecture built for the old hostile-administrator
+model (source attestation, attestation epochs, relationship gates,
+candidate-endpoint attestation proofs, dual-evidence confirmed removal, and the
+Blocker-B workload-incarnation proof) is **superseded and archived** under
+`docs/archive/superseded-security-model/`, together with its implementing code,
+schema, and tests. **Blocker B is no longer a blanket prerequisite** for the
+practical operator-driven roadmap.
+
+### What needs an ADR, and what does not
+
+ADRs remain available for genuinely load-bearing decisions. They are **not** a
+prerequisite for ordinary implementation:
+
+- Package scan/update/snapshot/job work does **not** need a new ADR merely
+  because it touches a managed guest.
+- Write a new ADR when a decision is genuinely architectural and hard to
+  reverse — a new persistence/authority owner, a new trust boundary, a new
+  external mutation path — not as a routine gate on ordinary work.
 
 ---
 
@@ -109,8 +117,11 @@ Rules that follow from this:
   ADR disagree on an invariant, the ADR wins. It authorizes no implementation on
   its own — an unimplemented item there still needs its own accepted
   architecture first.
-- **"ACTIVE AUTHORITY" does not mean "read this for every task."** ADR 0005 and
-  ADR 0006 are active authority and are also specialized — see §5.
+- **An ADR is not a prerequisite for ordinary implementation.** ADRs record
+  genuinely architectural decisions. Routine feature work — including package
+  scanning, update plans, jobs, snapshots, and rollback — proceeds under the
+  accepted inventory architecture and the product rules, without first minting
+  a new ADR.
 
 ---
 
@@ -118,32 +129,33 @@ Rules that follow from this:
 
 | Category | Where | Meaning |
 | --- | --- | --- |
-| **A — Active authority** | `docs/architecture/adr/0001`–`0006`, `0.5-foundation.md`, `0.5-inventory-model.md`, `AGENTS.md` | Normative and binding for architecture and security invariants. |
+| **A — Active authority** | `docs/architecture/adr/0001`–`0002`, `0.5-foundation.md`, `0.5-inventory-model.md`, `AGENTS.md` | Normative and binding for architecture and security invariants. |
 | **A2 — Active product intent** | `docs/product-intent.md` | Binding for **product direction and priority** — what to build next and what the product must never do. **Not** an ADR and **not** architecture authority: on any architectural or security invariant, an ACCEPTED ADR wins. |
 | **B — Active implementation contract** | `docs/architecture/0.5-r0-read-only-runtime-activation.md` | Cited by name and section from live runtime code and tests. |
 | **C — Active current status** | `docs/architecture/0.5-implementation-status.md` | The current map. Not authority. |
 | **D — Active operator/user doc** | `README.md`, `docs/operations/*`, `deploy/README-*.md`, `CHANGELOG.md` | How to install, deploy, and operate. |
-| **E — Specialized reference** | `docs/architecture/research/adr0006-workload-continuity-evidence.md`, `.agents/skills/*`, `custom_components/hubinet_ops/NOTICE.md`, `CLAUDE.md` | Read on demand for a specific kind of work. |
+| **E — Specialized reference** | `.agents/skills/*`, `custom_components/hubinet_ops/NOTICE.md`, `CLAUDE.md` | Read on demand for a specific kind of work. |
 | **F — Completed historical plan** | `docs/archive/project-history/` | Done. Preserved for traceability. |
-| **G — Superseded research** | `docs/archive/blocker-b-family-b/` | Abandoned path. **Not a roadmap.** |
+| **G — Superseded research and architecture** | `docs/archive/superseded-security-model/`, `docs/archive/blocker-b-family-b/` | Retired threat model and abandoned research. **Not a roadmap.** |
 | **H — Postmortem/archive** | `docs/archive/postmortems/` | Lessons from stopped work. |
 
 ### ADR register
-
-Every ADR below is **ACCEPTED** and none is archived. Acceptance is authority; it is not
-a reading obligation.
 
 | ADR | Status | Authority | Who needs to read it |
 | --- | --- | --- | --- |
 | 0001 — resource identity / incarnation | **ACCEPTED** | normative | anything touching identity, VMID-as-locator, incarnation, binding generations, terminal history |
 | 0002 — Proxmox discovery / reconciliation | **ACCEPTED** | normative | discovery, reconciliation, presence, absence, provider/transport contracts |
-| 0003 — source binding / attestation | **ACCEPTED** | normative | source binding, attestation, endpoint activation/failover questions |
-| 0004 — confirmed removal / operator absence | **ACCEPTED** | normative | confirmed removal, authoritative absence proof |
-| 0005 — workload continuity enrollment | **ACCEPTED**, *scoped*: the negative stock-PVE trust boundary and R0 safety decision only. Does not close Blocker B, does not authorize WAVE B1, grants `trusted` nowhere | normative within that scope | continuity/trust questions; anyone proposing mutation authority |
-| 0006 — workload continuity, stronger proof | **ACCEPTED**, *scoped*: negative/unresolved research record plus normative requirements for any future positive mechanism. Selects no mechanism | normative within that scope | continuity-proof research; anyone proposing a Blocker-B mechanism |
-| future positive Blocker-B mechanism ADR | **NOT STARTED** — a different, later ADR | — | — |
+| 0003 — source binding / attestation | **SUPERSEDED**, archived | none | nobody, by default |
+| 0004 — confirmed removal / operator absence | **SUPERSEDED**, archived | none | nobody, by default |
+| 0005 — workload continuity enrollment | **SUPERSEDED**, archived | none | nobody, by default |
+| 0006 — workload continuity, stronger proof | **SUPERSEDED**, archived | none | nobody, by default |
 
-There is no PROPOSED or SUPERSEDED ADR in this repository.
+ADRs 0003–0006 were superseded by the operator's threat-model reset and moved to
+`docs/archive/superseded-security-model/` (see that directory's README for what
+they claimed and what replaced them). ADR 0001 and ADR 0002 remain ACCEPTED and
+normative: identity, incarnation, discovery, and reconciliation are unchanged.
+Where the archived ADRs' text is still cited inside ADR 0001/0002 or the
+inventory model, read it as historical cross-reference, not as live authority.
 
 ---
 
@@ -165,14 +177,14 @@ See the task matrix in §5.
 
 ### DO NOT READ BY DEFAULT
 
+- `docs/archive/superseded-security-model/` — the retired attestation/
+  confirmed-removal/Blocker-B architecture. Superseded; not a roadmap.
 - `docs/archive/blocker-b-family-b/` — abandoned Family B / B-S1 research.
 - PR #52 / PR #53 branch material (`research/family-b-13-*`) — unmerged,
   abandoned implementation plans.
 - `docs/archive/project-history/` — completed R0 activation chronology,
   dogfood narratives, corrective-review history.
 - `docs/archive/postmortems/` — read only when re-entering the covered area.
-- `docs/architecture/research/adr0006-workload-continuity-evidence.md` — only
-  for continuity-proof research.
 
 ---
 
@@ -181,15 +193,12 @@ See the task matrix in §5.
 | Task | Read | Do not read |
 | --- | --- | --- |
 | **General product work** | the always-read set | anything in `docs/archive/` |
-| **Package scanning / update plan** (not implemented — package scanning needs its own accepted read-only evidence/transport contract before implementation, not gated by Blocker B) | always-read set; `docs/product-intent.md` §2–§5; ADR 0002 for what discovery may and may not assert; `AGENTS.md` mutation-boundary section | Family B research; the R0 chronology |
-| **Inventory / reconciliation / identity** | ADR 0001, ADR 0002, `0.5-inventory-model.md`; `.agents/skills/hubinet-phase-boundary` | ADR 0003–0006 unless the change touches attestation/removal/continuity |
-| **Home Assistant integration** | `0.5-foundation.md` (including "Dynamiczny model Home Assistant"), `0.5-inventory-model.md` (snapshot contract), ADR 0001, ADR 0002, `.agents/skills/hubinet-phase-boundary`, `docs/operations/0.5-ha-clean-break.md` | ADR 0003–0006 unless the change touches their specialized domains (source attestation, confirmed removal, workload continuity/trust); archive/history unless specifically needed |
+| **Package scanning / update plan** (not implemented) | always-read set; `docs/product-intent.md` §2–§5; ADR 0002 for what discovery may and may not assert; `AGENTS.md` "Threat model" and mutation-boundary section | `docs/archive/` |
+| **Inventory / reconciliation / identity** | ADR 0001, ADR 0002, `0.5-inventory-model.md`; `.agents/skills/hubinet-phase-boundary` | `docs/archive/` |
+| **Home Assistant integration** | `0.5-foundation.md` (including "Dynamiczny model Home Assistant"), `0.5-inventory-model.md` (snapshot contract), ADR 0001, ADR 0002, `.agents/skills/hubinet-phase-boundary`, `docs/operations/0.5-ha-clean-break.md` | `docs/archive/` |
 | **R0 runtime, PVE transport, scheduler, config, installer** | `docs/architecture/0.5-r0-read-only-runtime-activation.md` (the code cites it by section) | the R0 activation chronology |
-| **Mutation / jobs / snapshots** (Phase 1C — blocked) | `AGENTS.md` "Mutation and security boundaries"; ADR 0005 §26; `docs/product-intent.md` §4–§5; `.agents/skills/hubinet-architecture-change` | Family B research — it does not unblock this |
-| **Source attestation / endpoint binding** | ADR 0003 | ADR 0004–0006 |
-| **Confirmed removal / absence proof** | ADR 0004 | ADR 0003, 0005, 0006 |
-| **Persistent continuity / Blocker B** | ADR 0005, ADR 0006, then `docs/architecture/research/adr0006-workload-continuity-evidence.md`, then `docs/archive/postmortems/blocker-b-family-b-13.md` | the four archived Family B research documents, unless you have a specific reason |
-| **Deployment / operations** | `deploy/README-bootstrap-proxmox-0.5.md`, `deploy/README-0.5-firewall.md`, `docs/operations/0.5-r0-operational-activation.md`; for a deployment/runtime implementation change, also the AGENTS.md-required architecture baseline (`0.5-foundation.md`, `0.5-inventory-model.md`, ADR 0001, ADR 0002) | ADR 0003–0006 unless the change touches attestation/removal/continuity; archive/history unless specifically needed |
+| **Update execution / jobs / snapshots** (not implemented) | `AGENTS.md` "Threat model" and "Mutation and security boundaries"; `docs/product-intent.md` §4–§5 | `docs/archive/` |
+| **Deployment / operations** | `deploy/README-bootstrap-proxmox-0.5.md`, `deploy/README-0.5-firewall.md`, `docs/operations/0.5-r0-operational-activation.md`; for a deployment/runtime implementation change, also the AGENTS.md-required architecture baseline (`0.5-foundation.md`, `0.5-inventory-model.md`, ADR 0001, ADR 0002) | `docs/archive/` unless specifically needed |
 | **Code review** | `.agents/skills/hubinet-contract-review`, `AGENTS.md` "Code Review Rules", the status document | broad architecture/research sweeps |
 | **Declaring work done / merge-safe** | `.agents/skills/hubinet-test-gate` | — |
 | **Historical research question** ("why did X stop?") | `docs/archive/postmortems/`, then `docs/archive/` | — |
@@ -247,9 +256,12 @@ by later review. The rule is:
    old accepted claim" is not the rule and must never be adopted — it would let
    known-false architecture stay load-bearing.
 
-Applied to the current state: ADR 0005 and ADR 0006 remain **ACCEPTED**. The
-Family B / B-S1 *research path* was stopped and archived, which changed no ADR
-status and closed no blocker. Blocker B remains **OPEN**.
+Applied to the current state: ADR 0003–0006 were **explicitly superseded** by
+the operator's threat-model reset, which names what changed (the environment
+being managed is trusted; hostile-administrator resistance is out of scope) and
+records the new status. Their text is preserved unedited under
+`docs/archive/superseded-security-model/`. ADR 0001 and ADR 0002 are untouched
+and remain ACCEPTED.
 
 ---
 
@@ -267,13 +279,12 @@ docs/
     0.5-inventory-model.md                 ACCEPTED inventory model
     0.5-implementation-status.md           current implementation map
     0.5-r0-read-only-runtime-activation.md live R0 design contract
-    adr/0001..0006                         ACCEPTED ADRs
-    research/
-      adr0006-workload-continuity-evidence.md   non-normative, ADR-referenced
+    adr/0001..0002                         ACCEPTED ADRs
   operations/
     0.5-r0-operational-activation.md       real-host activation runbook
     0.5-ha-clean-break.md                  HA 0.4->0.5 clean-break plan
   archive/                                 NON-AUTHORITATIVE HISTORY
+    superseded-security-model/             retired ADR 0003-0006 + evidence
     blocker-b-family-b/                    abandoned Family B / B-S1 research
     postmortems/                           concise postmortems
     project-history/                       verbatim historical narrative

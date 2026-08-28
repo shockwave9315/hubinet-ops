@@ -50,9 +50,9 @@ install -- resources[] is deliberately NOT required to be non-empty):
   - presence != "confirmed_removed" (not a meaningful state on an initial
     R0 bootstrap pass, since nothing has ever been observed missing yet)
 
-Does not activate attestation and does not change runtime architecture --
-this script only ever reads the already-published snapshot; see
-app/inventory/publication.py for the read side.
+Changes no runtime state -- this script only ever reads the
+already-published snapshot; see app/inventory/publication.py for the
+read side.
 
 Prints one final line to stdout: "PASS ..." or "FAIL <reason>", plus INFO
 lines for diagnostics. Exit code 0 only on a genuine PASS.

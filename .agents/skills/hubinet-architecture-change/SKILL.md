@@ -37,7 +37,7 @@ If the architecture already defines the behavior and the implementation-status d
 Treat the request as `NEW ARCHITECTURAL DECISION` when it changes or newly defines topics such as:
 
 - durable identity meaning;
-- source/endpoint binding or attestation;
+- source/endpoint binding;
 - resource incarnation/replacement semantics;
 - generation/binding allocation;
 - trust/enrollment model;

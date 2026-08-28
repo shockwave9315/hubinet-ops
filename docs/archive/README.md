@@ -23,6 +23,7 @@ authority. None of it is a current roadmap.**
 
 | Directory | Contents | Why archived |
 | --- | --- | --- |
+| `superseded-security-model/` | Former ADR 0003–0006 and their evidence record: source attestation, attestation epochs, relationship gates, candidate-endpoint proofs, dual-evidence confirmed removal, Blocker-B workload-continuity proof | The hostile-administrator threat model they defend against was retired by an explicit operator decision. Their implementing code, schema, and tests were removed. See that directory's README. |
 | `blocker-b-family-b/` | Family B / B-S1 task-history witness research (#1, #2A, #2A.1, #2B) | Superseded research path. NO-GO on B-S1 as the mutation-authority path. Not referenced by any ADR. |
 | `postmortems/` | Concise postmortems of stopped work | Lessons preserved without forcing anyone to read the full research path. |
 | `project-history/` | Verbatim project narrative extracted from active documents | History preserved out of the hot reading path. |

@@ -106,10 +106,9 @@ implementation state; do not anchor review assumptions to a remembered PR
 number. The R0 read-only runtime already gives the backend durable ownership
 of inventory reconciliation, discovery-run issuance/scheduling, and
 published-snapshot/revision authority — this is implemented, not merely a
-Phase 0 contract layer. Source attestation (ADR 0003) and confirmed removal
-(ADR 0004) are also durably implemented but dormant (R0's own call surface
-never invokes either). Policy/plans/jobs/locks/mutation authority remains
-genuinely unimplemented. See the `hubinet-phase-boundary` skill for the full
+Phase 0 contract layer. Policy/plans/jobs/locks/mutation authority,
+package/update scanning, snapshots, and rollback remain genuinely
+unimplemented. See the `hubinet-phase-boundary` skill for the full
 current-ownership/deferred split.
 
 HA may validate canonical values, one-view consistency, observable successor contradictions, and permanent facts already observed.

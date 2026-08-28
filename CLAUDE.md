@@ -21,8 +21,8 @@ The current, single-track implementation lives in:
   runtime composition root, config loader, discovery scheduler, and production Proxmox
   transport. This is the current production entrypoint (`uvicorn
   app.inventory_runtime:app`) — **read-only**: no policy, jobs, mutation, endpoint
-  activation/failover, or attestation enrollment automation exists or is authorized yet.
-  Current status is tracked in `docs/architecture/0.5-implementation-status.md`.
+  activation/failover exists yet. Current status is tracked in
+  `docs/architecture/0.5-implementation-status.md`.
 - **`custom_components/hubinet_ops/`** — the native Home Assistant integration consuming
   the R0 backend over HTTP.
 
@@ -51,54 +51,48 @@ STATIC 0.4.x -> PVE AUTODISCOVERY -> DYNAMIC BACKEND INVENTORY
 PVE autodiscovery, dynamic backend inventory, and dynamic Home Assistant representation
 are implemented today, strictly read-only. The remaining product surface — read-only
 package/update scanning and presentation, operator-approved update plans, job-owned
-pre-update snapshots, health checks, and same-job rollback — is **not implemented and not
-authorized to begin**; each piece needs its own accepted architecture first.
+pre-update snapshots, health checks, and same-job rollback — is **not implemented yet**.
+It is ordinary implementation work under the accepted inventory architecture: it does
+**not** need a new ADR merely because it touches a managed guest.
 
-**Current authority:** under the ACCEPTED ADRs, **Phase 1C is BLOCKED**, **mutation
-authority is NONE**, **Blocker B is OPEN**, and **`security_continuity=trusted` is
-GRANTED NOWHERE**. The operator's target — that Blocker B should not remain a blanket
-prerequisite for a future job-scoped `plan -> approval -> fresh snapshot -> update ->
-healthcheck -> same-job rollback` — is a **question for a new ADR**, not present
-authorization.
+**Threat model (binding, `AGENTS.md` "Threat model"):** Hubinet Ops targets a trusted,
+self-administered Proxmox environment. TRUSTED: the Proxmox administrator/root, the
+Proxmox host, root inside a managed LXC, the Hubinet operator, normal apt/dpkg behavior.
+OUT OF SCOPE: a malicious root inside a managed guest, a compromised Proxmox root, an
+administrator replacing Hubinet-owned state, and any proof intended to survive full
+administrative compromise. Do not design defenses for those. The former attestation /
+confirmed-removal / Blocker-B security-proof architecture is superseded and archived
+under `docs/archive/superseded-security-model/`; its code, schema, and tests are gone.
 
-Hard rules: automatic package/update **scanning** is allowed but must be read-only; the
-operator sees exact package/update detail; **NO AUTO-UPDATE** — installing updates always
-requires explicit operator review and approval of the current plan; a material plan change
-after approval invalidates that approval; each run takes a fresh job-owned pre-update
-snapshot and may roll back only to its own; retention touches only Hubinet-managed
-snapshots, never operator snapshots; persistent workload-incarnation proof (Blocker B)
-remains **OPEN** and is not assumed solved; **Family B / B-S1 is not the current
-implementation path** (`docs/archive/postmortems/blocker-b-family-b-13.md`).
+Hard rules that remain binding: automatic package/update **scanning** is allowed but must
+be read-only; the operator sees exact package/update detail; **NO AUTO-UPDATE** —
+installing updates always requires explicit operator review and approval of the current
+plan; a material plan change after approval invalidates that approval; each run takes a
+fresh job-owned pre-update snapshot and may roll back only to its own; retention touches
+only Hubinet-managed snapshots, never operator snapshots; a failed or unavailable
+discovery is never deletion; a failed package scan is never zero updates.
 
 Normative 0.5 architecture, in order of authority:
 1. `docs/architecture/adr/0001-resource-identity-incarnation.md` (ACCEPTED)
 2. `docs/architecture/adr/0002-proxmox-discovery-reconciliation.md` (ACCEPTED)
-3. `docs/architecture/adr/0003-source-binding-attestation.md` (ACCEPTED)
-4. `docs/architecture/adr/0004-confirmed-removal-operator-absence.md` (ACCEPTED)
-5. `docs/architecture/adr/0005-workload-continuity-enrollment.md` (ACCEPTED — negative
-   stock-PVE trust boundary and R0 safety decision only; does not authorize mutation)
-6. `docs/architecture/adr/0006-workload-continuity-stronger-proof.md` (ACCEPTED —
-   negative/unresolved stronger-proof research record and normative requirements only;
-   selects no Blocker-B mechanism and authorizes no implementation)
-7. `docs/architecture/0.5-foundation.md` (ACCEPTED — Phase 0 decisions; partly in Polish)
-8. `docs/architecture/0.5-inventory-model.md` (ACCEPTED — materializes ADR 0001/0002)
-9. `docs/architecture/0.5-r0-read-only-runtime-activation.md` — the R0 read-only runtime
+3. `docs/architecture/0.5-foundation.md` (ACCEPTED — Phase 0 decisions; partly in Polish)
+4. `docs/architecture/0.5-inventory-model.md` (ACCEPTED — materializes ADR 0001/0002;
+   its attestation/trust sections are superseded, see its own header note)
+5. `docs/architecture/0.5-r0-read-only-runtime-activation.md` — the R0 read-only runtime
    activation design (19-item Phase 1 gate audit, composition-root/deployment decisions).
    Still an **active implementation contract**, not history: `app/inventory_runtime.py`,
    `inventory_runtime_config.py`, `inventory_scheduler.py`, `inventory_pve_transport.py`,
    `custom_components/hubinet_ops/transport_http.py`, `deploy/install-0.5.0-fresh.sh`,
    `config/inventory.example.yaml` and seven test modules cite it by name and section
-10. `docs/operations/0.5-r0-operational-activation.md`,
-    `docs/operations/0.5-ha-clean-break.md` — the operational activation runbook and the
-    Home Assistant 0.4→0.5 clean-break/purge plan for a real deployed instance
-11. `docs/architecture/0.5-implementation-status.md` — current status, NOT an authority;
-    if it conflicts with an ACCEPTED ADR, the ADR wins and the status doc must be
-    corrected.
+6. `docs/operations/0.5-r0-operational-activation.md`,
+   `docs/operations/0.5-ha-clean-break.md` — the operational activation runbook and the
+   Home Assistant 0.4→0.5 clean-break/purge plan for a real deployed instance
+7. `docs/architecture/0.5-implementation-status.md` — current status, NOT an authority;
+   if it conflicts with an ACCEPTED ADR, the ADR wins and the status doc must be
+   corrected.
 
-ADRs 0003-0006 are equally ACCEPTED and equally binding, but **specialized**: read them
-when the work touches source attestation (0003), confirmed removal (0004), or workload
-continuity/trust (0005, 0006). "ACTIVE AUTHORITY" does not mean every agent reads every
-ADR for every task.
+ADRs 0003–0006 are **SUPERSEDED** and archived; do not read them and do not reintroduce
+their concepts.
 
 Skills under `.agents/skills/` encode repo-specific procedures on top of these rules:
 `hubinet-contract-review` (review procedure), `hubinet-phase-boundary` (Phase 0 HA vs.
@@ -272,7 +266,7 @@ runtime/legacy areas. If any row in that family isn't closed, don't claim comple
 ## Architecture (0.5, current)
 
 `app/inventory/` is an independently instantiable subsystem — its own SQLite "authority"
-database (schema v5, marker `hubinet_ops_0_5_authority`). It has its own identity model,
+database (schema v6, marker `hubinet_ops_0_5_authority`). It has its own identity model,
 summarized from ADR 0001/0002:
 
 - A Proxmox VMID is only a reusable **slot locator** `(inventory_source_id, vmid)`, never
@@ -293,9 +287,6 @@ summarized from ADR 0001/0002:
   side of the contract validated in `custom_components/hubinet_ops/contract/`.
 - `app/inventory/store.py` / `authority.py` own the durable schema, CAS/fencing for
   discovery-run ownership, and the backend/source/global-revision bookkeeping.
-- `app/inventory/attestation.py` (source-binding/attestation authority, ADR 0003) and the
-  confirmed-removal authority (ADR 0004) are durably implemented but **dormant**: no
-  production caller invokes them yet (see `docs/architecture/0.5-implementation-status.md`).
 
 `app/inventory_runtime.py` is the current production composition root
 (`create_read_only_app`/`create_app_from_env`, `uvicorn app.inventory_runtime:app`). It
@@ -325,8 +316,7 @@ Whether new work belongs in the backend (`app/inventory/`) or in the HA-side
 validation/presentation layer (`custom_components/hubinet_ops/`) is a real design
 question — use the `hubinet-phase-boundary` skill rather than guessing, especially for
 anything touching freshness, reconciliation, run history, CAS/fencing, or authority.
-Mutation/policy/jobs/locks authority (Phase 1C) remains unimplemented and blocked on
-Blocker B (workload continuity) plus every other mutation gate — do not wire mutation
+Mutation/policy/jobs/locks authority remains unimplemented — do not wire mutation
 capability into any current module without an explicit activation/cutover review.
 
 ## Repository map
@@ -382,16 +372,15 @@ capability into any current module without an explicit activation/cutover review
   `test_bootstrap_proxmox_0_5_smoke.py` locally with the marker forced on and
   report it as merge-safety evidence — only a real run through the sandbox
   counts.
-- `docs/architecture/` — the documentation index (`README.md`), 0.5 ADRs, the inventory
-  model/foundation, the R0 activation design contract, and the current implementation
-  status (authority for 0.5 work; see above). `docs/architecture/research/` holds only
-  non-normative evidence an ACCEPTED ADR references.
+- `docs/architecture/` — the documentation index (`README.md`), ADR 0001/0002, the
+  inventory model/foundation, the R0 activation design contract, and the current
+  implementation status (authority for 0.5 work; see above).
   `docs/operations/` — the R0 operational activation runbook and HA clean-break/purge
   plan for a real deployed instance.
   `docs/product-intent.md` — the operator-stated current product target.
-  `docs/archive/` — **non-authoritative history**: superseded Family B / B-S1 research,
-  postmortems, and the verbatim R0 activation chronology. Never read by default; never a
-  roadmap.
+  `docs/archive/` — **non-authoritative history**: the superseded security-proof
+  architecture (former ADR 0003–0006), superseded Family B / B-S1 research, postmortems,
+  and the verbatim R0 activation chronology. Never read by default; never a roadmap.
 - `scripts/` — `validate_yaml.py` (repository-wide YAML parse check),
   `check_tracked_files.py` (fails CI if `.env`/`config.yaml`/secrets/DBs/keys/logs are
   tracked in git).

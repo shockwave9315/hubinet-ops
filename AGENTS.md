@@ -43,32 +43,61 @@ STATIC 0.4.x -> PVE AUTODISCOVERY -> DYNAMIC BACKEND INVENTORY
   rollback.
 - Automatic cleanup applies only to Hubinet-managed snapshots. Manual/operator
   snapshots are never touched by generic Hubinet retention.
-- Persistent workload-incarnation proof (Blocker B) is **not** silently assumed
-  solved; it remains OPEN, and it must never silently transfer long-lived
-  destructive authority from a destroyed occupant to its replacement.
-- **Family B / B-S1 is not the current implementation path.** See
-  `docs/archive/postmortems/blocker-b-family-b-13.md`.
+- A failed, partial, or unavailable package scan is **never** "zero updates".
 
-**CURRENT AUTHORITY — do not confuse the target with permission.** Under the
-ACCEPTED ADRs today: **Phase 1C is BLOCKED**, **mutation authority is NONE**,
-**Blocker B is OPEN**, and **`security_continuity=trusted` is GRANTED NOWHERE**.
-The scanning, update-plan, job, snapshot, healthcheck, and rollback rules above
-describe what a future implementation **must** satisfy; they are not permission
-to build it. Read-only package/update **scanning** is not gated on Blocker B,
-but it is a separate, still-unauthorized item in its own right: it is not
-covered by the existing accepted PVE inventory discovery contract and needs
-its own accepted read-only evidence/transport contract before implementation
-may begin. None of these items — scanning included — is authorized to begin,
-and each needs its own accepted architecture first
-(`.agents/skills/hubinet-architecture-change`).
+**What is implemented today:** PVE autodiscovery, dynamic backend inventory, and
+the dynamic Home Assistant representation — all strictly read-only. Package
+scanning, update plans, jobs, snapshots, healthchecks, and rollback are **not
+implemented yet**; the rules above are what they must satisfy when they are
+built. Building them does **not** require a new ADR first (see "When to write an
+ADR" below).
 
-**OPERATOR TARGET.** The operator's stated direction is that Blocker B *should
-not remain a blanket prerequisite* for a future, operator-reviewed, job-scoped
-`plan -> approval -> fresh snapshot -> update -> healthcheck -> same-job
-rollback`. Whether that narrow path can be authorized **without** closing
-persistent Blocker B is a **NEW ARCHITECTURAL DECISION** requiring its own ADR.
-Until such an ADR is ACCEPTED, the CURRENT AUTHORITY paragraph above is the only
-operative one.
+## Threat model
+
+Hubinet Ops is a practical operations application for a **trusted,
+self-administered** Proxmox environment.
+
+**TRUSTED:**
+
+- the Proxmox administrator/root;
+- the Proxmox host;
+- root inside a managed LXC;
+- the Hubinet operator;
+- normal `apt`/`dpkg` behavior.
+
+**OUT OF SCOPE — do not design defenses for these:**
+
+- a malicious root inside a managed guest deliberately racing or modifying files
+  to fool Hubinet;
+- a malicious or compromised Proxmox root;
+- an administrator deliberately replacing Hubinet-owned state;
+- security proofs intended to survive full administrative compromise of the
+  managed environment.
+
+**This does not mean weakening ordinary application safety.** These are KEPT and
+are binding:
+
+- least-privilege PVE credentials;
+- TLS verification;
+- secret redaction — no secrets in argv or logs;
+- fixed, typed, allowlisted operations, never arbitrary shell command text;
+- correct target/VMID validation;
+- a failed or unavailable discovery is never resource deletion;
+- a failed package scan is never zero updates;
+- concurrency protection where it prevents ordinary operational races;
+- update-plan revalidation before an approved future update;
+- job-owned snapshots and same-job rollback semantics;
+- protection of non-Hubinet snapshots;
+- **NO AUTO-UPDATE.**
+
+The earlier security-proof architecture written for a hostile-administrator
+model — source attestation, attestation epochs, relationship gates,
+candidate-endpoint attestation proofs, dual-evidence confirmed removal, and
+persistent workload-incarnation proof ("Blocker B") — is **superseded**. Its
+ADRs and evidence are archived under
+`docs/archive/superseded-security-model/`; its code, schema, and tests have been
+removed. Do not reintroduce those concepts, and do not treat Blocker B as a
+prerequisite for the operator-driven update roadmap.
 
 ## Architecture source of truth
 
@@ -79,11 +108,18 @@ Read and follow these documents before architecture or implementation work:
 - `docs/architecture/adr/0001-resource-identity-incarnation.md`
 - `docs/architecture/adr/0002-proxmox-discovery-reconciliation.md`
 
-ADRs 0003-0006 are equally ACCEPTED and equally binding, but are **specialized**:
-read them when the work touches source attestation (0003), confirmed removal
-(0004), or workload continuity/trust (0005, 0006). "ACTIVE AUTHORITY" does not
-mean every agent reads every ADR for every task — see the task matrix in
-`docs/architecture/README.md`.
+ADR 0001 and ADR 0002 are the only ACCEPTED ADRs. ADRs 0003-0006 are SUPERSEDED
+and archived — see the table in `docs/architecture/README.md`.
+
+### When to write an ADR
+
+An ADR records a genuinely architectural, hard-to-reverse decision: a new
+persistence/authority owner, a new trust boundary, a new external mutation path.
+
+**ADR creation is not a prerequisite for ordinary implementation.** Package
+scanning, update plans, jobs, snapshots, healthchecks, and rollback do not need
+a new ADR merely because they touch a managed guest — they proceed under the
+accepted inventory architecture, this threat model, and the product rules above.
 
 ACCEPTED ADRs are the normative architecture contract. Do not weaken or bypass
 their fail-closed invariants without an explicit architecture change and review.
@@ -148,9 +184,9 @@ or any legacy 0.4 dependency, fallback, or dual-write path.
   binding generations, incarnation continuity, and terminal history must follow
   accepted ADR 0001 and ADR 0002. Never key retained inventory, policy, HA
   devices, or operations by VMID alone.
-- Security-sensitive identity, binding, revision, freshness, provenance, and
-  trust state must not be reconstructed optimistically after gaps, failures,
-  races, or restart. Missing or ambiguous evidence removes authority.
+- Identity, binding, revision, freshness, and provenance state must not be
+  reconstructed optimistically after gaps, failures, races, or restart. Missing
+  or ambiguous evidence fails closed rather than being guessed.
 - Discovery must not create or copy management/update policy, permissions,
   approvals, plans, jobs, or locks. Inventory selection and policy belong to the
   backend; do not encode CT-specific/manual profiles or hardcoded VMIDs as
@@ -189,7 +225,7 @@ Home Assistant
   not a reuse of the deleted file.) Validate every typed action and all identity, binding,
   revision, VMID, and optional snapshot arguments at the backend and independent
   hostd/forced-command boundary.
-- Keep bearer authentication on every `/api/v1` endpoint. Never commit API tokens,
+- Keep bearer authentication on every `/api/v1` and `/r0/v1` endpoint. Never commit API tokens,
   MQTT passwords, webhook IDs, SSH keys, production addresses, runtime databases,
   or logs. Never log authorization headers, bearer tokens, MQTT passwords,
   private keys, or webhook identifiers.

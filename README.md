@@ -7,17 +7,16 @@ the archive if that old source ever needs to be inspected again.
 
 The current release, **R0**, is a **read-only** runtime activation: real discovery
 against a real Proxmox source, a durable SQLite authority database, and a read-only HTTP
-API consumed by the native Home Assistant integration. It has no policy, jobs, mutation,
-endpoint activation/failover, or attestation enrollment automation, and no code path in
-this release can grant `security_continuity=trusted`. R0 has been merged into `main` and
-is implemented and constructible in this repository. It has since been installed and
+API consumed by the native Home Assistant integration. It has no policy, jobs, or
+mutation of any kind. R0 has been merged into `main` and is implemented and
+constructible in this repository. It has since been installed and
 genuinely exercised on a real Proxmox host through explicitly-authorized manual dogfood
 runs of the automated bootstrap, the first real Home Assistant enrollment passed its R0
 acceptance checks, the recommended observation window completed, and the scheduled
 2026-08-23 operator re-check passed every remaining observation. **The current R0
-operational decision is GO**, strictly read-only, mutation authority NONE. This closes
-only the read-only operational observation gate; Blocker B remains open. This
-repository's own automated tests/CI remain fully hermetic throughout — none of the
+operational decision is GO**, strictly read-only. This closes only the read-only
+operational observation gate. This repository's own automated tests/CI remain fully
+hermetic throughout — none of the
 real-host work was exercised by CI. See
 `docs/architecture/0.5-implementation-status.md` for current status and
 `docs/archive/project-history/0.5-r0-activation-chronology.md` for the full historical

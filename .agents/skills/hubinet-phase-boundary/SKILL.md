@@ -19,8 +19,9 @@ Read in this order:
    - `docs/architecture/0.5-foundation.md`;
    - `docs/architecture/0.5-inventory-model.md`;
    - ADR 0001 for resource identity/incarnation/binding;
-   - ADR 0002 for source discovery/reconciliation;
-   - ADR 0003/0004/0005 when the question touches source attestation, confirmed removal, or workload continuity.
+   - ADR 0002 for source discovery/reconciliation.
+
+   ADR 0003-0006 are SUPERSEDED and archived (`docs/archive/superseded-security-model/`); do not read them and do not reintroduce their concepts. The current threat model is in `AGENTS.md`, "Threat model".
 
 ## Current R0 backend ownership
 
@@ -38,18 +39,16 @@ This is not a contract/validation-only layer — it is real durable backend
 authority already exercised by production code and tests. Do not describe
 persistent Phase 1 inventory/discovery authority as absent; it exists.
 
-Two further durable mechanisms exist but are **functionally dormant**: source
-attestation (ADR 0003) and confirmed-removal (ADR 0004). R0's own call
-surface never invokes either, and ordinary discovery/polling never
-automatically attests, removes, or grants trust to a workload. Treat them as
-implemented-but-not-yet-authorized-for-this-use, not as nonexistent.
+The former source-attestation and dual-evidence confirmed-removal mechanisms
+have been **removed** along with the hostile-administrator threat model they
+served. There is no attestation, epoch, relationship gate, or Class-C removal
+surface in the backend any more; do not describe one as dormant, and do not
+add one back.
 
-Genuinely **not implemented** (deferred, not merely dormant): stored
-policy/effective-capability authority, maintenance approvals/plans/jobs/
-locks/audit, mutation authorization, automatic rollback authority, and final
-0.5 break-glass design. Workload/resource continuity trust ("Blocker B",
-ADR 0005) has accepted architecture but no implementation path yet — no
-stock-PVE evidence is sufficient to grant `security_continuity=trusted`.
+Genuinely **not implemented** (deferred): stored policy/effective-capability
+authority, package/update scanning, update plans, jobs, snapshots,
+healthchecks, and rollback. These are ordinary future implementation work
+under the accepted inventory architecture — not blocked on a security proof.
 
 Always confirm exact current status against
 `docs/architecture/0.5-implementation-status.md` before classifying a
@@ -148,14 +147,12 @@ Classify ambiguous work as exactly one of:
 - `BACKEND OWNED (R0)` — the responsibility already exists as durable backend
   authority (see "Current R0 backend ownership" above); HA must consume it
   from the published snapshot, not reimplement it locally;
-- `DEFERRED / DORMANT BACKEND OWNER` — needs durable backend history,
-  transactions, scheduling, or authority that either doesn't exist yet
-  (e.g. policy/jobs/mutation) or exists but is dormant/not authorized for
-  this use (e.g. source attestation, confirmed removal invoked outside R0's
-  own call surface);
+- `DEFERRED BACKEND OWNER` — needs durable backend history, transactions,
+  scheduling, or authority that doesn't exist yet (e.g. policy, package
+  scanning, update plans, jobs, snapshots, rollback);
 - `NEW ARCHITECTURAL DECISION` — ownership/semantics are not accepted yet.
 
 State which accepted document/status section supports the classification.
 
-Do not implement a `BACKEND OWNED (R0)` or `DEFERRED / DORMANT BACKEND OWNER`
+Do not implement a `BACKEND OWNED (R0)` or `DEFERRED BACKEND OWNER`
 requirement in HA merely because it is easy to code.
