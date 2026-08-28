@@ -77,6 +77,19 @@ SMOKE_DEPENDENCY_PATTERNS = (
     "AGENTS.md",
     ".github/workflows/bootstrap-smoke.yml",
 )
+SMOKE_FINGERPRINT_SELECTORS = (
+    "deploy/bootstrap-proxmox-0.5.sh",
+    "deploy/lib/",
+    "deploy/install-0.5.0-fresh.sh",
+    "deploy/hubinet-ops-0.5.service",
+    "requirements.txt",
+    "tests/_bootstrap_fake_pve.py",
+    "tests/test_bootstrap_proxmox_0_5_smoke.py",
+    "tests/shell/",
+    "scripts/validate_hermetic_shell_boundary.py",
+    "AGENTS.md",
+    ".github/workflows/bootstrap-smoke.yml",
+)
 
 pytestmark = pytest.mark.skipif(
     __import__("shutil").which("bash") is None, reason="bash is not available in this environment"
@@ -236,36 +249,47 @@ def _bootstrap_smoke_steps() -> dict[str, dict]:
     }
 
 
-def _ci_smoke_fingerprint_patterns() -> tuple[str, ...]:
-    key = _bootstrap_smoke_steps()["bootstrap-smoke-proof"]["with"]["key"]
-    match = re.fullmatch(
-        r"bootstrap-smoke-proof-v1-\$\{\{ hashFiles\((.*)\) \}\}",
-        key,
+def _ci_smoke_fingerprint_selectors() -> tuple[str, ...]:
+    run = _bootstrap_smoke_steps()["smoke-fingerprint"]["run"]
+    lines = run.splitlines()
+    start = lines.index("git ls-files -s -z -- \\")
+    selectors: list[str] = []
+    for line in lines[start + 1:]:
+        stripped = line.strip()
+        if stripped == '> "$manifest"':
+            break
+        assert stripped.endswith(" \\")
+        selectors.append(stripped.removesuffix(" \\"))
+    assert selectors, "Git fingerprint selector list is empty or unparsable"
+    return tuple(selectors)
+
+
+def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
     )
-    assert match is not None, "cache key must be exactly the versioned hashFiles fingerprint"
-    arguments = match.group(1)
-    patterns = tuple(re.findall(r"'([^']+)'", arguments))
-    assert arguments == ", ".join(f"'{pattern}'" for pattern in patterns)
-    return patterns
 
 
-def _content_surface_fingerprint(root: Path, patterns: tuple[str, ...]) -> str:
-    """Small deterministic model of the hashFiles content-addressing property."""
+def _git_manifest_fingerprint(repo: Path) -> str:
+    manifest = _git(repo, "ls-files", "-s", "-z", "--", *SMOKE_FINGERPRINT_SELECTORS).stdout
+    assert manifest, "test Git fingerprint manifest unexpectedly empty"
+    return hashlib.sha256(manifest).hexdigest()
 
-    matched: set[Path] = set()
-    for pattern in patterns:
-        if pattern.endswith("/**"):
-            base = root / pattern[:-3]
-            if base.is_dir():
-                matched.update(path for path in base.rglob("*") if path.is_file())
-            continue
-        matched.update(path for path in root.glob(pattern) if path.is_file())
 
-    files = sorted(matched, key=lambda path: path.relative_to(root).as_posix())
-    digest = hashlib.sha256()
-    for path in files:
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
-    return digest.hexdigest()
+def _init_git_fingerprint_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    _git(tmp_path, "init", "-q")
+    dependency = tmp_path / "deploy" / "lib" / "bootstrap-common.sh"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("shared bootstrap bytes\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text("stable selected bytes\n", encoding="utf-8")
+    docs_file = tmp_path / "docs" / "note.md"
+    docs_file.parent.mkdir()
+    docs_file.write_text("docs bytes\n", encoding="utf-8")
+    _git(tmp_path, "add", "--all")
+    return dependency, docs_file
 
 
 def test_ci_workflow_is_narrowly_path_scoped():
@@ -342,10 +366,49 @@ def test_ci_workflow_path_filter_covers_every_bootstrap_production_dependency():
     )
 
 
-def test_ci_workflow_fingerprint_covers_the_complete_trigger_surface():
-    paths, _triggers = _ci_workflow_pull_request_paths()
-    assert _ci_smoke_fingerprint_patterns() == SMOKE_DEPENDENCY_PATTERNS
-    assert _ci_smoke_fingerprint_patterns() == tuple(paths)
+def test_ci_workflow_git_fingerprint_covers_the_complete_trigger_surface():
+    assert _ci_smoke_fingerprint_selectors() == SMOKE_FINGERPRINT_SELECTORS
+
+    def _selected(path: str) -> bool:
+        return any(
+            path == selector or (selector.endswith("/") and path.startswith(selector))
+            for selector in SMOKE_FINGERPRINT_SELECTORS
+        )
+
+    actual_files: set[str] = set()
+    for pattern in SMOKE_DEPENDENCY_PATTERNS:
+        if pattern.endswith("/**"):
+            base = REPO_ROOT / pattern[:-3]
+            if base.is_dir():
+                actual_files.update(
+                    path.relative_to(REPO_ROOT).as_posix()
+                    for path in base.rglob("*")
+                    if path.is_file()
+                )
+            continue
+        actual_files.update(
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in REPO_ROOT.glob(pattern)
+            if path.is_file()
+        )
+    assert actual_files
+    assert not sorted(path for path in actual_files if not _selected(path))
+
+
+def test_ci_workflow_git_fingerprint_fails_closed():
+    fingerprint = _bootstrap_smoke_steps()["smoke-fingerprint"]
+    run = fingerprint["run"]
+
+    assert fingerprint["shell"] == "bash"
+    assert run.startswith("set -euo pipefail\n")
+    assert "git ls-files -s -z -- \\" in run
+    assert '> "$manifest"' in run
+    assert 'if [[ ! -s "$manifest" ]]' in run
+    assert 'sha256sum "$manifest"' in run
+    assert "awk '{print $1}'" in run
+    assert 'if [[ ! "$fingerprint" =~ ^[0-9a-f]{64}$ ]]' in run
+    assert 'echo "hash=$fingerprint" >> "$GITHUB_OUTPUT"' in run
+    assert "|| true" not in run
 
 
 def test_ci_workflow_cache_hit_skips_only_the_expensive_step():
@@ -359,6 +422,9 @@ def test_ci_workflow_cache_hit_skips_only_the_expensive_step():
 
     assert proof["uses"] == "actions/cache@v4"
     assert proof["with"]["path"] == ".bootstrap-smoke-proof"
+    assert proof["with"]["key"] == (
+        "bootstrap-smoke-proof-v2-${{ steps.smoke-fingerprint.outputs.hash }}"
+    )
     assert "restore-keys" not in proof["with"]
     assert sandbox["if"] == "steps.bootstrap-smoke-proof.outputs.cache-hit != 'true'"
     assert sandbox["run"] == "bash tests/shell/run_bootstrap_smoke_sandbox.sh"
@@ -409,25 +475,75 @@ def test_docs_only_success_cannot_precede_an_unresolved_relevant_smoke_proof():
     assert "restore-keys" not in steps["bootstrap-smoke-proof"]["with"]
 
 
-def test_dependency_move_outside_surface_changes_fingerprint_without_rename_parser(tmp_path):
-    dependency = tmp_path / "deploy" / "lib" / "bootstrap-example.sh"
-    dependency.parent.mkdir(parents=True)
-    dependency.write_text("dependency content\n", encoding="utf-8")
-    docs_file = tmp_path / "docs" / "note.md"
-    docs_file.parent.mkdir()
-    docs_file.write_text("first docs content\n", encoding="utf-8")
+def test_git_fingerprint_ignores_docs_only_change(tmp_path):
+    _dependency, docs_file = _init_git_fingerprint_fixture(tmp_path)
+    before = _git_manifest_fingerprint(tmp_path)
 
-    before = _content_surface_fingerprint(tmp_path, SMOKE_DEPENDENCY_PATTERNS)
-    docs_file.write_text("changed docs content\n", encoding="utf-8")
-    assert _content_surface_fingerprint(tmp_path, SMOKE_DEPENDENCY_PATTERNS) == before
+    docs_file.write_text("changed docs bytes\n", encoding="utf-8")
+    _git(tmp_path, "add", "--", "docs/note.md")
 
-    dependency.rename(tmp_path / "docs" / dependency.name)
-    assert _content_surface_fingerprint(tmp_path, SMOKE_DEPENDENCY_PATTERNS) != before
+    assert _git_manifest_fingerprint(tmp_path) == before
 
+
+def test_git_fingerprint_changes_for_byte_identical_rename_inside_deploy_lib(tmp_path):
+    dependency, _docs_file = _init_git_fingerprint_fixture(tmp_path)
+    before_bytes = dependency.read_bytes()
+    before = _git_manifest_fingerprint(tmp_path)
+
+    renamed = dependency.with_name("bootstrap-common2.sh")
+    _git(tmp_path, "mv", "--", "deploy/lib/bootstrap-common.sh", "deploy/lib/bootstrap-common2.sh")
+
+    assert renamed.read_bytes() == before_bytes
+    assert _git_manifest_fingerprint(tmp_path) != before
+
+
+def test_git_fingerprint_changes_for_relevant_content_modification(tmp_path):
+    dependency, _docs_file = _init_git_fingerprint_fixture(tmp_path)
+    before = _git_manifest_fingerprint(tmp_path)
+
+    dependency.write_text("modified bootstrap bytes\n", encoding="utf-8")
+    _git(tmp_path, "add", "--", "deploy/lib/bootstrap-common.sh")
+
+    assert _git_manifest_fingerprint(tmp_path) != before
+
+
+def test_git_fingerprint_changes_for_relevant_deletion_and_addition(tmp_path):
+    dependency, _docs_file = _init_git_fingerprint_fixture(tmp_path)
+    before = _git_manifest_fingerprint(tmp_path)
+
+    dependency.unlink()
+    _git(tmp_path, "add", "--all")
+    after_deletion = _git_manifest_fingerprint(tmp_path)
+    assert after_deletion != before
+
+    added = dependency.with_name("bootstrap-added.sh")
+    added.write_text("new bootstrap bytes\n", encoding="utf-8")
+    _git(tmp_path, "add", "--", "deploy/lib/bootstrap-added.sh")
+    assert _git_manifest_fingerprint(tmp_path) != after_deletion
+
+
+def test_git_fingerprint_changes_for_relevant_git_mode_change(tmp_path):
+    _dependency, _docs_file = _init_git_fingerprint_fixture(tmp_path)
+    before = _git_manifest_fingerprint(tmp_path)
+
+    _git(tmp_path, "update-index", "--chmod=+x", "deploy/lib/bootstrap-common.sh")
+
+    assert _git_manifest_fingerprint(tmp_path) != before
+
+
+def test_ci_workflow_has_no_obsolete_delta_or_path_blind_proof_logic():
     workflow_text = CI_WORKFLOW.read_text(encoding="utf-8")
+    smoke = _bootstrap_smoke_job()
+
+    assert "hashFiles" not in workflow_text
+    assert "bootstrap-smoke-proof-v1-" not in workflow_text
     assert "EVENT_BEFORE" not in workflow_text
     assert "EVENT_AFTER" not in workflow_text
     assert "git diff" not in workflow_text
+    assert "--name-status" not in workflow_text
+    assert "needs" not in smoke
+    assert "needs." not in workflow_text
+    assert ".result" not in workflow_text
 
 
 def test_sandbox_runner_fails_closed_outside_ephemeral_ci():

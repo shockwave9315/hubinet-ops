@@ -10,8 +10,9 @@ name: Bootstrap Smoke (Sandbox)
 #
 # The pull_request.paths list below is deliberately a COARSE trigger over the
 # complete PR diff. Every triggered head runs the bootstrap-smoke job. The job
-# hashes the complete smoke dependency surface and reuses only an exact
-# successful proof for that content; a cache miss runs the full Docker sandbox.
+# hashes a Git-native manifest of the complete smoke dependency surface and
+# reuses only an exact successful proof for those paths, modes, and contents; a
+# cache miss runs the full Docker sandbox.
 #
 # Job-level concurrency cancels an older run for the same PR/ref. A cancelled
 # miss cannot publish actions/cache's success-only post-job proof, so a newer
@@ -21,8 +22,8 @@ name: Bootstrap Smoke (Sandbox)
 #
 # Path coverage rule (P2-1, third pass): every file whose change can
 # materially change the bootstrap execution the sandbox smoke matrix exercises
-# must be listed here AND in the hashFiles(...) fingerprint below. The
-# local-safe regression tests check both surfaces stay complete and identical.
+# must be listed here and covered by the Git manifest selectors below. The
+# local-safe regression tests check both surfaces remain complete.
 # "deploy/lib/hubinet-ops-bootstrap-*.py" is a GLOB covering the whole
 # family of python3 helpers the bootstrap pushes into and runs inside the CT.
 # deploy/install-0.5.0-fresh.sh and deploy/hubinet-ops-0.5.service are included
@@ -69,6 +70,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Compute path-sensitive bootstrap-smoke fingerprint
+        id: smoke-fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          manifest="$RUNNER_TEMP/bootstrap-smoke-git-manifest"
+          git ls-files -s -z -- \
+            deploy/bootstrap-proxmox-0.5.sh \
+            deploy/lib/ \
+            deploy/install-0.5.0-fresh.sh \
+            deploy/hubinet-ops-0.5.service \
+            requirements.txt \
+            tests/_bootstrap_fake_pve.py \
+            tests/test_bootstrap_proxmox_0_5_smoke.py \
+            tests/shell/ \
+            scripts/validate_hermetic_shell_boundary.py \
+            AGENTS.md \
+            .github/workflows/bootstrap-smoke.yml \
+            > "$manifest"
+
+          if [[ ! -s "$manifest" ]]; then
+            echo "bootstrap-smoke fingerprint manifest is empty" >&2
+            exit 1
+          fi
+
+          fingerprint="$(sha256sum "$manifest" | awk '{print $1}')"
+          if [[ ! "$fingerprint" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "bootstrap-smoke fingerprint is invalid" >&2
+            exit 1
+          fi
+          echo "hash=$fingerprint" >> "$GITHUB_OUTPUT"
+
       # actions/cache saves a miss only from its post-job hook after the job has
       # completed successfully. Failed or cancelled smoke runs publish no proof.
       - name: Restore exact successful bootstrap-smoke proof
@@ -76,7 +110,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .bootstrap-smoke-proof
-          key: bootstrap-smoke-proof-v1-${{ hashFiles('deploy/bootstrap-proxmox-0.5.sh', 'deploy/lib/bootstrap-*.sh', 'deploy/lib/hubinet-ops-bootstrap-*.py', 'deploy/install-0.5.0-fresh.sh', 'deploy/hubinet-ops-0.5.service', 'requirements.txt', 'tests/_bootstrap_fake_pve.py', 'tests/test_bootstrap_proxmox_0_5_smoke.py', 'tests/shell/**', 'scripts/validate_hermetic_shell_boundary.py', 'AGENTS.md', '.github/workflows/bootstrap-smoke.yml') }}
+          key: bootstrap-smoke-proof-v2-${{ steps.smoke-fingerprint.outputs.hash }}
 
       - name: Run the one whole bootstrap smoke matrix through the compliant sandbox
         id: bootstrap-smoke
