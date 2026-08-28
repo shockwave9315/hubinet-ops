@@ -178,6 +178,77 @@ def _command(
     return result
 
 
+def _local_node(runner: Runner) -> str:
+    """Ask this PVE node's own trusted local state who it is.
+
+    Uses ``/cluster/status``, the same authoritative source the backend's
+    discovery provider already uses to derive local node identity (see
+    ``app/inventory/provider.py``), so no new trust source is introduced.
+    """
+
+    result = _command(
+        runner,
+        ("pvesh", "get", "/cluster/status", "--output-format", "json"),
+        max_output=1 * 1024 * 1024,
+    )
+    if result.returncode != 0:
+        raise ScanError("execution_failed", "could not read local PVE cluster status")
+    try:
+        rows = json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ScanError("execution_failed", "local PVE cluster status was malformed") from exc
+    if not isinstance(rows, list):
+        raise ScanError("execution_failed", "local PVE cluster status was malformed")
+    local_nodes = [
+        row.get("name")
+        for row in rows
+        if isinstance(row, Mapping)
+        and row.get("type") == "node"
+        and row.get("local") in (1, True)
+    ]
+    if (
+        len(local_nodes) != 1
+        or not isinstance(local_nodes[0], str)
+        or not NODE_RE.fullmatch(local_nodes[0])
+    ):
+        raise ScanError("execution_failed", "local PVE node identity is ambiguous")
+    return local_nodes[0]
+
+
+def _run_guest_command(
+    runner: Runner,
+    vmid: int,
+    expected_node: str,
+    local_node: str,
+    tail: tuple[str, ...],
+    *,
+    max_output: int = MAX_COMMAND_OUTPUT_BYTES,
+) -> CommandResult:
+    """Run one fixed ``pct exec`` shape on whichever node currently holds it.
+
+    ``tail`` is always one of this file's own fixed argv shapes. When the
+    guest is local, it runs directly. Otherwise it is routed to the expected
+    cluster member over root's existing passwordless inter-node SSH trust
+    that Proxmox itself provisions on cluster join/migration -- no new
+    Hubinet credential is provisioned on that node. The remote command is
+    still built only from fixed constants plus the validated integer VMID;
+    no request-provided or arbitrary text ever reaches it.
+    """
+
+    inner = ("pct", "exec", str(vmid), "--", *tail)
+    if expected_node == local_node:
+        return _command(runner, inner, max_output=max_output)
+    argv = (
+        "ssh",
+        "-T",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        f"root@{expected_node}",
+        shlex.join(inner),
+    )
+    return _command(runner, argv, max_output=max_output)
+
+
 def _current_target(
     runner: Runner, vmid: int, expected_node: str
 ) -> None:
@@ -257,10 +328,12 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
     os_release = ""
     os_id = os_version = None
     try:
+        local_node = _local_node(runner)
+
         _current_target(runner, vmid, expected_node)
-        os_result = _command(
-            runner,
-            ("pct", "exec", str(vmid), "--", "env", "LC_ALL=C", "cat", "/etc/os-release"),
+        os_result = _run_guest_command(
+            runner, vmid, expected_node, local_node,
+            ("env", "LC_ALL=C", "cat", "/etc/os-release"),
             max_output=64 * 1024,
         )
         os_release, _ = _decode_output(os_result)
@@ -269,10 +342,10 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         os_id, os_version = _parse_os_release(os_release)
 
         _current_target(runner, vmid, expected_node)
-        update = _command(
-            runner,
+        update = _run_guest_command(
+            runner, vmid, expected_node, local_node,
             (
-                "pct", "exec", str(vmid), "--", "env", "LC_ALL=C",
+                "env", "LC_ALL=C",
                 "DEBIAN_FRONTEND=noninteractive", "apt-get", "update", "-qq",
             ),
         )
@@ -281,10 +354,10 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
             raise _package_failure("metadata_refresh", update_stderr)
 
         _current_target(runner, vmid, expected_node)
-        simulation = _command(
-            runner,
+        simulation = _run_guest_command(
+            runner, vmid, expected_node, local_node,
             (
-                "pct", "exec", str(vmid), "--", "env", "LC_ALL=C",
+                "env", "LC_ALL=C",
                 "DEBIAN_FRONTEND=noninteractive", "apt-get", "-s", "upgrade",
             ),
         )
@@ -293,9 +366,9 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
             raise _package_failure("simulation", simulation_stderr)
 
         _current_target(runner, vmid, expected_node)
-        reboot = _command(
-            runner,
-            ("pct", "exec", str(vmid), "--", "test", "-e", "/var/run/reboot-required"),
+        reboot = _run_guest_command(
+            runner, vmid, expected_node, local_node,
+            ("test", "-e", "/var/run/reboot-required"),
             max_output=4096,
         )
         reboot_required = True if reboot.returncode == 0 else None

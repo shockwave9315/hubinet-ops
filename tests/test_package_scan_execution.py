@@ -129,11 +129,11 @@ def test_package_manager_busy_has_distinct_classification() -> None:
     ) is PackageScanFailure.METADATA_REFRESH_FAILED
 
 
-def _request(*, vmid=101, operation="scan_packages"):
+def _request(*, vmid=101, operation="scan_packages", expected_node="pve-a"):
     return {
         "request_version": 1,
         "operation": operation,
-        "target": {"vmid": vmid, "expected_node": "pve-a"},
+        "target": {"vmid": vmid, "expected_node": expected_node},
         "context": {
             "scan_run_id": str(uuid.uuid4()),
             "resource_id": str(uuid.uuid4()),
@@ -151,52 +151,85 @@ class FakeHelperRunner:
         resource_type: str = "lxc",
         status: str = "running",
         node: str = "pve-a",
+        local_node: str = "pve-a",
+        migrate_after_checks: int | None = None,
+        migrate_to_node: str = "pve-c",
         os_release: str = 'ID=debian\nVERSION_ID="12"\n',
         update_returncode: int = 0,
         update_stderr: str = "",
         simulation_returncode: int = 0,
         simulation_stderr: str = "",
+        remote_returncode: int | None = None,
+        remote_stderr: str = "",
         timed_out_command: str | None = None,
     ) -> None:
         self.resource_type = resource_type
         self.status = status
         self.node = node
+        self.local_node = local_node
+        self.migrate_after_checks = migrate_after_checks
+        self.migrate_to_node = migrate_to_node
         self.os_release = os_release
         self.update_returncode = update_returncode
         self.update_stderr = update_stderr
         self.simulation_returncode = simulation_returncode
         self.simulation_stderr = simulation_stderr
+        self.remote_returncode = remote_returncode
+        self.remote_stderr = remote_stderr
         self.timed_out_command = timed_out_command
         self.calls: list[tuple[str, ...]] = []
+        self._target_checks = 0
 
     def __call__(self, argv, _timeout, _max_output):
         self.calls.append(argv)
         rendered = " ".join(argv)
         if self.timed_out_command and self.timed_out_command in rendered:
             return helper.CommandResult(-9, b"", b"", timed_out=True)
-        if argv[0] == "pvesh":
+        if argv[0] == "pvesh" and argv[2] == "/cluster/status":
+            rows = [
+                {
+                    "type": "node",
+                    "name": self.local_node,
+                    "local": 1,
+                    "nodeid": 0,
+                    "online": 1,
+                }
+            ]
+            return helper.CommandResult(0, json.dumps(rows).encode(), b"")
+        if argv[0] == "pvesh" and argv[2] == "/cluster/resources":
+            self._target_checks += 1
+            current_node = self.node
+            if (
+                self.migrate_after_checks is not None
+                and self._target_checks > self.migrate_after_checks
+            ):
+                current_node = self.migrate_to_node
             rows = [
                 {
                     "vmid": 101,
                     "type": self.resource_type,
-                    "node": self.node,
+                    "node": current_node,
                     "status": self.status,
                 }
             ]
             return helper.CommandResult(0, json.dumps(rows).encode(), b"")
-        if argv[-1] == "/etc/os-release":
+        if self.remote_returncode is not None and argv[0] == "ssh":
+            return helper.CommandResult(
+                self.remote_returncode, b"", self.remote_stderr.encode()
+            )
+        if "/etc/os-release" in rendered:
             return helper.CommandResult(0, self.os_release.encode(), b"")
-        if "update" in argv:
+        if "update" in rendered and "apt-get" in rendered:
             return helper.CommandResult(
                 self.update_returncode, b"", self.update_stderr.encode()
             )
-        if "upgrade" in argv:
+        if "upgrade" in rendered:
             return helper.CommandResult(
                 self.simulation_returncode,
                 ZERO_SIMULATION.encode(),
                 self.simulation_stderr.encode(),
             )
-        if "/var/run/reboot-required" in argv:
+        if "/var/run/reboot-required" in rendered:
             return helper.CommandResult(1, b"", b"")
         raise AssertionError(f"unexpected command shape: {argv!r}")
 
@@ -255,6 +288,84 @@ def test_helper_classifies_ordinary_failures(runner, classification: str) -> Non
     assert response["error"]["classification"] == classification
     assert "stdout" not in response["error"]
     assert "stderr" not in response["error"]
+
+
+def test_helper_runs_local_node_lxc_directly_without_ssh() -> None:
+    runner = FakeHelperRunner(node="pve-a", local_node="pve-a")
+    response = helper.handle_request(_request(expected_node="pve-a"), runner=runner)
+    assert response["ok"] is True
+    assert not any(call[0] == "ssh" for call in runner.calls)
+    assert any(call[0] == "pct" and call[1] == "exec" for call in runner.calls)
+
+
+def test_helper_routes_remote_node_lxc_execution_over_cluster_ssh() -> None:
+    # The bootstrap/entry PVE node is pve-a, but the LXC's expected (and
+    # cluster-resources-confirmed) node is pve-b. Every fixed pct exec shape
+    # must be routed to pve-b rather than run locally on pve-a.
+    runner = FakeHelperRunner(node="pve-b", local_node="pve-a")
+    response = helper.handle_request(_request(expected_node="pve-b"), runner=runner)
+    assert response["ok"] is True
+    assert not any(call[0] == "pct" for call in runner.calls)
+    ssh_calls = [call for call in runner.calls if call[0] == "ssh"]
+    assert len(ssh_calls) == 4
+    for call in ssh_calls:
+        assert call[-2] == "root@pve-b"
+        assert "BatchMode=yes" in call
+        assert "StrictHostKeyChecking=yes" in call
+        remote_command = call[-1]
+        assert remote_command.startswith("pct exec 101 --")
+        assert "eval" not in remote_command
+    assert any("apt-get update -qq" in call[-1] for call in ssh_calls)
+    assert any("apt-get -s upgrade" in call[-1] for call in ssh_calls)
+
+
+def test_helper_migration_between_validations_fails_closed_never_success() -> None:
+    # The guest starts on the expected node but migrates to a third node
+    # partway through the fixed operation sequence. The stale-target check
+    # that precedes every guest operation must catch this and stop the scan
+    # rather than let a later step commit success against the wrong node.
+    runner = FakeHelperRunner(
+        node="pve-b",
+        local_node="pve-a",
+        migrate_after_checks=1,
+        migrate_to_node="pve-c",
+    )
+    response = helper.handle_request(_request(expected_node="pve-b"), runner=runner)
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "stale_target"
+    # Only the first (os-release) guest command should have been attempted.
+    assert sum(1 for call in runner.calls if call[0] == "ssh") == 1
+
+
+def test_helper_remote_node_transport_failure_is_reported_never_zero() -> None:
+    runner = FakeHelperRunner(
+        node="pve-b",
+        local_node="pve-a",
+        remote_returncode=255,
+        remote_stderr="ssh: connect to host pve-b port 22: Connection refused",
+    )
+    response = helper.handle_request(_request(expected_node="pve-b"), runner=runner)
+    assert response["ok"] is False
+    assert response["error"]["classification"] != ""
+    assert response["error"]["classification"] in {
+        "unsupported_os",
+        "metadata_refresh_failed",
+        "package_manager_busy",
+        "simulation_failed",
+    }
+
+
+def test_helper_rejects_expected_node_with_shell_metacharacters() -> None:
+    for hostile in (
+        "pve-a; rm -rf /",
+        "pve-a && evil",
+        "$(evil)",
+        "-oProxyCommand=evil",
+        "pve a",
+        "pve-a\nrm -rf /",
+    ):
+        with pytest.raises(helper.RequestError, match="expected_node"):
+            helper.validate_request(_request(expected_node=hostile))
 
 
 def _scan_run() -> PackageScanRun:

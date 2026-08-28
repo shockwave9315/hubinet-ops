@@ -58,10 +58,15 @@ describes how to reach a Proxmox **source**. It never enumerates workloads.
 reads the validated runtime interval (default six hours), issues durable
 per-resource scan ownership through `InventoryAuthority`, and scans only
 current LXC resources. `app/package_scan_host_control.py` sends one bounded JSON
-request over a dedicated pinned-key SSH connection. The PVE forced helper
-accepts only `scan_packages`, rechecks live type/node/status, and uses fixed
-`pct exec` shapes for OS inspection, `apt-get update -qq`, `apt-get -s upgrade`,
-and the reboot-required marker. QEMU is published as unsupported.
+request over a dedicated pinned-key SSH connection to the bootstrap PVE node.
+The PVE forced helper accepts only `scan_packages`, rechecks live type/node/
+status before each fixed operation, and uses fixed `pct exec` shapes for OS
+inspection, `apt-get update -qq`, `apt-get -s upgrade`, and the
+reboot-required marker. The cluster is multi-node: when the guest's validated
+current node differs from the PVE node the helper is running on, it routes
+that same fixed `pct exec` shape to the guest's node over root's existing
+Proxmox cluster-member SSH trust rather than executing locally — no per-node
+Hubinet credential. QEMU is published as unsupported.
 
 ## Identity
 
