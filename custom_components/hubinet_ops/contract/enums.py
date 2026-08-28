@@ -96,3 +96,13 @@ class SourceHealthOrigin(StrEnum):
     CONTROLLED_CONTEXT_TRANSITION = "controlled_context_transition"
     TIME_EXPIRY = "time_expiry"
     INITIAL = "initial"
+
+
+class PackageScanStatus(StrEnum):
+    UNSUPPORTED = "unsupported"
+    NOT_SCANNED = "not_scanned"
+    SCANNING = "scanning"
+    SUCCESS = "success"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    UNAVAILABLE = "unavailable"

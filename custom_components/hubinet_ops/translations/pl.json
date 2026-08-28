@@ -58,7 +58,11 @@
       "resource_lifecycle": {"name": "Cykl życia"},
       "resource_observational_continuity": {"name": "Ciągłość obserwacyjna"},
       "resource_security_continuity": {"name": "Ciągłość bezpieczeństwa"},
-      "resource_type": {"name": "Typ"}
+      "resource_type": {"name": "Typ"},
+      "resource_package_scan_status": {"name": "Stan skanowania pakietów"},
+      "resource_pending_updates": {"name": "Oczekujące aktualizacje"},
+      "resource_last_package_scan": {"name": "Ostatnie skanowanie pakietów"},
+      "resource_reboot_required": {"name": "Wymagany restart"}
     }
   },
   "exceptions": {

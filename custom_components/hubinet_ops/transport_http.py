@@ -37,6 +37,11 @@ from .api import (
     NodeAvailability,
     NodeSnapshot,
     ObservationalContinuity,
+    PackageScanError,
+    PackageScanOs,
+    PackageScanPackage,
+    PackageScanSnapshot,
+    PackageScanStatus,
     PresenceState,
     ResourceSnapshot,
     ResourceStateLevel,
@@ -117,6 +122,46 @@ def _node_snapshot(payload: Mapping[str, Any]) -> NodeSnapshot:
     )
 
 
+def _package_scan_snapshot(payload: Mapping[str, Any]) -> PackageScanSnapshot:
+    os_payload = payload.get("os")
+    error_payload = payload.get("error")
+    return PackageScanSnapshot(
+        status=PackageScanStatus(payload["status"]),
+        scan_run_id=payload.get("scan_run_id"),
+        started_at=payload.get("started_at"),
+        completed_at=payload.get("completed_at"),
+        os=(
+            PackageScanOs(
+                os_id=str(os_payload["id"]), version=str(os_payload["version"])
+            )
+            if isinstance(os_payload, Mapping)
+            else None
+        ),
+        pending_count=payload.get("pending_count"),
+        plan_fingerprint=payload.get("plan_fingerprint"),
+        reboot_required=payload.get("reboot_required"),
+        packages=tuple(
+            PackageScanPackage(
+                name=str(package["name"]),
+                installed_version=str(package["installed_version"]),
+                candidate_version=str(package["candidate_version"]),
+                origin=package.get("origin"),
+                description=package.get("description"),
+                security=package.get("security"),
+            )
+            for package in payload.get("packages", ())
+        ),
+        error=(
+            PackageScanError(
+                classification=str(error_payload["classification"]),
+                message=str(error_payload["message"]),
+            )
+            if isinstance(error_payload, Mapping)
+            else None
+        ),
+    )
+
+
 def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
     return ResourceSnapshot(
         resource_id=str(payload["resource_id"]),
@@ -146,6 +191,7 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
         # JSON has no frozenset type -- explicit conversion (mismatch 2).
         effective_capabilities=frozenset(payload.get("effective_capabilities") or ()),
         state=payload.get("state") or {},
+        package_scan=_package_scan_snapshot(payload["package_scan"]),
         termination_reason=payload.get("termination_reason"),
         successor_resource_id=payload.get("successor_resource_id"),
     )

@@ -22,6 +22,7 @@ from .api import (
     InventorySourceSnapshot,
     NodeAvailability,
     NodeSnapshot,
+    PackageScanStatus,
     PresenceState,
     ResourceSnapshot,
 )
@@ -57,6 +58,9 @@ class HubinetOpsResourceSensorDescription(SensorEntityDescription):
     requires_current_source: bool = False
     requires_detail: bool = False
     requires_node: bool = False
+    requires_package_scan_success: bool = False
+    requires_package_scan_completed: bool = False
+    requires_reboot_known: bool = False
 
 
 SOURCE_SENSORS = (
@@ -147,6 +151,35 @@ RESOURCE_SENSORS = (
         translation_key="resource_security_continuity",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda resource: resource.security_continuity.value,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="package_scan_status",
+        translation_key="resource_package_scan_status",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda resource: resource.package_scan.status.value,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="pending_updates",
+        translation_key="resource_pending_updates",
+        value_fn=lambda resource: resource.package_scan.pending_count,
+        requires_current_source=True,
+        requires_package_scan_success=True,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="last_package_scan",
+        translation_key="resource_last_package_scan",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda resource: resource.package_scan.completed_at,
+        requires_package_scan_completed=True,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="reboot_required",
+        translation_key="resource_reboot_required",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda resource: resource.package_scan.reboot_required,
+        requires_current_source=True,
+        requires_package_scan_success=True,
+        requires_reboot_known=True,
     ),
 )
 
@@ -266,6 +299,16 @@ class HubinetOpsResourceSensor(HubinetOpsResourceEntity, SensorEntity):
             or resource.node_availability is not NodeAvailability.AVAILABLE
         ):
             return False
+        package_scan = resource.package_scan
+        if (
+            description.requires_package_scan_success
+            and package_scan.status is not PackageScanStatus.SUCCESS
+        ):
+            return False
+        if description.requires_package_scan_completed and package_scan.completed_at is None:
+            return False
+        if description.requires_reboot_known and package_scan.reboot_required is None:
+            return False
         return True
 
     @property
@@ -289,4 +332,8 @@ class HubinetOpsResourceSensor(HubinetOpsResourceEntity, SensorEntity):
             "node_availability": resource.node_availability.value,
             "source_health": source.health.value,
             "source_freshness": source.freshness.value,
+            "package_scan_status": resource.package_scan.status.value,
+            "package_scan_run_id": resource.package_scan.scan_run_id,
+            "package_scan_completed_at": resource.package_scan.completed_at,
+            "package_plan_fingerprint": resource.package_scan.plan_fingerprint,
         }

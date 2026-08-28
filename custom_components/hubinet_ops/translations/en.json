@@ -58,7 +58,11 @@
       "resource_lifecycle": {"name": "Lifecycle"},
       "resource_observational_continuity": {"name": "Observational continuity"},
       "resource_security_continuity": {"name": "Security continuity"},
-      "resource_type": {"name": "Type"}
+      "resource_type": {"name": "Type"},
+      "resource_package_scan_status": {"name": "Package scan status"},
+      "resource_pending_updates": {"name": "Pending updates"},
+      "resource_last_package_scan": {"name": "Last package scan"},
+      "resource_reboot_required": {"name": "Reboot required"}
     }
   },
   "exceptions": {

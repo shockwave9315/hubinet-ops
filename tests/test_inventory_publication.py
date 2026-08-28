@@ -50,9 +50,14 @@ from custom_components.hubinet_ops.contract.models import (
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     NodeSnapshot,
+    PackageScanError,
+    PackageScanOs,
+    PackageScanPackage,
+    PackageScanSnapshot,
     ResourceSnapshot,
     SourceContext,
 )
+from custom_components.hubinet_ops.contract.enums import PackageScanStatus
 
 
 START = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
@@ -102,6 +107,7 @@ def contract_snapshot(view) -> HubinetOpsSnapshot:
                     "node_availability": NodeAvailability(resource["node_availability"]),
                     "state_level": ResourceStateLevel(resource["state_level"]),
                     "effective_capabilities": frozenset(resource["effective_capabilities"]),
+                    "package_scan": _contract_package_scan(resource["package_scan"]),
                 }
             )
             for resource in view.resources
@@ -109,6 +115,24 @@ def contract_snapshot(view) -> HubinetOpsSnapshot:
         inventory_revision=view.inventory_revision,
         published_state_revision=view.published_state_revision,
         published_at=view.published_at,
+    )
+
+
+def _contract_package_scan(value) -> PackageScanSnapshot:
+    value = dict(value)
+    os_value = value["os"]
+    error_value = value["error"]
+    return PackageScanSnapshot(
+        status=PackageScanStatus(value["status"]),
+        scan_run_id=value["scan_run_id"],
+        started_at=value["started_at"],
+        completed_at=value["completed_at"],
+        os=PackageScanOs(str(os_value["id"]), str(os_value["version"])) if os_value else None,
+        pending_count=value["pending_count"],
+        plan_fingerprint=value["plan_fingerprint"],
+        reboot_required=value["reboot_required"],
+        packages=tuple(PackageScanPackage(**dict(package)) for package in value["packages"]),
+        error=PackageScanError(**dict(error_value)) if error_value else None,
     )
 
 
