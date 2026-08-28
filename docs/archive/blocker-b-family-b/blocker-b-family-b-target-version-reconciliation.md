@@ -1,3 +1,12 @@
+> **ARCHIVED / SUPERSEDED RESEARCH — do not read by default.**
+> This document is part of the abandoned Family B / B-S1 task-history witness
+> path. B-S1 is **NO-GO** as the mutation-authority path, Experiment #13 was
+> never executed, and Blocker B remains **OPEN**. Nothing here is architecture
+> authority or a current roadmap. Read
+> `docs/archive/postmortems/blocker-b-family-b-13.md` first, and
+> `docs/archive/blocker-b-family-b/README.md` for why this is archived.
+> The original document text follows unchanged.
+
 # NON-NORMATIVE RESEARCH / EVIDENCE
 
 # Family B Research #2A.1 exact-target version reconciliation

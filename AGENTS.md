@@ -2,6 +2,56 @@
 
 These rules apply to every coding agent working in this repository.
 
+## Start here
+
+- `docs/architecture/README.md` — documentation index, authority hierarchy,
+  **default reading set**, task-to-document matrix, and archive policy. Read it
+  before opening any other architecture document.
+- `docs/product-intent.md` — the current product target and its hard rules.
+- `docs/architecture/0.5-implementation-status.md` — what is actually
+  implemented today.
+
+Read the minimum current material required for your task. Do not recursively
+read all architecture and research documents. Material under `docs/archive/` is
+historical, is authority for nothing, and must not be read by default or treated
+as a roadmap.
+
+## Current product intent (binding summary)
+
+The full statement is `docs/product-intent.md`. The rules below are binding and
+are not repeated in full here:
+
+```text
+STATIC 0.4.x -> PVE AUTODISCOVERY -> DYNAMIC BACKEND INVENTORY
+  -> DYNAMIC HOME ASSISTANT RESOURCES / UI -> SAFE OPERATOR-DRIVEN UPDATE WORKFLOW
+```
+
+- PVE autodiscovery and dynamic inventory: adding or removing a guest in Proxmox
+  must never require a repository or config change.
+- Dynamic Home Assistant representation follows the accepted lifecycle/
+  reconciliation model. A failed, partial, or unavailable scan is never deletion.
+- Automatic **read-only** update/package scanning is allowed; the operator is to
+  be shown exact package/update information (name, installed version, candidate
+  version, origin, description, and further metadata — including security
+  classification and reboot-required only where reliably establishable).
+- **NO AUTO-UPDATE.** Package installation always requires explicit operator
+  review and approval of the current update plan.
+- A material change to the plan after approval invalidates that approval: fail
+  closed and require approval of the new plan.
+- Every update run takes a fresh, job-owned pre-update snapshot; a job may roll
+  back only to **its own** snapshot; healthcheck then same-job controlled
+  rollback.
+- Automatic cleanup applies only to Hubinet-managed snapshots. Manual/operator
+  snapshots are never touched by generic Hubinet retention.
+- Persistent workload-incarnation proof (Blocker B) is **not** silently assumed
+  solved; it remains OPEN, and it must never silently transfer long-lived
+  destructive authority from a destroyed occupant to its replacement.
+- **Family B / B-S1 is not the current implementation path.** See
+  `docs/archive/postmortems/blocker-b-family-b-13.md`.
+
+None of the unimplemented items above is authorized to begin. Each needs its own
+accepted architecture first (`.agents/skills/hubinet-architecture-change`).
+
 ## Architecture source of truth
 
 Read and follow these documents before architecture or implementation work:
@@ -10,6 +60,12 @@ Read and follow these documents before architecture or implementation work:
 - `docs/architecture/0.5-inventory-model.md`
 - `docs/architecture/adr/0001-resource-identity-incarnation.md`
 - `docs/architecture/adr/0002-proxmox-discovery-reconciliation.md`
+
+ADRs 0003-0006 are equally ACCEPTED and equally binding, but are **specialized**:
+read them when the work touches source attestation (0003), confirmed removal
+(0004), or workload continuity/trust (0005, 0006). "ACTIVE AUTHORITY" does not
+mean every agent reads every ADR for every task — see the task matrix in
+`docs/architecture/README.md`.
 
 ACCEPTED ADRs are the normative architecture contract. Do not weaken or bypass
 their fail-closed invariants without an explicit architecture change and review.
@@ -52,6 +108,12 @@ or any legacy 0.4 dependency, fallback, or dual-write path.
 - For detailed repository review procedure, use
   `.agents/skills/hubinet-contract-review/SKILL.md`; skills are procedures and do
   not override accepted ADRs or this repository-wide review boundary.
+- Acceptance is a ratchet, not immunity. Committed artifacts are immutable
+  historical facts and are never rewritten to look unaccepted; an accepted
+  document may still be explicitly superseded or revoked when a concrete later
+  witness falsifies a load-bearing claim, at which point dependent work stops and
+  reassesses and the superseded material is clearly indexed as historical. The
+  full rule is `docs/architecture/README.md` section 7.
 
 ## Authority, identity, and discovery
 
@@ -113,9 +175,19 @@ Home Assistant
   MQTT passwords, webhook IDs, SSH keys, production addresses, runtime databases,
   or logs. Never log authorization headers, bearer tokens, MQTT passwords,
   private keys, or webhook identifiers.
-- Updates require explicit backend policy and manual plan approval. Automatic
-  rollback additionally requires an existing eligible snapshot and explicit
-  `automatic_rollback` policy for the exact resource incarnation.
+- **NO AUTO-UPDATE.** Package/update *scanning* may run automatically, but only
+  read-only; *installing* updates requires explicit backend policy and explicit
+  operator review and approval of the current update plan. A material change to
+  the plan after approval invalidates that approval — fail closed and require
+  approval of the new plan. Never treat "N updates available" as permission to
+  install them. Automatic rollback additionally requires an existing eligible
+  snapshot and explicit `automatic_rollback` policy for the exact resource
+  incarnation.
+- A pre-update snapshot is created by, owned by, and named for the job that
+  creates it, on the actual current PVE guest; a job may roll back only to its
+  own recovery snapshot, never to an arbitrary earlier one. Generic Hubinet
+  snapshot retention/cleanup applies only to Hubinet-managed snapshots and never
+  deletes a manually created or operator-owned snapshot.
 - Manual update rollback requires `manual_rollback_allowed` plus a failed,
   blocked, or interrupted update operation and its recorded eligible snapshot.
 - Normal explicit snapshot restore remains backend-authoritative and requires all

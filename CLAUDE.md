@@ -32,6 +32,37 @@ boundary, fail-closed security invariants, test boundaries). This CLAUDE.md summ
 where things live and how to run things; `AGENTS.md` and the ACCEPTED architecture docs
 below are the actual authority and take precedence over anything here.
 
+**`docs/architecture/README.md` is the documentation entry point** — authority
+hierarchy, the default reading set, the task-to-document matrix, the archive policy, and
+the acceptance/supersession ratchet rule. Read the minimum current material your task
+needs; do not recursively read all architecture and research documents. Anything under
+`docs/archive/` is historical, is authority for nothing, and must not be read by default
+or treated as a roadmap.
+
+## Current product intent
+
+Full statement: `docs/product-intent.md`. Binding summary (also in `AGENTS.md`):
+
+```text
+STATIC 0.4.x -> PVE AUTODISCOVERY -> DYNAMIC BACKEND INVENTORY
+  -> DYNAMIC HOME ASSISTANT RESOURCES / UI -> SAFE OPERATOR-DRIVEN UPDATE WORKFLOW
+```
+
+PVE autodiscovery, dynamic backend inventory, and dynamic Home Assistant representation
+are implemented today, strictly read-only. The remaining product surface — read-only
+package/update scanning and presentation, operator-approved update plans, job-owned
+pre-update snapshots, health checks, and same-job rollback — is **not implemented and not
+authorized to begin**; each piece needs its own accepted architecture first.
+
+Hard rules: automatic package/update **scanning** is allowed but must be read-only; the
+operator sees exact package/update detail; **NO AUTO-UPDATE** — installing updates always
+requires explicit operator review and approval of the current plan; a material plan change
+after approval invalidates that approval; each run takes a fresh job-owned pre-update
+snapshot and may roll back only to its own; retention touches only Hubinet-managed
+snapshots, never operator snapshots; persistent workload-incarnation proof (Blocker B)
+remains **OPEN** and is not assumed solved; **Family B / B-S1 is not the current
+implementation path** (`docs/archive/postmortems/blocker-b-family-b-13.md`).
+
 Normative 0.5 architecture, in order of authority:
 1. `docs/architecture/adr/0001-resource-identity-incarnation.md` (ACCEPTED)
 2. `docs/architecture/adr/0002-proxmox-discovery-reconciliation.md` (ACCEPTED)
@@ -39,16 +70,28 @@ Normative 0.5 architecture, in order of authority:
 4. `docs/architecture/adr/0004-confirmed-removal-operator-absence.md` (ACCEPTED)
 5. `docs/architecture/adr/0005-workload-continuity-enrollment.md` (ACCEPTED — negative
    stock-PVE trust boundary and R0 safety decision only; does not authorize mutation)
-6. `docs/architecture/0.5-foundation.md` (ACCEPTED — Phase 0 decisions; partly in Polish)
-7. `docs/architecture/0.5-inventory-model.md` (ACCEPTED — materializes ADR 0001/0002)
-8. `docs/architecture/0.5-r0-read-only-runtime-activation.md` — the R0 read-only runtime
-   activation design (19-item Phase 1 gate audit, composition-root/deployment decisions)
-9. `docs/operations/0.5-r0-operational-activation.md`,
-   `docs/operations/0.5-ha-clean-break.md` — the operational activation runbook and the
-   Home Assistant 0.4→0.5 clean-break/purge plan for a real deployed instance
-10. `docs/architecture/0.5-implementation-status.md` — current status, NOT an authority;
+6. `docs/architecture/adr/0006-workload-continuity-stronger-proof.md` (ACCEPTED —
+   negative/unresolved stronger-proof research record and normative requirements only;
+   selects no Blocker-B mechanism and authorizes no implementation)
+7. `docs/architecture/0.5-foundation.md` (ACCEPTED — Phase 0 decisions; partly in Polish)
+8. `docs/architecture/0.5-inventory-model.md` (ACCEPTED — materializes ADR 0001/0002)
+9. `docs/architecture/0.5-r0-read-only-runtime-activation.md` — the R0 read-only runtime
+   activation design (19-item Phase 1 gate audit, composition-root/deployment decisions).
+   Still an **active implementation contract**, not history: `app/inventory_runtime.py`,
+   `inventory_runtime_config.py`, `inventory_scheduler.py`, `inventory_pve_transport.py`,
+   `custom_components/hubinet_ops/transport_http.py`, `deploy/install-0.5.0-fresh.sh`,
+   `config/inventory.example.yaml` and seven test modules cite it by name and section
+10. `docs/operations/0.5-r0-operational-activation.md`,
+    `docs/operations/0.5-ha-clean-break.md` — the operational activation runbook and the
+    Home Assistant 0.4→0.5 clean-break/purge plan for a real deployed instance
+11. `docs/architecture/0.5-implementation-status.md` — current status, NOT an authority;
     if it conflicts with an ACCEPTED ADR, the ADR wins and the status doc must be
     corrected.
+
+ADRs 0003-0006 are equally ACCEPTED and equally binding, but **specialized**: read them
+when the work touches source attestation (0003), confirmed removal (0004), or workload
+continuity/trust (0005, 0006). "ACTIVE AUTHORITY" does not mean every agent reads every
+ADR for every task.
 
 Skills under `.agents/skills/` encode repo-specific procedures on top of these rules:
 `hubinet-contract-review` (review procedure), `hubinet-phase-boundary` (Phase 0 HA vs.
@@ -332,9 +375,16 @@ capability into any current module without an explicit activation/cutover review
   `test_bootstrap_proxmox_0_5_smoke.py` locally with the marker forced on and
   report it as merge-safety evidence — only a real run through the sandbox
   counts.
-- `docs/architecture/` — 0.5 ADRs and status (authority for 0.5 work; see above).
+- `docs/architecture/` — the documentation index (`README.md`), 0.5 ADRs, the inventory
+  model/foundation, the R0 activation design contract, and the current implementation
+  status (authority for 0.5 work; see above). `docs/architecture/research/` holds only
+  non-normative evidence an ACCEPTED ADR references.
   `docs/operations/` — the R0 operational activation runbook and HA clean-break/purge
   plan for a real deployed instance.
+  `docs/product-intent.md` — the operator-stated current product target.
+  `docs/archive/` — **non-authoritative history**: superseded Family B / B-S1 research,
+  postmortems, and the verbatim R0 activation chronology. Never read by default; never a
+  roadmap.
 - `scripts/` — `validate_yaml.py` (repository-wide YAML parse check),
   `check_tracked_files.py` (fails CI if `.env`/`config.yaml`/secrets/DBs/keys/logs are
   tracked in git).
