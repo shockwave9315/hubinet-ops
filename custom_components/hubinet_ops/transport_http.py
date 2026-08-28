@@ -122,15 +122,13 @@ def _node_snapshot(payload: Mapping[str, Any]) -> NodeSnapshot:
     )
 
 
-def _package_scan_snapshot(payload: Mapping[str, Any] | None) -> PackageScanSnapshot:
-    if payload is None:
-        # Backward compatibility: an older 0.5 backend predating package
-        # scanning publishes resources with no ``package_scan`` field at
-        # all. That is a missing field, not a malformed one -- synthesize
-        # the same NOT_SCANNED shape the current backend would publish for
-        # an unattempted scan. A field that is *present* but malformed
-        # still fails validation below; this fallback never widens that.
-        return PackageScanSnapshot()
+def _package_scan_snapshot(payload: Any) -> PackageScanSnapshot:
+    if not isinstance(payload, Mapping):
+        # A field that is present but null or otherwise not an object is
+        # malformed, not missing -- it must still fail validation. Only a
+        # genuinely absent key is handled as the backward-compatibility
+        # fallback, by the caller, before this function is ever invoked.
+        raise TypeError("package_scan must be an object when present")
     os_payload = payload.get("os")
     error_payload = payload.get("error")
     return PackageScanSnapshot(
@@ -199,7 +197,18 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
         # JSON has no frozenset type -- explicit conversion (mismatch 2).
         effective_capabilities=frozenset(payload.get("effective_capabilities") or ()),
         state=payload.get("state") or {},
-        package_scan=_package_scan_snapshot(payload.get("package_scan")),
+        package_scan=(
+            # Backward compatibility: an older 0.5 backend predating
+            # package scanning publishes resources with no ``package_scan``
+            # key at all. Synthesize the same NOT_SCANNED shape the current
+            # backend would publish for an unattempted scan -- but only for
+            # a genuinely *missing* key. A present key that is null or
+            # otherwise malformed must still fail validation, never fall
+            # back to this default.
+            PackageScanSnapshot()
+            if "package_scan" not in payload
+            else _package_scan_snapshot(payload["package_scan"])
+        ),
         termination_reason=payload.get("termination_reason"),
         successor_resource_id=payload.get("successor_resource_id"),
     )

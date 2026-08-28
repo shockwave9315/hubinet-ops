@@ -344,6 +344,25 @@ async def test_finding3_present_but_malformed_package_scan_field_still_fails(
 
 
 @pytest.mark.asyncio
+async def test_finding3_present_null_package_scan_field_still_fails(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    # A present-but-null field is a malformed field, not a missing one --
+    # the missing-key compatibility fallback must not swallow this case.
+    ct = resource(RESOURCE_CT, ResourceType.LXC, 101, "Cloudflared")
+    expected = _fixture_snapshot(ct)
+    payload = _snapshot_json(expected)
+    payload["resources"][0]["package_scan"] = None
+    aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=payload)
+
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+    with pytest.raises(HubinetOpsInvalidResponse):
+        await transport.fetch_resource_snapshot()
+
+
+@pytest.mark.asyncio
 async def test_29_authorization_header_sent_on_every_request(
     hass: HomeAssistant, aioclient_mock
 ) -> None:
