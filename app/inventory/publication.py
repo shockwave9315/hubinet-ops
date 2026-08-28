@@ -275,8 +275,14 @@ class InventoryPublication:
             return base
         if (
             resource["presence"] != "present"
+            or resource["lifecycle"] != "active"
             or resource["status"] != "running"
             or resource["active_binding_id"] is None
+            or scan["expected_binding_id"] != resource["active_binding_id"]
+            or scan["expected_locator_generation"] != resource["locator_generation"]
+            or scan["expected_resource_continuity_revision"]
+            != resource["resource_continuity_revision"]
+            or scan["expected_vmid"] != resource["vmid"]
         ):
             base["status"] = "unavailable"
             return base

@@ -16,6 +16,7 @@ from app.inventory import (
     InventoryAuthorityStore,
     InventoryPublication,
     NormalizedDiscoverySnapshot,
+    PackageScanPackage as AuthorityPackageScanPackage,
     SourceAvailability,
 )
 from app.inventory.discovery import ProviderGuestLocatorSet, ProviderNodeScope
@@ -156,6 +157,7 @@ def reconcile(
     source_id,
     *,
     resource_type="qemu",
+    resource_present=True,
     current_node_name="pve-a",
     node_names=("pve-a",),
     provider_node_name=None,
@@ -185,7 +187,11 @@ def reconcile(
         boundary_consistent=True,
         covered_nodes=node_names,
         failed_baseline_scopes=(),
-        detail_summary={"ok_count": 1, "temporarily_unavailable_count": 0, "error_count": 0},
+        detail_summary={
+            "ok_count": 1 if resource_present else 0,
+            "temporarily_unavailable_count": 0,
+            "error_count": 0,
+        },
         failed_detail_scopes=(),
         nodes=tuple(
             DiscoveredNode(name, "online", True, START.isoformat(), {})
@@ -203,15 +209,29 @@ def reconcile(
                 DetailReadStatus.OK,
                 {},
             ),
-        ),
+        ) if resource_present else (),
         provider_node_scope=ProviderNodeScope._from_provider(
             BaselineMode.CLUSTER, tuple(sorted(node_names))
         ),
         provider_guest_locators=ProviderGuestLocatorSet._from_provider(
             ({"vmid": 100, "type": resource_type, "node": provider_node_name},)
+            if resource_present
+            else ()
         ),
     )
     authority.finalize_successful_discovery_run(source_id, run.run_id, snapshot)
+
+
+def successful_package_scan(authority, resource_id):
+    run = authority.issue_package_scan(resource_id)
+    completed = authority.finalize_successful_package_scan(
+        run.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=(AuthorityPackageScanPackage("apt", "2.6.1", "2.6.2"),),
+        reboot_required=True,
+    )
+    return run, completed
 
 
 def test_backend_publication_is_accepted_by_phase0_contract_oracle(tmp_path: Path) -> None:
@@ -243,6 +263,113 @@ def test_publication_retains_known_node_for_unresolved_current_relation(tmp_path
     assert resource.last_known_node_id == previous.current_node_id
     assert resource.node_availability is NodeAvailability.UNRESOLVED
     assert resource.last_known_node_id in snapshot.nodes_by_id
+
+
+def test_successful_package_plan_is_suppressed_after_continuity_break(
+    tmp_path: Path,
+) -> None:
+    _, _, store, authority, source_id = make_system(tmp_path)
+    reconcile(authority, source_id, resource_type="lxc")
+    original = store.list_resources(source_id)[0]
+    run, completed = successful_package_scan(authority, original.resource_id)
+
+    current = contract_snapshot(InventoryPublication(store, authority).read()).resources[0]
+    assert current.package_scan.status is PackageScanStatus.SUCCESS
+    assert current.package_scan.pending_count == 1
+    assert current.package_scan.plan_fingerprint == completed.plan_fingerprint
+    assert tuple(package.name for package in current.package_scan.packages) == ("apt",)
+
+    reconcile(
+        authority,
+        source_id,
+        resource_type="lxc",
+        resource_present=False,
+    )
+    reconcile(authority, source_id, resource_type="lxc")
+
+    returned = store.list_resources(source_id)[0]
+    assert returned.resource_id == original.resource_id
+    assert returned.resource_continuity_revision > original.resource_continuity_revision
+    assert returned.lifecycle == "quarantined"
+    assert returned.observational_continuity == "uncertain"
+
+    published = contract_snapshot(InventoryPublication(store, authority).read()).resources[0]
+    assert published.package_scan.status is PackageScanStatus.UNAVAILABLE
+    assert published.package_scan.pending_count is None
+    assert published.package_scan.plan_fingerprint is None
+    assert published.package_scan.reboot_required is None
+    assert published.package_scan.packages == ()
+
+    historical = store.package_scan_run(run.scan_run_id)
+    assert historical == completed
+    assert historical.packages[0].package_name == "apt"
+
+
+def test_successful_package_plan_survives_node_movement(tmp_path: Path) -> None:
+    _, _, store, authority, source_id = make_system(tmp_path)
+    reconcile(authority, source_id, resource_type="lxc")
+    resource = store.list_resources(source_id)[0]
+    _, completed = successful_package_scan(authority, resource.resource_id)
+
+    reconcile(
+        authority,
+        source_id,
+        resource_type="lxc",
+        current_node_name="pve-b",
+        node_names=("pve-a", "pve-b"),
+    )
+
+    moved = store.list_resources(source_id)[0]
+    assert moved.resource_id == resource.resource_id
+    assert moved.resource_continuity_revision == resource.resource_continuity_revision
+    published = contract_snapshot(InventoryPublication(store, authority).read()).resources[0]
+    assert published.current_node_id != resource.current_node_id
+    assert published.package_scan.status is PackageScanStatus.SUCCESS
+    assert published.package_scan.plan_fingerprint == completed.plan_fingerprint
+
+
+def test_successful_package_plan_requires_matching_persisted_resource_context() -> None:
+    resource = {
+        "resource_type": "lxc",
+        "presence": "present",
+        "lifecycle": "active",
+        "status": "running",
+        "active_binding_id": "binding-current",
+        "locator_generation": 3,
+        "resource_continuity_revision": 7,
+        "vmid": 100,
+    }
+    scan = {
+        "scan_run_id": "scan-run",
+        "started_at": START.isoformat(),
+        "completed_at": START.isoformat(),
+        "os_id": "debian",
+        "os_version": "12",
+        "lifecycle": "completed",
+        "outcome": "success",
+        "expected_binding_id": "binding-current",
+        "expected_locator_generation": 3,
+        "expected_resource_continuity_revision": 7,
+        "expected_vmid": 100,
+        "pending_count": 0,
+        "plan_fingerprint": "fingerprint",
+        "reboot_required": None,
+    }
+    assert InventoryPublication._package_scan(resource, scan, {})["status"] == "success"
+
+    for field, stale_value in (
+        ("expected_binding_id", "binding-stale"),
+        ("expected_locator_generation", 2),
+        ("expected_resource_continuity_revision", 6),
+        ("expected_vmid", 99),
+    ):
+        stale_scan = {**scan, field: stale_value}
+        published = InventoryPublication._package_scan(resource, stale_scan, {})
+        assert published["status"] == "unavailable"
+        assert published["pending_count"] is None
+        assert published["plan_fingerprint"] is None
+        assert published["reboot_required"] is None
+        assert published["packages"] == ()
 
 
 def test_direct_replacement_publishes_retained_predecessor_and_current_successor(tmp_path: Path) -> None:
