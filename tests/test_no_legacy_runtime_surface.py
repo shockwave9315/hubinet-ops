@@ -241,7 +241,6 @@ _CURRENT_0_5_PRODUCTION_MODULES = (
     "app/inventory_scheduler.py",
     "app/inventory_pve_transport.py",
     "app/inventory/__init__.py",
-    "app/inventory/attestation.py",
     "app/inventory/authority.py",
     "app/inventory/canonicalization.py",
     "app/inventory/discovery.py",

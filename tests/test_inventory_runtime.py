@@ -240,7 +240,7 @@ def test_4_startup_fails_closed_against_a_real_legacy_ops_db_fixture(tmp_path: P
 # ---------------------------------------------------------------------------
 
 
-def test_27_28_security_continuity_never_trusted_and_capabilities_always_empty(
+def test_27_28_security_continuity_always_unverified_and_capabilities_always_empty(
     tmp_path: Path, monkeypatch
 ) -> None:
     app, config = _build_app(tmp_path)
@@ -259,8 +259,7 @@ def test_27_28_security_continuity_never_trusted_and_capabilities_always_empty(
     body = response.json()
     assert body["resources"], "expected at least one discovered resource"
     for resource in body["resources"]:
-        assert resource["security_continuity"] in ("unverified", "revoked")
-        assert resource["security_continuity"] != "trusted"
+        assert resource["security_continuity"] == "unverified"
         assert resource["effective_capabilities"] == []
         assert resource["policy_applicable"] is False
 

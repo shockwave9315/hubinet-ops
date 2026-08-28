@@ -238,17 +238,14 @@ def test_22_abandoned_run_sequence_is_never_reused_and_nothing_is_fabricated(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #23 -- source epoch 0 discovery works (not_yet_attested)
+# §28 test #23 -- ordinary read-only discovery has no trust precondition
 # ---------------------------------------------------------------------------
 
 
-def test_23_discovery_succeeds_at_epoch_zero_not_yet_attested(
+def test_23_discovery_needs_no_trust_or_enrollment_precondition(
     tmp_path: Path, monkeypatch
 ) -> None:
     store, authority, config, source_id = _bootstrap(tmp_path)
-    attestation = store.attestation_state(source_id)
-    assert attestation.attestation_status.value == "not_yet_attested"
-    assert attestation.source_attestation_epoch == 0
 
     _patch_transport(monkeypatch, _pve_handler(guests=({"vmid": 100, "type": "qemu", "name": "vm1", "status": "running"},)))
     outcome = sched.run_discovery_cycle(authority, source_id, config)
@@ -258,12 +255,17 @@ def test_23_discovery_succeeds_at_epoch_zero_not_yet_attested(
     view = publication.read()
     assert len(view.resources) == 1
     assert view.resources[0]["security_continuity"] == "unverified"
+    assert view.resources[0]["state_level"] == "discovered"
+    assert view.resources[0]["effective_capabilities"] == ()
 
 
 # ---------------------------------------------------------------------------
-# §28 test #24/#25/#26 -- adversarial: no forbidden authority calls
+# §28 test #24/#25/#26 -- adversarial: no forbidden authority surface
 # ---------------------------------------------------------------------------
 
+# These are the removed security-proof and mutation-shaped operations. They
+# must not exist on the authority at all -- a structural guarantee, stronger
+# than "R0 happens not to call them".
 _FORBIDDEN_AUTHORITY_METHODS = (
     "enroll_source_attestation",
     "reattest_source",
@@ -282,39 +284,32 @@ _ENDPOINT_ACTIVATION_SHAPED_NAMES = (
 )
 
 
-def test_24_25_26_full_cycle_never_calls_any_forbidden_authority_method(
+def test_24_no_forbidden_authority_method_exists() -> None:
+    for name in _FORBIDDEN_AUTHORITY_METHODS:
+        assert not hasattr(InventoryAuthority, name), name
+
+
+def test_26_absent_guest_becomes_missing_and_is_never_removed(
     tmp_path: Path, monkeypatch
 ) -> None:
     store, authority, config, source_id = _bootstrap(tmp_path)
     _patch_transport(monkeypatch, _pve_handler(guests=({"vmid": 100, "type": "qemu", "name": "vm1", "status": "running"},)))
 
-    call_counts = {name: 0 for name in _FORBIDDEN_AUTHORITY_METHODS}
-    for name in _FORBIDDEN_AUTHORITY_METHODS:
-        original = getattr(InventoryAuthority, name)
-
-        def _make_spy(method_name, bound_original):
-            def _spy(self, *args, **kwargs):
-                call_counts[method_name] += 1
-                return bound_original(self, *args, **kwargs)
-
-            return _spy
-
-        monkeypatch.setattr(InventoryAuthority, name, _make_spy(name, original))
-
-    # Success cycle, then a cycle over a now-missing guest (presence should
-    # become "missing", never "confirmed_removed").
     first = sched.run_discovery_cycle(authority, source_id, config)
     assert first.status == "success"
+    resource_id = InventoryPublication(store, authority).read().resources[0]["resource_id"]
 
+    # A complete, boundary-valid baseline that no longer lists the guest.
     _patch_transport(monkeypatch, _pve_handler(guests=()))
     second = sched.run_discovery_cycle(authority, source_id, config)
     assert second.status == "success"
 
     view = InventoryPublication(store, authority).read()
+    assert len(view.resources) == 1
+    assert view.resources[0]["resource_id"] == resource_id
     assert view.resources[0]["presence"] == "missing"
-    assert view.resources[0]["presence"] != "confirmed_removed"
-
-    assert all(count == 0 for count in call_counts.values()), call_counts
+    assert view.resources[0]["lifecycle"] == "quarantined"
+    assert view.resources[0]["security_continuity"] == "unverified"
 
 
 def test_25_no_endpoint_activation_shaped_method_exists_on_the_authority() -> None:
