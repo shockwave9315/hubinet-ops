@@ -246,6 +246,8 @@ class FakeHelperRunner:
         migrate_after_checks: int | None = None,
         migrate_to_node: str = "pve-c",
         os_release: str = 'ID=debian\nVERSION_ID="12"\n',
+        apt_version: str = "apt 2.6.1 (amd64)\n",
+        apt_version_returncode: int = 0,
         update_returncode: int = 0,
         update_stderr: str = "",
         simulation_returncode: int = 0,
@@ -263,6 +265,8 @@ class FakeHelperRunner:
         self.migrate_after_checks = migrate_after_checks
         self.migrate_to_node = migrate_to_node
         self.os_release = os_release
+        self.apt_version = apt_version
+        self.apt_version_returncode = apt_version_returncode
         self.update_returncode = update_returncode
         self.update_stderr = update_stderr
         self.simulation_returncode = simulation_returncode
@@ -321,6 +325,10 @@ class FakeHelperRunner:
             )
         if "/etc/os-release" in rendered:
             return helper.CommandResult(self.os_returncode, self.os_release.encode(), b"")
+        if "apt-get --version" in rendered:
+            return helper.CommandResult(
+                self.apt_version_returncode, self.apt_version.encode(), b""
+            )
         if "update" in rendered and "apt-get" in rendered:
             return helper.CommandResult(
                 self.update_returncode, b"", self.update_stderr.encode()
@@ -354,12 +362,78 @@ def test_helper_success_uses_only_fixed_pvesh_and_pct_shapes() -> None:
     assert response["ok"] is True
     assert response["reboot_required"] is None
     assert all(call[0] in {"pvesh", "pct"} for call in runner.calls)
+    assert any(call[-2:] == ("apt-get", "--version") for call in runner.calls)
     assert any(
         call[-4:] == ("apt-get", "update", "-qq", "--error-on=any")
         for call in runner.calls
     )
     assert any(call[-3:] == ("apt-get", "-s", "upgrade") for call in runner.calls)
     assert not any("eval" in argument for call in runner.calls for argument in call)
+
+
+@pytest.mark.parametrize(
+    ("apt_version", "supported"),
+    (
+        ("apt 2.1.15 (amd64)\n", False),
+        ("apt 2.1.16 (amd64)\n", True),
+        ("apt 2.6.1 (amd64)\n", True),
+        ("apt 3.0.3 (amd64)\n", True),
+    ),
+)
+def test_helper_enforces_strict_metadata_refresh_apt_version_floor(
+    apt_version: str, supported: bool
+) -> None:
+    runner = FakeHelperRunner(apt_version=apt_version)
+    response = helper.handle_request(_request(), runner=runner)
+    update_calls = [
+        call for call in runner.calls if "apt-get" in call and "update" in call
+    ]
+    simulation_calls = [
+        call for call in runner.calls if call[-3:] == ("apt-get", "-s", "upgrade")
+    ]
+    assert response["ok"] is supported
+    assert bool(update_calls) is supported
+    assert bool(simulation_calls) is supported
+    if supported:
+        assert len(update_calls) == 1
+        assert update_calls[0][-4:] == (
+            "apt-get", "update", "-qq", "--error-on=any"
+        )
+    if not supported:
+        assert response["error"] == {
+            "classification": "unsupported_os",
+            "message": "guest APT version does not support strict metadata refresh",
+        }
+
+
+def test_helper_rejects_ubuntu_apt_2_0_without_legacy_fallback() -> None:
+    runner = FakeHelperRunner(
+        os_release='NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="20.04"\n',
+        apt_version="apt 2.0.10 (amd64)\n",
+    )
+    response = helper.handle_request(_request(), runner=runner)
+    apt_calls = [call for call in runner.calls if "apt-get" in call]
+    assert response["ok"] is False
+    assert response["os"] == {"id": "ubuntu", "version": "20.04"}
+    assert response["error"]["classification"] == "unsupported_os"
+    assert len(apt_calls) == 1
+    assert apt_calls[0][-2:] == ("apt-get", "--version")
+
+
+@pytest.mark.parametrize(
+    "runner",
+    (
+        FakeHelperRunner(apt_version_returncode=1),
+        FakeHelperRunner(apt_version="apt version unknown\n"),
+        FakeHelperRunner(apt_version="apt 2.1 (amd64)\n"),
+    ),
+)
+def test_helper_unproven_apt_capability_fails_closed(runner) -> None:
+    response = helper.handle_request(_request(), runner=runner)
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "execution_failed"
+    assert not any("update" in call for call in runner.calls)
+    assert not any("upgrade" in call for call in runner.calls)
 
 
 @pytest.mark.parametrize(
@@ -415,7 +489,7 @@ def test_helper_metadata_refresh_uses_fail_on_any_error_and_never_simulates_on_f
     update_calls = [
         call for call in runner.calls if call[0] == "pct" and "update" in call and "apt-get" in call
     ]
-    assert update_calls, "expected the fixed apt-get update argv to be issued"
+    assert len(update_calls) == 1, "expected exactly one fixed apt-get update argv"
     assert update_calls[0][-4:] == ("apt-get", "update", "-qq", "--error-on=any")
     assert not any("upgrade" in call for call in runner.calls)
     assert response["ok"] is False
@@ -439,7 +513,7 @@ def test_helper_routes_remote_node_lxc_execution_over_cluster_ssh() -> None:
     assert response["ok"] is True
     assert not any(call[0] == "pct" for call in runner.calls)
     ssh_calls = [call for call in runner.calls if call[0] == "ssh"]
-    assert len(ssh_calls) == 4
+    assert len(ssh_calls) == 5
     for call in ssh_calls:
         assert call[-2] == "root@pve-b"
         assert "BatchMode=yes" in call
@@ -470,7 +544,8 @@ def test_helper_migration_between_validations_fails_closed_never_success() -> No
 
 
 @pytest.mark.parametrize(
-    "failed_command", ("/etc/os-release", "apt-get update -qq", "apt-get -s upgrade")
+    "failed_command",
+    ("/etc/os-release", "apt-get --version", "apt-get update -qq", "apt-get -s upgrade"),
 )
 def test_helper_remote_node_transport_failure_is_execution_failed(
     failed_command: str,

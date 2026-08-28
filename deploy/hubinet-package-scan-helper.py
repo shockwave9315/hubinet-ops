@@ -21,6 +21,11 @@ MAX_REQUEST_BYTES = 4096
 MAX_COMMAND_OUTPUT_BYTES = 6 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 300.0
 NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")
+APT_VERSION_RE = re.compile(
+    r"apt ([0-9]+)\.([0-9]+)\.([0-9]+)"
+    r"(?:[~+.-][A-Za-z0-9.+:~-]*)? \([A-Za-z0-9_-]+\)"
+)
+MINIMUM_APT_VERSION = (2, 1, 16)
 BUSY_PATTERNS = (
     "could not get lock",
     "unable to acquire the dpkg frontend lock",
@@ -317,6 +322,14 @@ def _parse_os_release(text: str) -> tuple[str, str]:
     return os_id, version
 
 
+def _parse_apt_version(text: str) -> tuple[int, int, int]:
+    lines = text.splitlines()
+    if not lines or not (match := APT_VERSION_RE.fullmatch(lines[0])):
+        raise ScanError("execution_failed", "guest APT version output was malformed")
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
 def _package_failure(stage: str, stderr: str) -> ScanError:
     lowered = stderr.lower()
     if any(pattern in lowered for pattern in BUSY_PATTERNS):
@@ -346,6 +359,21 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         if os_result.returncode != 0:
             raise ScanError("guest_unavailable", "guest OS release metadata is unavailable")
         os_id, os_version = _parse_os_release(os_release)
+
+        _current_target(runner, vmid, expected_node)
+        apt_version_result = _run_guest_command(
+            runner, vmid, expected_node, local_node,
+            ("env", "LC_ALL=C", "apt-get", "--version"),
+            max_output=64 * 1024,
+        )
+        apt_version_stdout, _ = _decode_output(apt_version_result)
+        if apt_version_result.returncode != 0:
+            raise ScanError("execution_failed", "could not determine guest APT version")
+        if _parse_apt_version(apt_version_stdout) < MINIMUM_APT_VERSION:
+            raise ScanError(
+                "unsupported_os",
+                "guest APT version does not support strict metadata refresh",
+            )
 
         _current_target(runner, vmid, expected_node)
         update = _run_guest_command(
