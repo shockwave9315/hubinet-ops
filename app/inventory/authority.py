@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -20,6 +21,11 @@ from .models import (
     DiscoveryRun,
     DiscoveryRunLifecycle,
     InventorySourceState,
+    PackageScanFailure,
+    PackageScanLifecycle,
+    PackageScanOutcome,
+    PackageScanPackage,
+    PackageScanRun,
 )
 from .discovery import (
     BaselineCompleteness,
@@ -640,6 +646,305 @@ class InventoryAuthority:
                 and self._committed_context_is_current(source, endpoint, health)
             )
 
+    def issue_package_scan(self, resource_id: str) -> PackageScanRun:
+        """Capture and durably own the current LXC execution context."""
+
+        canonical_resource_id = _require_uuid(resource_id, "resource_id")
+        scan_run_id = _new_uuid()
+        started_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            row = self._require_package_scan_target(connection, canonical_resource_id)
+            if str(row["resource_type"]) != "lxc":
+                raise AuthorityConflict("package scanning supports LXC resources only")
+            previous = connection.execute(
+                "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
+                (canonical_resource_id,),
+            ).fetchone()[0]
+            attempt_sequence = (int(previous) if previous is not None else 0) + 1
+            try:
+                connection.execute(
+                    "INSERT INTO package_scan_runs("
+                    "scan_run_id, resource_id, inventory_source_id, attempt_sequence, "
+                    "expected_binding_id, expected_locator_generation, "
+                    "expected_resource_continuity_revision, expected_vmid, "
+                    "expected_node_id, expected_node_name, started_at, lifecycle) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+                    (
+                        scan_run_id,
+                        canonical_resource_id,
+                        str(row["inventory_source_id"]),
+                        attempt_sequence,
+                        str(row["binding_id"]),
+                        int(row["locator_generation"]),
+                        int(row["resource_continuity_revision"]),
+                        int(row["vmid"]),
+                        str(row["current_node_id"]),
+                        str(row["external_node_name"]),
+                        started_at,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise AuthorityConflict(
+                    "resource already has an active package scan"
+                ) from exc
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+        return self._store.package_scan_run(scan_run_id)
+
+    def package_scan_context_is_current(self, scan_run_id: str) -> bool:
+        canonical_run_id = _require_uuid(scan_run_id, "scan_run_id")
+        with self._store._read_transaction() as connection:
+            run = self._require_package_scan_run_row(connection, canonical_run_id)
+            if str(run["lifecycle"]) != PackageScanLifecycle.RUNNING.value:
+                return False
+            return self._package_scan_context_is_current(connection, run)
+
+    def finalize_successful_package_scan(
+        self,
+        scan_run_id: str,
+        *,
+        os_id: str,
+        os_version: str,
+        packages: tuple[PackageScanPackage, ...],
+        reboot_required: bool | None,
+    ) -> PackageScanRun:
+        """Commit one exact plan, or fence it as stale in the same transaction."""
+
+        canonical_run_id = _require_uuid(scan_run_id, "scan_run_id")
+        canonical_os_id = _require_text(os_id, "os_id", max_length=100).lower()
+        canonical_os_version = _require_text(os_version, "os_version", max_length=200)
+        if canonical_os_id not in {"debian", "ubuntu"}:
+            raise ValueError("successful package scan OS must be Debian or Ubuntu")
+        canonical_packages = _validate_package_plan(packages)
+        if reboot_required not in {True, None}:
+            raise ValueError("reboot_required must be true or unknown")
+        fingerprint = package_plan_fingerprint(canonical_packages)
+        completed_at = _timestamp(self._now())
+
+        with self._store._transaction() as connection:
+            run = self._require_package_scan_run_row(connection, canonical_run_id)
+            self._require_running_package_scan(run)
+            if not self._package_scan_context_is_current(connection, run):
+                self._complete_failed_package_scan(
+                    connection,
+                    canonical_run_id,
+                    completed_at=completed_at,
+                    outcome=PackageScanOutcome.FAILED,
+                    failure_class=PackageScanFailure.STALE_TARGET,
+                    error_message="resource binding or generation changed during package scan",
+                    os_id=None,
+                    os_version=None,
+                )
+            else:
+                connection.executemany(
+                    "INSERT INTO package_scan_packages("
+                    "scan_run_id, package_index, package_name, installed_version, "
+                    "candidate_version, origin, description, security) "
+                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        (
+                            canonical_run_id,
+                            index,
+                            package.package_name,
+                            package.installed_version,
+                            package.candidate_version,
+                            package.origin,
+                            package.description,
+                            1 if package.security is True else None,
+                        )
+                        for index, package in enumerate(canonical_packages)
+                    ),
+                )
+                connection.execute(
+                    "UPDATE package_scan_runs SET lifecycle='completed', completed_at=?, "
+                    "outcome='success', os_id=?, os_version=?, pending_count=?, "
+                    "plan_fingerprint=?, reboot_required=? WHERE scan_run_id=?",
+                    (
+                        completed_at,
+                        canonical_os_id,
+                        canonical_os_version,
+                        len(canonical_packages),
+                        fingerprint,
+                        1 if reboot_required is True else None,
+                        canonical_run_id,
+                    ),
+                )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+        return self._store.package_scan_run(canonical_run_id)
+
+    def finalize_failed_package_scan(
+        self,
+        scan_run_id: str,
+        *,
+        failure_class: PackageScanFailure,
+        error_message: str,
+        os_id: str | None = None,
+        os_version: str | None = None,
+    ) -> PackageScanRun:
+        canonical_run_id = _require_uuid(scan_run_id, "scan_run_id")
+        if not isinstance(failure_class, PackageScanFailure):
+            raise ValueError("failure_class must be a PackageScanFailure")
+        message = _require_text(error_message, "error_message", max_length=500)
+        normalized_os_id = (
+            _require_text(os_id, "os_id", max_length=100).lower()
+            if os_id is not None
+            else None
+        )
+        normalized_os_version = (
+            _require_text(os_version, "os_version", max_length=200)
+            if os_version is not None
+            else None
+        )
+        completed_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            run = self._require_package_scan_run_row(connection, canonical_run_id)
+            self._require_running_package_scan(run)
+            self._complete_failed_package_scan(
+                connection,
+                canonical_run_id,
+                completed_at=completed_at,
+                outcome=PackageScanOutcome.FAILED,
+                failure_class=failure_class,
+                error_message=message,
+                os_id=normalized_os_id,
+                os_version=normalized_os_version,
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+        return self._store.package_scan_run(canonical_run_id)
+
+    def recover_interrupted_package_scans(self) -> tuple[str, ...]:
+        """Terminalize every pre-restart running attempt as unknown/interrupted."""
+
+        completed_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            rows = connection.execute(
+                "SELECT scan_run_id FROM package_scan_runs "
+                "WHERE lifecycle='running' ORDER BY resource_id, attempt_sequence"
+            ).fetchall()
+            recovered = tuple(str(row["scan_run_id"]) for row in rows)
+            for scan_run_id in recovered:
+                self._complete_failed_package_scan(
+                    connection,
+                    scan_run_id,
+                    completed_at=completed_at,
+                    outcome=PackageScanOutcome.INTERRUPTED,
+                    failure_class=PackageScanFailure.EXECUTION_FAILED,
+                    error_message="backend restarted before package scan completed",
+                    os_id=None,
+                    os_version=None,
+                )
+            if recovered:
+                self._bump_global_revisions(
+                    connection, inventory_changed=False, published_changed=True
+                )
+        return recovered
+
+    @staticmethod
+    def _require_package_scan_target(
+        connection: sqlite3.Connection, resource_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT r.*, b.binding_id, b.locator_generation, n.external_node_name "
+            "FROM resource_incarnations r "
+            "LEFT JOIN resource_locator_bindings b ON b.resource_id=r.resource_id "
+            "AND b.valid_to_run_sequence IS NULL "
+            "LEFT JOIN inventory_nodes n ON n.node_id=r.current_node_id "
+            "WHERE r.resource_id=?",
+            (resource_id,),
+        ).fetchone()
+        if row is None:
+            raise AuthorityNotFound("package scan resource does not exist")
+        if (
+            row["presence"] != "present"
+            or row["lifecycle"] != "active"
+            or row["binding_id"] is None
+            or row["current_node_id"] is None
+            or row["external_node_name"] is None
+        ):
+            raise AuthorityConflict("resource has no current executable binding")
+        return row
+
+    @staticmethod
+    def _require_package_scan_run_row(
+        connection: sqlite3.Connection, scan_run_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM package_scan_runs WHERE scan_run_id=?", (scan_run_id,)
+        ).fetchone()
+        if row is None:
+            raise AuthorityNotFound("package scan run does not exist")
+        return row
+
+    @staticmethod
+    def _require_running_package_scan(run: sqlite3.Row) -> None:
+        if str(run["lifecycle"]) != PackageScanLifecycle.RUNNING.value:
+            raise AuthorityConflict("package scan run is already terminal")
+
+    @staticmethod
+    def _package_scan_context_is_current(
+        connection: sqlite3.Connection, run: sqlite3.Row
+    ) -> bool:
+        current = connection.execute(
+            "SELECT r.resource_id, r.inventory_source_id, r.vmid, "
+            "r.resource_continuity_revision, r.resource_type, r.presence, r.lifecycle, "
+            "r.current_node_id, b.binding_id, b.locator_generation, n.external_node_name "
+            "FROM resource_incarnations r "
+            "LEFT JOIN resource_locator_bindings b ON b.resource_id=r.resource_id "
+            "AND b.valid_to_run_sequence IS NULL "
+            "LEFT JOIN inventory_nodes n ON n.node_id=r.current_node_id "
+            "WHERE r.resource_id=?",
+            (str(run["resource_id"]),),
+        ).fetchone()
+        if current is None or current["binding_id"] is None:
+            return False
+        return all(
+            (
+                str(current["inventory_source_id"]) == str(run["inventory_source_id"]),
+                str(current["resource_type"]) == "lxc",
+                str(current["presence"]) == "present",
+                str(current["lifecycle"]) == "active",
+                int(current["vmid"]) == int(run["expected_vmid"]),
+                current["binding_id"] == run["expected_binding_id"],
+                int(current["locator_generation"]) == int(run["expected_locator_generation"]),
+                int(current["resource_continuity_revision"])
+                == int(run["expected_resource_continuity_revision"]),
+                current["current_node_id"] == run["expected_node_id"],
+                current["external_node_name"] == run["expected_node_name"],
+            )
+        )
+
+    @staticmethod
+    def _complete_failed_package_scan(
+        connection: sqlite3.Connection,
+        scan_run_id: str,
+        *,
+        completed_at: str,
+        outcome: PackageScanOutcome,
+        failure_class: PackageScanFailure,
+        error_message: str,
+        os_id: str | None,
+        os_version: str | None,
+    ) -> None:
+        connection.execute(
+            "UPDATE package_scan_runs SET lifecycle='completed', completed_at=?, "
+            "outcome=?, failure_class=?, error_message=?, os_id=?, os_version=? "
+            "WHERE scan_run_id=?",
+            (
+                completed_at,
+                outcome.value,
+                failure_class.value,
+                error_message,
+                os_id,
+                os_version,
+                scan_run_id,
+            ),
+        )
+
     def _authority_decision_time(self) -> datetime:
         return _parse_timestamp(_timestamp(self._now()), "authority decision time")
 
@@ -1138,6 +1443,71 @@ def _require_text(value: str, field_name: str, *, max_length: int) -> str:
     ):
         raise ValueError(f"{field_name} must be bounded non-empty text")
     return value
+
+
+def _optional_bounded_text(
+    value: str | None, field_name: str, *, max_length: int
+) -> str | None:
+    if value is None:
+        return None
+    return _require_text(value, field_name, max_length=max_length)
+
+
+def _validate_package_plan(
+    packages: tuple[PackageScanPackage, ...],
+) -> tuple[PackageScanPackage, ...]:
+    if not isinstance(packages, tuple):
+        raise ValueError("packages must be a tuple")
+    normalized: list[PackageScanPackage] = []
+    names: set[str] = set()
+    for package in packages:
+        if not isinstance(package, PackageScanPackage):
+            raise ValueError("packages must contain PackageScanPackage values")
+        name = _require_text(package.package_name, "package_name", max_length=300)
+        installed = _require_text(
+            package.installed_version, "installed_version", max_length=500
+        )
+        candidate = _require_text(
+            package.candidate_version, "candidate_version", max_length=500
+        )
+        if name in names:
+            raise ValueError("package plan contains a duplicate package name")
+        names.add(name)
+        if package.security not in {True, None}:
+            raise ValueError("package security must be true or unknown")
+        normalized.append(
+            PackageScanPackage(
+                package_name=name,
+                installed_version=installed,
+                candidate_version=candidate,
+                origin=_optional_bounded_text(
+                    package.origin, "origin", max_length=500
+                ),
+                description=_optional_bounded_text(
+                    package.description, "description", max_length=500
+                ),
+                security=package.security,
+            )
+        )
+    return tuple(sorted(normalized, key=lambda package: package.package_name))
+
+
+def package_plan_fingerprint(packages: tuple[PackageScanPackage, ...]) -> str:
+    """SHA-256 of canonical JSON for only the exact material package plan."""
+
+    canonical = _validate_package_plan(packages)
+    payload = [
+        {
+            "candidate_version": package.candidate_version,
+            "installed_version": package.installed_version,
+            "package_name": package.package_name,
+        }
+        for package in canonical
+    ]
+    encoded = json.dumps(
+        payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _require_credential_reference(value: str) -> str:

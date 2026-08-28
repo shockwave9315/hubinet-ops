@@ -22,6 +22,30 @@ class DiscoveryRunLifecycle(StrEnum):
     ABANDONED = "abandoned"
 
 
+class PackageScanLifecycle(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+
+
+class PackageScanOutcome(StrEnum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+
+
+class PackageScanFailure(StrEnum):
+    GUEST_UNAVAILABLE = "guest_unavailable"
+    UNSUPPORTED_RESOURCE_TYPE = "unsupported_resource_type"
+    UNSUPPORTED_OS = "unsupported_os"
+    PACKAGE_MANAGER_BUSY = "package_manager_busy"
+    METADATA_REFRESH_FAILED = "metadata_refresh_failed"
+    SIMULATION_FAILED = "simulation_failed"
+    TIMEOUT = "timeout"
+    MALFORMED_PLAN = "malformed_plan"
+    STALE_TARGET = "stale_target"
+    EXECUTION_FAILED = "execution_failed"
+
+
 class PersistentSourceHealth(StrEnum):
     HEALTHY = "healthy"
     SOURCE_UNAVAILABLE = "source_unavailable"
@@ -233,3 +257,39 @@ class ResourceTermination:
     successor_resource_id: str | None
     run_sequence: int
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PackageScanPackage:
+    package_name: str
+    installed_version: str
+    candidate_version: str
+    origin: str | None = None
+    description: str | None = None
+    security: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PackageScanRun:
+    scan_run_id: str
+    resource_id: str
+    inventory_source_id: str
+    attempt_sequence: int
+    expected_binding_id: str
+    expected_locator_generation: int
+    expected_resource_continuity_revision: int
+    expected_vmid: int
+    expected_node_id: str
+    expected_node_name: str
+    started_at: str
+    lifecycle: PackageScanLifecycle
+    completed_at: str | None
+    outcome: PackageScanOutcome | None
+    failure_class: PackageScanFailure | None
+    error_message: str | None
+    os_id: str | None
+    os_version: str | None
+    pending_count: int | None
+    plan_fingerprint: str | None
+    reboot_required: bool | None
+    packages: tuple[PackageScanPackage, ...] = ()
