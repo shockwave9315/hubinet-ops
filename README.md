@@ -18,8 +18,10 @@ a guest in Proxmox never requires touching this repository or its config.
 
 - PVE autodiscovery of every node, LXC, and QEMU guest.
 - A durable SQLite inventory owned by the backend.
-- A bearer-authenticated read-only HTTP API (`/r0/v1/health`, `/backend`,
-  `/snapshot`).
+- A read-only HTTP API (`GET /r0/v1/health`, `/backend`, `/snapshot`). Bearer
+  authentication is required on every endpoint except the deliberately
+  unauthenticated minimal `/r0/v1/health` liveness probe, which exposes no
+  inventory or credential data.
 - A native Home Assistant integration with dynamic devices and entities.
 - An automated Proxmox bootstrap that provisions the whole backend.
 

@@ -8,8 +8,10 @@
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery.
-- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, bearer
-  authenticated, no mutation route.
+- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, no mutation
+  route. Bearer authentication is required on every endpoint except the
+  deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
+  exposes no inventory or credential data.
 - **Home Assistant integration** — config flow, coordinator, structural
   contract validation, dynamic devices and entities, diagnostics with recursive
   secret redaction. Distributed via HACS.

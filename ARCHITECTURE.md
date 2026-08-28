@@ -39,7 +39,9 @@ database (marker `hubinet_ops_0_5_authority`, schema v6).
 `app/inventory_runtime.py` is the production composition root
 (`uvicorn app.inventory_runtime:app`). It builds the store, authority,
 publication, PVE transport, and scheduler, and serves `GET /r0/v1/health`,
-`/backend`, `/snapshot`. There is no mutation route.
+`/backend`, `/snapshot`. There is no mutation route. Bearer authentication is
+required on every endpoint except the deliberately unauthenticated minimal
+`/r0/v1/health` liveness probe, which exposes no inventory or credential data.
 
 `app/inventory_pve_transport.py` is GET-only with mandatory TLS verification
 and no mutation-verb escape hatch. `app/inventory_scheduler.py` is a thin
@@ -154,7 +156,9 @@ QEMU package execution is future work and does not block LXC.
 - Secrets never appear in argv, logs, diagnostics, or the published snapshot.
 - Typed, allowlisted operations only; never arbitrary command text.
 - Validate the current target before any mutation.
-- Bearer auth on every API endpoint.
+- Bearer authentication is required on every API endpoint except the
+  deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
+  exposes no inventory or credential data.
 - Failed, partial, or unavailable discovery never deletes a resource.
 - A failed scan is unknown, never zero updates.
 - Concurrency protection against ordinary operational races: durable ownership

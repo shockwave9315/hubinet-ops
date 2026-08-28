@@ -73,7 +73,9 @@ safety:
 - typed, allowlisted operations — never arbitrary shell command text, and never
   an API/topic/host-control path that accepts one;
 - validate the current target/VMID immediately before any mutation;
-- bearer auth on every API endpoint;
+- bearer authentication is required on every API endpoint except the
+  deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
+  exposes no inventory or credential data;
 - concurrency protection against ordinary operational races (durable ownership
   CAS, single-flight, fencing, restart recovery);
 - exact plan fingerprint and revalidation before an approved update runs;
