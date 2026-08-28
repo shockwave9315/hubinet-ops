@@ -1,4 +1,4 @@
-"""Public Phase 0 snapshot contract."""
+"""Public snapshot contract."""
 
 from .enums import (
     DetailStatus,

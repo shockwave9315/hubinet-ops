@@ -45,7 +45,7 @@
 # both sides. RESOLVED_PVE_IPS (global, set once by phase10_firewall) is
 # reused by the later phase12 recheck rather than re-resolved, since DNS
 # is inherently time-varying, unlike the rest of this bootstrap's
-# configuration -- see docs/README-bootstrap-proxmox-0.5.md: if internal
+# configuration -- see deploy/README-bootstrap-proxmox-0.5.md: if internal
 # DNS later moves the hostname to a new address, the firewall must be
 # regenerated (re-run this bootstrap) before the service can reach it;
 # this bootstrap never silently re-resolves and re-opens egress on its own

@@ -1,4 +1,4 @@
-"""Cross-snapshot successor validation for observable Phase 0 views."""
+"""Cross-snapshot successor validation for observable snapshot views."""
 
 from __future__ import annotations
 

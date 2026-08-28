@@ -1,7 +1,7 @@
-"""WAVE R0-B Family 3 -- discovery runtime, scheduler, restart recovery.
+"""Discovery runtime, scheduler, restart recovery.
 
-Covers §28 tests #20, #21, #22, #23, #24, #25, #26, #41, #42 of
-docs/architecture/0.5-r0-read-only-runtime-activation.md. No real network
+Covers tests #20, #21, #22, #23, #24, #25, #26, #41, #42 of
+ARCHITECTURE.md. No real network
 access anywhere in this file: every PVE request is intercepted in-process
 by ``httpx.MockTransport``.
 """
@@ -129,7 +129,7 @@ def _bootstrap(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# §28 test #20 -- per-source single-flight
+# test #20 -- per-source single-flight
 # ---------------------------------------------------------------------------
 
 
@@ -164,7 +164,7 @@ def test_20_scheduler_run_once_never_overlaps_itself(tmp_path: Path, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# §28 test #21 -- process crash after issuance, restart recovery
+# test #21 -- process crash after issuance, restart recovery
 # ---------------------------------------------------------------------------
 
 
@@ -189,7 +189,7 @@ def test_21_crash_after_issuance_is_recovered_on_restart(tmp_path: Path, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# §28 test #22 -- abandoned-run restart recovery: sequence non-reuse, no
+# test #22 -- abandoned-run restart recovery: sequence non-reuse, no
 # fabricated observation
 # ---------------------------------------------------------------------------
 
@@ -238,17 +238,14 @@ def test_22_abandoned_run_sequence_is_never_reused_and_nothing_is_fabricated(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #23 -- source epoch 0 discovery works (not_yet_attested)
+# Ordinary read-only discovery has no trust precondition
 # ---------------------------------------------------------------------------
 
 
-def test_23_discovery_succeeds_at_epoch_zero_not_yet_attested(
+def test_23_discovery_needs_no_trust_or_enrollment_precondition(
     tmp_path: Path, monkeypatch
 ) -> None:
     store, authority, config, source_id = _bootstrap(tmp_path)
-    attestation = store.attestation_state(source_id)
-    assert attestation.attestation_status.value == "not_yet_attested"
-    assert attestation.source_attestation_epoch == 0
 
     _patch_transport(monkeypatch, _pve_handler(guests=({"vmid": 100, "type": "qemu", "name": "vm1", "status": "running"},)))
     outcome = sched.run_discovery_cycle(authority, source_id, config)
@@ -258,12 +255,18 @@ def test_23_discovery_succeeds_at_epoch_zero_not_yet_attested(
     view = publication.read()
     assert len(view.resources) == 1
     assert view.resources[0]["security_continuity"] == "unverified"
+    assert view.resources[0]["state_level"] == "discovered"
+    assert view.resources[0]["effective_capabilities"] == ()
 
 
 # ---------------------------------------------------------------------------
-# §28 test #24/#25/#26 -- adversarial: no forbidden authority calls
+# Adversarial: no forbidden authority surface
 # ---------------------------------------------------------------------------
 
+# The retired security-proof and mutation-shaped operations, named here only so
+# reintroducing one fails a test (AGENTS.md, "Threat model"). They must not
+# exist on the authority at all -- a structural guarantee, stronger than
+# "the scheduler happens not to call them".
 _FORBIDDEN_AUTHORITY_METHODS = (
     "enroll_source_attestation",
     "reattest_source",
@@ -282,39 +285,32 @@ _ENDPOINT_ACTIVATION_SHAPED_NAMES = (
 )
 
 
-def test_24_25_26_full_cycle_never_calls_any_forbidden_authority_method(
+def test_24_no_forbidden_authority_method_exists() -> None:
+    for name in _FORBIDDEN_AUTHORITY_METHODS:
+        assert not hasattr(InventoryAuthority, name), name
+
+
+def test_26_absent_guest_becomes_missing_and_is_never_removed(
     tmp_path: Path, monkeypatch
 ) -> None:
     store, authority, config, source_id = _bootstrap(tmp_path)
     _patch_transport(monkeypatch, _pve_handler(guests=({"vmid": 100, "type": "qemu", "name": "vm1", "status": "running"},)))
 
-    call_counts = {name: 0 for name in _FORBIDDEN_AUTHORITY_METHODS}
-    for name in _FORBIDDEN_AUTHORITY_METHODS:
-        original = getattr(InventoryAuthority, name)
-
-        def _make_spy(method_name, bound_original):
-            def _spy(self, *args, **kwargs):
-                call_counts[method_name] += 1
-                return bound_original(self, *args, **kwargs)
-
-            return _spy
-
-        monkeypatch.setattr(InventoryAuthority, name, _make_spy(name, original))
-
-    # Success cycle, then a cycle over a now-missing guest (presence should
-    # become "missing", never "confirmed_removed").
     first = sched.run_discovery_cycle(authority, source_id, config)
     assert first.status == "success"
+    resource_id = InventoryPublication(store, authority).read().resources[0]["resource_id"]
 
+    # A complete, boundary-valid baseline that no longer lists the guest.
     _patch_transport(monkeypatch, _pve_handler(guests=()))
     second = sched.run_discovery_cycle(authority, source_id, config)
     assert second.status == "success"
 
     view = InventoryPublication(store, authority).read()
+    assert len(view.resources) == 1
+    assert view.resources[0]["resource_id"] == resource_id
     assert view.resources[0]["presence"] == "missing"
-    assert view.resources[0]["presence"] != "confirmed_removed"
-
-    assert all(count == 0 for count in call_counts.values()), call_counts
+    assert view.resources[0]["lifecycle"] == "quarantined"
+    assert view.resources[0]["security_continuity"] == "unverified"
 
 
 def test_25_no_endpoint_activation_shaped_method_exists_on_the_authority() -> None:
@@ -324,7 +320,7 @@ def test_25_no_endpoint_activation_shaped_method_exists_on_the_authority() -> No
 
 
 # ---------------------------------------------------------------------------
-# §28 test #41 -- scheduler shutdown does not force-abandon an in-flight run
+# test #41 -- scheduler shutdown does not force-abandon an in-flight run
 # ---------------------------------------------------------------------------
 
 
@@ -359,7 +355,7 @@ def test_41_shutdown_does_not_force_abandon_an_in_flight_run(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #42 -- startup ordering: recovery -> config drift -> scheduling
+# test #42 -- startup ordering: recovery -> config drift -> scheduling
 # ---------------------------------------------------------------------------
 
 

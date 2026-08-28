@@ -1064,7 +1064,7 @@ def cmd_pveum(args):
         # disproved that assumption -- the real command returns a
         # path-keyed object instead ({"<path>": {"Sys.Audit": 1, ...}}),
         # observed literally as `{"/":{}}` for an empty grant at path "/".
-        # See docs/architecture/0.5-implementation-status.md's real-PVE
+        # See the real-PVE
         # precheck notes. The requested --path value is read back from
         # argv (defaulting to "/", the only value this bootstrap ever
         # requests) rather than hardcoded, so a test could in principle

@@ -1,8 +1,6 @@
 """R0 discovery runtime: scheduler, orchestrator, and restart recovery.
 
-Implements exactly §§11-16 of
-``docs/architecture/0.5-r0-read-only-runtime-activation.md`` (WAVE R0-B,
-Family 3). This module is a thin orchestrator over the existing, already-
+See ``ARCHITECTURE.md``. This module is a thin orchestrator over the existing, already-
 tested ``app.inventory`` authority/provider/discovery methods -- it never
 touches ``discovery_runs``/``inventory_sources``/``resource_incarnations``
 directly, and it introduces no new durable authority behavior.
@@ -12,13 +10,12 @@ It has a narrow, closed call surface by construction: the only
 ``issue_discovery_run``, ``mark_discovery_run_running``,
 ``finalize_successful_discovery_run``, ``finalize_failed_discovery_run``,
 and ``abandon_discovery_run`` -- used both for startup crash/abandoned-run
-recovery (:func:`perform_startup_recovery`, §13) and as the uniform
+recovery (:func:`perform_startup_recovery`) and as the uniform
 post-issuance safety net inside :func:`run_discovery_cycle` that fences a
 run on an unexpected or unclassifiable failure rather than leaving it
-stranded (§12). It never calls any attestation-shaped, candidate-
-activation-shaped, or confirmed-removal-shaped authority method -- there
-is no code path here that could, by construction, not merely by
-convention.
+stranded. It never calls any mutation-shaped or
+endpoint-activation-shaped authority method -- there is no code path here
+that could, by construction, not merely by convention.
 """
 
 from __future__ import annotations
@@ -152,7 +149,6 @@ def _failure_snapshot(
         failed_detail_scopes=(),
         nodes=(),
         resources=(),
-        expected_source_attestation_epoch=run.expected_source_attestation_epoch,
         provider_node_scope=None,
         provider_guest_locators=None,
     )
@@ -184,9 +180,9 @@ def _discovered_resources(
 ) -> tuple[DiscoveredResource, ...]:
     # Per-guest detail reads (the optional
     # "/nodes/{node}/{type}/{vmid}/config" endpoint) are not implemented by
-    # this R0-B package -- every discovered guest is recorded as detail_
-    # status=OK from the baseline read alone, matching the accepted MVP
-    # scope (§9's ENDPOINT_ACL_MATRIX marks that endpoint
+    # this runtime -- every discovered guest is recorded as detail_
+    # status=OK from the baseline read alone, matching the current scope
+    # (ENDPOINT_ACL_MATRIX marks that endpoint
     # baseline_prerequisite=False).
     resources = []
     for row in result.guest_rows:
@@ -248,7 +244,6 @@ def _normalize_result(
         failed_detail_scopes=(),
         nodes=nodes,
         resources=resources,
-        expected_source_attestation_epoch=run.expected_source_attestation_epoch,
     )
 
 
@@ -256,7 +251,7 @@ def _build_transport(
     run: DiscoveryRun, config: R0RuntimeConfig
 ) -> ProxmoxHttpTransport:
     # Constructed fresh per discovery run from the run's own captured
-    # expected_canonical_transport_locator (§9) -- never a cached client
+    # expected_canonical_transport_locator -- never a cached client
     # pointed at whatever the current config happens to say.
     verify: bool | str = (
         config.source.tls.ca_bundle_path
@@ -277,14 +272,14 @@ def run_discovery_cycle(
     *,
     now: Callable[[], datetime] = _default_now,
 ) -> DiscoveryCycleOutcome:
-    """Perform exactly one issue -> transport I/O -> finalize cycle (§11).
+    """Perform exactly one issue -> transport I/O -> finalize cycle.
 
     Never bypasses the durable authority CAS: issuance, running transition,
     and finalization are exactly the four ``InventoryAuthority`` calls
     listed in this module's docstring, in that order, with no direct table
     access at any point.
 
-    Post-issuance safety invariant (§12): once ``issue_discovery_run`` has
+    Post-issuance safety invariant: once ``issue_discovery_run`` has
     successfully claimed ownership, this function never lets an exception
     (classifiable or not) leave ``active_discovery_run_id`` durably
     stranded. Classifiable transport/provider failures finalize as a
@@ -293,7 +288,7 @@ def run_discovery_cycle(
     error this function cannot honestly classify without fabricating
     provider evidence -- falls through to a single, uniform safety net
     that fences the run with the existing, already-tested
-    ``abandon_discovery_run`` mechanism (§13) rather than leaving it
+    ``abandon_discovery_run`` mechanism rather than leaving it
     active until the next process restart.
     """
 
@@ -302,7 +297,7 @@ def run_discovery_cycle(
     except AuthorityConflict as exc:
         # No run was issued at all -- nothing to strand. Per-source
         # single-flight is already durably enforced by the authority's
-        # own CAS (§1 item 11); a second concurrent issuance attempt (this
+        # own CAS (item 11); a second concurrent issuance attempt (this
         # scheduler racing itself, or a future manual trigger) must
         # cleanly lose, exactly like two scheduler ticks would -- log and
         # skip, never crash the process.
@@ -333,7 +328,7 @@ def run_discovery_cycle(
             # Already released/terminalized -- e.g. finalize_successful_
             # discovery_run's own completion-context-changed path already
             # audits an "invalid" completion and releases ownership before
-            # raising (§11); a mark_discovery_run_running conflict that
+            # raising; a mark_discovery_run_running conflict that
             # never touched ownership is the other case this call
             # actually fences. Either way, active_discovery_run_id is
             # guaranteed clear by the time we return.
@@ -393,17 +388,16 @@ def _execute_issued_run(
 def perform_startup_recovery(
     authority: InventoryAuthority, store: InventoryAuthorityStore
 ) -> tuple[str, ...]:
-    """Clear any stale active-run ownership left by a prior crash (§13).
+    """Clear any stale active-run ownership left by a prior crash.
 
-    Must run before any configuration-drift comparison (Family 1's
-    ``bootstrap_or_reconcile_source``) and before the first scheduled
-    discovery issuance (§8 step 4 / §42). Returns the run ids abandoned,
-    for logging/test observability only.
+    Must run before any configuration-drift comparison
+    (``bootstrap_or_reconcile_source``) and before the first scheduled
+    discovery issuance. Returns the run ids abandoned, for logging/test
+    observability only.
 
     Uses only the existing, already-tested ``abandon_discovery_run``
     method -- no raw SQL, no invented recovery mechanism, no fabricated
-    observation/completion/health, and no interaction with confirmed
-    removal or attestation of any kind.
+    observation/completion/health.
     """
 
     abandoned: list[str] = []
@@ -429,10 +423,10 @@ def bootstrap_and_start_r0_runtime(
     start: bool = True,
     now: Callable[[], datetime] = _default_now,
 ) -> "R0Scheduler":
-    """Exact §8 startup order, in one place (§42): recovery, then config-
-    drift comparison, then scheduling. Family 4's composition root calls
-    only this function to wire startup together -- it does not reimplement
-    or reorder any of these three steps itself."""
+    """Exact startup order, in one place: recovery, then config-drift
+    comparison, then scheduling. ``app/inventory_runtime.py`` calls only
+    this function to wire startup together -- it does not reimplement or
+    reorder any of these three steps itself."""
 
     from app.inventory_runtime_config import bootstrap_or_reconcile_source
 
@@ -450,11 +444,11 @@ def _clamped_interval_seconds(config: R0RuntimeConfig) -> int:
 
 
 class R0Scheduler:
-    """Single background thread driving §11's exact call chain on a timer.
+    """Single background thread driving's exact call chain on a timer.
 
-    The smallest safe scheduler (§12): no framework beyond the standard
-    library. Single-source in this R0-B package (§5); a future multi-source
-    package would run one independent instance of this per source.
+    The smallest safe scheduler: no framework beyond the standard
+    library. Single-source today; a future multi-source runtime would run
+    one independent instance of this per source.
     """
 
     def __init__(
@@ -475,7 +469,7 @@ class R0Scheduler:
         self._thread: threading.Thread | None = None
         # In-process single-flight guard: a performance/clarity nicety
         # only. The actual security boundary is the durable
-        # active_discovery_run_id CAS inside issue_discovery_run (§12).
+        # active_discovery_run_id CAS inside issue_discovery_run.
         self._cycle_lock = threading.Lock()
 
     @property
@@ -494,7 +488,7 @@ class R0Scheduler:
     def stop(self, *, grace_seconds: float = 10.0) -> None:
         """Stop issuing new runs; allow an in-flight run its own grace period.
 
-        Never force-abandons a running discovery run from here (§12/§41) --
+        Never force-abandons a running discovery run from here --
         that would race the run's own natural finalize path. If the grace
         period elapses first, the process is expected to exit and the next
         startup's :func:`perform_startup_recovery` picks the run up.

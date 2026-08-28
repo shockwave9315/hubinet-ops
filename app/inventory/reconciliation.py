@@ -86,9 +86,6 @@ class InventoryReconciler:
                 continue
 
             returning_from_gap = str(old["presence"]) == "missing"
-            security = str(old["security_continuity"])
-            if returning_from_gap and security == "trusted":
-                security = "revoked"
             last_known_node_id = (
                 None
                 if node_id is not None
@@ -97,7 +94,7 @@ class InventoryReconciler:
             connection.execute(
                 "UPDATE resource_incarnations SET name=?, status=?, current_node_id=?, "
                 "last_known_node_id=?, presence='present', lifecycle=?, "
-                "observational_continuity=?, security_continuity=?, detail_status=?, "
+                "observational_continuity=?, detail_status=?, "
                 "node_availability=?, facts_json=?, resource_continuity_revision="
                 "resource_continuity_revision+?, updated_at=? WHERE resource_id=?",
                 (
@@ -107,7 +104,6 @@ class InventoryReconciler:
                     last_known_node_id,
                     "quarantined" if returning_from_gap else str(old["lifecycle"]),
                     "uncertain" if returning_from_gap else str(old["observational_continuity"]),
-                    security,
                     observed.detail_status.value,
                     availability,
                     _json(observed.facts),
@@ -116,45 +112,25 @@ class InventoryReconciler:
                     str(old["resource_id"]),
                 ),
             )
-            if returning_from_gap:
-                # ADR 0004 §12 retention shape A: the slot is present again,
-                # so any retained sampled-absence provenance is no longer
-                # current-eligible. Clearing it is a routine, non-security
-                # side effect of ordinary reconciliation, not a removal/
-                # absence decision of any kind (§3 item 4/5/6/7 unchanged).
-                self._clear_absence_pointer(connection, str(old["resource_id"]))
             counts["updated"] += 1
 
         for vmid, old in active_rows.items():
             if vmid in observed_vmids:
                 continue
-            resource_id = str(old["resource_id"])
-            # ADR 0004 §12 retention shape A: this exact authoritative
-            # successful complete-baseline run sampled the known slot
-            # absent -- durably record/reconfirm that fact atomically with
-            # this same reconciliation commit, even when the resource was
-            # already missing and no other field below needs to change.
-            # This is machine consistency evidence only (§11); it grants no
-            # authority and performs no identity/binding/revision mutation.
-            self._upsert_absence_pointer(
-                connection,
-                resource_id=resource_id,
-                inventory_source_id=snapshot.inventory_source_id,
-                witness_run_id=snapshot.run_id,
-                witness_discovery_run_sequence=snapshot.discovery_run_sequence,
-                updated_at=committed_at,
-            )
             if str(old["presence"]) == "missing":
                 continue
-            security = "revoked" if str(old["security_continuity"]) == "trusted" else str(old["security_continuity"])
+            resource_id = str(old["resource_id"])
+            # A slot absent from a complete, boundary-valid baseline becomes
+            # missing/quarantined and is retained. It is never deleted, and a
+            # failed or partial run never reaches this method at all.
             last_known = old["current_node_id"] or old["last_known_node_id"]
             connection.execute(
                 "UPDATE resource_incarnations SET presence='missing', lifecycle='quarantined', "
-                "observational_continuity='uncertain', security_continuity=?, "
+                "observational_continuity='uncertain', "
                 "detail_status='not_applicable', node_availability='not_applicable', "
                 "current_node_id=NULL, last_known_node_id=?, resource_continuity_revision="
                 "resource_continuity_revision+1, updated_at=? WHERE resource_id=?",
-                (security, last_known, committed_at, resource_id),
+                (last_known, committed_at, resource_id),
             )
             counts["missing"] += 1
 
@@ -242,14 +218,8 @@ class InventoryReconciler:
         old_resource_id = str(old["resource_id"])
         old_binding_id = str(old["binding_id"])
         old_generation = int(old["locator_generation"])
-        # ADR 0004 §12 retention shape A: a replaced old resource is
-        # terminal (not_current/retired) and must not retain an eligible
-        # current sampled-absence pointer, whether or not it was missing
-        # immediately beforehand.
-        self._clear_absence_pointer(connection, old_resource_id)
         successor_id = self._new_uuid()
         successor_binding_id = self._new_uuid()
-        old_security = "revoked" if str(old["security_continuity"]) == "trusted" else str(old["security_continuity"])
         last_known = old["current_node_id"] or old["last_known_node_id"]
         connection.execute(
             "UPDATE resource_locator_bindings SET valid_to_run_sequence=?, closure_reason='replaced' "
@@ -258,11 +228,11 @@ class InventoryReconciler:
         )
         connection.execute(
             "UPDATE resource_incarnations SET presence='not_current', lifecycle='retired', "
-            "observational_continuity='replaced', security_continuity=?, detail_status='not_applicable', "
+            "observational_continuity='replaced', detail_status='not_applicable', "
             "node_availability='not_applicable', current_node_id=NULL, last_known_node_id=?, "
             "resource_continuity_revision=resource_continuity_revision+1, termination_reason='replaced', "
             "successor_resource_id=?, updated_at=? WHERE resource_id=?",
-            (old_security, last_known, successor_id, committed_at, old_resource_id),
+            (last_known, successor_id, committed_at, old_resource_id),
         )
         connection.execute(
             "INSERT INTO resource_incarnations(resource_id, inventory_source_id, resource_type, vmid, "
@@ -283,57 +253,10 @@ class InventoryReconciler:
         connection.execute(
             "INSERT INTO resource_terminations("
             "resource_id, inventory_source_id, binding_id, locator_generation, reason, "
-            "successor_resource_id, run_sequence, class_c_decision_id, created_at) "
-            "VALUES(?, ?, ?, ?, 'replaced', ?, ?, NULL, ?)",
+            "successor_resource_id, run_sequence, created_at) "
+            "VALUES(?, ?, ?, ?, 'replaced', ?, ?, ?)",
             (old_resource_id, snapshot.inventory_source_id, old_binding_id, old_generation,
              successor_id, snapshot.discovery_run_sequence, committed_at),
-        )
-
-    @staticmethod
-    def _upsert_absence_pointer(
-        connection: sqlite3.Connection,
-        *,
-        resource_id: str,
-        inventory_source_id: str,
-        witness_run_id: str,
-        witness_discovery_run_sequence: int,
-        updated_at: str,
-    ) -> None:
-        """ADR 0004 §12 retention shape A: overwrite, never append.
-
-        A single bounded row per resource; only ever written by an
-        authoritative successful complete-baseline reconciliation commit
-        (never by a partial/failed/stale run, which never reaches this
-        method at all), and carries no identity/binding/revision/authority
-        side effect of its own.
-        """
-
-        connection.execute(
-            "INSERT INTO resource_absence_pointers("
-            "resource_id, inventory_source_id, witness_run_id, "
-            "witness_discovery_run_sequence, updated_at) "
-            "VALUES(?, ?, ?, ?, ?) "
-            "ON CONFLICT(resource_id) DO UPDATE SET "
-            "witness_run_id=excluded.witness_run_id, "
-            "witness_discovery_run_sequence=excluded.witness_discovery_run_sequence, "
-            "updated_at=excluded.updated_at",
-            (
-                resource_id,
-                inventory_source_id,
-                witness_run_id,
-                witness_discovery_run_sequence,
-                updated_at,
-            ),
-        )
-
-    @staticmethod
-    def _clear_absence_pointer(connection: sqlite3.Connection, resource_id: str) -> None:
-        """Delete (never merely mark) retention-shape-A provenance that is
-        no longer current-eligible -- the slot is present again or the old
-        resource has become terminal via replacement (ADR 0004 §12)."""
-
-        connection.execute(
-            "DELETE FROM resource_absence_pointers WHERE resource_id=?", (resource_id,)
         )
 
 

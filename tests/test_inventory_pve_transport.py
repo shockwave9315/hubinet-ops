@@ -1,7 +1,7 @@
-"""WAVE R0-B Family 2 -- production GET-only Proxmox VE HTTP transport.
+"""Production GET-only Proxmox VE HTTP transport.
 
-Covers §28 tests #9-#19 of
-docs/architecture/0.5-r0-read-only-runtime-activation.md. No real network
+Covers tests #9-#19 of
+ARCHITECTURE.md. No real network
 access anywhere in this file: every request is intercepted in-process by
 ``httpx.MockTransport``, exactly like every other ``app.inventory`` test
 uses a fake/mock transport boundary instead of a live endpoint.
@@ -49,7 +49,7 @@ def _json_response(payload, *, status_code: int = 200, headers=None) -> httpx.Re
 
 
 # ---------------------------------------------------------------------------
-# §28 test #9 -- HTTPS-only PVE transport
+# test #9 -- HTTPS-only PVE transport
 # ---------------------------------------------------------------------------
 
 
@@ -68,7 +68,7 @@ def test_9_accepts_https_locator() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #10 -- no verify=False production transport
+# test #10 -- no verify=False production transport
 # ---------------------------------------------------------------------------
 
 
@@ -96,7 +96,7 @@ def test_10_ca_bundle_path_string_is_not_rejected_by_the_construction_guard() ->
 
 
 # ---------------------------------------------------------------------------
-# §28 test #11 -- exact token Authorization header shape
+# test #11 -- exact token Authorization header shape
 # ---------------------------------------------------------------------------
 
 
@@ -127,7 +127,7 @@ def test_11_pve_secret_never_appears_outside_the_authorization_header() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #12 -- GET allowlist only
+# test #12 -- GET allowlist only
 # ---------------------------------------------------------------------------
 
 
@@ -142,7 +142,7 @@ def test_12_adapter_exposes_no_mutation_or_generic_request_method() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #13 -- redirects fail closed
+# test #13 -- redirects fail closed
 # ---------------------------------------------------------------------------
 
 
@@ -166,7 +166,7 @@ def test_13_client_is_constructed_with_redirects_and_proxy_env_disabled() -> Non
 
 
 # ---------------------------------------------------------------------------
-# §28 test #14 -- timeout classification
+# test #14 -- timeout classification
 # ---------------------------------------------------------------------------
 
 
@@ -223,7 +223,7 @@ def test_14_default_timeouts_are_all_finite() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #15 -- invalid JSON/schema classification (adapter-level)
+# test #15 -- invalid JSON/schema classification (adapter-level)
 # ---------------------------------------------------------------------------
 
 
@@ -344,7 +344,7 @@ def _make_pve_handler(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #16 -- unsupported PVE release, end-to-end through the real adapter
+# test #16 -- unsupported PVE release, end-to-end through the real adapter
 # ---------------------------------------------------------------------------
 
 
@@ -358,7 +358,7 @@ def test_16_unsupported_pve_release_fails_closed_end_to_end() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #17 -- ACL/permission failure, end-to-end
+# test #17 -- ACL/permission failure, end-to-end
 # ---------------------------------------------------------------------------
 
 
@@ -374,7 +374,7 @@ def test_17_missing_permission_produces_configuration_error_end_to_end() -> None
 
 
 # ---------------------------------------------------------------------------
-# §28 test #18 -- cluster baseline, end-to-end
+# test #18 -- cluster baseline, end-to-end
 # ---------------------------------------------------------------------------
 
 
@@ -393,7 +393,7 @@ def test_18_cluster_baseline_completes_end_to_end() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #19 -- standalone baseline, end-to-end
+# test #19 -- standalone baseline, end-to-end
 # ---------------------------------------------------------------------------
 
 

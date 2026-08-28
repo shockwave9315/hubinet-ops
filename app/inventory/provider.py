@@ -209,7 +209,7 @@ def classify_boundary(
 
 
 class ProxmoxProviderV1:
-    """Dormant orchestrator facade around an injected read-only transport."""
+    """Orchestrator facade around an injected read-only transport."""
 
     contract_version = PROVIDER_CONTRACT_VERSION
 

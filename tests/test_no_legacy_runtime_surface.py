@@ -1,11 +1,10 @@
 """Permanent anti-regression guard: the 0.5-only repository boundary.
 
-Hubinet Ops 0.5 is a clean-break architecture (AGENTS.md, `docs/architecture/
-0.5-foundation.md`: "Git history and old tags are the archive. `main` is not
-an archive of obsolete runtime implementations."). The obsolete 0.2.x/0.3.x/
-0.4.x implementation, deployment, and Home Assistant presentation surfaces
-were retired from the current tree; their historical source remains
-recoverable only through Git history/tags.
+Hubinet Ops is a clean-break architecture: Git history and old tags are the
+archive, and `main` is not an archive of obsolete runtime implementations.
+The obsolete 0.2.x/0.3.x/0.4.x implementation, deployment, and Home Assistant
+presentation surfaces were retired from the current tree; their historical
+source remains recoverable only through Git history/tags.
 
 This file is a narrow, path/import-level guard, not a text-content ban. It
 must never fail on a *negative* historical reference inside current 0.5
@@ -241,7 +240,6 @@ _CURRENT_0_5_PRODUCTION_MODULES = (
     "app/inventory_scheduler.py",
     "app/inventory_pve_transport.py",
     "app/inventory/__init__.py",
-    "app/inventory/attestation.py",
     "app/inventory/authority.py",
     "app/inventory/canonicalization.py",
     "app/inventory/discovery.py",

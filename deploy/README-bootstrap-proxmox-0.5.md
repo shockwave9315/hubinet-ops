@@ -1,48 +1,22 @@
-# Hubinet Ops 0.5 R0 — automated Proxmox bootstrap
+# Automated Proxmox bootstrap
 
-`deploy/bootstrap-proxmox-0.5.sh` automates the manual procedure documented
-in
-[`docs/operations/0.5-r0-operational-activation.md`](../docs/operations/0.5-r0-operational-activation.md)
-sections 1-4 (and the start/first-half of section 5): a fresh unprivileged
-Debian 13 LXC, the R0 read-only runtime deployed into it via
-`deploy/install-0.5.0-fresh.sh` (unmodified), a least-privilege PVE
+`deploy/bootstrap-proxmox-0.5.sh` provisions the whole Hubinet Ops backend on
+a Proxmox host: a fresh unprivileged Debian 13 LXC, the runtime deployed into
+it via `deploy/install-0.5.0-fresh.sh` (unmodified), a least-privilege PVE
 identity, PVE TLS trust material, and the mandatory nftables firewall
-boundary — in that order, ending with the service started and CT boot
-enabled only after a genuine, contract-verified discovery success.
+boundary — in that order, ending with the service started and CT boot enabled
+only after a genuine, contract-verified discovery success.
 
-This script adds **no runtime mutation capability**. R0 remains read-only
-end to end; the `pct`/`pveum` commands this script runs are one-shot,
-human-invoked, PVE-host provisioning steps — structurally separate from
+This script adds **no runtime mutation capability**. The runtime remains
+read-only end to end; the `pct`/`pveum` commands here are one-shot,
+human-invoked, PVE-host provisioning steps, structurally separate from
 Hubinet Ops's own GET-only production PVE transport
 (`app/inventory_pve_transport.py`).
 
-> **Status**: implemented and unit/smoke-tested against a hermetic fake
-> command layer, AND exercised in three real, manual, operator-authorized
-> dogfood runs against the same real Proxmox host. Dogfood #1 stopped at
-> Phase 10 (nftables active-ruleset canonicalization, since fixed);
-> dogfood #2 reached Phase 12 (source acceptance) before failing on a
-> legacy PVE root CA missing the X509v3 Key Usage extension -- a
-> subsequent read-only forensic replay on the same preserved container
-> proved the exact production provider and Phase-12 acceptance checker
-> both PASS once that CA is corrected, but that replay was not itself a
-> dogfood PASS. **Dogfood #3, run fresh and clean from commit
-> `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2` (merged into `main` at the
-> time), completed Phase 1 through Phase 13 PASS with no manual
-> repair mid-run** -- the first dogfood to reach a full bootstrap PASS.
-> This proves the automated bootstrap completes successfully end to end
-> on a real host; it does **not** by itself mean full operational
-> readiness -- Home Assistant enrollment/acceptance and the multi-day
-> observation window in `docs/operations/0.5-r0-operational-activation.md`
-> §6/§7 are separate operational evidence. Those later steps have since
-> progressed: Home Assistant enrollment/acceptance passed and the recommended
-> >=24-hour observation window completed. The five observations left open by
-> PR #47 subsequently passed during the 2026-08-23 operator re-check. The
-> current R0 operational decision is GO; this bootstrap still did not prove
-> that operational decision by itself.
-> Before running the bootstrap yourself, review the "What this script proves,
-> and what it does not"
-> section below and the REAL-HOST PRECHECK commands (including the PVE
-> root CA Key Usage precheck) further down this document.
+It has been exercised against a real Proxmox host and completes end to end.
+Before running it yourself, read "What this script proves, and what it does
+not" and the REAL-HOST PRECHECK commands (including the PVE root CA Key Usage
+precheck) further down this document.
 
 ## Prerequisites
 
@@ -141,7 +115,7 @@ On the Proxmox host:
   `HubinetOpsR0Auditor`, a privilege-separated API token
   `hubinetops@pve!r0-readonly`, with the role granted to **both** the
   user and the token at path `/` with propagation — see
-  `docs/operations/0.5-r0-operational-activation.md` section 2 for the
+  the prerequisites above for the
   exact reasoning (this is the minimal set R0's own discovery contract
   requires, not a guess). The script reads back the token's actual
   effective permissions afterward and asserts the sorted set of truthy
@@ -227,7 +201,7 @@ working tree, at an exact commit you have explicitly confirmed:
   deployed.
 
 A signed-release / `curl | bash` distribution trust chain is **explicitly
-out of scope** for this wave — see "What remains manual" below. Run this
+out of scope** — see "What remains manual" below. Run this
 script from a real, trusted git checkout of this repository.
 
 ## What it never creates or does
@@ -255,8 +229,8 @@ script from a real, trusted git checkout of this repository.
 
 - **Least privilege by construction, verified as an exact set**: the PVE
   role created is exactly `Sys.Audit,VM.Audit`, matching
-  `app.inventory.provider.ENDPOINT_ACL_MATRIX`'s actual requirement (see
-  the operational-activation runbook section 2.1). Verification asserts
+  `app.inventory.provider.ENDPOINT_ACL_MATRIX`'s actual requirement.
+  Verification asserts
   the token's actual effective privilege set equals that pair exactly —
   any missing required privilege OR any unexpected extra one (of any
   name) fails the run closed.
@@ -331,8 +305,8 @@ missing or mismatched committed context, zero nodes, a terminal failure
 health state, an authentication failure, or a TLS failure never yields
 `Discovery: PASS`, and CT `onboot` is never enabled unless this check
 actually returns success. This script only ever reads the already-
-published snapshot (`app/inventory/publication.py`'s read side) — it does
-not activate attestation and does not change runtime architecture.
+published snapshot (`app/inventory/publication.py`'s read side) — it changes
+no runtime state.
 
 ## Ownership and rollback (PVE identity)
 
@@ -389,7 +363,7 @@ via the ledger — an ambiguous role-creation failure is always preserved.
 
 This is a fresh-install bootstrap, not an idempotent/adopt-existing tool:
 
-- A VMID that already exists → the script refuses to start (§ preflight).
+- A VMID that already exists → the script refuses to start (preflight).
   Remove it yourself (after confirming it's the failed run's own
   container, e.g. via the preserved-container path above) and re-run, or
   simply omit `--vmid` to let the script pick a different free one.
@@ -411,131 +385,54 @@ pveum user token permissions hubinetops@pve r0-readonly --path /
 
 The last command's output must show exactly `Sys.Audit` and `VM.Audit`
 (propagated) and nothing else — see
-`docs/operations/0.5-r0-operational-activation.md` section 2.5 for the
+the prerequisites above for the
 full manual verification procedure this script automates.
 
 ## What this script proves, and what it does not
 
 - It proves the created PVE credential's **effective permission set** is
-  exactly `Sys.Audit,VM.Audit` at the moment of verification, the
-  **firewall ruleset actually active** matches the intended exact
-  content/order, and the backend reports a **genuinely healthy, matching
-  discovery result** at acceptance time.
-- It does **not** prove long-term operational health — see
-  `docs/operations/0.5-r0-operational-activation.md` section 7 for the
-  required multi-day observation window before declaring R0 operationally
-  accepted.
-- **First real dogfood** (after this bootstrap merged to `main`): the
-  operator performed the first real, manual bootstrap execution against
-  Proxmox VE 9.2.3 / nftables 1.1.3 / a Debian 13 LXC (VMID 110). The run
-  reached Phase 10 and stopped there — **this is not yet a real
-  bootstrap PASS**. Everything through Phase 9 succeeded (VMID
-  auto-detection, storage, template, CT creation, PVE identity with the
-  exact `Sys.Audit,VM.Audit` proof, PVE CA deployment, exact source-SHA
-  deployment, the installer, CT tooling, config generation); Phase 10
-  loaded the generated ruleset successfully but then failed the
-  exact-content active-ruleset verification, closed exactly as designed
-  — the service was never started, and CT `onboot` remained `0`. The
-  cause: real nftables canonicalizes both a `/32` HA-source address and
-  the symbolic `hubinetops` skuid on the active-ruleset round trip (see
-  `deploy/lib/bootstrap-firewall.sh`'s `_nft_canonical_ha_source_expr`
-  and `_hubinetops_uid`) — fixed in a corrective pass. Real PVE-specific
-  behavior this repository's hermetic tests still cannot independently
-  exercise beyond what a real dogfood run has already confirmed remains
-  a residual risk — see the REAL-HOST PRECHECK block below for read-only
-  commands to sanity-check these assumptions manually.
-- **Second real dogfood** (fresh base after the fix above, on the SAME
-  physical PVE host as the first dogfood, since upgraded to Proxmox VE
-  9.2.11 — not a second/independent host, and this run proves nothing
-  about generalization to a different one): reached **Phase 12** —
-  Phase 10 (firewall) and **Phase 11 (service start) both PASSED**, the
-  hubinet-ops service genuinely started inside the CT (only stopped/
-  disabled again by rollback once Phase 12 failed), confirming the
-  `/32`/numeric-skuid fix above still holds on this host after its
-  upgrade — then Phase 12 (source acceptance) **failed closed** with
-  `health=source_unavailable`. **This is still not a real bootstrap
-  PASS.** The actual cause, confirmed by directly reading the service
-  journal and by real, read-only forensic checks on the preserved failed
-  CT (TCP/TLS/firewall/UID [checked inside the CT itself]/token-
-  permission all independently confirmed working): the PVE host's legacy
-  root CA lacked
-  the `X509v3 Key Usage` extension, which Python 3.13's strict
-  certificate-chain validation (used by both this bootstrap's own httpx-
-  based checks and the production R0 runtime's transport) rejects. This
-  is an **environmental PVE-host CA condition**, not a bootstrap defect —
-  see the "PVE root CA — Key Usage precheck" block below for how to check
-  this on your own host *before* running the bootstrap. This bootstrap
-  does not, and will not, create/regenerate/modify the PVE root CA
-  itself, and does not add any relaxed-verification fallback for a
-  legacy CA — that remains an external PVE-administrator operation.
-  Fixed in this pass: a certificate-verification failure now classifies
-  correctly as a security/configuration proof failure
-  (`app/inventory_pve_transport.py`), and a rollback-diagnostics
-  precision gap that recurred on this same run was further refined (see
-  `docs/architecture/0.5-implementation-status.md`'s "second real
-  dogfood" entry for the full detail). A fresh, clean dogfood #3 run
-  through Phase 13 with the CA corrected has since occurred and
-  achieved that PASS -- see the "third real dogfood" entry in the same
-  document.
-- **Third real dogfood** (fresh run from commit
-  `3d6d0865b28c5c6070cb565ff5b7af49bb7147d2`, merged into `main` at the
-  time, on the SAME physical PVE host as the first two dogfoods, with
-  the CA-classification
-  fix from the second dogfood in place): **completed Phase 1 through
-  Phase 13 PASS with no manual repair mid-run — the first dogfood run to
-  reach a full bootstrap PASS.** Verified final facts: backend
-  `source_health=healthy`, `source_freshness=fresh`,
-  `last_committed_run_sequence=1`, `node_count=1`, `resource_count=11`,
-  firewall (nftables) verification PASS, mutation authority confirmed
-  NONE, CT `onboot` enabled, `hubinet-ops` service active/enabled,
-  nftables active/enabled. This proves the automated bootstrap completes
-  successfully end to end on a real host. **It does not prove long-term
-  operational health or full R0 operational acceptance** — see
-  `docs/operations/0.5-r0-operational-activation.md` sections 6 and 7
-  for the separately completed Home Assistant enrollment/acceptance,
-  recommended >=24-hour observation window, and later 2026-08-23 operator
-  re-check in which all five observations left open by PR #47 passed. The
-  current R0 operational decision is GO; this dogfood run did not establish
-  that later operational closure by itself.
+  exactly `Sys.Audit,VM.Audit` at the moment of verification, the **firewall
+  ruleset actually active** matches the intended exact content/order, and the
+  backend reports a **genuinely healthy, matching discovery result** at
+  acceptance time.
+- It does **not** prove long-term operational health. Watch source
+  health/freshness across several discovery cycles before treating a new
+  install as settled.
+- It does **not** create, regenerate, or modify the PVE root CA. A legacy CA
+  missing the `X509v3 Key Usage` extension is rejected by Python's strict
+  chain validation, and there is no relaxed-verification fallback — check for
+  it with the precheck below and fix it as a PVE-administrator operation.
+- Real PVE-specific behavior that this repository's hermetic tests cannot
+  exercise remains a residual risk. The REAL-HOST PRECHECK block below gives
+  read-only commands to sanity-check those assumptions manually.
 - `.github/workflows/bootstrap-smoke.yml` wires the compliant sandbox
-  (`tests/shell/run_bootstrap_smoke_sandbox.sh`) into GitHub Actions,
-  narrowly path-filtered to bootstrap/sandbox-related changes and
-  triggered on `pull_request` (plus manual `workflow_dispatch`) — the
-  workflow itself sets only the `HUBINET_OPS_EPHEMERAL_CI=1` marker the
-  launcher requires and invokes the launcher unmodified; it never sets
-  `HUBINET_OPS_SYSTEM_SANDBOX` directly. It has since run successfully at
-  least once (PR #38); treat each individual PR's own sandbox run result
-  as the merge-readiness evidence for that PR, not a standing guarantee.
+  (`tests/shell/run_bootstrap_smoke_sandbox.sh`) into GitHub Actions, narrowly
+  path-filtered and PR-triggered. It sets only the `HUBINET_OPS_EPHEMERAL_CI=1`
+  marker the launcher requires and invokes the launcher unmodified; it never
+  sets `HUBINET_OPS_SYSTEM_SANDBOX` directly. Treat each PR's own sandbox run
+  as that PR's evidence, not a standing guarantee.
 
 ## After a successful run
 
-The script prints a summary (VMID, CT address, PVE endpoint, source
-commit, credential identity, permission profile, and PASS/FAIL for
-firewall/discovery) — never a secret. The R0 API bearer token Home
-Assistant needs is in `/etc/hubinet-ops/agent.env` inside the new CT, not
-printed to the console.
+The script prints a summary (VMID, CT address, PVE endpoint, source commit,
+credential identity, permission profile, and PASS/FAIL for firewall and
+discovery) — never a secret. The API bearer token Home Assistant needs is in
+`/etc/hubinet-ops/agent.env` inside the new CT, not printed to the console.
 
-Next step: add the native Hubinet Ops integration in Home Assistant,
-using the printed CT address on port 8787 and that bearer token — see
-`docs/operations/0.5-ha-clean-break.md` for the full HA-side procedure
-(including the mandatory zero-active-0.4-surface gate if this Home
-Assistant instance still has the legacy 0.4 package/dashboard installed).
+Next step: add the Hubinet Ops integration in Home Assistant using the printed
+CT address on port 8787 and that bearer token. See the installation section of
+the repository `README.md`.
 
 ## What remains manual
 
-- Real Home Assistant enrollment itself (config entry creation) — this
-  script only prepares the R0 backend; HA-side steps are covered by
-  `docs/operations/0.5-ha-clean-break.md` and
-  `docs/operations/0.5-r0-operational-activation.md` section 6.
-- The multi-day observation window
-  (`docs/operations/0.5-r0-operational-activation.md` section 7) before
-  declaring R0 operationally accepted.
-- Multi-source bootstrap (this script, like the R0 config format itself,
-  supports exactly one PVE source per run — see
-  `docs/architecture/0.5-r0-read-only-runtime-activation.md` section 5).
-- A signed-release / `curl | bash` one-line distribution path — deferred
-  as future packaging work; run this script from a real, trusted git
-  checkout of this repository for now.
+- Home Assistant enrollment itself (creating the config entry). This script
+  only prepares the backend.
+- Watching source health/freshness for a while before treating a new install
+  as settled.
+- Multi-source bootstrap. This script, like the config format itself, supports
+  exactly one PVE source per run.
+- A signed-release / `curl | bash` distribution path — future packaging work.
+  Run this script from a real, trusted git checkout for now.
 
 ## REAL-HOST PRECHECK
 
@@ -548,19 +445,19 @@ never run these against a real host itself — this list is for your own
 manual use.
 
 ```bash
-# Next-free VMID mechanism (Blocker: removed the hardcoded VMID=110 default)
+# Next-free VMID mechanism (the VMID is auto-detected, never hardcoded)
 pvesh get /cluster/nextid --output-format json
 
 # `pct config <vmid>` output shape -- confirm one "key: value" line per
 # config entry, including a literal "nameserver: <ip>" line after
-# `pct create --nameserver <ip>` (P2-2, third pass; read back by
+# `pct create --nameserver <ip>` (read back by
 # bootstrap-firewall.sh::_verify_ct_dns_resolver_matches_declared before
 # any hostname PVE endpoint firewall is generated)
 pct config <an-existing-test-vmid>
 
 # pveum JSON output support, and the exact shape of user/token/role
 # listings (including the `comment` field the rollback ownership-proof
-# read-back requires on BOTH user and token listings -- P2-3, third pass;
+# read-back requires on BOTH user and token listings;
 # note PVE roles have no comment field at all, so role rollback is never
 # automatic, see bootstrap-identity.sh's _role_object_owned_by_this_run)
 pveum user list --output-format json
@@ -580,7 +477,7 @@ pveum user token permissions <existing-user> <existing-token> \
 # Storage capacity reporting -- CONFIRM these Total/Used/Available values
 # are in KiB on your PVE version, matching what
 # deploy/lib/bootstrap-preflight.sh::_storage_has_free_space now assumes
-# (Blocker 1: an earlier version of this parser incorrectly treated this
+# (an earlier version of this parser incorrectly treated this
 # column as bytes)
 pvesm status --content rootdir
 pvesm status --content vztmpl
@@ -593,8 +490,7 @@ pveam available --section system | grep -i debian-13
 # PVE CA trust material
 ls -la /etc/pve/pve-root-ca.pem
 
-# PVE root CA -- Key Usage precheck (second real dogfood, eighth
-# corrective pass): a legacy PVE root CA that predates current PVE
+# PVE root CA -- Key Usage precheck: a legacy PVE root CA that predates current PVE
 # tooling may lack the X509v3 Key Usage extension. Python 3.13's strict
 # certificate-chain validation (used by both this bootstrap's own
 # checks and the production R0 runtime's transport) rejects such a CA
@@ -618,7 +514,7 @@ openssl x509 -in /etc/pve/pve-root-ca.pem -noout -text | grep -A2 'X509v3 Key Us
 # uses OpenSSL's permissive legacy chain-building rules and can report
 # "OK" for a CA that Python 3.13's own strict validation (used by this
 # bootstrap and by the production R0 runtime's transport) still rejects
-# -- exactly the missing-Key-Usage condition dogfood #2 exposed. A
+# -- exactly the missing-Key-Usage condition this precheck exists for. A
 # precheck using non-strict `openssl verify` can miss that condition
 # entirely and falsely report the host as ready.
 openssl verify -x509_strict -CAfile /etc/pve/pve-root-ca.pem /etc/pve/local/pve-ssl.pem
@@ -634,7 +530,7 @@ command -v jq; command -v python3; python3 --version
 # nftables availability (required inside the CT, provisioned by phase 8b)
 nft --version
 
-# Hostname PVE endpoint resolution sanity check (Blocker 4) -- if you plan
+# Hostname PVE endpoint resolution sanity check -- if you plan
 # to use a hostname --pve-endpoint, confirm it resolves the way
 # deploy/lib/hubinet-ops-bootstrap-resolve-dns.py will resolve it INSIDE a
 # fresh CT (i.e. using that CT's own resolver configuration, which may
@@ -642,7 +538,7 @@ nft --version
 #   pct exec <a-test-ct> -- python3 -c \
 #     "import socket; print(sorted({i[4][0] for i in socket.getaddrinfo('<your-pve-hostname>', 443, socket.AF_INET, socket.SOCK_STREAM)}))"
 
-# DNS resolver authority (P2-2, third pass) -- if you plan to use a
+# DNS resolver authority -- if you plan to use a
 # hostname --pve-endpoint (--dns-resolver required), confirm on a real
 # test CT built from the SAME template this bootstrap will select
 # (phase 2) that `pct create --nameserver <ip>` is accepted and persisted,

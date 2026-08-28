@@ -1,28 +1,17 @@
 """Hubinet Ops 0.5 persistent inventory authority core."""
 
 from .authority import InventoryAuthority
-from .attestation import (
-    ANCHOR_KIND_PVE_ROOT_CA_SHA256_FINGERPRINT,
-    SourceAttestationEvidenceReader,
-    SourceAttestationEvidenceReading,
-    SourceAttestationReadOutcome,
-)
 from .canonicalization import (
     CANONICALIZATION_CONTRACT_VERSION,
     canonicalize_transport_locator,
 )
 from .models import (
-    AttestationEvidenceTier,
-    AttestationOperation,
-    AttestationOutcome,
     AuthorityConflict,
     AuthorityDatabaseRejected,
     AuthorityError,
     AuthorityInvariantError,
     AuthorityNotFound,
     BackendInstance,
-    CandidateAttestationBinding,
-    ConfirmedRemovalResult,
     DiscoveryRun,
     DiscoveryRunLifecycle,
     EndpointLifecycle,
@@ -32,19 +21,11 @@ from .models import (
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
-    ResourceAbsenceAttestation,
-    ResourceAbsencePointer,
-    ResourceRemovalAuthority,
     ResourceTermination,
-    SourceAttestationEvent,
-    SourceAttestationRelationshipGate,
-    SourceAttestationState,
-    SourceAttestationStatus,
     SourceEndpoint,
     SourceRuntimeHealth,
     ResourceIncarnation,
     ResourceLocatorBinding,
-    TierTwoEvaluationStatus,
 )
 from .discovery import (
     BaselineCompleteness,
@@ -74,10 +55,6 @@ from .reconciliation import ReconciliationSummary
 from .store import InventoryAuthorityStore
 
 __all__ = [
-    "ANCHOR_KIND_PVE_ROOT_CA_SHA256_FINGERPRINT",
-    "AttestationEvidenceTier",
-    "AttestationOperation",
-    "AttestationOutcome",
     "AuthorityConflict",
     "AuthorityDatabaseRejected",
     "AuthorityError",
@@ -88,8 +65,6 @@ __all__ = [
     "BaselineMode",
     "BoundaryBaselineResult",
     "CANONICALIZATION_CONTRACT_VERSION",
-    "CandidateAttestationBinding",
-    "ConfirmedRemovalResult",
     "DiscoveryRun",
     "DiscoveryRunCompletionEvidence",
     "DiscoveryRunLifecycle",
@@ -115,23 +90,12 @@ __all__ = [
     "PublishedInventoryView",
     "ReadOnlyProviderTransport",
     "ReconciliationSummary",
-    "ResourceAbsenceAttestation",
-    "ResourceAbsencePointer",
     "ResourceIncarnation",
     "ResourceLocatorBinding",
-    "ResourceRemovalAuthority",
     "ResourceTermination",
-    "SourceAttestationEvent",
-    "SourceAttestationEvidenceReader",
-    "SourceAttestationEvidenceReading",
-    "SourceAttestationReadOutcome",
-    "SourceAttestationRelationshipGate",
-    "SourceAttestationState",
-    "SourceAttestationStatus",
     "SourceAvailability",
     "SourceEndpoint",
     "SourceRuntimeHealth",
-    "TierTwoEvaluationStatus",
     "canonicalize_transport_locator",
     "classify_boundary",
     "classify_provider_failure",

@@ -13,7 +13,7 @@
 # already enforces nothing sensitive is tracked -- scripts/check_tracked_files.py).
 #
 # A signed-release / `curl | bash` distribution trust chain is explicitly
-# OUT OF SCOPE for this wave -- see deploy/README-bootstrap-proxmox-0.5.md
+# OUT OF SCOPE -- see deploy/README-bootstrap-proxmox-0.5.md
 # "What remains manual". This script's guarantee is narrower and honest:
 # the exact tracked-file content of one confirmed local commit is what
 # gets deployed, nothing silently different.
@@ -181,7 +181,7 @@ YAML
     || die "failed to chmod inventory.yaml inside container ${VMID}"
 
   # agent.env: install-0.5.0-fresh.sh already generated a fresh
-  # HUBINET_OPS_R0_API_TOKEN inside the container (§ its own step 2). We
+  # HUBINET_OPS_R0_API_TOKEN inside the container (its own step 2). We
   # only need to fill in HUBINET_OPS_R0_PVE_TOKEN -- read the existing
   # file back, replace exactly that one line, never regenerate the API
   # bearer token the installer already created.

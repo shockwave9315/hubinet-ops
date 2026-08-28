@@ -557,7 +557,7 @@ class TestPathKeyedPermissionHelper:
     Proxmox VE 9.2.3 disproved that -- the real command returns a
     PATH-KEYED object instead ({"/": {"Sys.Audit": 1, ...}}), observed
     literally as `{"/":{}}` for an empty grant (see
-    docs/architecture/0.5-implementation-status.md's real-PVE precheck
+    The real-PVE precheck
     notes). These tests pin _json_truthy_keys_sorted_at_path's exact
     accept/reject behavior directly, independent of the full bootstrap
     script -- including explicitly proving the OLD flat-object shape is

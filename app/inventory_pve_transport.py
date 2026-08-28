@@ -1,8 +1,6 @@
 """Production GET-only Proxmox VE HTTP transport for the R0 read-only runtime.
 
-Implements exactly §9/§10 of
-``docs/architecture/0.5-r0-read-only-runtime-activation.md`` (WAVE R0-B,
-Family 2). This module is deliberately narrow: it is the concrete
+See ``ARCHITECTURE.md``. This module is deliberately narrow: it is the concrete
 production implementation of ``app.inventory.provider.ReadOnlyProviderTransport``
 and nothing else -- no discovery orchestration, no authority calls, no
 normalization. It is fed into the existing, already-tested
@@ -29,7 +27,7 @@ import httpx
 
 from app.inventory.provider import ProviderContractError, ProviderFailureKind
 
-# Conservative, finite tuning defaults (§31 item 3 -- implementation
+# Conservative, finite tuning defaults (item 3 -- implementation
 # tuning, not architecture). PVE baseline responses are bounded in
 # practice by node/guest counts, so 8 MiB is generous headroom while still
 # being a real, enforced ceiling rather than "unbounded".
@@ -45,8 +43,8 @@ _PVE_API_PREFIX = "/api2/json"
 class PveTransportError(ProviderContractError):
     """The production PVE transport failed at the HTTP boundary.
 
-    Carries a :class:`ProviderFailureKind` so callers (the R0 scheduler,
-    Family 3) can classify the failure using the exact existing
+    Carries a :class:`ProviderFailureKind` so ``app/inventory_scheduler.py``
+    can classify the failure using the exact existing
     ``classify_provider_failure`` mapping without re-deriving it from a
     plain exception message.
     """
@@ -69,7 +67,7 @@ def _require_https_locator(canonical_transport_locator: str) -> str:
 
 
 def _require_verification_enabled(verify: bool | str) -> bool | str:
-    # §9: "no verify=False production fallback" -- construction-time
+    #: "no verify=False production fallback" -- construction-time
     # assertion, not merely a documented convention. A caller-supplied test
     # transport that needs to disable verification against a local fixture
     # must use its own class, never this one.
@@ -90,7 +88,7 @@ def _require_pve_api_token(pve_api_token: str) -> str:
     return pve_api_token
 
 
-# Real dogfood #2 finding (docs/architecture/0.5-implementation-status.md):
+# Observed against a real PVE host:
 # a real legacy PVE root CA missing the X509v3 Key Usage extension made
 # Python 3.13's strict certificate-chain validation reject the leaf with
 # ``ssl.SSLCertVerificationError``. httpx/httpcore wrap that underlying ssl
@@ -176,10 +174,10 @@ class ProxmoxHttpTransport:
     """Narrow, GET-only, synchronous production PVE transport.
 
     Constructed fresh per discovery run from that run's own captured
-    ``expected_canonical_transport_locator`` (§9) -- never a long-lived
+    ``expected_canonical_transport_locator`` -- never a long-lived
     client pointed at a value that could go stale mid-run without the run
-    knowing. Callers (Family 3's scheduler) are expected to use this as a
-    context manager or call :meth:`close` once per run.
+    knowing. ``app/inventory_scheduler.py`` uses this as a context manager
+    or calls :meth:`close` once per run.
     """
 
     __slots__ = ("_client", "_max_response_bytes")
@@ -241,7 +239,7 @@ class ProxmoxHttpTransport:
             # configuration problem, never a plain network outage, and it
             # must be classifiable through the same PveTransportError
             # boundary as every other transport failure rather than an
-            # uncaught construction-time exception (§9, §12).
+            # uncaught construction-time exception.
             raise PveTransportError(
                 f"PVE transport TLS/client configuration is invalid: {exc}",
                 kind=ProviderFailureKind.SECURITY_PROOF,
@@ -267,7 +265,7 @@ class ProxmoxHttpTransport:
         Streams the response body incrementally and aborts as soon as the
         accumulated size exceeds ``max_response_bytes`` -- a chunked
         response with no trustworthy ``Content-Length`` is never fully
-        buffered in memory before the cap is enforced (§9). Status/
+        buffered in memory before the cap is enforced. Status/
         redirect/size checks are evaluated from the response headers
         before any body bytes are read, so an oversized or rejected
         response never pays the cost of a full body read at all.
@@ -301,7 +299,7 @@ class ProxmoxHttpTransport:
                 if response.status_code in (401, 403):
                     # A stock-PVE authentication/authorization rejection is
                     # a security/configuration proof failure, never a plain
-                    # transport outage (ADR 0002: token/effective-ACL/
+                    # transport outage (token/effective-ACL/
                     # provider-configuration problems classify as
                     # configuration_error, not source_unavailable).
                     raise PveTransportError(

@@ -15,7 +15,7 @@ RestartSec=5
 
 # 0027 on a plain-file create request (0666) yields 0640, and on a
 # directory create request (0777) yields 0750 -- exactly the accepted
-# §4 authority.db/-wal/-shm and /var/lib/hubinet-ops modes, guaranteed
+# authority.db/-wal/-shm and /var/lib/hubinet-ops modes, guaranteed
 # regardless of the installer's own umask or a distribution default.
 UMask=0027
 

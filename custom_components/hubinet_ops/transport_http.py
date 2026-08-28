@@ -1,12 +1,10 @@
 """Concrete read-only HTTP transport connecting Home Assistant to Hubinet Ops.
 
-Implements exactly §21 of
-``docs/architecture/0.5-r0-read-only-runtime-activation.md`` (WAVE R0-B,
-Family 5).
+See ``ARCHITECTURE.md``.
 
 This transport talks only to the Hubinet Ops R0 backend -- it never
 connects directly to Proxmox, and it structurally cannot: the published/
-HTTP/HA contract has no PVE-credential-shaped field anywhere (§17), so
+HTTP/HA contract has no PVE-credential-shaped field anywhere, so
 there is nothing here to read, store, or forward even by mistake. It uses
 Home Assistant's own shared ``aiohttp`` client session
 (``homeassistant.helpers.aiohttp_client.async_get_clientsession``), never a
@@ -53,7 +51,7 @@ from .api import (
 _LOGGER = logging.getLogger(__name__)
 
 # Bounded, never unbounded (mirrors the production PVE transport's own
-# posture, §9/§21). Tunable value, not an architecture decision.
+# posture). Tunable value, not an architecture decision.
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 _BACKEND_ROUTE = "/r0/v1/backend"
@@ -145,7 +143,7 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
         effective_policy=payload.get("effective_policy") or {},
         policy_applicable=bool(payload.get("policy_applicable", False)),
         suspended_reason=payload.get("suspended_reason"),
-        # JSON has no frozenset type -- explicit conversion (§17 mismatch 2).
+        # JSON has no frozenset type -- explicit conversion (mismatch 2).
         effective_capabilities=frozenset(payload.get("effective_capabilities") or ()),
         state=payload.get("state") or {},
         termination_reason=payload.get("termination_reason"),
@@ -169,7 +167,7 @@ class HttpHubinetOpsTransport:
     """Read-only HTTP transport implementing the ``HubinetOpsTransport`` Protocol.
 
     Reads backend/snapshot state only -- no write methods exist, and none
-    may be added even for convenience (§21).
+    may be added even for convenience.
     """
 
     def __init__(

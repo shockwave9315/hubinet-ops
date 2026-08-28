@@ -111,7 +111,7 @@ def test_unknown_nonempty_database_is_rejected_without_modification(
         assert connection.execute("SELECT value FROM unrelated").fetchone()[0] == "retained"
 
 
-@pytest.mark.parametrize("old_version", (1, 2))
+@pytest.mark.parametrize("old_version", (1, 2, 3, 4, 5))
 def test_older_dormant_authority_schema_is_rejected_without_migration(
     tmp_path: Path, old_version: int
 ) -> None:

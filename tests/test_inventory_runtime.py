@@ -1,8 +1,8 @@
-"""WAVE R0-B Family 4 -- R0 composition root and read-only HTTP API.
+"""R0 composition root and read-only HTTP API.
 
-Covers §28 tests #1, #2, #3, #4, #27, #28, #29 (backend-side half), #30
+Covers tests #1, #2, #3, #4, #27, #28, #29 (backend-side half), #30
 (P3 cleanup: explicitly assigned here), #32, #35, #40 (runtime/composition
-portion) of docs/architecture/0.5-r0-read-only-runtime-activation.md.
+portion) of the R0 runtime contract in ARCHITECTURE.md.
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ def _run_discovery(monkeypatch, config, authority, source_id: str, *, guests=(),
 
 
 # ---------------------------------------------------------------------------
-# §28 test #1 -- composition-root import-graph test
+# test #1 -- composition-root import-graph test
 # ---------------------------------------------------------------------------
 
 
@@ -175,7 +175,7 @@ def test_1_static_ast_scan_finds_no_denylisted_import_in_r0_modules() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #2 -- FastAPI route enumeration
+# test #2 -- FastAPI route enumeration
 # ---------------------------------------------------------------------------
 
 
@@ -196,13 +196,13 @@ def test_2_only_get_head_options_routes_exist(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #3 -- app.main import/behavior unchanged (narrow regression guard)
+# test #3 -- app.main import/behavior unchanged (narrow regression guard)
 # ---------------------------------------------------------------------------
 #
 # The legacy 0.2.x-0.4.x runtime (app/main.py, app/service.py, app/database.py,
 # etc.) has been retired from the current tree as part of the 0.5-only
 # repository cleanup; its historical source remains available through Git
-# history/tags. The invariant this test protected -- "R0-B never edits the
+# history/tags. The invariant this test protected -- "the runtime never edits the
 # legacy composition root" -- is now vacuously true (the file no longer
 # exists) and is superseded by the AST-based forbidden-legacy-import guard
 # below (`test_r0_production_modules_import_no_forbidden_legacy_symbol` in
@@ -212,7 +212,7 @@ def test_2_only_get_head_options_routes_exist(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #4 -- R0 DB separateness + rejection of legacy/incompatible DB
+# test #4 -- R0 DB separateness + rejection of legacy/incompatible DB
 # ---------------------------------------------------------------------------
 
 
@@ -236,11 +236,11 @@ def test_4_startup_fails_closed_against_a_real_legacy_ops_db_fixture(tmp_path: P
 
 
 # ---------------------------------------------------------------------------
-# §28 test #27/#28 -- no path to trusted; effective capabilities always empty
+# test #27/#28 -- no path to trusted; effective capabilities always empty
 # ---------------------------------------------------------------------------
 
 
-def test_27_28_security_continuity_never_trusted_and_capabilities_always_empty(
+def test_27_28_security_continuity_always_unverified_and_capabilities_always_empty(
     tmp_path: Path, monkeypatch
 ) -> None:
     app, config = _build_app(tmp_path)
@@ -259,14 +259,13 @@ def test_27_28_security_continuity_never_trusted_and_capabilities_always_empty(
     body = response.json()
     assert body["resources"], "expected at least one discovered resource"
     for resource in body["resources"]:
-        assert resource["security_continuity"] in ("unverified", "revoked")
-        assert resource["security_continuity"] != "trusted"
+        assert resource["security_continuity"] == "unverified"
         assert resource["effective_capabilities"] == []
         assert resource["policy_applicable"] is False
 
 
 # ---------------------------------------------------------------------------
-# §28 test #29 (backend-side half) -- publication -> HTTP field mapping
+# test #29 (backend-side half) -- publication -> HTTP field mapping
 # ---------------------------------------------------------------------------
 
 
@@ -313,7 +312,7 @@ def test_29_backend_and_snapshot_http_shape_matches_publication_contract(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #30 -- backend identity stable across restart (P3: assigned here)
+# test #30 -- backend identity stable across restart (P3: assigned here)
 # ---------------------------------------------------------------------------
 
 
@@ -338,7 +337,7 @@ def test_30_backend_identity_stable_across_restart(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #32 -- auth failures correctly mapped
+# test #32 -- auth failures correctly mapped
 # ---------------------------------------------------------------------------
 
 
@@ -363,7 +362,7 @@ def test_32_health_is_unauthenticated_and_minimal(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# §28 test #35 -- freshness expiry remains backend-owned
+# test #35 -- freshness expiry remains backend-owned
 # ---------------------------------------------------------------------------
 
 
@@ -395,7 +394,7 @@ def test_35_freshness_expiry_is_materialized_by_the_backend_on_get(
 
 
 # ---------------------------------------------------------------------------
-# §28 test #40 (runtime/composition portion) -- never touches an unrelated DB
+# test #40 (runtime/composition portion) -- never touches an unrelated DB
 # ---------------------------------------------------------------------------
 
 

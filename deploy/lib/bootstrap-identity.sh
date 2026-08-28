@@ -2,12 +2,13 @@
 # Phase 6 -- dedicated read-only PVE identity (user/role/token).
 # Phase 7 -- PVE TLS trust material.
 #
-# Exact shape mirrors docs/operations/0.5-r0-operational-activation.md
-# section 2, automated: user hubinetops@pve, role HubinetOpsR0Auditor with
+# Exact shape mirrors deploy/README-bootstrap-proxmox-0.5.md, automated:
+# user hubinetops@pve, role HubinetOpsR0Auditor with
 # privileges exactly Sys.Audit,VM.Audit, token r0-readonly with privsep=1,
 # ACL granted to BOTH the user and the token at path / with propagate 1.
 #
-# Fresh-install semantics only (see docs/README section "Idempotency"):
+# Fresh-install semantics only (see deploy/README-bootstrap-proxmox-0.5.md,
+# "Retrying"):
 # any pre-existing user/role/token with these exact names is a conflict
 # and STOPs the run -- this bootstrap never silently adopts an existing
 # identity of unknown provenance.
@@ -150,8 +151,8 @@ phase6_pve_identity() {
   [[ -s "${PVE_TOKEN_SECRET_FILE}" ]] || die "PVE token secret was empty after creation -- refusing to continue"
 
   # privsep=1 means the token has NO effective permissions of its own
-  # until it receives its own ACL grant (runbook section 2.4 step 4) --
-  # skipping this step produces an authenticated-but-zero-privilege token.
+  # until it receives its own ACL grant -- skipping this step produces an
+  # authenticated-but-zero-privilege token.
   run_logged pveum acl modify / --tokens "${PVE_FULL_TOKEN_ID}" --roles "${PVE_ROLE}" --propagate 1 \
     || die "failed to grant role ${PVE_ROLE} to token ${PVE_FULL_TOKEN_ID} at /"
   ledger_record pve-acl-token "${PVE_FULL_TOKEN_ID}"
@@ -227,7 +228,7 @@ _assert_pve_object_absent() {
 # precheck against Proxmox VE 9.2.3 disproved that -- the real command
 # returns a path-keyed object instead ({"/": {"Sys.Audit": 1, ...}}, an
 # empty grant observed literally as `{"/":{}}`). See
-# docs/architecture/0.5-implementation-status.md's real-PVE precheck
+# The real-PVE precheck
 # notes for the exact observed command/output. Privilege names are now
 # read only from the object at the exact requested path "/" via
 # _json_truthy_keys_sorted_at_path (bootstrap-common.sh) -- never
@@ -260,7 +261,7 @@ _verify_effective_permissions() {
   actual_keys="$(_json_truthy_keys_sorted_at_path "${perms_file}" "/")" && parse_status=0 || parse_status=$?
   rm -f "${perms_file}"
   (( parse_status == 0 )) \
-    || die "could not verify effective permissions for ${PVE_FULL_TOKEN_ID}: 'pveum user token permissions --path /' did not produce the expected path-keyed JSON shape {\"/\": {<privilege>: 1, ...}} (confirmed against a real PVE 9.2.3 host -- see docs/architecture/0.5-implementation-status.md's real-PVE precheck notes) -- refusing to continue with an unverifiable privilege set"
+    || die "could not verify effective permissions for ${PVE_FULL_TOKEN_ID}: 'pveum user token permissions --path /' did not produce the expected path-keyed JSON shape {\"/\": {<privilege>: 1, ...}} (confirmed against a real PVE 9.2.3 host) -- refusing to continue with an unverifiable privilege set"
 
   local expected_keys
   expected_keys="$(printf '%s\n' "${PVE_REQUIRED_PRIVS//,/$'\n'}" | LC_ALL=C sort)"

@@ -1,4 +1,4 @@
-"""Single-resource legality validation for the Phase 0 contract."""
+"""Single-resource legality validation for the snapshot contract."""
 
 from __future__ import annotations
 

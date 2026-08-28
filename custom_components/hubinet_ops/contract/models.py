@@ -1,4 +1,4 @@
-"""Canonical immutable models for the Phase 0 snapshot contract."""
+"""Canonical immutable models for the snapshot contract."""
 
 from __future__ import annotations
 

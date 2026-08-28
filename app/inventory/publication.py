@@ -1,4 +1,4 @@
-"""Consistent dormant publication boundary for the 0.5 inventory authority."""
+"""Consistent publication boundary for the inventory authority."""
 
 from __future__ import annotations
 

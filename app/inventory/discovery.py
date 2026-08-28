@@ -1,4 +1,4 @@
-"""Immutable normalized discovery values for the dormant Phase 1B backend."""
+"""Immutable normalized discovery values for the inventory backend."""
 
 from __future__ import annotations
 
@@ -131,13 +131,6 @@ class ProviderGuestLocatorSet:
         return cls(locators, _PROVIDER_GUEST_LOCATOR_SET_TOKEN)
 
 
-class ContinuityEvidenceKind(StrEnum):
-    RESOURCE_TYPE_CHANGE = "resource_type_change"
-    CONTINUITY_ANCHOR_MISMATCH = "continuity_anchor_mismatch"
-    TRUSTED_EVENT_CHAIN = "trusted_event_chain"
-    OPERATOR_REPLACEMENT = "operator_replacement"
-
-
 def _freeze(value: Any) -> Any:
     if value is None or type(value) in {str, int, float, bool}:
         return value
@@ -180,12 +173,6 @@ def _uuid(value: str, name: str) -> str:
 def _positive(value: int, name: str) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _nonnegative(value: int, name: str) -> int:
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{name} must be a nonnegative integer")
     return value
 
 
@@ -270,7 +257,6 @@ class NormalizedDiscoverySnapshot:
     failed_detail_scopes: tuple[str, ...]
     nodes: tuple[DiscoveredNode, ...]
     resources: tuple[DiscoveredResource, ...]
-    expected_source_attestation_epoch: int = 0
     provider_node_scope: ProviderNodeScope | None = None
     provider_guest_locators: ProviderGuestLocatorSet | None = None
 
@@ -296,7 +282,6 @@ class NormalizedDiscoverySnapshot:
         failed_detail_scopes: tuple[str, ...],
         nodes: tuple[DiscoveredNode, ...],
         resources: tuple[DiscoveredResource, ...],
-        expected_source_attestation_epoch: int = 0,
     ) -> NormalizedDiscoverySnapshot:
         """Normalize provider evidence without accepting a substitute node scope
         or guest locator set."""
@@ -339,7 +324,6 @@ class NormalizedDiscoverySnapshot:
             failed_detail_scopes=failed_detail_scopes,
             nodes=nodes,
             resources=resources,
-            expected_source_attestation_epoch=expected_source_attestation_epoch,
             provider_node_scope=provider_baseline.node_scope,
             provider_guest_locators=ProviderGuestLocatorSet._from_provider(
                 provider_baseline.guest_rows
@@ -356,9 +340,6 @@ class NormalizedDiscoverySnapshot:
         _positive(self.canonicalization_contract_version, "canonicalization_contract_version")
         _positive(self.expected_transport_trust_revision, "expected_transport_trust_revision")
         _positive(self.provider_contract_version, "provider_contract_version")
-        _nonnegative(
-            self.expected_source_attestation_epoch, "expected_source_attestation_epoch"
-        )
         _text(self.observed_at, "observed_at")
         if not isinstance(self.source_availability, SourceAvailability):
             raise ValueError("source_availability must be canonical")
@@ -525,7 +506,6 @@ class NormalizedDiscoverySnapshot:
             "canonical_transport_locator": self.canonical_transport_locator,
             "canonicalization_contract_version": self.canonicalization_contract_version,
             "expected_transport_trust_revision": self.expected_transport_trust_revision,
-            "expected_source_attestation_epoch": self.expected_source_attestation_epoch,
             "provider_contract_version": self.provider_contract_version,
             "observed_at": self.observed_at,
             "completeness": self.baseline_completeness.value,

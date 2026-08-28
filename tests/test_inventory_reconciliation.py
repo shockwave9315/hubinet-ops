@@ -578,7 +578,7 @@ def test_direct_replacement_handoff_rolls_back_at_internal_midpoint(
 # --- G8: standalone <-> cluster baseline_mode transition -------------------
 #
 # `baseline_mode` is per-run observed provenance recorded on each completed
-# `discovery_runs` record (see ADR 0002's `ClusterStatusResult`/provider-v1
+# `discovery_runs` record (see `ClusterStatusResult`/provider-v1
 # contract and 0.5-inventory-model.md: "mutable presentation/observed:
 # display name oraz cluster/standalone facts"). It is not part of
 # `inventory_source_id`, `InventorySource` has no durable mode field, and a

@@ -224,7 +224,7 @@ for key in keys:
 # the required nonempty PVE_REQUIRED_PRIVS set), but it makes the
 # supported real deployment path deterministically fail during phase 6
 # even when correctly configured. See
-# docs/architecture/0.5-implementation-status.md's real-PVE precheck
+# The real-PVE precheck
 # notes for the exact observed command/output this was corrected against.
 #
 # Requires: the top level is an object; the exact <path> key exists;
@@ -609,7 +609,7 @@ is_valid_vmid() {
 # --ha-source and static IP validation. Deliberately conservative (rejects
 # IPv6, hostnames) -- this bootstrap targets the documented IPv4 firewall
 # model in deploy/README-0.5-firewall.md; IPv6 is out of scope for this
-# wave, not silently mishandled.
+# scope, not silently mishandled.
 is_valid_ipv4_cidr() {
   local value="$1"
   [[ "${value}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]] || return 1

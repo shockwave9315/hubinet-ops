@@ -4,7 +4,7 @@
 # workloads. There is no VMID list, LXC/QEMU list, node membership, or
 # per-resource field anywhere in this file: every node/LXC/QEMU is
 # discovered dynamically through the Proxmox API after bootstrap (see
-# docs/architecture/0.5-r0-read-only-runtime-activation.md, section 5).
+# ARCHITECTURE.md).
 # Adding or removing a guest in Proxmox requires zero changes here.
 #
 # Secrets (the PVE API token, the R0 API bearer token) are never written to
@@ -15,13 +15,13 @@ source:
   # Human-readable label for this source, shown to operators. Not identity.
   display_name: "Home Proxmox"
 
-  # Fixed literal for R0-B's only supported provider. Do not change.
+  # Fixed literal for the only supported provider. Do not change.
   provider_kind: proxmox_ve
 
   # The Proxmox VE API endpoint. HTTPS only; canonicalized and durably
   # bound as the source's one active endpoint on first bootstrap. Changing
   # this after bootstrap is a fail-closed configuration-drift error, never
-  # silent endpoint failover (section 6) -- rotate PVE endpoints via an
+  # silent endpoint failover -- rotate PVE endpoints via an
   # explicit, separately-authorized operator procedure, not by editing
   # this file.
   pve_endpoint: "https://pve.example.internal:8006"
@@ -35,7 +35,7 @@ source:
   # effect (e.g. a rotation version tag). Never the PVE token itself.
   # Change this value, together with the actual secret in the environment
   # file, whenever you rotate the underlying PVE API token; R0 applies the
-  # rotation automatically on the next restart (section 7).
+  # rotation automatically on the next restart.
   credential_reference: "secret://pve-token-v1"
 
   # Name of the environment variable (in the R0 EnvironmentFile) holding

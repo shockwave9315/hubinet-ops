@@ -519,7 +519,7 @@ class TestPveIdentity:
 # precheck against Proxmox VE 9.2.3 disproved that -- the real command
 # returns a PATH-KEYED object instead ({"/": {"Sys.Audit": 1, ...}}),
 # observed literally as `{"/":{}}` for an empty grant (see
-# docs/architecture/0.5-implementation-status.md's real-PVE precheck
+# The real-PVE precheck
 # notes). These tests exercise _verify_effective_permissions' full
 # exact-set STOP/proceed outcome end to end via the fake's
 # "pveum_output_override": {"token_permissions": ...} hook (which now
