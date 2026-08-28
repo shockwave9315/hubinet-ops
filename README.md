@@ -23,10 +23,13 @@ a guest in Proxmox never requires touching this repository or its config.
   unauthenticated minimal `/r0/v1/health` liveness probe, which exposes no
   inventory or credential data.
 - A native Home Assistant integration with dynamic devices and entities.
+- Automatic Debian/Ubuntu LXC package scanning with exact durable plans and
+  Home Assistant summary entities.
 - An automated Proxmox bootstrap that provisions the whole backend.
 
-The runtime is read-only. Package scanning, update plans, jobs, snapshots,
-healthchecks, and rollback are not built yet — see `STATUS.md`.
+Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
+installs packages. Update plans, jobs, snapshots, healthchecks, and rollback
+are not built yet — see `STATUS.md`.
 
 ## Installation
 
@@ -34,9 +37,10 @@ The two halves deploy independently.
 
 **Backend (on the Proxmox host).** `deploy/bootstrap-proxmox-0.5.sh` creates a
 fresh unprivileged Debian LXC at the next free VMID, provisions a
-least-privilege PVE token, sets up TLS trust, installs the service, writes the
-config, and applies an nftables boundary — after one upfront confirmation of
-the full plan. See [`deploy/README-bootstrap-proxmox-0.5.md`](deploy/README-bootstrap-proxmox-0.5.md)
+least-privilege PVE token, sets up TLS trust, installs the service, provisions
+a dedicated pinned-key/forced-command package-scan boundary, writes the config,
+and applies an nftables boundary — after one upfront confirmation of the full
+plan. See [`deploy/README-bootstrap-proxmox-0.5.md`](deploy/README-bootstrap-proxmox-0.5.md)
 and [`deploy/README-0.5-firewall.md`](deploy/README-0.5-firewall.md).
 
 **Home Assistant integration (via HACS).**
@@ -103,7 +107,10 @@ uvicorn app.inventory_runtime:create_app_from_env --factory --host 127.0.0.1 --p
 `create_app_from_env` builds the app from a runtime config file — selected via
 `HUBINET_OPS_R0_CONFIG`, or the configured/default runtime config path — and
 from the environment variables that config references, currently
-`HUBINET_OPS_R0_PVE_TOKEN` and `HUBINET_OPS_R0_API_TOKEN`. See
+`HUBINET_OPS_R0_PVE_TOKEN` and `HUBINET_OPS_R0_API_TOKEN`. The validated
+`package_scan.interval_seconds` runtime setting defaults to 21,600 seconds;
+the scheduler supports controlled interval replacement, but this stage exposes
+no Home Assistant write API. See
 [`config/inventory.example.yaml`](config/inventory.example.yaml) and
 [`.env.r0.example`](.env.r0.example) for the config shape and required
 variables. Never run a deployment script against a real host from a
@@ -118,6 +125,8 @@ development or agent session.
 | `app/inventory_runtime_config.py` | source-centric config loader |
 | `app/inventory_scheduler.py` | discovery scheduler and restart recovery |
 | `app/inventory_pve_transport.py` | GET-only PVE HTTP transport |
+| `app/package_scan.py`, `app/package_scan_scheduler.py` | exact APT-plan parsing and automatic scan worker |
+| `app/package_scan_host_control.py` | bounded typed SSH client for the forced PVE helper |
 | `custom_components/hubinet_ops/` | Home Assistant integration |
 | `config/inventory.example.yaml`, `.env.r0.example` | config and secrets templates |
 | `deploy/` | Proxmox bootstrap, in-CT installer, systemd unit, firewall docs |

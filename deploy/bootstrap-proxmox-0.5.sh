@@ -5,7 +5,7 @@ set -Eeuo pipefail
 #
 # Automates the manual procedure documented in
 # deploy/README-bootstrap-proxmox-0.5.md: creates a
-# fresh unprivileged Debian 13 LXC, deploys the R0 read-only runtime into
+# fresh unprivileged Debian 13 LXC, deploys the inventory/package-scan runtime into
 # it (deploy/install-0.5.0-fresh.sh, unmodified), provisions a
 # least-privilege PVE read-only identity (exactly Sys.Audit+VM.Audit,
 # verified as an exact set -- never a broader privilege), provisions PVE
@@ -14,11 +14,9 @@ set -Eeuo pipefail
 # real authenticated discovery success, and enables CT boot -- in that
 # order, never reversed.
 #
-# This script does NOT add runtime mutation capability of any kind. R0
-# remains read-only end to end; `pct`/`pveum` invoked here are one-shot,
-# human-invoked PVE-host provisioning commands, not Hubinet Ops runtime
-# code, and are structurally separate from app/inventory_runtime.py's own
-# GET-only production transport.
+# The PVE API credential remains GET-only. Package scanning uses a separate
+# forced-command SSH key and fixed `pct exec` shapes for non-installing APT
+# metadata refresh/simulation; no arbitrary remote shell is exposed.
 #
 # Run as root ON the Proxmox VE host itself (this script drives `pct`/
 # `pveum`/`pveam`/`nft` locally; it is not SSH-orchestrated).
@@ -71,6 +69,7 @@ PVE_CA_PATH=""
 TLS_TRUST_MODE=""
 DNS_RESOLVER_IP=""
 FRESHNESS_SECONDS="300"
+PACKAGE_SCAN_INTERVAL_SECONDS="21600"
 HA_DISPLAY_NAME="Home Proxmox"
 SOURCE_DIR="$(cd "${BOOTSTRAP_SCRIPT_DIR}/.." && pwd)"
 EXPECTED_SOURCE_SHA=""
@@ -102,8 +101,8 @@ usage() {
   cat <<'USAGE'
 Usage: bootstrap-proxmox-0.5.sh [options]
 
-Creates a fresh unprivileged Debian 13 LXC, deploys the Hubinet Ops 0.5 R0
-read-only runtime into it, provisions a least-privilege PVE credential and
+Creates a fresh unprivileged Debian 13 LXC, deploys the Hubinet Ops 0.5
+inventory/package-scan runtime into it, provisions a least-privilege PVE credential and
 the mandatory firewall boundary, and starts the service.
 
 Required:
@@ -147,6 +146,7 @@ Commonly overridden:
                                provenance-verified discovery result before
                                failing (see Mandatory acceptance below).
   --freshness-seconds <N>      default: 300
+  --package-scan-interval <N>  default: 21600 (6 hours)
   --display-name <text>        default: "Home Proxmox"
   --source-dir <path>          default: this script's own repository root
                                (must be a git checkout with a clean
@@ -208,6 +208,7 @@ while [[ $# -gt 0 ]]; do
     --expected-sha) EXPECTED_SOURCE_SHA="$2"; shift 2 ;;
     --discovery-timeout) BOOTSTRAP_DISCOVERY_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --freshness-seconds) FRESHNESS_SECONDS="$2"; shift 2 ;;
+    --package-scan-interval) PACKAGE_SCAN_INTERVAL_SECONDS="$2"; shift 2 ;;
     --display-name) HA_DISPLAY_NAME="$2"; shift 2 ;;
     --source-dir) SOURCE_DIR="$2"; shift 2 ;;
     --non-interactive) BOOTSTRAP_NON_INTERACTIVE="1"; shift ;;
@@ -266,6 +267,8 @@ source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-container.sh"
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-identity.sh"
 # shellcheck source=lib/bootstrap-deploy.sh
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-deploy.sh"
+# shellcheck source=lib/bootstrap-host-control.sh
+source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-host-control.sh"
 # shellcheck source=lib/bootstrap-firewall.sh
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/bootstrap-firewall.sh"
 # shellcheck source=lib/bootstrap-finish.sh
@@ -283,6 +286,11 @@ rollback_on_failure() {
     pct exec "${VMID}" -- systemctl disable --now hubinet-ops >/dev/null 2>&1 \
       || log_warn "could not stop/disable hubinet-ops inside container ${VMID} during cleanup (may never have been enabled -- not necessarily an error)"
   fi
+
+  # Exact Hubinet-owned helper/key/authorization artifacts only. The
+  # cleanup function filters by this run's unique marker and never
+  # replaces or removes unrelated operator authorized_keys entries.
+  rollback_host_control
 
   if ledger_has ct "${VMID}"; then
     pct set "${VMID}" --onboot 0 >/dev/null 2>&1 || true
@@ -528,9 +536,10 @@ trap 'exit 143' TERM
 
 phase1_preflight
 phase2_plan_template
+phase2c_plan_host_control
 _plan_source_commit
 
-log_info "Plan: create VMID ${VMID}$( [[ "${VMID_EXPLICIT}" == "0" ]] && printf ' (auto-detected next-free)' ) (${HOSTNAME_}) from template [${TEMPLATE_PLAN_NOTE}] on storage ${STORAGE}, bridge ${BRIDGE}, network ${NETWORK_MODE}; PVE endpoint ${PVE_ENDPOINT}; source commit ${SOURCE_HEAD_SHA}; HA source ${HA_SOURCE_CIDR} -> TCP 8787 only."
+log_info "Plan: create VMID ${VMID}$( [[ "${VMID_EXPLICIT}" == "0" ]] && printf ' (auto-detected next-free)' ) (${HOSTNAME_}) from template [${TEMPLATE_PLAN_NOTE}] on storage ${STORAGE}, bridge ${BRIDGE}, network ${NETWORK_MODE}; PVE endpoint ${PVE_ENDPOINT}; source commit ${SOURCE_HEAD_SHA}; HA source ${HA_SOURCE_CIDR} -> TCP 8787 only; package scans every ${PACKAGE_SCAN_INTERVAL_SECONDS}s through one pinned-key, forced-command SSH boundary."
 confirm_or_abort "Proceed with this plan?"
 
 phase2b_provision_template
@@ -541,6 +550,7 @@ phase6_pve_identity
 phase7_tls_trust
 phase8_deploy_source
 phase8b_provision_tooling
+phase8c_provision_host_control
 phase9_generate_config
 phase10_firewall
 phase11_start_service

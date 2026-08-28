@@ -413,6 +413,7 @@ phase10_firewall() {
     local ip
     for ip in "${resolved_ips[@]}"; do
       printf '    meta skuid "hubinetops" ip daddr %s tcp dport %s accept\n' "${ip}" "${pve_port}"
+      printf '    meta skuid "hubinetops" ip daddr %s tcp dport 22 accept\n' "${ip}"
     done
     if [[ -n "${dns_rule_lines}" ]]; then
       # Here-string (<<<), not a pipe: a pipe fed via `printf '%s'` (no
@@ -498,6 +499,7 @@ _verify_firewall_active() {
   local ip
   for ip in "${resolved_ips[@]}"; do
     expected_output+=("meta skuid ${hubinetops_uid} ip daddr ${ip} tcp dport ${pve_port} accept")
+    expected_output+=("meta skuid ${hubinetops_uid} ip daddr ${ip} tcp dport 22 accept")
   done
   if [[ -n "${dns_rule_lines}" ]]; then
     local dns_line

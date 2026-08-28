@@ -1,4 +1,4 @@
-"""R0 source bootstrap / configuration loader for the 0.5 read-only runtime.
+"""R0 source and package-scan runtime configuration loader.
 
 See ``ARCHITECTURE.md``. This is a small, R0-dedicated settings loader —
 deliberately not a general application-settings type, so the composition

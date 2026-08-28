@@ -25,6 +25,12 @@ hostile administrator of the managed environment is out of scope. See
   aside, and start it again. The fresh database mints a new
   `backend_instance_id` and new `resource_id`s, so remove the old Home
   Assistant config entry and re-enroll.
+- **Automatic Debian/Ubuntu LXC package scanning.** Schema v7 adds durable scan
+  attempts and exact package rows and rejects v6 without migration. A
+  configurable scheduler uses a dedicated pinned SSH key and one forced PVE
+  helper operation to refresh APT metadata and simulate upgrades. Failed scans
+  publish unknown, never zero. Home Assistant adds summary sensors without
+  recording the full package list as attributes.
 - **Documentation reduced to `README.md`, `PRODUCT.md`, `ARCHITECTURE.md`,
   `STATUS.md`, and `AGENTS.md`.** The ADR/research/runbook hierarchy and the
   custom agent skills were deleted; Git history is the archive.

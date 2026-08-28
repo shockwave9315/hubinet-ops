@@ -1,9 +1,9 @@
-"""R0 composition root: the final, sole production 0.5 read-only runtime.
+"""R0 composition root: inventory HTTP API plus automatic package scanning.
 
 See ``ARCHITECTURE.md``.
 
 This module is the only production entrypoint for Hubinet Ops 0.5's R0
-read-only runtime. It constructs exactly:
+runtime. It constructs exactly:
 
 - ``app.inventory.store.InventoryAuthorityStore`` (opened against the R0
   authority DB path from configuration);

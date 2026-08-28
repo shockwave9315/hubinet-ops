@@ -89,7 +89,7 @@ systemctl daemon-reload
 
 cat <<INFO
 
-Hubinet Ops 0.5 (R0 read-only runtime) installed, but NOT started or
+Hubinet Ops 0.5 (inventory and package-scanning runtime) installed, but NOT started or
 enabled for boot.
 
 Before starting the service:
@@ -97,7 +97,11 @@ Before starting the service:
 1. Edit /etc/hubinet-ops/inventory.yaml -- set source.pve_endpoint,
    source.display_name, source.freshness_duration_seconds, and
    source.credential_reference (an opaque secret:// reference, never
-   the PVE token itself).
+   the PVE token itself). Automatic package scanning also requires the
+   package_scan.host_control paths to a dedicated private key and pinned
+   known_hosts file plus a package-scan-only forced command on the PVE host.
+   The full Proxmox bootstrap provisions that boundary automatically; this
+   standalone installer deliberately does not modify the PVE host.
 
 2. Edit /etc/hubinet-ops/agent.env -- set HUBINET_OPS_R0_PVE_TOKEN to
    your Proxmox API token in the exact shape user@realm!tokenid=secret.

@@ -8,7 +8,8 @@ built today is in `STATUS.md`.
 ```text
 Proxmox VE
   -> Hubinet backend            (app/inventory_runtime.py composition root)
-  -> authoritative inventory DB (SQLite, app/inventory/)
+  -> authoritative inventory/scan DB (SQLite, app/inventory/)
+  -> package scan scheduler      (typed SSH -> forced PVE helper -> pct exec)
   -> HTTP API                   (/r0/v1, bearer auth)
   -> Home Assistant             (custom_components/hubinet_ops/)
 ```
@@ -21,7 +22,9 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v6).
+database (marker `hubinet_ops_0_5_authority`, schema v7). Schema v7 adds
+explicit package scan attempts and exact package rows. There is no migration
+from v6; pre-release installs recreate the authority database.
 
 - `store.py` — schema, transactions, CAS/fencing for discovery-run ownership,
   backend/source/global-revision bookkeeping.
@@ -50,6 +53,15 @@ orchestrator over authority methods — it never touches tables directly.
 
 Configuration (`app/inventory_runtime_config.py`, `config/inventory.example.yaml`)
 describes how to reach a Proxmox **source**. It never enumerates workloads.
+
+`app/package_scan_scheduler.py` is an independent single-worker scheduler. It
+reads the validated runtime interval (default six hours), issues durable
+per-resource scan ownership through `InventoryAuthority`, and scans only
+current LXC resources. `app/package_scan_host_control.py` sends one bounded JSON
+request over a dedicated pinned-key SSH connection. The PVE forced helper
+accepts only `scan_packages`, rechecks live type/node/status, and uses fixed
+`pct exec` shapes for OS inspection, `apt-get update -qq`, `apt-get -s upgrade`,
+and the reboot-required marker. QEMU is published as unsupported.
 
 ## Identity
 
@@ -116,9 +128,9 @@ The Home Assistant half ships separately through HACS. HA never receives a
 Proxmox credential; it authenticates only to the Hubinet backend with the
 backend's own bearer token.
 
-## Future: package scanning and updates for LXC
+## Package scanning for LXC
 
-Not implemented. The intended channel:
+Implemented channel:
 
 ```text
 Hubinet backend
@@ -138,16 +150,18 @@ Properties that channel must have:
   locator, never durable identity.
 - **Scan is non-installing.** Metadata refresh and simulation only; see
   `PRODUCT.md`, "What package scanning may do".
-- **Plan fingerprint.** An approved plan carries an exact fingerprint,
-  revalidated before execution. A material difference fails closed.
-- **Job-owned snapshot.** Each update job creates its own fresh snapshot before
-  touching packages and may roll back only to that one. Manual and
-  non-Hubinet snapshots are never touched by Hubinet retention.
-- **Ordinary concurrency control.** One job per resource at a time; jobs are
-  durably owned, fenced, and recovered after a restart, exactly as discovery
-  runs already are.
+- **Exact plan fingerprint.** Successful scans sort the material triples
+  `(package name, installed version, candidate version)` and hash canonical
+  JSON with SHA-256. Optional metadata cannot change the fingerprint.
+- **Ordinary concurrency control.** One scan per resource at a time; attempts
+  are durably owned, fenced against binding/generation changes, and unfinished
+  attempts recover as interrupted/unknown after restart.
+- **Latest attempt wins.** A failure after an earlier success publishes null
+  pending count and no stale package plan. Full exact rows remain available in
+  the backend/coordinator snapshot but never become HA entity attributes.
 
-QEMU package execution is future work and does not block LXC.
+Update approval/execution, job-owned snapshots, healthchecks, rollback, and
+QEMU package execution remain future work.
 
 ## Ordinary safety rules (all layers, now and later)
 

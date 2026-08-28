@@ -320,12 +320,39 @@ def _exec_inner(vmid, inner, state):
         _ct_path(vmid, inner[2]).mkdir(parents=True, exist_ok=True)
         return 0
 
+    if inner[0] == "install" and "-d" in inner:
+        _ct_path(vmid, inner[-1]).mkdir(parents=True, exist_ok=True)
+        return 0
+
+    if inner[0] == "ssh-keygen":
+        key_path = inner[inner.index("-f") + 1]
+        comment = inner[inner.index("-C") + 1]
+        private = _ct_path(vmid, key_path)
+        private.parent.mkdir(parents=True, exist_ok=True)
+        private.write_text("FAKE PRIVATE KEY FOR SANDBOX TEST ONLY\n", encoding="utf-8")
+        private.with_name(private.name + ".pub").write_text(
+            f"ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE= {comment}\n",
+            encoding="utf-8",
+        )
+        return 0
+
+    if inner[0] == "runuser" and "ssh" in inner:
+        sys.stdout.write(
+            '{"response_version":1,"ok":false,"context":{},'
+            '"error":{"classification":"execution_failed",'
+            '"message":"unknown host-control operation"}}'
+        )
+        return 2
+
     if inner[0] == "tar":
         # Extraction is not content-inspected by any test assertion; a
         # no-op is sufficient and keeps the fake hermetic.
         return 0
 
     if inner[0] == "rm":
+        normalized_target = _normalize_ct_arg(inner[-1])
+        if normalized_target == "/etc/hubinet-ops/host-control":
+            shutil.rmtree(_ct_path(vmid, normalized_target), ignore_errors=True)
         return 0
 
     if inner[:2] == ["chown", "root:hubinetops"] or inner[0] == "chown":
@@ -502,7 +529,9 @@ def _exec_sh_c(script):
     prefix = "command -v "
     if script.startswith(prefix):
         name = script[len(prefix):].strip()
-        available = name in SCENARIO.get("ct_tools_available", ["nft", "curl", "ss"])
+        available = name in SCENARIO.get(
+            "ct_tools_available", ["nft", "curl", "ss", "ssh", "ssh-keygen"]
+        )
         return 0 if available else 1
     return 2
 
@@ -1276,7 +1305,7 @@ def default_scenario() -> dict[str, Any]:
         "failed_units": [],
         "legacy_present": {},
         "health_body": '{"status": "ok"}',
-        "ct_tools_available": ["nft", "curl", "ss"],
+        "ct_tools_available": ["nft", "curl", "ss", "ssh", "ssh-keygen"],
         "discovery_result": "healthy",
         "discovery_backend_instance_id": "fake-backend-instance-id",
         "discovery_source_name": FAKE_DISPLAY_NAME,
@@ -1337,6 +1366,12 @@ def build_minimal_source_checkout(tmp_path: Path, repo_root: Path) -> Path:
         (repo_root / "deploy" / "install-0.5.0-fresh.sh").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
+    (src / "deploy" / "hubinet-package-scan-helper.py").write_text(
+        (repo_root / "deploy" / "hubinet-package-scan-helper.py").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
     (src / "config" / "inventory.example.yaml").write_text(
         "source:\n  display_name: example\n", encoding="utf-8"
     )
@@ -1374,6 +1409,12 @@ def build_fake_pve_environment(tmp_path: Path, scenario: dict[str, Any] | None =
     bin_dir.mkdir(exist_ok=True)
     ct_root = tmp_path / "ctroot"
     ct_root.mkdir(exist_ok=True)
+    host_root = tmp_path / "hostroot"
+    (host_root / "etc" / "ssh").mkdir(parents=True, exist_ok=True)
+    (host_root / "etc" / "ssh" / "ssh_host_ed25519_key.pub").write_text(
+        "ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE= fake-pve\n",
+        encoding="utf-8",
+    )
     log_path = tmp_path / "fake-command.log"
     scenario_path = tmp_path / "scenario.json"
     state_path = tmp_path / "state.json"
@@ -1425,6 +1466,7 @@ def build_fake_pve_environment(tmp_path: Path, scenario: dict[str, Any] | None =
     env["HUBINET_FAKE_CT_ROOT"] = str(ct_root)
     env["HUBINET_FAKE_STATE"] = str(state_path)
     env["HUBINET_OPS_TEST_MODE"] = "1"
+    env["HUBINET_OPS_TEST_HOST_ROOT"] = str(host_root)
     # Windows Git-Bash-only: MSYS auto-converts POSIX-looking absolute-path
     # arguments (e.g. "/etc/hubinet-ops/...") into Windows paths when
     # exec'ing a native (non-MSYS) executable such as python.exe. That

@@ -4,19 +4,21 @@
 a Proxmox host: a fresh unprivileged Debian 13 LXC, the runtime deployed into
 it via `deploy/install-0.5.0-fresh.sh` (unmodified), a least-privilege PVE
 identity, PVE TLS trust material, and the mandatory nftables firewall
-boundary — in that order, ending with the service started and CT boot enabled
-only after a genuine, contract-verified discovery success.
+boundary, plus the package-scan-only forced-command SSH boundary — in that
+order, ending with the service started and CT boot enabled only after a genuine,
+contract-verified discovery success.
 
-This script adds **no runtime mutation capability**. The runtime remains
-read-only end to end; the `pct`/`pveum` commands here are one-shot,
-human-invoked, PVE-host provisioning steps, structurally separate from
-Hubinet Ops's own GET-only production PVE transport
-(`app/inventory_pve_transport.py`).
+The PVE API credential remains read-only and unchanged. Package scanning uses a
+separate dedicated SSH key whose one forced helper operation may run fixed
+`pct exec` package-inspection commands. It can refresh APT metadata and simulate
+an upgrade, but never installs, upgrades, removes, autoremoves, or reconfigures
+workload packages.
 
-It has been exercised against a real Proxmox host and completes end to end.
-Before running it yourself, read "What this script proves, and what it does
-not" and the REAL-HOST PRECHECK commands (including the PVE root CA Key Usage
-precheck) further down this document.
+The package-scan additions have hermetic static and system-sandbox coverage;
+Linux CI remains the deployment smoke gate. Before running it yourself, read
+"What this script proves, and what it does not" and the REAL-HOST PRECHECK
+commands (including the PVE root CA Key Usage precheck) further down this
+document.
 
 ## Prerequisites
 
@@ -131,10 +133,19 @@ On the Proxmox host:
   roughly 1024x and falsely rejecting ordinary real storage. An
   unparseable Available value is a hard stop, never a silently-skipped
   check.
-- Inside the CT: `nftables`, `curl`, and `iproute2` are explicitly
+- Inside the CT: `nftables`, `curl`, `iproute2`, and `openssh-client` are explicitly
   installed and their presence verified (never assumed present on the
   base template) before the firewall and acceptance phases depend on
   them.
+- On the PVE host: one uniquely named root-owned package-scan helper and one
+  appended Hubinet-owned line in `/root/.ssh/authorized_keys`. That key has a
+  forced command and explicitly disables PTY, port forwarding, agent
+  forwarding, and X11 forwarding. Existing authorized-key entries and sshd
+  configuration are preserved.
+- Inside the CT: a dedicated Ed25519 private key (`0600`, owned by the
+  `hubinetops` service user) and a `known_hosts` file derived from the PVE
+  host's local SSH host public key. Bootstrap probes this exact boundary from
+  the service user before continuing.
 - Inside the CT: the R0 runtime (via the unmodified
   `deploy/install-0.5.0-fresh.sh`), a generated
   `/etc/hubinet-ops/inventory.yaml` (source-centric only — no VMID/
@@ -144,7 +155,8 @@ On the Proxmox host:
 - Inside the CT: an `nftables` ruleset (`/etc/nftables.conf`) restricting
   inbound TCP 8787 to exactly the configured HA source CIDR, and
   outbound traffic from the `hubinetops` service user to exactly the
-  configured PVE endpoint on the port that endpoint is actually
+  configured PVE endpoint on TCP 22 for the package-scan forced command and
+  on the HTTPS port that endpoint is actually
   configured with (never an independently hardcoded `8006` — derived from
   `--pve-endpoint`; defaults to `8006` only when the endpoint itself
   omits a port), plus, only if the endpoint is configured as a hostname
@@ -217,10 +229,10 @@ script from a real, trusted git checkout of this repository.
   `--pve-ca-path` and `--tls-trust` fails closed when no CA is found.
 - No non-git source payload of any kind.
 - No 0.4 migration, import, or coexistence of any kind.
-- No SSH, MQTT, hostd, or forced-command wrapper of any kind.
-- No arbitrary command execution — every `pct`/`pveum` invocation uses a
-  fixed, quoted argument list; nothing here accepts free-form command
-  text, and `eval` is never used.
+- No arbitrary SSH or command-string API. The dedicated key can reach only the
+  package-scan forced helper; that helper accepts bounded JSON on stdin and one
+  typed operation, validates the VMID/current node/type/status, and invokes only
+  fixed `pvesh`/`pct exec` argument shapes. It never uses `eval`.
 - No host mutation of any kind (including `pveam update`/`download`)
   before you have seen and confirmed the full plan (VMID, template,
   source commit).
@@ -354,6 +366,9 @@ via the ledger — an ambiguous role-creation failure is always preserved.
   stopped and disabled; its `onboot` is forced back to `0`). Pass
   `--cleanup-on-failure` to have the script destroy it automatically
   instead.
+- Host-control rollback removes only this run's unique helper, exact in-CT key
+  directory, and the authorized-key line carrying this run's unique marker.
+  Unrelated operator keys, SSH configuration, and files are preserved.
 - The script **never destroys, overwrites, adopts, or repurposes a VMID
   or PVE user/role/token that existed before this run started** — a
   pre-existing conflict is always a hard `STOP`, on every failure path,
@@ -431,6 +446,9 @@ the repository `README.md`.
   as settled.
 - Multi-source bootstrap. This script, like the config format itself, supports
   exactly one PVE source per run.
+- PVE sshd policy must allow root public-key login. Bootstrap does not edit
+  `sshd_config`; its end-to-end forced-command probe fails closed if the host's
+  policy disallows the dedicated key.
 - A signed-release / `curl | bash` distribution path — future packaging work.
   Run this script from a real, trusted git checkout for now.
 

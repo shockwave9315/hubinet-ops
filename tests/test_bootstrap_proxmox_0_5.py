@@ -748,6 +748,7 @@ _REAL_HOST_FIXTURE = '''table inet hubinet_ops_r0 {
     type filter hook output priority filter; policy accept;
     ct state established,related accept
     meta skuid 999 ip daddr 192.168.4.249 tcp dport 8006 accept
+    meta skuid 999 ip daddr 192.168.4.249 tcp dport 22 accept
     meta skuid 999 drop
   }
 }
