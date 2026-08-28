@@ -94,8 +94,20 @@ python -m pytest -q --tb=short -o asyncio_mode=auto tests/test_hubinet_ops_integ
 and runs only inside `tests/shell/run_bootstrap_smoke_sandbox.sh`'s
 ephemeral-CI Docker sandbox; it skips everywhere else by design.
 
-Run the backend locally with `uvicorn app.inventory_runtime:app`. Never run a
-deployment script against a real host from a development or agent session.
+Run the backend locally with:
+
+```bash
+uvicorn app.inventory_runtime:create_app_from_env --factory --host 127.0.0.1 --port 8787
+```
+
+`create_app_from_env` builds the app from a runtime config file — selected via
+`HUBINET_OPS_R0_CONFIG`, or the configured/default runtime config path — and
+from the environment variables that config references, currently
+`HUBINET_OPS_R0_PVE_TOKEN` and `HUBINET_OPS_R0_API_TOKEN`. See
+[`config/inventory.example.yaml`](config/inventory.example.yaml) and
+[`.env.r0.example`](.env.r0.example) for the config shape and required
+variables. Never run a deployment script against a real host from a
+development or agent session.
 
 ## Repository map
 

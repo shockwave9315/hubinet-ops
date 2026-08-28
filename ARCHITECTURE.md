@@ -36,8 +36,9 @@ database (marker `hubinet_ops_0_5_authority`, schema v6).
 - `publication.py` — assembles the published snapshot (backend, sources, nodes,
   resources, revisions) in one consistent read transaction.
 
-`app/inventory_runtime.py` is the production composition root
-(`uvicorn app.inventory_runtime:app`). It builds the store, authority,
+`app/inventory_runtime.py` is the production composition root, served via its
+`create_app_from_env` factory
+(`uvicorn app.inventory_runtime:create_app_from_env --factory`). It builds the store, authority,
 publication, PVE transport, and scheduler, and serves `GET /r0/v1/health`,
 `/backend`, `/snapshot`. There is no mutation route. Bearer authentication is
 required on every endpoint except the deliberately unauthenticated minimal
