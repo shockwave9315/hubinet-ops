@@ -9,27 +9,20 @@ name: Bootstrap Smoke (Sandbox)
 # permitted to do that).
 #
 # The pull_request.paths list below is deliberately a COARSE trigger over the
-# complete PR diff. GitHub re-evaluates that complete diff on every synchronize
-# event, so after one bootstrap dependency (notably AGENTS.md) has changed, a
-# later unrelated documentation-only commit still schedules this workflow.
+# complete PR diff. Every triggered head runs the bootstrap-smoke job. The job
+# hashes the complete smoke dependency surface and reuses only an exact
+# successful proof for that content; a cache miss runs the full Docker sandbox.
 #
-# The cheap `scope` job closes that CI-minutes gap without weakening coverage:
-# on pull_request/synchronize it examines only the exact before..after head
-# update and runs the expensive Docker job only when that update touches one of
-# the same smoke dependencies. Any missing/malformed event data, fetch/diff
-# failure, helper failure, fork/unavailable commit, or unexpected helper output
-# FAILS CLOSED to running the full smoke. opened/reopened/manual runs that reach
-# this workflow always run the full smoke.
-#
-# Concurrency cancellation lives on the EXPENSIVE job, not the whole workflow.
-# Otherwise an unrelated synchronize event could cancel an in-flight relevant
-# smoke and then skip its own smoke, leaving the relevant change untested. A new
-# relevant synchronize still cancels the older relevant smoke as intended.
+# Job-level concurrency cancels an older run for the same PR/ref. A cancelled
+# miss cannot publish actions/cache's success-only post-job proof, so a newer
+# head arriving before proof exists also misses and runs the full smoke. A
+# docs-only head can skip only the expensive step after an earlier run has
+# completed successfully and published the exact same content proof.
 #
 # Path coverage rule (P2-1, third pass): every file whose change can
 # materially change the bootstrap execution the sandbox smoke matrix exercises
-# must be listed here AND in scripts/bootstrap_smoke_scope.py. The stdlib-only
-# tests/test_bootstrap_smoke_scope.py check those two lists stay identical.
+# must be listed here AND in the hashFiles(...) fingerprint below. The
+# local-safe regression tests check both surfaces stay complete and identical.
 # "deploy/lib/hubinet-ops-bootstrap-*.py" is a GLOB covering the whole
 # family of python3 helpers the bootstrap pushes into and runs inside the CT.
 # deploy/install-0.5.0-fresh.sh and deploy/hubinet-ops-0.5.service are included
@@ -51,7 +44,6 @@ on:
       - "tests/test_bootstrap_proxmox_0_5_smoke.py"
       - "tests/shell/**"
       - "scripts/validate_hermetic_shell_boundary.py"
-      - "scripts/bootstrap_smoke_scope.py"
       - "AGENTS.md"
       - ".github/workflows/bootstrap-smoke.yml"
   workflow_dispatch: {}
@@ -60,86 +52,7 @@ permissions:
   contents: read
 
 jobs:
-  scope:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      run_smoke: ${{ steps.scope.outputs.run_smoke }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify bootstrap-smoke scope helper contract
-        run: python3 -m unittest discover -s tests -p 'test_bootstrap_smoke_scope.py' -v
-
-      - name: Decide whether this head update needs the expensive sandbox smoke
-        id: scope
-        shell: bash
-        env:
-          EVENT_ACTION: ${{ github.event.action }}
-          EVENT_BEFORE: ${{ github.event.before }}
-          EVENT_AFTER: ${{ github.event.after }}
-        run: |
-          set -euo pipefail
-
-          emit_run_smoke() {
-            local value="$1"
-            local reason="$2"
-            echo "run_smoke=${value}" >> "$GITHUB_OUTPUT"
-            echo "bootstrap-smoke scope: run_smoke=${value} reason=${reason}"
-          }
-
-          # workflow_dispatch, opened and reopened are already coarse-filtered
-          # by the workflow trigger (except manual dispatch), so run the full
-          # smoke. The delta optimization is intentionally synchronize-only.
-          if [[ "$GITHUB_EVENT_NAME" != "pull_request" || "$EVENT_ACTION" != "synchronize" ]]; then
-            emit_run_smoke true "non-synchronize-event"
-            exit 0
-          fi
-
-          # Never treat missing or attacker-shaped revspec text as evidence for
-          # skipping a security-relevant smoke. synchronize normally supplies
-          # exact 40-hex before/after SHAs; anything else fails closed.
-          if [[ ! "$EVENT_BEFORE" =~ ^[0-9a-f]{40}$ || ! "$EVENT_AFTER" =~ ^[0-9a-f]{40}$ ]]; then
-            emit_run_smoke true "invalid-synchronize-range"
-            exit 0
-          fi
-
-          # The head may come from a fork or an unusual ref topology. If the
-          # exact synchronize range cannot be fetched from origin, do not guess:
-          # run the full smoke instead.
-          if ! git fetch --no-tags --depth=1 origin "$EVENT_BEFORE" "$EVENT_AFTER"; then
-            emit_run_smoke true "failed-to-fetch-synchronize-range"
-            exit 0
-          fi
-
-          delta_file="$RUNNER_TEMP/bootstrap-smoke-synchronize-delta"
-          if ! git diff --name-only -z "$EVENT_BEFORE" "$EVENT_AFTER" > "$delta_file"; then
-            emit_run_smoke true "failed-to-diff-synchronize-range"
-            exit 0
-          fi
-
-          if ! decision="$(python3 scripts/bootstrap_smoke_scope.py --null < "$delta_file")"; then
-            emit_run_smoke true "scope-helper-failed"
-            exit 0
-          fi
-
-          case "$decision" in
-            true)
-              emit_run_smoke true "latest-head-update-touched-smoke-dependency"
-              ;;
-            false)
-              emit_run_smoke false "latest-head-update-unrelated-to-smoke-dependencies"
-              ;;
-            *)
-              emit_run_smoke true "unexpected-scope-helper-output"
-              ;;
-          esac
-
   bootstrap-smoke:
-    needs: scope
-    if: needs.scope.outputs.run_smoke == 'true'
-    # Keep cancellation here, after scope. A docs-only synchronize that skips
-    # this job cannot cancel an earlier relevant smoke that is still running.
     concurrency:
       group: bootstrap-smoke-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
@@ -156,5 +69,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # actions/cache saves a miss only from its post-job hook after the job has
+      # completed successfully. Failed or cancelled smoke runs publish no proof.
+      - name: Restore exact successful bootstrap-smoke proof
+        id: bootstrap-smoke-proof
+        uses: actions/cache@v4
+        with:
+          path: .bootstrap-smoke-proof
+          key: bootstrap-smoke-proof-v1-${{ hashFiles('deploy/bootstrap-proxmox-0.5.sh', 'deploy/lib/bootstrap-*.sh', 'deploy/lib/hubinet-ops-bootstrap-*.py', 'deploy/install-0.5.0-fresh.sh', 'deploy/hubinet-ops-0.5.service', 'requirements.txt', 'tests/_bootstrap_fake_pve.py', 'tests/test_bootstrap_proxmox_0_5_smoke.py', 'tests/shell/**', 'scripts/validate_hermetic_shell_boundary.py', 'AGENTS.md', '.github/workflows/bootstrap-smoke.yml') }}
+
       - name: Run the one whole bootstrap smoke matrix through the compliant sandbox
+        id: bootstrap-smoke
+        if: steps.bootstrap-smoke-proof.outputs.cache-hit != 'true'
         run: bash tests/shell/run_bootstrap_smoke_sandbox.sh
+
+      - name: Stage successful proof for the cache post-job save
+        if: success() && steps.bootstrap-smoke-proof.outputs.cache-hit != 'true'
+        run: touch .bootstrap-smoke-proof

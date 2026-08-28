@@ -35,6 +35,7 @@ target script.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -62,6 +63,20 @@ SANDBOX_DOCKERFILE = REPO_ROOT / "tests" / "shell" / "Dockerfile.bootstrap-smoke
 SANDBOX_RUNNER = REPO_ROOT / "tests" / "shell" / "run_bootstrap_smoke_sandbox.sh"
 SANDBOX_ENTRYPOINT = REPO_ROOT / "tests" / "shell" / "bootstrap_smoke_sandbox_entrypoint.sh"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "bootstrap-smoke.yml"
+SMOKE_DEPENDENCY_PATTERNS = (
+    "deploy/bootstrap-proxmox-0.5.sh",
+    "deploy/lib/bootstrap-*.sh",
+    "deploy/lib/hubinet-ops-bootstrap-*.py",
+    "deploy/install-0.5.0-fresh.sh",
+    "deploy/hubinet-ops-0.5.service",
+    "requirements.txt",
+    "tests/_bootstrap_fake_pve.py",
+    "tests/test_bootstrap_proxmox_0_5_smoke.py",
+    "tests/shell/**",
+    "scripts/validate_hermetic_shell_boundary.py",
+    "AGENTS.md",
+    ".github/workflows/bootstrap-smoke.yml",
+)
 
 pytestmark = pytest.mark.skipif(
     __import__("shutil").which("bash") is None, reason="bash is not available in this environment"
@@ -193,11 +208,15 @@ def test_ci_workflow_sets_the_required_ephemeral_ci_marker():
     assert "runs-on: ubuntu-latest" in text or "runs-on: ubuntu-" in text
 
 
-def _ci_workflow_pull_request_paths() -> list[str]:
+def _load_ci_workflow() -> dict:
     import yaml
 
     with CI_WORKFLOW.open(encoding="utf-8") as fh:
-        doc = yaml.safe_load(fh)
+        return yaml.safe_load(fh)
+
+
+def _ci_workflow_pull_request_paths() -> tuple[list[str], dict]:
+    doc = _load_ci_workflow()
     # YAML parses the bare `on:` key as the boolean True key under Python's
     # yaml.safe_load (YAML 1.1 boolean-like scalar) -- look it up either way.
     triggers = doc.get("on", doc.get(True))
@@ -205,9 +224,54 @@ def _ci_workflow_pull_request_paths() -> list[str]:
     return triggers["pull_request"].get("paths", []), triggers
 
 
+def _bootstrap_smoke_job() -> dict:
+    return _load_ci_workflow()["jobs"]["bootstrap-smoke"]
+
+
+def _bootstrap_smoke_steps() -> dict[str, dict]:
+    return {
+        step["id"]: step
+        for step in _bootstrap_smoke_job()["steps"]
+        if "id" in step
+    }
+
+
+def _ci_smoke_fingerprint_patterns() -> tuple[str, ...]:
+    key = _bootstrap_smoke_steps()["bootstrap-smoke-proof"]["with"]["key"]
+    match = re.fullmatch(
+        r"bootstrap-smoke-proof-v1-\$\{\{ hashFiles\((.*)\) \}\}",
+        key,
+    )
+    assert match is not None, "cache key must be exactly the versioned hashFiles fingerprint"
+    arguments = match.group(1)
+    patterns = tuple(re.findall(r"'([^']+)'", arguments))
+    assert arguments == ", ".join(f"'{pattern}'" for pattern in patterns)
+    return patterns
+
+
+def _content_surface_fingerprint(root: Path, patterns: tuple[str, ...]) -> str:
+    """Small deterministic model of the hashFiles content-addressing property."""
+
+    matched: set[Path] = set()
+    for pattern in patterns:
+        if pattern.endswith("/**"):
+            base = root / pattern[:-3]
+            if base.is_dir():
+                matched.update(path for path in base.rglob("*") if path.is_file())
+            continue
+        matched.update(path for path in root.glob(pattern) if path.is_file())
+
+    files = sorted(matched, key=lambda path: path.relative_to(root).as_posix())
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
 def test_ci_workflow_is_narrowly_path_scoped():
     paths, triggers = _ci_workflow_pull_request_paths()
     assert paths, "workflow's pull_request trigger must be path-filtered"
+    assert tuple(paths) == SMOKE_DEPENDENCY_PATTERNS
     # Not triggered on every push -- this is a narrowly-scoped, PR-only,
     # expensive Docker job, never a blanket "every branch push" trigger.
     assert "push" not in triggers or "branches" in triggers.get("push", {})
@@ -251,23 +315,8 @@ def test_ci_workflow_path_filter_covers_every_bootstrap_production_dependency():
     # launcher/entrypoint/Dockerfile; the lexical hermetic-shell-boundary
     # validator; AGENTS.md (the sandbox contract) and the workflow file
     # itself.
-    candidate_globs = [
-        "deploy/bootstrap-proxmox-0.5.sh",
-        "deploy/lib/bootstrap-*.sh",
-        "deploy/lib/hubinet-ops-bootstrap-*.py",
-        "deploy/install-0.5.0-fresh.sh",
-        "deploy/hubinet-ops-0.5.service",
-        "requirements.txt",
-        "tests/_bootstrap_fake_pve.py",
-        "tests/test_bootstrap_proxmox_0_5_smoke.py",
-        "tests/shell/**",
-        "scripts/validate_hermetic_shell_boundary.py",
-        "AGENTS.md",
-        ".github/workflows/bootstrap-smoke.yml",
-    ]
-
     actual_files: set[str] = set()
-    for pattern in candidate_globs:
+    for pattern in SMOKE_DEPENDENCY_PATTERNS:
         if pattern.endswith("/**"):
             base = REPO_ROOT / pattern[:-3]
             if base.is_dir():
@@ -293,26 +342,92 @@ def test_ci_workflow_path_filter_covers_every_bootstrap_production_dependency():
     )
 
 
-def test_ci_workflow_scopes_concurrency_cancellation_to_smoke_job():
-    import yaml
+def test_ci_workflow_fingerprint_covers_the_complete_trigger_surface():
+    paths, _triggers = _ci_workflow_pull_request_paths()
+    assert _ci_smoke_fingerprint_patterns() == SMOKE_DEPENDENCY_PATTERNS
+    assert _ci_smoke_fingerprint_patterns() == tuple(paths)
 
-    with CI_WORKFLOW.open(encoding="utf-8") as fh:
-        doc = yaml.safe_load(fh)
 
-    assert "concurrency" not in doc
+def test_ci_workflow_cache_hit_skips_only_the_expensive_step():
+    smoke = _bootstrap_smoke_job()
+    assert "if" not in smoke, "the latest head must always execute the required job"
+    assert "needs" not in smoke
 
-    jobs = doc["jobs"]
-    scope = jobs["scope"]
-    scope_concurrency = scope.get("concurrency", {})
-    assert scope_concurrency.get("cancel-in-progress") is not True
+    steps = _bootstrap_smoke_steps()
+    proof = steps["bootstrap-smoke-proof"]
+    sandbox = steps["bootstrap-smoke"]
 
-    smoke = jobs["bootstrap-smoke"]
-    assert smoke["needs"] == "scope"
-    assert smoke["if"] == "needs.scope.outputs.run_smoke == 'true'"
+    assert proof["uses"] == "actions/cache@v4"
+    assert proof["with"]["path"] == ".bootstrap-smoke-proof"
+    assert "restore-keys" not in proof["with"]
+    assert sandbox["if"] == "steps.bootstrap-smoke-proof.outputs.cache-hit != 'true'"
+    assert sandbox["run"] == "bash tests/shell/run_bootstrap_smoke_sandbox.sh"
+
+
+def test_ci_workflow_publishes_only_a_successful_exact_proof():
+    smoke = _bootstrap_smoke_job()
+    steps = smoke["steps"]
+    indexed = {step.get("id") or step.get("name"): index for index, step in enumerate(steps)}
+    proof = _bootstrap_smoke_steps()["bootstrap-smoke-proof"]
+    stage = next(step for step in steps if step.get("name", "").startswith("Stage successful proof"))
+
+    # The combined cache action saves a miss from its post-job hook only after
+    # successful job completion. There is no explicit save step that can run
+    # independently of that success-only lifecycle.
+    assert proof["uses"] == "actions/cache@v4"
+    assert not any(step.get("uses", "").startswith("actions/cache/save@") for step in steps)
+    assert indexed["bootstrap-smoke-proof"] < indexed["bootstrap-smoke"] < indexed[stage["name"]]
+    assert indexed[stage["name"]] == len(steps) - 1
+    assert stage["if"] == (
+        "success() && steps.bootstrap-smoke-proof.outputs.cache-hit != 'true'"
+    )
+    assert stage["run"] == "touch .bootstrap-smoke-proof"
+
+
+def test_docs_only_success_cannot_precede_an_unresolved_relevant_smoke_proof():
+    doc = _load_ci_workflow()
+    smoke = _bootstrap_smoke_job()
+    steps = _bootstrap_smoke_steps()
+
+    assert set(doc["jobs"]) == {"bootstrap-smoke"}
+    assert "if" not in smoke
     assert smoke["concurrency"] == {
         "group": "bootstrap-smoke-${{ github.event.pull_request.number || github.ref }}",
         "cancel-in-progress": True,
     }
+    assert steps["bootstrap-smoke-proof"]["uses"] == "actions/cache@v4"
+    assert steps["bootstrap-smoke"]["if"] == (
+        "steps.bootstrap-smoke-proof.outputs.cache-hit != 'true'"
+    )
+
+    # Relevant head A and docs-only successor B have the same dependency
+    # fingerprint. Until A completes successfully, that exact proof key is
+    # absent because the combined cache action saves misses only after a
+    # successful job. Cancelling A therefore leaves unconditional job B with a
+    # cache miss and its own smoke step; there is no inherited/skipped result.
+    assert "github.sha" not in steps["bootstrap-smoke-proof"]["with"]["key"]
+    assert "restore-keys" not in steps["bootstrap-smoke-proof"]["with"]
+
+
+def test_dependency_move_outside_surface_changes_fingerprint_without_rename_parser(tmp_path):
+    dependency = tmp_path / "deploy" / "lib" / "bootstrap-example.sh"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("dependency content\n", encoding="utf-8")
+    docs_file = tmp_path / "docs" / "note.md"
+    docs_file.parent.mkdir()
+    docs_file.write_text("first docs content\n", encoding="utf-8")
+
+    before = _content_surface_fingerprint(tmp_path, SMOKE_DEPENDENCY_PATTERNS)
+    docs_file.write_text("changed docs content\n", encoding="utf-8")
+    assert _content_surface_fingerprint(tmp_path, SMOKE_DEPENDENCY_PATTERNS) == before
+
+    dependency.rename(tmp_path / "docs" / dependency.name)
+    assert _content_surface_fingerprint(tmp_path, SMOKE_DEPENDENCY_PATTERNS) != before
+
+    workflow_text = CI_WORKFLOW.read_text(encoding="utf-8")
+    assert "EVENT_BEFORE" not in workflow_text
+    assert "EVENT_AFTER" not in workflow_text
+    assert "git diff" not in workflow_text
 
 
 def test_sandbox_runner_fails_closed_outside_ephemeral_ci():
