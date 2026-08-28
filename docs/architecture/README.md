@@ -11,8 +11,8 @@ read all architecture and research documents.
 
 ## 1. Current product direction
 
-Hubinet Ops 0.5 is an evolution of the practical 0.4.x workflow, with nothing
-statically configured:
+Hubinet Ops 0.5 is an evolution of the practical 0.4.x workflow, with the **guest
+inventory and its Home Assistant representation no longer statically enumerated**:
 
 ```text
 STATIC 0.4.x
@@ -21,6 +21,11 @@ STATIC 0.4.x
   -> DYNAMIC HOME ASSISTANT RESOURCES / UI
   -> SAFE OPERATOR-DRIVEN UPDATE WORKFLOW
 ```
+
+Adding or removing a supported PVE guest must never require editing a static VMID
+list or hand-maintaining a Home Assistant card. Source configuration,
+credentials, operational settings, and retention settings remain ordinary
+configuration.
 
 Hard product rules — full statement in `docs/product-intent.md`:
 
@@ -35,14 +40,33 @@ Hard product rules — full statement in `docs/product-intent.md`:
 - Retention/cleanup touches **only Hubinet-managed snapshots**; operator
   snapshots are never touched.
 - **Persistent workload-incarnation proof (Blocker B) is not solved** and must
-  not be assumed solved — but it must not be treated as a blanket blocker on
-  ordinary discovery, visibility, read-only scanning, or explicitly approved
-  same-job update work either.
+  not be assumed solved. It must never silently transfer long-lived destructive
+  authority from a destroyed occupant to its replacement.
 - **Family B / B-S1 is not the current implementation path.**
 
 Current implemented state: PVE autodiscovery, dynamic backend inventory, and
 dynamic Home Assistant representation are **live and read-only**. Package
 scanning, update plans, jobs, snapshots, and rollback are **not implemented**.
+
+### Current authority vs. operator target — do not confuse these
+
+> **CURRENT AUTHORITY.** Under the ACCEPTED ADRs today:
+> **Phase 1C is BLOCKED**, **mutation authority is NONE**, **Blocker B is OPEN**,
+> and **`security_continuity=trusted` is GRANTED NOWHERE**. Nothing in this index
+> or in `docs/product-intent.md` authorizes mutation, jobs, snapshots, update
+> execution, or rollback. No implementation of any of them may begin.
+>
+> **OPERATOR TARGET.** The operator's stated direction is narrower than "unblock
+> mutation": Blocker B *should not remain a blanket prerequisite* for a future,
+> operator-reviewed, job-scoped
+> `plan -> approval -> fresh snapshot -> update -> healthcheck -> same-job rollback`.
+> Deciding whether that narrow path can be authorized **without** closing
+> persistent Blocker B requires a **new, explicit architecture decision** — its
+> own ADR, separately reviewed and accepted.
+>
+> Until that ADR exists and is ACCEPTED, the CURRENT AUTHORITY line above is the
+> only operative one. An implementation agent must read the operator target as
+> *a question for a future ADR*, never as present authorization.
 
 ---
 
@@ -52,7 +76,9 @@ scanning, update plans, jobs, snapshots, and rollback are **not implemented**.
 explicit operator decisions
 > ACCEPTED ADRs / accepted architecture
 > AGENTS.md
-> docs/product-intent.md          (product direction, not architecture)
+> docs/product-intent.md          (ACTIVE PRODUCT INTENT: binding for product
+>                                  direction/priority, subordinate to ACCEPTED
+>                                  ADRs on any architecture/security invariant)
 > docs/architecture/0.5-implementation-status.md   (map, not authority)
 > code / tests
 > non-normative research
@@ -64,9 +90,12 @@ Rules that follow from this:
 - An ACCEPTED ADR beats the status document, the skills, the code, and any
   research. If implementation conflicts with an accepted ADR, **stop and report
   the conflict**; do not adapt the architecture to fit.
-- `docs/product-intent.md` is authoritative for *what to build next*, never for
-  architectural or security invariants. Where it and an ADR disagree on an
-  invariant, the ADR wins.
+- `docs/product-intent.md` is **ACTIVE PRODUCT INTENT**: binding for *what to
+  build next* and for the product rules the operator has fixed (for example NO
+  AUTO-UPDATE), never for architectural or security invariants. Where it and an
+  ADR disagree on an invariant, the ADR wins. It authorizes no implementation on
+  its own — an unimplemented item there still needs its own accepted
+  architecture first.
 - **"ACTIVE AUTHORITY" does not mean "read this for every task."** ADR 0005 and
   ADR 0006 are active authority and are also specialized — see §5.
 
@@ -76,7 +105,8 @@ Rules that follow from this:
 
 | Category | Where | Meaning |
 | --- | --- | --- |
-| **A — Active authority** | `docs/architecture/adr/0001`–`0006`, `0.5-foundation.md`, `0.5-inventory-model.md`, `AGENTS.md`, `docs/product-intent.md` | Normative. Binding. |
+| **A — Active authority** | `docs/architecture/adr/0001`–`0006`, `0.5-foundation.md`, `0.5-inventory-model.md`, `AGENTS.md` | Normative and binding for architecture and security invariants. |
+| **A2 — Active product intent** | `docs/product-intent.md` | Binding for **product direction and priority** — what to build next and what the product must never do. **Not** an ADR and **not** architecture authority: on any architectural or security invariant, an ACCEPTED ADR wins. |
 | **B — Active implementation contract** | `docs/architecture/0.5-r0-read-only-runtime-activation.md` | Cited by name and section from live runtime code and tests. |
 | **C — Active current status** | `docs/architecture/0.5-implementation-status.md` | The current map. Not authority. |
 | **D — Active operator/user doc** | `README.md`, `docs/operations/*`, `deploy/README-*.md`, `CHANGELOG.md` | How to install, deploy, and operate. |

@@ -54,6 +54,13 @@ package/update scanning and presentation, operator-approved update plans, job-ow
 pre-update snapshots, health checks, and same-job rollback — is **not implemented and not
 authorized to begin**; each piece needs its own accepted architecture first.
 
+**Current authority:** under the ACCEPTED ADRs, **Phase 1C is BLOCKED**, **mutation
+authority is NONE**, **Blocker B is OPEN**, and **`security_continuity=trusted` is
+GRANTED NOWHERE**. The operator's target — that Blocker B should not remain a blanket
+prerequisite for a future job-scoped `plan -> approval -> fresh snapshot -> update ->
+healthcheck -> same-job rollback` — is a **question for a new ADR**, not present
+authorization.
+
 Hard rules: automatic package/update **scanning** is allowed but must be read-only; the
 operator sees exact package/update detail; **NO AUTO-UPDATE** — installing updates always
 requires explicit operator review and approval of the current plan; a material plan change

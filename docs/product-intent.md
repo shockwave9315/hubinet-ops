@@ -1,6 +1,6 @@
 # Hubinet Ops 0.5 — current product intent
 
-Status: **OPERATOR-STATED PRODUCT TARGET.** Recorded 2026-08-28.
+Status: **ACTIVE PRODUCT INTENT** (operator-stated product target). Recorded 2026-08-28.
 
 This document records **what the operator wants the product to do**. It is the
 authority for *product direction and priority*.
@@ -17,7 +17,8 @@ It is **not** an ADR and **not** an architecture authority:
 ## 1. The product in one line
 
 Hubinet Ops 0.5 is an evolution of the practical 0.4.x workflow — the same
-useful operations, but with nothing statically configured:
+useful operations, but with the **guest inventory and its Home Assistant
+representation no longer statically enumerated**:
 
 ```text
 STATIC 0.4.x
@@ -27,10 +28,24 @@ STATIC 0.4.x
   -> SAFE OPERATOR-DRIVEN UPDATE WORKFLOW
 ```
 
-0.4.x already had statically configured VM/LXC targets, update scanning,
+0.4.x already had statically enumerated VM/LXC targets, update scanning,
 pre-update snapshots, update execution, health checking, rollback, and a Home
 Assistant representation. **0.5 is not reinventing those operations.** It is
-making them dynamic, identity-safe, and operator-governed.
+making the *inventory* dynamic, identity-safe, and operator-governed.
+
+### What "dynamic" does and does not mean
+
+**Dynamic** means, specifically:
+
+- VM/LXC target inventory is no longer statically enumerated anywhere;
+- the Home Assistant resource representation follows dynamic discovery;
+- adding or removing a supported PVE guest never requires editing a static VMID
+  list, or creating/removing a static Home Assistant card.
+
+It does **not** mean every Hubinet configuration value becomes dynamic. Source
+configuration, credentials and credential references, operational settings,
+scheduling, and retention settings remain ordinary, legitimately configured
+values. This document does not redesign configuration.
 
 ## 2. Hard product rules
 
@@ -52,10 +67,19 @@ These are requirements, not suggestions.
 7. **Snapshot retention/cleanup touches only Hubinet-managed snapshots.**
    Manually created or operator-owned snapshots must never be deleted merely
    because Hubinet can see them.
-8. **Snapshots belong to the actual current PVE guest.** If the CT/VM is
-   destroyed, its PVE snapshot goes with it. Hubinet must never keep a detached
-   historical snapshot and later apply it to a newly created guest that happens
-   to reuse the same VMID.
+8. **A recovery snapshot reference is scoped to the exact job and the exact
+   current guest it was created for.** This is a Hubinet fail-closed rule, stated
+   independently of what any particular PVE storage backend physically does:
+   - if that guest is destroyed or confirmed absent, the Hubinet recovery
+     snapshot reference becomes unusable/stale and must fail closed;
+   - it must never be rebound to a later guest that happens to reuse the same
+     VMID;
+   - Hubinet never treats an old storage artifact as a recovery point for a new
+     occupant merely because the locator matches.
+
+   Hubinet's safety here must not depend on assumptions about ZFS, LVM, RBD, or
+   any other backend's deletion semantics. The rule holds regardless of backend
+   details.
 9. **Persistent workload-incarnation proof is not solved and must not be assumed
    solved.** See §4.
 
@@ -69,8 +93,17 @@ Discovery and presentation are the visible half of the product.
   CT/VM may establish current absence, per the accepted discovery/reconciliation
   architecture (ADR 0002, ADR 0004).
 - **A failed, partial, or unavailable PVE scan is never resource deletion.**
-- Resources confirmed absent disappear from the current Home Assistant view
-  according to the designed lifecycle/reconciliation model.
+- Resources confirmed absent are **no longer shown as current/active resources**
+  in the dynamic Home Assistant view, according to the designed
+  lifecycle/reconciliation model.
+
+  This is a statement about the *current view*, not about registry cleanup. It
+  does not by itself prescribe destructive Device/Entity Registry deletion: the
+  accepted architecture may legitimately retain historical backend resource
+  identity and leave a Home Assistant registry entity present-but-unavailable.
+  Registry and history lifecycle remain governed by the accepted inventory/HA
+  architecture (ADR 0001, ADR 0002, ADR 0004, `0.5-inventory-model.md`), which
+  this document does not redesign.
 
 For packages/updates, the operator wants to see, where the information can be
 obtained reliably:
@@ -103,21 +136,45 @@ Without a stronger primitive, Hubinet cannot prove A and B are the same
 incarnation. **This must never silently transfer long-lived destructive
 authority or policy from A to B.**
 
-Operator position: this unresolved question must no longer be *assumed* to block
-ordinary discovery, current Home Assistant visibility, read-only package
-scanning, package-detail presentation, explicitly operator-approved current
-update work, creation of a fresh job-owned snapshot, health checking, and
-same-job rollback to that snapshot.
-
 **Blocker B remains OPEN as its own separate question.**
 
-Architectural consequence, stated honestly: under currently ACCEPTED
-architecture (ADR 0005 §26, ADR 0006), Phase 1C — policy, jobs, and mutation
-authority — is **BLOCKED**. Whether a narrower, same-job, approval-scoped
-update/snapshot/rollback path can be authorized *without* first closing
-Blocker B is a **NEW ARCHITECTURAL DECISION**. It requires its own ADR and its
-own review. This document records the operator's intent to pursue that
-question; it does not decide it, and it does not unblock anything.
+### CURRENT AUTHORITY
+
+Under the currently ACCEPTED architecture (ADR 0005 §26, ADR 0006):
+
+```text
+Phase 1C:                     BLOCKED
+mutation authority:           NONE
+Blocker B:                    OPEN
+security_continuity=trusted:  GRANTED NOWHERE
+```
+
+Nothing in this document changes any of those. Read-only discovery, current
+Home Assistant visibility, read-only package scanning, and package-detail
+presentation are not gated on Blocker B in the first place — they are read-only
+and belong to the existing accepted discovery model. **Update execution,
+snapshots, jobs, health checking as a job step, and rollback are all Phase 1C
+and remain BLOCKED. None of them is authorized to begin.**
+
+### OPERATOR TARGET
+
+The operator's stated direction is deliberately narrower than "unblock
+mutation": Blocker B **should not remain a blanket prerequisite** for a future,
+operator-reviewed, job-scoped path of exactly this shape:
+
+```text
+plan -> approval -> fresh job-owned snapshot -> update -> healthcheck
+     -> same-job rollback
+```
+
+Whether that narrow path can be authorized **without** first closing persistent
+Blocker B is a **NEW ARCHITECTURAL DECISION**. It requires its own ADR,
+separately reviewed and accepted.
+
+This document records the operator's intent to pursue that question. It does not
+decide it, does not unblock anything, and must not be read by an implementation
+agent as present authorization. Until that ADR exists and is ACCEPTED, the
+CURRENT AUTHORITY block above is the only operative one.
 
 ## 5. Intended update workflow (target shape, not yet designed)
 

@@ -49,8 +49,21 @@ STATIC 0.4.x -> PVE AUTODISCOVERY -> DYNAMIC BACKEND INVENTORY
 - **Family B / B-S1 is not the current implementation path.** See
   `docs/archive/postmortems/blocker-b-family-b-13.md`.
 
-None of the unimplemented items above is authorized to begin. Each needs its own
-accepted architecture first (`.agents/skills/hubinet-architecture-change`).
+**CURRENT AUTHORITY — do not confuse the target with permission.** Under the
+ACCEPTED ADRs today: **Phase 1C is BLOCKED**, **mutation authority is NONE**,
+**Blocker B is OPEN**, and **`security_continuity=trusted` is GRANTED NOWHERE**.
+The update-plan, job, snapshot, healthcheck, and rollback rules above describe
+what a future implementation **must** satisfy; they are not permission to build
+it. None of those items is authorized to begin, and each needs its own accepted
+architecture first (`.agents/skills/hubinet-architecture-change`).
+
+**OPERATOR TARGET.** The operator's stated direction is that Blocker B *should
+not remain a blanket prerequisite* for a future, operator-reviewed, job-scoped
+`plan -> approval -> fresh snapshot -> update -> healthcheck -> same-job
+rollback`. Whether that narrow path can be authorized **without** closing
+persistent Blocker B is a **NEW ARCHITECTURAL DECISION** requiring its own ADR.
+Until such an ADR is ACCEPTED, the CURRENT AUTHORITY paragraph above is the only
+operative one.
 
 ## Architecture source of truth
 
