@@ -87,6 +87,9 @@ PVE guest must never require a repository or config change.
 
 ## Repository workflow
 
+- Pre-release authority schema versions are not migrated in place; a schema
+  bump may require a fresh deployment and database. Do not add authority schema
+  migrators unless the operator explicitly changes this product decision.
 - Verify a clean worktree, fetch `origin`, and confirm the branch and its
   remote head before starting. Stop and ask if the worktree is dirty or history
   has diverged. If you are on `main`, create or switch to a feature branch
