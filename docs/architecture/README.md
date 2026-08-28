@@ -53,8 +53,12 @@ scanning, update plans, jobs, snapshots, and rollback are **not implemented**.
 > **CURRENT AUTHORITY.** Under the ACCEPTED ADRs today:
 > **Phase 1C is BLOCKED**, **mutation authority is NONE**, **Blocker B is OPEN**,
 > and **`security_continuity=trusted` is GRANTED NOWHERE**. Nothing in this index
-> or in `docs/product-intent.md` authorizes mutation, jobs, snapshots, update
-> execution, or rollback. No implementation of any of them may begin.
+> or in `docs/product-intent.md` authorizes package scanning, mutation, jobs,
+> snapshots, update execution, or rollback. Read-only package/update scanning is
+> not gated on Blocker B, but it still needs its own accepted read-only
+> evidence/transport contract before implementation may begin — it is not
+> already covered by the existing accepted PVE inventory discovery contract.
+> No implementation of any of these items may begin.
 >
 > **OPERATOR TARGET.** The operator's stated direction is narrower than "unblock
 > mutation": Blocker B *should not remain a blanket prerequisite* for a future,
@@ -177,7 +181,7 @@ See the task matrix in §5.
 | Task | Read | Do not read |
 | --- | --- | --- |
 | **General product work** | the always-read set | anything in `docs/archive/` |
-| **Package scanning / update plan** (not yet implemented) | always-read set; `docs/product-intent.md` §2–§5; ADR 0002 for what discovery may and may not assert; `AGENTS.md` mutation-boundary section | Family B research; the R0 chronology |
+| **Package scanning / update plan** (not implemented — package scanning needs its own accepted read-only evidence/transport contract before implementation, not gated by Blocker B) | always-read set; `docs/product-intent.md` §2–§5; ADR 0002 for what discovery may and may not assert; `AGENTS.md` mutation-boundary section | Family B research; the R0 chronology |
 | **Inventory / reconciliation / identity** | ADR 0001, ADR 0002, `0.5-inventory-model.md`; `.agents/skills/hubinet-phase-boundary` | ADR 0003–0006 unless the change touches attestation/removal/continuity |
 | **Home Assistant integration** | `0.5-inventory-model.md` (snapshot contract), `0.5-foundation.md` "Dynamiczny model Home Assistant", `.agents/skills/hubinet-phase-boundary`, `docs/operations/0.5-ha-clean-break.md` | backend ADR detail beyond the snapshot contract |
 | **R0 runtime, PVE transport, scheduler, config, installer** | `docs/architecture/0.5-r0-read-only-runtime-activation.md` (the code cites it by section) | the R0 activation chronology |
@@ -185,7 +189,7 @@ See the task matrix in §5.
 | **Source attestation / endpoint binding** | ADR 0003 | ADR 0004–0006 |
 | **Confirmed removal / absence proof** | ADR 0004 | ADR 0003, 0005, 0006 |
 | **Persistent continuity / Blocker B** | ADR 0005, ADR 0006, then `docs/architecture/research/adr0006-workload-continuity-evidence.md`, then `docs/archive/postmortems/blocker-b-family-b-13.md` | the four archived Family B research documents, unless you have a specific reason |
-| **Deployment / operations** | `deploy/README-bootstrap-proxmox-0.5.md`, `deploy/README-0.5-firewall.md`, `docs/operations/0.5-r0-operational-activation.md` | architecture ADRs |
+| **Deployment / operations** | `deploy/README-bootstrap-proxmox-0.5.md`, `deploy/README-0.5-firewall.md`, `docs/operations/0.5-r0-operational-activation.md`; for a deployment/runtime implementation change, also the AGENTS.md-required architecture baseline (`0.5-foundation.md`, `0.5-inventory-model.md`, ADR 0001, ADR 0002) | ADR 0003–0006 unless the change touches attestation/removal/continuity; archive/history unless specifically needed |
 | **Code review** | `.agents/skills/hubinet-contract-review`, `AGENTS.md` "Code Review Rules", the status document | broad architecture/research sweeps |
 | **Declaring work done / merge-safe** | `.agents/skills/hubinet-test-gate` | — |
 | **Historical research question** ("why did X stop?") | `docs/archive/postmortems/`, then `docs/archive/` | — |

@@ -52,10 +52,15 @@ STATIC 0.4.x -> PVE AUTODISCOVERY -> DYNAMIC BACKEND INVENTORY
 **CURRENT AUTHORITY — do not confuse the target with permission.** Under the
 ACCEPTED ADRs today: **Phase 1C is BLOCKED**, **mutation authority is NONE**,
 **Blocker B is OPEN**, and **`security_continuity=trusted` is GRANTED NOWHERE**.
-The update-plan, job, snapshot, healthcheck, and rollback rules above describe
-what a future implementation **must** satisfy; they are not permission to build
-it. None of those items is authorized to begin, and each needs its own accepted
-architecture first (`.agents/skills/hubinet-architecture-change`).
+The scanning, update-plan, job, snapshot, healthcheck, and rollback rules above
+describe what a future implementation **must** satisfy; they are not permission
+to build it. Read-only package/update **scanning** is not gated on Blocker B,
+but it is a separate, still-unauthorized item in its own right: it is not
+covered by the existing accepted PVE inventory discovery contract and needs
+its own accepted read-only evidence/transport contract before implementation
+may begin. None of these items — scanning included — is authorized to begin,
+and each needs its own accepted architecture first
+(`.agents/skills/hubinet-architecture-change`).
 
 **OPERATOR TARGET.** The operator's stated direction is that Blocker B *should
 not remain a blanket prerequisite* for a future, operator-reviewed, job-scoped
