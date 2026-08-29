@@ -1,4 +1,4 @@
-"""R0 source bootstrap / configuration loader for the 0.5 read-only runtime.
+"""R0 source and package-scan runtime configuration loader.
 
 See ``ARCHITECTURE.md``. This is a small, R0-dedicated settings loader —
 deliberately not a general application-settings type, so the composition
@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -49,6 +50,8 @@ PROVIDER_KIND_PROXMOX_VE = "proxmox_ve"
 # and operator-controlled either way, so this is guidance, not a security
 # boundary.
 _MIN_API_TOKEN_LENGTH = 16
+DEFAULT_PACKAGE_SCAN_INTERVAL_SECONDS = 6 * 60 * 60
+DEFAULT_PACKAGE_SCAN_INITIAL_DELAY_SECONDS = 30
 
 
 class R0ConfigError(ValueError):
@@ -92,6 +95,24 @@ class R0SourceConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class R0HostControlConfig:
+    host: str
+    port: int
+    user: str
+    private_key_path: Path
+    known_hosts_path: Path
+    timeout_seconds: int
+    max_result_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class R0PackageScanConfig:
+    interval_seconds: int
+    initial_delay_seconds: int
+    host_control: R0HostControlConfig
+
+
+@dataclass(frozen=True, slots=True)
 class R0RuntimeConfig:
     """Fully loaded R0 runtime configuration, secrets included in memory only.
 
@@ -102,6 +123,7 @@ class R0RuntimeConfig:
 
     source: R0SourceConfig
     authority_db_path: Path
+    package_scan: R0PackageScanConfig
     pve_api_token: str = field(repr=False)
     api_bearer_token: str = field(repr=False)
 
@@ -109,6 +131,7 @@ class R0RuntimeConfig:
         return (
             "R0RuntimeConfig(source="
             f"{self.source!r}, authority_db_path={self.authority_db_path!r}, "
+            f"package_scan={self.package_scan!r}, "
             "pve_api_token=<redacted>, api_bearer_token=<redacted>)"
         )
 
@@ -129,6 +152,31 @@ def _require_positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise R0ConfigError(f"{name} must be a positive integer")
     return value
+
+
+def _require_bounded_int(
+    value: Any, name: str, *, minimum: int, maximum: int
+) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not minimum <= value <= maximum
+    ):
+        raise R0ConfigError(
+            f"{name} must be an integer from {minimum} through {maximum}"
+        )
+    return value
+
+
+def validate_package_scan_interval_seconds(value: Any) -> int:
+    """Shared validation for config now and a future controlled-input writer."""
+
+    return _require_bounded_int(
+        value,
+        "package_scan.interval_seconds",
+        minimum=60,
+        maximum=7 * 24 * 60 * 60,
+    )
 
 
 def _require_bool(value: Any, name: str, *, default: bool) -> bool:
@@ -242,6 +290,77 @@ def parse_r0_runtime_config(
         runtime_raw.get("api_token_env"), "runtime.api_token_env"
     )
 
+    package_scan_value = raw.get("package_scan") or {}
+    package_scan_raw = _require_mapping(package_scan_value, "package_scan")
+    host_control_value = package_scan_raw.get("host_control") or {}
+    host_control_raw = _require_mapping(
+        host_control_value, "package_scan.host_control"
+    )
+    default_host = urlsplit(transport_locator).hostname
+    if default_host is None:
+        raise R0ConfigError("source.pve_endpoint has no host-control hostname")
+    interval_seconds = validate_package_scan_interval_seconds(
+        package_scan_raw.get(
+            "interval_seconds", DEFAULT_PACKAGE_SCAN_INTERVAL_SECONDS
+        )
+    )
+    initial_delay_seconds = _require_bounded_int(
+        package_scan_raw.get(
+            "initial_delay_seconds", DEFAULT_PACKAGE_SCAN_INITIAL_DELAY_SECONDS
+        ),
+        "package_scan.initial_delay_seconds",
+        minimum=0,
+        maximum=600,
+    )
+    host_control = R0HostControlConfig(
+        host=_require_text(
+            host_control_raw.get("host", default_host),
+            "package_scan.host_control.host",
+        ),
+        port=_require_bounded_int(
+            host_control_raw.get("port", 22),
+            "package_scan.host_control.port",
+            minimum=1,
+            maximum=65535,
+        ),
+        user=_require_text(
+            host_control_raw.get("user", "root"),
+            "package_scan.host_control.user",
+        ),
+        private_key_path=Path(
+            _require_text(
+                host_control_raw.get(
+                    "private_key_path",
+                    "/etc/hubinet-ops/host-control/id_ed25519",
+                ),
+                "package_scan.host_control.private_key_path",
+            )
+        ),
+        known_hosts_path=Path(
+            _require_text(
+                host_control_raw.get(
+                    "known_hosts_path",
+                    "/etc/hubinet-ops/host-control/known_hosts",
+                ),
+                "package_scan.host_control.known_hosts_path",
+            )
+        ),
+        timeout_seconds=_require_bounded_int(
+            host_control_raw.get("timeout_seconds", 900),
+            "package_scan.host_control.timeout_seconds",
+            minimum=30,
+            maximum=3600,
+        ),
+        max_result_bytes=_require_bounded_int(
+            host_control_raw.get("max_result_bytes", 8 * 1024 * 1024),
+            "package_scan.host_control.max_result_bytes",
+            minimum=1024 * 1024,
+            maximum=16 * 1024 * 1024,
+        ),
+    )
+    if not host_control.private_key_path.is_absolute() or not host_control.known_hosts_path.is_absolute():
+        raise R0ConfigError("package-scan host-control paths must be absolute")
+
     pve_api_token = _require_env_secret(env, pve_token_env, purpose="PVE API token")
     api_bearer_token = _require_env_secret(env, api_token_env, purpose="R0 API bearer token")
     if len(api_bearer_token) < _MIN_API_TOKEN_LENGTH:
@@ -259,6 +378,11 @@ def parse_r0_runtime_config(
             tls=R0TlsConfig(verify=tls_verify, ca_bundle_path=ca_bundle_path),
         ),
         authority_db_path=authority_db_path,
+        package_scan=R0PackageScanConfig(
+            interval_seconds=interval_seconds,
+            initial_delay_seconds=initial_delay_seconds,
+            host_control=host_control,
+        ),
         pve_api_token=pve_api_token,
         api_bearer_token=api_bearer_token,
     )

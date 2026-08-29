@@ -1,6 +1,6 @@
 """Hubinet Ops 0.5 persistent inventory authority core."""
 
-from .authority import InventoryAuthority
+from .authority import InventoryAuthority, package_plan_fingerprint
 from .canonicalization import (
     CANONICALIZATION_CONTRACT_VERSION,
     canonicalize_transport_locator,
@@ -21,6 +21,11 @@ from .models import (
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
+    PackageScanFailure,
+    PackageScanLifecycle,
+    PackageScanOutcome,
+    PackageScanPackage,
+    PackageScanRun,
     ResourceTermination,
     SourceEndpoint,
     SourceRuntimeHealth,
@@ -83,6 +88,11 @@ __all__ = [
     "PersistentSourceFreshness",
     "PersistentSourceHealth",
     "PersistentSourceHealthOrigin",
+    "PackageScanFailure",
+    "PackageScanLifecycle",
+    "PackageScanOutcome",
+    "PackageScanPackage",
+    "PackageScanRun",
     "PROVIDER_CONTRACT_VERSION",
     "ProviderContractError",
     "ProviderFailureKind",
@@ -101,4 +111,5 @@ __all__ = [
     "classify_provider_failure",
     "evaluate_permission_coverage",
     "validate_supported_pve_release",
+    "package_plan_fingerprint",
 ]

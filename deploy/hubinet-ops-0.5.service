@@ -1,5 +1,5 @@
 [Unit]
-Description=Hubinet Ops Agent (0.5, read-only inventory)
+Description=Hubinet Ops Agent (0.5, inventory and package scanning)
 After=network-online.target
 Wants=network-online.target
 

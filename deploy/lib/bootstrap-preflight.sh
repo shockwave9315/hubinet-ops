@@ -128,6 +128,9 @@ phase1_preflight() {
   [[ "${SWAP_MIB}" =~ ^[0-9]+$ ]] || die "--swap must be a non-negative integer (MiB)"
   is_positive_int "${ROOTFS_GIB}" || die "--rootfs-size must be a positive integer (GiB)"
   is_positive_int "${BOOTSTRAP_DISCOVERY_TIMEOUT_SECONDS}" || die "--discovery-timeout must be a positive integer (seconds)"
+  [[ "${PACKAGE_SCAN_INTERVAL_SECONDS}" =~ ^[0-9]+$ ]] \
+    && (( PACKAGE_SCAN_INTERVAL_SECONDS >= 60 && PACKAGE_SCAN_INTERVAL_SECONDS <= 604800 )) \
+    || die "--package-scan-interval must be an integer from 60 through 604800 seconds"
 
   # --- enough disk/resources exist where reasonably checkable ------------
   _storage_has_free_space "${STORAGE}" "${ROOTFS_GIB}" \

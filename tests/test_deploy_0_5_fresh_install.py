@@ -82,6 +82,19 @@ def test_40_install_script_never_references_legacy_config_or_ops_db_as_a_depende
     assert "config/config.example.yaml" not in text
 
 
+def test_40_install_script_installs_openssh_client_for_package_scan_host_control() -> None:
+    # Corrective pass, Finding 2: package scanning reaches the guest through
+    # the external `ssh` binary (SshPackageScanHostControl). The full
+    # Proxmox bootstrap installs openssh-client already; this standalone
+    # installer must too, or a minimal Debian host is missing the backend
+    # runtime dependency package scanning needs.
+    text = INSTALL_SCRIPT.read_text(encoding="utf-8")
+    install_line = next(
+        line for line in text.splitlines() if line.startswith("DEBIAN_FRONTEND=noninteractive apt-get install")
+    )
+    assert "openssh-client" in install_line
+
+
 def test_40_install_script_uses_the_r0_config_and_env_paths() -> None:
     text = INSTALL_SCRIPT.read_text(encoding="utf-8")
     assert "/etc/hubinet-ops/inventory.yaml" in text

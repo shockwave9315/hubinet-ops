@@ -12,6 +12,7 @@ from .enums import (
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
+    PackageScanStatus,
     PresenceState,
     ResourceStateLevel,
     ResourceType,
@@ -21,6 +22,7 @@ from .enums import (
     SourceHealthOrigin,
 )
 from .primitives import _immutable_mapping, _require_uuid_identity
+from .package_scan_validation import validate_package_scan_snapshot
 from .projections import (
     inventory_projection as _inventory_projection,
     source_reconciliation_projection as _source_reconciliation_projection,
@@ -116,6 +118,87 @@ class NodeSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PackageScanOs:
+    os_id: str
+    version: str
+
+    def __post_init__(self) -> None:
+        if self.os_id not in {"debian", "ubuntu"}:
+            raise ValueError("package scan OS id is unsupported")
+        if not isinstance(self.version, str) or not self.version or len(self.version) > 200:
+            raise ValueError("package scan OS version is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class PackageScanError:
+    classification: str
+    message: str
+
+    def __post_init__(self) -> None:
+        if self.classification not in {
+            "guest_unavailable",
+            "unsupported_resource_type",
+            "unsupported_os",
+            "package_manager_busy",
+            "metadata_refresh_failed",
+            "simulation_failed",
+            "timeout",
+            "malformed_plan",
+            "stale_target",
+            "execution_failed",
+        }:
+            raise ValueError("package scan error classification is invalid")
+        if not isinstance(self.message, str) or not self.message or len(self.message) > 500:
+            raise ValueError("package scan error message is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class PackageScanPackage:
+    name: str
+    installed_version: str
+    candidate_version: str
+    origin: str | None = None
+    description: str | None = None
+    security: bool | None = None
+
+    def __post_init__(self) -> None:
+        for value, field_name, maximum in (
+            (self.name, "name", 300),
+            (self.installed_version, "installed_version", 500),
+            (self.candidate_version, "candidate_version", 500),
+        ):
+            if not isinstance(value, str) or not value or len(value) > maximum:
+                raise ValueError(f"package scan {field_name} is invalid")
+        for value, field_name in (
+            (self.origin, "origin"),
+            (self.description, "description"),
+        ):
+            if value is not None and (
+                not isinstance(value, str) or not value or len(value) > 500
+            ):
+                raise ValueError(f"package scan {field_name} is invalid")
+        if self.security not in {True, None}:
+            raise ValueError("package scan security must be true or unknown")
+
+
+@dataclass(frozen=True, slots=True)
+class PackageScanSnapshot:
+    status: PackageScanStatus = PackageScanStatus.NOT_SCANNED
+    scan_run_id: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    os: PackageScanOs | None = None
+    pending_count: int | None = None
+    plan_fingerprint: str | None = None
+    reboot_required: bool | None = None
+    packages: tuple[PackageScanPackage, ...] = ()
+    error: PackageScanError | None = None
+
+    def __post_init__(self) -> None:
+        validate_package_scan_snapshot(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceSnapshot:
     """One backend-owned resource incarnation and effective presentation view."""
 
@@ -147,6 +230,7 @@ class ResourceSnapshot:
     suspended_reason: str | None = None
     effective_capabilities: frozenset[str] = field(default_factory=frozenset)
     state: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    package_scan: PackageScanSnapshot = field(default_factory=PackageScanSnapshot)
     termination_reason: str | None = None
     successor_resource_id: str | None = None
 

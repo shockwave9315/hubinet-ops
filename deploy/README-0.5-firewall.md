@@ -9,24 +9,25 @@ policy -- do not start the service before applying it.
 
 ```text
 ALLOW  egress   R0 host  -> configured PVE endpoint HTTPS port (normally 8006)
+ALLOW  egress   R0 host  -> configured PVE host SSH TCP 22 (forced scan helper)
 ALLOW  ingress  HA host/subnet -> R0 host TCP 8787
 
 DENY   ingress  everything else -> R0 host TCP 8787
 DENY   (no special allowance needed for anything else --
         R0 never initiates any other class of outbound connection:
-        no SSH, no MQTT, no direct guest network access)
+        no MQTT and no direct guest network access)
 ```
 
 R0 needs network access only for:
 
 - outbound HTTPS to the one configured, active Proxmox VE endpoint;
+- outbound SSH to that PVE host for the pinned-key, package-scan-only forced
+  command;
 - inbound read-only HTTP from the Home Assistant host/subnet, on the
   port this service listens on (8787 by default).
 
-R0 needs no network access for SSH, `pct`/`qm`, hostd/forced-command, MQTT,
-or any direct guest connection -- it has no dependency on any of those at
-all (see `ARCHITECTURE.md`, and the composition root's import denylist
-enforced by `tests/test_r0_architecture_regression.py`).
+R0 needs no MQTT or direct guest-network access. `pct` runs only behind the PVE
+forced helper; it is never exposed as a backend command-string interface.
 
 This policy must ALSO account for two things a naive "only the explicit
 rules above" reading misses:
@@ -94,6 +95,8 @@ table inet hubinet_ops_r0 {
     ct state established,related accept
     # Outbound, scoped to the R0 process only: PVE HTTPS, nothing else.
     meta skuid "hubinetops" ip daddr 192.0.2.10 tcp dport 8006 accept
+    # Package scanning: the same pinned PVE host, forced-command SSH only.
+    meta skuid "hubinetops" ip daddr 192.0.2.10 tcp dport 22 accept
     # If source.pve_endpoint in inventory.yaml uses a hostname rather
     # than a literal IP, hubinetops also needs to resolve it -- allow
     # only your own local/internal DNS resolver, never DNS at large.
@@ -128,6 +131,7 @@ policy adds.
 ```bash
 ufw default deny outgoing
 ufw allow out to 192.0.2.10 port 8006 proto tcp comment "R0 -> PVE"
+ufw allow out to 192.0.2.10 port 22 proto tcp comment "R0 -> PVE forced package scan"
 # If source.pve_endpoint uses a hostname, also allow resolution against
 # your own local/internal DNS resolver only (never DNS at large):
 #   ufw allow out to <your-resolver-ip> port 53 proto udp comment "R0 -> DNS resolver"

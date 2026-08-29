@@ -98,10 +98,39 @@ class InventoryPublication:
                 "FROM resource_locator_bindings h2 WHERE h2.resource_id=r.resource_id) "
                 "ORDER BY r.inventory_source_id, r.vmid, locator_generation"
             ).fetchall()
+            scan_rows = connection.execute(
+                "SELECT p.* FROM package_scan_runs p WHERE p.attempt_sequence=("
+                "SELECT MAX(latest.attempt_sequence) FROM package_scan_runs latest "
+                "WHERE latest.resource_id=p.resource_id) "
+                "ORDER BY p.resource_id"
+            ).fetchall()
+            scan_by_resource = {
+                str(row["resource_id"]): row for row in scan_rows
+            }
+            package_rows = connection.execute(
+                "SELECT package.* FROM package_scan_packages package "
+                "JOIN package_scan_runs run USING(scan_run_id) "
+                "WHERE run.outcome='success' AND run.attempt_sequence=("
+                "SELECT MAX(latest.attempt_sequence) FROM package_scan_runs latest "
+                "WHERE latest.resource_id=run.resource_id) "
+                "ORDER BY run.resource_id, package.package_index"
+            ).fetchall()
+            packages_by_run: dict[str, list[Any]] = {}
+            for package in package_rows:
+                packages_by_run.setdefault(str(package["scan_run_id"]), []).append(
+                    package
+                )
 
             sources = tuple(self._source(row) for row in source_rows)
             nodes = tuple(self._node(row) for row in node_rows)
-            resources = tuple(self._resource(row) for row in resource_rows)
+            resources = tuple(
+                self._resource(
+                    row,
+                    scan_by_resource.get(str(row["resource_id"])),
+                    packages_by_run,
+                )
+                for row in resource_rows
+            )
             return PublishedInventoryView(
                 backend={
                     "backend_instance_id": str(backend["backend_instance_id"]),
@@ -168,7 +197,7 @@ class InventoryPublication:
         }
 
     @staticmethod
-    def _resource(row) -> dict[str, Any]:
+    def _resource(row, scan, packages_by_run: Mapping[str, list[Any]]) -> dict[str, Any]:
         return {
             "resource_id": str(row["resource_id"]),
             "inventory_source_id": str(row["inventory_source_id"]),
@@ -194,6 +223,95 @@ class InventoryPublication:
             "suspended_reason": None,
             "effective_capabilities": (),
             "state": json.loads(str(row["facts_json"])),
+            "package_scan": InventoryPublication._package_scan(
+                row, scan, packages_by_run
+            ),
             "termination_reason": row["termination_reason"],
             "successor_resource_id": row["successor_resource_id"],
         }
+
+    @staticmethod
+    def _package_scan(
+        resource, scan, packages_by_run: Mapping[str, list[Any]]
+    ) -> dict[str, Any]:
+        base = {
+            "status": "unsupported" if resource["resource_type"] == "qemu" else "not_scanned",
+            "scan_run_id": None,
+            "started_at": None,
+            "completed_at": None,
+            "os": None,
+            "pending_count": None,
+            "plan_fingerprint": None,
+            "reboot_required": None,
+            "packages": (),
+            "error": None,
+        }
+        if resource["resource_type"] == "qemu" or scan is None:
+            return base
+        base.update(
+            {
+                "scan_run_id": str(scan["scan_run_id"]),
+                "started_at": str(scan["started_at"]),
+                "completed_at": scan["completed_at"],
+                "os": (
+                    {
+                        "id": str(scan["os_id"]),
+                        "version": str(scan["os_version"]),
+                    }
+                    if scan["os_id"] is not None and scan["os_version"] is not None
+                    else None
+                ),
+            }
+        )
+        if scan["lifecycle"] == "running":
+            base["status"] = "scanning"
+            return base
+        if scan["outcome"] != "success":
+            base["status"] = str(scan["outcome"])
+            base["error"] = {
+                "classification": str(scan["failure_class"]),
+                "message": str(scan["error_message"]),
+            }
+            return base
+        if (
+            resource["presence"] != "present"
+            or resource["lifecycle"] != "active"
+            or resource["status"] != "running"
+            or resource["active_binding_id"] is None
+            or scan["expected_binding_id"] != resource["active_binding_id"]
+            or scan["expected_locator_generation"] != resource["locator_generation"]
+            or scan["expected_resource_continuity_revision"]
+            != resource["resource_continuity_revision"]
+            or scan["expected_vmid"] != resource["vmid"]
+        ):
+            base["status"] = "unavailable"
+            return base
+        package_rows = packages_by_run.get(str(scan["scan_run_id"]), [])
+        base.update(
+            {
+                "status": "success",
+                "pending_count": int(scan["pending_count"]),
+                "plan_fingerprint": str(scan["plan_fingerprint"]),
+                "reboot_required": (
+                    True if scan["reboot_required"] == 1 else None
+                ),
+                "packages": tuple(
+                    {
+                        "name": str(package["package_name"]),
+                        "installed_version": str(package["installed_version"]),
+                        "candidate_version": str(package["candidate_version"]),
+                        "origin": package["origin"],
+                        "description": package["description"],
+                        "security": (
+                            True if package["security"] == 1 else None
+                        ),
+                    }
+                    for package in package_rows
+                ),
+            }
+        )
+        if len(package_rows) != int(scan["pending_count"]):
+            raise RuntimeError(
+                "successful package scan package rows do not match pending count"
+            )
+        return base

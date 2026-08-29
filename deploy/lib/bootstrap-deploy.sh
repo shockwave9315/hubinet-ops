@@ -115,18 +115,20 @@ phase8_deploy_source() {
 # any of these are pre-installed -- they are explicitly provisioned here,
 # after the installer has run, rather than assumed.
 phase8b_provision_tooling() {
-  log_phase "Phase 8b: provision required CT tooling (nftables, curl, iproute2)"
+  log_phase "Phase 8b: provision required CT tooling (nftables, curl, iproute2, openssh-client)"
 
   run_logged pct exec "${VMID}" -- apt-get update \
     || die "apt-get update failed inside container ${VMID} while provisioning required tooling"
-  run_logged pct exec "${VMID}" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nftables curl iproute2 \
-    || die "failed to install required tooling (nftables, curl, iproute2) inside container ${VMID}"
+  run_logged pct exec "${VMID}" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nftables curl iproute2 openssh-client \
+    || die "failed to install required tooling (nftables, curl, iproute2, openssh-client) inside container ${VMID}"
 
   _require_ct_command nft
   _require_ct_command curl
   _require_ct_command ss
+  _require_ct_command ssh
+  _require_ct_command ssh-keygen
 
-  log_pass "required CT tooling present: nftables (nft), curl, iproute2 (ss)"
+  log_pass "required CT tooling present: nftables (nft), curl, iproute2 (ss), openssh-client (ssh/ssh-keygen)"
 }
 
 _require_ct_command() {
@@ -167,6 +169,18 @@ source:
   credential_reference: "secret://${PVE_TOKEN_ID}-v1"
   pve_token_env: HUBINET_OPS_R0_PVE_TOKEN
 ${tls_block}
+
+package_scan:
+  interval_seconds: ${PACKAGE_SCAN_INTERVAL_SECONDS}
+  initial_delay_seconds: 30
+  host_control:
+    host: "$(_endpoint_host "${PVE_ENDPOINT}")"
+    port: 22
+    user: root
+    private_key_path: "${HOST_CONTROL_CT_PRIVATE_KEY}"
+    known_hosts_path: "${HOST_CONTROL_CT_KNOWN_HOSTS}"
+    timeout_seconds: 900
+    max_result_bytes: 8388608
 
 runtime:
   authority_db_path: /var/lib/hubinet-ops/authority.db

@@ -54,6 +54,23 @@ source:
     # certificate is not already covered by the system trust store.
     ca_bundle_path: null
 
+# Automatic package scans are scheduled independently from discovery.
+# The interval is a validated runtime setting and can be changed without
+# changing scheduler code. This stage has no Home Assistant write API.
+package_scan:
+  interval_seconds: 21600
+  initial_delay_seconds: 30
+  host_control:
+    # Dedicated SSH key plus a pinned PVE host key. Bootstrap provisions
+    # these paths and one package-scan-only forced-command authorization.
+    host: "pve.example.internal"
+    port: 22
+    user: root
+    private_key_path: /etc/hubinet-ops/host-control/id_ed25519
+    known_hosts_path: /etc/hubinet-ops/host-control/known_hosts
+    timeout_seconds: 900
+    max_result_bytes: 8388608
+
 runtime:
   # Canonical clean-install path for the fresh 0.5 authority database.
   # Never point this at a legacy 0.4 ops.db path -- the store independently

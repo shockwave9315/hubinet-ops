@@ -72,6 +72,27 @@ def test_parse_valid_config_produces_frozen_config_with_secrets_from_env() -> No
     assert config.authority_db_path == Path("/var/lib/hubinet-ops/authority.db")
     assert config.pve_api_token == VALID_ENV["HUBINET_OPS_R0_PVE_TOKEN"]
     assert config.api_bearer_token == VALID_ENV["HUBINET_OPS_R0_API_TOKEN"]
+    assert config.package_scan.interval_seconds == 6 * 60 * 60
+    assert config.package_scan.initial_delay_seconds == 30
+    assert config.package_scan.host_control.host == "pve.example.internal"
+
+
+def test_package_scan_interval_is_a_validated_runtime_setting() -> None:
+    raw = _raw()
+    raw["package_scan"] = {
+        "interval_seconds": 3600,
+        "initial_delay_seconds": 5,
+        "host_control": {"host": "pve-control.internal"},
+    }
+    config = parse_r0_runtime_config(raw, env=VALID_ENV)
+    assert config.package_scan.interval_seconds == 3600
+    assert config.package_scan.initial_delay_seconds == 5
+    assert config.package_scan.host_control.host == "pve-control.internal"
+
+    for invalid in (0, 59, 604801, "21600", True):
+        raw["package_scan"]["interval_seconds"] = invalid
+        with pytest.raises(R0ConfigError, match="package_scan.interval_seconds"):
+            parse_r0_runtime_config(raw, env=VALID_ENV)
 
 
 def test_config_repr_never_leaks_secrets() -> None:

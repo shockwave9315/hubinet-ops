@@ -4,6 +4,7 @@ import ast
 from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
+import hashlib
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -37,6 +38,10 @@ from custom_components.hubinet_ops.api import (
     NodeAvailability,
     NodeSnapshot,
     ObservationalContinuity,
+    PackageScanError,
+    PackageScanOs,
+    PackageScanSnapshot,
+    PackageScanStatus,
     PresenceState,
     ResourceSnapshot,
     ResourceStateLevel,
@@ -249,6 +254,7 @@ def resource(
     state: dict[str, Any] | None = None,
     termination_reason: str | None = None,
     successor_resource_id: str | None = None,
+    package_scan: PackageScanSnapshot | None = None,
 ) -> ResourceSnapshot:
     if active_binding_id is None and presence in {
         PresenceState.PRESENT,
@@ -281,6 +287,7 @@ def resource(
         state=state or {},
         termination_reason=termination_reason,
         successor_resource_id=successor_resource_id,
+        package_scan=package_scan or PackageScanSnapshot(),
     )
 
 
@@ -725,6 +732,10 @@ async def test_devices_and_entities_are_keyed_by_backend_resource_id(
             "lifecycle",
             "observational_continuity",
             "security_continuity",
+            "package_scan_status",
+            "pending_updates",
+            "last_package_scan",
+            "reboot_required",
         }
     }
 
@@ -902,10 +913,10 @@ async def test_retained_and_successor_generations_share_vmid_without_collision(
     assert set(resource_entity_states(hass, entry, old_id).values()) == {
         STATE_UNAVAILABLE
     }
-    assert all(
-        state != STATE_UNAVAILABLE
-        for state in resource_entity_states(hass, entry, successor_id).values()
-    )
+    successor_states = resource_entity_states(hass, entry, successor_id)
+    assert {
+        key for key, state in successor_states.items() if state == STATE_UNAVAILABLE
+    } == {"pending_updates", "last_package_scan", "reboot_required"}
     assert old_device.via_device_id is not None
 
 
@@ -960,6 +971,10 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "lifecycle",
         "observational_continuity",
         "security_continuity",
+        "package_scan_status",
+        "pending_updates",
+        "last_package_scan",
+        "reboot_required",
     }
     assert set(states.values()) == {STATE_UNAVAILABLE}
 
@@ -1011,7 +1026,9 @@ async def test_replacement_transition_retains_old_entities_unavailable(
     }
     successor_states = resource_entity_states(hass, entry, successor_id)
     assert successor_states
-    assert all(state != STATE_UNAVAILABLE for state in successor_states.values())
+    assert {
+        key for key, state in successor_states.items() if state == STATE_UNAVAILABLE
+    } == {"pending_updates", "last_package_scan", "reboot_required"}
 
 
 @pytest.mark.asyncio
@@ -1067,9 +1084,69 @@ async def test_present_unavailable_node_only_blocks_node_dependent_entities(
     states = resource_entity_states(hass, entry, RESOURCE_CT)
     assert {
         key for key, state in states.items() if state == STATE_UNAVAILABLE
-    } == {"status", "node"}
+    } == {
+        "status",
+        "node",
+        "pending_updates",
+        "last_package_scan",
+        "reboot_required",
+    }
     assert states["presence"] == "present"
     assert states["detail_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_pending_updates_distinguishes_exact_zero_from_failed_unknown(
+    hass: HomeAssistant,
+) -> None:
+    success = PackageScanSnapshot(
+        status=PackageScanStatus.SUCCESS,
+        scan_run_id="95255892-75df-4fb6-ae04-c4fe4802aa97",
+        started_at="2026-08-08T12:00:00+00:00",
+        completed_at="2026-08-08T12:00:10+00:00",
+        os=PackageScanOs("debian", "12"),
+        pending_count=0,
+        plan_fingerprint=hashlib.sha256(b"[]").hexdigest(),
+        packages=(),
+    )
+    failure = PackageScanSnapshot(
+        status=PackageScanStatus.FAILED,
+        scan_run_id="10e2eedd-d417-4a8c-afb5-b1b49df44540",
+        started_at="2026-08-08T13:00:00+00:00",
+        completed_at="2026-08-08T13:00:05+00:00",
+        error=PackageScanError(
+            "metadata_refresh_failed", "APT metadata refresh failed"
+        ),
+    )
+    first = snapshot((replace(INITIAL_RESOURCES[1], package_scan=success),))
+    second = snapshot(
+        (replace(INITIAL_RESOURCES[1], package_scan=failure),),
+        # Package-scan-only transition: no new inventory commit, so the
+        # source/inventory state (and inventory_revision) is unchanged from
+        # `first` -- only the published-state revision/timestamp and the
+        # resource's package_scan advance.
+        published_state_revision=21,
+        published_at="2026-08-08T13:00:05+00:00",
+    )
+    entry = await setup_entry(hass, FakeTransport([first, second]))
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    assert states["pending_updates"] == "0"
+    assert states["package_scan_status"] == "success"
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    assert states["pending_updates"] == STATE_UNAVAILABLE
+    assert states["package_scan_status"] == "failed"
+    pending_entity = next(
+        item
+        for item in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if item.unique_id.endswith(":pending_updates")
+    )
+    attributes = hass.states.get(pending_entity.entity_id).attributes
+    assert "packages" not in attributes
 
 
 @pytest.mark.asyncio

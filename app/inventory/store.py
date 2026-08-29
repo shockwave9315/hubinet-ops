@@ -21,6 +21,11 @@ from .models import (
     InventorySource,
     InventorySourceState,
     InventoryNode,
+    PackageScanFailure,
+    PackageScanLifecycle,
+    PackageScanOutcome,
+    PackageScanPackage,
+    PackageScanRun,
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
@@ -33,7 +38,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 6
+AUTHORITY_SCHEMA_VERSION = 7
 BUSY_TIMEOUT_MS = 5_000
 
 _REQUIRED_TABLES = frozenset(
@@ -48,6 +53,8 @@ _REQUIRED_TABLES = frozenset(
         "resource_incarnations",
         "resource_locator_bindings",
         "resource_terminations",
+        "package_scan_runs",
+        "package_scan_packages",
         "canonicalization_migrations",
     }
 )
@@ -69,6 +76,9 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "binding_identity_immutable",
         "resource_termination_immutable",
         "resource_termination_no_delete",
+        "one_active_package_scan_per_resource",
+        "package_scan_issuance_immutable",
+        "package_scan_terminalization_once",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -211,6 +221,33 @@ class InventoryAuthorityStore:
                 (resource_id,),
             ).fetchone()
         return _resource_termination(row) if row is not None else None
+
+    def package_scan_run(self, scan_run_id: str) -> PackageScanRun:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM package_scan_runs WHERE scan_run_id=?",
+                (scan_run_id,),
+            ).fetchone()
+            if row is None:
+                raise AuthorityNotFound("package scan run does not exist")
+            return _package_scan_run(connection, row)
+
+    def list_package_scan_runs(
+        self, resource_id: str | None = None
+    ) -> tuple[PackageScanRun, ...]:
+        with self._read_transaction() as connection:
+            if resource_id is None:
+                rows = connection.execute(
+                    "SELECT * FROM package_scan_runs "
+                    "ORDER BY resource_id, attempt_sequence"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM package_scan_runs WHERE resource_id=? "
+                    "ORDER BY attempt_sequence",
+                    (resource_id,),
+                ).fetchall()
+            return tuple(_package_scan_run(connection, row) for row in rows)
 
     def record_counts(self) -> dict[str, int]:
         """Return bounded schema diagnostics without exposing SQL execution."""
@@ -740,12 +777,77 @@ def _resource_termination(row: sqlite3.Row) -> ResourceTermination:
     )
 
 
+def _package_scan_run(
+    connection: sqlite3.Connection, row: sqlite3.Row
+) -> PackageScanRun:
+    package_rows = connection.execute(
+        "SELECT * FROM package_scan_packages WHERE scan_run_id=? "
+        "ORDER BY package_index",
+        (str(row["scan_run_id"]),),
+    ).fetchall()
+    packages = tuple(
+        PackageScanPackage(
+            package_name=str(package["package_name"]),
+            installed_version=str(package["installed_version"]),
+            candidate_version=str(package["candidate_version"]),
+            origin=package["origin"],
+            description=package["description"],
+            security=_optional_sqlite_boolean(package["security"], "security"),
+        )
+        for package in package_rows
+    )
+    lifecycle = PackageScanLifecycle(str(row["lifecycle"]))
+    outcome = (
+        PackageScanOutcome(str(row["outcome"]))
+        if row["outcome"] is not None
+        else None
+    )
+    failure = (
+        PackageScanFailure(str(row["failure_class"]))
+        if row["failure_class"] is not None
+        else None
+    )
+    pending = int(row["pending_count"]) if row["pending_count"] is not None else None
+    if outcome is PackageScanOutcome.SUCCESS and pending != len(packages):
+        raise AuthorityInvariantError(
+            "successful package scan pending count does not match package rows"
+        )
+    return PackageScanRun(
+        scan_run_id=str(row["scan_run_id"]),
+        resource_id=str(row["resource_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        attempt_sequence=int(row["attempt_sequence"]),
+        expected_binding_id=str(row["expected_binding_id"]),
+        expected_locator_generation=int(row["expected_locator_generation"]),
+        expected_resource_continuity_revision=int(
+            row["expected_resource_continuity_revision"]
+        ),
+        expected_vmid=int(row["expected_vmid"]),
+        expected_node_id=str(row["expected_node_id"]),
+        expected_node_name=str(row["expected_node_name"]),
+        started_at=str(row["started_at"]),
+        lifecycle=lifecycle,
+        completed_at=row["completed_at"],
+        outcome=outcome,
+        failure_class=failure,
+        error_message=row["error_message"],
+        os_id=row["os_id"],
+        os_version=row["os_version"],
+        pending_count=pending,
+        plan_fingerprint=row["plan_fingerprint"],
+        reboot_required=_optional_sqlite_boolean(
+            row["reboot_required"], "reboot_required"
+        ),
+        packages=packages,
+    )
+
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 6)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 7)
     )
     """,
     """
@@ -1098,6 +1200,79 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE package_scan_runs (
+        scan_run_id TEXT PRIMARY KEY,
+        resource_id TEXT NOT NULL,
+        inventory_source_id TEXT NOT NULL,
+        attempt_sequence INTEGER NOT NULL
+            CHECK(typeof(attempt_sequence) = 'integer' AND attempt_sequence > 0),
+        expected_binding_id TEXT NOT NULL,
+        expected_locator_generation INTEGER NOT NULL
+            CHECK(typeof(expected_locator_generation) = 'integer' AND
+                  expected_locator_generation > 0),
+        expected_resource_continuity_revision INTEGER NOT NULL
+            CHECK(typeof(expected_resource_continuity_revision) = 'integer' AND
+                  expected_resource_continuity_revision > 0),
+        expected_vmid INTEGER NOT NULL
+            CHECK(typeof(expected_vmid) = 'integer' AND expected_vmid > 0),
+        expected_node_id TEXT NOT NULL,
+        expected_node_name TEXT NOT NULL CHECK(length(trim(expected_node_name)) > 0),
+        started_at TEXT NOT NULL,
+        lifecycle TEXT NOT NULL CHECK(lifecycle IN ('running', 'completed')),
+        completed_at TEXT,
+        outcome TEXT CHECK(outcome IS NULL OR outcome IN ('success', 'failed', 'interrupted')),
+        failure_class TEXT CHECK(failure_class IS NULL OR failure_class IN (
+            'guest_unavailable', 'unsupported_resource_type', 'unsupported_os',
+            'package_manager_busy', 'metadata_refresh_failed', 'simulation_failed',
+            'timeout', 'malformed_plan', 'stale_target', 'execution_failed')),
+        error_message TEXT CHECK(error_message IS NULL OR length(error_message) <= 500),
+        os_id TEXT,
+        os_version TEXT,
+        pending_count INTEGER CHECK(pending_count IS NULL OR
+            (typeof(pending_count) = 'integer' AND pending_count >= 0)),
+        plan_fingerprint TEXT CHECK(plan_fingerprint IS NULL OR length(plan_fingerprint) = 64),
+        reboot_required INTEGER CHECK(reboot_required IS NULL OR reboot_required = 1),
+        FOREIGN KEY(inventory_source_id, resource_id)
+            REFERENCES resource_incarnations(inventory_source_id, resource_id),
+        FOREIGN KEY(expected_binding_id) REFERENCES resource_locator_bindings(binding_id),
+        FOREIGN KEY(inventory_source_id, expected_node_id)
+            REFERENCES inventory_nodes(inventory_source_id, node_id),
+        UNIQUE(resource_id, attempt_sequence),
+        CHECK((lifecycle = 'running' AND completed_at IS NULL AND outcome IS NULL AND
+               failure_class IS NULL AND error_message IS NULL AND os_id IS NULL AND
+               os_version IS NULL AND pending_count IS NULL AND plan_fingerprint IS NULL AND
+               reboot_required IS NULL) OR
+              (lifecycle = 'completed' AND completed_at IS NOT NULL AND outcome IS NOT NULL)),
+        CHECK(outcome != 'success' OR (
+            failure_class IS NULL AND error_message IS NULL AND os_id IS NOT NULL AND
+            os_version IS NOT NULL AND pending_count IS NOT NULL AND
+            plan_fingerprint IS NOT NULL)),
+        CHECK(outcome NOT IN ('failed', 'interrupted') OR (
+            failure_class IS NOT NULL AND error_message IS NOT NULL AND
+            pending_count IS NULL AND plan_fingerprint IS NULL AND reboot_required IS NULL))
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX one_active_package_scan_per_resource
+    ON package_scan_runs(resource_id) WHERE lifecycle = 'running'
+    """,
+    """
+    CREATE TABLE package_scan_packages (
+        scan_run_id TEXT NOT NULL,
+        package_index INTEGER NOT NULL
+            CHECK(typeof(package_index) = 'integer' AND package_index >= 0),
+        package_name TEXT NOT NULL CHECK(length(trim(package_name)) > 0),
+        installed_version TEXT NOT NULL CHECK(length(trim(installed_version)) > 0),
+        candidate_version TEXT NOT NULL CHECK(length(trim(candidate_version)) > 0),
+        origin TEXT CHECK(origin IS NULL OR length(origin) <= 500),
+        description TEXT CHECK(description IS NULL OR length(description) <= 500),
+        security INTEGER CHECK(security IS NULL OR security = 1),
+        PRIMARY KEY(scan_run_id, package_index),
+        UNIQUE(scan_run_id, package_name),
+        FOREIGN KEY(scan_run_id) REFERENCES package_scan_runs(scan_run_id)
+    )
+    """,
+    """
     CREATE TRIGGER backend_instance_identity_immutable
     BEFORE UPDATE OF backend_instance_id, created_at ON backend_instance
     BEGIN SELECT RAISE(ABORT, 'backend instance identity is immutable'); END
@@ -1191,5 +1366,21 @@ _SCHEMA_STATEMENTS = (
     BEGIN SELECT RAISE(ABORT,
         'resource terminations are immutable retained terminal/tombstone records'
     ); END
+    """,
+    """
+    CREATE TRIGGER package_scan_issuance_immutable
+    BEFORE UPDATE OF scan_run_id, resource_id, inventory_source_id,
+                     attempt_sequence, expected_binding_id,
+                     expected_locator_generation,
+                     expected_resource_continuity_revision, expected_vmid,
+                     expected_node_id, expected_node_name, started_at
+    ON package_scan_runs
+    BEGIN SELECT RAISE(ABORT, 'package scan issuance fields are immutable'); END
+    """,
+    """
+    CREATE TRIGGER package_scan_terminalization_once
+    BEFORE UPDATE ON package_scan_runs
+    WHEN OLD.lifecycle = 'completed'
+    BEGIN SELECT RAISE(ABORT, 'package scan run is already terminal'); END
     """,
 )
