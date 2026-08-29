@@ -8,6 +8,7 @@ import hashlib
 import json
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
@@ -67,6 +68,8 @@ from custom_components.hubinet_ops.const import (
     CONF_BASE_URL,
     CONF_VERIFY_TLS,
     DATA_API_FACTORY,
+    DATA_COORDINATORS,
+    DATA_SERVICES_REGISTERED,
     DOMAIN,
     MODEL_LXC,
     SERVICE_APPROVE_UPDATE_PLAN,
@@ -3485,3 +3488,160 @@ def test_resource_locator_rejects_non_integer_vmid() -> None:
             1.5,  # type: ignore[arg-type]
             "Invalid VMID",
         )
+
+
+# --- Family B: partial setup must not leave global service/coordinator state ---
+
+SECOND_BASE_URL = "https://ops-second.example.test"
+
+
+class RoutingApiFactory:
+    """Route each entry's client to its own fake transport by base_url.
+
+    Lets two config entries load independently in the same test instead of
+    sharing one FakeTransport's snapshot queue/index.
+    """
+
+    def __init__(self) -> None:
+        self._transports: dict[str, FakeTransport] = {}
+
+    def register(self, base_url: str, transport: FakeTransport) -> None:
+        self._transports[base_url] = transport
+
+    def __call__(
+        self, *, base_url: str, api_token: str, verify_tls: bool
+    ) -> HubinetOpsApi:
+        return HubinetOpsApi(
+            base_url=base_url,
+            api_token=api_token,
+            verify_tls=verify_tls,
+            transport=self._transports[base_url],
+        )
+
+
+@pytest.mark.asyncio
+async def test_first_entry_platform_setup_failure_leaves_no_stale_global_state(
+    hass: HomeAssistant,
+) -> None:
+    """First/only entry: first refresh succeeds, platform forwarding fails."""
+
+    install_factory(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    entry.add_to_hass(hass)
+
+    with patch.object(
+        hass.config_entries,
+        "async_forward_entry_setups",
+        side_effect=RuntimeError("forced platform setup failure"),
+    ):
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.entry_id not in hass.data.get(DOMAIN, {}).get(DATA_COORDINATORS, {})
+    assert not hass.data.get(DOMAIN, {}).get(DATA_SERVICES_REGISTERED, False)
+    assert not hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert not hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+
+
+@pytest.mark.asyncio
+async def test_second_entry_failure_leaves_first_intact_then_retry_loads_cleanly(
+    hass: HomeAssistant,
+) -> None:
+    """Loaded A + failed B leaves A/services intact; unload A clears services;
+    a later retry of B loads cleanly with no stale/duplicate coordinator."""
+
+    routing = RoutingApiFactory()
+    hass.data.setdefault(DOMAIN, {})[DATA_API_FACTORY] = routing
+
+    transport_a = FakeTransport([snapshot(INITIAL_RESOURCES)])
+    routing.register(BASE_URL, transport_a)
+    entry_a = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops A",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    entry_a.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry_a.entry_id)
+    await hass.async_block_till_done()
+    assert hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+    assert entry_a.entry_id in hass.data[DOMAIN][DATA_COORDINATORS]
+
+    planned_b = exact_plan_resource()
+    transport_b = FakeTransport(
+        [snapshot((planned_b,), backend_instance_id=OTHER_BACKEND_ID)]
+    )
+    routing.register(SECOND_BASE_URL, transport_b)
+    entry_b = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops B",
+        data={**ENTRY_DATA, CONF_BASE_URL: SECOND_BASE_URL},
+        unique_id=OTHER_BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    entry_b.add_to_hass(hass)
+
+    real_forward = hass.config_entries.async_forward_entry_setups
+
+    async def flaky_forward(forwarded_entry: Any, platforms: Any) -> None:
+        if forwarded_entry.entry_id == entry_b.entry_id:
+            raise RuntimeError("forced platform setup failure")
+        await real_forward(forwarded_entry, platforms)
+
+    with patch.object(
+        hass.config_entries, "async_forward_entry_setups", side_effect=flaky_forward
+    ):
+        assert not await hass.config_entries.async_setup(entry_b.entry_id)
+        await hass.async_block_till_done()
+
+    # A remains present; B is absent from the loaded coordinator map; A's
+    # services remain registered untouched by B's failure.
+    coordinators = hass.data[DOMAIN][DATA_COORDINATORS]
+    assert entry_a.entry_id in coordinators
+    assert entry_b.entry_id not in coordinators
+    assert hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+
+    assert await hass.config_entries.async_unload(entry_a.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.data[DOMAIN][DATA_COORDINATORS] == {}
+    assert not hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert not hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+
+    # Retry B, this time letting platform forwarding actually succeed.
+    assert await hass.config_entries.async_unload(entry_b.entry_id)
+    await hass.async_block_till_done()
+    assert entry_b.state is ConfigEntryState.NOT_LOADED
+
+    assert await hass.config_entries.async_setup(entry_b.entry_id)
+    await hass.async_block_till_done()
+    assert entry_b.state is ConfigEntryState.LOADED
+
+    coordinators = hass.data[DOMAIN][DATA_COORDINATORS]
+    assert list(coordinators) == [entry_b.entry_id]
+    assert hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+
+    device_id = dr.async_get(hass).async_get_device(
+        {(DOMAIN, resource_registry_key(OTHER_BACKEND_ID, RESOURCE_CT))}
+    ).id
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"device_id": device_id},
+        blocking=True,
+        return_response=True,
+    )
+    assert response["resource_id"] == RESOURCE_CT

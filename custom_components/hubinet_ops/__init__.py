@@ -60,11 +60,19 @@ async def async_setup_entry(
     coordinator = HubinetOpsCoordinator(hass, entry, api)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
+
+    # Only reflect this entry in global Hubinet state (the loaded-coordinator
+    # map and the domain services) once platform forwarding has actually
+    # succeeded. Sensor setup needs only entry.runtime_data, so nothing
+    # requires these globals to exist beforehand -- and a failure below must
+    # not leave a stale coordinator or callable approval services behind for
+    # an entry that never finished loading.
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
     hass.data.setdefault(DOMAIN, {}).setdefault(DATA_COORDINATORS, {})[
         entry.entry_id
     ] = coordinator
     async_setup_services(hass)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 
