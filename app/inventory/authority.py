@@ -26,6 +26,7 @@ from .models import (
     PackageScanOutcome,
     PackageScanPackage,
     PackageScanRun,
+    PackagePlanApproval,
 )
 from .discovery import (
     BaselineCompleteness,
@@ -654,6 +655,16 @@ class InventoryAuthority:
             ):
                 source_authority_rejected = True
             else:
+                source = self._require_source_row(connection, source_id)
+                endpoint = self._require_active_endpoint_row(connection, source_id)
+                health = connection.execute(
+                    "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+                    (source_id,),
+                ).fetchone()
+                if health is None:
+                    raise AuthorityInvariantError(
+                        "inventory source must have exactly one runtime health record"
+                    )
                 previous = connection.execute(
                     "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
                     (canonical_resource_id,),
@@ -662,15 +673,26 @@ class InventoryAuthority:
                 try:
                     connection.execute(
                         "INSERT INTO package_scan_runs("
-                        "scan_run_id, resource_id, inventory_source_id, attempt_sequence, "
+                        "scan_run_id, resource_id, inventory_source_id, "
+                        "committed_source_config_revision, committed_endpoint_id, "
+                        "committed_canonical_transport_locator, "
+                        "committed_canonicalization_contract_version, "
+                        "committed_transport_trust_revision, provider_contract_version, "
+                        "attempt_sequence, "
                         "expected_binding_id, expected_locator_generation, "
                         "expected_resource_continuity_revision, expected_vmid, "
                         "expected_node_id, expected_node_name, started_at, lifecycle) "
-                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
                         (
                             scan_run_id,
                             canonical_resource_id,
                             source_id,
+                            int(health["committed_source_config_revision"]),
+                            str(health["committed_endpoint_id"]),
+                            str(health["committed_canonical_transport_locator"]),
+                            int(health["committed_canonicalization_contract_version"]),
+                            int(health["committed_transport_trust_revision"]),
+                            int(source["provider_contract_version"]),
                             attempt_sequence,
                             str(row["binding_id"]),
                             int(row["locator_generation"]),
@@ -847,6 +869,134 @@ class InventoryAuthority:
                 )
         return recovered
 
+    def approve_package_plan(
+        self,
+        resource_id: str,
+        reviewed_scan_run_id: str,
+        reviewed_plan_fingerprint: str,
+    ) -> PackagePlanApproval:
+        """Approve only the exact current plan reference supplied by the operator."""
+
+        canonical_resource_id = _require_uuid(resource_id, "resource_id")
+        canonical_scan_run_id = _require_uuid(
+            reviewed_scan_run_id, "reviewed_scan_run_id"
+        )
+        canonical_fingerprint = _require_package_plan_fingerprint(
+            reviewed_plan_fingerprint
+        )
+        approval_id = _new_uuid()
+        approved_at = _timestamp(self._now())
+        plan_is_stale = False
+        result: PackagePlanApproval | None = None
+
+        with self._store._transaction() as connection:
+            resource = self._require_package_scan_target(
+                connection, canonical_resource_id
+            )
+            if str(resource["resource_type"]) != "lxc":
+                raise AuthorityConflict("package plan approval supports LXC resources only")
+
+            run = self._require_package_scan_run_row(
+                connection, canonical_scan_run_id
+            )
+            if str(run["resource_id"]) != canonical_resource_id:
+                raise AuthorityConflict("reviewed package scan belongs to another resource")
+
+            latest_sequence = connection.execute(
+                "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
+                (canonical_resource_id,),
+            ).fetchone()[0]
+            if latest_sequence is None or int(run["attempt_sequence"]) != int(
+                latest_sequence
+            ):
+                raise AuthorityConflict("reviewed package scan is not the latest attempt")
+            if (
+                str(run["lifecycle"]) != PackageScanLifecycle.COMPLETED.value
+                or str(run["outcome"]) != PackageScanOutcome.SUCCESS.value
+            ):
+                raise AuthorityConflict("reviewed package scan is not a successful exact plan")
+
+            stored_fingerprint = self._successful_package_scan_fingerprint(
+                connection, run
+            )
+            if stored_fingerprint != canonical_fingerprint:
+                raise AuthorityConflict("reviewed package plan fingerprint does not match")
+
+            decision_time = self._authority_decision_time()
+            self._materialize_due_expiry_in_transaction(
+                connection,
+                str(run["inventory_source_id"]),
+                now=decision_time,
+            )
+            if not self._package_scan_is_current_and_approvable(connection, run):
+                # Preserve any expiry materialized just above while refusing
+                # the approval: let the transaction commit the durable
+                # freshness transition and raise the conflict after it,
+                # mirroring issue_package_scan's pattern. Do not touch
+                # package_plan_approvals on this path.
+                plan_is_stale = True
+            else:
+                existing = connection.execute(
+                    "SELECT * FROM package_plan_approvals WHERE resource_id=?",
+                    (canonical_resource_id,),
+                ).fetchone()
+                if (
+                    existing is not None
+                    and str(existing["reviewed_scan_run_id"]) == canonical_scan_run_id
+                    and str(existing["approved_plan_fingerprint"])
+                    == canonical_fingerprint
+                ):
+                    result = PackagePlanApproval(
+                        approval_id=str(existing["approval_id"]),
+                        resource_id=canonical_resource_id,
+                        reviewed_scan_run_id=canonical_scan_run_id,
+                        approved_plan_fingerprint=canonical_fingerprint,
+                        approved_at=str(existing["approved_at"]),
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO package_plan_approvals("
+                        "resource_id, approval_id, reviewed_scan_run_id, "
+                        "approved_plan_fingerprint, approved_at) VALUES(?, ?, ?, ?, ?) "
+                        "ON CONFLICT(resource_id) DO UPDATE SET approval_id=excluded.approval_id, "
+                        "reviewed_scan_run_id=excluded.reviewed_scan_run_id, "
+                        "approved_plan_fingerprint=excluded.approved_plan_fingerprint, "
+                        "approved_at=excluded.approved_at",
+                        (
+                            canonical_resource_id,
+                            approval_id,
+                            canonical_scan_run_id,
+                            canonical_fingerprint,
+                            approved_at,
+                        ),
+                    )
+                    self._after_package_plan_approval_write(
+                        connection, resource_id=canonical_resource_id
+                    )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
+                    # Capture the exact fact this transaction wrote. Do not
+                    # perform a post-commit reread of the mutable
+                    # per-resource row: another transaction may replace it
+                    # before we would have read it back, which would return
+                    # someone else's approval for this request.
+                    result = PackagePlanApproval(
+                        approval_id=approval_id,
+                        resource_id=canonical_resource_id,
+                        reviewed_scan_run_id=canonical_scan_run_id,
+                        approved_plan_fingerprint=canonical_fingerprint,
+                        approved_at=approved_at,
+                    )
+
+        if plan_is_stale:
+            raise AuthorityConflict(
+                "reviewed package scan is stale or its current context is invalid"
+            )
+        if result is None:
+            raise AuthorityInvariantError("package plan approval was not captured")
+        return result
+
     @staticmethod
     def _require_package_scan_target(
         connection: sqlite3.Connection, resource_id: str
@@ -895,7 +1045,8 @@ class InventoryAuthority:
         current = connection.execute(
             "SELECT r.resource_id, r.inventory_source_id, r.vmid, "
             "r.resource_continuity_revision, r.resource_type, r.presence, r.lifecycle, "
-            "r.current_node_id, b.binding_id, b.locator_generation, n.external_node_name "
+            "r.status, r.current_node_id, b.binding_id, b.locator_generation, "
+            "n.external_node_name, n.available AS node_available "
             "FROM resource_incarnations r "
             "LEFT JOIN resource_locator_bindings b ON b.resource_id=r.resource_id "
             "AND b.valid_to_run_sequence IS NULL "
@@ -903,7 +1054,17 @@ class InventoryAuthority:
             "WHERE r.resource_id=?",
             (str(run["resource_id"]),),
         ).fetchone()
-        if current is None or current["binding_id"] is None:
+        if current is None:
+            return False
+        if current["binding_id"] is None:
+            return False
+        # A missing/quarantined resource (or one whose node reference has not
+        # resolved) retains no current node, so these joined fields are NULL.
+        # Reject before any int()/comparison coercion so nullable legal state
+        # fails closed instead of raising.
+        if current["current_node_id"] is None:
+            return False
+        if current["node_available"] is None:
             return False
         return all(
             (
@@ -911,6 +1072,7 @@ class InventoryAuthority:
                 str(current["resource_type"]) == "lxc",
                 str(current["presence"]) == "present",
                 str(current["lifecycle"]) == "active",
+                str(current["status"]) == "running",
                 int(current["vmid"]) == int(run["expected_vmid"]),
                 current["binding_id"] == run["expected_binding_id"],
                 int(current["locator_generation"]) == int(run["expected_locator_generation"]),
@@ -918,8 +1080,115 @@ class InventoryAuthority:
                 == int(run["expected_resource_continuity_revision"]),
                 current["current_node_id"] == run["expected_node_id"],
                 current["external_node_name"] == run["expected_node_name"],
+                current["node_available"] == 1,
             )
         )
+
+    def _package_scan_source_context_is_current(
+        self, connection: sqlite3.Connection, run: sqlite3.Row
+    ) -> bool:
+        source_id = str(run["inventory_source_id"])
+        source = self._require_source_row(connection, source_id)
+        endpoint = self._require_active_endpoint_row(connection, source_id)
+        health = connection.execute(
+            "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+            (source_id,),
+        ).fetchone()
+        if health is None:
+            raise AuthorityInvariantError(
+                "inventory source must have exactly one runtime health record"
+            )
+        return all(
+            (
+                self._source_has_current_authority_in_transaction(
+                    connection, source_id
+                ),
+                int(run["committed_source_config_revision"])
+                == int(health["committed_source_config_revision"]),
+                str(run["committed_endpoint_id"])
+                == str(health["committed_endpoint_id"]),
+                str(run["committed_canonical_transport_locator"])
+                == str(health["committed_canonical_transport_locator"]),
+                int(run["committed_canonicalization_contract_version"])
+                == int(health["committed_canonicalization_contract_version"]),
+                int(run["committed_transport_trust_revision"])
+                == int(health["committed_transport_trust_revision"]),
+                int(run["provider_contract_version"])
+                == int(source["provider_contract_version"]),
+                str(run["committed_endpoint_id"]) == str(endpoint["endpoint_id"]),
+            )
+        )
+
+    def _successful_package_scan_fingerprint(
+        self, connection: sqlite3.Connection, run: sqlite3.Row
+    ) -> str:
+        rows = connection.execute(
+            "SELECT * FROM package_scan_packages WHERE scan_run_id=? "
+            "ORDER BY package_index",
+            (str(run["scan_run_id"]),),
+        ).fetchall()
+        pending_count = run["pending_count"]
+        if pending_count is None or int(pending_count) != len(rows):
+            raise AuthorityInvariantError(
+                "successful package scan pending count does not match exact rows"
+            )
+        packages = tuple(
+            PackageScanPackage(
+                package_name=str(row["package_name"]),
+                installed_version=str(row["installed_version"]),
+                candidate_version=str(row["candidate_version"]),
+                origin=row["origin"],
+                description=row["description"],
+                security=True if row["security"] == 1 else None,
+            )
+            for row in rows
+        )
+        recomputed = package_plan_fingerprint(packages)
+        if recomputed != str(run["plan_fingerprint"]):
+            raise AuthorityInvariantError(
+                "successful package scan fingerprint does not match exact rows"
+            )
+        return recomputed
+
+    def _package_scan_is_current_and_approvable(
+        self, connection: sqlite3.Connection, run: sqlite3.Row
+    ) -> bool:
+        if (
+            str(run["lifecycle"]) != PackageScanLifecycle.COMPLETED.value
+            or str(run["outcome"]) != PackageScanOutcome.SUCCESS.value
+        ):
+            return False
+        self._successful_package_scan_fingerprint(connection, run)
+        return self._package_scan_context_is_current(
+            connection, run
+        ) and self._package_scan_source_context_is_current(connection, run)
+
+    @staticmethod
+    def _package_scan_context_matches_reviewed(
+        current: sqlite3.Row, reviewed: sqlite3.Row
+    ) -> bool:
+        fields = (
+            "resource_id",
+            "inventory_source_id",
+            "committed_source_config_revision",
+            "committed_endpoint_id",
+            "committed_canonical_transport_locator",
+            "committed_canonicalization_contract_version",
+            "committed_transport_trust_revision",
+            "provider_contract_version",
+            "expected_binding_id",
+            "expected_locator_generation",
+            "expected_resource_continuity_revision",
+            "expected_vmid",
+            "expected_node_id",
+            "expected_node_name",
+        )
+        return all(current[field] == reviewed[field] for field in fields)
+
+    def _after_package_plan_approval_write(
+        self, connection: sqlite3.Connection, *, resource_id: str
+    ) -> None:
+        """Test seam after the approval write, still inside its transaction."""
 
     @staticmethod
     def _complete_failed_package_scan(
@@ -1446,6 +1715,18 @@ def _require_uuid(value: str, field_name: str) -> str:
     if parsed.int == 0 or str(parsed) != value:
         raise ValueError(
             f"{field_name} must be a canonical lowercase hyphenated non-NIL UUID"
+        )
+    return value
+
+
+def _require_package_plan_fingerprint(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(
+            "reviewed_plan_fingerprint must be a lowercase SHA-256 fingerprint"
         )
     return value
 

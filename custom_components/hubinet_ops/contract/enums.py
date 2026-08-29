@@ -106,3 +106,9 @@ class PackageScanStatus(StrEnum):
     FAILED = "failed"
     INTERRUPTED = "interrupted"
     UNAVAILABLE = "unavailable"
+
+
+class PackagePlanApprovalStatus(StrEnum):
+    NONE = "none"
+    APPROVED = "approved"
+    STALE = "stale"

@@ -119,14 +119,15 @@ a test or a fail-closed invariant to make a change pass.
 - Never run real `apt`, `pct`, `ssh`, `systemctl`, or deployment operations from
   a test on the pytest host.
 - A deployment script may execute only inside the repository's system-enforced
-  smoke sandbox on an ephemeral CI runner. The sandbox is the security
+  smoke sandbox, whether launched by GitHub's ephemeral runner or by the
+  established local Docker CI equivalent. The sandbox is the security
   boundary: no network, no host PID namespace, no capabilities, no privileges,
   no host sockets/secrets, no writable host filesystem; non-root, read-only
   root and repository, one-shot writable workspace and `/tmp`. Inside it the
   harness sets `HUBINET_OPS_TEST_MODE=1`, uses an isolated `PATH` that does not
   inherit the host's, and replaces every privileged or external command with a
-  fake. Do not run `tests/test_bootstrap_proxmox_0_5_smoke.py` locally with the
-  marker forced on and report it as evidence.
+  fake. Never run `tests/test_bootstrap_proxmox_0_5_smoke.py` on the ordinary
+  pytest host by forcing its sandbox marker and report that as evidence.
 - `scripts/validate_hermetic_shell_boundary.py` is a conservative lexical
   scanner and defense in depth, not the execution boundary. It must fail closed
   on host `PATH` access, absolute standard executable paths, `command -p`, and
@@ -134,16 +135,63 @@ a test or a fail-closed invariant to make a change pass.
   `PATH` or reference `/bin`, `/sbin`, `/usr/bin`, `/usr/sbin` — the exact
   first-line `#!/usr/bin/env bash` shebang is the only exception.
 
-Validation should be proportional. Targeted tests plus `git diff --check` for a
-small change; the bounded affected family for a bugfix. Run the full validation
-from `README.md` before publishing or merging a runtime change, or when
-claiming done/ready/merge-safe. Green tests are evidence that the covered
-behavior passed, not proof that no untested counterexample exists — do not
-claim more than the evidence supports.
+### Local CI equivalent
 
-The Home Assistant suite is pinned separately and needs Python ≥ 3.14.2; Linux
-CI is the real gate. Do not patch Home Assistant or fake `fcntl` to run it on
-Windows.
+Hubinet Ops has a first-class local CI equivalent on the Linux development
+devbox. It reproduces the relevant GitHub validation families locally: normal
+repository validation/pytest, the pinned Home Assistant suite, and the complete
+bootstrap smoke matrix in the hardened Docker sandbox. GitHub
+`workflow_dispatch` is not required to obtain this evidence during development.
+Before using or changing local CI, inspect and reuse the existing repository and
+devbox setup; do not claim the sandbox is GitHub-only and do not create a second
+local launcher merely because part of the established invocation is
+environment-level.
+
+`tests/shell/run_bootstrap_smoke_sandbox.sh` is specifically the GitHub-hosted
+wrapper and must continue to verify genuine GitHub runner markers. Never fake
+`GITHUB_ACTIONS`, `HUBINET_OPS_EPHEMERAL_CI`, `RUNNER_ENVIRONMENT`, or
+`GITHUB_RUN_ID` to bypass it. The established local CI path instead invokes the
+same `tests/shell/Dockerfile.bootstrap-smoke` image and
+`tests/shell/bootstrap_smoke_sandbox_entrypoint.sh` directly through the
+existing devbox Docker setup (using its configured Docker-group mechanism such
+as `sg docker` when necessary). It must retain the existing isolation boundary:
+no network, read-only root and repository, dropped capabilities,
+no-new-privileges, no IPC, bounded resources, non-root UID/GID, isolated tmpfs
+workspace and `/tmp`, no host sockets or secrets, fake privileged/external
+commands, and the existing host filesystem/PID sentinel checks. Never weaken
+those controls to make a local run pass.
+
+### Proportional validation
+
+Use the minimum sufficient evidence for what actually changed, not maximum test
+execution after every edit:
+
+- Documentation, comments, or wording only: run `git diff --check` plus any
+  directly relevant static/document check. Do not run all pytest suites solely
+  for a few prose changes.
+- Strings, translations, or simple YAML metadata: run the relevant
+  YAML/translation and structural validation. Add executable tests only when
+  the metadata affects executable behavior they cover.
+- Small executable bugfix: run focused affected tests and, where needed, the
+  bounded sibling family for the same invariant.
+- Substantial runtime, schema, or Home Assistant stage: iterate with focused
+  tests, then focused family tests. Once the final intended executable head is
+  coherent and is being claimed complete/merge-safe, run the complete existing
+  local CI equivalent once as the final gate, not after every small edit.
+- Bootstrap/deployment behavior: the hardened local Docker bootstrap smoke is
+  directly relevant and must pass before claiming the change complete.
+
+An agent may deliberately omit an irrelevant test and should report what was
+not run and why. It must not omit a relevant test merely to save time. If code
+changes materially after the complete local CI run, rerun the affected gate or
+the full local CI when warranted; prose-only follow-ups need only proportional
+checks. Expected ordinary-suite skips for sandbox-gated tests are not defects
+and must not be forced on the pytest host. Green tests are evidence for the
+covered behavior, not proof that no untested counterexample exists.
+
+The Home Assistant suite is pinned separately and needs Python ≥ 3.14.2 on
+Linux. Both the existing local CI equivalent and GitHub CI provide this gate.
+Do not patch Home Assistant or fake `fcntl` to run it on Windows.
 
 ## Review
 

@@ -274,6 +274,12 @@ class PackageScanRun:
     scan_run_id: str
     resource_id: str
     inventory_source_id: str
+    committed_source_config_revision: int
+    committed_endpoint_id: str
+    committed_canonical_transport_locator: str
+    committed_canonicalization_contract_version: int
+    committed_transport_trust_revision: int
+    provider_contract_version: int
     attempt_sequence: int
     expected_binding_id: str
     expected_locator_generation: int
@@ -293,3 +299,12 @@ class PackageScanRun:
     plan_fingerprint: str | None
     reboot_required: bool | None
     packages: tuple[PackageScanPackage, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PackagePlanApproval:
+    approval_id: str
+    resource_id: str
+    reviewed_scan_run_id: str
+    approved_plan_fingerprint: str
+    approved_at: str

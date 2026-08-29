@@ -19,9 +19,11 @@ from .const import (
     CONF_BASE_URL,
     CONF_VERIFY_TLS,
     DATA_API_FACTORY,
+    DATA_COORDINATORS,
     DOMAIN,
 )
 from .coordinator import HubinetOpsConfigEntry, HubinetOpsCoordinator
+from .services import async_setup_services, async_unload_services
 from .transport_http import http_api_factory
 
 PLATFORMS = [Platform.SENSOR]
@@ -58,7 +60,19 @@ async def async_setup_entry(
     coordinator = HubinetOpsCoordinator(hass, entry, api)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
+
+    # Only reflect this entry in global Hubinet state (the loaded-coordinator
+    # map and the domain services) once platform forwarding has actually
+    # succeeded. Sensor setup needs only entry.runtime_data, so nothing
+    # requires these globals to exist beforehand -- and a failure below must
+    # not leave a stale coordinator or callable approval services behind for
+    # an entry that never finished loading.
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    hass.data.setdefault(DOMAIN, {}).setdefault(DATA_COORDINATORS, {})[
+        entry.entry_id
+    ] = coordinator
+    async_setup_services(hass)
     return True
 
 
@@ -67,7 +81,14 @@ async def async_unload_entry(
 ) -> bool:
     """Unload a Hubinet Ops config entry."""
 
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not unloaded:
+        return False
+    coordinators = hass.data.get(DOMAIN, {}).get(DATA_COORDINATORS, {})
+    coordinators.pop(entry.entry_id, None)
+    if not coordinators:
+        async_unload_services(hass)
+    return True
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

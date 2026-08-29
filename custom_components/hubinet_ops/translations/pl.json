@@ -60,9 +60,47 @@
       "resource_security_continuity": {"name": "Ciągłość bezpieczeństwa"},
       "resource_type": {"name": "Typ"},
       "resource_package_scan_status": {"name": "Stan skanowania pakietów"},
+      "resource_package_plan_approval": {
+        "name": "Zatwierdzenie planu pakietów",
+        "state": {
+          "none": "Brak",
+          "approved": "Zatwierdzony",
+          "stale": "Nieaktualny"
+        }
+      },
       "resource_pending_updates": {"name": "Oczekujące aktualizacje"},
       "resource_last_package_scan": {"name": "Ostatnie skanowanie pakietów"},
       "resource_reboot_required": {"name": "Wymagany restart"}
+    }
+  },
+  "services": {
+    "view_update_plan": {
+      "name": "Wyświetl plan aktualizacji",
+      "description": "Odczytuje świeży, dokładny plan pakietów dla wybranego zasobu Hubinet Ops.",
+      "fields": {
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
+        }
+      }
+    },
+    "approve_update_plan": {
+      "name": "Zatwierdź plan aktualizacji",
+      "description": "Zatwierdza dokładne skanowanie i odcisk zwrócone przez akcję Wyświetl plan aktualizacji.",
+      "fields": {
+        "resource_id": {
+          "name": "Identyfikator zasobu",
+          "description": "Dokładna tożsamość zasobu zwrócona przez akcję Wyświetl plan aktualizacji."
+        },
+        "scan_run_id": {
+          "name": "Identyfikator skanowania",
+          "description": "Dokładna tożsamość skanowania zwrócona przez akcję Wyświetl plan aktualizacji."
+        },
+        "plan_fingerprint": {
+          "name": "Odcisk planu",
+          "description": "Dokładny odcisk materialnego planu zwrócony przez akcję Wyświetl plan aktualizacji."
+        }
+      }
     }
   },
   "exceptions": {

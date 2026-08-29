@@ -13,6 +13,7 @@ from .enums import (
     NodeAvailability,
     ObservationalContinuity,
     PackageScanStatus,
+    PackagePlanApprovalStatus,
     PresenceState,
     ResourceStateLevel,
     ResourceType,
@@ -23,6 +24,7 @@ from .enums import (
 )
 from .primitives import _immutable_mapping, _require_uuid_identity
 from .package_scan_validation import validate_package_scan_snapshot
+from .approval_validation import validate_package_plan_approval_snapshot
 from .projections import (
     inventory_projection as _inventory_projection,
     source_reconciliation_projection as _source_reconciliation_projection,
@@ -199,6 +201,19 @@ class PackageScanSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PackagePlanApprovalSnapshot:
+    status: PackagePlanApprovalStatus = PackagePlanApprovalStatus.NONE
+    approvable: bool = False
+    approval_id: str | None = None
+    reviewed_scan_run_id: str | None = None
+    plan_fingerprint: str | None = None
+    approved_at: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_package_plan_approval_snapshot(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceSnapshot:
     """One backend-owned resource incarnation and effective presentation view."""
 
@@ -231,6 +246,9 @@ class ResourceSnapshot:
     effective_capabilities: frozenset[str] = field(default_factory=frozenset)
     state: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     package_scan: PackageScanSnapshot = field(default_factory=PackageScanSnapshot)
+    package_plan_approval: PackagePlanApprovalSnapshot = field(
+        default_factory=PackagePlanApprovalSnapshot
+    )
     termination_reason: str | None = None
     successor_resource_id: str | None = None
 

@@ -5,10 +5,14 @@ from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 import hashlib
+import json
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
+import yaml
 
 pytest.importorskip("homeassistant", reason="isolated HA test dependencies not installed")
 
@@ -22,7 +26,10 @@ from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import service as service_helper
+from homeassistant.helpers.translation import async_get_translations
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.exceptions import HomeAssistantError
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -31,6 +38,7 @@ from custom_components.hubinet_ops.api import (
     DetailStatus,
     HubinetOpsApi,
     HubinetOpsCannotConnect,
+    HubinetOpsConflict,
     HubinetOpsInvalidAuth,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
@@ -40,8 +48,11 @@ from custom_components.hubinet_ops.api import (
     ObservationalContinuity,
     PackageScanError,
     PackageScanOs,
+    PackageScanPackage,
     PackageScanSnapshot,
     PackageScanStatus,
+    PackagePlanApprovalSnapshot,
+    PackagePlanApprovalStatus,
     PresenceState,
     ResourceSnapshot,
     ResourceStateLevel,
@@ -57,8 +68,12 @@ from custom_components.hubinet_ops.const import (
     CONF_BASE_URL,
     CONF_VERIFY_TLS,
     DATA_API_FACTORY,
+    DATA_COORDINATORS,
+    DATA_SERVICES_REGISTERED,
     DOMAIN,
     MODEL_LXC,
+    SERVICE_APPROVE_UPDATE_PLAN,
+    SERVICE_VIEW_UPDATE_PLAN,
 )
 from custom_components.hubinet_ops.coordinator import (
     node_registry_key,
@@ -255,6 +270,7 @@ def resource(
     termination_reason: str | None = None,
     successor_resource_id: str | None = None,
     package_scan: PackageScanSnapshot | None = None,
+    package_plan_approval: PackagePlanApprovalSnapshot | None = None,
 ) -> ResourceSnapshot:
     if active_binding_id is None and presence in {
         PresenceState.PRESENT,
@@ -288,6 +304,9 @@ def resource(
         termination_reason=termination_reason,
         successor_resource_id=successor_resource_id,
         package_scan=package_scan or PackageScanSnapshot(),
+        package_plan_approval=(
+            package_plan_approval or PackagePlanApprovalSnapshot()
+        ),
     )
 
 
@@ -372,13 +391,16 @@ class FakeTransport:
         *,
         validation_error: Exception | None = None,
         validation_backend_instance_id: str = BACKEND_ID,
+        approval_error: Exception | None = None,
     ) -> None:
         self._snapshots = list(snapshots)
         self._index = 0
         self.validation_error = validation_error
         self.validation_backend_instance_id = validation_backend_instance_id
+        self.approval_error = approval_error
         self.validate_calls = 0
         self.snapshot_calls = 0
+        self.approval_calls: list[tuple[str, str, str]] = []
 
     async def validate_connection(self) -> BackendInformation:
         self.validate_calls += 1
@@ -398,6 +420,15 @@ class FakeTransport:
         selected = self._snapshots[min(self._index, len(self._snapshots) - 1)]
         self._index += 1
         return selected
+
+    async def approve_package_plan(
+        self, resource_id: str, scan_run_id: str, plan_fingerprint: str
+    ) -> None:
+        self.approval_calls.append(
+            (resource_id, scan_run_id, plan_fingerprint)
+        )
+        if self.approval_error is not None:
+            raise self.approval_error
 
 
 class FakeApiFactory:
@@ -474,6 +505,14 @@ def resource_entity_states(
         assert state is not None
         states[item.unique_id.removeprefix(prefix)] = state.state
     return states
+
+
+def resource_device_id(hass: HomeAssistant, resource_id: str) -> str:
+    device = dr.async_get(hass).async_get_device(
+        {(DOMAIN, resource_registry_key(BACKEND_ID, resource_id))}
+    )
+    assert device is not None
+    return device.id
 
 
 @pytest.mark.asyncio
@@ -733,6 +772,7 @@ async def test_devices_and_entities_are_keyed_by_backend_resource_id(
             "observational_continuity",
             "security_continuity",
             "package_scan_status",
+            "package_plan_approval",
             "pending_updates",
             "last_package_scan",
             "reboot_required",
@@ -972,6 +1012,7 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "observational_continuity",
         "security_continuity",
         "package_scan_status",
+        "package_plan_approval",
         "pending_updates",
         "last_package_scan",
         "reboot_required",
@@ -1147,6 +1188,526 @@ async def test_pending_updates_distinguishes_exact_zero_from_failed_unknown(
     )
     attributes = hass.states.get(pending_entity.entity_id).attributes
     assert "packages" not in attributes
+
+
+PLAN_SCAN_A = "95255892-75df-4fb6-ae04-c4fe4802aa97"
+PLAN_SCAN_B = "10e2eedd-d417-4a8c-afb5-b1b49df44540"
+
+
+def exact_plan_resource(
+    *,
+    approved: bool = False,
+    packages: tuple[PackageScanPackage, ...] | None = None,
+    scan_run_id: str = PLAN_SCAN_A,
+    approval: PackagePlanApprovalSnapshot | None = None,
+) -> ResourceSnapshot:
+    packages = packages or (
+        PackageScanPackage(
+            name="apt",
+            installed_version="2.6.1",
+            candidate_version="2.6.2",
+            origin="Debian:12/stable",
+            description="command-line package manager",
+            security=None,
+        ),
+        PackageScanPackage(
+            name="zlib1g",
+            installed_version="1.2.13",
+            candidate_version="1.2.14",
+            origin="Debian:12/stable-security",
+            description=None,
+            security=True,
+        ),
+    )
+    material = [
+        {
+            "candidate_version": package.candidate_version,
+            "installed_version": package.installed_version,
+            "package_name": package.name,
+        }
+        for package in packages
+    ]
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            material, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    if approval is None:
+        approval = (
+            PackagePlanApprovalSnapshot(
+                status=PackagePlanApprovalStatus.APPROVED,
+                approvable=True,
+                approval_id="36d17ae7-f86c-4613-a046-a2bd3301af38",
+                reviewed_scan_run_id=scan_run_id,
+                plan_fingerprint=fingerprint,
+                approved_at="2026-08-08T12:01:00+00:00",
+            )
+            if approved
+            else PackagePlanApprovalSnapshot(approvable=True)
+        )
+    return replace(
+        INITIAL_RESOURCES[1],
+        package_scan=PackageScanSnapshot(
+            status=PackageScanStatus.SUCCESS,
+            scan_run_id=scan_run_id,
+            started_at="2026-08-08T12:00:00+00:00",
+            completed_at="2026-08-08T12:00:10+00:00",
+            os=PackageScanOs("debian", "12"),
+            pending_count=len(packages),
+            plan_fingerprint=fingerprint,
+            packages=packages,
+        ),
+        package_plan_approval=approval,
+    )
+
+
+@pytest.mark.asyncio
+async def test_view_update_plan_reads_fresh_snapshot_and_returns_exact_rows(
+    hass: HomeAssistant,
+) -> None:
+    planned = exact_plan_resource()
+    view = snapshot((planned,))
+    transport = FakeTransport([view, view])
+    entry = await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert transport.snapshot_calls == 2
+    assert response["resource_id"] == RESOURCE_CT
+    assert response["resource_name"] == "CT101 Cloudflared"
+    assert response["approvable"] is True
+    assert response["scan_run_id"] == PLAN_SCAN_A
+    assert response["plan_fingerprint"] == planned.package_scan.plan_fingerprint
+    assert response["pending_count"] == 2
+    assert response["approval_reference"] == {
+        "resource_id": RESOURCE_CT,
+        "scan_run_id": PLAN_SCAN_A,
+        "plan_fingerprint": planned.package_scan.plan_fingerprint,
+    }
+    assert response["packages"] == [
+        {
+            "name": "apt",
+            "installed_version": "2.6.1",
+            "candidate_version": "2.6.2",
+            "origin": "Debian:12/stable",
+            "security": None,
+            "description": "command-line package manager",
+        },
+        {
+            "name": "zlib1g",
+            "installed_version": "1.2.13",
+            "candidate_version": "1.2.14",
+            "origin": "Debian:12/stable-security",
+            "security": True,
+            "description": None,
+        },
+    ]
+    assert resource_entity_states(hass, entry, RESOURCE_CT)[
+        "package_plan_approval"
+    ] == "none"
+
+    resource_key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    resource_entities = [
+        item
+        for item in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if item.unique_id.startswith(f"{resource_key}:")
+    ]
+    assert len(resource_entities) == 13
+    for item in resource_entities:
+        state = hass.states.get(item.entity_id)
+        assert state is not None
+        assert "packages" not in state.attributes
+        assert all(package.name not in state.attributes for package in planned.package_scan.packages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("device_kind", ("source", "node"))
+async def test_view_update_plan_rejects_non_resource_hubinet_device(
+    hass: HomeAssistant, device_kind: str
+) -> None:
+    planned = exact_plan_resource()
+    transport = FakeTransport([snapshot((planned,))])
+    await setup_entry(hass, transport)
+    identifier = (
+        source_registry_key(BACKEND_ID, SOURCE_ID)
+        if device_kind == "source"
+        else node_registry_key(BACKEND_ID, NODE_A)
+    )
+    device = dr.async_get(hass).async_get_device({(DOMAIN, identifier)})
+    assert device is not None
+
+    with pytest.raises(HomeAssistantError, match="exactly one.*resource"):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_VIEW_UPDATE_PLAN,
+            {"device_id": device.id},
+            blocking=True,
+            return_response=True,
+        )
+    assert transport.snapshot_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_view_update_plan_rejects_foreign_integration_device(
+    hass: HomeAssistant,
+) -> None:
+    transport = FakeTransport([snapshot((exact_plan_resource(),))])
+    await setup_entry(hass, transport)
+    foreign_entry = MockConfigEntry(domain="foreign_test", title="Foreign", data={})
+    foreign_entry.add_to_hass(hass)
+    foreign_device = dr.async_get(hass).async_get_or_create(
+        config_entry_id=foreign_entry.entry_id,
+        identifiers={("foreign_test", "device-1")},
+        name="Foreign device",
+    )
+
+    with pytest.raises(HomeAssistantError, match="exactly one.*resource"):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_VIEW_UPDATE_PLAN,
+            {"device_id": foreign_device.id},
+            blocking=True,
+            return_response=True,
+        )
+    assert transport.snapshot_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deleted", (False, True), ids=("unknown", "deleted"))
+async def test_view_update_plan_rejects_unknown_or_deleted_device(
+    hass: HomeAssistant, deleted: bool
+) -> None:
+    transport = FakeTransport([snapshot((exact_plan_resource(),))])
+    await setup_entry(hass, transport)
+    device_id = "f" * 32
+    if deleted:
+        device_id = resource_device_id(hass, RESOURCE_CT)
+        dr.async_get(hass).async_remove_device(device_id)
+
+    with pytest.raises(HomeAssistantError, match="does not exist"):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_VIEW_UPDATE_PLAN,
+            {"device_id": device_id},
+            blocking=True,
+            return_response=True,
+        )
+    assert transport.snapshot_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_view_update_plan_rejects_ambiguous_resource_device(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planned = exact_plan_resource()
+    transport = FakeTransport([snapshot((planned, INITIAL_RESOURCES[2]))])
+    entry = await setup_entry(hass, transport)
+    selected = SimpleNamespace(
+        config_entries={entry.entry_id},
+        identifiers={
+            (DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_CT)),
+            (DOMAIN, resource_registry_key(BACKEND_ID, RESOURCE_TEST)),
+        },
+    )
+    registry = SimpleNamespace(async_get=lambda device_id: selected)
+    with monkeypatch.context() as context:
+        context.setattr(
+            "custom_components.hubinet_ops.services.dr.async_get",
+            lambda hass: registry,
+        )
+        with pytest.raises(HomeAssistantError, match="exactly one.*resource"):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_VIEW_UPDATE_PLAN,
+                {"device_id": "ambiguous-device"},
+                blocking=True,
+                return_response=True,
+            )
+    assert transport.snapshot_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ("failed", "unsupported", "unknown"))
+async def test_view_update_plan_never_returns_reference_for_nonapprovable_state(
+    hass: HomeAssistant, state: str
+) -> None:
+    if state == "failed":
+        selected = replace(
+            INITIAL_RESOURCES[1],
+            package_scan=PackageScanSnapshot(
+                status=PackageScanStatus.FAILED,
+                scan_run_id=PLAN_SCAN_A,
+                started_at="2026-08-08T12:00:00+00:00",
+                completed_at="2026-08-08T12:00:10+00:00",
+                error=PackageScanError(
+                    "metadata_refresh_failed", "metadata refresh failed"
+                ),
+            ),
+        )
+    elif state == "unsupported":
+        selected = replace(
+            INITIAL_RESOURCES[0],
+            package_scan=PackageScanSnapshot(status=PackageScanStatus.UNSUPPORTED),
+        )
+    else:
+        selected = INITIAL_RESOURCES[1]
+    view = snapshot((selected,))
+    transport = FakeTransport([view, view])
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"device_id": resource_device_id(hass, selected.resource_id)},
+        blocking=True,
+        return_response=True,
+    )
+    assert response["approvable"] is False
+    assert response["scan_run_id"] is None
+    assert response["plan_fingerprint"] is None
+    assert response["approval_reference"] is None
+
+
+@pytest.mark.asyncio
+async def test_approve_update_plan_forwards_exact_reference_and_refreshes(
+    hass: HomeAssistant,
+) -> None:
+    planned = exact_plan_resource()
+    initial = snapshot((planned,))
+    approved = snapshot(
+        (exact_plan_resource(approved=True),),
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    transport = FakeTransport([initial, approved])
+    entry = await setup_entry(hass, transport)
+    assert resource_entity_states(hass, entry, RESOURCE_CT)[
+        "package_plan_approval"
+    ] == "none"
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_APPROVE_UPDATE_PLAN,
+        {
+            "resource_id": RESOURCE_CT,
+            "scan_run_id": PLAN_SCAN_A,
+            "plan_fingerprint": planned.package_scan.plan_fingerprint,
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert transport.approval_calls == [
+        (RESOURCE_CT, PLAN_SCAN_A, planned.package_scan.plan_fingerprint)
+    ]
+    assert transport.snapshot_calls == 2
+    assert (
+        entry.runtime_data.data.resources_by_id[
+            RESOURCE_CT
+        ].package_plan_approval.status
+        is PackagePlanApprovalStatus.APPROVED
+    )
+    assert resource_entity_states(hass, entry, RESOURCE_CT)[
+        "package_plan_approval"
+    ] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_approval_sensor_follows_changed_plan_stale_publication(
+    hass: HomeAssistant,
+) -> None:
+    approved_a = exact_plan_resource(approved=True)
+    changed_packages = (
+        replace(
+            approved_a.package_scan.packages[0], candidate_version="2.6.3"
+        ),
+        approved_a.package_scan.packages[1],
+    )
+    stale_approval = replace(
+        approved_a.package_plan_approval,
+        status=PackagePlanApprovalStatus.STALE,
+        approvable=True,
+    )
+    changed_b = exact_plan_resource(
+        packages=changed_packages,
+        scan_run_id=PLAN_SCAN_B,
+        approval=stale_approval,
+    )
+    second = snapshot(
+        (changed_b,),
+        published_state_revision=21,
+        published_at="2026-08-08T13:00:00+00:00",
+    )
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot((approved_a,)), second])
+    )
+    assert resource_entity_states(hass, entry, RESOURCE_CT)[
+        "package_plan_approval"
+    ] == "approved"
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    assert states["package_plan_approval"] == "stale"
+    approval_entity = next(
+        item
+        for item in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if item.unique_id.endswith(":package_plan_approval")
+    )
+    attributes = hass.states.get(approval_entity.entity_id).attributes
+    assert "packages" not in attributes
+    assert all(package.name not in attributes for package in changed_packages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context_kind", ("resource", "source"))
+async def test_approval_sensor_uses_backend_stale_state_during_context_failure(
+    hass: HomeAssistant, context_kind: str
+) -> None:
+    approved = exact_plan_resource(approved=True)
+    context_stale = replace(
+        approved,
+        resource_continuity_revision=(
+            2 if context_kind == "resource" else approved.resource_continuity_revision
+        ),
+        package_plan_approval=replace(
+            approved.package_plan_approval,
+            status=PackagePlanApprovalStatus.STALE,
+            approvable=False,
+        ),
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [
+                snapshot(
+                    (context_stale,),
+                    sources=(unavailable_source(),)
+                    if context_kind == "source"
+                    else None,
+                )
+            ]
+        ),
+    )
+
+    states = resource_entity_states(hass, entry, RESOURCE_CT)
+    assert states["package_plan_approval"] == "stale"
+
+
+def test_update_plan_action_metadata_and_polish_translations_are_structural() -> None:
+    integration_root = (
+        Path(__file__).parents[1] / "custom_components" / "hubinet_ops"
+    )
+    services = yaml.safe_load((integration_root / "services.yaml").read_text())
+    assert services["view_update_plan"]["fields"] == {
+        "device_id": {
+            "required": True,
+            "selector": {"device": {"integration": DOMAIN}},
+        }
+    }
+
+    strings = json.loads((integration_root / "strings.json").read_text())
+    english = json.loads((integration_root / "translations" / "en.json").read_text())
+    polish = json.loads((integration_root / "translations" / "pl.json").read_text())
+    assert strings["services"] == english["services"]
+    assert set(strings["services"]) == {
+        SERVICE_VIEW_UPDATE_PLAN,
+        SERVICE_APPROVE_UPDATE_PLAN,
+    }
+    assert polish["services"][SERVICE_VIEW_UPDATE_PLAN]["name"] == (
+        "Wyświetl plan aktualizacji"
+    )
+    assert polish["services"][SERVICE_APPROVE_UPDATE_PLAN]["name"] == (
+        "Zatwierdź plan aktualizacji"
+    )
+    assert polish["entity"]["sensor"]["resource_package_plan_approval"][
+        "state"
+    ] == {
+        "none": "Brak",
+        "approved": "Zatwierdzony",
+        "stale": "Nieaktualny",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pinned_ha_loads_device_selector_and_polish_action_translations(
+    hass: HomeAssistant,
+) -> None:
+    await setup_entry(hass, FakeTransport([snapshot((exact_plan_resource(),))]))
+    descriptions = await service_helper.async_get_all_descriptions(hass)
+    assert descriptions[DOMAIN][SERVICE_VIEW_UPDATE_PLAN]["fields"] == {
+        "device_id": {
+            "required": True,
+            "selector": {
+                "device": {"integration": DOMAIN, "multiple": False}
+            },
+        }
+    }
+
+    polish = await async_get_translations(
+        hass, "pl", "services", integrations={DOMAIN}
+    )
+    assert polish[
+        f"component.{DOMAIN}.services.{SERVICE_VIEW_UPDATE_PLAN}.name"
+    ] == "Wyświetl plan aktualizacji"
+    assert polish[
+        f"component.{DOMAIN}.services.{SERVICE_APPROVE_UPDATE_PLAN}.name"
+    ] == "Zatwierdź plan aktualizacji"
+
+
+@pytest.mark.asyncio
+async def test_skipped_poll_race_keeps_viewed_a_and_backend_refuses_after_b(
+    hass: HomeAssistant,
+) -> None:
+    planned_a = exact_plan_resource()
+    coordinator_view_a = snapshot((planned_a,))
+    transport = FakeTransport([coordinator_view_a, coordinator_view_a])
+    entry = await setup_entry(hass, transport)
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+    reference_a = response["approval_reference"]
+
+    # Backend plan B completes without a coordinator poll. The fake backend's
+    # conflict is the HA-side witness; the real authority/API race is covered
+    # by test_package_plan_approval and test_inventory_runtime.
+    transport.approval_error = HubinetOpsConflict(
+        f"backend now has newer scan {PLAN_SCAN_B}"
+    )
+    with pytest.raises(HomeAssistantError, match="refused"):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_APPROVE_UPDATE_PLAN,
+            reference_a,
+            blocking=True,
+        )
+
+    assert transport.approval_calls == [
+        (
+            RESOURCE_CT,
+            PLAN_SCAN_A,
+            planned_a.package_scan.plan_fingerprint,
+        )
+    ]
+    assert transport.snapshot_calls == 2
+    assert entry.runtime_data.data.resources_by_id[
+        RESOURCE_CT
+    ].package_scan.scan_run_id == PLAN_SCAN_A
 
 
 @pytest.mark.asyncio
@@ -2927,3 +3488,160 @@ def test_resource_locator_rejects_non_integer_vmid() -> None:
             1.5,  # type: ignore[arg-type]
             "Invalid VMID",
         )
+
+
+# --- Family B: partial setup must not leave global service/coordinator state ---
+
+SECOND_BASE_URL = "https://ops-second.example.test"
+
+
+class RoutingApiFactory:
+    """Route each entry's client to its own fake transport by base_url.
+
+    Lets two config entries load independently in the same test instead of
+    sharing one FakeTransport's snapshot queue/index.
+    """
+
+    def __init__(self) -> None:
+        self._transports: dict[str, FakeTransport] = {}
+
+    def register(self, base_url: str, transport: FakeTransport) -> None:
+        self._transports[base_url] = transport
+
+    def __call__(
+        self, *, base_url: str, api_token: str, verify_tls: bool
+    ) -> HubinetOpsApi:
+        return HubinetOpsApi(
+            base_url=base_url,
+            api_token=api_token,
+            verify_tls=verify_tls,
+            transport=self._transports[base_url],
+        )
+
+
+@pytest.mark.asyncio
+async def test_first_entry_platform_setup_failure_leaves_no_stale_global_state(
+    hass: HomeAssistant,
+) -> None:
+    """First/only entry: first refresh succeeds, platform forwarding fails."""
+
+    install_factory(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops Test",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    entry.add_to_hass(hass)
+
+    with patch.object(
+        hass.config_entries,
+        "async_forward_entry_setups",
+        side_effect=RuntimeError("forced platform setup failure"),
+    ):
+        assert not await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+    assert entry.entry_id not in hass.data.get(DOMAIN, {}).get(DATA_COORDINATORS, {})
+    assert not hass.data.get(DOMAIN, {}).get(DATA_SERVICES_REGISTERED, False)
+    assert not hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert not hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+
+
+@pytest.mark.asyncio
+async def test_second_entry_failure_leaves_first_intact_then_retry_loads_cleanly(
+    hass: HomeAssistant,
+) -> None:
+    """Loaded A + failed B leaves A/services intact; unload A clears services;
+    a later retry of B loads cleanly with no stale/duplicate coordinator."""
+
+    routing = RoutingApiFactory()
+    hass.data.setdefault(DOMAIN, {})[DATA_API_FACTORY] = routing
+
+    transport_a = FakeTransport([snapshot(INITIAL_RESOURCES)])
+    routing.register(BASE_URL, transport_a)
+    entry_a = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops A",
+        data=ENTRY_DATA,
+        unique_id=BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    entry_a.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry_a.entry_id)
+    await hass.async_block_till_done()
+    assert hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+    assert entry_a.entry_id in hass.data[DOMAIN][DATA_COORDINATORS]
+
+    planned_b = exact_plan_resource()
+    transport_b = FakeTransport(
+        [snapshot((planned_b,), backend_instance_id=OTHER_BACKEND_ID)]
+    )
+    routing.register(SECOND_BASE_URL, transport_b)
+    entry_b = MockConfigEntry(
+        domain=DOMAIN,
+        title="Hubinet Ops B",
+        data={**ENTRY_DATA, CONF_BASE_URL: SECOND_BASE_URL},
+        unique_id=OTHER_BACKEND_ID,
+        version=1,
+        minor_version=1,
+    )
+    entry_b.add_to_hass(hass)
+
+    real_forward = hass.config_entries.async_forward_entry_setups
+
+    async def flaky_forward(forwarded_entry: Any, platforms: Any) -> None:
+        if forwarded_entry.entry_id == entry_b.entry_id:
+            raise RuntimeError("forced platform setup failure")
+        await real_forward(forwarded_entry, platforms)
+
+    with patch.object(
+        hass.config_entries, "async_forward_entry_setups", side_effect=flaky_forward
+    ):
+        assert not await hass.config_entries.async_setup(entry_b.entry_id)
+        await hass.async_block_till_done()
+
+    # A remains present; B is absent from the loaded coordinator map; A's
+    # services remain registered untouched by B's failure.
+    coordinators = hass.data[DOMAIN][DATA_COORDINATORS]
+    assert entry_a.entry_id in coordinators
+    assert entry_b.entry_id not in coordinators
+    assert hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+
+    assert await hass.config_entries.async_unload(entry_a.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.data[DOMAIN][DATA_COORDINATORS] == {}
+    assert not hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert not hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+
+    # Retry B, this time letting platform forwarding actually succeed.
+    assert await hass.config_entries.async_unload(entry_b.entry_id)
+    await hass.async_block_till_done()
+    assert entry_b.state is ConfigEntryState.NOT_LOADED
+
+    assert await hass.config_entries.async_setup(entry_b.entry_id)
+    await hass.async_block_till_done()
+    assert entry_b.state is ConfigEntryState.LOADED
+
+    coordinators = hass.data[DOMAIN][DATA_COORDINATORS]
+    assert list(coordinators) == [entry_b.entry_id]
+    assert hass.services.has_service(DOMAIN, SERVICE_VIEW_UPDATE_PLAN)
+    assert hass.services.has_service(DOMAIN, SERVICE_APPROVE_UPDATE_PLAN)
+
+    device_id = dr.async_get(hass).async_get_device(
+        {(DOMAIN, resource_registry_key(OTHER_BACKEND_ID, RESOURCE_CT))}
+    ).id
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"device_id": device_id},
+        blocking=True,
+        return_response=True,
+    )
+    assert response["resource_id"] == RESOURCE_CT

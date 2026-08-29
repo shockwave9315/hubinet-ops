@@ -79,6 +79,6 @@ runtime:
   authority_db_path: /var/lib/hubinet-ops/authority.db
 
   # Name of the environment variable (in the R0 EnvironmentFile) holding
-  # the R0 read-only HTTP API's own bearer token -- entirely independent
+  # the R0 HTTP API's own bearer token -- entirely independent
   # from, and never derived from or shared with, the PVE token above.
   api_token_env: HUBINET_OPS_R0_API_TOKEN

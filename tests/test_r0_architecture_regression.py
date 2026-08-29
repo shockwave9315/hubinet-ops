@@ -227,10 +227,15 @@ def test_r0_production_modules_import_no_forbidden_legacy_symbol() -> None:
                 ), (rel_path, name)
 
 
-def test_r0_production_modules_define_no_mutation_http_verb() -> None:
+def test_r0_production_modules_define_only_exact_plan_approval_mutation() -> None:
     text = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
-    for verb in ("@app.post(", "@app.put(", "@app.patch(", "@app.delete("):
+    for verb in ("@app.post(", "@app.patch(", "@app.delete("):
         assert verb not in text
+    assert text.count("@app.put(") == 1
+    assert (
+        'f"{API_PREFIX}/resources/{{resource_id}}/package-plan-approval"'
+        in text
+    )
 
 
 def test_r0_config_loader_has_no_static_workload_inventory_concept() -> None:
@@ -276,23 +281,25 @@ def test_r0_ha_transport_never_references_pve_or_imports_app_inventory() -> None
     assert "app.inventory" not in text
 
 
-def test_r0_ha_transport_defines_no_write_method() -> None:
+def test_r0_ha_transport_defines_only_exact_plan_approval_write() -> None:
     tree = ast.parse(
         (REPO_ROOT / "custom_components/hubinet_ops/transport_http.py").read_text(
             encoding="utf-8"
         )
     )
-    protocol_methods = {"validate_connection", "fetch_backend_information", "fetch_resource_snapshot"}
-    mutation_shaped_prefixes = ("post", "put", "patch", "delete", "mutate", "update", "write", "create", "set_")
+    protocol_methods = {
+        "validate_connection",
+        "fetch_backend_information",
+        "fetch_resource_snapshot",
+        "approve_package_plan",
+    }
+    exact_private_methods = {"_get", "_put"}
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == "HttpHubinetOpsTransport":
             method_names = {
                 item.name for item in node.body if isinstance(item, ast.AsyncFunctionDef)
             }
-            assert protocol_methods <= method_names
-            for name in method_names - protocol_methods:
-                assert name.startswith("_"), f"unexpected public method {name!r}"
-                assert not name.lstrip("_").startswith(mutation_shaped_prefixes), name
+            assert method_names == protocol_methods | exact_private_methods
             return
     raise AssertionError("HttpHubinetOpsTransport class not found")
 

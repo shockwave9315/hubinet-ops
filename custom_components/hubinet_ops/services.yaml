@@ -1,0 +1,22 @@
+view_update_plan:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: hubinet_ops
+
+approve_update_plan:
+  fields:
+    resource_id:
+      required: true
+      selector:
+        text:
+    scan_run_id:
+      required: true
+      selector:
+        text:
+    plan_fingerprint:
+      required: true
+      selector:
+        text:

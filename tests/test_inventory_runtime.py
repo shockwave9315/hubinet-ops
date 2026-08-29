@@ -18,7 +18,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.inventory import AuthorityDatabaseRejected
+from app.inventory import AuthorityDatabaseRejected, PackageScanPackage
 from app.inventory_pve_transport import ProxmoxHttpTransport, _PVE_API_PREFIX
 from app.inventory_runtime import create_app_from_env, create_read_only_app
 from app.inventory_runtime_config import R0ConfigError, parse_r0_runtime_config
@@ -179,17 +179,26 @@ def test_1_static_ast_scan_finds_no_denylisted_import_in_r0_modules() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_2_only_get_head_options_routes_exist(tmp_path: Path) -> None:
+def test_2_only_reads_and_exact_package_plan_approval_route_exist(tmp_path: Path) -> None:
     app, _config = _build_app(tmp_path)
     found_r0_route = False
+    mutation_routes = []
     for route in app.routes:
         methods = getattr(route, "methods", None)
         if methods is None:
             continue
-        assert methods <= {"GET", "HEAD", "OPTIONS"}, (getattr(route, "path", route), methods)
+        assert methods <= {"GET", "HEAD", "OPTIONS", "PUT"}, (
+            getattr(route, "path", route),
+            methods,
+        )
+        if "PUT" in methods:
+            mutation_routes.append(str(getattr(route, "path", "")))
         if str(getattr(route, "path", "")).startswith("/r0/v1"):
             found_r0_route = True
     assert found_r0_route
+    assert mutation_routes == [
+        "/r0/v1/resources/{resource_id}/package-plan-approval"
+    ]
     assert app.docs_url is None
     assert app.redoc_url is None
     assert app.openapi_url is None
@@ -359,6 +368,125 @@ def test_32_health_is_unauthenticated_and_minimal(tmp_path: Path) -> None:
     response = client.get("/r0/v1/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def _discover_lxc_plan(app, config, monkeypatch):
+    source_id = app.state.store.list_source_states()[0].source.inventory_source_id
+    _run_discovery(
+        monkeypatch,
+        config,
+        app.state.authority,
+        source_id,
+        guests=(
+            {"vmid": 101, "type": "lxc", "name": "ct1", "status": "running"},
+        ),
+    )
+    resource = app.state.store.list_resources(source_id)[0]
+    run = app.state.authority.issue_package_scan(resource.resource_id)
+    completed = app.state.authority.finalize_successful_package_scan(
+        run.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=(PackageScanPackage("apt", "2.6.1", "2.6.2"),),
+        reboot_required=None,
+    )
+    return resource, completed
+
+
+def test_package_plan_approval_route_auth_validation_and_not_found(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app, config = _build_app(tmp_path)
+    resource, completed = _discover_lxc_plan(app, config, monkeypatch)
+    path = f"/r0/v1/resources/{resource.resource_id}/package-plan-approval"
+    client = TestClient(app)
+    exact = {
+        "scan_run_id": completed.scan_run_id,
+        "plan_fingerprint": completed.plan_fingerprint,
+    }
+    assert client.put(path, json=exact).status_code == 401
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    assert client.put(path, headers=headers, json={}).status_code == 422
+    assert client.put(
+        path, headers=headers, json={**exact, "unexpected": True}
+    ).status_code == 422
+    assert client.put(
+        path, headers=headers, json={**exact, "scan_run_id": "not-a-uuid"}
+    ).status_code == 422
+    assert client.put(
+        path, headers=headers, json={**exact, "plan_fingerprint": "not-a-hash"}
+    ).status_code == 422
+    assert client.put(
+        "/r0/v1/resources/not-a-uuid/package-plan-approval",
+        headers=headers,
+        json=exact,
+    ).status_code == 422
+
+    unknown_resource = "11111111-1111-1111-1111-111111111111"
+    assert client.put(
+        f"/r0/v1/resources/{unknown_resource}/package-plan-approval",
+        headers=headers,
+        json=exact,
+    ).status_code == 404
+    unknown_scan = "22222222-2222-2222-2222-222222222222"
+    assert client.put(
+        path,
+        headers=headers,
+        json={**exact, "scan_run_id": unknown_scan},
+    ).status_code == 404
+
+
+def test_package_plan_approval_route_accepts_exact_reference_and_refuses_stale_race(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    app, config = _build_app(tmp_path)
+    resource, plan_a = _discover_lxc_plan(app, config, monkeypatch)
+    path = f"/r0/v1/resources/{resource.resource_id}/package-plan-approval"
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+
+    def forbidden_host_mutation(*args, **kwargs):
+        raise AssertionError("approval route reached package host control")
+
+    monkeypatch.setattr(
+        app.state.package_scan_host_control,
+        "scan_packages",
+        forbidden_host_mutation,
+    )
+
+    response = client.put(
+        path,
+        headers=headers,
+        json={
+            "scan_run_id": plan_a.scan_run_id,
+            "plan_fingerprint": plan_a.plan_fingerprint,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resource_id"] == resource.resource_id
+    assert body["reviewed_scan_run_id"] == plan_a.scan_run_id
+    assert body["plan_fingerprint"] == plan_a.plan_fingerprint
+    assert config.api_bearer_token not in response.text
+    assert config.api_bearer_token not in caplog.text
+
+    plan_b_run = app.state.authority.issue_package_scan(resource.resource_id)
+    app.state.authority.finalize_successful_package_scan(
+        plan_b_run.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=(PackageScanPackage("apt", "2.6.1", "2.6.9"),),
+        reboot_required=None,
+    )
+    stale = client.put(
+        path,
+        headers=headers,
+        json={
+            "scan_run_id": plan_a.scan_run_id,
+            "plan_fingerprint": plan_a.plan_fingerprint,
+        },
+    )
+    assert stale.status_code == 409
 
 
 # ---------------------------------------------------------------------------
