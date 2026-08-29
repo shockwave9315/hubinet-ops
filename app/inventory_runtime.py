@@ -12,7 +12,7 @@ runtime. It constructs exactly:
 - the R0 discovery scheduler (``app.inventory_scheduler.R0Scheduler``, via
   ``bootstrap_and_start_r0_runtime`` -- recovery, then config-drift
   reconciliation, then scheduling, in that exact order);
-- the read-only HTTP route table below.
+- the bounded HTTP route table below (read-only inventory plus exact-plan approval).
 
 Import denylist (never import, directly or transitively, from this
 module, ``app.inventory_scheduler``, or ``app.inventory_pve_transport``):
@@ -36,12 +36,19 @@ import hmac
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.inventory import InventoryAuthority, InventoryAuthorityStore, InventoryPublication
+from app.inventory import (
+    AuthorityConflict,
+    AuthorityNotFound,
+    InventoryAuthority,
+    InventoryAuthorityStore,
+    InventoryPublication,
+)
 from app.inventory_runtime_config import R0RuntimeConfig, load_r0_runtime_config
 from app.inventory_scheduler import R0Scheduler, bootstrap_and_start_r0_runtime
 from app.package_scan_host_control import SshPackageScanHostControl
@@ -51,6 +58,19 @@ _LOGGER = logging.getLogger(__name__)
 
 API_PREFIX = "/r0/v1"
 DEFAULT_R0_CONFIG_PATH = "/etc/hubinet-ops/inventory.yaml"
+_CANONICAL_UUID_PATTERN = (
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_PLAN_FINGERPRINT_PATTERN = r"^[0-9a-f]{64}$"
+
+
+class PackagePlanApprovalRequest(BaseModel):
+    """The exact package-plan reference the operator reviewed."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    scan_run_id: str = Field(pattern=_CANONICAL_UUID_PATTERN)
+    plan_fingerprint: str = Field(pattern=_PLAN_FINGERPRINT_PATTERN)
 
 
 def _thaw(value: Any) -> Any:
@@ -200,6 +220,36 @@ def create_read_only_app(
             "inventory_revision": view.inventory_revision,
             "published_state_revision": view.published_state_revision,
             "published_at": view.published_at,
+        }
+
+    @app.put(
+        f"{API_PREFIX}/resources/{{resource_id}}/package-plan-approval",
+        dependencies=[Depends(_require_bearer_token)],
+    )
+    def approve_package_plan(
+        body: PackagePlanApprovalRequest,
+        resource_id: Annotated[str, ApiPath(pattern=_CANONICAL_UUID_PATTERN)],
+    ) -> dict[str, Any]:
+        """Persist approval of only the exact reviewed package-plan reference."""
+
+        try:
+            approval = authority.approve_package_plan(
+                resource_id,
+                body.scan_run_id,
+                body.plan_fingerprint,
+            )
+        except AuthorityNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AuthorityConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "approval_id": approval.approval_id,
+            "resource_id": approval.resource_id,
+            "reviewed_scan_run_id": approval.reviewed_scan_run_id,
+            "plan_fingerprint": approval.approved_plan_fingerprint,
+            "approved_at": approval.approved_at,
         }
 
     return app

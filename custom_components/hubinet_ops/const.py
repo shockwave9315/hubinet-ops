@@ -12,6 +12,11 @@ DEFAULT_VERIFY_TLS = True
 DEFAULT_UPDATE_INTERVAL = timedelta(seconds=60)
 
 DATA_API_FACTORY = "api_factory"
+DATA_COORDINATORS = "coordinators"
+DATA_SERVICES_REGISTERED = "services_registered"
+
+SERVICE_VIEW_UPDATE_PLAN = "view_update_plan"
+SERVICE_APPROVE_UPDATE_PLAN = "approve_update_plan"
 
 MANUFACTURER = "Hubinet Ops"
 MODEL_SOURCE = "Proxmox inventory source via Hubinet Ops"

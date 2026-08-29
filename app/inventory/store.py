@@ -26,6 +26,7 @@ from .models import (
     PackageScanOutcome,
     PackageScanPackage,
     PackageScanRun,
+    PackagePlanApproval,
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
@@ -38,7 +39,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 7
+AUTHORITY_SCHEMA_VERSION = 8
 BUSY_TIMEOUT_MS = 5_000
 
 _REQUIRED_TABLES = frozenset(
@@ -55,6 +56,7 @@ _REQUIRED_TABLES = frozenset(
         "resource_terminations",
         "package_scan_runs",
         "package_scan_packages",
+        "package_plan_approvals",
         "canonicalization_migrations",
     }
 )
@@ -248,6 +250,14 @@ class InventoryAuthorityStore:
                     (resource_id,),
                 ).fetchall()
             return tuple(_package_scan_run(connection, row) for row in rows)
+
+    def package_plan_approval(self, resource_id: str) -> PackagePlanApproval | None:
+        with self._read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM package_plan_approvals WHERE resource_id=?",
+                (resource_id,),
+            ).fetchone()
+        return _package_plan_approval(row) if row is not None else None
 
     def record_counts(self) -> dict[str, int]:
         """Return bounded schema diagnostics without exposing SQL execution."""
@@ -816,6 +826,20 @@ def _package_scan_run(
         scan_run_id=str(row["scan_run_id"]),
         resource_id=str(row["resource_id"]),
         inventory_source_id=str(row["inventory_source_id"]),
+        committed_source_config_revision=int(
+            row["committed_source_config_revision"]
+        ),
+        committed_endpoint_id=str(row["committed_endpoint_id"]),
+        committed_canonical_transport_locator=str(
+            row["committed_canonical_transport_locator"]
+        ),
+        committed_canonicalization_contract_version=int(
+            row["committed_canonicalization_contract_version"]
+        ),
+        committed_transport_trust_revision=int(
+            row["committed_transport_trust_revision"]
+        ),
+        provider_contract_version=int(row["provider_contract_version"]),
         attempt_sequence=int(row["attempt_sequence"]),
         expected_binding_id=str(row["expected_binding_id"]),
         expected_locator_generation=int(row["expected_locator_generation"]),
@@ -842,12 +866,22 @@ def _package_scan_run(
     )
 
 
+def _package_plan_approval(row: sqlite3.Row) -> PackagePlanApproval:
+    return PackagePlanApproval(
+        approval_id=str(row["approval_id"]),
+        resource_id=str(row["resource_id"]),
+        reviewed_scan_run_id=str(row["reviewed_scan_run_id"]),
+        approved_plan_fingerprint=str(row["approved_plan_fingerprint"]),
+        approved_at=str(row["approved_at"]),
+    )
+
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 7)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 8)
     )
     """,
     """
@@ -1204,6 +1238,20 @@ _SCHEMA_STATEMENTS = (
         scan_run_id TEXT PRIMARY KEY,
         resource_id TEXT NOT NULL,
         inventory_source_id TEXT NOT NULL,
+        committed_source_config_revision INTEGER NOT NULL
+            CHECK(typeof(committed_source_config_revision) = 'integer' AND
+                  committed_source_config_revision > 0),
+        committed_endpoint_id TEXT NOT NULL,
+        committed_canonical_transport_locator TEXT NOT NULL,
+        committed_canonicalization_contract_version INTEGER NOT NULL
+            CHECK(typeof(committed_canonicalization_contract_version) = 'integer' AND
+                  committed_canonicalization_contract_version > 0),
+        committed_transport_trust_revision INTEGER NOT NULL
+            CHECK(typeof(committed_transport_trust_revision) = 'integer' AND
+                  committed_transport_trust_revision > 0),
+        provider_contract_version INTEGER NOT NULL
+            CHECK(typeof(provider_contract_version) = 'integer' AND
+                  provider_contract_version > 0),
         attempt_sequence INTEGER NOT NULL
             CHECK(typeof(attempt_sequence) = 'integer' AND attempt_sequence > 0),
         expected_binding_id TEXT NOT NULL,
@@ -1270,6 +1318,18 @@ _SCHEMA_STATEMENTS = (
         PRIMARY KEY(scan_run_id, package_index),
         UNIQUE(scan_run_id, package_name),
         FOREIGN KEY(scan_run_id) REFERENCES package_scan_runs(scan_run_id)
+    )
+    """,
+    """
+    CREATE TABLE package_plan_approvals (
+        resource_id TEXT PRIMARY KEY,
+        approval_id TEXT NOT NULL UNIQUE,
+        reviewed_scan_run_id TEXT NOT NULL,
+        approved_plan_fingerprint TEXT NOT NULL
+            CHECK(length(approved_plan_fingerprint) = 64),
+        approved_at TEXT NOT NULL,
+        FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id),
+        FOREIGN KEY(reviewed_scan_run_id) REFERENCES package_scan_runs(scan_run_id)
     )
     """,
     """
@@ -1370,6 +1430,11 @@ _SCHEMA_STATEMENTS = (
     """
     CREATE TRIGGER package_scan_issuance_immutable
     BEFORE UPDATE OF scan_run_id, resource_id, inventory_source_id,
+                     committed_source_config_revision, committed_endpoint_id,
+                     committed_canonical_transport_locator,
+                     committed_canonicalization_contract_version,
+                     committed_transport_trust_revision,
+                     provider_contract_version,
                      attempt_sequence, expected_binding_id,
                      expected_locator_generation,
                      expected_resource_continuity_revision, expected_vmid,

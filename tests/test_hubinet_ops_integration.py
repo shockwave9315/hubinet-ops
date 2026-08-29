@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 import hashlib
+import json
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
@@ -23,6 +24,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from homeassistant.exceptions import HomeAssistantError
 
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -31,6 +33,7 @@ from custom_components.hubinet_ops.api import (
     DetailStatus,
     HubinetOpsApi,
     HubinetOpsCannotConnect,
+    HubinetOpsConflict,
     HubinetOpsInvalidAuth,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
@@ -40,8 +43,11 @@ from custom_components.hubinet_ops.api import (
     ObservationalContinuity,
     PackageScanError,
     PackageScanOs,
+    PackageScanPackage,
     PackageScanSnapshot,
     PackageScanStatus,
+    PackagePlanApprovalSnapshot,
+    PackagePlanApprovalStatus,
     PresenceState,
     ResourceSnapshot,
     ResourceStateLevel,
@@ -59,6 +65,8 @@ from custom_components.hubinet_ops.const import (
     DATA_API_FACTORY,
     DOMAIN,
     MODEL_LXC,
+    SERVICE_APPROVE_UPDATE_PLAN,
+    SERVICE_VIEW_UPDATE_PLAN,
 )
 from custom_components.hubinet_ops.coordinator import (
     node_registry_key,
@@ -372,13 +380,16 @@ class FakeTransport:
         *,
         validation_error: Exception | None = None,
         validation_backend_instance_id: str = BACKEND_ID,
+        approval_error: Exception | None = None,
     ) -> None:
         self._snapshots = list(snapshots)
         self._index = 0
         self.validation_error = validation_error
         self.validation_backend_instance_id = validation_backend_instance_id
+        self.approval_error = approval_error
         self.validate_calls = 0
         self.snapshot_calls = 0
+        self.approval_calls: list[tuple[str, str, str]] = []
 
     async def validate_connection(self) -> BackendInformation:
         self.validate_calls += 1
@@ -398,6 +409,15 @@ class FakeTransport:
         selected = self._snapshots[min(self._index, len(self._snapshots) - 1)]
         self._index += 1
         return selected
+
+    async def approve_package_plan(
+        self, resource_id: str, scan_run_id: str, plan_fingerprint: str
+    ) -> None:
+        self.approval_calls.append(
+            (resource_id, scan_run_id, plan_fingerprint)
+        )
+        if self.approval_error is not None:
+            raise self.approval_error
 
 
 class FakeApiFactory:
@@ -1147,6 +1167,258 @@ async def test_pending_updates_distinguishes_exact_zero_from_failed_unknown(
     )
     attributes = hass.states.get(pending_entity.entity_id).attributes
     assert "packages" not in attributes
+
+
+PLAN_SCAN_A = "95255892-75df-4fb6-ae04-c4fe4802aa97"
+PLAN_SCAN_B = "10e2eedd-d417-4a8c-afb5-b1b49df44540"
+
+
+def exact_plan_resource(*, approved: bool = False) -> ResourceSnapshot:
+    packages = (
+        PackageScanPackage(
+            name="apt",
+            installed_version="2.6.1",
+            candidate_version="2.6.2",
+            origin="Debian:12/stable",
+            description="command-line package manager",
+            security=None,
+        ),
+        PackageScanPackage(
+            name="zlib1g",
+            installed_version="1.2.13",
+            candidate_version="1.2.14",
+            origin="Debian:12/stable-security",
+            description=None,
+            security=True,
+        ),
+    )
+    material = [
+        {
+            "candidate_version": package.candidate_version,
+            "installed_version": package.installed_version,
+            "package_name": package.name,
+        }
+        for package in packages
+    ]
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            material, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    approval = (
+        PackagePlanApprovalSnapshot(
+            status=PackagePlanApprovalStatus.APPROVED,
+            approvable=True,
+            approval_id="36d17ae7-f86c-4613-a046-a2bd3301af38",
+            reviewed_scan_run_id=PLAN_SCAN_A,
+            plan_fingerprint=fingerprint,
+            approved_at="2026-08-08T12:01:00+00:00",
+        )
+        if approved
+        else PackagePlanApprovalSnapshot(approvable=True)
+    )
+    return replace(
+        INITIAL_RESOURCES[1],
+        package_scan=PackageScanSnapshot(
+            status=PackageScanStatus.SUCCESS,
+            scan_run_id=PLAN_SCAN_A,
+            started_at="2026-08-08T12:00:00+00:00",
+            completed_at="2026-08-08T12:00:10+00:00",
+            os=PackageScanOs("debian", "12"),
+            pending_count=len(packages),
+            plan_fingerprint=fingerprint,
+            packages=packages,
+        ),
+        package_plan_approval=approval,
+    )
+
+
+@pytest.mark.asyncio
+async def test_view_update_plan_reads_fresh_snapshot_and_returns_exact_rows(
+    hass: HomeAssistant,
+) -> None:
+    planned = exact_plan_resource()
+    view = snapshot((planned,))
+    transport = FakeTransport([view, view])
+    entry = await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"resource_id": RESOURCE_CT},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert transport.snapshot_calls == 2
+    assert response["resource_id"] == RESOURCE_CT
+    assert response["resource_name"] == "CT101 Cloudflared"
+    assert response["approvable"] is True
+    assert response["scan_run_id"] == PLAN_SCAN_A
+    assert response["plan_fingerprint"] == planned.package_scan.plan_fingerprint
+    assert response["pending_count"] == 2
+    assert response["approval_reference"] == {
+        "resource_id": RESOURCE_CT,
+        "scan_run_id": PLAN_SCAN_A,
+        "plan_fingerprint": planned.package_scan.plan_fingerprint,
+    }
+    assert response["packages"] == [
+        {
+            "name": "apt",
+            "installed_version": "2.6.1",
+            "candidate_version": "2.6.2",
+            "origin": "Debian:12/stable",
+            "security": None,
+            "description": "command-line package manager",
+        },
+        {
+            "name": "zlib1g",
+            "installed_version": "1.2.13",
+            "candidate_version": "1.2.14",
+            "origin": "Debian:12/stable-security",
+            "security": True,
+            "description": None,
+        },
+    ]
+
+    resource_key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    resource_entities = [
+        item
+        for item in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if item.unique_id.startswith(f"{resource_key}:")
+    ]
+    assert len(resource_entities) == 12
+    for item in resource_entities:
+        state = hass.states.get(item.entity_id)
+        assert state is not None
+        assert "packages" not in state.attributes
+        assert all(package.name not in state.attributes for package in planned.package_scan.packages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ("failed", "unsupported", "unknown"))
+async def test_view_update_plan_never_returns_reference_for_nonapprovable_state(
+    hass: HomeAssistant, state: str
+) -> None:
+    if state == "failed":
+        selected = replace(
+            INITIAL_RESOURCES[1],
+            package_scan=PackageScanSnapshot(
+                status=PackageScanStatus.FAILED,
+                scan_run_id=PLAN_SCAN_A,
+                started_at="2026-08-08T12:00:00+00:00",
+                completed_at="2026-08-08T12:00:10+00:00",
+                error=PackageScanError(
+                    "metadata_refresh_failed", "metadata refresh failed"
+                ),
+            ),
+        )
+    elif state == "unsupported":
+        selected = replace(
+            INITIAL_RESOURCES[0],
+            package_scan=PackageScanSnapshot(status=PackageScanStatus.UNSUPPORTED),
+        )
+    else:
+        selected = INITIAL_RESOURCES[1]
+    view = snapshot((selected,))
+    transport = FakeTransport([view, view])
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"resource_id": selected.resource_id},
+        blocking=True,
+        return_response=True,
+    )
+    assert response["approvable"] is False
+    assert response["scan_run_id"] is None
+    assert response["plan_fingerprint"] is None
+    assert response["approval_reference"] is None
+
+
+@pytest.mark.asyncio
+async def test_approve_update_plan_forwards_exact_reference_and_refreshes(
+    hass: HomeAssistant,
+) -> None:
+    planned = exact_plan_resource()
+    initial = snapshot((planned,))
+    approved = snapshot(
+        (exact_plan_resource(approved=True),),
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
+    )
+    transport = FakeTransport([initial, approved])
+    entry = await setup_entry(hass, transport)
+
+    await hass.services.async_call(
+        DOMAIN,
+        SERVICE_APPROVE_UPDATE_PLAN,
+        {
+            "resource_id": RESOURCE_CT,
+            "scan_run_id": PLAN_SCAN_A,
+            "plan_fingerprint": planned.package_scan.plan_fingerprint,
+        },
+        blocking=True,
+    )
+    await hass.async_block_till_done()
+
+    assert transport.approval_calls == [
+        (RESOURCE_CT, PLAN_SCAN_A, planned.package_scan.plan_fingerprint)
+    ]
+    assert transport.snapshot_calls == 2
+    assert (
+        entry.runtime_data.data.resources_by_id[
+            RESOURCE_CT
+        ].package_plan_approval.status
+        is PackagePlanApprovalStatus.APPROVED
+    )
+
+
+@pytest.mark.asyncio
+async def test_skipped_poll_race_keeps_viewed_a_and_backend_refuses_after_b(
+    hass: HomeAssistant,
+) -> None:
+    planned_a = exact_plan_resource()
+    coordinator_view_a = snapshot((planned_a,))
+    transport = FakeTransport([coordinator_view_a, coordinator_view_a])
+    entry = await setup_entry(hass, transport)
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_UPDATE_PLAN,
+        {"resource_id": RESOURCE_CT},
+        blocking=True,
+        return_response=True,
+    )
+    reference_a = response["approval_reference"]
+
+    # Backend plan B completes without a coordinator poll. The fake backend's
+    # conflict is the HA-side witness; the real authority/API race is covered
+    # by test_package_plan_approval and test_inventory_runtime.
+    transport.approval_error = HubinetOpsConflict(
+        f"backend now has newer scan {PLAN_SCAN_B}"
+    )
+    with pytest.raises(HomeAssistantError, match="refused"):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_APPROVE_UPDATE_PLAN,
+            reference_a,
+            blocking=True,
+        )
+
+    assert transport.approval_calls == [
+        (
+            RESOURCE_CT,
+            PLAN_SCAN_A,
+            planned_a.package_scan.plan_fingerprint,
+        )
+    ]
+    assert transport.snapshot_calls == 2
+    assert entry.runtime_data.data.resources_by_id[
+        RESOURCE_CT
+    ].package_scan.scan_run_id == PLAN_SCAN_A
 
 
 @pytest.mark.asyncio

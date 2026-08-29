@@ -31,12 +31,17 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.hubinet_ops.api import (
     BackendInformation,
+    DetailStatus,
     HubinetOpsCannotConnect,
+    HubinetOpsConflict,
     HubinetOpsInvalidAuth,
     HubinetOpsInvalidResponse,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
+    LifecycleState,
     NodeSnapshot,
+    NodeAvailability,
+    ObservationalContinuity,
     PackageScanError,
     PackageScanSnapshot,
     PackageScanStatus,
@@ -193,8 +198,28 @@ def _snapshot_json(item: HubinetOpsSnapshot) -> dict[str, Any]:
     }
 
 
-def _fixture_snapshot(*resources) -> HubinetOpsSnapshot:
-    return snapshot(resources, sources=(source(),), nodes=(node(),))
+def _fixture_snapshot(
+    *resources,
+    source_run_sequence: int = 5,
+    inventory_revision: int = 10,
+    published_state_revision: int = 20,
+    published_at: str = "2026-08-08T12:00:00+00:00",
+) -> HubinetOpsSnapshot:
+    return snapshot(
+        resources,
+        sources=(
+            source(
+                last_issued_run_sequence=source_run_sequence,
+                latest_completed_run_sequence=source_run_sequence,
+                last_health_run_sequence=source_run_sequence,
+                last_committed_run_sequence=source_run_sequence,
+            ),
+        ),
+        nodes=(node(),),
+        inventory_revision=inventory_revision,
+        published_state_revision=published_state_revision,
+        published_at=published_at,
+    )
 
 
 def _package_scan_json(scan: PackageScanSnapshot) -> dict[str, Any]:
@@ -377,6 +402,56 @@ async def test_29_authorization_header_sent_on_every_request(
     assert len(aioclient_mock.mock_calls) == 1
     headers = aioclient_mock.mock_calls[0][3]
     assert headers["Authorization"] == f"Bearer {API_TOKEN}"
+
+
+@pytest.mark.asyncio
+async def test_exact_plan_approval_put_forwards_reference_and_bearer_unchanged(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    scan_run_id = "95255892-75df-4fb6-ae04-c4fe4802aa97"
+    fingerprint = "a" * 64
+    url = f"{BASE_URL}/r0/v1/resources/{RESOURCE_CT}/package-plan-approval"
+    aioclient_mock.put(
+        url,
+        json={
+            "approval_id": "36d17ae7-f86c-4613-a046-a2bd3301af38",
+            "resource_id": RESOURCE_CT,
+            "reviewed_scan_run_id": scan_run_id,
+            "plan_fingerprint": fingerprint,
+            "approved_at": "2026-08-08T12:01:00+00:00",
+        },
+    )
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+
+    await transport.approve_package_plan(RESOURCE_CT, scan_run_id, fingerprint)
+
+    assert len(aioclient_mock.mock_calls) == 1
+    call = aioclient_mock.mock_calls[0]
+    assert call[0] == "PUT"
+    assert call[3]["Authorization"] == f"Bearer {API_TOKEN}"
+    assert call[2] == {
+        "scan_run_id": scan_run_id,
+        "plan_fingerprint": fingerprint,
+    }
+
+
+@pytest.mark.asyncio
+async def test_exact_plan_approval_conflict_maps_to_typed_conflict(
+    hass: HomeAssistant, aioclient_mock
+) -> None:
+    url = f"{BASE_URL}/r0/v1/resources/{RESOURCE_CT}/package-plan-approval"
+    aioclient_mock.put(url, status=409)
+    transport = HttpHubinetOpsTransport(
+        hass, base_url=BASE_URL, api_token=API_TOKEN, verify_tls=True
+    )
+    with pytest.raises(HubinetOpsConflict):
+        await transport.approve_package_plan(
+            RESOURCE_CT,
+            "95255892-75df-4fb6-ae04-c4fe4802aa97",
+            "a" * 64,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +655,10 @@ async def test_36_new_resource_appears_via_real_transport_without_reload(
     updated = _fixture_snapshot(
         resource(RESOURCE_VM, ResourceType.QEMU, 100, "Home Assistant"),
         resource(RESOURCE_CT, ResourceType.LXC, 101, "Cloudflared"),
+        source_run_sequence=6,
+        inventory_revision=11,
+        published_state_revision=21,
+        published_at="2026-08-08T12:01:00+00:00",
     )
     aioclient_mock.clear_requests()
     aioclient_mock.get(f"{BASE_URL}/r0/v1/snapshot", json=_snapshot_json(updated))
@@ -621,15 +700,39 @@ async def test_37_replacement_preserves_old_and_successor_via_real_transport(
         100,
         "Home Assistant (old)",
         active_binding_id=None,
+        resource_continuity_revision=2,
+        current_node_id=None,
+        last_known_node_id=NODE_A,
         presence=PresenceState.NOT_CURRENT,
+        lifecycle=LifecycleState.RETIRED,
+        observational_continuity=ObservationalContinuity.REPLACED,
+        detail_status=DetailStatus.NOT_APPLICABLE,
+        node_availability=NodeAvailability.NOT_APPLICABLE,
+        status="unknown",
+        termination_reason="replaced",
         successor_resource_id=successor_id,
     )
-    successor = resource(successor_id, ResourceType.QEMU, 100, "Home Assistant")
+    successor = resource(
+        successor_id,
+        ResourceType.QEMU,
+        100,
+        "Home Assistant",
+        locator_generation=2,
+    )
 
     aioclient_mock.clear_requests()
     aioclient_mock.get(
         f"{BASE_URL}/r0/v1/snapshot",
-        json=_snapshot_json(_fixture_snapshot(retired_original, successor)),
+        json=_snapshot_json(
+            _fixture_snapshot(
+                retired_original,
+                successor,
+                source_run_sequence=6,
+                inventory_revision=11,
+                published_state_revision=21,
+                published_at="2026-08-08T12:01:00+00:00",
+            )
+        ),
     )
 
     coordinator = entry.runtime_data

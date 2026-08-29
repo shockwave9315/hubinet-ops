@@ -4,17 +4,24 @@
 
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
-- **Persistent backend inventory and scans** — SQLite authority database (schema v7):
+- **Persistent backend inventory, scans, and approvals** — SQLite authority
+  database (schema v8):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
-  ownership with CAS/fencing and restart recovery.
-- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, no mutation
-  route. Bearer authentication is required on every endpoint except the
+  ownership with CAS/fencing and restart recovery, immutable package-scan
+  source context, and durable exact-plan approval facts.
+- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus exactly
+  one authority-only mutation,
+  `PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
+  authentication is required on every endpoint except the
   deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
   exposes no inventory or credential data.
 - **Home Assistant integration** — config flow, coordinator, structural
   contract validation, dynamic devices and entities, package-scan summary
-  sensors, diagnostics with recursive secret redaction. Distributed via HACS.
+  sensors, diagnostics with recursive secret redaction, and native
+  `view_update_plan` / `approve_update_plan` actions. The view action returns
+  exact package rows as response data, never as entity attributes. Distributed
+  via HACS.
 - **Automatic Debian/Ubuntu LXC package scanning** — configurable six-hour
   default interval, one worker, typed pinned-key SSH to a forced PVE helper,
   fixed `pct exec` operations, APT metadata refresh plus upgrade simulation,
@@ -24,9 +31,11 @@
   fresh unprivileged LXC, a least-privilege PVE identity, TLS trust, a dedicated
   forced-command scan boundary, the service, and an nftables boundary.
 
-The HTTP/PVE API inventory surface remains read-only. Package scanning may
-write APT index/cache metadata but never changes workload packages. There is no
-policy, update job, or endpoint failover.
+The PVE API inventory surface remains read-only. The backend's sole mutation
+route records Hubinet approval authority state only. Package scanning may write
+APT index/cache metadata but never changes workload packages. There is no
+update execution, update job, snapshot mutation, healthcheck, rollback,
+lifecycle mutation, policy, or endpoint failover.
 
 ## Human0 validation
 
@@ -65,13 +74,18 @@ Hubinet observes current guest state. Human0 validates only the currently
 implemented scope; update execution, job-owned snapshots, healthchecks, and
 rollback remain unimplemented future stages.
 
+## Exact update-plan approval
+
+- **Implemented:** fresh exact-plan presentation, explicit durable approval of
+  the reviewed `(resource_id, scan_run_id, plan_fingerprint)`, and atomic
+  fingerprint/resource/source-context revalidation. A later same material
+  fingerprint remains effectively approved only while required resource and
+  source context is unchanged. Changed, failed, interrupted, unsupported, or
+  unavailable plans are not effectively approved.
+- Approval is authority state only. This stage cannot install or upgrade
+  packages and does not create jobs or PVE snapshots.
+
 ## Next
-
-- **Exact update plan presentation and explicit operator approval**, with exact
-  fingerprint and current-context binding/revalidation. This stage does not
-  execute updates.
-
-## Then
 
 - Job execution with a fresh job-owned snapshot and live output.
 - Healthcheck after update.
@@ -87,9 +101,10 @@ rollback remain unimplemented future stages.
 - `deploy/bootstrap-proxmox-0.5.sh` is only executed for real inside the
   ephemeral-CI Docker sandbox (`tests/shell/run_bootstrap_smoke_sandbox.sh`).
   Local runs validate it statically.
-- Pre-release: the authority database is disposable. A schema change means a
-  fresh database and Home Assistant re-enrollment. There is no migration path
-  and none is planned before the first release.
+- Pre-release: schema v8 is incompatible with v7. Existing deployments require
+  a fresh backend database/fresh deployment and Home Assistant re-enrollment.
+  There is no v7-to-v8 migration path, and none is planned before the first
+  release.
 - Package origin, description, security classification, and reboot-required
   stay unknown unless reliable evidence is present. The first parser derives
   origin/security from stable-English APT simulation evidence and leaves

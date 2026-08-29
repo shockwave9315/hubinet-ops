@@ -178,6 +178,24 @@ def test_fresh_current_source_allows_scan_and_captures_resource_context(
     )
     assert run.expected_vmid == resource.vmid
     assert run.expected_node_id == resource.current_node_id
+    assert (
+        run.committed_source_config_revision
+        == state.runtime_health.committed_source_config_revision
+    )
+    assert run.committed_endpoint_id == state.runtime_health.committed_endpoint_id
+    assert (
+        run.committed_canonical_transport_locator
+        == state.runtime_health.committed_canonical_transport_locator
+    )
+    assert (
+        run.committed_canonicalization_contract_version
+        == state.runtime_health.committed_canonicalization_contract_version
+    )
+    assert (
+        run.committed_transport_trust_revision
+        == state.runtime_health.committed_transport_trust_revision
+    )
+    assert run.provider_contract_version == state.source.provider_contract_version
 
 
 def test_scan_issuance_atomically_materializes_expiry_and_consumes_no_attempt(

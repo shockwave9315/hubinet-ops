@@ -1,4 +1,4 @@
-"""Read-only API surface and compatibility facade for Hubinet Ops."""
+"""Typed API surface and compatibility facade for Hubinet Ops."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from .contract import (
     PackageScanPackage,
     PackageScanSnapshot,
     PackageScanStatus,
+    PackagePlanApprovalSnapshot,
+    PackagePlanApprovalStatus,
     PresenceState,
     ResourceSnapshot,
     ResourceStateLevel,
@@ -46,8 +48,12 @@ class HubinetOpsInvalidResponse(HubinetOpsApiError):
     """The Hubinet Ops backend returned data outside the typed contract."""
 
 
+class HubinetOpsConflict(HubinetOpsApiError):
+    """The backend refused a stale or mismatched exact plan reference."""
+
+
 class HubinetOpsTransport(Protocol):
-    """Read-only transport implemented by the future backend API adapter."""
+    """Typed backend transport with one exact-plan approval mutation."""
 
     async def validate_connection(self) -> BackendInformation:
         """Authenticate and validate the backend identity."""
@@ -58,9 +64,14 @@ class HubinetOpsTransport(Protocol):
     async def fetch_resource_snapshot(self) -> HubinetOpsSnapshot:
         """Fetch one logical inventory/state/policy snapshot."""
 
+    async def approve_package_plan(
+        self, resource_id: str, scan_run_id: str, plan_fingerprint: str
+    ) -> None:
+        """Approve the caller-supplied exact reviewed plan reference."""
+
 
 class HubinetOpsApi:
-    """Read-only Hubinet Ops client independent from a concrete transport."""
+    """Typed Hubinet Ops client independent from a concrete transport."""
 
     def __init__(
         self,
@@ -90,6 +101,15 @@ class HubinetOpsApi:
 
         return await self._transport.fetch_resource_snapshot()
 
+    async def async_approve_package_plan(
+        self, resource_id: str, scan_run_id: str, plan_fingerprint: str
+    ) -> None:
+        """Forward one exact reviewed plan reference unchanged."""
+
+        await self._transport.approve_package_plan(
+            resource_id, scan_run_id, plan_fingerprint
+        )
+
 
 class HubinetOpsApiFactory(Protocol):
     """Factory boundary used by config flow, setup and fake transports."""
@@ -116,6 +136,11 @@ class _UnconfiguredPhaseZeroTransport:
         raise self._error()
 
     async def fetch_resource_snapshot(self) -> HubinetOpsSnapshot:
+        raise self._error()
+
+    async def approve_package_plan(
+        self, resource_id: str, scan_run_id: str, plan_fingerprint: str
+    ) -> None:
         raise self._error()
 
 

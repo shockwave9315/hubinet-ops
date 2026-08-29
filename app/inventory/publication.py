@@ -107,6 +107,12 @@ class InventoryPublication:
             scan_by_resource = {
                 str(row["resource_id"]): row for row in scan_rows
             }
+            approval_rows = connection.execute(
+                "SELECT * FROM package_plan_approvals ORDER BY resource_id"
+            ).fetchall()
+            approval_by_resource = {
+                str(row["resource_id"]): row for row in approval_rows
+            }
             package_rows = connection.execute(
                 "SELECT package.* FROM package_scan_packages package "
                 "JOIN package_scan_runs run USING(scan_run_id) "
@@ -125,8 +131,10 @@ class InventoryPublication:
             nodes = tuple(self._node(row) for row in node_rows)
             resources = tuple(
                 self._resource(
+                    connection,
                     row,
                     scan_by_resource.get(str(row["resource_id"])),
+                    approval_by_resource.get(str(row["resource_id"])),
                     packages_by_run,
                 )
                 for row in resource_rows
@@ -196,8 +204,14 @@ class InventoryPublication:
             "facts": json.loads(str(row["facts_json"])),
         }
 
-    @staticmethod
-    def _resource(row, scan, packages_by_run: Mapping[str, list[Any]]) -> dict[str, Any]:
+    def _resource(
+        self,
+        connection,
+        row,
+        scan,
+        approval,
+        packages_by_run: Mapping[str, list[Any]],
+    ) -> dict[str, Any]:
         return {
             "resource_id": str(row["resource_id"]),
             "inventory_source_id": str(row["inventory_source_id"]),
@@ -225,6 +239,9 @@ class InventoryPublication:
             "state": json.loads(str(row["facts_json"])),
             "package_scan": InventoryPublication._package_scan(
                 row, scan, packages_by_run
+            ),
+            "package_plan_approval": self._package_plan_approval(
+                connection, row, scan, approval
             ),
             "termination_reason": row["termination_reason"],
             "successor_resource_id": row["successor_resource_id"],
@@ -315,3 +332,58 @@ class InventoryPublication:
                 "successful package scan package rows do not match pending count"
             )
         return base
+
+    def _package_plan_approval(
+        self, connection, resource, current_scan, approval
+    ) -> dict[str, Any]:
+        approvable = False
+        if current_scan is not None:
+            approvable = self._authority._package_scan_is_current_and_approvable(
+                connection, current_scan
+            )
+
+        if approval is None:
+            return {
+                "status": "none",
+                "approvable": approvable,
+                "approval_id": None,
+                "reviewed_scan_run_id": None,
+                "plan_fingerprint": None,
+                "approved_at": None,
+            }
+
+        effective = False
+        if approvable and current_scan is not None:
+            reviewed = connection.execute(
+                "SELECT * FROM package_scan_runs WHERE scan_run_id=?",
+                (str(approval["reviewed_scan_run_id"]),),
+            ).fetchone()
+            if reviewed is None:
+                raise RuntimeError("package plan approval references a missing scan")
+            current_fingerprint = self._authority._successful_package_scan_fingerprint(
+                connection, current_scan
+            )
+            reviewed_fingerprint = self._authority._successful_package_scan_fingerprint(
+                connection, reviewed
+            )
+            effective = all(
+                (
+                    str(reviewed["resource_id"]) == str(resource["resource_id"]),
+                    str(approval["approved_plan_fingerprint"])
+                    == current_fingerprint,
+                    str(approval["approved_plan_fingerprint"])
+                    == reviewed_fingerprint,
+                    self._authority._package_scan_context_matches_reviewed(
+                        current_scan, reviewed
+                    ),
+                )
+            )
+
+        return {
+            "status": "approved" if effective else "stale",
+            "approvable": approvable,
+            "approval_id": str(approval["approval_id"]),
+            "reviewed_scan_run_id": str(approval["reviewed_scan_run_id"]),
+            "plan_fingerprint": str(approval["approved_plan_fingerprint"]),
+            "approved_at": str(approval["approved_at"]),
+        }

@@ -22,9 +22,11 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v7). Schema v7 adds
-explicit package scan attempts and exact package rows. There is no migration
-from v6; pre-release installs recreate the authority database.
+database (marker `hubinet_ops_0_5_authority`, schema v8). Schema v8 adds
+immutable source-context issuance facts to package scans and one durable exact
+plan approval fact per resource. There is no migration from v7; pre-release
+installs recreate the authority database and require Home Assistant
+re-enrollment.
 
 - `store.py` — schema, transactions, CAS/fencing for discovery-run ownership,
   backend/source/global-revision bookkeeping.
@@ -43,9 +45,12 @@ from v6; pre-release installs recreate the authority database.
 `create_app_from_env` factory
 (`uvicorn app.inventory_runtime:create_app_from_env --factory`). It builds the store, authority,
 publication, PVE transport, and scheduler, and serves `GET /r0/v1/health`,
-`/backend`, `/snapshot`. There is no mutation route. Bearer authentication is
-required on every endpoint except the deliberately unauthenticated minimal
-`/r0/v1/health` liveness probe, which exposes no inventory or credential data.
+`/backend`, `/snapshot`, plus the single narrow authority mutation
+`PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
+authentication is required on every endpoint except the deliberately
+unauthenticated minimal `/r0/v1/health` liveness probe, which exposes no
+inventory or credential data. Approval changes only the authority database and
+has no host-control path.
 
 `app/inventory_pve_transport.py` is GET-only with mandatory TLS verification
 and no mutation-verb escape hatch. `app/inventory_scheduler.py` is a thin
@@ -112,7 +117,12 @@ anything on them.
 
 `custom_components/hubinet_ops/` — one `DataUpdateCoordinator`, one snapshot
 fetch per refresh, structural validation of the payload in `contract/`, then
-devices and entities.
+devices and entities. The response-capable `view_update_plan` action performs a
+separate fresh snapshot read and returns exact package rows plus the exact
+approval reference. `approve_update_plan` forwards that caller-supplied
+reference unchanged to the backend and refreshes the coordinator after
+success. Package rows do not become entity attributes or package-per-entity
+state.
 
 The coordinator is **not** a reconciler. It never infers `missing` from a diff
 between two polls, and it never assumes revision `N -> N+1` means backend
@@ -164,9 +174,16 @@ Properties that channel must have:
 - **Latest attempt wins.** A failure after an earlier success publishes null
   pending count and no stale package plan. Full exact rows remain available in
   the backend/coordinator snapshot but never become HA entity attributes.
+- **Approval is an exact durable fact.** One per-resource row records the
+  reviewed scan, its material fingerprint, and approval time. Effective
+  `none`/`approved`/`stale` state is derived rather than persisted. Approval
+  atomically requires the latest successful scan, a recomputed exact-row
+  fingerprint matching stored and caller-supplied values, current resource
+  binding/generation/continuity/VMID/node context, and the same fresh healthy
+  committed source context captured when the scan was issued.
 
-Update approval/execution, job-owned snapshots, healthchecks, rollback, and
-QEMU package execution remain future work.
+Update execution, job-owned snapshots, healthchecks, rollback, lifecycle
+mutation, and QEMU package execution remain future work.
 
 ## Ordinary safety rules (all layers, now and later)
 

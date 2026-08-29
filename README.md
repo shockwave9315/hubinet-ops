@@ -18,18 +18,24 @@ a guest in Proxmox never requires touching this repository or its config.
 
 - PVE autodiscovery of every node, LXC, and QEMU guest.
 - A durable SQLite inventory owned by the backend.
-- A read-only HTTP API (`GET /r0/v1/health`, `/backend`, `/snapshot`). Bearer
+- An HTTP API with read-only inventory routes (`GET /r0/v1/health`, `/backend`,
+  `/snapshot`) and one authority-only exact-plan approval route. Bearer
   authentication is required on every endpoint except the deliberately
   unauthenticated minimal `/r0/v1/health` liveness probe, which exposes no
   inventory or credential data.
 - A native Home Assistant integration with dynamic devices and entities.
 - Automatic Debian/Ubuntu LXC package scanning with exact durable plans and
   Home Assistant summary entities.
+- Fresh exact-plan viewing and explicit durable approval through two native
+  Home Assistant actions. Approval never executes an update.
 - An automated Proxmox bootstrap that provisions the whole backend.
 
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
-installs packages. Update plans, jobs, snapshots, healthchecks, and rollback
-are not built yet — see `STATUS.md`.
+installs packages. Update execution, jobs, snapshots, healthchecks, and
+rollback are not built yet — see `STATUS.md`.
+
+Schema v8 has no v7 migration. Existing pre-release deployments must use a
+fresh backend database/fresh deployment and re-enroll Home Assistant.
 
 ## Installation
 
@@ -109,8 +115,9 @@ uvicorn app.inventory_runtime:create_app_from_env --factory --host 127.0.0.1 --p
 from the environment variables that config references, currently
 `HUBINET_OPS_R0_PVE_TOKEN` and `HUBINET_OPS_R0_API_TOKEN`. The validated
 `package_scan.interval_seconds` runtime setting defaults to 21,600 seconds;
-the scheduler supports controlled interval replacement, but this stage exposes
-no Home Assistant write API. See
+the scheduler supports controlled interval replacement. The only Home
+Assistant write is exact-plan approval authority; it cannot execute package or
+workload mutations. See
 [`config/inventory.example.yaml`](config/inventory.example.yaml) and
 [`.env.r0.example`](.env.r0.example) for the config shape and required
 variables. Never run a deployment script against a real host from a
@@ -121,7 +128,7 @@ development or agent session.
 | Path | What it is |
 | --- | --- |
 | `app/inventory/` | durable authority subsystem: identity, discovery, reconciliation, publication |
-| `app/inventory_runtime.py` | production composition root and read-only HTTP API |
+| `app/inventory_runtime.py` | production composition root and bounded HTTP API |
 | `app/inventory_runtime_config.py` | source-centric config loader |
 | `app/inventory_scheduler.py` | discovery scheduler and restart recovery |
 | `app/inventory_pve_transport.py` | GET-only PVE HTTP transport |

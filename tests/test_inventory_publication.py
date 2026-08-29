@@ -38,6 +38,7 @@ from custom_components.hubinet_ops.contract.enums import (
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
+    PackagePlanApprovalStatus,
     PresenceState,
     ResourceStateLevel,
     ResourceType,
@@ -55,6 +56,7 @@ from custom_components.hubinet_ops.contract.models import (
     PackageScanOs,
     PackageScanPackage,
     PackageScanSnapshot,
+    PackagePlanApprovalSnapshot,
     ResourceSnapshot,
     SourceContext,
 )
@@ -109,6 +111,20 @@ def contract_snapshot(view) -> HubinetOpsSnapshot:
                     "state_level": ResourceStateLevel(resource["state_level"]),
                     "effective_capabilities": frozenset(resource["effective_capabilities"]),
                     "package_scan": _contract_package_scan(resource["package_scan"]),
+                    "package_plan_approval": PackagePlanApprovalSnapshot(
+                        status=PackagePlanApprovalStatus(
+                            resource["package_plan_approval"]["status"]
+                        ),
+                        approvable=resource["package_plan_approval"]["approvable"],
+                        approval_id=resource["package_plan_approval"]["approval_id"],
+                        reviewed_scan_run_id=resource["package_plan_approval"][
+                            "reviewed_scan_run_id"
+                        ],
+                        plan_fingerprint=resource["package_plan_approval"][
+                            "plan_fingerprint"
+                        ],
+                        approved_at=resource["package_plan_approval"]["approved_at"],
+                    ),
                 }
             )
             for resource in view.resources

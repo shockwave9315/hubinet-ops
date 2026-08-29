@@ -1,4 +1,4 @@
-"""Concrete read-only HTTP transport connecting Home Assistant to Hubinet Ops.
+"""Concrete typed HTTP transport connecting Home Assistant to Hubinet Ops.
 
 See ``ARCHITECTURE.md``.
 
@@ -29,6 +29,7 @@ from .api import (
     HubinetOpsApi,
     HubinetOpsApiFactory,
     HubinetOpsCannotConnect,
+    HubinetOpsConflict,
     HubinetOpsInvalidAuth,
     HubinetOpsInvalidResponse,
     HubinetOpsSnapshot,
@@ -42,6 +43,8 @@ from .api import (
     PackageScanPackage,
     PackageScanSnapshot,
     PackageScanStatus,
+    PackagePlanApprovalSnapshot,
+    PackagePlanApprovalStatus,
     PresenceState,
     ResourceSnapshot,
     ResourceStateLevel,
@@ -61,6 +64,9 @@ _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 _BACKEND_ROUTE = "/r0/v1/backend"
 _SNAPSHOT_ROUTE = "/r0/v1/snapshot"
+_PACKAGE_PLAN_APPROVAL_ROUTE = (
+    "/r0/v1/resources/{resource_id}/package-plan-approval"
+)
 
 
 def _backend_information(payload: Mapping[str, Any]) -> BackendInformation:
@@ -168,6 +174,19 @@ def _package_scan_snapshot(payload: Any) -> PackageScanSnapshot:
     )
 
 
+def _package_plan_approval_snapshot(payload: Any) -> PackagePlanApprovalSnapshot:
+    if not isinstance(payload, Mapping):
+        raise TypeError("package_plan_approval must be an object when present")
+    return PackagePlanApprovalSnapshot(
+        status=PackagePlanApprovalStatus(payload["status"]),
+        approvable=payload["approvable"],
+        approval_id=payload.get("approval_id"),
+        reviewed_scan_run_id=payload.get("reviewed_scan_run_id"),
+        plan_fingerprint=payload.get("plan_fingerprint"),
+        approved_at=payload.get("approved_at"),
+    )
+
+
 def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
     return ResourceSnapshot(
         resource_id=str(payload["resource_id"]),
@@ -209,6 +228,11 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
             if "package_scan" not in payload
             else _package_scan_snapshot(payload["package_scan"])
         ),
+        package_plan_approval=(
+            PackagePlanApprovalSnapshot()
+            if "package_plan_approval" not in payload
+            else _package_plan_approval_snapshot(payload["package_plan_approval"])
+        ),
         termination_reason=payload.get("termination_reason"),
         successor_resource_id=payload.get("successor_resource_id"),
     )
@@ -227,11 +251,7 @@ def _snapshot_from_payload(payload: Mapping[str, Any]) -> HubinetOpsSnapshot:
 
 
 class HttpHubinetOpsTransport:
-    """Read-only HTTP transport implementing the ``HubinetOpsTransport`` Protocol.
-
-    Reads backend/snapshot state only -- no write methods exist, and none
-    may be added even for convenience.
-    """
+    """HTTP transport with reads plus one narrow exact-plan approval write."""
 
     def __init__(
         self,
@@ -270,10 +290,49 @@ class HttpHubinetOpsTransport:
             raise HubinetOpsCannotConnect("Hubinet Ops backend request timed out") from exc
         except aiohttp.ClientConnectorError as exc:
             raise HubinetOpsCannotConnect(
-                f"cannot connect to Hubinet Ops backend: {exc}"
+                "cannot connect to Hubinet Ops backend"
             ) from exc
         except aiohttp.ClientError as exc:
-            raise HubinetOpsCannotConnect(f"Hubinet Ops backend request failed: {exc}") from exc
+            raise HubinetOpsCannotConnect("Hubinet Ops backend request failed") from exc
+
+    async def _put(self, path: str, payload: Mapping[str, str]) -> Any:
+        url = f"{self._base_url}{path}"
+        headers = {"Authorization": f"Bearer {self._api_token}"}
+        try:
+            async with self._session.put(
+                url,
+                headers=headers,
+                json=dict(payload),
+                timeout=_REQUEST_TIMEOUT,
+            ) as response:
+                if response.status in (401, 403):
+                    raise HubinetOpsInvalidAuth(
+                        "Hubinet Ops backend rejected the bearer token"
+                    )
+                if response.status == 409:
+                    raise HubinetOpsConflict(
+                        "the reviewed package plan is no longer current"
+                    )
+                if response.status != 200:
+                    raise HubinetOpsCannotConnect(
+                        f"Hubinet Ops backend returned HTTP {response.status}"
+                    )
+                try:
+                    return await response.json()
+                except (aiohttp.ContentTypeError, ValueError) as exc:
+                    raise HubinetOpsInvalidResponse(
+                        "Hubinet Ops backend returned a non-JSON body"
+                    ) from exc
+        except TimeoutError as exc:
+            raise HubinetOpsCannotConnect(
+                "Hubinet Ops backend request timed out"
+            ) from exc
+        except aiohttp.ClientConnectorError as exc:
+            raise HubinetOpsCannotConnect(
+                "cannot connect to Hubinet Ops backend"
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise HubinetOpsCannotConnect("Hubinet Ops backend request failed") from exc
 
     async def validate_connection(self) -> BackendInformation:
         payload = await self._get(_BACKEND_ROUTE)
@@ -289,6 +348,28 @@ class HttpHubinetOpsTransport:
             return _snapshot_from_payload(payload)
         except (KeyError, TypeError, ValueError) as exc:
             raise HubinetOpsInvalidResponse(f"malformed Hubinet Ops snapshot: {exc}") from exc
+
+    async def approve_package_plan(
+        self, resource_id: str, scan_run_id: str, plan_fingerprint: str
+    ) -> None:
+        payload = await self._put(
+            _PACKAGE_PLAN_APPROVAL_ROUTE.format(resource_id=resource_id),
+            {
+                "scan_run_id": scan_run_id,
+                "plan_fingerprint": plan_fingerprint,
+            },
+        )
+        if not isinstance(payload, Mapping) or any(
+            payload.get(field) != expected
+            for field, expected in (
+                ("resource_id", resource_id),
+                ("reviewed_scan_run_id", scan_run_id),
+                ("plan_fingerprint", plan_fingerprint),
+            )
+        ):
+            raise HubinetOpsInvalidResponse(
+                "approval response does not match the reviewed plan reference"
+            )
 
 
 def http_api_factory(hass: HomeAssistant) -> HubinetOpsApiFactory:
