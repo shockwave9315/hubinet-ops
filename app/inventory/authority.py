@@ -886,6 +886,8 @@ class InventoryAuthority:
         )
         approval_id = _new_uuid()
         approved_at = _timestamp(self._now())
+        plan_is_stale = False
+        result: PackagePlanApproval | None = None
 
         with self._store._transaction() as connection:
             resource = self._require_package_scan_target(
@@ -927,55 +929,73 @@ class InventoryAuthority:
                 now=decision_time,
             )
             if not self._package_scan_is_current_and_approvable(connection, run):
-                raise AuthorityConflict(
-                    "reviewed package scan is stale or its current context is invalid"
-                )
+                # Preserve any expiry materialized just above while refusing
+                # the approval: let the transaction commit the durable
+                # freshness transition and raise the conflict after it,
+                # mirroring issue_package_scan's pattern. Do not touch
+                # package_plan_approvals on this path.
+                plan_is_stale = True
+            else:
+                existing = connection.execute(
+                    "SELECT * FROM package_plan_approvals WHERE resource_id=?",
+                    (canonical_resource_id,),
+                ).fetchone()
+                if (
+                    existing is not None
+                    and str(existing["reviewed_scan_run_id"]) == canonical_scan_run_id
+                    and str(existing["approved_plan_fingerprint"])
+                    == canonical_fingerprint
+                ):
+                    result = PackagePlanApproval(
+                        approval_id=str(existing["approval_id"]),
+                        resource_id=canonical_resource_id,
+                        reviewed_scan_run_id=canonical_scan_run_id,
+                        approved_plan_fingerprint=canonical_fingerprint,
+                        approved_at=str(existing["approved_at"]),
+                    )
+                else:
+                    connection.execute(
+                        "INSERT INTO package_plan_approvals("
+                        "resource_id, approval_id, reviewed_scan_run_id, "
+                        "approved_plan_fingerprint, approved_at) VALUES(?, ?, ?, ?, ?) "
+                        "ON CONFLICT(resource_id) DO UPDATE SET approval_id=excluded.approval_id, "
+                        "reviewed_scan_run_id=excluded.reviewed_scan_run_id, "
+                        "approved_plan_fingerprint=excluded.approved_plan_fingerprint, "
+                        "approved_at=excluded.approved_at",
+                        (
+                            canonical_resource_id,
+                            approval_id,
+                            canonical_scan_run_id,
+                            canonical_fingerprint,
+                            approved_at,
+                        ),
+                    )
+                    self._after_package_plan_approval_write(
+                        connection, resource_id=canonical_resource_id
+                    )
+                    self._bump_global_revisions(
+                        connection, inventory_changed=False, published_changed=True
+                    )
+                    # Capture the exact fact this transaction wrote. Do not
+                    # perform a post-commit reread of the mutable
+                    # per-resource row: another transaction may replace it
+                    # before we would have read it back, which would return
+                    # someone else's approval for this request.
+                    result = PackagePlanApproval(
+                        approval_id=approval_id,
+                        resource_id=canonical_resource_id,
+                        reviewed_scan_run_id=canonical_scan_run_id,
+                        approved_plan_fingerprint=canonical_fingerprint,
+                        approved_at=approved_at,
+                    )
 
-            existing = connection.execute(
-                "SELECT * FROM package_plan_approvals WHERE resource_id=?",
-                (canonical_resource_id,),
-            ).fetchone()
-            if (
-                existing is not None
-                and str(existing["reviewed_scan_run_id"]) == canonical_scan_run_id
-                and str(existing["approved_plan_fingerprint"])
-                == canonical_fingerprint
-            ):
-                return PackagePlanApproval(
-                    approval_id=str(existing["approval_id"]),
-                    resource_id=canonical_resource_id,
-                    reviewed_scan_run_id=canonical_scan_run_id,
-                    approved_plan_fingerprint=canonical_fingerprint,
-                    approved_at=str(existing["approved_at"]),
-                )
-
-            connection.execute(
-                "INSERT INTO package_plan_approvals("
-                "resource_id, approval_id, reviewed_scan_run_id, "
-                "approved_plan_fingerprint, approved_at) VALUES(?, ?, ?, ?, ?) "
-                "ON CONFLICT(resource_id) DO UPDATE SET approval_id=excluded.approval_id, "
-                "reviewed_scan_run_id=excluded.reviewed_scan_run_id, "
-                "approved_plan_fingerprint=excluded.approved_plan_fingerprint, "
-                "approved_at=excluded.approved_at",
-                (
-                    canonical_resource_id,
-                    approval_id,
-                    canonical_scan_run_id,
-                    canonical_fingerprint,
-                    approved_at,
-                ),
+        if plan_is_stale:
+            raise AuthorityConflict(
+                "reviewed package scan is stale or its current context is invalid"
             )
-            self._after_package_plan_approval_write(
-                connection, resource_id=canonical_resource_id
-            )
-            self._bump_global_revisions(
-                connection, inventory_changed=False, published_changed=True
-            )
-
-        approval = self._store.package_plan_approval(canonical_resource_id)
-        if approval is None:
-            raise AuthorityInvariantError("package plan approval was not persisted")
-        return approval
+        if result is None:
+            raise AuthorityInvariantError("package plan approval was not captured")
+        return result
 
     @staticmethod
     def _require_package_scan_target(

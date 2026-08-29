@@ -367,3 +367,117 @@ def test_internal_exact_row_mismatch_refuses_approval(tmp_path: Path) -> None:
             resource.resource_id, reviewed.scan_run_id, reviewed.plan_fingerprint
         )
     assert store.package_plan_approval(resource.resource_id) is None
+
+
+def test_expired_approval_is_rejected_but_expiry_durably_materializes(
+    tmp_path: Path,
+) -> None:
+    """P2-A1: a due freshness expiry must commit durably even when the same
+    transaction refuses the approval it was discovered inside of."""
+
+    clock, store, authority, resource = _system(
+        tmp_path, freshness_duration_seconds=60
+    )
+    reviewed = _successful_plan(authority, resource.resource_id)
+
+    # Positive control: still within the freshness window, approval succeeds
+    # and the source remains fresh.
+    approval = authority.approve_package_plan(
+        resource.resource_id, reviewed.scan_run_id, reviewed.plan_fingerprint
+    )
+    state = store.source_state(resource.inventory_source_id)
+    assert state.runtime_health.freshness.value == "fresh"
+
+    # Issue and complete a newer scan while still fresh -- only the later
+    # approve_package_plan call, not this scan issuance, should observe the
+    # elapsed deadline.
+    later = _successful_plan(authority, resource.resource_id)
+
+    revision_before_expiry = store.backend_instance().published_state_revision
+    clock.value = START + timedelta(seconds=61)
+
+    with pytest.raises(AuthorityConflict, match="current context"):
+        authority.approve_package_plan(
+            resource.resource_id, later.scan_run_id, later.plan_fingerprint
+        )
+
+    # The rejected approval must not leave the source looking incorrectly
+    # fresh: the expiry materialized inside the same transaction must commit
+    # even though the approval write itself did not happen.
+    after_state = store.source_state(resource.inventory_source_id)
+    assert after_state.runtime_health.freshness.value == "stale"
+    assert after_state.runtime_health.health_origin.value == "time_expiry"
+    assert "deadline" in after_state.runtime_health.health_reason
+    assert (
+        store.backend_instance().published_state_revision > revision_before_expiry
+    )
+    # The prior (still-current-material) approval must be untouched by the
+    # rejected request.
+    assert store.package_plan_approval(resource.resource_id) == approval
+
+    # Durable across restart -- not dependent on some later unrelated action
+    # re-deriving staleness live.
+    db_path = store.path
+    store.close()
+    reopened = InventoryAuthorityStore(db_path, now=clock)
+    restarted_state = reopened.source_state(resource.inventory_source_id)
+    assert restarted_state.runtime_health.freshness.value == "stale"
+    assert restarted_state.runtime_health.health_origin.value == "time_expiry"
+    assert reopened.package_plan_approval(resource.resource_id) == approval
+
+
+def test_approval_response_reflects_its_own_transaction_not_a_later_replacement(
+    tmp_path: Path,
+) -> None:
+    """P2-A2: the operation that approved A must return A even though the
+    mutable per-resource row is replaced with B before any post-commit read
+    of it could run."""
+
+    _, store, authority, resource = _system(tmp_path)
+    superseded = _successful_plan(authority, resource.resource_id)
+    reviewed = _successful_plan(
+        authority,
+        resource.resource_id,
+        (PackageScanPackage("apt", "2.6.1", "2.6.9"),),
+    )
+    assert reviewed.plan_fingerprint != superseded.plan_fingerprint
+
+    class ReplacingAuthority(InventoryAuthority):
+        """Simulate a concurrent writer replacing the current approval row
+        at the exact old post-commit-reread boundary: immediately after this
+        transaction's own write, still inside its transaction."""
+
+        def _after_package_plan_approval_write(self, connection, *, resource_id):
+            connection.execute(
+                "INSERT INTO package_plan_approvals("
+                "resource_id, approval_id, reviewed_scan_run_id, "
+                "approved_plan_fingerprint, approved_at) VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(resource_id) DO UPDATE SET "
+                "approval_id=excluded.approval_id, "
+                "reviewed_scan_run_id=excluded.reviewed_scan_run_id, "
+                "approved_plan_fingerprint=excluded.approved_plan_fingerprint, "
+                "approved_at=excluded.approved_at",
+                (
+                    resource_id,
+                    str(uuid.uuid4()),
+                    superseded.scan_run_id,
+                    superseded.plan_fingerprint,
+                    "2026-08-08T12:09:00+00:00",
+                ),
+            )
+
+    racing = ReplacingAuthority(store, now=authority._now)
+    approval_a = racing.approve_package_plan(
+        resource.resource_id, reviewed.scan_run_id, reviewed.plan_fingerprint
+    )
+
+    # By the time approve_package_plan returned, the durable row had already
+    # been replaced: a post-commit reread would return the replacement here.
+    durable = store.package_plan_approval(resource.resource_id)
+    assert durable.reviewed_scan_run_id == superseded.scan_run_id
+
+    # The operation that actually approved `reviewed` must still report it,
+    # not the row currently sitting in the table.
+    assert approval_a.reviewed_scan_run_id == reviewed.scan_run_id
+    assert approval_a.approved_plan_fingerprint == reviewed.plan_fingerprint
+    assert approval_a.approval_id != durable.approval_id
