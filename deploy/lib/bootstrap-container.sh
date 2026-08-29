@@ -14,15 +14,23 @@
 _TEMPLATE_NAME_PATTERN='^debian-13-standard_'
 
 TEMPLATE_PLAN_NOTE=""
+HOST_TEMPLATE_ARCH=""
 
 phase2_plan_template() {
   log_phase "Phase 2: template selection (planning, read-only)"
 
+  HOST_TEMPLATE_ARCH="$(dpkg --print-architecture 2>/dev/null)" \
+    || die "could not determine the PVE host's Debian architecture with 'dpkg --print-architecture'; verify dpkg is installed and working before retrying"
+  [[ "${HOST_TEMPLATE_ARCH}" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+    || die "'dpkg --print-architecture' returned an invalid architecture identifier '${HOST_TEMPLATE_ARCH}'; refusing to select a template because compatibility cannot be established"
+  log_info "PVE host Debian/template architecture: ${HOST_TEMPLATE_ARCH} (from dpkg --print-architecture)"
+
   if [[ -n "${TEMPLATE}" ]]; then
     [[ "$(basename "${TEMPLATE}")" =~ ${_TEMPLATE_NAME_PATTERN} ]] \
       || die "template '${TEMPLATE}' does not look like a supported Debian 13 standard template (expected a 'debian-13-standard_*' filename); pass a supported template explicitly or omit --template to auto-select one"
-    TEMPLATE_PLAN_NOTE="operator-specified: ${TEMPLATE}"
-    log_info "using operator-specified template: ${TEMPLATE}"
+    _validate_template_architecture "${TEMPLATE}"
+    TEMPLATE_PLAN_NOTE="operator-specified: ${TEMPLATE} (matches host architecture ${HOST_TEMPLATE_ARCH})"
+    log_info "using operator-specified template: ${TEMPLATE} (matches host architecture ${HOST_TEMPLATE_ARCH})"
     log_pass "template selection: ${TEMPLATE}"
     return 0
   fi
@@ -31,12 +39,12 @@ phase2_plan_template() {
   local_best="$(_newest_local_debian13_template)" || true
   if [[ -n "${local_best}" ]]; then
     TEMPLATE="${local_best}"
-    TEMPLATE_PLAN_NOTE="already cached locally: ${TEMPLATE}"
-    log_info "found cached template: ${TEMPLATE}"
+    TEMPLATE_PLAN_NOTE="already cached locally: ${TEMPLATE} (matches host architecture ${HOST_TEMPLATE_ARCH})"
+    log_info "found cached ${HOST_TEMPLATE_ARCH} template: ${TEMPLATE}"
   else
     TEMPLATE=""
-    TEMPLATE_PLAN_NOTE="not cached locally -- will be downloaded during provisioning (newest available Debian 13 standard template at that time; 'pveam update'/'download' run only after this plan is confirmed)"
-    log_info "no local Debian 13 standard template found; the newest available one will be downloaded after the plan is confirmed"
+    TEMPLATE_PLAN_NOTE="no ${HOST_TEMPLATE_ARCH} template cached locally -- will be downloaded during provisioning (newest available Debian 13 standard ${HOST_TEMPLATE_ARCH} template at that time; 'pveam update'/'download' run only after this plan is confirmed)"
+    log_info "no local Debian 13 standard ${HOST_TEMPLATE_ARCH} template found; the newest compatible one will be downloaded after the plan is confirmed"
   fi
 
   log_pass "template selection (planned): ${TEMPLATE_PLAN_NOTE}"
@@ -58,13 +66,33 @@ phase2b_provision_template() {
   TEMPLATE="$(_newest_local_debian13_template)" || true
   if [[ -z "${TEMPLATE}" ]]; then
     TEMPLATE="$(_download_newest_debian13_template)" \
-      || die "no Debian 13 standard LXC template is available locally or via 'pveam available' -- pass --template <storage>:vztmpl/<file> explicitly"
+      || die "no Debian 13 standard ${HOST_TEMPLATE_ARCH} LXC template is available locally or via 'pveam available'; make a compatible template available or pass --template <storage>:vztmpl/<file> explicitly"
   fi
 
   [[ "$(basename "${TEMPLATE}")" =~ ${_TEMPLATE_NAME_PATTERN} ]] \
     || die "resolved template '${TEMPLATE}' does not look like a supported Debian 13 standard template"
+  _validate_template_architecture "${TEMPLATE}"
 
   log_pass "template provisioned: ${TEMPLATE}"
+}
+
+_template_architecture() {
+  local filename
+  filename="$(basename "$1")"
+  if [[ "${filename}" =~ _([^_]+)\.tar\.(gz|xz|zst)$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+_validate_template_architecture() {
+  local template="$1"
+  local template_arch
+  template_arch="$(_template_architecture "${template}")" \
+    || die "could not determine architecture from template '${template}'; expected its filename to end in '_${HOST_TEMPLATE_ARCH}.tar.gz', '_${HOST_TEMPLATE_ARCH}.tar.xz', or '_${HOST_TEMPLATE_ARCH}.tar.zst'"
+  [[ "${template_arch}" == "${HOST_TEMPLATE_ARCH}" ]] \
+    || die "template '${template}' has architecture '${template_arch}', but this PVE host requires '${HOST_TEMPLATE_ARCH}'; choose a Debian 13 standard ${HOST_TEMPLATE_ARCH} template or omit --template to auto-select one"
 }
 
 # _newest_local_debian13_template: `pveam list <storage>` lists already
@@ -83,7 +111,7 @@ _newest_local_debian13_template() {
       [[ -n "${volid}" ]] && candidates+=("${volid}")
     done < <(pveam list "${storage}" 2>/dev/null \
       | awk '{print $1}' \
-      | grep -E "/${_TEMPLATE_NAME_PATTERN#^}")
+      | grep -E "/${_TEMPLATE_NAME_PATTERN#^}.*_${HOST_TEMPLATE_ARCH}\.tar\.(gz|xz|zst)$")
   done
   [[ ${#candidates[@]} -gt 0 ]] || return 1
 
@@ -109,7 +137,7 @@ _download_newest_debian13_template() {
   local filename
   filename="$(pveam available --section system 2>/dev/null \
     | awk '{print $2}' \
-    | grep -E "${_TEMPLATE_NAME_PATTERN}" \
+    | grep -E "${_TEMPLATE_NAME_PATTERN}.*_${HOST_TEMPLATE_ARCH}\.tar\.(gz|xz|zst)$" \
     | sort -V \
     | tail -n1)"
   [[ -n "${filename}" ]] || return 1

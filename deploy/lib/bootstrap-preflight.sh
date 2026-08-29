@@ -20,6 +20,7 @@ phase1_preflight() {
   require_command pveam "Proxmox appliance/template management"
   require_command pvesh "Proxmox API shell (node/storage/next-VMID introspection)"
   require_command pvesm "Proxmox storage management"
+  require_command dpkg "PVE host Debian architecture detection"
   require_command git "source commit verification (git archive of an exact, confirmed SHA)"
 
   # A real JSON parser is required (not optional) specifically for the
