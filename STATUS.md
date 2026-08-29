@@ -28,10 +28,48 @@ The HTTP/PVE API inventory surface remains read-only. Package scanning may
 write APT index/cache metadata but never changes workload packages. There is no
 policy, update job, or endpoint failover.
 
+## Human0 validation
+
+The implemented R0/bootstrap/discovery/package-scan/Home Assistant scope in
+v0.5.0-rc3 has completed its first real operator Human0 validation on a
+self-administered Proxmox host. This is separate from the automated CI evidence,
+which uses fake transports, simulated process output, and an ephemeral smoke
+sandbox.
+
+- **PASS:** A fresh default-path bootstrap completed and created the backend
+  LXC, least-privilege PVE read identity, forced-command package-scan boundary,
+  firewall, service, and discovery state; final onboot was enabled only after
+  acceptance passed.
+- **PASS:** Dynamic discovery was healthy and fresh, and Home Assistant enrolled
+  through the supported HACS/native integration path.
+- **PASS:** A supported Debian LXC completed an automatic package scan. Durable
+  exact rows and `pending_count` matched the Home Assistant summary.
+- **PASS:** Unsupported QEMU/HAOS scanning published unavailable/unknown pending
+  updates, not a false zero.
+- **PASS:** Holding the Debian guest's APT lock produced a real
+  `package_manager_busy` failure. Current publication became `status=failed`,
+  `pending_count=null`, `plan_fingerprint=null`, and `packages=[]`; the Home
+  Assistant entity became unavailable instead of reusing the previous success.
+- **PASS:** After the lock was released, a later automatic scan recovered to
+  success and Home Assistant again showed the correct count.
+- **PASS:** An independent `apt-get -s upgrade` inside the guest reported 24
+  upgrade operations, matching the backend exact plan and Home Assistant count.
+- **PASS:** After the operator manually upgraded the test guest outside Hubinet
+  Ops, a new scan changed the backend and Home Assistant count from 24 to 0.
+- **PASS:** After the operator manually restored a pre-update PVE snapshot
+  outside Hubinet Ops, a new scan restored the observed 24-package plan.
+
+Hubinet Ops performed neither the package upgrade nor the snapshot rollback in
+the last two checks. They were manual operator actions used only to verify that
+Hubinet observes current guest state. Human0 validates only the currently
+implemented scope; update execution, job-owned snapshots, healthchecks, and
+rollback remain unimplemented future stages.
+
 ## Next
 
-- **Update plan and explicit operator approval**, with exact scan fingerprint
-  revalidation.
+- **Exact update plan presentation and explicit operator approval**, with exact
+  fingerprint and current-context binding/revalidation. This stage does not
+  execute updates.
 
 ## Then
 
