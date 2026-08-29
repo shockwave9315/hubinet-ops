@@ -8,6 +8,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 import voluptuous as vol
 
 from .api import HubinetOpsApiError, PackageScanStatus
@@ -18,8 +19,13 @@ from .const import (
     SERVICE_APPROVE_UPDATE_PLAN,
     SERVICE_VIEW_UPDATE_PLAN,
 )
-from .coordinator import HubinetOpsCoordinator, resource_device_name
+from .coordinator import (
+    HubinetOpsCoordinator,
+    resource_device_name,
+    resource_registry_key,
+)
 
+ATTR_DEVICE_ID = "device_id"
 ATTR_RESOURCE_ID = "resource_id"
 ATTR_SCAN_RUN_ID = "scan_run_id"
 ATTR_PLAN_FINGERPRINT = "plan_fingerprint"
@@ -30,7 +36,7 @@ _UUID_RE = re.compile(
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _VIEW_SCHEMA = vol.Schema(
-    {vol.Required(ATTR_RESOURCE_ID): vol.Match(_UUID_RE)}
+    {vol.Required(ATTR_DEVICE_ID): str}
 )
 _APPROVE_SCHEMA = vol.Schema(
     {
@@ -59,6 +65,37 @@ def _coordinator_for_resource(
     return matches[0]
 
 
+def _coordinator_and_resource_for_device(
+    hass: HomeAssistant, device_id: str
+) -> tuple[HubinetOpsCoordinator, str]:
+    """Resolve one selected HA device to exactly one loaded Hubinet resource."""
+
+    device = dr.async_get(hass).async_get(device_id)
+    if device is None:
+        raise HomeAssistantError("selected Hubinet Ops resource device does not exist")
+
+    coordinators: Mapping[str, HubinetOpsCoordinator] = hass.data.get(DOMAIN, {}).get(
+        DATA_COORDINATORS, {}
+    )
+    matches: list[tuple[HubinetOpsCoordinator, str]] = []
+    for coordinator in coordinators.values():
+        if coordinator.config_entry.entry_id not in device.config_entries:
+            continue
+        backend_instance_id = coordinator.data.backend.backend_instance_id
+        for resource in coordinator.data.resources:
+            if (
+                DOMAIN,
+                resource_registry_key(backend_instance_id, resource.resource_id),
+            ) in device.identifiers:
+                matches.append((coordinator, resource.resource_id))
+
+    if len(matches) != 1:
+        raise HomeAssistantError(
+            "selected device must identify exactly one loaded Hubinet Ops resource"
+        )
+    return matches[0]
+
+
 def _approval_response(approval: Any) -> dict[str, Any]:
     return {
         "status": approval.status.value,
@@ -73,8 +110,9 @@ def _approval_response(approval: Any) -> dict[str, Any]:
 async def _view_update_plan(
     hass: HomeAssistant, call: ServiceCall
 ) -> ServiceResponse:
-    resource_id = call.data[ATTR_RESOURCE_ID]
-    coordinator = _coordinator_for_resource(hass, resource_id)
+    coordinator, resource_id = _coordinator_and_resource_for_device(
+        hass, call.data[ATTR_DEVICE_ID]
+    )
     try:
         snapshot = await coordinator.api.async_fetch_resource_snapshot()
     except HubinetOpsApiError as exc:

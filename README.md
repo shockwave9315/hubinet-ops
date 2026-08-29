@@ -26,8 +26,10 @@ a guest in Proxmox never requires touching this repository or its config.
 - A native Home Assistant integration with dynamic devices and entities.
 - Automatic Debian/Ubuntu LXC package scanning with exact durable plans and
   Home Assistant summary entities.
-- Fresh exact-plan viewing and explicit durable approval through two native
-  Home Assistant actions. Approval never executes an update.
+- Fresh exact-plan viewing through a native Hubinet resource-device selector,
+  explicit durable approval through a second native Home Assistant action, and
+  a concise backend-published approval-status sensor. Approval never executes
+  an update.
 - An automated Proxmox bootstrap that provisions the whole backend.
 
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never

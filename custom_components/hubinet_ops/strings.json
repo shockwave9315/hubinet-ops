@@ -90,6 +90,14 @@
       "resource_package_scan_status": {
         "name": "Package scan status"
       },
+      "resource_package_plan_approval": {
+        "name": "Package plan approval",
+        "state": {
+          "none": "None",
+          "approved": "Approved",
+          "stale": "Stale"
+        }
+      },
       "resource_pending_updates": {
         "name": "Pending updates"
       },
@@ -98,6 +106,36 @@
       },
       "resource_reboot_required": {
         "name": "Reboot required"
+      }
+    }
+  },
+  "services": {
+    "view_update_plan": {
+      "name": "View update plan",
+      "description": "Read the fresh exact package plan for one selected Hubinet Ops resource.",
+      "fields": {
+        "device_id": {
+          "name": "Resource",
+          "description": "Select a workload resource managed by Hubinet Ops."
+        }
+      }
+    },
+    "approve_update_plan": {
+      "name": "Approve update plan",
+      "description": "Approve the exact scan and fingerprint returned by View update plan.",
+      "fields": {
+        "resource_id": {
+          "name": "Resource ID",
+          "description": "Exact resource identity returned by View update plan."
+        },
+        "scan_run_id": {
+          "name": "Scan run ID",
+          "description": "Exact scan identity returned by View update plan."
+        },
+        "plan_fingerprint": {
+          "name": "Plan fingerprint",
+          "description": "Exact material plan fingerprint returned by View update plan."
+        }
       }
     }
   },

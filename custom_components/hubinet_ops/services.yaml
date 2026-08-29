@@ -1,33 +1,22 @@
 view_update_plan:
-  name: View update plan
-  description: Read the fresh exact package plan for one Hubinet resource.
   fields:
-    resource_id:
-      name: Resource ID
-      description: Backend-owned resource identity to review.
+    device_id:
       required: true
       selector:
-        text:
+        device:
+          integration: hubinet_ops
 
 approve_update_plan:
-  name: Approve update plan
-  description: Approve the exact scan and fingerprint returned by View update plan.
   fields:
     resource_id:
-      name: Resource ID
-      description: Exact resource identity returned by View update plan.
       required: true
       selector:
         text:
     scan_run_id:
-      name: Scan run ID
-      description: Exact scan identity returned by View update plan.
       required: true
       selector:
         text:
     plan_fingerprint:
-      name: Plan fingerprint
-      description: Exact material plan fingerprint returned by View update plan.
       required: true
       selector:
         text:

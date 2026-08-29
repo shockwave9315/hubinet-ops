@@ -17,11 +17,11 @@
   deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
   exposes no inventory or credential data.
 - **Home Assistant integration** — config flow, coordinator, structural
-  contract validation, dynamic devices and entities, package-scan summary
-  sensors, diagnostics with recursive secret redaction, and native
-  `view_update_plan` / `approve_update_plan` actions. The view action returns
-  exact package rows as response data, never as entity attributes. Distributed
-  via HACS.
+  contract validation, dynamic devices and entities, package-scan summary and
+  concise approval-status sensors, diagnostics with recursive secret redaction,
+  and native `view_update_plan` / `approve_update_plan` actions. The view action
+  uses the native Hubinet resource-device selector and returns exact package
+  rows as response data, never as entity attributes. Distributed via HACS.
 - **Automatic Debian/Ubuntu LXC package scanning** — configurable six-hour
   default interval, one worker, typed pinned-key SSH to a forced PVE helper,
   fixed `pct exec` operations, APT metadata refresh plus upgrade simulation,
@@ -96,11 +96,14 @@ rollback remain unimplemented future stages.
 
 - The Home Assistant test suite requires Python ≥ 3.14.2 with
   `homeassistant==2026.8.1` and does not run on native Windows, because Home
-  Assistant imports POSIX `fcntl` at collection time. Linux CI is the real
-  compatibility gate. Do not patch Home Assistant or fake `fcntl` around this.
+  Assistant imports POSIX `fcntl` at collection time. The pinned Linux suite in
+  the existing local CI equivalent and GitHub CI is the compatibility gate. Do
+  not patch Home Assistant or fake `fcntl` around this.
 - `deploy/bootstrap-proxmox-0.5.sh` is only executed for real inside the
-  ephemeral-CI Docker sandbox (`tests/shell/run_bootstrap_smoke_sandbox.sh`).
-  Local runs validate it statically.
+  hardened Docker smoke sandbox. GitHub uses the guarded
+  `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the existing Linux
+  devbox local CI invokes the same Dockerfile and sandbox entrypoint directly
+  without faking GitHub runner markers.
 - Pre-release: schema v8 is incompatible with v7. Existing deployments require
   a fresh backend database/fresh deployment and Home Assistant re-enrollment.
   There is no v7-to-v8 migration path, and none is planned before the first

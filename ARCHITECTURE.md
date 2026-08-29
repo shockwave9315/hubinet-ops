@@ -117,12 +117,14 @@ anything on them.
 
 `custom_components/hubinet_ops/` — one `DataUpdateCoordinator`, one snapshot
 fetch per refresh, structural validation of the payload in `contract/`, then
-devices and entities. The response-capable `view_update_plan` action performs a
-separate fresh snapshot read and returns exact package rows plus the exact
-approval reference. `approve_update_plan` forwards that caller-supplied
-reference unchanged to the backend and refreshes the coordinator after
-success. Package rows do not become entity attributes or package-per-entity
-state.
+devices and entities. The response-capable `view_update_plan` action accepts a
+native Hubinet resource-device selection, resolves its backend-owned
+`resource_id`, performs a separate fresh snapshot read, and returns exact
+package rows plus the exact approval reference. `approve_update_plan` forwards
+that caller-supplied reference unchanged to the backend and refreshes the
+coordinator after success. One concise resource sensor displays the
+backend-published `none | approved | stale` approval state. Package rows do not
+become entity attributes or package-per-entity state.
 
 The coordinator is **not** a reconciler. It never infers `missing` from a diff
 between two polls, and it never assumes revision `N -> N+1` means backend

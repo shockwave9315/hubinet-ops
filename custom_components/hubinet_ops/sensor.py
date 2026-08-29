@@ -12,7 +12,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, override
 
-from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+)
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -23,6 +27,7 @@ from .api import (
     NodeAvailability,
     NodeSnapshot,
     PackageScanStatus,
+    PackagePlanApprovalStatus,
     PresenceState,
     ResourceSnapshot,
 )
@@ -157,6 +162,14 @@ RESOURCE_SENSORS = (
         translation_key="resource_package_scan_status",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda resource: resource.package_scan.status.value,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="package_plan_approval",
+        translation_key="resource_package_plan_approval",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.ENUM,
+        options=[status.value for status in PackagePlanApprovalStatus],
+        value_fn=lambda resource: resource.package_plan_approval.status.value,
     ),
     HubinetOpsResourceSensorDescription(
         key="pending_updates",
