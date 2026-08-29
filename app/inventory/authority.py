@@ -630,20 +630,8 @@ class InventoryAuthority:
             self._materialize_due_expiry_in_transaction(
                 connection, source_id, now=decision_time
             )
-            source = self._require_source_row(connection, source_id)
-            endpoint = self._require_active_endpoint_row(connection, source_id)
-            health = connection.execute(
-                "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
-                (source_id,),
-            ).fetchone()
-            if health is None:
-                raise AuthorityInvariantError(
-                    "inventory source must have exactly one runtime health record"
-                )
-            return (
-                health["health"] == "healthy"
-                and health["freshness"] == "fresh"
-                and self._committed_context_is_current(source, endpoint, health)
+            return self._source_has_current_authority_in_transaction(
+                connection, source_id
             )
 
     def issue_package_scan(self, resource_id: str) -> PackageScanRun:
@@ -651,44 +639,59 @@ class InventoryAuthority:
 
         canonical_resource_id = _require_uuid(resource_id, "resource_id")
         scan_run_id = _new_uuid()
-        started_at = _timestamp(self._now())
+        source_authority_rejected = False
         with self._store._transaction() as connection:
             row = self._require_package_scan_target(connection, canonical_resource_id)
             if str(row["resource_type"]) != "lxc":
                 raise AuthorityConflict("package scanning supports LXC resources only")
-            previous = connection.execute(
-                "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
-                (canonical_resource_id,),
-            ).fetchone()[0]
-            attempt_sequence = (int(previous) if previous is not None else 0) + 1
-            try:
-                connection.execute(
-                    "INSERT INTO package_scan_runs("
-                    "scan_run_id, resource_id, inventory_source_id, attempt_sequence, "
-                    "expected_binding_id, expected_locator_generation, "
-                    "expected_resource_continuity_revision, expected_vmid, "
-                    "expected_node_id, expected_node_name, started_at, lifecycle) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
-                    (
-                        scan_run_id,
-                        canonical_resource_id,
-                        str(row["inventory_source_id"]),
-                        attempt_sequence,
-                        str(row["binding_id"]),
-                        int(row["locator_generation"]),
-                        int(row["resource_continuity_revision"]),
-                        int(row["vmid"]),
-                        str(row["current_node_id"]),
-                        str(row["external_node_name"]),
-                        started_at,
-                    ),
+            source_id = str(row["inventory_source_id"])
+            decision_time = self._authority_decision_time()
+            self._materialize_due_expiry_in_transaction(
+                connection, source_id, now=decision_time
+            )
+            if not self._source_has_current_authority_in_transaction(
+                connection, source_id
+            ):
+                source_authority_rejected = True
+            else:
+                previous = connection.execute(
+                    "SELECT MAX(attempt_sequence) FROM package_scan_runs WHERE resource_id=?",
+                    (canonical_resource_id,),
+                ).fetchone()[0]
+                attempt_sequence = (int(previous) if previous is not None else 0) + 1
+                try:
+                    connection.execute(
+                        "INSERT INTO package_scan_runs("
+                        "scan_run_id, resource_id, inventory_source_id, attempt_sequence, "
+                        "expected_binding_id, expected_locator_generation, "
+                        "expected_resource_continuity_revision, expected_vmid, "
+                        "expected_node_id, expected_node_name, started_at, lifecycle) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+                        (
+                            scan_run_id,
+                            canonical_resource_id,
+                            source_id,
+                            attempt_sequence,
+                            str(row["binding_id"]),
+                            int(row["locator_generation"]),
+                            int(row["resource_continuity_revision"]),
+                            int(row["vmid"]),
+                            str(row["current_node_id"]),
+                            str(row["external_node_name"]),
+                            _timestamp(decision_time),
+                        ),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise AuthorityConflict(
+                        "resource already has an active package scan"
+                    ) from exc
+                self._bump_global_revisions(
+                    connection, inventory_changed=False, published_changed=True
                 )
-            except sqlite3.IntegrityError as exc:
-                raise AuthorityConflict(
-                    "resource already has an active package scan"
-                ) from exc
-            self._bump_global_revisions(
-                connection, inventory_changed=False, published_changed=True
+        # Preserve any expiry materialized above while refusing the scan row.
+        if source_authority_rejected:
+            raise AuthorityConflict(
+                "package scan requires fresh healthy inventory authority"
             )
         return self._store.package_scan_run(scan_run_id)
 
@@ -947,6 +950,25 @@ class InventoryAuthority:
 
     def _authority_decision_time(self) -> datetime:
         return _parse_timestamp(_timestamp(self._now()), "authority decision time")
+
+    def _source_has_current_authority_in_transaction(
+        self, connection: sqlite3.Connection, source_id: str
+    ) -> bool:
+        source = self._require_source_row(connection, source_id)
+        endpoint = self._require_active_endpoint_row(connection, source_id)
+        health = connection.execute(
+            "SELECT * FROM source_runtime_health WHERE inventory_source_id=?",
+            (source_id,),
+        ).fetchone()
+        if health is None:
+            raise AuthorityInvariantError(
+                "inventory source must have exactly one runtime health record"
+            )
+        return (
+            health["health"] == "healthy"
+            and health["freshness"] == "fresh"
+            and self._committed_context_is_current(source, endpoint, health)
+        )
 
     def _materialize_due_expiry_in_transaction(
         self,

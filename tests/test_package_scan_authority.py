@@ -13,6 +13,7 @@ from app.inventory import (
     DetailReadStatus,
     DiscoveredNode,
     DiscoveredResource,
+    DiscoveryRunCompletionEvidence,
     InventoryAuthority,
     InventoryAuthorityStore,
     InventoryPublication,
@@ -39,7 +40,9 @@ class Clock:
         return self.value
 
 
-def _system(tmp_path: Path, *, resource_type: str = "lxc"):
+def _system(
+    tmp_path: Path, *, resource_type: str = "lxc", freshness_duration_seconds: int = 300
+):
     clock = Clock()
     store = InventoryAuthorityStore(tmp_path / "authority.db", now=clock)
     authority = InventoryAuthority(store, now=clock)
@@ -48,6 +51,7 @@ def _system(tmp_path: Path, *, resource_type: str = "lxc"):
         display_name="Primary",
         credential_reference="secret://pve",
         transport_locator="https://pve.example:8006",
+        freshness_duration_seconds=freshness_duration_seconds,
     )
     _reconcile(authority, source.source.inventory_source_id, resource_type=resource_type)
     return clock, store, authority, store.list_resources()[0]
@@ -59,6 +63,7 @@ def _reconcile(
     *,
     resource_type: str = "lxc",
     status: str = "running",
+    observed_at: str = START.isoformat(),
 ) -> None:
     run = authority.issue_discovery_run(source_id, 1)
     snapshot = NormalizedDiscoverySnapshot(
@@ -71,7 +76,7 @@ def _reconcile(
         canonicalization_contract_version=run.expected_canonicalization_contract_version,
         expected_transport_trust_revision=run.expected_transport_trust_revision,
         provider_contract_version=1,
-        observed_at=START.isoformat(),
+        observed_at=observed_at,
         source_facts={},
         source_availability=SourceAvailability.AVAILABLE,
         baseline_completeness=BaselineCompleteness.COMPLETE,
@@ -90,7 +95,7 @@ def _reconcile(
             "error_count": 0,
         },
         failed_detail_scopes=(),
-        nodes=(DiscoveredNode("pve-a", "online", True, START.isoformat(), {}),),
+        nodes=(DiscoveredNode("pve-a", "online", True, observed_at, {}),),
         resources=(
             DiscoveredResource(
                 source_id,
@@ -99,7 +104,7 @@ def _reconcile(
                 "guest",
                 status,
                 "pve-a",
-                START.isoformat(),
+                observed_at,
                 DetailReadStatus.OK,
                 {},
             ),
@@ -126,6 +131,139 @@ def _packages() -> tuple[PackageScanPackage, ...]:
         ),
         PackageScanPackage("apt", "2.6.1", "2.6.2"),
     )
+
+
+def _finalize_discovery_failure(
+    authority: InventoryAuthority,
+    source_id: str,
+    outcome: BaselineCompleteness,
+) -> None:
+    run = authority.issue_discovery_run(source_id, 1)
+    authority.finalize_failed_discovery_run(
+        source_id,
+        run.run_id,
+        completion_evidence=DiscoveryRunCompletionEvidence(outcome),
+        reason=f"test {outcome.value}",
+    )
+
+
+def test_fresh_current_source_allows_scan_and_captures_resource_context(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    state = store.source_state(resource.inventory_source_id)
+    assert state.runtime_health.health.value == "healthy"
+    assert state.runtime_health.freshness.value == "fresh"
+    assert (
+        state.runtime_health.committed_source_config_revision
+        == state.source.source_config_revision
+    )
+    assert (
+        state.runtime_health.committed_endpoint_id
+        == state.active_endpoint.endpoint_id
+    )
+    assert (
+        state.runtime_health.committed_transport_trust_revision
+        == state.active_endpoint.transport_trust_revision
+    )
+
+    run = authority.issue_package_scan(resource.resource_id)
+
+    assert run.attempt_sequence == 1
+    assert run.expected_binding_id == resource.active_binding_id
+    assert run.expected_locator_generation == resource.locator_generation
+    assert (
+        run.expected_resource_continuity_revision
+        == resource.resource_continuity_revision
+    )
+    assert run.expected_vmid == resource.vmid
+    assert run.expected_node_id == resource.current_node_id
+
+
+def test_scan_issuance_atomically_materializes_expiry_and_consumes_no_attempt(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, resource = _system(
+        tmp_path, freshness_duration_seconds=60
+    )
+    clock.value = START + timedelta(seconds=61)
+
+    with pytest.raises(
+        AuthorityConflict,
+        match="package scan requires fresh healthy inventory authority",
+    ):
+        authority.issue_package_scan(resource.resource_id)
+
+    assert store.list_package_scan_runs(resource.resource_id) == ()
+    stale = store.source_state(resource.inventory_source_id).runtime_health
+    assert stale.health.value == "healthy"
+    assert stale.freshness.value == "stale"
+    assert stale.health_origin.value == "time_expiry"
+    assert stale.health_reason == "freshness_deadline_elapsed"
+
+    _reconcile(
+        authority,
+        resource.inventory_source_id,
+        observed_at=clock.value.isoformat(),
+    )
+    retry = authority.issue_package_scan(resource.resource_id)
+    assert retry.attempt_sequence == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_health"),
+    (
+        (BaselineCompleteness.SOURCE_UNAVAILABLE, "source_unavailable"),
+        (BaselineCompleteness.PARTIAL, "degraded"),
+    ),
+)
+def test_unavailable_or_degraded_source_refuses_scan_without_attempt(
+    tmp_path: Path,
+    outcome: BaselineCompleteness,
+    expected_health: str,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    _finalize_discovery_failure(authority, resource.inventory_source_id, outcome)
+    retained = store.list_resources(resource.inventory_source_id)[0]
+    assert retained.presence == "present"
+    assert retained.lifecycle == "active"
+    assert retained.active_binding_id is not None
+    assert (
+        store.source_state(resource.inventory_source_id).runtime_health.health.value
+        == expected_health
+    )
+
+    with pytest.raises(AuthorityConflict, match="fresh healthy inventory authority"):
+        authority.issue_package_scan(resource.resource_id)
+
+    assert store.list_package_scan_runs(resource.resource_id) == ()
+
+
+def test_committed_context_mismatch_refuses_scan_and_preserves_history(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    historical = authority.issue_package_scan(resource.resource_id)
+    authority.finalize_successful_package_scan(
+        historical.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=_packages(),
+        reboot_required=None,
+    )
+    before = store.list_package_scan_runs(resource.resource_id)
+    authority.rotate_transport_trust(resource.inventory_source_id)
+    state = store.source_state(resource.inventory_source_id)
+    assert state.runtime_health.freshness.value == "stale"
+    assert (
+        state.runtime_health.committed_transport_trust_revision
+        != state.active_endpoint.transport_trust_revision
+    )
+
+    with pytest.raises(AuthorityConflict, match="fresh healthy inventory authority"):
+        authority.issue_package_scan(resource.resource_id)
+
+    assert store.list_package_scan_runs(resource.resource_id) == before
 
 
 def test_success_persists_sorted_exact_plan_and_material_fingerprint(tmp_path: Path) -> None:
@@ -312,6 +450,48 @@ def test_automatic_scheduler_scans_current_lxc_and_uses_runtime_interval(
     assert scheduler.interval_seconds == 3600
     with pytest.raises(ValueError):
         scheduler.configure_interval_seconds(59)
+
+
+def test_scheduler_stale_source_conflict_never_reaches_host_control(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    _finalize_discovery_failure(
+        authority,
+        resource.inventory_source_id,
+        BaselineCompleteness.SOURCE_UNAVAILABLE,
+    )
+    retained = store.list_resources(resource.inventory_source_id)[0]
+    assert retained.resource_type == "lxc"
+    assert retained.presence == "present"
+    assert retained.lifecycle == "active"
+    assert retained.active_binding_id is not None
+
+    class CountingHostControl(SuccessfulHostControl):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def scan_packages(self, run):
+            self.calls += 1
+            return super().scan_packages(run)
+
+    host_control = CountingHostControl()
+    scheduler = PackageScanScheduler(
+        authority,
+        store,
+        host_control,
+        interval_seconds=21_600,
+        initial_delay_seconds=0,
+    )
+
+    outcomes = scheduler.run_once()
+
+    assert len(outcomes) == 1
+    assert outcomes[0].resource_id == resource.resource_id
+    assert outcomes[0].status == "conflict"
+    assert outcomes[0].scan_run_id is None
+    assert host_control.calls == 0
+    assert store.list_package_scan_runs(resource.resource_id) == ()
 
 
 def test_scheduler_skips_qemu_without_inventory_error(tmp_path: Path) -> None:
