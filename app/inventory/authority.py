@@ -1034,7 +1034,17 @@ class InventoryAuthority:
             "WHERE r.resource_id=?",
             (str(run["resource_id"]),),
         ).fetchone()
-        if current is None or current["binding_id"] is None:
+        if current is None:
+            return False
+        if current["binding_id"] is None:
+            return False
+        # A missing/quarantined resource (or one whose node reference has not
+        # resolved) retains no current node, so these joined fields are NULL.
+        # Reject before any int()/comparison coercion so nullable legal state
+        # fails closed instead of raising.
+        if current["current_node_id"] is None:
+            return False
+        if current["node_available"] is None:
             return False
         return all(
             (
@@ -1050,7 +1060,7 @@ class InventoryAuthority:
                 == int(run["expected_resource_continuity_revision"]),
                 current["current_node_id"] == run["expected_node_id"],
                 current["external_node_name"] == run["expected_node_name"],
-                int(current["node_available"]) == 1,
+                current["node_available"] == 1,
             )
         )
 

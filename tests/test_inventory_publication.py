@@ -344,6 +344,105 @@ def test_successful_package_plan_survives_node_movement(tmp_path: Path) -> None:
     assert published.package_scan.plan_fingerprint == completed.plan_fingerprint
 
 
+def test_publication_survives_missing_scanned_resource_with_no_historical_approval(
+    tmp_path: Path,
+) -> None:
+    """Regression: a guest disappearing after a successful scan must not crash read().
+
+    `_package_scan_context_is_current` used to evaluate
+    `int(current["node_available"]) == 1` inside an eagerly built `all((...))`
+    tuple. Once a scanned guest is absent from a complete baseline, its
+    `current_node_id` becomes NULL while its locator binding is retained, so
+    the LEFT-JOINed `node_available` is NULL and `int(None)` raised TypeError,
+    taking down the entire published snapshot.
+    """
+
+    _, _, store, authority, source_id = make_system(tmp_path)
+    reconcile(authority, source_id, resource_type="lxc")
+    resource = store.list_resources(source_id)[0]
+    successful_package_scan(authority, resource.resource_id)
+
+    reconcile(authority, source_id, resource_type="lxc", resource_present=False)
+    retained = store.list_resources(source_id)[0]
+    assert retained.presence == "missing"
+    assert retained.current_node_id is None
+    assert retained.active_binding_id is not None
+
+    snapshot = contract_snapshot(InventoryPublication(store, authority).read())
+    published = snapshot.resources[0]
+    assert published.resource_id == resource.resource_id
+    assert published.presence is PresenceState.MISSING
+    assert published.package_scan.status is PackageScanStatus.UNAVAILABLE
+    approval = published.package_plan_approval
+    assert approval.status is PackagePlanApprovalStatus.NONE
+    assert approval.approvable is False
+
+
+def test_publication_survives_missing_scanned_resource_with_historical_approval(
+    tmp_path: Path,
+) -> None:
+    clock, db_path, store, authority, source_id = make_system(tmp_path)
+    reconcile(authority, source_id, resource_type="lxc")
+    resource = store.list_resources(source_id)[0]
+    _, completed = successful_package_scan(authority, resource.resource_id)
+    approval = authority.approve_package_plan(
+        resource.resource_id, completed.scan_run_id, completed.plan_fingerprint
+    )
+
+    reconcile(authority, source_id, resource_type="lxc", resource_present=False)
+
+    snapshot = contract_snapshot(InventoryPublication(store, authority).read())
+    published = snapshot.resources[0]
+    assert published.presence is PresenceState.MISSING
+    plan_approval = published.package_plan_approval
+    assert plan_approval.status is PackagePlanApprovalStatus.STALE
+    assert plan_approval.approvable is False
+    assert plan_approval.approval_id == approval.approval_id
+    assert plan_approval.reviewed_scan_run_id == approval.reviewed_scan_run_id
+    assert plan_approval.plan_fingerprint == approval.approved_plan_fingerprint
+
+    store.close()
+    reopened = InventoryAuthorityStore(db_path, now=clock)
+    reopened_authority = InventoryAuthority(reopened, now=clock)
+    reopened_snapshot = contract_snapshot(
+        InventoryPublication(reopened, reopened_authority).read()
+    )
+    reopened_published = reopened_snapshot.resources[0]
+    reopened_approval = reopened_published.package_plan_approval
+    assert reopened_approval.status is PackagePlanApprovalStatus.STALE
+    assert reopened_approval.approvable is False
+
+
+def test_publication_present_resource_with_unresolved_node_is_not_approvable(
+    tmp_path: Path,
+) -> None:
+    """Regression sibling: an unresolved (not merely missing) node must also fail closed."""
+
+    _, _, store, authority, source_id = make_system(tmp_path)
+    reconcile(authority, source_id, resource_type="lxc")
+    resource = store.list_resources(source_id)[0]
+    successful_package_scan(authority, resource.resource_id)
+
+    reconcile(
+        authority,
+        source_id,
+        resource_type="lxc",
+        current_node_name=None,
+        node_names=("pve-a",),
+    )
+    unresolved = store.list_resources(source_id)[0]
+    assert unresolved.presence == "present"
+    assert unresolved.current_node_id is None
+
+    snapshot = contract_snapshot(InventoryPublication(store, authority).read())
+    published = snapshot.resources[0]
+    assert published.resource_id == resource.resource_id
+    assert published.presence is PresenceState.PRESENT
+    assert published.node_availability is NodeAvailability.UNRESOLVED
+    approval = published.package_plan_approval
+    assert approval.approvable is False
+
+
 def test_successful_package_plan_requires_matching_persisted_resource_context() -> None:
     resource = {
         "resource_type": "lxc",

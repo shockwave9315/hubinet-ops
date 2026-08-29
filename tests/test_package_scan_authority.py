@@ -64,6 +64,7 @@ def _reconcile(
     resource_type: str = "lxc",
     status: str = "running",
     observed_at: str = START.isoformat(),
+    resource_present: bool = True,
 ) -> None:
     run = authority.issue_discovery_run(source_id, 1)
     snapshot = NormalizedDiscoverySnapshot(
@@ -90,7 +91,7 @@ def _reconcile(
         covered_nodes=("pve-a",),
         failed_baseline_scopes=(),
         detail_summary={
-            "ok_count": 1,
+            "ok_count": 1 if resource_present else 0,
             "temporarily_unavailable_count": 0,
             "error_count": 0,
         },
@@ -108,12 +109,16 @@ def _reconcile(
                 DetailReadStatus.OK,
                 {},
             ),
-        ),
+        )
+        if resource_present
+        else (),
         provider_node_scope=ProviderNodeScope._from_provider(
             BaselineMode.CLUSTER, ("pve-a",)
         ),
         provider_guest_locators=ProviderGuestLocatorSet._from_provider(
             ({"vmid": 101, "type": resource_type, "node": "pve-a"},)
+            if resource_present
+            else ()
         ),
     )
     authority.finalize_successful_discovery_run(source_id, run.run_id, snapshot)
@@ -406,6 +411,42 @@ def test_changed_resource_context_fences_success_as_stale(tmp_path: Path) -> Non
     _, _, authority, resource = _system(tmp_path)
     run = authority.issue_package_scan(resource.resource_id)
     _reconcile(authority, resource.inventory_source_id, resource_type="qemu")
+    completed = authority.finalize_successful_package_scan(
+        run.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=_packages(),
+        reboot_required=None,
+    )
+    assert completed.outcome is PackageScanOutcome.FAILED
+    assert completed.failure_class is PackageScanFailure.STALE_TARGET
+    assert completed.pending_count is None
+    assert completed.packages == ()
+
+
+def test_guest_disappearance_during_scan_fences_success_as_stale_not_execution_failed(
+    tmp_path: Path,
+) -> None:
+    """Regression: nullable current-node state must fence cleanly, not raise.
+
+    Before the fix, `_package_scan_context_is_current` evaluated
+    `int(current["node_available"]) == 1` inside an eagerly built `all((...))`
+    tuple. Once the guest disappears from a complete baseline, its
+    `current_node_id` (and therefore the LEFT-JOINed `node_available`) is
+    NULL while its locator binding is still retained, so `int(None)` raised
+    TypeError instead of finalizing the scan as a clean stale-target failure.
+    """
+
+    _, store, authority, resource = _system(tmp_path)
+    run = authority.issue_package_scan(resource.resource_id)
+
+    _reconcile(authority, resource.inventory_source_id, resource_present=False)
+    retained = store.list_resources(resource.inventory_source_id)[0]
+    assert retained.presence == "missing"
+    assert retained.lifecycle == "quarantined"
+    assert retained.current_node_id is None
+    assert retained.active_binding_id is not None
+
     completed = authority.finalize_successful_package_scan(
         run.scan_run_id,
         os_id="debian",
