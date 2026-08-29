@@ -8,8 +8,9 @@ script -- see that file's own module docstring for why it is gated).
 Per AGENTS.md's test-boundary rules, tests must never invoke real `pct`,
 `pveum`, `pveam`, `pvesh`, `pvesm`, `nft`, or contact any real network/PVE
 endpoint. This module builds a temporary PATH containing fake replacements
-for exactly those command names plus the CT-side commands the bootstrap
-script now also depends on (`apt-get`, `env`, `sh -c "command -v ..."`, and
+for exactly those command names, host architecture detection via `dpkg`, plus
+the CT-side commands the bootstrap script now also depends on (`apt-get`,
+`env`, `sh -c "command -v ..."`, and
 a simulated `python3 .../hubinet-ops-bootstrap-accept.py` discovery-
 acceptance check) -- nothing else on PATH is touched (real `bash`, `awk`,
 `grep`, `sed`, `git`, `tar`, `python3` itself, etc. remain the real system
@@ -217,7 +218,15 @@ def cmd_pct(args):
         vmid = args[1]
         if _fail("pct_create"):
             sys.exit(1)
-        entry = {"started": False, "onboot": "0", "features": ""}
+        template = args[2]
+        match = re.search(r"_([^_]+)\.tar\.(?:gz|xz|zst)$", template)
+        entry = {
+            "started": False,
+            "onboot": "0",
+            "features": "",
+            "template": template,
+            "arch": match.group(1) if match else "unknown",
+        }
         # --nameserver (P2-2 third pass): bootstrap-container.sh passes this
         # only in hostname PVE endpoint mode, carrying --dns-resolver's
         # value -- persisted here exactly as a real PVE host would persist
@@ -235,7 +244,7 @@ def cmd_pct(args):
         if _fail("pct_config"):
             sys.exit(1)
         entry = state["vmids"].get(vmid, {})
-        lines = ["arch: amd64", "hostname: hubinet-ops"]
+        lines = [f"arch: {entry.get('arch', 'unknown')}", "hostname: hubinet-ops"]
         if entry.get("nameserver"):
             lines.append(f"nameserver: {entry['nameserver']}")
         sys.stdout.write("\n".join(lines) + "\n")
@@ -257,6 +266,9 @@ def cmd_pct(args):
         if _fail("pct_start"):
             sys.exit(1)
         entry = state["vmids"].setdefault(vmid, {"started": False, "onboot": "0", "features": ""})
+        host_arch = SCENARIO.get("host_debian_arch", "amd64")
+        if entry.get("arch") != host_arch:
+            sys.exit(1)
         entry["started"] = True
         _save_state(state)
         # Simulate PVE's own real container-start machinery regenerating
@@ -1177,6 +1189,16 @@ def cmd_pveam(args):
     return 2
 
 
+def cmd_dpkg(args):
+    _log("dpkg", *args)
+    if args == ["--print-architecture"]:
+        if _fail("dpkg_arch"):
+            return 1
+        print(SCENARIO.get("host_debian_arch", "amd64"))
+        return 0
+    return 2
+
+
 def cmd_pvesh(args):
     _log("pvesh", *args)
     state = _load_state()
@@ -1247,6 +1269,7 @@ DISPATCH = {
     "pveam": cmd_pveam,
     "pvesh": cmd_pvesh,
     "pvesm": cmd_pvesm,
+    "dpkg": cmd_dpkg,
 }
 
 
@@ -1294,6 +1317,7 @@ def default_scenario() -> dict[str, Any]:
         "next_free_vmid": FAKE_NEXT_VMID,
         "local_templates": [FAKE_TEMPLATE_VOLID],
         "available_templates": [f"system {FAKE_TEMPLATE_FILENAME}"],
+        "host_debian_arch": "amd64",
         "bridges": [FAKE_BRIDGE],
         "storages": {"rootdir": [FAKE_STORAGE], "vztmpl": [FAKE_TEMPLATE_STORAGE]},
         # KiB, matching real `pvesm status` output -- 100 GiB.
@@ -1336,7 +1360,7 @@ def default_scenario() -> dict[str, Any]:
     }
 
 
-_FAKE_COMMANDS = ("pct", "pveum", "pveam", "pvesh", "pvesm", "nft")
+_FAKE_COMMANDS = ("pct", "pveum", "pveam", "pvesh", "pvesm", "nft", "dpkg")
 
 
 def build_minimal_source_checkout(tmp_path: Path, repo_root: Path) -> Path:

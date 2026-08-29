@@ -2608,6 +2608,105 @@ class TestContainerCreation:
         assert result.returncode == 0, result.stderr
         assert "debian-13-standard_13.10-1_amd64.tar.zst" in result.stderr
 
+    def test_newer_incompatible_cached_template_is_ignored(self, tmp_path, source_checkout):
+        compatible = "local:vztmpl/debian-13-standard_13.5-1_amd64.tar.zst"
+        incompatible = "local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst"
+        result, fake_env_obj = _run_full(
+            tmp_path,
+            source_checkout,
+            scenario_overrides={"local_templates": [incompatible, compatible]},
+        )
+        assert result.returncode == 0, result.stderr
+        create_lines = [line for line in fake_env_obj.log_lines() if line.startswith("pct create")]
+        assert len(create_lines) == 1
+        assert compatible in create_lines[0]
+        assert incompatible not in create_lines[0]
+        assert fake_env_obj.state()["vmids"]["110"]["arch"] == "amd64"
+        assert "matches host architecture amd64" in result.stderr
+
+    def test_incompatible_cached_template_falls_back_to_compatible_download(self, tmp_path, source_checkout):
+        incompatible = "local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst"
+        compatible_filename = "debian-13-standard_13.5-1_amd64.tar.zst"
+        result, fake_env_obj = _run_full(
+            tmp_path,
+            source_checkout,
+            scenario_overrides={
+                "local_templates": [incompatible],
+                "available_templates": [
+                    "system debian-13-standard_13.6-1_arm64.tar.zst",
+                    f"system {compatible_filename}",
+                ],
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert f"pveam download local {compatible_filename}" in fake_env_obj.log_lines()
+        create_lines = [line for line in fake_env_obj.log_lines() if line.startswith("pct create")]
+        assert len(create_lines) == 1
+        assert compatible_filename in create_lines[0]
+        assert incompatible not in create_lines[0]
+
+    def test_explicit_incompatible_template_stops_before_pve_mutation(self, tmp_path, source_checkout):
+        incompatible = "local:vztmpl/debian-13-standard_13.6-1_arm64.tar.zst"
+        result, fake_env_obj = _run_full(
+            tmp_path,
+            source_checkout,
+            args=["--template", incompatible],
+        )
+        assert result.returncode != 0
+        assert "has architecture 'arm64', but this PVE host requires 'amd64'" in result.stderr
+        assert not any(line.startswith("pct create") for line in fake_env_obj.log_lines())
+        assert not any(line.startswith("pveum ") for line in fake_env_obj.log_lines())
+        assert not any(
+            line.startswith("pveam update") or line.startswith("pveam download")
+            for line in fake_env_obj.log_lines()
+        )
+
+    def test_explicit_compatible_template_remains_legal(self, tmp_path, source_checkout):
+        compatible = "local:vztmpl/debian-13-standard_13.5-1_amd64.tar.zst"
+        result, fake_env_obj = _run_full(
+            tmp_path,
+            source_checkout,
+            args=["--template", compatible],
+        )
+        assert result.returncode == 0, result.stderr
+        assert fake_env_obj.state()["vmids"]["110"]["template"] == compatible
+
+    def test_generic_matching_debian_architecture_is_accepted(self, tmp_path, source_checkout):
+        compatible = "local:vztmpl/debian-13-standard_13.5-1_ppc64el.tar.zst"
+        result, fake_env_obj = _run_full(
+            tmp_path,
+            source_checkout,
+            scenario_overrides={
+                "host_debian_arch": "ppc64el",
+                "local_templates": [compatible],
+                "available_templates": [],
+            },
+        )
+        assert result.returncode == 0, result.stderr
+        assert fake_env_obj.state()["vmids"]["110"]["arch"] == "ppc64el"
+
+    def test_invalid_host_architecture_stops_during_read_only_planning(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path,
+            source_checkout,
+            scenario_overrides={"host_debian_arch": "AMD64!"},
+        )
+        assert result.returncode != 0
+        assert "returned an invalid architecture identifier 'AMD64!'" in result.stderr
+        assert not any(line.startswith("pct create") for line in fake_env_obj.log_lines())
+        assert not any(line.startswith("pveum ") for line in fake_env_obj.log_lines())
+
+    def test_host_architecture_query_failure_stops_during_read_only_planning(self, tmp_path, source_checkout):
+        result, fake_env_obj = _run_full(
+            tmp_path,
+            source_checkout,
+            scenario_overrides={"fail": ["dpkg_arch"]},
+        )
+        assert result.returncode != 0
+        assert "could not determine the PVE host's Debian architecture" in result.stderr
+        assert not any(line.startswith("pct create") for line in fake_env_obj.log_lines())
+        assert not any(line.startswith("pveum ") for line in fake_env_obj.log_lines())
+
     def test_no_debian13_template_anywhere_is_rejected(self, tmp_path, source_checkout):
         result, _ = _run_full(
             tmp_path, source_checkout,
