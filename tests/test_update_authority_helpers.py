@@ -12,6 +12,7 @@ HTTP, never touching a real PVE/network endpoint.
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import sqlite3
@@ -149,24 +150,33 @@ class TestInspect:
 
 
 class TestPathState:
-    def test_reports_exists_and_absent_without_conflating_them(self, tmp_path, capsys):
+    def test_reports_existing_path(self, tmp_path, capsys):
         present = tmp_path / "present"
         present.write_text("x", encoding="utf-8")
 
         assert authority_tool.cmd_path_state([str(present)]) == 0
         assert json.loads(capsys.readouterr().out) == {"ok": True, "exists": True}
 
+    def test_reports_enoent_as_absent(self, tmp_path, capsys):
         assert authority_tool.cmd_path_state([str(tmp_path / "absent")]) == 0
         assert json.loads(capsys.readouterr().out) == {"ok": True, "exists": False}
 
-    def test_probe_error_is_not_reported_as_absent(self, tmp_path, monkeypatch, capsys):
+    def test_lstat_eio_is_not_reported_as_absent(self, tmp_path, monkeypatch, capsys):
         def _raise(_path):
-            raise OSError("simulated probe failure")
+            raise OSError(errno.EIO, "simulated probe failure")
 
-        monkeypatch.setattr(authority_tool.os.path, "exists", _raise)
+        monkeypatch.setattr(authority_tool.os, "lstat", _raise)
         assert authority_tool.cmd_path_state([str(tmp_path / "unknown")]) != 0
         payload = json.loads(capsys.readouterr().out)
         assert payload == {"ok": False, "reason": "path_probe_failed"}
+        assert payload.get("exists") is not False
+
+    def test_dangling_symlink_is_existing_path_entry(self, tmp_path, capsys):
+        dangling = tmp_path / "dangling"
+        dangling.symlink_to(tmp_path / "missing-target")
+
+        assert authority_tool.cmd_path_state([str(dangling)]) == 0
+        assert json.loads(capsys.readouterr().out) == {"ok": True, "exists": True}
 
 
 class TestBackup:
@@ -217,6 +227,57 @@ class TestRemove:
     def test_remove_is_idempotent_on_missing_file(self, tmp_path):
         rc = authority_tool.cmd_remove([str(tmp_path / "nope.db")])
         assert rc == 0
+
+    def test_remove_fails_closed_on_pre_unlink_probe_unknown(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        db = tmp_path / "authority.db"
+        _make_authority_db(db)
+        unlink_calls = []
+        real_lstat = authority_tool.os.lstat
+
+        def _probe(path):
+            if path == str(db):
+                raise OSError(errno.EACCES, "simulated probe failure", path)
+            return real_lstat(path)
+
+        monkeypatch.setattr(authority_tool.os, "lstat", _probe)
+        monkeypatch.setattr(authority_tool.os, "unlink", unlink_calls.append)
+
+        rc = authority_tool.cmd_remove([str(db)])
+        assert rc != 0
+        assert json.loads(capsys.readouterr().out) == {
+            "ok": False,
+            "reason": "path_probe_failed:authority.db",
+        }
+        assert unlink_calls == []
+        assert db.exists()
+
+    def test_remove_fails_closed_on_post_unlink_probe_unknown(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        db = tmp_path / "authority.db"
+        _make_authority_db(db)
+        real_lstat = authority_tool.os.lstat
+        db_probe_count = 0
+
+        def _probe(path):
+            nonlocal db_probe_count
+            if path == str(db):
+                db_probe_count += 1
+                if db_probe_count == 2:
+                    raise OSError(errno.EIO, "simulated verification failure", path)
+            return real_lstat(path)
+
+        monkeypatch.setattr(authority_tool.os, "lstat", _probe)
+
+        rc = authority_tool.cmd_remove([str(db)])
+        assert rc != 0
+        assert json.loads(capsys.readouterr().out) == {
+            "ok": False,
+            "reason": "path_probe_failed_after_remove:authority.db",
+        }
+        assert not db.exists()
 
     def test_remove_fails_closed_when_unlink_raises(self, tmp_path, monkeypatch, capsys):
         # P1-B: a present-but-unremovable file (permission error, busy

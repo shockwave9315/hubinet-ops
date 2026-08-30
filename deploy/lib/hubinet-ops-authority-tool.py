@@ -86,6 +86,7 @@ deploy/lib/hubinet-ops-bootstrap-accept.py convention.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sqlite3
@@ -98,6 +99,22 @@ import uuid
 # its current value is itself part of this repository's stable on-disk
 # contract, not expected to change casually.
 EXPECTED_MARKER_TEXT = "hubinet_ops_0_5_authority"
+
+_PATH_EXISTS = "exists"
+_PATH_ABSENT = "absent"
+_PATH_UNKNOWN = "unknown"
+
+
+def _path_entry_state(path: str) -> str:
+    """Strictly classify one path entry without hiding probe failures."""
+
+    try:
+        os.lstat(path)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            return _PATH_ABSENT
+        return _PATH_UNKNOWN
+    return _PATH_EXISTS
 
 
 def _is_canonical_uuid(value: object) -> bool:
@@ -207,12 +224,11 @@ def cmd_path_state(argv: list[str]) -> int:
     if len(argv) != 1:
         print(json.dumps({"ok": False, "reason": "usage"}))
         return 2
-    try:
-        exists = os.path.exists(argv[0])
-    except OSError:
+    state = _path_entry_state(argv[0])
+    if state == _PATH_UNKNOWN:
         print(json.dumps({"ok": False, "reason": "path_probe_failed"}))
         return 1
-    print(json.dumps({"ok": True, "exists": exists}, separators=(",", ":")))
+    print(json.dumps({"ok": True, "exists": state == _PATH_EXISTS}, separators=(",", ":")))
     return 0
 
 
@@ -320,8 +336,16 @@ def cmd_remove(argv: list[str]) -> int:
         print(json.dumps({"ok": False, "reason": "usage"}))
         return 2
     db_path = argv[0]
-    for candidate in (db_path, db_path + "-wal", db_path + "-shm"):
-        if not os.path.exists(candidate):
+    candidates = (db_path, db_path + "-wal", db_path + "-shm")
+    for candidate in candidates:
+        state = _path_entry_state(candidate)
+        if state == _PATH_UNKNOWN:
+            print(json.dumps({
+                "ok": False,
+                "reason": f"path_probe_failed:{os.path.basename(candidate)}",
+            }))
+            return 1
+        if state == _PATH_ABSENT:
             continue
         try:
             os.unlink(candidate)
@@ -337,10 +361,27 @@ def cmd_remove(argv: list[str]) -> int:
     # raised nothing" and "the path is actually gone" (e.g. a concurrent
     # recreate, or a filesystem that accepts an unlink() call but does not
     # actually make the path disappear).
+    verification_states = [
+        (candidate, _path_entry_state(candidate))
+        for candidate in candidates
+    ]
+    unknown = [
+        candidate
+        for candidate, state in verification_states
+        if state == _PATH_UNKNOWN
+    ]
+    if unknown:
+        print(json.dumps({
+            "ok": False,
+            "reason": "path_probe_failed_after_remove:"
+            + ",".join(os.path.basename(p) for p in unknown),
+        }))
+        return 1
+
     still_present = [
         candidate
-        for candidate in (db_path, db_path + "-wal", db_path + "-shm")
-        if os.path.exists(candidate)
+        for candidate, state in verification_states
+        if state == _PATH_EXISTS
     ]
     if still_present:
         print(json.dumps({
