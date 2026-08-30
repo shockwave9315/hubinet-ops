@@ -79,6 +79,7 @@ import os
 import re
 import shutil
 import sys
+import tarfile
 from pathlib import Path
 
 FAKE_STORAGE = "local-lxc"
@@ -132,10 +133,16 @@ def _fail(kind):
 _CT_PATH_ANCHORS = (
     "etc/hubinet-ops",
     "var/lib/hubinet-ops",
+    "opt/hubinet-ops",
     "tmp/hubinet-ops-src",
     "tmp/nftables.conf",
     "tmp/hubinet-ops-src.tar.gz",
     "tmp/hubinet-ops-bootstrap-accept.py",
+    "tmp/hubinet-ops-update-src",
+    "tmp/hubinet-ops-update-src.tar.gz",
+    "tmp/hubinet-ops-authority-tool.py",
+    "tmp/hubinet-ops-update-probe.py",
+    "tmp/hubinet-ops-update-venv-stage.py",
 )
 
 
@@ -356,15 +363,69 @@ def _exec_inner(vmid, inner, state):
         )
         return 2
 
+    if inner[0] == "tar" and "-xzf" in inner:
+        # The in-place updater's own staging step (unlike the bootstrap
+        # installer, which never inspects extracted content) needs this
+        # extraction to be real: later fake commands (cp -a, cat, ...)
+        # read the extracted files back. Still fully hermetic --
+        # Python's own stdlib tarfile against a tarball `pct push` already
+        # copied for real onto this same simulated CT filesystem.
+        if _fail("tar_extract"):
+            return 1
+        tarball_arg = inner[inner.index("-xzf") + 1]
+        dest_arg = inner[inner.index("-C") + 1] if "-C" in inner else "."
+        tarball_path = _ct_path(vmid, tarball_arg)
+        dest_path = _ct_path(vmid, dest_arg)
+        dest_path.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tarball_path, "r:gz") as archive:
+            archive.extractall(dest_path, filter="data")  # noqa: S202 -- trusted, test-only tarball
+        return 0
+
     if inner[0] == "tar":
-        # Extraction is not content-inspected by any test assertion; a
-        # no-op is sufficient and keeps the fake hermetic.
         return 0
 
     if inner[0] == "rm":
-        normalized_target = _normalize_ct_arg(inner[-1])
-        if normalized_target == "/etc/hubinet-ops/host-control":
-            shutil.rmtree(_ct_path(vmid, normalized_target), ignore_errors=True)
+        # Generalized (beyond the original host-control-only special
+        # case): the in-place updater's own rollback/cleanup steps
+        # `rm -rf` several different staged/rollback paths, and a later
+        # `mv` into a path this didn't actually remove would otherwise
+        # nest incorrectly (Python's shutil.move moves INTO an existing
+        # directory rather than replacing it) -- so this fake must really
+        # remove each named target, not merely report success.
+        targets = [a for a in inner[1:] if not a.startswith("-")]
+        for raw_target in targets:
+            normalized_target = _normalize_ct_arg(raw_target)
+            target_path = _ct_path(vmid, normalized_target)
+            if target_path.is_dir():
+                shutil.rmtree(target_path, ignore_errors=True)
+            elif target_path.exists():
+                target_path.unlink()
+        return 0
+
+    if inner[0] == "mv" and len(inner) >= 3:
+        src = _ct_path(vmid, inner[-2])
+        dst = _ct_path(vmid, inner[-1])
+        if not src.exists():
+            return 1
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and dst.is_dir() and not src.is_dir():
+            return 1
+        shutil.move(str(src), str(dst))
+        return 0
+
+    if inner[0] == "cp":
+        cp_args = [a for a in inner[1:] if not a.startswith("-")]
+        if len(cp_args) != 2:
+            return 2
+        src = _ct_path(vmid, cp_args[0])
+        dst = _ct_path(vmid, cp_args[1])
+        if not src.exists():
+            return 1
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(str(src), str(dst), dirs_exist_ok=True)
+        else:
+            shutil.copyfile(str(src), str(dst))
         return 0
 
     if inner[:2] == ["chown", "root:hubinetops"] or inner[0] == "chown":
@@ -462,8 +523,142 @@ def _exec_inner(vmid, inner, state):
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-resolve-dns.py"):
         return _exec_resolve_dns(inner[2:])
 
+    if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-authority-tool.py"):
+        return _exec_authority_tool(vmid, inner[2:])
+
+    if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-update-probe.py"):
+        return _exec_update_probe(vmid)
+
+    if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-update-venv-stage.py"):
+        return _exec_venv_stage(vmid, inner[2:])
+
     _log("pct", "exec", "UNHANDLED", *inner)
     return 2
+
+
+def _exec_authority_tool(vmid, args):
+    # Simulates deploy/lib/hubinet-ops-authority-tool.py's OWN observable
+    # JSON contract without a real sqlite database -- a fake "authority.db"
+    # is simply a small JSON object {"marker", "schema_version",
+    # "backend_instance_id"} written directly at the CT path by whatever
+    # seeded/activated it (see seed_authority_db / the real production
+    # code path, both of which write through this same simulated
+    # filesystem). This keeps the shell-level orchestration tests
+    # (staging/activation/rollback order, ledger gating) exercised
+    # against realistic pass/fail outcomes while the REAL tool's own
+    # sqlite/backup/integrity-check logic is covered by direct pytest
+    # unit tests against the real script (no fake needed there).
+    if not args:
+        return 2
+    subcommand = args[0]
+    if _fail(f"authority_tool_{subcommand}"):
+        print(json.dumps({"ok": False, "reason": "simulated_failure"}))
+        return 1
+    if subcommand == "inspect":
+        path = _ct_path(vmid, args[1])
+        if not path.exists() or path.stat().st_size == 0:
+            print(json.dumps({"ok": False, "exists": False, "reason": "missing_or_empty"}))
+            return 0
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            print(json.dumps({"ok": False, "exists": True, "reason": "structurally_unreadable"}))
+            return 0
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("marker"), str)
+            or not isinstance(data.get("schema_version"), int)
+            or not isinstance(data.get("backend_instance_id"), str)
+        ):
+            print(json.dumps({"ok": False, "exists": True, "reason": "structurally_unreadable"}))
+            return 0
+        if data["marker"] != "hubinet_ops_0_5_authority":
+            print(json.dumps({"ok": False, "exists": True, "reason": "marker_mismatch"}))
+            return 0
+        print(json.dumps({
+            "ok": True, "exists": True, "marker": data["marker"],
+            "schema_version": data["schema_version"],
+            "backend_instance_id": data["backend_instance_id"],
+        }))
+        return 0
+    if subcommand == "backup" and len(args) == 6:
+        db_arg, dest_arg, exp_marker, exp_version, exp_backend = args[1:6]
+        src = _ct_path(vmid, db_arg)
+        if not src.exists() or src.stat().st_size == 0:
+            print(json.dumps({"ok": False, "reason": "live_recheck_missing_or_empty"}))
+            return 1
+        try:
+            data = json.loads(src.read_text())
+        except (OSError, ValueError):
+            print(json.dumps({"ok": False, "reason": "live_recheck_structurally_unreadable"}))
+            return 1
+        if (
+            data.get("marker") != exp_marker
+            or str(data.get("schema_version")) != str(exp_version)
+            or data.get("backend_instance_id") != exp_backend
+        ):
+            print(json.dumps({"ok": False, "reason": "live_recheck_context_changed"}))
+            return 1
+        dest = _ct_path(vmid, dest_arg)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(data), encoding="utf-8")
+        print(json.dumps({
+            "ok": True, "backup_path": dest_arg,
+            "backend_instance_id": data["backend_instance_id"],
+        }))
+        return 0
+    if subcommand == "remove" and len(args) == 2:
+        target = _ct_path(vmid, args[1])
+        if target.exists():
+            target.unlink()
+        print(json.dumps({"ok": True}))
+        return 0
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    return 2
+
+
+def _exec_venv_stage(vmid, args):
+    # Simulates deploy/lib/hubinet-ops-update-venv-stage.py's own
+    # observable contract -- creating a venv-shaped directory and
+    # succeeding/failing per the "venv_create"/"pip_install" scenario
+    # keys, without actually invoking a real venv/pip anywhere.
+    if len(args) != 2:
+        return 2
+    venv_path = _ct_path(vmid, args[0])
+    if _fail("venv_create"):
+        return 1
+    (venv_path / "bin").mkdir(parents=True, exist_ok=True)
+    (venv_path / "bin" / "pip").write_text("#!/bin/sh\n", encoding="utf-8")
+    (venv_path / "bin" / "python3").write_text("#!/bin/sh\n", encoding="utf-8")
+    if _fail("pip_install"):
+        return 1
+    return 0
+
+
+def _exec_update_probe(vmid):
+    # Simulates deploy/lib/hubinet-ops-update-probe.py's own observable
+    # JSON contract -- one bounded, non-waiting read of current state,
+    # driven by "update_probe_*" scenario keys (default: mirrors the
+    # discovery_* keys already used by _exec_discovery_accept so a test
+    # scenario only needs to set one consistent set of facts for both the
+    # pre-update probe and the post-update acceptance check).
+    if _fail("update_probe"):
+        print(json.dumps({"ok": False, "reason": "backend_endpoint_unreachable: simulated"}))
+        return 0
+    backend_id = SCENARIO.get(
+        "update_probe_backend_instance_id",
+        SCENARIO.get("discovery_backend_instance_id", "fake-backend-instance-id"),
+    )
+    sequence = SCENARIO.get("update_probe_sequence", SCENARIO.get("discovery_committed_sequence", 1))
+    print(json.dumps({
+        "ok": True,
+        "backend_instance_id": backend_id,
+        "service_active": True,
+        "last_committed_run_sequence": sequence,
+        "health": "healthy",
+        "freshness": "fresh",
+    }))
+    return 0
 
 
 def _exec_resolve_dns(args):
@@ -574,6 +769,24 @@ def _exec_discovery_accept(vmid, args):
     source_name = SCENARIO.get("discovery_source_name", expected_name)
     resource_count = SCENARIO.get("discovery_resource_count", 0)
     node_count = SCENARIO.get("discovery_node_count", 1)
+    committed_sequence = SCENARIO.get("discovery_committed_sequence", 1)
+    # A 3rd positional argument mirrors the real script's own optional
+    # min-committed-sequence-exclusive extension (see
+    # deploy/lib/hubinet-ops-bootstrap-accept.py) -- used by the in-place
+    # updater's post-update, DB-preserving acceptance check to prove a
+    # genuine completed cycle happened AFTER the restart, not merely that
+    # the pre-update state is still being reported.
+    if len(args) >= 3:
+        try:
+            min_sequence_exclusive = int(args[2])
+        except ValueError:
+            min_sequence_exclusive = 0
+        if min_sequence_exclusive and committed_sequence <= min_sequence_exclusive:
+            print(
+                f"FAIL committed-sequence-not-past-baseline "
+                f"got={committed_sequence!r} baseline={min_sequence_exclusive!r}"
+            )
+            return 1
 
     state = _load_state()
     if not _firewall_permits_local_and_reply_traffic(vmid, state):
@@ -631,7 +844,7 @@ def _exec_discovery_accept(vmid, args):
     print(
         f"PASS backend_instance_id={backend_id} "
         f"source_health=healthy source_freshness=fresh "
-        f"last_committed_run_sequence=1 "
+        f"last_committed_run_sequence={committed_sequence} "
         f"node_count={node_count} resource_count={resource_count}"
     )
     return 0
@@ -651,6 +864,22 @@ def _exec_systemctl(vmid, args, state):
         entry["service_enabled"] = False
         _save_state(state)
         return 0
+    if args == ["stop", "hubinet-ops"]:
+        if _fail("service_stop"):
+            return 1
+        entry["service"] = "inactive"
+        _save_state(state)
+        return 0
+    if args == ["start", "hubinet-ops"]:
+        if _fail("service_start_after_stop"):
+            return 1
+        entry["service"] = "active"
+        _save_state(state)
+        return 0
+    if args == ["daemon-reload"]:
+        if _fail("daemon_reload"):
+            return 1
+        return 0
     if args == ["is-active", "hubinet-ops"]:
         state_val = SCENARIO.get("service_active_override", entry.get("service", "inactive"))
         sys.stdout.write(state_val + "\n")
@@ -668,6 +897,10 @@ def _exec_systemctl(vmid, args, state):
         return 0
     if args == ["status", "hubinet-ops-hostd"]:
         return 0 if SCENARIO.get("legacy_present", {}).get("hostd") else 1
+    if args == ["is-active", "nftables"]:
+        active = entry.get("nftables_active", False)
+        sys.stdout.write(("active" if active else "inactive") + "\n")
+        return 0 if active else 3
     if args[:1] == ["enable"] and "nftables" in args:
         return 0
     if args[:1] == ["restart"] and "nftables" in args:
