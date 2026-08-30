@@ -152,6 +152,12 @@ BOOTSTRAP_LEDGER="$(mktemp /tmp/hubinet-ops-update-ledger.XXXXXX)"
 BOOTSTRAP_SECRET_FILES="$(mktemp /tmp/hubinet-ops-update-secrets.XXXXXX)"
 chmod 0600 "${BOOTSTRAP_LEDGER}" "${BOOTSTRAP_SECRET_FILES}"
 
+# UPDATE_RUN_ID: generated ONCE for the whole invocation (not only once
+# staging starts) so every /tmp artifact this run creates -- including the
+# Phase U2 planning tools update-plan.sh pushes into the CT -- is
+# run-owned from the start, never a fixed shared name.
+UPDATE_RUN_ID="$(_generate_run_id)"
+
 _update_exit_trap() {
   local exit_code=$?
   trap - EXIT
@@ -184,6 +190,7 @@ update_plan_print
 
 if [[ "${UPDATE_DRY_RUN}" == "1" ]]; then
   log_info "--dry-run: stopping after the plan above. No managed-state mutation was made."
+  _update_cleanup_plan_tools
   exit 0
 fi
 

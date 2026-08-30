@@ -420,3 +420,252 @@ class TestInstalledSourceMarkerAndRepeatedUpdates:
         assert post_state["vmids"][FAKE_VMID]["service"] == "active"
         db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
         assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+
+
+# ---------------------------------------------------------------------------
+# M. P1-A -- every INTERMEDIATE activation-step failure (not only ones
+#    after a fully completed artifact swap) must roll back to a coherent
+#    OLD installation. See deploy/lib/update-activate.sh's own header
+#    comment and _update_rollback_app / _update_rollback_venv_and_
+#    requirements / _update_rollback_unit.
+# ---------------------------------------------------------------------------
+
+
+class TestActivationIntermediateFailures:
+    def test_app_first_move_failure_leaves_old_app_untouched(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="3" * 40,
+            scenario_overrides={"fail": ["mv_live_app_to_rollback"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-app-fail-1", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        marker = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip()
+        assert marker == "3" * 40
+
+    def test_app_second_move_failure_restores_old_app(self, tmp_path):
+        # The concrete witness P1-A targets: by the time the SECOND move
+        # (staged -> live) fails, the OLD app has already been moved aside
+        # to app.rollback-<RUN_ID>. Under the old code, the
+        # "update-app-activated" ledger marker was only ever recorded
+        # AFTER this second move succeeded, so rollback would skip app
+        # restoration entirely and leave /opt/hubinet-ops/app missing
+        # outright.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="4" * 40,
+            scenario_overrides={"fail": ["mv_staged_app_to_live"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-app-fail-2", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists(), (
+            "the application payload directory must never be left missing after rollback"
+        )
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_venv_second_move_failure_restores_old_venv(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_requirements="fastapi==0.100.0\n",
+            scenario_overrides={"fail": ["mv_staged_venv_to_live"]},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-venv-fail", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip").exists(), (
+            "the virtualenv must never be left missing after rollback"
+        )
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_requirements_second_move_failure_restores_old_requirements(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_requirements="fastapi==0.100.0\n",
+            scenario_overrides={"fail": ["mv_staged_requirements_to_live"]},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-reqs-fail-2", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_unit_preserve_copy_failure_leaves_old_unit(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path, scenario_overrides={"fail": ["cp_live_unit_to_rollback"]}
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-unit-fail", REPO_ROOT, unit_text="[Unit]\nDescription=changed\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "changed" not in env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service")
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# N. P1-B -- authority-database removal during ROLLBACK must fail closed:
+#    the validated pre-update backup must never be copied over an
+#    unproven live/sidecar state.
+# ---------------------------------------------------------------------------
+
+
+class TestAuthorityRemoveFailClosedRollback:
+    def test_rollback_hard_stops_when_target_db_removal_cannot_be_proven(self, tmp_path):
+        # The forward reset's own `remove` call (1st) succeeds; the LATER
+        # rollback-triggering failure's `remove` call (2nd, during
+        # rollback itself) is the one that fails here.
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail_nth_authority_remove": 2,
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target-v8-remove-fail", REPO_ROOT, schema_version=8)
+        result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "could not prove removal" in result.stderr
+        backups_root = env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/update-backups")
+        backup_files = list(backups_root.rglob("authority.db"))
+        assert backup_files, "expected the retained authority DB backup to survive"
+        backup_data = json.loads(backup_files[0].read_text(encoding="utf-8"))
+        assert backup_data["schema_version"] == 7
+        assert backup_data["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+        # Never copied over an uncertain live database state.
+        assert not env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db").exists()
+
+
+# ---------------------------------------------------------------------------
+# O. P2-A -- staging must be exact and run-owned/clean.
+# ---------------------------------------------------------------------------
+
+
+class TestStagingExactAndCleanP2A:
+    def test_stale_legacy_shared_staging_path_never_enters_activated_app(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        stale = env.ct_file(FAKE_VMID, "/tmp/hubinet-ops-update-src/leftover.py")
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("# stale content from a prior interrupted run\n", encoding="utf-8")
+        target = build_update_target_checkout(tmp_path / "target-stale-staging", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/leftover.py").exists()
+        # The stale fixed-name path is simply never touched by a run-owned
+        # (UPDATE_RUN_ID-suffixed) staging path.
+        assert stale.exists()
+
+    def test_helper_staged_from_exact_commit_not_dirty_worktree(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(
+            tmp_path / "target-helper-exact", REPO_ROOT,
+            helper_text="#!/usr/bin/env python3\n# committed helper content\n",
+        )
+        expected_sha = git_head_sha(target)
+        # `git status --porcelain` (this repo's own clean-worktree gate)
+        # reports clean for an assume-unchanged path even though its
+        # on-disk content differs from what is actually committed at
+        # HEAD -- staging must read the committed blob (git show), never
+        # this drifted worktree file.
+        subprocess.run(
+            ["git", "update-index", "--assume-unchanged", "deploy/hubinet-package-scan-helper.py"],
+            cwd=str(target), check=True, capture_output=True,
+        )
+        (target / "deploy" / "hubinet-package-scan-helper.py").write_text(
+            "#!/usr/bin/env python3\n# WORKTREE DRIFT -- must never be staged\n", encoding="utf-8"
+        )
+        result = _run(env.env, _base_args(target, expected_sha=expected_sha))
+        assert result.returncode == 0, result.stderr
+        helper_path = (
+            Path(env.env["HUBINET_OPS_TEST_HOST_ROOT"])
+            / "usr" / "local" / "libexec" / f"hubinet-package-scan-helper-{FAKE_RUN_ID}"
+        )
+        activated = helper_path.read_text(encoding="utf-8")
+        assert "WORKTREE DRIFT" not in activated
+        assert "committed helper content" in activated
+
+
+# ---------------------------------------------------------------------------
+# P. P2-B -- the installed-source marker must roll back coherently,
+#    together with the app/db, never leaving a NEW marker paired with a
+#    rolled-back OLD installation.
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerRollbackCoherenceP2B:
+    def test_marker_move_failure_restores_old_marker_with_app(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="5" * 40,
+            scenario_overrides={"fail": ["mv_staged_marker_to_live"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-marker-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        marker = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip()
+        assert marker == "5" * 40
+        # The app payload -- already fully activated to the NEW content by
+        # the time the marker step (the LAST activation step) runs -- must
+        # also have been rolled back to the OLD content, together with
+        # the marker.
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_marker_move_failure_with_no_pre_existing_marker_leaves_none(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha=None,
+            scenario_overrides={"fail": ["mv_staged_marker_to_live"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-marker-fail-no-old", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# Q. P2-C -- a schema-PRESERVING update must preflight-prove the live DB's
+#    actual structural schema objects match the target's required set,
+#    before the service is ever stopped -- a coherent marker/version/
+#    backend-identity classification alone is weaker than the target
+#    runtime's own schema validation.
+# ---------------------------------------------------------------------------
+
+
+class TestPreserveSchemaObjectsP2C:
+    def test_preserve_fails_closed_before_service_stop_on_structural_drift(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=8,
+            # Missing "one_active_endpoint_per_source" relative to the
+            # target's default required set (FAKE_REQUIRED_SCHEMA_OBJECTS).
+            schema_objects=["authority_schema", "backend_instance"],
+        )
+        target = build_update_target_checkout(tmp_path / "target-schema-drift", REPO_ROOT, schema_version=8)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "structurally drifted" in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not any("systemctl" in line and "stop" in line for line in env.log_lines())
+
+    def test_preserve_succeeds_when_schema_objects_match(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-schema-ok", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr

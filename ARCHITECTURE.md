@@ -181,17 +181,30 @@ bearer, or the host-control key.
 
 **Authority schema decision.** `deploy/lib/hubinet-ops-authority-tool.py`
 (run inside the CT) is a small, read-only-first inspector: it reads
-`authority_schema`'s marker/version and `backend_instance.backend_instance_id`
-and reports whether the database is recognizable — never a security proof,
-just enough to classify. The target schema is read statically (a regex over
-the target commit's `app/inventory/store.py` text, never an executed import)
-so the updater never has to run target application code to plan. Same
-schema: preserve, untouched. Different schema: no migration exists in this
-product's current scope (see `AGENTS.md`) — a coherent backup
-(`sqlite3`'s stdlib online backup API, integrity-checked and re-validated
-against the pre-reset identity before the live file is removed) followed by
-removal; the target runtime creates its own fresh schema on next start. The
-updater never writes authority schema DDL itself.
+`authority_schema`'s marker/version, `backend_instance.backend_instance_id`,
+and the live set of table/index/trigger names, and reports whether the
+database is recognizable — never a security proof, just enough to classify.
+The target schema is read statically (a regex over the target commit's
+`app/inventory/store.py` text, never an executed import) so the updater
+never has to run target application code to plan; the same static read also
+extracts the target's *required* schema-object set. Same marker/version:
+before ever stopping the service, the updater additionally proves the live
+database's actual schema objects match that required set exactly — a
+matching marker/version alone is weaker than the target runtime's own
+schema validation (`app/inventory/store.py`'s `_REQUIRED_SCHEMA_OBJECTS`
+check), so a structurally drifted database that would otherwise be
+misclassified "preserve" and then get rejected by the target runtime at
+restart instead fails closed here, before any mutation. Different schema:
+no migration exists in this product's current scope (see `AGENTS.md`) — a
+coherent backup (`sqlite3`'s stdlib online backup API, integrity-checked and
+re-validated against the pre-reset identity before the live file is
+removed) followed by removal; the target runtime creates its own fresh
+schema on next start. The updater never writes authority schema DDL itself.
+`remove` fails closed: a present-but-unremovable database or WAL/SHM
+sidecar is an immediate reported failure (independently re-verified absent,
+never assumed from the unlink call's own success alone), and rollback
+never copies the validated pre-update backup over an authority database
+whose removal it cannot prove.
 
 **PVE host helper update contract.** The forced-command `authorized_keys`
 line, the pinned host-control key, and `known_hosts` are never touched.
@@ -201,13 +214,21 @@ path, new content, exactly like `deploy/hubinet-package-scan-helper.py`'s
 own request/response version check already expects.
 
 **Rollback.** Filesystem rollback material
-(`app.rollback-<runid>`, `.venv.rollback-<runid>`, a preserved copy of the
-systemd unit, a preserved copy of the PVE helper) is retained until
-acceptance succeeds, using the same ledger mechanism
+(`app.rollback-<runid>`, `.venv.rollback-<runid>`, `requirements.txt.
+rollback-<runid>`, a preserved copy of the systemd unit, a preserved copy
+of the PVE helper, and a preserved copy of the installed-source marker) is
+retained until acceptance succeeds, using the same ledger mechanism
 (`deploy/lib/bootstrap-common.sh`) bootstrap's own rollback already relies
-on. A target failure after a destructive authority reset restores the
-coherent *old* installation, database included — the updater never leaves
-old code paired with a new, incompatible schema.
+on. For every one of those artifacts, a durable "attempted" ledger marker
+is recorded *before* its first destructive mutation (not after its swap
+completes), and rollback restores based on which of that artifact's own
+fixed, owned paths actually exist rather than trusting the marker to imply
+a fully completed swap — correct for a failure at any intermediate point,
+not only one after a complete swap, because a real rename is atomic. A
+target failure after a destructive authority reset restores the coherent
+*old* installation, database included — the updater never leaves old code
+paired with a new, incompatible schema, and never a new installed-source
+marker paired with a rolled-back old installation.
 
 See `deploy/README-update-proxmox-0.5.md` for the operator runbook.
 

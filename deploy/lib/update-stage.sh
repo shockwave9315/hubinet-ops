@@ -5,8 +5,8 @@
 # file activates a staged artifact -- see update-activate.sh for that.
 
 UPDATE_RUN_ID=""
-UPDATE_CT_SOURCE_TARBALL="/tmp/hubinet-ops-update-src.tar.gz"
-UPDATE_CT_SOURCE_DIR="/tmp/hubinet-ops-update-src"
+UPDATE_CT_SOURCE_TARBALL=""
+UPDATE_CT_SOURCE_DIR=""
 UPDATE_APP_STAGED_PATH=""
 UPDATE_VENV_STAGED_PATH=""
 UPDATE_REQUIREMENTS_STAGED_PATH=""
@@ -15,7 +15,13 @@ UPDATE_HELPER_STAGED_HOST_PATH=""
 UPDATE_HELPER_HOST_PATH=""
 
 update_stage_all() {
-  UPDATE_RUN_ID="$(_generate_run_id)"
+  # UPDATE_RUN_ID is generated once, by update-proxmox-0.5.sh itself,
+  # before Phase U1 -- shared by the planning-phase tool paths
+  # (update-plan.sh) and every staging/activation path below, so every
+  # /tmp artifact this invocation touches is run-owned from the start.
+  [[ -n "${UPDATE_RUN_ID}" ]] || die "internal error: UPDATE_RUN_ID was not set before update_stage_all"
+  UPDATE_CT_SOURCE_TARBALL="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}.tar.gz"
+  UPDATE_CT_SOURCE_DIR="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}"
   UPDATE_APP_STAGED_PATH="/opt/hubinet-ops/app.staged-${UPDATE_RUN_ID}"
   UPDATE_VENV_STAGED_PATH="/opt/hubinet-ops/.venv.staged-${UPDATE_RUN_ID}"
   UPDATE_REQUIREMENTS_STAGED_PATH="/opt/hubinet-ops/requirements.txt.staged-${UPDATE_RUN_ID}"
@@ -49,6 +55,14 @@ _update_stage_source_tree() {
     || die "git archive of commit ${SOURCE_HEAD_SHA} failed"
   run_logged pct push "${VMID}" "${tarball_host}" "${UPDATE_CT_SOURCE_TARBALL}" \
     || die "failed to push target source tarball into container ${VMID}"
+  # UPDATE_CT_SOURCE_DIR is this run's own run-id-suffixed path (never a
+  # fixed shared name a previous interrupted/killed run could have left
+  # populated) -- still clear it defensively before extracting, so a
+  # target archive is never overlaid onto ANY prior tree, even in the
+  # practically-impossible event this fresh random run-id path already
+  # had something at it.
+  run_logged pct exec "${VMID}" -- rm -rf "${UPDATE_CT_SOURCE_DIR}" \
+    || die "failed to clear the staging extraction directory inside container ${VMID} before use"
   run_logged pct exec "${VMID}" -- mkdir -p "${UPDATE_CT_SOURCE_DIR}" \
     || die "failed to create staging extraction directory inside container ${VMID}"
   run_logged pct exec "${VMID}" -- tar -xzf "${UPDATE_CT_SOURCE_TARBALL}" -C "${UPDATE_CT_SOURCE_DIR}" \
@@ -96,8 +110,16 @@ _update_stage_unit() {
 _update_stage_helper() {
   local helper_tmp
   helper_tmp="$(mktemp /tmp/hubinet-ops-update-helper.XXXXXX)"
-  cp "${SOURCE_DIR}/deploy/hubinet-package-scan-helper.py" "${helper_tmp}" \
-    || { rm -f "${helper_tmp}"; die "failed to read the target PVE host helper from ${SOURCE_DIR}"; }
+  # Read the helper payload from the EXACT approved commit (git show), not
+  # the mutable SOURCE_DIR worktree file -- this staging step runs before
+  # update-activate.sh's own immediately-before-activation HEAD/clean
+  # recheck, so a worktree read here could stage content that was never
+  # actually confirmed. `>` writes the blob's exact bytes; no command
+  # substitution (which would strip a trailing newline).
+  git -C "${SOURCE_DIR}" show "${SOURCE_HEAD_SHA}:deploy/hubinet-package-scan-helper.py" >"${helper_tmp}" 2>/dev/null \
+    || { rm -f "${helper_tmp}"; die "failed to read deploy/hubinet-package-scan-helper.py from the exact approved commit ${SOURCE_HEAD_SHA}"; }
+  [[ -s "${helper_tmp}" ]] \
+    || { rm -f "${helper_tmp}"; die "target commit ${SOURCE_HEAD_SHA} produced an empty deploy/hubinet-package-scan-helper.py -- refusing to stage it"; }
   ledger_record update-staged-helper "${UPDATE_HELPER_STAGED_HOST_PATH}"
   _host_control_install_file 0755 "${helper_tmp}" "${UPDATE_HELPER_STAGED_HOST_PATH}" \
     || { rm -f "${helper_tmp}"; die "failed to stage the target PVE host helper"; }
@@ -110,12 +132,20 @@ _update_stage_helper() {
 # entirely). Never touches an artifact that was already activated (those
 # are cleaned up separately, only after acceptance succeeds).
 update_stage_cleanup() {
+  _update_cleanup_plan_tools
   if ledger_has update-staged-helper "${UPDATE_HELPER_STAGED_HOST_PATH}" \
     && ! ledger_has update-helper-activated "${VMID}"; then
     rm -f "${UPDATE_HELPER_STAGED_HOST_PATH}" 2>/dev/null || true
   fi
   if [[ -n "${VMID:-}" ]]; then
-    pct exec "${VMID}" -- rm -rf "${UPDATE_CT_SOURCE_DIR}" >/dev/null 2>&1 || true
+    # UPDATE_CT_SOURCE_DIR is only assigned once update_stage_all actually
+    # runs (it is run-id-suffixed -- see update_stage_all); this cleanup
+    # function is also called on a failure BEFORE staging ever started
+    # (e.g. Phase U2 classification, plan confirmation), where it is still
+    # the empty string default. Never pass an empty path to `rm -rf`.
+    if [[ -n "${UPDATE_CT_SOURCE_DIR}" ]]; then
+      pct exec "${VMID}" -- rm -rf "${UPDATE_CT_SOURCE_DIR}" >/dev/null 2>&1 || true
+    fi
     if ledger_has update-staged-app "${VMID}" && ! ledger_has update-app-activated "${VMID}"; then
       pct exec "${VMID}" -- rm -rf "${UPDATE_APP_STAGED_PATH}" "${UPDATE_REQUIREMENTS_STAGED_PATH}" >/dev/null 2>&1 || true
     fi

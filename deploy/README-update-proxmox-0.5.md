@@ -156,14 +156,16 @@ Before the old service is stopped, any failure (staging, source-provenance
 recheck, a build failure in a staged virtualenv) leaves the existing
 installation completely untouched.
 
-After the service is stopped, a failure at any later point triggers a
-coherent rollback: every changed artifact (app payload, virtualenv +
-`requirements.txt`, systemd unit, PVE host helper) is restored from its
+After the service is stopped, a failure at any later point — including a
+failure partway through swapping any single artifact, not only one after
+that swap fully completes — triggers a coherent rollback: every changed
+artifact (app payload, virtualenv + `requirements.txt`, systemd unit, PVE
+host helper, and the installed-source marker) is restored from its
 retained rollback copy, and — if a destructive authority reset had already
 happened — the validated pre-update database backup is restored in place
 of the newly-created target database, so a failed update never leaves old
-code paired with an incompatible new schema. The old service is then
-restarted and its liveness re-verified.
+code paired with an incompatible new schema or a new source marker. The
+old service is then restarted and its liveness re-verified.
 
 If rollback itself cannot complete, the updater stops hard, preserves every
 rollback/backup artifact for manual recovery, and prints the exact state

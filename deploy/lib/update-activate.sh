@@ -4,12 +4,30 @@
 # From _update_recheck_source_commit onward this file may mutate managed
 # installation state. The activation mutation order in
 # update_activate_and_accept is fixed and never reordered (AGENTS.md task
-# prompt section 20). Every step records a ledger marker (bootstrap-
-# common.sh::ledger_record) BEFORE or immediately after the mutation it
-# guards, exactly like deploy/bootstrap-proxmox-0.5.sh's own rollback
-# convention -- update-proxmox-0.5.sh's own EXIT trap calls
+# prompt section 20). update-proxmox-0.5.sh's own EXIT trap calls
 # update_rollback_on_failure whenever the process exits non-zero after the
 # service was stopped (ledger_has update-service-stopped), never before.
+#
+# Rollback invariant (corrective pass): for every rollback-managed
+# artifact (app, venv+requirements, systemd unit), a durable
+# "*-activation-attempted" ledger marker is recorded BEFORE that
+# artifact's FIRST destructive mutation -- not after its swap completes.
+# A destructive mutation is one that removes or overwrites something at a
+# LIVE path; a `cp` that only reads the live path to create a rollback
+# copy is not destructive and does not itself need a marker first (see
+# the systemd unit and PVE host helper steps below, which stage their
+# rollback copy with `cp` before the one destructive `mv`).
+#
+# Rollback itself never trusts "the marker implies the swap fully
+# completed" -- each `_update_rollback_*` helper instead inspects the
+# actual, bounded set of paths that artifact owns (live path, this run's
+# fixed rollback-<UPDATE_RUN_ID> path) and restores based on what it
+# actually finds there. This makes rollback correct regardless of exactly
+# which destructive step (if any) failed, because a real `mv`/rename is
+# atomic -- it either fully happens or leaves both sides exactly as they
+# were -- so "does the rollback-<UPDATE_RUN_ID> path exist" is a reliable,
+# bounded signal of whether the live path still holds the pre-update
+# content or needs restoring. Never guesses at an arbitrary path.
 
 UPDATE_DB_BACKUP_PATH=""
 UPDATE_POST_BACKEND_INSTANCE_ID=""
@@ -72,15 +90,22 @@ update_activate_and_accept() {
   # update_rollback_on_failure via the EXIT trap.
   ledger_record update-service-stopped "${VMID}"
 
-  # Step 4 -- activate app payload atomically.
+  # Step 4 -- activate app payload atomically. The attempted-marker is
+  # recorded BEFORE the first destructive move (live app -> rollback),
+  # not after the swap completes, so rollback's own state-inspection
+  # logic (_update_rollback_app) is armed for every intermediate failure
+  # -- including the first move itself failing.
+  ledger_record update-app-activation-attempted "${VMID}"
   run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/app "/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}" \
     || die "failed to move the live application payload aside inside container ${VMID}"
   run_logged pct exec "${VMID}" -- mv "${UPDATE_APP_STAGED_PATH}" /opt/hubinet-ops/app \
     || die "failed to activate the staged application payload inside container ${VMID}"
   ledger_record update-app-activated "${VMID}"
 
-  # 5/6. requirements + venv, only if changed.
+  # 5/6. requirements + venv, only if changed. Same attempted-before-
+  # first-destructive-move discipline as the app payload above.
   if [[ "${UPDATE_REQUIREMENTS_CHANGED}" == "1" ]]; then
+    ledger_record update-venv-activation-attempted "${VMID}"
     run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/.venv "/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}" \
       || die "failed to move the active virtualenv aside inside container ${VMID}"
     run_logged pct exec "${VMID}" -- mv "${UPDATE_VENV_STAGED_PATH}" /opt/hubinet-ops/.venv \
@@ -92,8 +117,13 @@ update_activate_and_accept() {
     ledger_record update-venv-activated "${VMID}"
   fi
 
-  # Step 7 -- systemd unit, only if changed.
+  # Step 7 -- systemd unit, only if changed. The `cp` that preserves the
+  # active unit is not itself destructive to the live path, but the
+  # attempted-marker is still recorded before it (not after the
+  # destructive `mv`) so rollback is armed even if the `cp` itself is the
+  # step that fails.
   if [[ "${UPDATE_UNIT_CHANGED}" == "1" ]]; then
+    ledger_record update-unit-activation-attempted "${VMID}"
     run_logged pct exec "${VMID}" -- cp /etc/systemd/system/hubinet-ops.service "/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}" \
       || die "failed to preserve the active systemd unit inside container ${VMID}"
     run_logged pct exec "${VMID}" -- mv "${UPDATE_UNIT_STAGED_PATH}" /etc/systemd/system/hubinet-ops.service \
@@ -244,15 +274,61 @@ _update_accept_firewall() {
     || die "post-update firewall acceptance failed: nftables is not active inside container ${VMID} (${nft_active:-unknown})"
 }
 
+# _update_write_source_marker (P2-B): the new marker is fully prepared --
+# pushed to a run-owned staged path AND chown'd there -- before the live
+# marker is touched at all. Only then is the live marker's swap performed
+# via the same attempted-marker-before-first-destructive-mutation /
+# state-inspection-rollback discipline as every other rollback-managed
+# artifact in this file (see the header comment and _update_rollback_app
+# et al.): a failed update must always leave the PRE-UPDATE marker state
+# exactly, whether that was an old SHA or no marker at all -- never a NEW
+# marker paired with a rolled-back OLD app/db.
 _update_write_source_marker() {
+  local marker_path="/opt/hubinet-ops/.hubinet-source-commit"
+  local marker_staged_path="${marker_path}.staged-${UPDATE_RUN_ID}"
+  local marker_rollback_path="${marker_path}.rollback-${UPDATE_RUN_ID}"
   local marker_tmp
   marker_tmp="$(mktemp /tmp/hubinet-ops-update-source-marker.XXXXXX)"
   printf '%s\n' "${SOURCE_HEAD_SHA}" >"${marker_tmp}"
-  run_logged pct push "${VMID}" "${marker_tmp}" /opt/hubinet-ops/.hubinet-source-commit \
-    || die "failed to write the installed-source marker after a successful update"
+  run_logged pct push "${VMID}" "${marker_tmp}" "${marker_staged_path}" \
+    || die "failed to stage the installed-source marker after a successful update"
   rm -f "${marker_tmp}"
-  run_logged pct exec "${VMID}" -- chown hubinetops:hubinetops /opt/hubinet-ops/.hubinet-source-commit \
-    || die "failed to set ownership on the installed-source marker"
+  run_logged pct exec "${VMID}" -- chown hubinetops:hubinetops "${marker_staged_path}" \
+    || die "failed to set ownership on the staged installed-source marker"
+
+  # From here on, the live marker may be mutated -- record intent first.
+  ledger_record update-marker-activation-attempted "${VMID}"
+  if _update_ct_path_exists "${marker_path}"; then
+    run_logged pct exec "${VMID}" -- mv "${marker_path}" "${marker_rollback_path}" \
+      || die "failed to move the pre-update installed-source marker aside inside container ${VMID}"
+  fi
+  run_logged pct exec "${VMID}" -- mv "${marker_staged_path}" "${marker_path}" \
+    || die "failed to activate the installed-source marker inside container ${VMID}"
+  ledger_record update-marker-activated "${VMID}"
+}
+
+# _update_rollback_marker: same state-inspection discipline as
+# _update_rollback_app et al. If an old marker existed pre-update, its
+# content was moved aside to marker_rollback_path before the live marker
+# was touched -- if that path exists, restore it verbatim (whether the
+# live marker currently holds nothing or the new SHA, this is correct
+# either way, since the swap is an atomic rename). If it does NOT exist,
+# either the old-marker-aside move never ran (no marker existed
+# pre-update) or it failed before doing anything -- either way there is
+# no old marker to restore, so a failed update must leave NO marker
+# rather than a new one paired with the rolled-back old app.
+_update_rollback_marker() {
+  ledger_has update-marker-activation-attempted "${VMID}" || return 0
+  local marker_path="/opt/hubinet-ops/.hubinet-source-commit"
+  local marker_rollback_path="${marker_path}.rollback-${UPDATE_RUN_ID}"
+  if _update_ct_path_exists "${marker_rollback_path}"; then
+    pct exec "${VMID}" -- rm -f "${marker_path}" >/dev/null 2>&1 || true
+    if ! pct exec "${VMID}" -- mv "${marker_rollback_path}" "${marker_path}" >/dev/null 2>&1; then
+      _update_rollback_hard_stop "could not restore the pre-update installed-source marker inside container ${VMID}"
+    fi
+  else
+    pct exec "${VMID}" -- rm -f "${marker_path}" >/dev/null 2>&1 || true
+  fi
 }
 
 _update_finish_summary() {
@@ -263,11 +339,13 @@ _update_finish_summary() {
     "/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}" \
     "/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}" \
     "/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}" \
+    "/opt/hubinet-ops/.hubinet-source-commit.rollback-${UPDATE_RUN_ID}" \
     "${UPDATE_CT_SOURCE_DIR}" \
     >/dev/null 2>&1 || true
   if [[ "${UPDATE_HELPER_CHANGED}" == "1" ]]; then
     rm -f "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" 2>/dev/null || true
   fi
+  _update_cleanup_plan_tools
 
   cat <<SUMMARY
 
@@ -306,11 +384,35 @@ update_rollback_on_failure() {
       || log_warn "could not stop the newly-started (failed) service during rollback"
   fi
 
+  # Undo order below roughly mirrors LIFO (the installed-source marker is
+  # always the LAST thing activation touches, so it is undone first here);
+  # each restore below is independent and self-contained (state-inspection
+  # based, never assumes another artifact's rollback already ran), so the
+  # exact relative order does not change correctness -- only that every
+  # attempted artifact is restored before the service is started again.
+  _update_rollback_marker
+
   if ledger_has update-authority-reset "${VMID}"; then
-    local remove_output
-    remove_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" remove /var/lib/hubinet-ops/authority.db 2>/dev/null)"
-    if ! _json_bool_field_is_true "${remove_output}" "ok"; then
-      log_warn "could not remove the newly-created target authority database during rollback -- see manual remediation below"
+    # Fail-closed rollback (P1-B): removal of the NEW/target database must
+    # be PROVEN successful (cmd_remove's own ok:true, which already means
+    # every one of db/wal/shm was independently re-verified absent -- see
+    # hubinet-ops-authority-tool.py's cmd_remove) before the validated OLD
+    # backup is ever copied into place. Never warn-then-continue: copying
+    # a trusted backup over an uncertain live/sidecar state could silently
+    # leave stale WAL/SHM content paired with a just-restored main file.
+    # The backup itself is never touched by this block, so it remains
+    # available for manual recovery either way.
+    # Guarded exactly like _update_perform_authority_reset's own forward
+    # `remove` call above -- a bare `var="$(cmd)"` with no `&&`/`||` is NOT
+    # safe under this file's `set -Eeuo pipefail`: cmd's own non-zero exit
+    # would abort the WHOLE script right here (silently, before the
+    # fail-closed hard-stop below ever runs) rather than being handled by
+    # the very check this line exists to reach.
+    local remove_output remove_status
+    remove_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" remove /var/lib/hubinet-ops/authority.db 2>/dev/null)" \
+      && remove_status=0 || remove_status=$?
+    if (( remove_status != 0 )) || ! _json_bool_field_is_true "${remove_output}" "ok"; then
+      _update_rollback_hard_stop "could not prove removal of the newly-created target authority database during rollback (tool output: ${remove_output:-none}) -- refusing to copy the pre-update backup over an uncertain live database state. The validated backup at ${UPDATE_DB_BACKUP_PATH} is untouched; resolve the removal failure manually, then restore it by hand"
     fi
     if ! pct exec "${VMID}" -- cp "${UPDATE_DB_BACKUP_PATH}" /var/lib/hubinet-ops/authority.db >/dev/null 2>&1; then
       _update_rollback_hard_stop "could not restore the pre-update authority database backup (${UPDATE_DB_BACKUP_PATH}) to /var/lib/hubinet-ops/authority.db -- the backup itself is preserved and untouched; restore it manually before restarting the service"
@@ -325,29 +427,9 @@ update_rollback_on_failure() {
     fi
   fi
 
-  if ledger_has update-unit-activated "${VMID}"; then
-    if ! pct exec "${VMID}" -- mv "/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}" /etc/systemd/system/hubinet-ops.service >/dev/null 2>&1; then
-      _update_rollback_hard_stop "could not restore the pre-update systemd unit inside container ${VMID}"
-    fi
-    pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 || true
-  fi
-
-  if ledger_has update-venv-activated "${VMID}"; then
-    pct exec "${VMID}" -- rm -rf /opt/hubinet-ops/.venv >/dev/null 2>&1 || true
-    if ! pct exec "${VMID}" -- mv "/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}" /opt/hubinet-ops/.venv >/dev/null 2>&1; then
-      _update_rollback_hard_stop "could not restore the pre-update virtualenv inside container ${VMID}"
-    fi
-    if ! pct exec "${VMID}" -- mv "/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}" /opt/hubinet-ops/requirements.txt >/dev/null 2>&1; then
-      _update_rollback_hard_stop "could not restore the pre-update requirements.txt inside container ${VMID}"
-    fi
-  fi
-
-  if ledger_has update-app-activated "${VMID}"; then
-    pct exec "${VMID}" -- rm -rf /opt/hubinet-ops/app >/dev/null 2>&1 || true
-    if ! pct exec "${VMID}" -- mv "/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}" /opt/hubinet-ops/app >/dev/null 2>&1; then
-      _update_rollback_hard_stop "could not restore the pre-update application payload inside container ${VMID}"
-    fi
-  fi
+  _update_rollback_unit
+  _update_rollback_venv_and_requirements
+  _update_rollback_app
 
   run_logged pct exec "${VMID}" -- systemctl start hubinet-ops \
     || _update_rollback_hard_stop "restored the pre-update installation's files, but could not start hubinet-ops inside container ${VMID}"
@@ -369,6 +451,70 @@ update_rollback_on_failure() {
 
   update_stage_cleanup
   log_warn "rollback complete -- the pre-update installation is running again (exit ${exit_code})"
+}
+
+# _update_ct_path_exists: read-only existence check of a fixed, known,
+# rollback-owned CT path -- never used to guess at an arbitrary path.
+_update_ct_path_exists() {
+  local path="$1"
+  pct exec "${VMID}" -- test -e "${path}" >/dev/null 2>&1
+}
+
+# _update_rollback_unit: state-inspection restore, not marker-implies-
+# complete. If the systemd unit activation was ever attempted, the only
+# question that matters is whether this run's fixed rollback copy
+# (.service.rollback-<UPDATE_RUN_ID>) exists: if it does, the live unit
+# might currently hold either the pre-update or the newly-activated
+# content, and unconditionally restoring the rollback copy over it is
+# correct either way (the destructive `mv` that consumes staged-> live is
+# atomic, so live never holds a partial mix); if it does not exist, the
+# preserving `cp` itself never completed and the live unit was never
+# touched, so there is nothing to restore.
+_update_rollback_unit() {
+  ledger_has update-unit-activation-attempted "${VMID}" || return 0
+  local rollback_path="/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}"
+  _update_ct_path_exists "${rollback_path}" || return 0
+  if ! pct exec "${VMID}" -- mv "${rollback_path}" /etc/systemd/system/hubinet-ops.service >/dev/null 2>&1; then
+    _update_rollback_hard_stop "could not restore the pre-update systemd unit inside container ${VMID}"
+  fi
+  pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+# _update_rollback_venv_and_requirements: same state-inspection discipline
+# as _update_rollback_unit, applied independently to the venv and to
+# requirements.txt (the two moves are sequential but neither implies the
+# other reached its own rollback-copy step; see the intermediate-state
+# enumeration in this file's header comment).
+_update_rollback_venv_and_requirements() {
+  ledger_has update-venv-activation-attempted "${VMID}" || return 0
+
+  local rollback_venv="/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}"
+  if _update_ct_path_exists "${rollback_venv}"; then
+    pct exec "${VMID}" -- rm -rf /opt/hubinet-ops/.venv >/dev/null 2>&1 || true
+    if ! pct exec "${VMID}" -- mv "${rollback_venv}" /opt/hubinet-ops/.venv >/dev/null 2>&1; then
+      _update_rollback_hard_stop "could not restore the pre-update virtualenv inside container ${VMID}"
+    fi
+  fi
+
+  local rollback_requirements="/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}"
+  if _update_ct_path_exists "${rollback_requirements}"; then
+    pct exec "${VMID}" -- rm -f /opt/hubinet-ops/requirements.txt >/dev/null 2>&1 || true
+    if ! pct exec "${VMID}" -- mv "${rollback_requirements}" /opt/hubinet-ops/requirements.txt >/dev/null 2>&1; then
+      _update_rollback_hard_stop "could not restore the pre-update requirements.txt inside container ${VMID}"
+    fi
+  fi
+}
+
+# _update_rollback_app: same state-inspection discipline as
+# _update_rollback_unit, applied to the application payload directory.
+_update_rollback_app() {
+  ledger_has update-app-activation-attempted "${VMID}" || return 0
+  local rollback_path="/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}"
+  _update_ct_path_exists "${rollback_path}" || return 0
+  pct exec "${VMID}" -- rm -rf /opt/hubinet-ops/app >/dev/null 2>&1 || true
+  if ! pct exec "${VMID}" -- mv "${rollback_path}" /opt/hubinet-ops/app >/dev/null 2>&1; then
+    _update_rollback_hard_stop "could not restore the pre-update application payload inside container ${VMID}"
+  fi
 }
 
 _update_rollback_hard_stop() {

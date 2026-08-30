@@ -21,7 +21,12 @@ Subcommands (argv[1]):
   inspect <db_path>
       Read-only. Prints one JSON object to stdout:
         {"ok": true, "exists": true, "marker": "...", "schema_version": N,
-         "backend_instance_id": "..."}
+         "backend_instance_id": "...", "schema_objects": ["...", ...]}
+      schema_objects is the sorted list of table/index/trigger names
+      actually present (the same structural fact
+      app/inventory/store.py's own schema validation checks) -- a plain
+      read-only fact, not a judgment; this tool has no target version to
+      compare it against.
       or
         {"ok": false, "exists": <bool>, "reason": "<short-code>"}
       Never raises for an expected malformed/missing condition -- every
@@ -53,10 +58,18 @@ Subcommands (argv[1]):
 
   remove <db_path>
       Removes <db_path> and its WAL/SHM sidecars (<db_path>-wal,
-      <db_path>-shm) if present. Idempotent -- a missing file is not an
-      error. Never called by update-authority.sh except immediately after
-      a `backup` subcommand has reported "ok": true for the exact same
-      database. Prints {"ok": true} and exits 0.
+      <db_path>-shm). Idempotent -- a missing file is not an error. Never
+      called by update-authority.sh except immediately after a `backup`
+      subcommand has reported "ok": true for the exact same database.
+      Fails closed: for each of the three paths, a present-but-unremovable
+      file (permission error, busy handle, read-only filesystem, ...) is
+      an immediate {"ok": false, "reason": "<short-code>"} with a non-zero
+      exit -- never silently swallowed. After every removal attempt, this
+      command independently re-verifies (a fresh existence check, not the
+      unlink call's own reported success) that all three paths are
+      actually absent before ever printing {"ok": true}; if any target is
+      still present after that verification, it is still {"ok": false}.
+      Never prints {"ok": true} on a best-effort basis.
 
 Never writes schema DDL, never opens a write connection to <db_path> in
 `inspect` mode, and never touches secrets -- only structural authority
@@ -145,11 +158,30 @@ def _read_facts(db_path: str) -> tuple[bool, dict]:
         ):
             return False, {"exists": True, "reason": "backend_instance_id_invalid"}
 
+        # schema_objects: the same read-only structural fact
+        # app/inventory/store.py's own _open_or_initialize/_validate_schema
+        # checks itself (identical SQL shape) -- table/index/trigger names,
+        # sqlite_-internal names excluded. This tool still makes no
+        # judgment about whether the set is "right" for any particular
+        # target version (it has no target to compare against and
+        # deliberately never invents schema knowledge); the caller
+        # (deploy/lib/update-plan.sh) is the one that statically extracts
+        # the target's required set and compares, before ever stopping the
+        # service on a would-be schema-preserving update.
+        schema_objects = sorted(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') "
+                "AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        )
+
         return True, {
             "exists": True,
             "marker": marker,
             "schema_version": schema_version,
             "backend_instance_id": str(backend_rows[0]["backend_instance_id"]),
+            "schema_objects": schema_objects,
         }
     finally:
         connection.close()
@@ -253,6 +285,10 @@ def cmd_backup(argv: list[str]) -> int:
 
 
 def _silent_unlink(path: str) -> None:
+    # Best-effort only -- used exclusively for this tool's OWN cleanup of a
+    # backup/dest file it just created itself on an earlier failure path
+    # (see cmd_backup above). Never used for cmd_remove's fail-closed
+    # target-database removal below.
     try:
         os.unlink(path)
     except OSError:
@@ -265,7 +301,34 @@ def cmd_remove(argv: list[str]) -> int:
         return 2
     db_path = argv[0]
     for candidate in (db_path, db_path + "-wal", db_path + "-shm"):
-        _silent_unlink(candidate)
+        if not os.path.exists(candidate):
+            continue
+        try:
+            os.unlink(candidate)
+        except OSError as exc:
+            print(json.dumps({
+                "ok": False,
+                "reason": f"unlink_failed:{os.path.basename(candidate)}:{exc.errno or 'unknown'}",
+            }))
+            return 1
+
+    # Never trust the unlink calls' own reported success alone -- an
+    # independent existence re-check closes any gap between "os.unlink()
+    # raised nothing" and "the path is actually gone" (e.g. a concurrent
+    # recreate, or a filesystem that accepts an unlink() call but does not
+    # actually make the path disappear).
+    still_present = [
+        candidate
+        for candidate in (db_path, db_path + "-wal", db_path + "-shm")
+        if os.path.exists(candidate)
+    ]
+    if still_present:
+        print(json.dumps({
+            "ok": False,
+            "reason": "still_present_after_remove:" + ",".join(os.path.basename(p) for p in still_present),
+        }))
+        return 1
+
     print(json.dumps({"ok": True}, separators=(",", ":")))
     return 0
 

@@ -5,8 +5,8 @@
 # installation state; ephemeral /tmp planning files are cleaned on exit
 # (see update-proxmox-0.5.sh's own exit trap).
 
-UPDATE_TOOL_CT_PATH="/tmp/hubinet-ops-authority-tool.py"
-UPDATE_PROBE_CT_PATH="/tmp/hubinet-ops-update-probe.py"
+UPDATE_TOOL_CT_PATH=""
+UPDATE_PROBE_CT_PATH=""
 
 UPDATE_INSTALLED_SHA=""
 UPDATE_REQUIREMENTS_CHANGED="0"
@@ -14,6 +14,7 @@ UPDATE_UNIT_CHANGED="0"
 UPDATE_HELPER_CHANGED="0"
 UPDATE_TARGET_SCHEMA_MARKER=""
 UPDATE_TARGET_SCHEMA_VERSION=""
+UPDATE_TARGET_SCHEMA_OBJECTS=""
 UPDATE_CURRENT_SCHEMA_MARKER=""
 UPDATE_CURRENT_SCHEMA_VERSION=""
 UPDATE_CURRENT_BACKEND_INSTANCE_ID=""
@@ -52,10 +53,33 @@ sys.exit(0 if data.get(sys.argv[1]) is True else 1)
 }
 
 update_plan_push_tools() {
+  # Run-owned (UPDATE_RUN_ID, generated once by update-proxmox-0.5.sh
+  # before Phase U1) rather than a fixed shared /tmp name -- see
+  # _update_cleanup_plan_tools below for the matching cleanup on every
+  # exit path (dry-run success, ordinary success, pre-stop failure, and
+  # the tail of a full rollback).
+  [[ -n "${UPDATE_RUN_ID}" ]] || die "internal error: UPDATE_RUN_ID was not set before update_plan_push_tools"
+  UPDATE_TOOL_CT_PATH="/tmp/hubinet-ops-authority-tool-${UPDATE_RUN_ID}.py"
+  UPDATE_PROBE_CT_PATH="/tmp/hubinet-ops-update-probe-${UPDATE_RUN_ID}.py"
   run_logged pct push "${VMID}" "${UPDATE_SCRIPT_DIR}/hubinet-ops-authority-tool.py" "${UPDATE_TOOL_CT_PATH}" \
     || die "failed to push the authority inspection tool into container ${VMID}"
   run_logged pct push "${VMID}" "${UPDATE_SCRIPT_DIR}/hubinet-ops-update-probe.py" "${UPDATE_PROBE_CT_PATH}" \
     || die "failed to push the pre-update probe into container ${VMID}"
+}
+
+# _update_cleanup_plan_tools: best-effort removal of the Phase U2 planning
+# tools pushed above. Called on every exit path -- dry-run success,
+# ordinary success, and pre-service-stop failure (see
+# update-proxmox-0.5.sh and update-stage.sh::update_stage_cleanup) -- and
+# also at the tail of a full post-stop rollback, once the authority-tool
+# is no longer needed for the (possible) authority-database restore. Not a
+# durable journal; nothing here is managed state a future update depends
+# on.
+_update_cleanup_plan_tools() {
+  [[ -n "${VMID:-}" ]] || return 0
+  [[ -n "${UPDATE_TOOL_CT_PATH}" ]] && pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" >/dev/null 2>&1
+  [[ -n "${UPDATE_PROBE_CT_PATH}" ]] && pct exec "${VMID}" -- rm -f "${UPDATE_PROBE_CT_PATH}" >/dev/null 2>&1
+  return 0
 }
 
 _update_target_file_text() {
@@ -139,6 +163,54 @@ print(match.group(1) if match else "")
 ')"
   [[ -n "${UPDATE_TARGET_SCHEMA_MARKER}" && "${UPDATE_TARGET_SCHEMA_VERSION}" =~ ^[0-9]+$ ]] \
     || die "could not statically determine AUTHORITY_SCHEMA_MARKER/AUTHORITY_SCHEMA_VERSION from target commit ${SOURCE_HEAD_SHA}'s app/inventory/store.py"
+
+  # P2-C: static (non-executing) extraction of the target's REQUIRED
+  # authority schema-object contract -- every table/index/trigger name
+  # folded into app/inventory/store.py's _REQUIRED_SCHEMA_OBJECTS
+  # (_REQUIRED_TABLES unioned with the extra index/trigger names) -- a
+  # lexical scan of the quoted identifiers between the _REQUIRED_TABLES
+  # definition and the following _LEGACY_TABLES definition, never an
+  # import or execution of target application code (AGENTS.md task
+  # prompt section 11.E). Used only to preflight-validate a would-be
+  # SCHEMA-PRESERVING update (_update_verify_preserve_schema_objects,
+  # below) before the service is ever stopped.
+  UPDATE_TARGET_SCHEMA_OBJECTS="$(printf '%s\n' "${target_text}" | python3 -c '
+import re, sys
+text = sys.stdin.read()
+start = text.find("_REQUIRED_TABLES")
+end = text.find("_LEGACY_TABLES")
+names = set()
+if start != -1 and end != -1 and end > start:
+    names = set(re.findall("\"([A-Za-z0-9_]+)\"", text[start:end]))
+print(" ".join(sorted(names)))
+')"
+  [[ -n "${UPDATE_TARGET_SCHEMA_OBJECTS}" ]] \
+    || die "could not statically determine the required authority schema-object set from target commit ${SOURCE_HEAD_SHA}'s app/inventory/store.py"
+}
+
+# _update_verify_preserve_schema_objects (P2-C): a matching marker/
+# version/backend-identity classification alone is weaker than the
+# target runtime's own schema validation (app/inventory/store.py's
+# _open_or_initialize checks the exact _REQUIRED_SCHEMA_OBJECTS set, not
+# only marker/version/user_version/backend identity) -- an installed DB
+# that this updater would otherwise classify "preserve" could still be
+# REJECTED by the target runtime at restart if it has drifted
+# structurally (a missing table/index/trigger) while keeping a coherent
+# marker/version. This proves the live DB's actual schema_objects
+# (reported by hubinet-ops-authority-tool.py's inspect, above) match the
+# target's statically-extracted required set -- BEFORE the service is
+# ever stopped. A mismatch here is not an authority reset (no version
+# transition exists to justify one); it fails closed instead.
+_update_verify_preserve_schema_objects() {
+  local inspect_output="$1"
+  python3 -c '
+import json, sys
+data = json.loads(sys.argv[1])
+actual = set(data.get("schema_objects") or [])
+expected = set(sys.argv[2].split())
+sys.exit(0 if actual == expected else 1)
+' "${inspect_output}" "${UPDATE_TARGET_SCHEMA_OBJECTS}" \
+    || die "the current authority database's marker/schema_version look schema-preserving-compatible (marker=${UPDATE_CURRENT_SCHEMA_MARKER}, version=${UPDATE_CURRENT_SCHEMA_VERSION}), but its actual schema objects (tables/indexes/triggers) do not match target commit ${SOURCE_HEAD_SHA}'s required set for that version -- refusing a schema-preserving update against a structurally drifted database (this is not an authority reset; no version transition exists for this classification). Investigate and repair the database manually before retrying."
 }
 
 _update_classify_authority() {
@@ -161,6 +233,7 @@ _update_classify_authority() {
 
   if [[ "${UPDATE_CURRENT_SCHEMA_MARKER}" == "${UPDATE_TARGET_SCHEMA_MARKER}" \
         && "${UPDATE_CURRENT_SCHEMA_VERSION}" == "${UPDATE_TARGET_SCHEMA_VERSION}" ]]; then
+    _update_verify_preserve_schema_objects "${inspect_output}"
     UPDATE_AUTHORITY_ACTION="preserve"
     UPDATE_HA_REENROLL_REQUIRED="0"
   else

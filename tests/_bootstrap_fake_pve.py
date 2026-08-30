@@ -140,8 +140,8 @@ _CT_PATH_ANCHORS = (
     "tmp/hubinet-ops-bootstrap-accept.py",
     "tmp/hubinet-ops-update-src",
     "tmp/hubinet-ops-update-src.tar.gz",
-    "tmp/hubinet-ops-authority-tool.py",
-    "tmp/hubinet-ops-update-probe.py",
+    "tmp/hubinet-ops-authority-tool",  # matches both the fixed and the
+    "tmp/hubinet-ops-update-probe",    # run-id-suffixed pushed path shape
     "tmp/hubinet-ops-update-venv-stage.py",
 )
 
@@ -331,6 +331,50 @@ def cmd_pct(args):
     sys.exit(2)
 
 
+# Deterministic fake failure seams for the in-place updater's individual
+# CT-side mv/cp activation steps (deploy/lib/update-activate.sh) -- keyed
+# by the LOGICAL (run-id-independent) source/destination shape of each
+# move, so a test can force exactly one intermediate activation step to
+# fail without knowing UPDATE_RUN_ID (random per invocation) in advance.
+# ("exact", value) matches a normalized CT path exactly; ("prefix", value)
+# matches anything starting with value (used for the run-id-suffixed
+# staged-/rollback- side of each move).
+_ACTIVATION_MOVE_FAIL_RULES = [
+    ("mv", ("exact", "/opt/hubinet-ops/app"), ("prefix", "/opt/hubinet-ops/app.rollback-"), "mv_live_app_to_rollback"),
+    ("mv", ("prefix", "/opt/hubinet-ops/app.staged-"), ("exact", "/opt/hubinet-ops/app"), "mv_staged_app_to_live"),
+    ("mv", ("exact", "/opt/hubinet-ops/.venv"), ("prefix", "/opt/hubinet-ops/.venv.rollback-"), "mv_live_venv_to_rollback"),
+    ("mv", ("prefix", "/opt/hubinet-ops/.venv.staged-"), ("exact", "/opt/hubinet-ops/.venv"), "mv_staged_venv_to_live"),
+    ("mv", ("exact", "/opt/hubinet-ops/requirements.txt"), ("prefix", "/opt/hubinet-ops/requirements.txt.rollback-"), "mv_live_requirements_to_rollback"),
+    ("mv", ("prefix", "/opt/hubinet-ops/requirements.txt.staged-"), ("exact", "/opt/hubinet-ops/requirements.txt"), "mv_staged_requirements_to_live"),
+    ("cp", ("exact", "/etc/systemd/system/hubinet-ops.service"), ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-"), "cp_live_unit_to_rollback"),
+    ("mv", ("prefix", "/etc/systemd/system/hubinet-ops.service.staged-"), ("exact", "/etc/systemd/system/hubinet-ops.service"), "mv_staged_unit_to_live"),
+    ("mv", ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.rollback-"), "mv_live_marker_to_rollback"),
+    ("mv", ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.staged-"), ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), "mv_staged_marker_to_live"),
+]
+
+
+def _match_endpoint(mode_value, normalized_path):
+    mode, value = mode_value
+    return normalized_path == value if mode == "exact" else normalized_path.startswith(value)
+
+
+def _activation_fail_key(op, src_norm, dst_norm):
+    for rule_op, src_rule, dst_rule, key in _ACTIVATION_MOVE_FAIL_RULES:
+        if rule_op == op and _match_endpoint(src_rule, src_norm) and _match_endpoint(dst_rule, dst_norm):
+            return key
+    return None
+
+
+def _matches_run_owned_ct_script(raw_arg, base_name):
+    # deploy/lib/update-plan.sh (P2-A/small-cleanup, AGENTS.md) now pushes
+    # this planning tool to a run-id-suffixed path
+    # ("<base_name>-<UPDATE_RUN_ID>.py"), never the fixed "<base_name>.py"
+    # name -- match either shape so this fake dispatcher recognizes it
+    # regardless of which naming convention produced the pushed path.
+    normalized = raw_arg.replace("\\", "/")
+    return bool(re.search(rf"(^|/){re.escape(base_name)}(-[0-9a-f]+)?\.py$", normalized))
+
+
 def _exec_inner(vmid, inner, state):
     joined = " ".join(inner)
     ct = str(vmid)
@@ -403,6 +447,15 @@ def _exec_inner(vmid, inner, state):
         return 0
 
     if inner[0] == "mv" and len(inner) >= 3:
+        src_norm = _normalize_ct_arg(inner[-2])
+        dst_norm = _normalize_ct_arg(inner[-1])
+        fail_key = _activation_fail_key("mv", src_norm, dst_norm)
+        if fail_key is not None and _fail(fail_key):
+            # Simulates the realistic failure shape: the command fails
+            # before mutating anything (a real rename() is atomic --
+            # either it fully happens or nothing does), so neither src
+            # nor dst is touched.
+            return 1
         src = _ct_path(vmid, inner[-2])
         dst = _ct_path(vmid, inner[-1])
         if not src.exists():
@@ -417,6 +470,11 @@ def _exec_inner(vmid, inner, state):
         cp_args = [a for a in inner[1:] if not a.startswith("-")]
         if len(cp_args) != 2:
             return 2
+        src_norm = _normalize_ct_arg(cp_args[0])
+        dst_norm = _normalize_ct_arg(cp_args[1])
+        fail_key = _activation_fail_key("cp", src_norm, dst_norm)
+        if fail_key is not None and _fail(fail_key):
+            return 1
         src = _ct_path(vmid, cp_args[0])
         dst = _ct_path(vmid, cp_args[1])
         if not src.exists():
@@ -523,10 +581,10 @@ def _exec_inner(vmid, inner, state):
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-resolve-dns.py"):
         return _exec_resolve_dns(inner[2:])
 
-    if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-authority-tool.py"):
-        return _exec_authority_tool(vmid, inner[2:])
+    if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-authority-tool"):
+        return _exec_authority_tool(vmid, inner[2:], state)
 
-    if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-update-probe.py"):
+    if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-update-probe"):
         return _exec_update_probe(vmid)
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-update-venv-stage.py"):
@@ -536,7 +594,7 @@ def _exec_inner(vmid, inner, state):
     return 2
 
 
-def _exec_authority_tool(vmid, args):
+def _exec_authority_tool(vmid, args, state):
     # Simulates deploy/lib/hubinet-ops-authority-tool.py's OWN observable
     # JSON contract without a real sqlite database -- a fake "authority.db"
     # is simply a small JSON object {"marker", "schema_version",
@@ -551,6 +609,23 @@ def _exec_authority_tool(vmid, args):
     if not args:
         return 2
     subcommand = args[0]
+    if subcommand == "remove":
+        # "fail_nth_authority_remove": N -- fails only the Nth call this
+        # run makes to `remove` (1-indexed), succeeding on every other
+        # call. Needed because update-activate.sh's forward reset path and
+        # its own rollback-on-later-failure path both call `remove` with
+        # IDENTICAL argv (the same db_path) -- a blanket "always fail
+        # remove" scenario key cannot distinguish "fail the ORIGINAL
+        # reset" from "fail removal of the newly-created target database
+        # DURING rollback" (see AGENTS.md P1-B fail-closed-rollback
+        # regression), so this counts real calls instead.
+        call_number = state.get("authority_tool_remove_calls", 0) + 1
+        state["authority_tool_remove_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_authority_remove")
+        if fail_nth is not None and call_number == int(fail_nth):
+            print(json.dumps({"ok": False, "reason": "simulated_remove_failure"}))
+            return 1
     if _fail(f"authority_tool_{subcommand}"):
         print(json.dumps({"ok": False, "reason": "simulated_failure"}))
         return 1
@@ -579,6 +654,7 @@ def _exec_authority_tool(vmid, args):
             "ok": True, "exists": True, "marker": data["marker"],
             "schema_version": data["schema_version"],
             "backend_instance_id": data["backend_instance_id"],
+            "schema_objects": data.get("schema_objects", []),
         }))
         return 0
     if subcommand == "backup" and len(args) == 6:

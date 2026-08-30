@@ -87,6 +87,14 @@ class TestInspect:
         assert facts["marker"] == MARKER
         assert facts["schema_version"] == 8
         assert facts["backend_instance_id"] == BACKEND_ID
+        # P2-C: schema_objects is a plain read-only structural fact (same
+        # query shape as app/inventory/store.py's own schema validation) --
+        # this fixture only creates the two marker/backend tables, so that
+        # is exactly what comes back. This tool makes no judgment about
+        # whether the set is "right" for any target version; see
+        # deploy/lib/update-plan.sh's _update_verify_preserve_schema_objects
+        # for the caller-side comparison against a target's required set.
+        assert facts["schema_objects"] == ["authority_schema", "backend_instance"]
 
     def test_marker_mismatch(self, tmp_path):
         db = tmp_path / "authority.db"
@@ -188,6 +196,41 @@ class TestRemove:
     def test_remove_is_idempotent_on_missing_file(self, tmp_path):
         rc = authority_tool.cmd_remove([str(tmp_path / "nope.db")])
         assert rc == 0
+
+    def test_remove_fails_closed_when_unlink_raises(self, tmp_path, monkeypatch, capsys):
+        # P1-B: a present-but-unremovable file (permission error, busy
+        # handle, read-only filesystem, ...) must be an immediate
+        # {"ok": false} with a non-zero exit -- never silently swallowed
+        # into a claimed success.
+        db = tmp_path / "authority.db"
+        _make_authority_db(db)
+
+        def _raise(path):
+            raise OSError(13, "Permission denied", path)
+
+        monkeypatch.setattr(authority_tool.os, "unlink", _raise)
+        rc = authority_tool.cmd_remove([str(db)])
+        assert rc != 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["reason"].startswith("unlink_failed:")
+        # The mocked unlink never actually removed anything.
+        assert db.exists()
+
+    def test_remove_fails_closed_when_still_present_after_unlink(self, tmp_path, monkeypatch, capsys):
+        # Never trust the unlink call's own reported success alone -- an
+        # independent existence re-check after every unlink attempt must
+        # also catch a path that (for whatever reason) is still present.
+        db = tmp_path / "authority.db"
+        _make_authority_db(db)
+
+        monkeypatch.setattr(authority_tool.os, "unlink", lambda path: None)
+        rc = authority_tool.cmd_remove([str(db)])
+        assert rc != 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["ok"] is False
+        assert payload["reason"].startswith("still_present_after_remove:")
+        assert db.exists()
 
 
 class TestUpdateProbe:

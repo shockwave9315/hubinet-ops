@@ -34,6 +34,15 @@ FAKE_RUN_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 FAKE_BACKEND_INSTANCE_ID = "00000000-0000-4000-8000-000000000001"
 FAKE_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
 FAKE_HELPER_HOST_PATH_TEMPLATE = "/usr/local/libexec/hubinet-package-scan-helper-{run_id}"
+# P2-C: the default authority schema-object set both sides of the fixture
+# agree on -- seed_installed_environment writes this into the fake
+# authority.db's own "schema_objects" fact (what the live DB actually
+# has), and build_update_target_checkout embeds the SAME names into the
+# fake target's store.py _REQUIRED_TABLES (what update-plan.sh's static
+# extraction expects) -- so the default "preserve" scenario across every
+# existing test stays internally coherent unless a test deliberately
+# passes a different set on one side to exercise a structural mismatch.
+FAKE_REQUIRED_SCHEMA_OBJECTS = ("authority_schema", "backend_instance", "one_active_endpoint_per_source")
 
 
 def seed_installed_environment(
@@ -50,6 +59,7 @@ def seed_installed_environment(
     installed_helper_text: str | None = None,
     corrupt_authority_db: bool = False,
     missing_authority_db: bool = False,
+    schema_objects: list[str] | None = None,
 ) -> FakePveEnvironment:
     scenario = default_scenario()
     scenario["update_probe_backend_instance_id"] = backend_instance_id
@@ -169,6 +179,9 @@ def seed_installed_environment(
                 "marker": FAKE_SCHEMA_MARKER,
                 "schema_version": schema_version,
                 "backend_instance_id": backend_instance_id,
+                "schema_objects": sorted(
+                    schema_objects if schema_objects is not None else FAKE_REQUIRED_SCHEMA_OBJECTS
+                ),
             }),
             encoding="utf-8",
         )
@@ -213,6 +226,7 @@ def build_update_target_checkout(
     requirements_text: str = "fastapi==0.116.1\n",
     unit_text: str | None = None,
     helper_text: str | None = None,
+    required_schema_objects: list[str] | None = None,
 ) -> Path:
     """A tiny, fast, git-initialized target checkout for --source-dir.
 
@@ -230,10 +244,27 @@ def build_update_target_checkout(
     (src / "deploy").mkdir(parents=True)
     (src / "app" / "__init__.py").write_text("", encoding="utf-8")
     (src / "app" / "inventory" / "__init__.py").write_text("", encoding="utf-8")
+    objects = sorted(
+        required_schema_objects if required_schema_objects is not None else FAKE_REQUIRED_SCHEMA_OBJECTS
+    )
+    objects_literal = "".join(f'        "{name}",\n' for name in objects)
     (src / "app" / "inventory" / "store.py").write_text(
         '"""Fake target store.py for update-proxmox-0.5.sh tests."""\n\n'
         'AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"\n'
-        f'AUTHORITY_SCHEMA_VERSION = {schema_version}\n',
+        f'AUTHORITY_SCHEMA_VERSION = {schema_version}\n\n'
+        # Deliberately mirrors the real app/inventory/store.py shape
+        # (_REQUIRED_TABLES unioned into _REQUIRED_SCHEMA_OBJECTS, followed
+        # by _LEGACY_TABLES) -- deploy/lib/update-plan.sh's
+        # _update_target_authority_schema statically scans exactly this
+        # text shape (see AGENTS.md P2-C) to preflight-validate a
+        # would-be schema-preserving update; it never imports this file.
+        "_REQUIRED_TABLES = frozenset(\n"
+        "    {\n"
+        f"{objects_literal}"
+        "    }\n"
+        ")\n"
+        "_REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES\n"
+        '_LEGACY_TABLES = frozenset({"plans", "jobs"})\n',
         encoding="utf-8",
     )
     (src / "requirements.txt").write_text(requirements_text, encoding="utf-8")
