@@ -231,7 +231,8 @@ starts a new ownership/planning pass. It re-verifies that VMID still carries
 the same bootstrap ownership chain. If rollback was not armed, it removes
 only that run's staged artifacts and proves the existing service enabled,
 active, and healthy. If rollback was armed, it loads the prior run-id and
-markers and calls the same rollback implementation described below. Once the
+markers, restores the run-owned authority helper, and calls the same rollback
+implementation described below. Once the
 old service is positively restored, enabled, active, and healthy, recovery
 marks the journal
 recovered, performs final run-owned cleanup, removes the journal, and exits
@@ -239,7 +240,34 @@ successfully with a message requiring the update to be rerun. The requested
 new target is deliberately not planned or activated in that recovery
 invocation.
 
-If recovery cannot re-prove ownership, non-running service state before a
+The run-owned authority helper lives at
+`/tmp/hubinet-ops-authority-tool-<run-id>.py` inside the container, and a real
+PVE/CT restart legitimately clears that volatile `/tmp`. Every remaining
+recovery operation runs through that helper: the three-valued path-state
+probes and, after a destructive authority reset, the fail-closed database
+removal and validated-backup restore. So before any rollback, path-state, or
+authority-database operation, recovery re-pushes the same bounded
+`deploy/lib/hubinet-ops-authority-tool.py` to that same reconstructed
+run-owned path and positively proves it usable. This is recovery
+infrastructure only: it never starts Phase U2, never stages or activates
+target application, configuration, or identity content, never pushes the
+pre-update HTTP probe, and stays bounded to the loaded run ID. If the helper
+cannot be restored or proven usable, recovery hard stops with the journal,
+rollback artifacts, and authority backup preserved, and starts no new plan.
+
+Rollback is also replayable. A first rollback can restore artifacts and then
+hard stop at a later terminal step (re-enable, start, or the health proof),
+which deliberately retains the active journal, so a later invocation
+re-enters the same rollback for the same run ID. Every rollback helper
+therefore tolerates already-restored state — inspecting the bounded set of
+paths its own artifact owns — while still failing closed on an unknown path
+state. The PVE host helper additionally keeps its canonical
+`.rollback-<run-id>` copy unconsumed (it is copied to a run-owned restore
+temporary that is atomically renamed onto the live path), so a retry retains
+the original recovery material until terminal recovery cleans it up.
+
+If recovery cannot re-prove ownership, restore and prove the run-owned
+authority helper, prove non-running service state before a
 rollback mutation, a required rollback path/postcondition, restored boot
 activation, restored startup, or health, it exits non-zero and retains the
 active journal plus rollback and

@@ -508,20 +508,44 @@ _update_write_source_marker() {
   run_logged pct exec "${VMID}" -- chown hubinetops:hubinetops "${marker_staged_path}" \
     || die "failed to set ownership on the staged installed-source marker"
 
-  # From here on, the live marker may be mutated -- record intent first.
-  ledger_record update-marker-activation-attempted "${VMID}"
+  # P2-B (correction pass 7) -- ordering. NO marker mutation can occur
+  # before its precondition has been PROVEN and journaled, so the
+  # attempted-marker must not be armed before that proof exists. The old
+  # order recorded update-marker-activation-attempted first and only then
+  # probed, so an UNKNOWN probe died with "attempted" already in the
+  # ledger and neither precondition recorded -- and rollback then hard
+  # stopped on a marker mutation that had provably never been armed.
+  #
+  # Correct order, and the only one this function ever uses:
+  #
+  #   1. stage + chown the new marker                      (above)
+  #   2. probe the old marker
+  #   3. EXISTS   -> record update-marker-precondition-exists
+  #      ABSENT   -> record update-marker-precondition-absent
+  #      UNKNOWN  -> fail BEFORE any marker mutation is armed
+  #   4. durably journal update-marker-activation-attempted together with
+  #      that proven precondition, in one atomic journal replacement,
+  #      BEFORE the first marker `mv`
+  #   5. perform the marker mutation
+  #
+  # The attempted marker is persisted through the DURABLE journal (a
+  # single update_journal_record call carries the ledger's whole
+  # recovery-relevant set, precondition included), never left only in the
+  # ephemeral ledger. An UNKNOWN precondition therefore produces no
+  # attempted marker at all: ordinary full artifact rollback proceeds and
+  # _update_rollback_marker correctly has nothing to do.
   local path_state_rc
   if _update_ct_path_state "${marker_path}"; then
-    update_journal_record update-marker-precondition-exists "${VMID}"
+    ledger_record update-marker-precondition-exists "${VMID}"
+    update_journal_record update-marker-activation-attempted "${VMID}"
     run_logged pct exec "${VMID}" -- mv "${marker_path}" "${marker_rollback_path}" \
       || die "failed to move the pre-update installed-source marker aside inside container ${VMID}"
   else
     path_state_rc=$?
-    if (( path_state_rc == 1 )); then
-      update_journal_record update-marker-precondition-absent "${VMID}"
-    else
-      die "could not prove whether the pre-update installed-source marker exists inside container ${VMID} -- refusing to mutate it"
-    fi
+    (( path_state_rc == 1 )) \
+      || die "could not prove whether the pre-update installed-source marker exists inside container ${VMID} -- refusing to mutate it"
+    ledger_record update-marker-precondition-absent "${VMID}"
+    update_journal_record update-marker-activation-attempted "${VMID}"
   fi
   run_logged pct exec "${VMID}" -- mv "${marker_staged_path}" "${marker_path}" \
     || die "failed to activate the installed-source marker inside container ${VMID}"
@@ -573,6 +597,12 @@ _update_rollback_marker() {
       || _update_rollback_hard_stop "could not prove the installed-source marker rollback path absent"
     _update_remove_ct_path_and_prove_absent "${marker_path}" file "target installed-source marker"
   else
+    # Structurally unreachable since correction pass 7 -- the attempted
+    # marker is now journaled only together with a proven precondition
+    # (see _update_write_source_marker). Retained as defence in depth: an
+    # attempted marker with no precondition would mean rollback cannot
+    # know what the pre-update marker state was, and guessing is never an
+    # option here.
     _update_rollback_hard_stop "installed-source marker activation was attempted without a recorded, proven precondition"
   fi
 }
@@ -680,11 +710,7 @@ update_rollback_on_failure() {
       || _update_rollback_hard_stop "could not restore authority database mode with chmod 0640 inside container ${VMID}"
   fi
 
-  if ledger_has update-helper-activated "${VMID}"; then
-    if ! mv "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" "${UPDATE_HELPER_HOST_PATH}" 2>/dev/null; then
-      _update_rollback_hard_stop "could not restore the pre-update PVE host helper from ${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID} -- restore it manually before retrying"
-    fi
-  fi
+  _update_rollback_host_helper
 
   _update_rollback_unit
   _update_rollback_venv_and_requirements
@@ -773,6 +799,60 @@ _update_remove_ct_path_and_prove_absent() {
     || _update_rollback_hard_stop "could not prove the live ${label} path absent inside container ${VMID}; restoration was not attempted"
 }
 
+# --- Rollback replayability (P2-A, correction pass 7) ----------------------
+#
+# A first rollback can legitimately restore several artifacts and then hard
+# stop at a LATER terminal step (re-enable, start, or the health proof).
+# That path deliberately RETAINS the active journal, so a later updater
+# invocation re-enters this SAME rollback for the SAME run id. Rollback is
+# therefore not a one-shot operation: every helper below must tolerate
+# already-restored state without falsely diagnosing corruption, exactly as
+# the app/venv/requirements/marker helpers already do by inspecting the
+# bounded set of paths their artifact owns.
+
+# _update_rollback_host_helper: host-side rollback of the PVE package-scan
+# helper. Two properties, both bounded to this run's fixed paths (never a
+# guessed one):
+#
+#   - the canonical .rollback-<UPDATE_RUN_ID> copy -- proven to exist
+#     before target activation -- is no longer CONSUMED by the restore. It
+#     is copied to a run-owned restore temp, and that temp is atomically
+#     renamed onto the live path, so a retry after a partial rollback
+#     still has the original recovery material. The canonical copy is
+#     removed only by _update_cleanup_recovered_run_artifacts at terminal
+#     recovery.
+#   - an ABSENT canonical copy is not automatically corruption: a prior
+#     rollback of this same run may already have restored and consumed it
+#     (that is what the previous bare `mv` did). Same bounded state
+#     inspection as _update_rollback_app/_update_rollback_venv_and_
+#     requirements -- prove the live helper is actually there, and fail
+#     closed only if it is not.
+_update_rollback_host_helper() {
+  ledger_has update-helper-activated "${VMID}" || return 0
+  local rollback_path="${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}"
+  local restore_tmp="${UPDATE_HELPER_HOST_PATH}.restore-tmp-${UPDATE_RUN_ID}"
+
+  if [[ -e "${rollback_path}" ]]; then
+    [[ -f "${rollback_path}" && -s "${rollback_path}" ]] \
+      || _update_rollback_hard_stop "the preserved pre-update PVE host helper (${rollback_path}) is not a usable non-empty regular file -- restore ${UPDATE_HELPER_PATH} manually before retrying"
+    rm -f -- "${restore_tmp}" \
+      || _update_rollback_hard_stop "could not clear the run-owned PVE host helper restore temporary ${restore_tmp}"
+    _host_control_install_file 0755 "${rollback_path}" "${restore_tmp}" \
+      || _update_rollback_hard_stop "could not stage the preserved pre-update PVE host helper for restoration at ${restore_tmp} -- the preserved copy at ${rollback_path} is untouched"
+    if ! mv "${restore_tmp}" "${UPDATE_HELPER_HOST_PATH}" 2>/dev/null; then
+      rm -f -- "${restore_tmp}" 2>/dev/null || true
+      _update_rollback_hard_stop "could not atomically restore the pre-update PVE host helper onto ${UPDATE_HELPER_PATH} -- the preserved copy at ${rollback_path} is untouched; restore it manually before retrying"
+    fi
+    return 0
+  fi
+
+  # The canonical copy is gone. On a recovery retry that is exactly what a
+  # previous, already-successful helper restore leaves behind -- never
+  # reported as corruption on that evidence alone.
+  [[ -f "${UPDATE_HELPER_HOST_PATH}" && -x "${UPDATE_HELPER_HOST_PATH}" ]] \
+    || _update_rollback_hard_stop "the preserved pre-update PVE host helper (${rollback_path}) is absent and the live helper ${UPDATE_HELPER_PATH} is not an executable regular file -- restore it manually before retrying"
+}
+
 # _update_rollback_unit: state-inspection restore, not marker-implies-
 # complete. If the systemd unit activation was ever attempted, the only
 # question that matters is whether this run's fixed rollback copy
@@ -780,28 +860,39 @@ _update_remove_ct_path_and_prove_absent() {
 # might currently hold either the pre-update or the newly-activated
 # content, and unconditionally restoring the rollback copy over it is
 # correct either way (the destructive `mv` that consumes staged-> live is
-# atomic, so live never holds a partial mix); if it does not exist, the
-# preserving `cp` itself never completed and the live unit was never
-# touched, so there is nothing to restore.
+# atomic, so live never holds a partial mix); if it does not exist, either
+# the preserving copy never needed restoring or a PRIOR rollback of this
+# same run already restored it and consumed the artifact -- so there is
+# nothing left to restore, and this must not hard stop merely because it
+# is a retry (P2-A, correction pass 7: the implementation now matches what
+# this contract already said). UNKNOWN still fails closed, and a real
+# restore still treats daemon-reload as load-bearing.
 _update_rollback_unit() {
   ledger_has update-unit-activation-attempted "${VMID}" || return 0
-  local rollback_path="/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}"
+  local live_path="/etc/systemd/system/hubinet-ops.service"
+  local rollback_path="${live_path}.rollback-${UPDATE_RUN_ID}"
   local path_state_rc
   if _update_ct_path_state "${rollback_path}"; then
-    :
+    _update_remove_ct_path_and_prove_absent "${live_path}" file "systemd unit"
+    if ! pct exec "${VMID}" -- mv "${rollback_path}" "${live_path}" >/dev/null 2>&1; then
+      _update_rollback_hard_stop "could not restore the pre-update systemd unit inside container ${VMID}"
+    fi
+    pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 \
+      || _update_rollback_hard_stop "systemctl daemon-reload failed after restoring the pre-update unit inside container ${VMID}; refusing to restart under an unproven loaded unit definition"
+    return 0
   else
     path_state_rc=$?
-    if (( path_state_rc == 1 )); then
-      _update_rollback_hard_stop "the finalized pre-update systemd unit rollback artifact is absent inside container ${VMID}"
-    fi
-    _update_rollback_hard_stop "could not determine whether the pre-update systemd unit rollback artifact exists inside container ${VMID}"
   fi
-  _update_remove_ct_path_and_prove_absent /etc/systemd/system/hubinet-ops.service file "systemd unit"
-  if ! pct exec "${VMID}" -- mv "${rollback_path}" /etc/systemd/system/hubinet-ops.service >/dev/null 2>&1; then
-    _update_rollback_hard_stop "could not restore the pre-update systemd unit inside container ${VMID}"
+  (( path_state_rc == 1 )) \
+    || _update_rollback_hard_stop "could not determine whether the pre-update systemd unit rollback artifact exists inside container ${VMID}"
+  # ABSENT. Nothing to restore -- but the live unit must positively exist,
+  # or this installation cannot be started again at all.
+  if _update_ct_path_state "${live_path}"; then
+    return 0
+  else
+    path_state_rc=$?
   fi
-  pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 \
-    || _update_rollback_hard_stop "systemctl daemon-reload failed after restoring the pre-update unit inside container ${VMID}; refusing to restart under an unproven loaded unit definition"
+  _update_rollback_hard_stop "the pre-update systemd unit rollback artifact is absent and the live unit is $( (( path_state_rc == 1 )) && printf 'absent' || printf 'unknown' ) inside container ${VMID}"
 }
 
 # _update_rollback_venv_and_requirements: same state-inspection discipline

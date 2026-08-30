@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 import textwrap
@@ -385,6 +386,29 @@ def _matches_run_owned_ct_script(raw_arg, base_name):
     return bool(re.search(rf"(^|/){re.escape(base_name)}(-[0-9a-f]+)?\.py$", normalized))
 
 
+# Correction pass 7 (P1 test realism): a simulated
+# `pct exec <vmid> -- python3 <ct-script-path> ...` must never INVENT the
+# execution of a file that does not exist in this fake CT filesystem.
+# Matching the argv shape alone hid a real defect: the run-owned authority
+# helper lives in the container's volatile /tmp, and a genuine PVE/CT
+# reboot clears it, so "the updater re-pushed what it needs" and "the
+# updater silently depended on a file that is gone" were indistinguishable
+# in this fake. These two helpers make the fake fail exactly like real
+# python3 does instead.
+def _pushed_ct_script_exists(vmid, raw_arg):
+    return _ct_path(vmid, raw_arg).is_file()
+
+
+def _missing_python_script(raw_arg):
+    normalized = _normalize_ct_arg(raw_arg)
+    _log("pct", "exec", "python3", "MISSING-SCRIPT", normalized)
+    sys.stderr.write(
+        f"python3: can't open file '{normalized}': [Errno 2] No such file or directory\n"
+    )
+    # Real CPython's own exit status for an unopenable script argument.
+    return 2
+
+
 def _exec_inner(vmid, inner, state):
     joined = " ".join(inner)
     ct = str(vmid)
@@ -641,18 +665,28 @@ def _exec_inner(vmid, inner, state):
         return _exec_sh_c(inner[2])
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-accept.py"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
         return _exec_discovery_accept(vmid, inner[2:])
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-resolve-dns.py"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
         return _exec_resolve_dns(inner[2:])
 
     if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-authority-tool"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
         return _exec_authority_tool(vmid, inner[2:], state)
 
     if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-update-probe"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
         return _exec_update_probe(vmid)
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-update-venv-stage.py"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
         return _exec_venv_stage(vmid, inner[2:])
 
     _log("pct", "exec", "UNHANDLED", *inner)
@@ -1838,12 +1872,23 @@ class FakePveEnvironment:
         - inside the CT, systemd boot-activates hubinet-ops IF AND ONLY IF
           the unit file is currently ENABLED. A unit the updater disabled
           for its mutation window stays inactive, so no half-swapped
-          app/venv/unit/helper/database state can ever auto-run.
+          app/venv/unit/helper/database state can ever auto-run;
+        - the container's /tmp is VOLATILE and comes back empty, exactly
+          as a real restarted CT's does (correction pass 7, P1). This
+          fake previously preserved it, which silently hid the updater's
+          dependence on run-owned /tmp helpers surviving a reboot.
 
-        Nothing else about the installation is invented here: files, the
-        durable updater journal and every rollback artifact survive the
-        restart exactly as they were, which is the whole point.
+        Nothing else about the installation is invented here. Everything
+        durable survives the restart exactly as it was -- /opt rollback
+        and staged artifacts, /var/lib authority backups and data, and the
+        host-side updater journal, lock and helper artifacts -- which is
+        the whole point.
         """
+        ct_tmp = self.ct_root / vmid / "tmp"
+        if ct_tmp.exists():
+            shutil.rmtree(ct_tmp)
+        ct_tmp.mkdir(parents=True)
+
         state = self.state()
         entry = state["vmids"].setdefault(vmid, {})
         entry["started"] = str(entry.get("onboot", "1")) == "1"

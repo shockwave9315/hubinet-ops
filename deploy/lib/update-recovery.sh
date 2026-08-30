@@ -235,8 +235,56 @@ _update_cleanup_recovered_run_artifacts() {
   pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" "${UPDATE_PROBE_CT_PATH}" \
     /tmp/hubinet-ops-update-venv-stage.py >/dev/null 2>&1 \
     || _update_rollback_hard_stop "could not remove run-owned planning/staging tools for interrupted run ${UPDATE_RUN_ID}"
-  rm -f -- "${UPDATE_HELPER_STAGED_HOST_PATH}" "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" \
+  rm -f -- "${UPDATE_HELPER_STAGED_HOST_PATH}" \
+    "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" \
+    "${UPDATE_HELPER_HOST_PATH}.restore-tmp-${UPDATE_RUN_ID}" \
     || _update_rollback_hard_stop "could not remove host-side run-owned helper artifacts for interrupted run ${UPDATE_RUN_ID}"
+}
+
+# _update_recovery_restore_authority_tool (P1, correction pass 7):
+# RECOVERY INFRASTRUCTURE -- never a new target deployment plan.
+#
+# The run-owned authority helper lives at
+# /tmp/hubinet-ops-authority-tool-${UPDATE_RUN_ID}.py INSIDE the container,
+# and it is pushed exactly once, by update_plan_push_tools during the
+# ORIGINAL invocation's Phase U2. A real PVE/CT restart legitimately clears
+# the container's volatile /tmp; nothing here ever claims otherwise or
+# tries to make /tmp durable. But startup recovery deliberately does NOT
+# start a new plan, so without this step nothing would ever restore that
+# helper -- and every remaining recovery operation runs THROUGH it:
+# _update_ct_path_state's three-valued path probes and the fail-closed
+# authority-database remove/restore of a destructive reset. An interrupted
+# run whose CT /tmp did not survive could therefore not roll itself back
+# at all.
+#
+# So, before any rollback/path-state/authority-tool operation, re-push the
+# SAME bounded updater-owned deploy/lib/hubinet-ops-authority-tool.py to
+# the SAME reconstructed run-owned path, then POSITIVELY prove it is
+# usable by requiring a definite three-valued (EXISTS/ABSENT) answer for
+# one fixed, allowlisted live path. A weaker shell `test -e` is never
+# substituted for the helper's own explicit JSON answer.
+#
+# This step never enters Phase U2, never stages or activates target
+# app/config/identity content, never pushes the pre-update HTTP probe
+# (recovery does not use it), and is bounded to the previously-loaded run
+# id. If the helper cannot be restored or proven usable, it hard stops:
+# the journal, every rollback artifact and any authority backup are
+# preserved and no new plan is started.
+_update_recovery_restore_authority_tool() {
+  [[ -n "${UPDATE_RUN_ID}" && -n "${UPDATE_TOOL_CT_PATH}" ]] \
+    || _update_rollback_hard_stop "internal error: interrupted-run recovery cannot restore the authority helper without a loaded run identity"
+  [[ "${UPDATE_TOOL_CT_PATH}" == "/tmp/hubinet-ops-authority-tool-${UPDATE_RUN_ID}.py" ]] \
+    || _update_rollback_hard_stop "internal error: the recovery authority-helper path '${UPDATE_TOOL_CT_PATH}' is not bounded to loaded run ${UPDATE_RUN_ID}"
+
+  run_logged pct push "${VMID}" "${UPDATE_SCRIPT_DIR}/hubinet-ops-authority-tool.py" "${UPDATE_TOOL_CT_PATH}" \
+    || _update_rollback_hard_stop "could not restore the run-owned authority helper (${UPDATE_TOOL_CT_PATH}) inside container ${VMID} for interrupted run ${UPDATE_RUN_ID}; no rollback, path-state, or authority-database operation was attempted"
+
+  local probe_rc=0
+  _update_ct_path_state /opt/hubinet-ops/app || probe_rc=$?
+  (( probe_rc == 0 || probe_rc == 1 )) \
+    || _update_rollback_hard_stop "restored the run-owned authority helper for interrupted run ${UPDATE_RUN_ID}, but it did not return a usable path answer inside container ${VMID}; no rollback, path-state, or authority-database operation was attempted"
+
+  log_warn "restored the run-owned authority helper ${UPDATE_TOOL_CT_PATH} for interrupted run ${UPDATE_RUN_ID} (recovery infrastructure only -- no new update plan was started)"
 }
 
 update_journal_resolve() {
@@ -271,6 +319,10 @@ update_startup_recovery_gate() {
   fi
 
   if [[ "${UPDATE_ROLLBACK_ARMED}" == "1" ]]; then
+    # Rollback below is executed entirely through the run-owned authority
+    # helper, which a PVE/CT restart may legitimately have removed with
+    # the container's volatile /tmp. Restore and prove it FIRST.
+    _update_recovery_restore_authority_tool
     update_rollback_on_failure 1
   else
     # No service stop/destructive transition was armed. Remove only this

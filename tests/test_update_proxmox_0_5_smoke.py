@@ -74,6 +74,38 @@ def _update_state_path(env, vmid, suffix):
     )
 
 
+def _journal_run_id(journal_text):
+    for line in journal_text.splitlines():
+        if line.startswith("run_id="):
+            return line.split("=", 1)[1]
+    raise AssertionError(f"journal carries no run_id: {journal_text!r}")
+
+
+def _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id):
+    """Startup recovery re-pushes exactly ONE thing: the run-owned authority
+    helper, at the SAME reconstructed run-id path.
+
+    That single push is recovery INFRASTRUCTURE -- the container's volatile
+    /tmp may legitimately have been cleared by a PVE/CT restart, and every
+    remaining recovery operation (three-valued path-state probes, the
+    fail-closed authority remove/restore) runs through that helper. It is
+    still never a new Phase U2 deployment plan, so nothing else may be
+    pushed: not the pre-update HTTP probe, not a source tarball, not the
+    venv-staging tool, not the acceptance script.
+    """
+    pushes = [line for line in env.log_lines()[before_recovery:] if line.startswith("pct push")]
+    assert len(pushes) == 1, pushes
+    source, destination = pushes[0].split()[-2:]
+    assert source.endswith("/deploy/lib/hubinet-ops-authority-tool.py"), pushes
+    assert destination == f"/tmp/hubinet-ops-authority-tool-{run_id}.py", pushes
+
+
+def _assert_recovery_pushed_nothing(env, before_recovery):
+    assert not any(
+        line.startswith("pct push") for line in env.log_lines()[before_recovery:]
+    ), "startup recovery must not enter normal planning and push a new tool"
+
+
 @pytest.fixture
 def target_checkout(tmp_path):
     return build_update_target_checkout(tmp_path / "target", REPO_ROOT, schema_version=8)
@@ -495,6 +527,8 @@ class TestInterruptedRunRecovery:
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists()
         assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
 
+        run_id = _journal_run_id(journal_text)
+
         before_recovery = len(env.log_lines())
         recovered = _run(env.env, _base_args(target))
         assert recovered.returncode == 0, recovered.stderr
@@ -505,10 +539,7 @@ class TestInterruptedRunRecovery:
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
         assert not journal.exists()
-        recovery_lines = env.log_lines()[before_recovery:]
-        assert not any(line.startswith("pct push") for line in recovery_lines), (
-            "startup recovery must not enter normal planning and push a new tool"
-        )
+        _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
 
     def test_sigkill_after_target_service_start_rolls_back_before_new_plan(self, tmp_path):
         env = seed_installed_environment(
@@ -547,6 +578,7 @@ class TestInterruptedRunRecovery:
         scenario["fail_service_state_probe_after"] = 1
         env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
         journal = _update_state_path(env, FAKE_VMID, "journal")
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
         before_recovery = len(env.log_lines())
 
         blocked = _run(env.env, _base_args(target))
@@ -558,8 +590,7 @@ class TestInterruptedRunRecovery:
         assert "state=active" in journal.read_text(encoding="utf-8")
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists()
         assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
-        recovery_lines = env.log_lines()[before_recovery:]
-        assert not any(line.startswith("pct push") for line in recovery_lines)
+        _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1349,6 +1380,7 @@ class TestServiceAutostartGuardAgainstReboot:
         # Mid-mutation state: no live app at all, boot activation removed.
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists()
         assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is False
+        run_id = _journal_run_id(journal_text)
 
         env.simulate_pve_ct_reboot(FAKE_VMID)
         rebooted = env.state()["vmids"][FAKE_VMID]
@@ -1371,8 +1403,7 @@ class TestServiceAutostartGuardAgainstReboot:
         assert post["service"] == "active"
         assert post["service_enabled"] is True
         assert not journal.exists()
-        recovery_lines = env.log_lines()[before_recovery:]
-        assert not any(line.startswith("pct push") for line in recovery_lines)
+        _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
 
     def test_reboot_after_app_activation_before_venv_swap_never_autostarts(self, tmp_path):
         env = seed_installed_environment(
@@ -1586,3 +1617,593 @@ class TestServiceAutostartGuardAgainstReboot:
         # And a restart of the finished installation brings Hubinet back.
         env.simulate_pve_ct_reboot(FAKE_VMID)
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# W. Correction pass 7, P1 -- reboot recovery must not depend on the
+#    container's /tmp surviving.
+#
+#    The run-owned authority helper
+#    (/tmp/hubinet-ops-authority-tool-<UPDATE_RUN_ID>.py) is pushed exactly
+#    once, during the ORIGINAL invocation's Phase U2. A real PVE/CT restart
+#    legitimately clears a container's volatile /tmp, and startup recovery
+#    deliberately never starts a new plan -- so nothing would re-push it,
+#    while every remaining recovery operation (the three-valued path-state
+#    probes and the fail-closed authority-database remove/restore) runs
+#    THROUGH that helper. The fix is not to pretend /tmp is durable: it is
+#    for recovery to re-push the same bounded updater-owned tool to the
+#    same reconstructed run-owned path and positively prove it usable
+#    before entering rollback.
+#
+#    These tests are only meaningful because the fake was corrected in the
+#    same pass: FakePveEnvironment.simulate_pve_ct_reboot now really
+#    empties the CT's /tmp, and the fake `python3` dispatcher refuses to
+#    invent execution of a script that is not present in the fake CT
+#    filesystem (returning 2, exactly like real CPython).
+# ---------------------------------------------------------------------------
+
+
+class TestRebootTmpLossRecoveryP1:
+    def test_reboot_clearing_ct_tmp_repushes_run_owned_tool_then_rolls_back(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="3" * 40,
+            scenario_overrides={"kill_updater_after_move": "mv_live_app_to_rollback"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-tmp-loss", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "rollback_armed=1" in journal_text
+        run_id = _journal_run_id(journal_text)
+
+        tool_ct_path = env.ct_file(FAKE_VMID, f"/tmp/hubinet-ops-authority-tool-{run_id}.py")
+        assert tool_ct_path.is_file(), (
+            "the original invocation must have pushed the run-owned authority helper"
+        )
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        # The exact defect witness: the helper every rollback operation runs
+        # through is GONE, because a restarted container's /tmp is volatile.
+        assert not tool_ct_path.exists()
+        assert not list(env.ct_file(FAKE_VMID, "/tmp").glob("hubinet-ops-*"))
+        # Everything durable survived, which is what recovery still needs.
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert journal.exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
+
+        before_recovery = len(env.log_lines())
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "restored the run-owned authority helper" in recovered.stderr
+        assert "rollback complete" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr, "recovery must not start a new plan"
+        # Exactly one push, and it is the authority helper at the SAME
+        # reconstructed run-id path -- never the pre-update HTTP probe,
+        # which recovery does not use.
+        _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
+        assert not any(
+            "hubinet-ops-update-probe" in line
+            for line in env.log_lines()[before_recovery:]
+            if line.startswith("pct push")
+        )
+
+        # The pre-update installation is coherent, enabled, active, healthy.
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "3" * 40
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not journal.exists()
+        # The re-pushed recovery helper is itself run-owned and cleaned up.
+        assert not tool_ct_path.exists()
+
+    def test_destructive_reset_reboot_recovery_restores_tool_for_db_rollback(self, tmp_path):
+        # The same /tmp loss, but on the path where the re-pushed helper is
+        # load-bearing for MORE than path probes: a destructive authority
+        # reset already happened, so rollback must run the fail-closed
+        # `remove` + validated-backup restore through that helper.
+        new_backend_instance_id = "22222222-2222-4222-8222-222222222222"
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            installed_source_sha="4" * 40,
+            scenario_overrides={
+                "discovery_backend_instance_id": new_backend_instance_id,
+                "kill_updater_after_target_start": True,
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-reset-tmp-loss", REPO_ROOT, schema_version=8
+        )
+
+        interrupted = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert interrupted.returncode == -9
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "ledger=update-authority-reset-attempted" in journal_text
+        assert "authority_action=reset_required" in journal_text
+        run_id = _journal_run_id(journal_text)
+        # The live database really was destroyed after its validated backup.
+        assert not env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db").exists()
+        backup = env.ct_file(
+            FAKE_VMID, f"/var/lib/hubinet-ops/update-backups/{run_id}/authority.db"
+        )
+        assert backup.is_file()
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        assert not env.ct_file(
+            FAKE_VMID, f"/tmp/hubinet-ops-authority-tool-{run_id}.py"
+        ).exists()
+        # The authority backup is NOT in /tmp and must survive the restart.
+        assert backup.is_file()
+
+        before_recovery = len(env.log_lines())
+        recovered = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "restored the run-owned authority helper" in recovered.stderr
+        assert "rollback complete" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
+
+        restored = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
+        assert restored["schema_version"] == 7, (
+            "the re-pushed helper must have driven the fail-closed remove + "
+            "validated-backup restore, not been silently skipped"
+        )
+        assert restored["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not journal.exists()
+
+    def test_recovery_that_cannot_restore_the_tool_hard_stops_and_preserves_state(self, tmp_path):
+        # Fail-closed control: if the run-owned helper cannot be restored,
+        # recovery must stop before ANY rollback/path-state/authority
+        # operation, preserve the journal and every rollback artifact, and
+        # start no new plan.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="5" * 40,
+            scenario_overrides={"kill_updater_after_move": "mv_live_app_to_rollback"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-tool-lost", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["pct_push"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        blocked = _run(env.env, _base_args(target))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        assert "could not restore the run-owned authority helper" in blocked.stderr
+        assert "no rollback, path-state, or authority-database operation was attempted" in blocked.stderr
+        assert "rollback complete" not in blocked.stderr
+        assert "Phase U2" not in blocked.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=active" in journal.read_text(encoding="utf-8")
+        # Nothing was touched: no live app restored, artifacts all retained.
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists()
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.staged-*"))
+
+
+# ---------------------------------------------------------------------------
+# X. Correction pass 7, P2-A -- rollback must be REPLAYABLE after a partial
+#    rollback.
+#
+#    A first rollback can legitimately restore several artifacts and then
+#    hard stop at a LATER terminal operation (re-enable / start / the
+#    health proof). That path deliberately RETAINS the active journal, so
+#    a later updater invocation re-enters the SAME rollback for the SAME
+#    run id. Most rollback helpers already tolerated already-restored
+#    state by inspecting the bounded set of paths their artifact owns; the
+#    PVE host helper and the systemd unit did not, and diagnosed
+#    corruption on state a previous rollback of the same run had itself
+#    produced.
+#
+#    Each test below drives exactly that sequence: update changes the
+#    artifact, the target fails, the first rollback restores it and then
+#    hard stops at re-enable, the injected terminal problem is fixed, and
+#    the updater is invoked again.
+# ---------------------------------------------------------------------------
+
+
+OLD_HELPER_TEXT = "#!/usr/bin/env python3\n# pre-update helper\n"
+NEW_HELPER_TEXT = "#!/usr/bin/env python3\n# target helper\n"
+OLD_UNIT_TEXT = "[Unit]\nDescription=pre-update unit\n"
+NEW_UNIT_TEXT = "[Unit]\nDescription=target unit\n"
+
+
+def _helper_host_path(env, suffix=""):
+    return (
+        Path(env.env["HUBINET_OPS_TEST_HOST_ROOT"])
+        / "usr" / "local" / "libexec"
+        / f"hubinet-package-scan-helper-{FAKE_RUN_ID}{suffix}"
+    )
+
+
+def _clear_scenario_failures(env):
+    scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+    scenario["fail"] = []
+    scenario["discovery_result"] = "healthy"
+    env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+
+class TestPartialRollbackRetryP2A:
+    def test_second_recovery_after_partial_rollback_with_changed_helper(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="6" * 40,
+            installed_helper_text=OLD_HELPER_TEXT,
+            scenario_overrides={
+                # The target is activated, then acceptance fails ...
+                "discovery_result": "backend_unreachable",
+                # ... and the resulting rollback restores helper/unit/app
+                # and only THEN hard stops, at the re-enable proof.
+                "fail": ["service_autostart_enable"],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-helper-retry", REPO_ROOT, helper_text=NEW_HELPER_TEXT
+        )
+        helper_live = _helper_host_path(env)
+        helper_rollback_glob = list(helper_live.parent.glob(f"{helper_live.name}.rollback-*"))
+        assert not helper_rollback_glob
+
+        first = _run(env.env, _base_args(target))
+        assert first.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in first.stderr
+        assert "boot activation re-enabled" in first.stderr
+        assert "rollback complete" not in first.stderr
+        # The helper WAS restored by that first, partial rollback ...
+        assert helper_live.read_text(encoding="utf-8") == OLD_HELPER_TEXT
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "state=active" in journal_text
+        assert "ledger=update-helper-activated" in journal_text
+        run_id = _journal_run_id(journal_text)
+        # ... and the canonical recovery material was deliberately NOT
+        # consumed, so a retry still has the original pre-update helper.
+        helper_rollback = _helper_host_path(env, f".rollback-{run_id}")
+        assert helper_rollback.is_file()
+        assert helper_rollback.read_text(encoding="utf-8") == OLD_HELPER_TEXT
+        assert not _helper_host_path(env, f".restore-tmp-{run_id}").exists()
+
+        _clear_scenario_failures(env)
+        before_recovery = len(env.log_lines())
+        second = _run(env.env, _base_args(target))
+        assert second.returncode == 0, second.stderr
+        assert "detected prior updater journal" in second.stderr
+        assert "rollback complete" in second.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in second.stderr
+        assert "Phase U2" not in second.stderr, "recovery must start no new update plan"
+        _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
+
+        assert helper_live.read_text(encoding="utf-8") == OLD_HELPER_TEXT
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "6" * 40
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not journal.exists()
+        # Terminal recovery, and only terminal recovery, consumes the
+        # run-owned host-side helper artifacts.
+        assert not helper_rollback.exists()
+        assert not _helper_host_path(env, f".restore-tmp-{run_id}").exists()
+        assert not _helper_host_path(env, f".staged-{run_id}").exists()
+
+    def test_second_recovery_with_helper_rollback_artifact_already_consumed(self, tmp_path):
+        # The same retry, but starting from the state a rollback that
+        # CONSUMED its canonical helper copy leaves behind (what the
+        # previous bare `mv` did, and what any already-in-flight run
+        # updated from that shape would still present). An absent
+        # canonical copy plus a present, executable live helper is a
+        # completed restore, never corruption.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="7" * 40,
+            installed_helper_text=OLD_HELPER_TEXT,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["service_autostart_enable"],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-helper-consumed", REPO_ROOT, helper_text=NEW_HELPER_TEXT
+        )
+
+        first = _run(env.env, _base_args(target))
+        assert first.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in first.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        helper_live = _helper_host_path(env)
+        helper_rollback = _helper_host_path(env, f".rollback-{run_id}")
+        assert helper_live.read_text(encoding="utf-8") == OLD_HELPER_TEXT
+        helper_rollback.unlink()
+
+        _clear_scenario_failures(env)
+        second = _run(env.env, _base_args(target))
+        assert second.returncode == 0, second.stderr
+        assert "rollback complete" in second.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in second.stderr
+        assert "Phase U2" not in second.stderr
+        assert helper_live.read_text(encoding="utf-8") == OLD_HELPER_TEXT
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not journal.exists()
+
+    def test_retry_whose_live_helper_is_also_gone_never_reaches_a_tolerant_restore(
+        self, tmp_path
+    ):
+        # Positive control for the tolerant branch above: tolerating a
+        # consumed canonical copy must never become "assume it is fine".
+        # With BOTH the canonical copy and the live helper gone, the
+        # forced-command ownership chain no longer identifies this
+        # installation at all, so recovery fails closed even earlier --
+        # before any rollback, path-state or authority operation -- and
+        # preserves the journal and every rollback artifact rather than
+        # silently continuing. (_update_rollback_host_helper's own absent
+        # + unusable-live hard stop stays as defence in depth behind that
+        # gate.)
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="8" * 40,
+            installed_helper_text=OLD_HELPER_TEXT,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["service_autostart_enable"],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-helper-lost", REPO_ROOT, helper_text=NEW_HELPER_TEXT
+        )
+
+        first = _run(env.env, _base_args(target))
+        assert first.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        run_id = _journal_run_id(journal.read_text(encoding="utf-8"))
+        _helper_host_path(env, f".rollback-{run_id}").unlink()
+        _helper_host_path(env).unlink()
+
+        _clear_scenario_failures(env)
+        before_recovery = len(env.log_lines())
+        second = _run(env.env, _base_args(target))
+        assert second.returncode != 0
+        assert "ownership verification failed" in second.stderr
+        assert "does not exist on this PVE host" in second.stderr
+        assert "rollback complete" not in second.stderr
+        assert "Phase U2" not in second.stderr
+        assert journal.exists()
+        assert "state=active" in journal.read_text(encoding="utf-8")
+        # Nothing was pushed and nothing was restored.
+        _assert_recovery_pushed_nothing(env, before_recovery)
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+
+    def test_second_recovery_after_partial_rollback_with_changed_unit(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="9" * 40,
+            installed_unit_text=OLD_UNIT_TEXT,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["service_autostart_enable"],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-unit-retry", REPO_ROOT, unit_text=NEW_UNIT_TEXT
+        )
+        unit_live = env.ct_file(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service")
+
+        first = _run(env.env, _base_args(target))
+        assert first.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in first.stderr
+        assert "boot activation re-enabled" in first.stderr
+        assert "rollback complete" not in first.stderr
+        # The unit WAS restored by that first, partial rollback, and its
+        # rollback artifact was consumed by the atomic restore rename.
+        assert unit_live.read_text(encoding="utf-8") == OLD_UNIT_TEXT
+        assert not list(unit_live.parent.glob("hubinet-ops.service.rollback-*"))
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "ledger=update-unit-activation-attempted" in journal_text
+        run_id = _journal_run_id(journal_text)
+        reloads_after_first = env.state()["daemon_reload_calls"]
+
+        _clear_scenario_failures(env)
+        before_recovery = len(env.log_lines())
+        second = _run(env.env, _base_args(target))
+        assert second.returncode == 0, second.stderr
+        assert "rollback complete" in second.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in second.stderr
+        assert "rollback artifact is absent" not in second.stderr
+        assert "Phase U2" not in second.stderr, "recovery must start no new update plan"
+        _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
+
+        assert unit_live.read_text(encoding="utf-8") == OLD_UNIT_TEXT
+        # Nothing was restored this time, so no further daemon-reload was
+        # needed -- daemon-reload stays load-bearing for an ACTUAL restore.
+        assert env.state()["daemon_reload_calls"] == reloads_after_first
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not journal.exists()
+
+    def test_unit_rollback_artifact_absent_and_live_unit_gone_still_fails_closed(self, tmp_path):
+        # Positive control for the unit's tolerant branch: an absent
+        # rollback artifact is only benign while the live unit positively
+        # exists. UNKNOWN/absent still fails closed.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="a" * 40,
+            installed_unit_text=OLD_UNIT_TEXT,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["service_autostart_enable"],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-unit-lost", REPO_ROOT, unit_text=NEW_UNIT_TEXT
+        )
+        first = _run(env.env, _base_args(target))
+        assert first.returncode != 0
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        env.ct_file(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service").unlink()
+
+        _clear_scenario_failures(env)
+        second = _run(env.env, _base_args(target))
+        assert second.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in second.stderr
+        assert "rollback artifact is absent and the live unit is absent" in second.stderr
+        assert "rollback complete" not in second.stderr
+        assert "Phase U2" not in second.stderr
+        assert journal.exists()
+
+
+# ---------------------------------------------------------------------------
+# Y. Correction pass 7, P2-B -- an UNKNOWN installed-source-marker
+#    precondition must never arm a marker mutation that cannot have
+#    happened.
+#
+#    _update_write_source_marker used to record
+#    update-marker-activation-attempted BEFORE probing whether an old
+#    marker existed. An UNKNOWN probe then died with "attempted" recorded
+#    and neither precondition-exists nor precondition-absent, and rollback
+#    correctly refused to guess -- hard stopping an otherwise perfectly
+#    ordinary full artifact rollback over a marker mutation that provably
+#    never occurred. The probe now runs first, and the attempted marker is
+#    journaled durably together with its proven precondition, immediately
+#    before the first marker `mv`.
+# ---------------------------------------------------------------------------
+
+
+class TestMarkerPreconditionUnknownP2B:
+    def test_unknown_marker_precondition_rolls_back_fully_and_leaves_marker_intact(
+        self, tmp_path
+    ):
+        # A fully activated and accepted target -- app, venv/requirements,
+        # unit, PVE helper and a destructive authority reset all done --
+        # that fails only at the very last step, because the live marker's
+        # path state cannot be proven either way.
+        new_backend_instance_id = "33333333-3333-4333-8333-333333333333"
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            installed_source_sha="b" * 40,
+            installed_requirements="fastapi==0.100.0\n",
+            installed_unit_text=OLD_UNIT_TEXT,
+            installed_helper_text=OLD_HELPER_TEXT,
+            scenario_overrides={
+                "discovery_backend_instance_id": new_backend_instance_id,
+                "path_probe_transport_fail_prefixes": [
+                    "/opt/hubinet-ops/.hubinet-source-commit"
+                ],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-marker-unknown",
+            REPO_ROOT,
+            schema_version=8,
+            requirements_text="fastapi==0.116.1\n",
+            unit_text=NEW_UNIT_TEXT,
+            helper_text=NEW_HELPER_TEXT,
+        )
+
+        result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert result.returncode != 0
+        assert "could not prove whether the pre-update installed-source marker exists" in result.stderr
+        # The whole point: an UNKNOWN precondition never armed a marker
+        # mutation, so rollback is an ordinary full artifact rollback and
+        # never hard stops on the marker.
+        assert "rollback complete" in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in result.stderr
+        assert "installed-source marker activation was attempted" not in result.stderr
+
+        # The old marker is exactly unchanged -- never moved aside, never
+        # replaced, never removed.
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit") == "b" * 40 + "\n"
+        assert not list(
+            env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob(".hubinet-source-commit.rollback-*")
+        )
+        # Every other artifact was restored to its pre-update state.
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+        assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == OLD_UNIT_TEXT
+        assert _helper_host_path(env).read_text(encoding="utf-8") == OLD_HELPER_TEXT
+        restored = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
+        assert restored["schema_version"] == 7
+        assert restored["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+        # And the pre-update installation is coherently back in service.
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+    def test_marker_precondition_exists_is_journaled_before_the_first_marker_move(
+        self, tmp_path
+    ):
+        # Positive control, old marker EXISTS: the durable journal must
+        # carry BOTH the proven precondition and the attempted marker
+        # before the first destructive marker `mv` -- witnessed by killing
+        # the updater exactly on that move.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="c" * 40,
+            scenario_overrides={"kill_updater_after_move": "mv_live_marker_to_rollback"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-marker-exists", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        journal_text = _update_state_path(env, FAKE_VMID, "journal").read_text(encoding="utf-8")
+        assert "ledger=update-marker-precondition-exists" in journal_text
+        assert "ledger=update-marker-activation-attempted" in journal_text
+        assert "ledger=update-marker-precondition-absent" not in journal_text
+
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "c" * 40
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+
+    def test_marker_precondition_absent_is_journaled_and_leaves_no_marker(self, tmp_path):
+        # Positive control, old marker ABSENT: the proven-absent
+        # precondition is journaled with the attempted marker, and a
+        # failed update must leave NO marker rather than a new SHA paired
+        # with the rolled-back old payload.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha=None,
+            scenario_overrides={"fail": ["mv_staged_marker_to_live"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-marker-absent", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in result.stderr
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True

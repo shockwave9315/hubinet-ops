@@ -44,6 +44,11 @@ hostile administrator of the managed environment is out of scope. See
   rollback, and an explicit, backed-up authority-database reset only when the
   target schema is incompatible (Home Assistant re-enrollment is required only
   then). Fresh bootstrap remains first-install/disaster-recovery only.
+  Interrupted runs are recovered from a durable per-VMID journal: recovery
+  restores the run-owned authority helper (a real PVE/CT restart clears the
+  container's volatile `/tmp`) before entering rollback, and rollback is
+  replayable, so a second recovery after a partial rollback completes instead
+  of misreporting already-restored artifacts as corruption.
 
 Unchanged: PVE autodiscovery, dynamic backend inventory, the GET-only PVE
 runtime, source health/freshness behavior, the Home Assistant snapshot contract

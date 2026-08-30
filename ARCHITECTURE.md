@@ -293,6 +293,28 @@ any new-run ownership or planning read. The updater re-verifies the same
 installation and then either cleans a pre-mutation interruption or re-enters
 the existing fail-closed rollback machinery with the prior run-id.
 
+Because that rollback machinery runs entirely through the run-owned authority
+helper in the container's volatile `/tmp` — three-valued path-state probes,
+and the fail-closed database removal and validated-backup restore after a
+destructive authority reset — recovery first re-pushes the same bounded
+updater-owned tool to the same reconstructed run-owned path and positively
+proves it usable. A real PVE/CT restart clears that `/tmp`, and recovery
+deliberately never starts a new plan, so nothing else would restore it. The
+re-push is recovery infrastructure only: no Phase U2, no target
+application/configuration/identity content, no pre-update HTTP probe, and
+bounded to the loaded run ID. If it cannot be restored and proven, recovery
+hard stops with the journal, rollback artifacts, and authority backup
+preserved.
+
+Rollback is replayable. A first rollback may restore artifacts and then hard
+stop at a later terminal step, retaining the active journal, so a later
+invocation re-enters the same rollback for the same run-id. Every rollback
+helper therefore tolerates already-restored state by inspecting the bounded
+set of paths its artifact owns, while still failing closed on an unknown path
+state; the PVE host helper keeps its canonical rollback copy unconsumed
+(restore temporary plus atomic rename onto the live path) so retries retain
+the original recovery material.
+
 Successful recovery proves the restored service enabled, active, and
 healthy, clears the journal, and exits with an instruction to rerun; it never starts the
 requested new plan in that invocation. If any ownership, service-state,

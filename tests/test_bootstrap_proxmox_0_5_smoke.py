@@ -2154,6 +2154,21 @@ class TestFirewallStatefulSemantics:
         )
 
     def _discovery_accept(self, fake_env_obj, vmid="110"):
+        # `pct push` FIRST, exactly as bootstrap-finish.sh does before it
+        # ever runs this script inside the CT. The fake dispatcher refuses
+        # to invent execution of a CT-side Python helper that is not
+        # actually present (correction pass 7), so this fixture must
+        # reproduce the real push/exec pair rather than only the exec.
+        push = subprocess.run(
+            [
+                "bash", "-c",
+                f"pct push {vmid} "
+                f"{REPO_ROOT / 'deploy' / 'lib' / 'hubinet-ops-bootstrap-accept.py'} "
+                "/tmp/hubinet-ops-bootstrap-accept.py",
+            ],
+            env=fake_env_obj.env, capture_output=True, text=True, timeout=15,
+        )
+        assert push.returncode == 0, push.stderr
         return subprocess.run(
             ["bash", "-c", f'pct exec {vmid} -- python3 /tmp/hubinet-ops-bootstrap-accept.py "{FAKE_DISPLAY_NAME}" 5'],
             env=fake_env_obj.env, capture_output=True, text=True, timeout=15,
