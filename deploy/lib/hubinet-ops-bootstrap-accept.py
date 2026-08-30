@@ -117,7 +117,7 @@ def get_json(path: str, token: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _check_committed_source(source: dict) -> str | None:
+def _check_committed_source(source: dict, *, min_sequence_exclusive: int = 0) -> str | None:
     """Returns None if the source proves a genuinely committed, fresh,
     current success; otherwise a FAIL reason string (never raises -- the
     caller decides whether a given reason is worth continuing to poll
@@ -129,6 +129,11 @@ def _check_committed_source(source: dict) -> str | None:
     sequence = source.get("last_committed_run_sequence")
     if not isinstance(sequence, int) or sequence <= 0:
         return f"last-committed-run-sequence-invalid got={sequence!r}"
+    if min_sequence_exclusive and sequence <= min_sequence_exclusive:
+        return (
+            "committed-sequence-not-past-baseline "
+            f"got={sequence!r} baseline={min_sequence_exclusive!r}"
+        )
 
     if not source.get("last_successful_observed_at"):
         return "last-successful-observed-at-missing"
@@ -150,8 +155,20 @@ def _check_committed_source(source: dict) -> str | None:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("FAIL usage: hubinet-ops-bootstrap-accept.py <expected-display-name> <timeout-seconds>")
+    # A 4th, optional argument lets the in-place updater
+    # (deploy/lib/update-activate.sh) reuse this exact acceptance contract
+    # for a POST-UPDATE, DB-PRESERVING check instead of copying it: when
+    # given and > 0, the committed run sequence must exceed this floor,
+    # proving a genuine completed discovery cycle happened AFTER the
+    # update restarted the service, not merely that the pre-update state
+    # was still being reported. Omitted (or "0"), this is the original,
+    # unextended bootstrap contract -- any positive sequence passes,
+    # exactly as before.
+    if len(sys.argv) not in (3, 4):
+        print(
+            "FAIL usage: hubinet-ops-bootstrap-accept.py <expected-display-name> "
+            "<timeout-seconds> [min-committed-sequence-exclusive]"
+        )
         return 1
     expected_display_name = sys.argv[1]
     try:
@@ -159,6 +176,16 @@ def main() -> int:
     except ValueError:
         print("FAIL invalid timeout-seconds argument")
         return 1
+    min_committed_sequence_exclusive = 0
+    if len(sys.argv) == 4:
+        try:
+            min_committed_sequence_exclusive = int(sys.argv[3])
+        except ValueError:
+            print("FAIL invalid min-committed-sequence-exclusive argument")
+            return 1
+        if min_committed_sequence_exclusive < 0:
+            print("FAIL invalid min-committed-sequence-exclusive argument")
+            return 1
 
     try:
         token = read_bearer_token()
@@ -209,7 +236,9 @@ def main() -> int:
                 # PASS on it.
                 last_health = f"healthy/{source.get('freshness')}"
             else:
-                committed_check_failure = _check_committed_source(source)
+                committed_check_failure = _check_committed_source(
+                    source, min_sequence_exclusive=min_committed_sequence_exclusive
+                )
                 if committed_check_failure is not None:
                     print(f"FAIL {committed_check_failure}")
                     return 1

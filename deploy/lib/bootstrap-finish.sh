@@ -162,6 +162,20 @@ _accept_discovery() {
 phase13_finish() {
   log_phase "Phase 13: finalize"
 
+  # Advisory-only installed-source marker (see deploy/update-proxmox-0.5.sh
+  # and AGENTS.md's product-update lifecycle) -- written only now, AFTER
+  # phase12_acceptance already passed, exactly like the in-place updater's
+  # own marker semantics: a bootstrap that failed before acceptance must
+  # never claim its source as an accepted installed version.
+  local marker_tmp
+  marker_tmp="$(mktemp /tmp/hubinet-ops-bootstrap-source-marker.XXXXXX)"
+  printf '%s\n' "${SOURCE_HEAD_SHA}" >"${marker_tmp}"
+  run_logged pct push "${VMID}" "${marker_tmp}" /opt/hubinet-ops/.hubinet-source-commit \
+    || die "failed to write the installed-source marker after successful acceptance"
+  rm -f "${marker_tmp}"
+  run_logged pct exec "${VMID}" -- chown hubinetops:hubinetops /opt/hubinet-ops/.hubinet-source-commit \
+    || die "failed to set ownership on the installed-source marker"
+
   run_logged pct set "${VMID}" --onboot 1 \
     || die "failed to enable onboot for container ${VMID} after successful acceptance"
 
