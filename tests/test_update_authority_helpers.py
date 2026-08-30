@@ -15,7 +15,10 @@ from __future__ import annotations
 import errno
 import importlib.util
 import json
+import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -26,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 AUTHORITY_TOOL_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-authority-tool.py"
 UPDATE_PROBE_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-update-probe.py"
 ACCEPT_SCRIPT_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-bootstrap-accept.py"
+VENV_BUILD_PATH = ROOT / "deploy" / "lib" / "hubinet-ops-update-venv-stage.py"
 
 MARKER = "hubinet_ops_0_5_authority"
 BACKEND_ID = "11111111-1111-4111-8111-111111111111"
@@ -416,3 +420,145 @@ class TestAcceptScriptMinSequenceExtension:
         rc = accept_script.main()
         assert rc == 1
         assert "invalid min-committed-sequence-exclusive" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Correction pass 8, P1 -- the REAL, non-faked half of the final-path venv
+# proof.
+#
+# These build a genuine stdlib virtualenv in tmp_path and read back a
+# console script venv/pip generated itself. Bounded and offline: with_pip
+# is bootstrapped by ensurepip from CPython's own bundled wheels, and
+# PIP_NO_INDEX/PIP_NO_INPUT are exported so no test can reach a package
+# index even if one were reachable. Nothing here touches PVE, LXC, systemd,
+# apt, or the pytest host's own environment.
+# ---------------------------------------------------------------------------
+
+venv_build = _load(VENV_BUILD_PATH, "hubinet_ops_update_venv_build")
+
+
+def _offline_env() -> dict:
+    env = dict(os.environ)
+    env["PIP_NO_INDEX"] = "1"
+    env["PIP_NO_INPUT"] = "1"
+    env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+    env["PIP_RETRIES"] = "0"
+    return env
+
+
+def _entrypoint_header(script_path: Path) -> str:
+    """The interpreter-selection preamble of a pip-generated console script.
+
+    Short venv paths produce a plain `#!<venv>/bin/python` shebang; a path
+    over the kernel's shebang limit produces the equivalent `#!/bin/sh` +
+    `'''exec' <abs-path>` wrapper instead. Both embed the SAME absolute
+    interpreter path, so both forms are covered by reading the preamble.
+    """
+
+    with script_path.open("r", encoding="utf-8", errors="replace") as handle:
+        return "".join(next(handle, "") for _ in range(3))
+
+
+@pytest.fixture(scope="module")
+def _ensurepip_available() -> None:
+    try:
+        import ensurepip  # noqa: F401
+    except ImportError:  # pragma: no cover -- distro-stripped python3
+        pytest.skip("this interpreter has no ensurepip, so no venv can be built offline")
+
+
+class TestFinalPathVirtualenvBuild:
+    def test_generated_entrypoint_names_the_path_the_venv_was_built_at(
+        self, tmp_path, _ensurepip_available
+    ):
+        final = tmp_path / "opt" / "hubinet-ops" / ".venv"
+        final.parent.mkdir(parents=True)
+        venv_build.create_environment(final)
+
+        pip_script = final / "bin" / "pip"
+        assert pip_script.is_file()
+        header = _entrypoint_header(pip_script)
+        assert f"{final}/bin/python" in header, header
+        assert ".staged-" not in header, header
+
+    def test_a_renamed_virtualenv_keeps_its_original_interpreter_path(
+        self, tmp_path, _ensurepip_available
+    ):
+        """The exact reason a staged-then-renamed venv design is rejected.
+
+        A virtualenv is not relocatable: renaming the directory does not
+        rewrite the absolute interpreter path pip baked into every console
+        script it generated. This is the regression that keeps the
+        "build at .venv.staged-<runid>, then mv onto .venv" design from
+        coming back.
+        """
+        staged = tmp_path / "opt" / "hubinet-ops" / ".venv.staged-aaaaaaaa"
+        live = tmp_path / "opt" / "hubinet-ops" / ".venv"
+        staged.parent.mkdir(parents=True)
+        venv_build.create_environment(staged)
+
+        shutil.move(str(staged), str(live))
+
+        header = _entrypoint_header(live / "bin" / "pip")
+        assert f"{staged}/bin/python" in header, (
+            "renaming a virtualenv must NOT rewrite generated entrypoints -- if this "
+            "ever becomes false the staged-then-rename design would be safe, but it "
+            "is not, so the updater builds at the final path instead"
+        )
+        assert f"{live}/bin/python" not in header, header
+        assert not staged.exists()
+
+    def test_main_builds_at_the_exact_destination_it_is_given(
+        self, tmp_path, _ensurepip_available
+    ):
+        """End-to-end through the production script's own argv contract."""
+        final = tmp_path / "opt" / "hubinet-ops" / ".venv"
+        final.parent.mkdir(parents=True)
+        requirements = tmp_path / "requirements.txt"
+        requirements.write_text("", encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(VENV_BUILD_PATH), str(final), str(requirements)],
+            capture_output=True,
+            env=_offline_env(),
+            timeout=300,
+        )
+        # Offline, `pip install --upgrade pip` legitimately cannot resolve a
+        # distribution, so a non-zero exit here is the expected shape of a
+        # failed build -- and it must leave the (partial) environment at the
+        # FINAL pathname, which is exactly what update-activate.sh's
+        # rollback removes and proves absent.
+        assert final.is_dir()
+        header = _entrypoint_header(final / "bin" / "pip")
+        assert f"{final}/bin/python" in header, (header, result.stderr[-500:])
+        assert ".staged-" not in header
+
+    def test_refuses_an_already_existing_destination(self, tmp_path):
+        existing = tmp_path / ".venv"
+        existing.mkdir()
+        (existing / "sentinel").write_text("do not touch", encoding="utf-8")
+        requirements = tmp_path / "requirements.txt"
+        requirements.write_text("", encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(VENV_BUILD_PATH), str(existing), str(requirements)],
+            capture_output=True,
+            env=_offline_env(),
+            timeout=60,
+        )
+        assert result.returncode == 1
+        assert b"already-existing path" in result.stderr
+        assert (existing / "sentinel").read_text(encoding="utf-8") == "do not touch"
+        assert not (existing / "bin").exists()
+
+    def test_refuses_a_missing_requirements_file(self, tmp_path):
+        final = tmp_path / ".venv"
+        result = subprocess.run(
+            [sys.executable, str(VENV_BUILD_PATH), str(final), str(tmp_path / "absent.txt")],
+            capture_output=True,
+            env=_offline_env(),
+            timeout=60,
+        )
+        assert result.returncode == 1
+        assert b"requirements file does not exist" in result.stderr
+        assert not final.exists()

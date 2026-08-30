@@ -196,21 +196,32 @@ class TestRequirementsChanged:
         assert result.returncode == 0, result.stderr
         assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.116.1\n"
 
-    def test_failed_venv_staging_leaves_old_service_untouched(self, tmp_path):
+    def test_venv_build_tool_push_failure_leaves_old_service_untouched(self, tmp_path):
+        """Phase U3 still fails harmlessly, before the mutation window.
+
+        The venv is no longer BUILT during staging (see
+        TestVenvBuiltAtFinalPathP1), but the small build helper is still
+        pushed there -- deliberately, so a transport failure is discovered
+        while the old service is untouched rather than after it is
+        stopped.
+        """
         env = seed_installed_environment(
             tmp_path,
             installed_requirements="fastapi==0.100.0\n",
-            scenario_overrides={"fail": ["pip_install"]},
+            scenario_overrides={
+                "pct_push_fail_dest_suffixes": ["hubinet-ops-update-venv-stage.py"]
+            },
         )
         target = build_update_target_checkout(
-            tmp_path / "target-reqs-fail", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+            tmp_path / "target-reqs-push-fail", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
         )
         result = _run(env.env, _base_args(target))
         assert result.returncode != 0
         assert "the ACTIVE virtualenv was never touched" in result.stderr
         assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip") == "#!/bin/sh\n"
         assert not any(
-            line.startswith("systemctl") and "stop" in line for line in env.log_lines()
+            "systemctl" in line and " stop " in line for line in env.log_lines()
         )
 
 
@@ -706,11 +717,18 @@ class TestActivationIntermediateFailures:
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
 
-    def test_venv_second_move_failure_restores_old_venv(self, tmp_path):
+    def test_venv_build_step_failure_restores_old_venv(self, tmp_path):
+        # Correction pass 8 (P1): the venv step's second half is no longer
+        # a staged->live rename but the BUILD at the final live path, so
+        # this family's "the first destructive move succeeded and the
+        # activating step then failed" state is reached that way now. The
+        # invariant under test is unchanged: rollback must never leave the
+        # virtualenv missing, and requirements.txt must still describe the
+        # environment that is actually installed.
         env = seed_installed_environment(
             tmp_path,
             installed_requirements="fastapi==0.100.0\n",
-            scenario_overrides={"fail": ["mv_staged_venv_to_live"]},
+            scenario_overrides={"fail": ["pip_install"]},
         )
         target = build_update_target_checkout(
             tmp_path / "target-venv-fail", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
@@ -2035,9 +2053,15 @@ class TestPartialRollbackRetryP2A:
         _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
 
         assert unit_live.read_text(encoding="utf-8") == OLD_UNIT_TEXT
-        # Nothing was restored this time, so no further daemon-reload was
-        # needed -- daemon-reload stays load-bearing for an ACTUAL restore.
-        assert env.state()["daemon_reload_calls"] == reloads_after_first
+        # Correction pass 8 (P2): the replay finds the rollback artifact
+        # already consumed and the old unit already on the live path -- and
+        # STILL reloads systemd before starting it. "The file is back" is a
+        # fact about the filesystem, never proof that the systemd manager
+        # stopped holding the target definition (the first rollback here
+        # did reload, but a run SIGKILLed between the restore rename and
+        # its reload would not have -- see
+        # TestUnitRollbackReplayReloadsSystemdP2).
+        assert env.state()["daemon_reload_calls"] == reloads_after_first + 1
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
         assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
         post = env.state()["vmids"][FAKE_VMID]
@@ -2207,3 +2231,519 @@ class TestMarkerPreconditionUnknownP2B:
         post = env.state()["vmids"][FAKE_VMID]
         assert post["service"] == "active"
         assert post["service_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# Correction pass 8, P1 -- a changed-requirements update BUILDS the target
+# virtualenv at its FINAL live pathname.
+#
+# The rejected design built /opt/hubinet-ops/.venv.staged-<runid> while the
+# old service was still running and then renamed that directory onto
+# /opt/hubinet-ops/.venv. A Python virtualenv is not generally relocatable:
+# the console entrypoints pip/ensurepip generate embed the ABSOLUTE
+# interpreter path of the environment they were created in, so the
+# "activated" environment's own bin/pip still pointed at a staging pathname
+# that no longer existed. The fake reproduces exactly that property (it
+# writes the build path into the generated entrypoint), so these tests fail
+# against the old design. The real, non-faked half of this proof -- a
+# genuine stdlib venv whose generated console script is inspected, and
+# whose shebang demonstrably does NOT follow a rename -- lives in
+# tests/test_update_authority_helpers.py.
+# ---------------------------------------------------------------------------
+
+
+def _venv_build_invocations(env):
+    return [
+        line
+        for line in env.log_lines()
+        if " python3 /tmp/hubinet-ops-update-venv-stage.py" in line
+    ]
+
+
+class TestVenvBuiltAtFinalPathP1:
+    def test_changed_requirements_build_the_venv_at_the_final_live_path(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_requirements="fastapi==0.100.0\n")
+        target = build_update_target_checkout(
+            tmp_path / "target-final-venv", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+
+        # The build helper is invoked exactly once, with the FINAL live
+        # pathname as its destination -- never a staging pathname.
+        builds = _venv_build_invocations(env)
+        assert len(builds) == 1, builds
+        assert " /opt/hubinet-ops/.venv " in builds[0], builds
+        assert ".venv.staged-" not in builds[0], builds
+
+        # No staged-venv path is created anywhere, at any point in the run.
+        assert not any(".venv.staged-" in line for line in env.log_lines())
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob(".venv.staged-*"))
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob(".venv.rollback-*"))
+
+        # The activated environment's own generated entrypoint carries the
+        # absolute path it was built at. Under the rejected staged-then-
+        # rename design this would name a .venv.staged-<runid> directory
+        # that no longer exists.
+        pip_text = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip")
+        assert pip_text.strip() == "#!/opt/hubinet-ops/.venv/bin/python", pip_text
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.116.1\n"
+
+    def test_code_only_update_never_builds_or_touches_the_venv(self, tmp_path):
+        """Negative control: requirements unchanged -> no venv work at all."""
+        env = seed_installed_environment(tmp_path, installed_requirements="fastapi==0.116.1\n")
+        pre_pip = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip")
+        pre_requirements = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt")
+        target = build_update_target_checkout(
+            tmp_path / "target-code-only-venv", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+
+        assert not any(
+            "hubinet-ops-update-venv-stage.py" in line for line in env.log_lines()
+        ), "a code-only update must neither push nor run the venv build helper"
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip") == pre_pip
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == pre_requirements
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob(".venv.rollback-*"))
+
+    def test_pip_install_failure_rolls_back_to_the_old_environment(self, tmp_path):
+        """A failed build at the final path leaves the OLD installation coherent."""
+        env = seed_installed_environment(
+            tmp_path,
+            installed_requirements="fastapi==0.100.0\n",
+            scenario_overrides={"fail": ["pip_install"]},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-venv-build-fail", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+
+        # The partial target environment is gone and the preserved old one
+        # is back at the live path, with its own original entrypoint.
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip") == "#!/bin/sh\n"
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob(".venv.rollback-*"))
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+    def test_venv_create_failure_partial_target_is_removed_by_rollback(self, tmp_path):
+        """The build can die with a half-created directory at the LIVE path."""
+        env = seed_installed_environment(
+            tmp_path,
+            installed_requirements="fastapi==0.100.0\n",
+            scenario_overrides={"fail": ["venv_create"]},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-venv-create-fail", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip") == "#!/bin/sh\n"
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_sigkill_during_final_path_build_is_recovered_on_the_next_run(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_requirements="fastapi==0.100.0\n",
+            installed_source_sha="9" * 40,
+            scenario_overrides={"kill_updater_during_venv_build": True},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-venv-sigkill", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "state=active" in journal_text
+        assert "rollback_armed=1" in journal_text
+        assert "ledger=update-venv-activation-attempted" in journal_text
+        # The interrupted build really was at the FINAL live path, and the
+        # old environment is preserved under this run's rollback name.
+        assert (
+            env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip").strip()
+            == "#!/opt/hubinet-ops/.venv/bin/python"
+        )
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob(".venv.rollback-*"))
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is False
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario.pop("kill_updater_during_venv_build", None)
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "previous interrupted update" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        # A partially built environment is never resumed: it is removed and
+        # the preserved pre-update environment is restored verbatim.
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip") == "#!/bin/sh\n"
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob(".venv.rollback-*"))
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not journal.exists()
+
+
+# ---------------------------------------------------------------------------
+# Correction pass 8, P2 -- rollback readiness is a bounded POLL, not a
+# one-shot request. hubinet-ops.service is Type=simple, so systemd reports
+# `active` as soon as the process is exec'd -- strictly earlier than the
+# moment uvicorn has bound 127.0.0.1:8787. A single health request fired at
+# that instant misclassified an ordinary startup race as a failed rollback.
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackHealthReadinessP2:
+    def test_delayed_health_readiness_still_completes_the_rollback(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                # Deterministic probe counter, never a wall-clock sleep:
+                # the first three health requests of the run get no answer,
+                # exactly as they would while uvicorn is still binding
+                # 127.0.0.1:8787 behind an already-`active` Type=simple unit.
+                "health_fail_first_n": 3,
+            },
+        )
+        # Comfortably inside the EXISTING bounded startup/service deadline
+        # (the fake environment's default is deliberately tiny) so the
+        # retries have somewhere to happen. The one-shot probe this
+        # replaces would fail here no matter how long the deadline is.
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "10"
+        target = build_update_target_checkout(tmp_path / "target-slow-health", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        # The UPDATE still failed (that is what triggered the rollback),
+        # but the ROLLBACK itself must succeed.
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+        assert env.state()["backend_health_calls"] >= 4
+
+    def test_health_never_ready_hard_stops_and_retains_every_artifact(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["backend_health"],
+            },
+        )
+        # Bound the EXISTING startup/service deadline for this test rather
+        # than inventing a new one -- the loop is deliberately not allowed
+        # to run unbounded.
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "3"
+        target = build_update_target_checkout(tmp_path / "target-dead-health", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "unauthenticated health probe" in result.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=active" in journal.read_text(encoding="utf-8")
+
+    def test_recovery_after_a_transient_readiness_failure_completes(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["backend_health"],
+            },
+        )
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "3"
+        target = build_update_target_checkout(tmp_path / "target-transient-health", REPO_ROOT)
+        blocked = _run(env.env, _base_args(target))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+
+        _clear_scenario_failures(env)
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "previous interrupted update" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not journal.exists()
+
+
+# ---------------------------------------------------------------------------
+# Correction pass 8, P2 -- a REPLAYED unit rollback must still reload
+# systemd. "The old unit file is back on the live path" is a fact about the
+# filesystem and is never proof that the systemd MANAGER stopped holding
+# the target definition in memory.
+# ---------------------------------------------------------------------------
+
+
+class TestUnitRollbackReplayReloadsSystemdP2:
+    def test_replay_after_unit_restore_still_daemon_reloads_before_start(self, tmp_path):
+        original_unit = (REPO_ROOT / "deploy" / "hubinet-ops-0.5.service").read_text(encoding="utf-8")
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                # SIGKILL the updater the instant the preserved old unit is
+                # back on the live path -- i.e. strictly before rollback's
+                # own daemon-reload.
+                "kill_updater_after_move": "mv_rollback_unit_to_live",
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-unit-replay", REPO_ROOT,
+            unit_text="[Unit]\nDescription=changed target unit\n",
+        )
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+
+        # Exactly one daemon-reload has happened so far: the FORWARD one
+        # that loaded the target unit. Rollback's own never ran.
+        assert env.state()["daemon_reload_calls"] == 1
+        live_unit = env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service")
+        assert live_unit == original_unit
+        assert not list(
+            env.ct_file(FAKE_VMID, "/etc/systemd/system").glob("hubinet-ops.service.rollback-*")
+        ), "the rollback artifact was consumed by the interrupted restore"
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "ledger=update-unit-activation-attempted" in journal_text
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario.pop("kill_updater_after_move", None)
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        before_recovery = len(env.log_lines())
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "previous interrupted update" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+
+        # The replay found no rollback artifact and the old unit already in
+        # place -- and still reloaded systemd before starting it.
+        assert env.state()["daemon_reload_calls"] == 2
+        recovery_lines = env.log_lines()[before_recovery:]
+        probe_index = next(
+            i for i, line in enumerate(recovery_lines)
+            if "path-state" in line and "hubinet-ops.service.rollback-" in line
+        )
+        reload_index = next(
+            i for i, line in enumerate(recovery_lines) if "daemon-reload" in line
+        )
+        start_index = next(
+            i for i, line in enumerate(recovery_lines)
+            if line.endswith("systemctl start hubinet-ops")
+        )
+        assert probe_index < reload_index < start_index, recovery_lines
+        assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == original_unit
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not journal.exists()
+
+    def test_replay_with_rollback_artifact_absent_and_no_live_unit_fails_closed(self, tmp_path):
+        """Positive control: the tolerant branch is not a blanket pass."""
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "kill_updater_after_move": "mv_rollback_unit_to_live",
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-unit-replay-gone", REPO_ROOT,
+            unit_text="[Unit]\nDescription=changed target unit\n",
+        )
+        assert _run(env.env, _base_args(target)).returncode == -9
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario.pop("kill_updater_after_move", None)
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        env.ct_file(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service").unlink()
+
+        blocked = _run(env.env, _base_args(target))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        assert _update_state_path(env, FAKE_VMID, "journal").exists()
+
+
+# ---------------------------------------------------------------------------
+# Correction pass 8, P2 -- the durable `update-authority-restored`
+# checkpoint. Once the pre-update authority database has been restored and
+# that fact is durable, a REPLAYED rollback must never re-apply the original
+# backup: the restored old service may legitimately have written new
+# authority state since, and re-applying the backup would destroy it.
+# ---------------------------------------------------------------------------
+
+
+def _authority_backup_restores(env):
+    return [
+        line
+        for line in env.log_lines()
+        if " cp " in line
+        and "/var/lib/hubinet-ops/update-backups/" in line
+        and line.endswith("/var/lib/hubinet-ops/authority.db")
+    ]
+
+
+def _interrupt_after_authority_rollback_restart(tmp_path, name):
+    """Drive a destructive-reset update to a rollback that restores the old
+    authority database, journals `update-authority-restored`, restarts the
+    old service -- and is then SIGKILLed before the journal reaches a
+    terminal state."""
+    env = seed_installed_environment(
+        tmp_path,
+        schema_version=7,
+        scenario_overrides={
+            "discovery_result": "backend_unreachable",
+            # Start #1 is the target's; start #2 is the ROLLBACK's own
+            # restart of the restored old installation.
+            "kill_updater_after_service_start_call": 2,
+        },
+    )
+    target = build_update_target_checkout(tmp_path / name, REPO_ROOT, schema_version=8)
+    interrupted = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+    assert interrupted.returncode == -9
+
+    journal = _update_state_path(env, FAKE_VMID, "journal")
+    journal_text = journal.read_text(encoding="utf-8")
+    assert "state=active" in journal_text
+    assert "ledger=update-authority-reset-attempted" in journal_text
+    assert "ledger=update-authority-restored" in journal_text, (
+        "the restore checkpoint must be durable BEFORE the old service can start"
+    )
+    restored = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
+    assert restored["schema_version"] == 7
+    assert restored["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+    assert len(_authority_backup_restores(env)) == 1
+
+    scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+    scenario.pop("kill_updater_after_service_start_call", None)
+    env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+    return env, target, journal
+
+
+class TestAuthorityRestoredCheckpointP2:
+    def test_post_rollback_authority_writes_survive_a_replayed_rollback(self, tmp_path):
+        env, target, journal = _interrupt_after_authority_rollback_restart(
+            tmp_path, "target-authority-replay"
+        )
+
+        # The restored OLD service is running again and legitimately writes
+        # new authority state (discovery, scans, approvals...).
+        db_path = env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db")
+        db = json.loads(db_path.read_text(encoding="utf-8"))
+        db["post_rollback_write"] = "committed-run-sequence-99"
+        db_path.write_text(json.dumps(db), encoding="utf-8")
+
+        recovered = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "previous interrupted update" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        assert "already restored durably" in recovered.stderr
+
+        final = json.loads(db_path.read_text(encoding="utf-8"))
+        assert final["post_rollback_write"] == "committed-run-sequence-99", (
+            "a replayed rollback must never re-apply the original backup over "
+            "writes the restored old service made after the first rollback"
+        )
+        assert final["schema_version"] == 7
+        assert final["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+        # Exactly one backup restore across BOTH invocations.
+        assert len(_authority_backup_restores(env)) == 1
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not journal.exists()
+
+    def test_replay_with_a_different_live_authority_identity_hard_stops(self, tmp_path):
+        env, target, journal = _interrupt_after_authority_rollback_restart(
+            tmp_path, "target-authority-wrong-identity"
+        )
+        db_path = env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db")
+        db = json.loads(db_path.read_text(encoding="utf-8"))
+        db["backend_instance_id"] = "22222222-2222-4222-8222-222222222222"
+        db_path.write_text(json.dumps(db), encoding="utf-8")
+        backups = list(
+            env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/update-backups").rglob("authority.db")
+        )
+        assert backups
+
+        blocked = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        assert "backend_instance_id" in blocked.stderr
+
+        # The uncertain live database is NOT overwritten, and the validated
+        # backup is retained for manual diagnosis.
+        still_there = json.loads(db_path.read_text(encoding="utf-8"))
+        assert still_there["backend_instance_id"] == "22222222-2222-4222-8222-222222222222"
+        assert len(_authority_backup_restores(env)) == 1
+        assert backups[0].exists()
+        assert journal.exists()
+        assert "state=active" in journal.read_text(encoding="utf-8")
+
+    def test_replay_with_a_missing_live_authority_hard_stops(self, tmp_path):
+        env, target, journal = _interrupt_after_authority_rollback_restart(
+            tmp_path, "target-authority-missing"
+        )
+        env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db").unlink()
+        backups = list(
+            env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/update-backups").rglob("authority.db")
+        )
+        assert backups
+
+        blocked = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        assert "missing, corrupt, or unrecognized" in blocked.stderr
+        assert len(_authority_backup_restores(env)) == 1
+        assert backups[0].exists()
+        assert journal.exists()
+
+    def test_replay_with_a_corrupt_live_authority_hard_stops(self, tmp_path):
+        env, target, journal = _interrupt_after_authority_rollback_restart(
+            tmp_path, "target-authority-corrupt"
+        )
+        env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db").write_text(
+            "not-json-and-not-sqlite", encoding="utf-8"
+        )
+        blocked = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        assert "missing, corrupt, or unrecognized" in blocked.stderr
+        assert env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db") == (
+            "not-json-and-not-sqlite"
+        )
+        assert len(_authority_backup_restores(env)) == 1
+        assert journal.exists()
+
+    def test_first_authority_rollback_restores_the_backup_exactly_once(self, tmp_path):
+        """Positive control: the ordinary, uninterrupted path is unchanged."""
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-authority-once", REPO_ROOT, schema_version=8
+        )
+        result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert len(_authority_backup_restores(env)) == 1
+        db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
+        assert db["schema_version"] == 7
+        assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()

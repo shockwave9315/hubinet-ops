@@ -180,7 +180,9 @@ lock.
      of the window), then stop it
   -> activate in one fixed order (app, venv+requirements if changed, unit
      if changed, PVE helper same-path content swap if changed, authority
-     preserve-or-reset), retaining rollback material
+     preserve-or-reset), retaining rollback material; a changed
+     requirements.txt BUILDS the new virtualenv at its final live path
+     inside this window
   -> start + accept (reused bootstrap discovery-acceptance contract,
      extended with an optional minimum-committed-sequence floor to prove a
      genuine post-restart cycle; host-control forced-boundary re-probe;
@@ -220,6 +222,23 @@ sidecar is an immediate reported failure (independently re-verified absent,
 never assumed from the unlink call's own success alone), and rollback
 never copies the validated pre-update backup over an authority database
 whose removal it cannot prove.
+
+**Virtualenv replacement.** A code-only update — the common case — never
+rebuilds the environment, never runs `pip`, and leaves `/opt/hubinet-ops/
+.venv` untouched. When `requirements.txt` actually changes, the target
+environment is created **directly at `/opt/hubinet-ops/.venv`**, inside the
+mutation window, after the old environment has been renamed to
+`.venv.rollback-<runid>` and that live path has been positively proven
+absent. It is deliberately *not* built at a staging path and renamed into
+place: a Python virtualenv is not generally relocatable, because the
+console entrypoints `pip`/`ensurepip` generate embed the absolute
+interpreter path of the environment they were created in, and a rename
+rewrites none of them. Rewriting shebangs is not an accepted alternative.
+The cost is a longer maintenance window whenever dependencies change; that
+is accepted rather than optimized away with wheel caches, download stages,
+or a package mirror. A failed or interrupted build leaves a partial
+environment at the live path; it is never resumed — rollback removes it,
+proves the path absent, and restores the preserved old environment.
 
 **PVE host helper update contract.** The forced-command `authorized_keys`
 line, the pinned host-control key, and `known_hosts` are never touched.
@@ -277,9 +296,21 @@ that a path is absent. Enablement in particular is read from systemd's own
 `disable`/`enable` request may mutate state and still fail, or report
 success without changing anything. Rollback does not mutate any managed file until systemd
 positively reports the service non-running; every load-bearing removal is
-independently re-proved absent before restoration; restoring a systemd unit
-requires a successful daemon reload; and a restored authority database must
-have its service ownership and mode successfully reinstated before restart.
+independently re-proved absent before restoration; and a restored authority
+database must have its service ownership and mode successfully reinstated
+before restart. Whenever unit activation was ever attempted, rollback
+requires a successful `daemon-reload` before the restored old service may
+be started — including on a replay that finds the old unit file already
+back on the live path, because that is a fact about the filesystem and
+never proof that the systemd *manager* stopped holding the target
+definition. Rollback's terminal proof that the restored installation is in
+service is a bounded *poll* of both required runtime facts (systemd
+`active`, plus a non-empty answer from the unauthenticated health
+endpoint) against the existing startup deadline, not a single request:
+`hubinet-ops.service` is `Type=simple`, so systemd reports `active`
+strictly before uvicorn has bound `127.0.0.1:8787`, and a one-shot probe
+misclassified that ordinary readiness race as a failed rollback. A unit
+systemd positively reports as `failed` is terminal and fails earlier.
 
 The same PVE-host directory contains at most one active bounded recovery
 journal per VMID (`vmid-<vmid>.journal`). It records the update run-id, the
@@ -314,6 +345,22 @@ set of paths its artifact owns, while still failing closed on an unknown path
 state; the PVE host helper keeps its canonical rollback copy unconsumed
 (restore temporary plus atomic rename onto the live path) so retries retain
 the original recovery material.
+
+The authority database is the one rollback-managed artifact whose restore
+is *not* idempotent: once the restored old service is running again it may
+legitimately write new authority state. So the journal carries one more
+durable fact, `update-authority-restored`, recorded only after the restored
+database has been positively inspected and before the old service can be
+started. A replay that sees it never removes the live database and never
+re-applies the backup; it instead re-proves that the live database's
+durable identity lineage (schema marker, schema version,
+`backend_instance_id`, read from the retained validated backup itself,
+since a recovery invocation has no planning facts) is still the restored
+old authority. Content is expected to have advanced, so no whole-database
+byte or hash comparison is ever made. A missing, corrupt, or
+differently-identified database is a hard stop with the journal and backup
+retained — manual diagnosis is safer than automatically overwriting a
+database that may hold valuable post-rollback state.
 
 Successful recovery proves the restored service enabled, active, and
 healthy, clears the journal, and exits with an instruction to rerun; it never starts the

@@ -318,6 +318,17 @@ def cmd_pct(args):
         vmid, host_path, ct_path = args[1], args[2], args[3]
         if _fail("pct_push"):
             sys.exit(1)
+        # "pct_push_fail_dest_suffixes": [...] -- fail only the pushes
+        # whose CT destination ends with one of these suffixes. A blanket
+        # "fail every push" cannot express "this ONE staged artifact could
+        # not be transferred", which is what a Phase U3 staging-failure
+        # regression needs (every other push in the same run must still
+        # succeed so the run actually reaches staging).
+        suffixes = SCENARIO.get("pct_push_fail_dest_suffixes", [])
+        if isinstance(suffixes, str):
+            suffixes = [suffixes]
+        if any(_normalize_ct_arg(ct_path).endswith(suffix) for suffix in suffixes):
+            sys.exit(1)
         dest = _ct_path(vmid, ct_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(_resolve_host_path(host_path), dest)
@@ -350,6 +361,12 @@ _ACTIVATION_MOVE_FAIL_RULES = [
     ("mv", ("prefix", "/opt/hubinet-ops/requirements.txt.staged-"), ("exact", "/opt/hubinet-ops/requirements.txt"), "mv_staged_requirements_to_live"),
     ("cp", ("exact", "/etc/systemd/system/hubinet-ops.service"), ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-"), "cp_live_unit_to_rollback"),
     ("mv", ("prefix", "/etc/systemd/system/hubinet-ops.service.staged-"), ("exact", "/etc/systemd/system/hubinet-ops.service"), "mv_staged_unit_to_live"),
+    # ROLLBACK-side restore of the preserved old unit. Needed as its own
+    # seam (correction pass 8, P2) so a test can interrupt the updater
+    # exactly BETWEEN "the old unit file is back on the live path" and
+    # "systemd has been told about it", the reachable state in which a
+    # replayed rollback must still daemon-reload.
+    ("mv", ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-"), ("exact", "/etc/systemd/system/hubinet-ops.service"), "mv_rollback_unit_to_live"),
     ("mv", ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.rollback-"), "mv_live_marker_to_rollback"),
     ("mv", ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.staged-"), ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), "mv_staged_marker_to_live"),
 ]
@@ -825,17 +842,43 @@ def _exec_authority_tool(vmid, args, state):
 
 def _exec_venv_stage(vmid, args):
     # Simulates deploy/lib/hubinet-ops-update-venv-stage.py's own
-    # observable contract -- creating a venv-shaped directory and
-    # succeeding/failing per the "venv_create"/"pip_install" scenario
-    # keys, without actually invoking a real venv/pip anywhere.
+    # observable contract without invoking a real venv/pip anywhere.
+    #
+    # Correction pass 8 (P1): the destination is now the FINAL live venv
+    # pathname, never a staging pathname that something later renames, so
+    # this fake reproduces the two properties that correction depends on:
+    #
+    #   - the generated console entrypoint embeds the ABSOLUTE path of the
+    #     environment it was built in (exactly why a real virtualenv is
+    #     not relocatable), so an orchestration test can read the
+    #     activated /opt/hubinet-ops/.venv/bin/pip back and see which
+    #     pathname it was actually built at;
+    #   - a failed build leaves a PARTIAL environment behind at that final
+    #     pathname ("venv_create" fails after the directory exists but
+    #     before pip; "pip_install" fails with the environment fully
+    #     created), which is what rollback must remove and prove absent.
+    #
+    # "kill_updater_during_venv_build" additionally SIGKILLs the updater
+    # once a partial environment exists at the final path -- the reboot /
+    # untrappable-interruption witness for a final-path build.
     if len(args) != 2:
         return 2
     venv_path = _ct_path(vmid, args[0])
-    if _fail("venv_create"):
+    if venv_path.exists():
+        sys.stderr.write(f"refusing to build into an already-existing path: {args[0]}\n")
+        return 1
+    if not _ct_path(vmid, args[1]).is_file():
+        sys.stderr.write(f"requirements file does not exist: {args[1]}\n")
         return 1
     (venv_path / "bin").mkdir(parents=True, exist_ok=True)
-    (venv_path / "bin" / "pip").write_text("#!/bin/sh\n", encoding="utf-8")
+    if _fail("venv_create"):
+        return 1
+    (venv_path / "bin" / "pip").write_text(
+        f"#!{_normalize_ct_arg(args[0])}/bin/python\n", encoding="utf-8"
+    )
     (venv_path / "bin" / "python3").write_text("#!/bin/sh\n", encoding="utf-8")
+    if SCENARIO.get("kill_updater_during_venv_build"):
+        os.kill(os.getppid(), signal.SIGKILL)
     if _fail("pip_install"):
         return 1
     return 0
@@ -1138,6 +1181,14 @@ def _exec_systemctl(vmid, args, state):
             # Later interruption witness: target service has actually
             # started, but acceptance/source-marker completion has not.
             os.kill(os.getppid(), signal.SIGKILL)
+        kill_after_call = SCENARIO.get("kill_updater_after_service_start_call")
+        if kill_after_call is not None and call_number == int(kill_after_call):
+            # Same untrappable-disappearance shape, aimed at an arbitrary
+            # start in the run. Start #2 is the ROLLBACK's own restart of
+            # the restored old installation -- the point at which the old
+            # service is live again and may legitimately write new
+            # authority state, while the journal is still active.
+            os.kill(os.getppid(), signal.SIGKILL)
         return 0
     if args == ["daemon-reload"]:
         call_number = state.get("daemon_reload_calls", 0) + 1
@@ -1387,6 +1438,19 @@ def _exec_curl(vmid, args):
         if _fail("backend_health"):
             return 7
         state = _load_state()
+        # "health_fail_first_n": N -- the first N health requests of this
+        # run get no answer, every later one succeeds. Deterministic
+        # (a persisted call counter, never a wall-clock sleep) simulation
+        # of the ordinary Type=simple readiness race: systemd reports the
+        # unit active as soon as the process is exec'd, which is strictly
+        # earlier than the moment uvicorn has bound 127.0.0.1:8787.
+        fail_first = SCENARIO.get("health_fail_first_n")
+        if fail_first is not None:
+            call_number = state.get("backend_health_calls", 0) + 1
+            state["backend_health_calls"] = call_number
+            _save_state(state)
+            if call_number <= int(fail_first):
+                return 7
         if not _firewall_permits_local_and_reply_traffic(vmid, state):
             # Simulates the packet being silently dropped by this CT's own
             # active firewall -- curl reports "no response" (exit 7),

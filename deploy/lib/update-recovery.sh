@@ -43,7 +43,10 @@ _update_set_run_paths() {
   UPDATE_CT_SOURCE_TARBALL="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}.tar.gz"
   UPDATE_CT_SOURCE_DIR="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}"
   UPDATE_APP_STAGED_PATH="/opt/hubinet-ops/app.staged-${UPDATE_RUN_ID}"
-  UPDATE_VENV_STAGED_PATH="/opt/hubinet-ops/.venv.staged-${UPDATE_RUN_ID}"
+  # No staged-virtualenv path exists any more: a changed-requirements
+  # update builds the new environment directly at /opt/hubinet-ops/.venv
+  # inside the mutation window, because a virtualenv is not relocatable
+  # (see _update_activate_venv_and_requirements in update-activate.sh).
   UPDATE_REQUIREMENTS_STAGED_PATH="/opt/hubinet-ops/requirements.txt.staged-${UPDATE_RUN_ID}"
   UPDATE_UNIT_STAGED_PATH="/etc/systemd/system/hubinet-ops.service.staged-${UPDATE_RUN_ID}"
   if [[ -n "${UPDATE_HELPER_PATH:-}" ]]; then
@@ -61,6 +64,7 @@ _update_journal_marker_is_recovery_relevant() {
     update-unit-activation-attempted|\
     update-helper-activated|\
     update-authority-reset-attempted|\
+    update-authority-restored|\
     update-marker-activation-attempted|\
     update-marker-precondition-exists|\
     update-marker-precondition-absent) return 0 ;;
@@ -220,7 +224,6 @@ _update_cleanup_recovered_run_artifacts() {
     "${UPDATE_CT_SOURCE_TARBALL}" \
     "${UPDATE_CT_SOURCE_DIR}" \
     "${UPDATE_APP_STAGED_PATH}" \
-    "${UPDATE_VENV_STAGED_PATH}" \
     "${UPDATE_REQUIREMENTS_STAGED_PATH}" \
     "${UPDATE_UNIT_STAGED_PATH}" \
     "/opt/hubinet-ops/.hubinet-source-commit.staged-${UPDATE_RUN_ID}" \

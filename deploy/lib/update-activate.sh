@@ -44,6 +44,7 @@ UPDATE_PRE_NFTABLES_CONF=""
 UPDATE_DISPLAY_NAME=""
 _UPDATE_SERVICE_STATE_DETAIL="unknown"
 _UPDATE_SERVICE_ENABLED_DETAIL="unknown"
+_UPDATE_ROLLBACK_READINESS_DETAIL="unknown"
 
 # Three-valued service-state probe. Return 0 means the service is active
 # or transitioning and therefore MUST be treated as potentially running;
@@ -86,6 +87,55 @@ _update_wait_until_service_stopped() {
         return 0
       fi
       # UNKNOWN may be transient, but is never treated as stopped.
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  return 1
+}
+
+# _update_wait_until_service_active_and_healthy (correction pass 8, P2):
+# the bounded readiness proof a RESTARTED pre-update installation must
+# pass before rollback may be called complete.
+#
+# The old code proved `active` in a bounded loop and then issued the
+# application health request EXACTLY ONCE. hubinet-ops.service is
+# Type=simple, so systemd reports `active` as soon as the process has been
+# exec'd -- strictly earlier than the moment uvicorn has actually bound
+# 127.0.0.1:8787. A single request fired at that instant can legitimately
+# get nothing back from a perfectly healthy installation, and an ordinary
+# startup readiness race was therefore classified as a FAILED rollback,
+# hard stopping a recovery that had in fact succeeded.
+#
+# Both required facts are now polled together against the SAME existing
+# bounded deadline (BOOTSTRAP_SERVICE_TIMEOUT_SECONDS -- no new timeout is
+# invented, and there is no unbounded loop and no fixed pre-probe sleep).
+# Health semantics are NOT weakened: success still requires systemd to
+# report `active` AND the unauthenticated health endpoint to answer with a
+# non-empty body; an empty or failed response is still never a pass. Unit
+# enablement, the third required fact, is proven separately and earlier by
+# _update_restore_service_autostart, before the service is started at all.
+#
+# A unit systemd positively reports as `failed` is terminal -- systemd is
+# not going to make it active by being waited on -- so that state returns
+# early instead of burning the whole deadline. `activating`/`inactive` are
+# ordinary transitional answers during a start and are simply retried.
+_update_wait_until_service_active_and_healthy() {
+  local waited=0 state="" health_body=""
+  while (( waited < BOOTSTRAP_SERVICE_TIMEOUT_SECONDS )); do
+    state="$(pct exec "${VMID}" -- systemctl is-active hubinet-ops 2>/dev/null || true)"
+    if [[ "${state}" == "active" ]]; then
+      health_body="$(pct exec "${VMID}" -- curl -fsS "http://127.0.0.1:8787/r0/v1/health" 2>/dev/null || true)"
+      if [[ -n "${health_body}" ]]; then
+        _UPDATE_ROLLBACK_READINESS_DETAIL="active and healthy after ${waited}s"
+        return 0
+      fi
+      _UPDATE_ROLLBACK_READINESS_DETAIL="active, but the unauthenticated health probe has not answered yet"
+    elif [[ "${state}" == "failed" ]]; then
+      _UPDATE_ROLLBACK_READINESS_DETAIL="systemd reports the restored unit as failed"
+      return 1
+    else
+      _UPDATE_ROLLBACK_READINESS_DETAIL="last service state: ${state:-unknown}"
     fi
     sleep 1
     waited=$(( waited + 1 ))
@@ -276,16 +326,7 @@ update_activate_and_accept() {
   # 5/6. requirements + venv, only if changed. Same attempted-before-
   # first-destructive-move discipline as the app payload above.
   if [[ "${UPDATE_REQUIREMENTS_CHANGED}" == "1" ]]; then
-    update_journal_record update-venv-activation-attempted "${VMID}"
-    run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/.venv "/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}" \
-      || die "failed to move the active virtualenv aside inside container ${VMID}"
-    run_logged pct exec "${VMID}" -- mv "${UPDATE_VENV_STAGED_PATH}" /opt/hubinet-ops/.venv \
-      || die "failed to activate the staged virtualenv inside container ${VMID}"
-    run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/requirements.txt "/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}" \
-      || die "failed to move the active requirements.txt aside inside container ${VMID}"
-    run_logged pct exec "${VMID}" -- mv "${UPDATE_REQUIREMENTS_STAGED_PATH}" /opt/hubinet-ops/requirements.txt \
-      || die "failed to activate the staged requirements.txt inside container ${VMID}"
-    ledger_record update-venv-activated "${VMID}"
+    _update_activate_venv_and_requirements
   fi
 
   # Step 7 -- systemd unit, only if changed. (P1-B correction pass 2:) a
@@ -367,6 +408,80 @@ update_activate_and_accept() {
     || die "the target installation was fully accepted, but hubinet-ops boot activation could not be proven restored inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL})"
 
   _update_finish_summary
+}
+
+# _update_activate_venv_and_requirements (correction pass 8, P1): the
+# target virtualenv is BUILT AT ITS FINAL LIVE PATHNAME, never built
+# elsewhere and renamed into place.
+#
+# The previous design created /opt/hubinet-ops/.venv.staged-<runid> while
+# the old service was still running and then renamed that whole directory
+# onto /opt/hubinet-ops/.venv. A Python virtualenv is not generally
+# relocatable: the console entrypoints pip/ensurepip generate embed the
+# ABSOLUTE interpreter path of the environment they were created in, so
+# the "activated" environment's own bin/pip (and every other generated
+# entrypoint) still pointed at a .venv.staged-<runid> pathname that no
+# longer existed. Rewriting shebangs is deliberately NOT the fix; building
+# at the final pathname is.
+#
+# The cost is a longer maintenance window when dependencies actually
+# change -- accepted, and deliberately not optimized away with wheel
+# caches, download stages, or a package mirror. A code-only update (the
+# common case) never reaches this function at all: no venv is rebuilt, no
+# pip runs, and the existing environment is left exactly as it is.
+#
+# Ordering, and the invariants each step exists for:
+#
+#   1. durably journal update-venv-activation-attempted BEFORE the first
+#      destructive mutation -- as for every other rollback-managed
+#      artifact in this file, so rollback is armed even if the very first
+#      move fails, and so a SIGKILL/reboot mid-build is recoverable;
+#   2. move the live environment aside to this run's fixed
+#      .venv.rollback-<runid> path (atomic rename: it either fully
+#      happens or leaves both sides exactly as they were);
+#   3. POSITIVELY prove the final live pathname is now absent, through
+#      the same three-valued path probe every other proof here uses --
+#      UNKNOWN is never permission to build;
+#   4. build the new environment directly at that final pathname and
+#      install the exact target requirements into it;
+#   5. only then swap requirements.txt, so the recorded requirements
+#      always describe the environment that is actually installed.
+#
+# A failure or interruption anywhere in 2-5 leaves at most a PARTIAL
+# environment at the live path. That is never resumed: rollback's
+# _update_rollback_venv_and_requirements removes the partial target,
+# proves the path absent, and restores the preserved old environment (and
+# then the preserved requirements.txt), exactly as it already did for a
+# failed rename.
+_update_activate_venv_and_requirements() {
+  local live_venv="/opt/hubinet-ops/.venv"
+  local rollback_venv="/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}"
+  local path_state_rc
+
+  update_journal_record update-venv-activation-attempted "${VMID}"
+  run_logged pct exec "${VMID}" -- mv "${live_venv}" "${rollback_venv}" \
+    || die "failed to move the active virtualenv aside inside container ${VMID}"
+
+  if _update_ct_path_state "${live_venv}"; then
+    die "the live virtualenv path ${live_venv} still exists after the pre-update environment was moved aside inside container ${VMID} -- refusing to build a new environment over unknown content"
+  else
+    path_state_rc=$?
+  fi
+  (( path_state_rc == 1 )) \
+    || die "could not prove the live virtualenv path ${live_venv} absent inside container ${VMID} before building the target environment"
+
+  run_logged pct exec "${VMID}" -- python3 "${UPDATE_VENV_STAGE_TOOL_CT_PATH}" "${live_venv}" "${UPDATE_REQUIREMENTS_STAGED_PATH}" \
+    || die "failed to build the target virtualenv at ${live_venv} inside container ${VMID}; the pre-update environment is preserved at ${rollback_venv} and rollback recovery is required"
+  run_logged pct exec "${VMID}" -- chown -R hubinetops:hubinetops "${live_venv}" \
+    || die "failed to set ownership on the newly built virtualenv inside container ${VMID}"
+  pct exec "${VMID}" -- rm -f "${UPDATE_VENV_STAGE_TOOL_CT_PATH}" >/dev/null 2>&1 \
+    || log_warn "could not remove ${UPDATE_VENV_STAGE_TOOL_CT_PATH} inside the container (non-fatal)"
+
+  run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/requirements.txt "/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}" \
+    || die "failed to move the active requirements.txt aside inside container ${VMID}"
+  run_logged pct exec "${VMID}" -- mv "${UPDATE_REQUIREMENTS_STAGED_PATH}" /opt/hubinet-ops/requirements.txt \
+    || die "failed to activate the staged requirements.txt inside container ${VMID}"
+  ledger_record update-venv-activated "${VMID}"
 }
 
 _update_perform_authority_reset() {
@@ -679,36 +794,7 @@ update_rollback_on_failure() {
   # attempted artifact is restored before the service is started again.
   _update_rollback_marker
 
-  if ledger_has update-authority-reset-attempted "${VMID}"; then
-    # Fail-closed rollback (P1-B): removal of the NEW/target database must
-    # be PROVEN successful (cmd_remove's own ok:true, which already means
-    # every one of db/wal/shm was independently re-verified absent -- see
-    # hubinet-ops-authority-tool.py's cmd_remove) before the validated OLD
-    # backup is ever copied into place. Never warn-then-continue: copying
-    # a trusted backup over an uncertain live/sidecar state could silently
-    # leave stale WAL/SHM content paired with a just-restored main file.
-    # The backup itself is never touched by this block, so it remains
-    # available for manual recovery either way.
-    # Guarded exactly like _update_perform_authority_reset's own forward
-    # `remove` call above -- a bare `var="$(cmd)"` with no `&&`/`||` is NOT
-    # safe under this file's `set -Eeuo pipefail`: cmd's own non-zero exit
-    # would abort the WHOLE script right here (silently, before the
-    # fail-closed hard-stop below ever runs) rather than being handled by
-    # the very check this line exists to reach.
-    local remove_output remove_status
-    remove_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" remove /var/lib/hubinet-ops/authority.db 2>/dev/null)" \
-      && remove_status=0 || remove_status=$?
-    if (( remove_status != 0 )) || ! _json_bool_field_is_true "${remove_output}" "ok"; then
-      _update_rollback_hard_stop "could not prove removal of the newly-created target authority database during rollback (tool output: ${remove_output:-none}) -- refusing to copy the pre-update backup over an uncertain live database state. The validated backup at ${UPDATE_DB_BACKUP_PATH} is untouched; resolve the removal failure manually, then restore it by hand"
-    fi
-    if ! pct exec "${VMID}" -- cp "${UPDATE_DB_BACKUP_PATH}" /var/lib/hubinet-ops/authority.db >/dev/null 2>&1; then
-      _update_rollback_hard_stop "could not restore the pre-update authority database backup (${UPDATE_DB_BACKUP_PATH}) to /var/lib/hubinet-ops/authority.db -- the backup itself is preserved and untouched; restore it manually before restarting the service"
-    fi
-    pct exec "${VMID}" -- chown hubinetops:hubinetops /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 \
-      || _update_rollback_hard_stop "could not restore authority database ownership with chown hubinetops:hubinetops inside container ${VMID}"
-    pct exec "${VMID}" -- chmod 0640 /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 \
-      || _update_rollback_hard_stop "could not restore authority database mode with chmod 0640 inside container ${VMID}"
-  fi
+  _update_rollback_authority
 
   _update_rollback_host_helper
 
@@ -731,20 +817,8 @@ update_rollback_on_failure() {
   run_logged pct exec "${VMID}" -- systemctl start hubinet-ops \
     || _update_rollback_hard_stop "restored the pre-update installation's files, but could not start hubinet-ops inside container ${VMID}"
 
-  local waited=0 state=""
-  while (( waited < BOOTSTRAP_SERVICE_TIMEOUT_SECONDS )); do
-    state="$(pct exec "${VMID}" -- systemctl is-active hubinet-ops 2>/dev/null || true)"
-    [[ "${state}" == "active" ]] && break
-    sleep 1
-    waited=$(( waited + 1 ))
-  done
-  [[ "${state}" == "active" ]] \
-    || _update_rollback_hard_stop "restored the pre-update installation's files, but it did not become active within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (last state: ${state:-unknown})"
-
-  local health_body
-  health_body="$(pct exec "${VMID}" -- curl -fsS "http://127.0.0.1:8787/r0/v1/health" 2>/dev/null || true)"
-  [[ -n "${health_body}" ]] \
-    || _update_rollback_hard_stop "restored the pre-update installation and it reports active, but the unauthenticated health probe returned nothing"
+  _update_wait_until_service_active_and_healthy \
+    || _update_rollback_hard_stop "restored the pre-update installation's files, but it did not prove active AND answer its own unauthenticated health probe within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (${_UPDATE_ROLLBACK_READINESS_DETAIL})"
 
   update_journal_resolve recovered
   log_warn "rollback complete -- the pre-update installation is enabled, running again, and healthy (exit ${exit_code})"
@@ -853,6 +927,129 @@ _update_rollback_host_helper() {
     || _update_rollback_hard_stop "the preserved pre-update PVE host helper (${rollback_path}) is absent and the live helper ${UPDATE_HELPER_PATH} is not an executable regular file -- restore it manually before retrying"
 }
 
+# _update_rollback_authority (correction pass 8, P2): restoring the
+# pre-update authority database is a REPLAY-SAFE, at-most-once
+# destructive operation.
+#
+# Rollback is not one-shot -- a first rollback attempt can legitimately
+# restore several artifacts and then hard stop (or be SIGKILLed) at a
+# later terminal step, deliberately RETAINING the active journal so a
+# later invocation re-enters this same rollback for the same run id. For
+# every other artifact that is harmless: the restore is idempotent
+# state-inspection over run-owned paths. The authority database is NOT:
+# once the old service has been started again on the restored database it
+# may legitimately have written NEW authority state (discovery results,
+# scans, approvals). Blindly re-applying the original pre-update backup on
+# a replay would silently destroy exactly those post-rollback writes.
+#
+# So the durable journal now carries one more state fact,
+# `update-authority-restored`, recorded only after the restored database
+# has been positively inspected, and BEFORE the old service can be started
+# (the start happens later in update_rollback_on_failure, and every
+# journal record is an atomic durable replacement -- see
+# update_journal_checkpoint).
+#
+#   marker ABSENT  -> first authority rollback. Prove removal of the
+#                     target database, copy the validated backup back,
+#                     restore owner/mode, positively inspect the result,
+#                     then journal the marker.
+#   marker PRESENT -> the restore already completed durably. NEVER remove
+#                     the live database and NEVER recopy the backup.
+#                     Instead re-prove that the live database's durable
+#                     IDENTITY LINEAGE is still the restored OLD authority
+#                     (same schema marker, same schema version, same
+#                     backend_instance_id as the retained backup). Its
+#                     CONTENT may legitimately have advanced, so no byte
+#                     or hash comparison against the backup is ever made.
+#
+# Anything else -- a missing, corrupt, unreadable, or differently-
+# identified live database -- is a HARD STOP with the journal and the
+# validated backup retained. Manual diagnosis is strictly safer than
+# automatically overwriting a database whose provenance is uncertain and
+# which may hold valuable post-rollback state.
+_update_rollback_authority() {
+  ledger_has update-authority-reset-attempted "${VMID}" || return 0
+  [[ -n "${UPDATE_DB_BACKUP_PATH}" ]] \
+    || _update_rollback_hard_stop "an authority reset was attempted for run ${UPDATE_RUN_ID}, but no validated pre-update backup path is recorded -- refusing to touch the live authority database"
+
+  if ledger_has update-authority-restored "${VMID}"; then
+    _update_prove_restored_authority_lineage
+    log_warn "the pre-update authority database was already restored durably by an earlier rollback attempt of run ${UPDATE_RUN_ID}, and still carries that same authority identity -- preserving every write the restored old service has made since, and NOT re-applying ${UPDATE_DB_BACKUP_PATH}"
+    return 0
+  fi
+
+  # Fail-closed rollback (P1-B): removal of the NEW/target database must
+  # be PROVEN successful (cmd_remove's own ok:true, which already means
+  # every one of db/wal/shm was independently re-verified absent -- see
+  # hubinet-ops-authority-tool.py's cmd_remove) before the validated OLD
+  # backup is ever copied into place. Never warn-then-continue: copying
+  # a trusted backup over an uncertain live/sidecar state could silently
+  # leave stale WAL/SHM content paired with a just-restored main file.
+  # The backup itself is never touched by this block, so it remains
+  # available for manual recovery either way.
+  # Guarded exactly like _update_perform_authority_reset's own forward
+  # `remove` call -- a bare `var="$(cmd)"` with no `&&`/`||` is NOT
+  # safe under this file's `set -Eeuo pipefail`: cmd's own non-zero exit
+  # would abort the WHOLE script right here (silently, before the
+  # fail-closed hard-stop below ever runs) rather than being handled by
+  # the very check this line exists to reach.
+  local remove_output remove_status
+  remove_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" remove /var/lib/hubinet-ops/authority.db 2>/dev/null)" \
+    && remove_status=0 || remove_status=$?
+  if (( remove_status != 0 )) || ! _json_bool_field_is_true "${remove_output}" "ok"; then
+    _update_rollback_hard_stop "could not prove removal of the newly-created target authority database during rollback (tool output: ${remove_output:-none}) -- refusing to copy the pre-update backup over an uncertain live database state. The validated backup at ${UPDATE_DB_BACKUP_PATH} is untouched; resolve the removal failure manually, then restore it by hand"
+  fi
+  if ! pct exec "${VMID}" -- cp "${UPDATE_DB_BACKUP_PATH}" /var/lib/hubinet-ops/authority.db >/dev/null 2>&1; then
+    _update_rollback_hard_stop "could not restore the pre-update authority database backup (${UPDATE_DB_BACKUP_PATH}) to /var/lib/hubinet-ops/authority.db -- the backup itself is preserved and untouched; restore it manually before restarting the service"
+  fi
+  pct exec "${VMID}" -- chown hubinetops:hubinetops /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 \
+    || _update_rollback_hard_stop "could not restore authority database ownership with chown hubinetops:hubinetops inside container ${VMID}"
+  pct exec "${VMID}" -- chmod 0640 /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 \
+    || _update_rollback_hard_stop "could not restore authority database mode with chmod 0640 inside container ${VMID}"
+
+  # Positively inspect what was actually restored before claiming it, and
+  # make that fact durable BEFORE the old service is allowed to start and
+  # write to it.
+  _update_prove_restored_authority_lineage
+  update_journal_record update-authority-restored "${VMID}"
+}
+
+# _update_prove_restored_authority_lineage: the live authority database
+# must be a coherent, recognizable authority whose durable identity is the
+# OLD (pre-update) one. The expected identity is read from the retained,
+# already-validated backup itself rather than from planning-phase
+# variables, because a startup-recovery invocation deliberately never runs
+# Phase U2 and therefore has no UPDATE_CURRENT_* facts at all.
+#
+# Only IDENTITY is compared -- schema marker, schema version, and
+# backend_instance_id. Content is expected to differ once the restored old
+# service has run: this function must never compare whole-database bytes
+# or hashes, or a legitimate post-rollback write would look like
+# corruption.
+_update_prove_restored_authority_lineage() {
+  local backup_output backup_status live_output live_status
+  local field expected actual
+
+  backup_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" inspect "${UPDATE_DB_BACKUP_PATH}" 2>/dev/null)" \
+    && backup_status=0 || backup_status=$?
+  if (( backup_status != 0 )) || ! _json_bool_field_is_true "${backup_output}" "ok"; then
+    _update_rollback_hard_stop "could not read the pre-update authority identity from the retained backup ${UPDATE_DB_BACKUP_PATH} (tool output: ${backup_output:-none}) -- the live authority database was not touched"
+  fi
+
+  live_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" inspect /var/lib/hubinet-ops/authority.db 2>/dev/null)" \
+    && live_status=0 || live_status=$?
+  if (( live_status != 0 )) || ! _json_bool_field_is_true "${live_output}" "ok"; then
+    _update_rollback_hard_stop "the live authority database at /var/lib/hubinet-ops/authority.db is missing, corrupt, or unrecognized (tool output: ${live_output:-none}) -- refusing to overwrite an uncertain database automatically. The validated pre-update backup at ${UPDATE_DB_BACKUP_PATH} is retained untouched; diagnose and restore it by hand"
+  fi
+
+  for field in marker schema_version backend_instance_id; do
+    expected="$(_json_field_from_text "${backup_output}" "${field}")" || expected=""
+    actual="$(_json_field_from_text "${live_output}" "${field}")" || actual=""
+    [[ -n "${expected}" && "${expected}" == "${actual}" ]] \
+      || _update_rollback_hard_stop "the live authority database's ${field} (${actual:-unknown}) is not the pre-update authority's (${expected:-unknown}) -- this is not the database this rollback restored, so it is NOT overwritten automatically. The validated pre-update backup at ${UPDATE_DB_BACKUP_PATH} is retained untouched; diagnose manually"
+  done
+}
+
 # _update_rollback_unit: state-inspection restore, not marker-implies-
 # complete. If the systemd unit activation was ever attempted, the only
 # question that matters is whether this run's fixed rollback copy
@@ -887,7 +1084,20 @@ _update_rollback_unit() {
     || _update_rollback_hard_stop "could not determine whether the pre-update systemd unit rollback artifact exists inside container ${VMID}"
   # ABSENT. Nothing to restore -- but the live unit must positively exist,
   # or this installation cannot be started again at all.
+  #
+  # (Correction pass 8, P2:) reaching this branch does NOT mean the
+  # systemd MANAGER is already running the old unit definition. The
+  # reachable witness is a prior rollback of this same run that restored
+  # the old unit file onto the live path (consuming the rollback artifact)
+  # and was then SIGKILLed BEFORE its daemon-reload -- systemd then still
+  # holds the TARGET unit definition in memory even though the file on
+  # disk is the old one. "The file is already back" is a fact about the
+  # filesystem and is never proof about the manager, so whenever unit
+  # activation was ever attempted, a daemon-reload is unconditionally
+  # required before the restored old service may be started.
   if _update_ct_path_state "${live_path}"; then
+    pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 \
+      || _update_rollback_hard_stop "systemctl daemon-reload failed inside container ${VMID} while replaying the unit rollback of run ${UPDATE_RUN_ID}; the pre-update unit file is in place but systemd may still hold the target definition, so restarting under an unproven loaded unit definition is refused"
     return 0
   else
     path_state_rc=$?

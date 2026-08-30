@@ -8,7 +8,6 @@ UPDATE_RUN_ID=""
 UPDATE_CT_SOURCE_TARBALL=""
 UPDATE_CT_SOURCE_DIR=""
 UPDATE_APP_STAGED_PATH=""
-UPDATE_VENV_STAGED_PATH=""
 UPDATE_REQUIREMENTS_STAGED_PATH=""
 UPDATE_UNIT_STAGED_PATH=""
 UPDATE_HELPER_STAGED_HOST_PATH=""
@@ -27,7 +26,7 @@ update_stage_all() {
   _update_stage_source_tree
   _update_stage_app_payload
   if [[ "${UPDATE_REQUIREMENTS_CHANGED}" == "1" ]]; then
-    _update_stage_venv
+    _update_stage_venv_builder
   fi
   if [[ "${UPDATE_UNIT_CHANGED}" == "1" ]]; then
     _update_stage_unit
@@ -82,16 +81,32 @@ _update_stage_app_payload() {
 
 UPDATE_VENV_STAGE_TOOL_CT_PATH="/tmp/hubinet-ops-update-venv-stage.py"
 
-_update_stage_venv() {
+# _update_stage_venv_builder (correction pass 8, P1): staging no longer
+# BUILDS a virtualenv. A Python virtualenv is not generally relocatable --
+# the console entrypoints pip generates embed the absolute interpreter
+# path of the environment they were created in, so the old
+# "build at .venv.staged-<runid>, then rename onto .venv" design produced
+# an activated environment whose own entrypoints pointed at a staging
+# pathname that no longer existed (see
+# deploy/lib/hubinet-ops-update-venv-stage.py's docstring). The new
+# environment is therefore created DIRECTLY at /opt/hubinet-ops/.venv,
+# inside the mutation window, by update-activate.sh.
+#
+# What stays in this phase, while the old service is still healthy and
+# untouched, is everything that can still fail harmlessly here: the
+# target requirements.txt is staged from the exact approved commit (see
+# _update_stage_app_payload), and the small build helper is pushed into
+# the container and proven present. A push failure here means the old
+# installation is simply left running, exactly as it was -- strictly
+# better than discovering it after the service has been stopped.
+_update_stage_venv_builder() {
+  # Recorded BEFORE the push, so a push that fails part-way is still
+  # cleaned up -- and so update_stage_cleanup touches the container only
+  # for a run that actually got this far, exactly like every other
+  # artifact it handles.
+  ledger_record update-staged-venv-tool "${VMID}"
   run_logged pct push "${VMID}" "${UPDATE_SCRIPT_DIR}/hubinet-ops-update-venv-stage.py" "${UPDATE_VENV_STAGE_TOOL_CT_PATH}" \
-    || die "failed to push the venv-staging tool into container ${VMID}"
-  ledger_record update-staged-venv "${VMID}"
-  run_logged pct exec "${VMID}" -- python3 "${UPDATE_VENV_STAGE_TOOL_CT_PATH}" "${UPDATE_VENV_STAGED_PATH}" "${UPDATE_REQUIREMENTS_STAGED_PATH}" \
-    || die "failed to stage a new virtualenv with target requirements inside container ${VMID} -- the ACTIVE virtualenv was never touched"
-  run_logged pct exec "${VMID}" -- rm -f "${UPDATE_VENV_STAGE_TOOL_CT_PATH}" \
-    || log_warn "could not remove ${UPDATE_VENV_STAGE_TOOL_CT_PATH} inside the container (non-fatal)"
-  run_logged pct exec "${VMID}" -- chown -R hubinetops:hubinetops "${UPDATE_VENV_STAGED_PATH}" \
-    || die "failed to set ownership on the staged virtualenv"
+    || die "failed to push the virtualenv build tool into container ${VMID} -- the ACTIVE virtualenv was never touched"
 }
 
 _update_stage_unit() {
@@ -144,8 +159,16 @@ update_stage_cleanup() {
     if ledger_has update-staged-app "${VMID}" && ! ledger_has update-app-activated "${VMID}"; then
       pct exec "${VMID}" -- rm -rf "${UPDATE_APP_STAGED_PATH}" "${UPDATE_REQUIREMENTS_STAGED_PATH}" >/dev/null 2>&1 || true
     fi
-    if ledger_has update-staged-venv "${VMID}" && ! ledger_has update-venv-activated "${VMID}"; then
-      pct exec "${VMID}" -- rm -rf "${UPDATE_VENV_STAGED_PATH}" >/dev/null 2>&1 || true
+    # No staged virtualenv exists to clean up any more -- the target
+    # environment is built directly at the live path inside the mutation
+    # window, and a partial one is removed by rollback's own
+    # state-inspection restore, never here. Only the pushed build helper
+    # is this phase's own leftover, and only for a run that actually
+    # pushed it (this function also runs on failure paths that never
+    # reached staging at all, where it must touch the container for
+    # nothing).
+    if ledger_has update-staged-venv-tool "${VMID}"; then
+      pct exec "${VMID}" -- rm -f "${UPDATE_VENV_STAGE_TOOL_CT_PATH}" >/dev/null 2>&1 || true
     fi
     if ledger_has update-staged-unit "${VMID}" && ! ledger_has update-unit-activated "${VMID}"; then
       pct exec "${VMID}" -- rm -f "${UPDATE_UNIT_STAGED_PATH}" >/dev/null 2>&1 || true

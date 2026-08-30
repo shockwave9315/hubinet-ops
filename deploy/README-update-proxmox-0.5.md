@@ -172,8 +172,16 @@ one exists. Each destructive transition is preceded by a flushed temporary
 journal write, atomic rename, and state-directory flush.
 
 Before the old service is stopped, any failure (staging, source-provenance
-recheck, a build failure in a staged virtualenv) leaves the existing
-installation completely untouched.
+recheck) leaves the existing installation completely untouched.
+
+Note that when `requirements.txt` changes, building the new virtualenv is
+part of the maintenance window rather than something prepared beforehand: a
+virtualenv is not relocatable, so the environment is created directly at
+`/opt/hubinet-ops/.venv` while the service is stopped. Expect a
+dependency-changing update to take noticeably longer than an ordinary
+code-only one, which does not touch the environment at all. A build failure
+there rolls back to the pre-update environment and restarts the old
+service.
 
 ### Boot activation during the update window
 
