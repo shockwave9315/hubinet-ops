@@ -57,6 +57,11 @@ Inspect the plan without changing anything:
 sudo ./update-proxmox-0.5.sh --vmid 110 --dry-run
 ```
 
+Normal and dry-run invocations are serialized per VMID. If another updater
+process currently owns that VMID, the second invocation fails immediately
+before ownership verification or planning. An update for a different VMID is
+independent.
+
 ### Flags
 
 | Flag | Meaning |
@@ -152,6 +157,20 @@ and never requires re-enrollment.
 
 ## Failure and rollback
 
+The updater holds one kernel-backed PVE-host lock for the selected VMID from
+before ownership/planning through final cleanup. The stable lock file is
+`/var/lib/hubinet-ops/update-state/vmid-<vmid>.lock`; ownership is the open
+`flock` descriptor, so SIGKILL or reboot releases it without PID-file stale
+lock handling.
+
+After ownership is first proven and before planning, the updater creates one
+small durable journal at
+`/var/lib/hubinet-ops/update-state/vmid-<vmid>.journal`. It contains no
+credentials: only the VMID, update and installation run IDs, rollback-armed
+state, bounded rollback facts/markers, and the authority backup reference if
+one exists. Each destructive transition is preceded by a flushed temporary
+journal write, atomic rename, and state-directory flush.
+
 Before the old service is stopped, any failure (staging, source-provenance
 recheck, a build failure in a staged virtualenv) leaves the existing
 installation completely untouched.
@@ -172,6 +191,28 @@ If rollback itself cannot complete, the updater stops hard, preserves every
 rollback/backup artifact for manual recovery, and prints the exact state
 left behind rather than claiming a false recovery.
 
+After SIGKILL, host reboot, or another exit that bypassed the shell trap, the
+next invocation takes the same VMID lock and checks this journal before it
+starts a new ownership/planning pass. It re-verifies that VMID still carries
+the same bootstrap ownership chain. If rollback was not armed, it removes
+only that run's staged artifacts and proves the existing service active and
+healthy. If rollback was armed, it loads the prior run-id and markers and
+calls the same rollback implementation described below. Once the old service
+is positively restored, active, and healthy, recovery marks the journal
+recovered, performs final run-owned cleanup, removes the journal, and exits
+successfully with a message requiring the update to be rerun. The requested
+new target is deliberately not planned or activated in that recovery
+invocation.
+
+If recovery cannot re-prove ownership, non-running service state before a
+rollback mutation, a required rollback path/postcondition, restored startup,
+or health, it exits non-zero and retains the active journal plus rollback and
+authority-backup artifacts. The diagnostic prints the VMID, interrupted run
+ID, journal path, and authority backup path when applicable. Every later
+invocation encounters the same recovery gate; no fresh plan can begin until
+recovery succeeds or the operator manually restores a coherent installation
+and resolves the recorded state.
+
 Rollback first issues a stop request and positively proves through systemd
 that the service is non-running before touching any managed file. Service
 state and rollback-path existence are three-valued: a failed transport,
@@ -182,6 +223,11 @@ and a restored authority database must regain `hubinetops:hubinetops` ownership
 and mode `0640`, before the old service is restarted. Failure of any of these
 proofs stops rollback hard and preserves the remaining artifacts for manual
 recovery.
+
+This is ordinary operational recovery for legitimate updater races,
+untrappable process death, and host restart under normal atomic-filesystem
+assumptions. It does not claim resistance to a malicious administrator/root,
+deliberate journal or lock modification, or hostile kernel/storage behavior.
 
 ## Acceptance
 

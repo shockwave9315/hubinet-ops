@@ -11,11 +11,13 @@ ephemeral-CI/local-CI sandbox; every test is a hard skip elsewhere.
 
 from __future__ import annotations
 
+import fcntl
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -62,6 +64,14 @@ def _base_args(target_dir, *, vmid=FAKE_VMID, expected_sha=None, extra=()):
     if expected_sha is not False:
         args += ["--expected-sha", expected_sha]
     return args + list(extra)
+
+
+def _update_state_path(env, vmid, suffix):
+    return (
+        Path(env.env["HUBINET_OPS_TEST_HOST_ROOT"])
+        / "var" / "lib" / "hubinet-ops" / "update-state"
+        / f"vmid-{vmid}.{suffix}"
+    )
 
 
 @pytest.fixture
@@ -120,6 +130,23 @@ class TestCodeOnlyUpdate:
         marker = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip()
         assert marker == git_head_sha(target)
         assert "backend_instance_id" in result.stdout or "backend_instance_id" in result.stderr
+        assert not list(
+            env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("requirements.txt.staged-*")
+        )
+
+    def test_failed_after_app_activation_never_stages_unchanged_requirements(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-failed-code-only", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert not list(
+            env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("requirements.txt.staged-*")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +387,179 @@ class TestDryRun:
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").exists()
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
         assert not any("systemctl" in line and "stop" in line for line in env.log_lines())
+
+
+# ---------------------------------------------------------------------------
+# Per-VMID kernel-backed single-flight. These are real simultaneously-held
+# advisory locks, not a mocked "lock exists" flag.
+# ---------------------------------------------------------------------------
+
+
+class TestPerVmidSingleFlight:
+    def test_same_vmid_second_invocation_is_rejected_until_holder_exits(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-lock", REPO_ROOT)
+        first_stdout = tmp_path / "first.stdout"
+        first_stderr = tmp_path / "first.stderr"
+        first_args = [
+            "bash",
+            str(UPDATE_SCRIPT),
+            "--vmid",
+            FAKE_VMID,
+            "--source-dir",
+            str(target),
+            "--expected-sha",
+            git_head_sha(target),
+        ]
+
+        with first_stdout.open("wb") as stdout_fh, first_stderr.open("wb") as stderr_fh:
+            first = subprocess.Popen(
+                first_args,
+                cwd=str(REPO_ROOT),
+                env=env.env,
+                stdin=subprocess.PIPE,
+                stdout=stdout_fh,
+                stderr=stderr_fh,
+            )
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if "Hubinet Ops in-place update plan" in first_stdout.read_text(
+                    encoding="utf-8", errors="replace"
+                ):
+                    break
+                assert first.poll() is None, first_stderr.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                time.sleep(0.05)
+            else:
+                first.kill()
+                pytest.fail("first updater never reached its confirmation while holding the lock")
+
+            log_count = len(env.log_lines())
+            second = _run(env.env, _base_args(target, extra=["--dry-run"]))
+            assert second.returncode != 0
+            assert "another Hubinet Ops updater run owns VMID" in second.stderr
+            assert len(env.log_lines()) == log_count, (
+                "the rejected invocation must not reach ownership/planning fake PVE commands"
+            )
+
+            first.terminate()
+            first.wait(timeout=15)
+
+        later = _run(env.env, _base_args(target, extra=["--dry-run"]))
+        assert later.returncode == 0, later.stderr
+
+    def test_different_vmid_lock_does_not_reject_target_vmid(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-other-lock", REPO_ROOT)
+        other_lock = _update_state_path(env, "111", "lock")
+        other_lock.parent.mkdir(parents=True, exist_ok=True)
+        with other_lock.open("w", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = _run(env.env, _base_args(target, extra=["--dry-run"]))
+        assert result.returncode == 0, result.stderr
+
+    def test_stale_unheld_lock_file_does_not_block_later_invocation(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-stale-lock", REPO_ROOT)
+        stale_lock = _update_state_path(env, FAKE_VMID, "lock")
+        stale_lock.parent.mkdir(parents=True, exist_ok=True)
+        stale_lock.write_text("stale file without a kernel lock\n", encoding="utf-8")
+
+        result = _run(env.env, _base_args(target, extra=["--dry-run"]))
+        assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Durable interrupted-run recovery. The fake performs the first destructive
+# rename and then SIGKILLs the updater shell itself, bypassing EXIT entirely.
+# ---------------------------------------------------------------------------
+
+
+class TestInterruptedRunRecovery:
+    def test_sigkill_after_live_app_move_is_recovered_before_new_plan(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="6" * 40,
+            scenario_overrides={"kill_updater_after_move": "mv_live_app_to_rollback"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-sigkill", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "state=active" in journal_text
+        assert "rollback_armed=1" in journal_text
+        assert "ledger=update-app-activation-attempted" in journal_text
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists()
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+
+        before_recovery = len(env.log_lines())
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "detected prior updater journal" in recovered.stderr
+        assert "previous interrupted update" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not journal.exists()
+        recovery_lines = env.log_lines()[before_recovery:]
+        assert not any(line.startswith("pct push") for line in recovery_lines), (
+            "startup recovery must not enter normal planning and push a new tool"
+        )
+
+    def test_sigkill_after_target_service_start_rolls_back_before_new_plan(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="7" * 40,
+            scenario_overrides={"kill_updater_after_target_start": True},
+        )
+        target = build_update_target_checkout(tmp_path / "target-late-sigkill", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert "state=active" in journal.read_text(encoding="utf-8")
+
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "previous interrupted update" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert not journal.exists()
+
+    def test_unproven_recovery_retains_journal_and_blocks_new_plan(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={"kill_updater_after_move": "mv_live_app_to_rollback"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-unresolved", REPO_ROOT)
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail_service_state_probe_after"] = 1
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        before_recovery = len(env.log_lines())
+
+        blocked = _run(env.env, _base_args(target))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        assert "active journal" in blocked.stderr
+        assert "Phase U2" not in blocked.stderr
+        assert journal.exists()
+        assert "state=active" in journal.read_text(encoding="utf-8")
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists()
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        recovery_lines = env.log_lines()[before_recovery:]
+        assert not any(line.startswith("pct push") for line in recovery_lines)
 
 
 # ---------------------------------------------------------------------------

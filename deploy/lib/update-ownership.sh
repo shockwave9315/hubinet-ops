@@ -25,8 +25,14 @@ _update_require_ct_path() {
 }
 
 update_ownership_verify() {
-  local vmid="$1"
-  log_phase "Phase U1: verify installation ownership (VMID ${vmid})"
+  local vmid="$1" mode="${2:-normal}" expected_run_id="${3:-}"
+  [[ "${mode}" == "normal" || "${mode}" == "recovery" ]] \
+    || die "internal error: unsupported ownership verification mode '${mode}'"
+  if [[ "${mode}" == "recovery" ]]; then
+    log_phase "Interrupted-run recovery: re-verify installation ownership (VMID ${vmid})"
+  else
+    log_phase "Phase U1: verify installation ownership (VMID ${vmid})"
+  fi
 
   local status_output
   status_output="$(pct status "${vmid}" 2>&1)" \
@@ -37,11 +43,13 @@ update_ownership_verify() {
   _update_require_ct_path "${vmid}" /etc/hubinet-ops/inventory.yaml "the R0 config file"
   _update_require_ct_path "${vmid}" /etc/hubinet-ops/agent.env "agent.env"
   _update_require_ct_path "${vmid}" "${HOST_CONTROL_CT_PRIVATE_KEY}.pub" "the host-control public key"
-  _update_require_ct_path "${vmid}" /opt/hubinet-ops/app "the application payload directory"
-  _update_require_ct_path "${vmid}" /opt/hubinet-ops/requirements.txt "requirements.txt"
-  _update_require_ct_path "${vmid}" /opt/hubinet-ops/.venv "the service virtualenv"
-  _update_require_ct_path "${vmid}" /etc/systemd/system/hubinet-ops.service "the systemd unit"
-  _update_require_ct_path "${vmid}" /var/lib/hubinet-ops/authority.db "the authority database"
+  if [[ "${mode}" == "normal" ]]; then
+    _update_require_ct_path "${vmid}" /opt/hubinet-ops/app "the application payload directory"
+    _update_require_ct_path "${vmid}" /opt/hubinet-ops/requirements.txt "requirements.txt"
+    _update_require_ct_path "${vmid}" /opt/hubinet-ops/.venv "the service virtualenv"
+    _update_require_ct_path "${vmid}" /etc/systemd/system/hubinet-ops.service "the systemd unit"
+    _update_require_ct_path "${vmid}" /var/lib/hubinet-ops/authority.db "the authority database"
+  fi
 
   local pubkey_tmp key_type key_data key_comment extra
   pubkey_tmp="$(mktemp /tmp/hubinet-ops-update-hostcontrol-pub.XXXXXX)"
@@ -59,6 +67,9 @@ update_ownership_verify() {
   UPDATE_VMID_RUN_ID="${key_comment#"${marker_prefix}"}"
   [[ -n "${UPDATE_VMID_RUN_ID}" ]] \
     || die "ownership verification failed: could not recover a non-empty run-id from container ${vmid}'s host-control public-key comment"
+  if [[ "${mode}" == "recovery" && "${UPDATE_VMID_RUN_ID}" != "${expected_run_id}" ]]; then
+    die "interrupted-update recovery ownership failed: VMID ${vmid} now carries installation run-id ${UPDATE_VMID_RUN_ID}, expected ${expected_run_id}; preserving the journal and rollback artifacts"
+  fi
 
   UPDATE_AUTH_MARKER="hubinet-ops-package-scan-vmid-${vmid}-${UPDATE_VMID_RUN_ID}"
 

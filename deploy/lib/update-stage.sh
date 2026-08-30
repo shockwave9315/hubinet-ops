@@ -20,14 +20,7 @@ update_stage_all() {
   # (update-plan.sh) and every staging/activation path below, so every
   # /tmp artifact this invocation touches is run-owned from the start.
   [[ -n "${UPDATE_RUN_ID}" ]] || die "internal error: UPDATE_RUN_ID was not set before update_stage_all"
-  UPDATE_CT_SOURCE_TARBALL="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}.tar.gz"
-  UPDATE_CT_SOURCE_DIR="/tmp/hubinet-ops-update-src-${UPDATE_RUN_ID}"
-  UPDATE_APP_STAGED_PATH="/opt/hubinet-ops/app.staged-${UPDATE_RUN_ID}"
-  UPDATE_VENV_STAGED_PATH="/opt/hubinet-ops/.venv.staged-${UPDATE_RUN_ID}"
-  UPDATE_REQUIREMENTS_STAGED_PATH="/opt/hubinet-ops/requirements.txt.staged-${UPDATE_RUN_ID}"
-  UPDATE_UNIT_STAGED_PATH="/etc/systemd/system/hubinet-ops.service.staged-${UPDATE_RUN_ID}"
-  UPDATE_HELPER_HOST_PATH="$(_host_control_host_path "${UPDATE_HELPER_PATH}")"
-  UPDATE_HELPER_STAGED_HOST_PATH="${UPDATE_HELPER_HOST_PATH}.staged-${UPDATE_RUN_ID}"
+  _update_set_run_paths
 
   log_phase "Phase U3: stage target artifacts (run ${UPDATE_RUN_ID})"
 
@@ -79,10 +72,12 @@ _update_stage_app_payload() {
     || die "failed to stage the target application payload inside container ${VMID}"
   run_logged pct exec "${VMID}" -- chown -R hubinetops:hubinetops "${UPDATE_APP_STAGED_PATH}" \
     || die "failed to set ownership on the staged application payload"
-  run_logged pct exec "${VMID}" -- cp "${UPDATE_CT_SOURCE_DIR}/requirements.txt" "${UPDATE_REQUIREMENTS_STAGED_PATH}" \
-    || die "failed to stage the target requirements.txt inside container ${VMID}"
-  run_logged pct exec "${VMID}" -- chown hubinetops:hubinetops "${UPDATE_REQUIREMENTS_STAGED_PATH}" \
-    || die "failed to set ownership on the staged requirements.txt"
+  if [[ "${UPDATE_REQUIREMENTS_CHANGED}" == "1" ]]; then
+    run_logged pct exec "${VMID}" -- cp "${UPDATE_CT_SOURCE_DIR}/requirements.txt" "${UPDATE_REQUIREMENTS_STAGED_PATH}" \
+      || die "failed to stage the target requirements.txt inside container ${VMID}"
+    run_logged pct exec "${VMID}" -- chown hubinetops:hubinetops "${UPDATE_REQUIREMENTS_STAGED_PATH}" \
+      || die "failed to set ownership on the staged requirements.txt"
+  fi
 }
 
 UPDATE_VENV_STAGE_TOOL_CT_PATH="/tmp/hubinet-ops-update-venv-stage.py"

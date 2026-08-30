@@ -47,6 +47,8 @@ source "${BOOTSTRAP_SCRIPT_DIR}/lib/update-plan.sh"
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/update-stage.sh"
 # shellcheck source=lib/update-activate.sh
 source "${BOOTSTRAP_SCRIPT_DIR}/lib/update-activate.sh"
+# shellcheck source=lib/update-recovery.sh
+source "${BOOTSTRAP_SCRIPT_DIR}/lib/update-recovery.sh"
 
 # ---------------------------------------------------------------------------
 # Defaults / CLI contract (AGENTS.md task prompt section 8)
@@ -142,6 +144,8 @@ require_command pveum "Proxmox user/permission management"
 require_command git "source commit verification"
 require_command python3 "JSON parsing and authority database inspection"
 require_command cmp "byte-exact update-plan artifact comparison"
+require_command flock "per-VMID updater single-flight"
+require_command sync "durable interrupted-update journal replacement"
 
 # ---------------------------------------------------------------------------
 # Ledger / secret-file lifecycle -- exactly the same mechanism bootstrap
@@ -153,20 +157,31 @@ BOOTSTRAP_LEDGER="$(mktemp /tmp/hubinet-ops-update-ledger.XXXXXX)"
 BOOTSTRAP_SECRET_FILES="$(mktemp /tmp/hubinet-ops-update-secrets.XXXXXX)"
 chmod 0600 "${BOOTSTRAP_LEDGER}" "${BOOTSTRAP_SECRET_FILES}"
 
-# UPDATE_RUN_ID: generated ONCE for the whole invocation (not only once
-# staging starts) so every /tmp artifact this run creates -- including the
-# Phase U2 planning tools update-plan.sh pushes into the CT -- is
-# run-owned from the start, never a fixed shared name.
-UPDATE_RUN_ID="$(_generate_run_id)"
+UPDATE_RUN_ID=""
 
 _update_exit_trap() {
   local exit_code=$?
   trap - EXIT
+  if [[ "${_UPDATE_STARTUP_RECOVERY_IN_PROGRESS:-0}" == "1" ]]; then
+    log_warn "startup recovery did not complete; preserving ${UPDATE_JOURNAL_PATH} and every referenced artifact for manual recovery"
+    cleanup_secret_files
+    rm -f -- "${BOOTSTRAP_LEDGER}"
+    exit "${exit_code}"
+  fi
   if (( exit_code != 0 )) && ledger_has update-service-stop-attempted "${VMID}"; then
     update_rollback_on_failure "${exit_code}"
   elif (( exit_code != 0 )); then
     log_warn "update did not complete (exit ${exit_code}) before any service stop was attempted -- the existing installation was never touched"
-    update_stage_cleanup 2>/dev/null || true
+    if [[ "${UPDATE_JOURNAL_STATE:-}" == "active" ]]; then
+      if _update_prove_service_active_and_healthy; then
+        update_journal_resolve recovered
+      else
+        update_stage_cleanup 2>/dev/null || true
+        log_warn "the pre-mutation service did not prove active + healthy; preserving ${UPDATE_JOURNAL_PATH} for the next recovery invocation"
+      fi
+    else
+      update_stage_cleanup 2>/dev/null || true
+    fi
   fi
   cleanup_secret_files
   rm -f -- "${BOOTSTRAP_LEDGER}"
@@ -184,14 +199,32 @@ trap 'exit 143' TERM
 # installation.
 # ---------------------------------------------------------------------------
 
+# Single-flight covers dry-run and the complete recovery/update lifecycle.
+# Kernel ownership of UPDATE_LOCK_FD is released automatically on shell exit,
+# including after SIGKILL/reboot; the stable lock file itself is not state.
+update_lock_acquire
+
+# A prior active journal is resolved before a new run-id is allocated and
+# before any ownership/planning reads for the requested new update.
+update_startup_recovery_gate
+
+# Generated once for the new invocation. The first active journal is written
+# immediately after ownership is proven and before planning begins.
+UPDATE_RUN_ID="$(_generate_run_id)"
 update_ownership_verify "${VMID}"
+UPDATE_INSTALLATION_RUN_ID="${UPDATE_VMID_RUN_ID}"
+_update_set_run_paths
+update_journal_checkpoint active
 _plan_source_commit
 update_plan_classify
+update_journal_checkpoint active
 update_plan_print
 
 if [[ "${UPDATE_DRY_RUN}" == "1" ]]; then
   log_info "--dry-run: stopping after the plan above. No managed-state mutation was made."
   _update_cleanup_plan_tools
+  update_journal_checkpoint completed
+  _update_journal_clear
   exit 0
 fi
 

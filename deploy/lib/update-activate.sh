@@ -128,7 +128,8 @@ update_activate_and_accept() {
   # Arm rollback BEFORE the first stop request. The request may mutate
   # systemd state and still return non-zero (or the process may be
   # interrupted before a success-only marker could be written).
-  ledger_record update-service-stop-attempted "${VMID}"
+  UPDATE_ROLLBACK_ARMED="1"
+  update_journal_record update-service-stop-attempted "${VMID}"
   run_logged pct exec "${VMID}" -- systemctl stop hubinet-ops \
     || die "failed to request a stop of hubinet-ops inside container ${VMID}; resulting service state is ambiguous and rollback recovery is required"
   _update_wait_until_service_stopped \
@@ -141,7 +142,7 @@ update_activate_and_accept() {
   # not after the swap completes, so rollback's own state-inspection
   # logic (_update_rollback_app) is armed for every intermediate failure
   # -- including the first move itself failing.
-  ledger_record update-app-activation-attempted "${VMID}"
+  update_journal_record update-app-activation-attempted "${VMID}"
   run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/app "/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}" \
     || die "failed to move the live application payload aside inside container ${VMID}"
   run_logged pct exec "${VMID}" -- mv "${UPDATE_APP_STAGED_PATH}" /opt/hubinet-ops/app \
@@ -151,7 +152,7 @@ update_activate_and_accept() {
   # 5/6. requirements + venv, only if changed. Same attempted-before-
   # first-destructive-move discipline as the app payload above.
   if [[ "${UPDATE_REQUIREMENTS_CHANGED}" == "1" ]]; then
-    ledger_record update-venv-activation-attempted "${VMID}"
+    update_journal_record update-venv-activation-attempted "${VMID}"
     run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/.venv "/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}" \
       || die "failed to move the active virtualenv aside inside container ${VMID}"
     run_logged pct exec "${VMID}" -- mv "${UPDATE_VENV_STAGED_PATH}" /opt/hubinet-ops/.venv \
@@ -182,7 +183,7 @@ update_activate_and_accept() {
       || { pct exec "${VMID}" -- rm -f "${unit_rollback_tmp_path}" >/dev/null 2>&1 || true; die "failed to preserve the active systemd unit inside container ${VMID}"; }
     run_logged pct exec "${VMID}" -- mv "${unit_rollback_tmp_path}" "${unit_rollback_path}" \
       || die "failed to finalize the preserved systemd unit inside container ${VMID}"
-    ledger_record update-unit-activation-attempted "${VMID}"
+    update_journal_record update-unit-activation-attempted "${VMID}"
     run_logged pct exec "${VMID}" -- mv "${UPDATE_UNIT_STAGED_PATH}" /etc/systemd/system/hubinet-ops.service \
       || die "failed to activate the staged systemd unit inside container ${VMID}"
     ledger_record update-unit-activated "${VMID}"
@@ -194,7 +195,7 @@ update_activate_and_accept() {
   if [[ "${UPDATE_HELPER_CHANGED}" == "1" ]]; then
     cp "${UPDATE_HELPER_HOST_PATH}" "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" \
       || die "failed to preserve the active PVE host helper before activation"
-    ledger_record update-helper-activated "${VMID}"
+    update_journal_record update-helper-activated "${VMID}"
     mv "${UPDATE_HELPER_STAGED_HOST_PATH}" "${UPDATE_HELPER_HOST_PATH}" \
       || die "failed to activate the staged PVE host helper (same-path atomic rename)"
   fi
@@ -268,7 +269,7 @@ _update_perform_authority_reset() {
   # "reset completed"; it always re-proves removal of whatever target/
   # partial state remains before ever copying the validated backup back
   # (see update_rollback_on_failure).
-  ledger_record update-authority-reset-attempted "${VMID}"
+  update_journal_record update-authority-reset-attempted "${VMID}"
 
   tool_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" remove /var/lib/hubinet-ops/authority.db 2>/dev/null)" \
     && status=0 || status=$?
@@ -376,13 +377,13 @@ _update_write_source_marker() {
   ledger_record update-marker-activation-attempted "${VMID}"
   local path_state_rc
   if _update_ct_path_state "${marker_path}"; then
-    ledger_record update-marker-precondition-exists "${VMID}"
+    update_journal_record update-marker-precondition-exists "${VMID}"
     run_logged pct exec "${VMID}" -- mv "${marker_path}" "${marker_rollback_path}" \
       || die "failed to move the pre-update installed-source marker aside inside container ${VMID}"
   else
     path_state_rc=$?
     if (( path_state_rc == 1 )); then
-      ledger_record update-marker-precondition-absent "${VMID}"
+      update_journal_record update-marker-precondition-absent "${VMID}"
     else
       die "could not prove whether the pre-update installed-source marker exists inside container ${VMID} -- refusing to mutate it"
     fi
@@ -442,6 +443,12 @@ _update_rollback_marker() {
 }
 
 _update_finish_summary() {
+  # Coherence and acceptance have been positively proven. Persist the
+  # terminal state before removing rollback material, so a crash between
+  # these two steps is cleanup-only on the next invocation, never a false
+  # request to roll an already-accepted target back.
+  update_journal_checkpoint completed
+
   # Success: clean up rollback material and staged leftovers -- nothing
   # here is managed state a future update depends on.
   pct exec "${VMID}" -- rm -rf \
@@ -456,6 +463,7 @@ _update_finish_summary() {
     rm -f "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" 2>/dev/null || true
   fi
   _update_cleanup_plan_tools
+  _update_journal_clear
 
   cat <<SUMMARY
 
@@ -565,7 +573,7 @@ update_rollback_on_failure() {
   [[ -n "${health_body}" ]] \
     || _update_rollback_hard_stop "restored the pre-update installation and it reports active, but the unauthenticated health probe returned nothing"
 
-  update_stage_cleanup
+  update_journal_resolve recovered
   log_warn "rollback complete -- the pre-update installation is running again (exit ${exit_code})"
 }
 
@@ -722,6 +730,6 @@ _update_rollback_app() {
 
 _update_rollback_hard_stop() {
   log_warn "ROLLBACK COULD NOT BE COMPLETED: $*"
-  log_warn "Preserving every rollback/backup artifact for manual recovery. Run ${UPDATE_RUN_ID} left the installation in a non-coherent state -- do not assume the service is safe to use until this is resolved by hand."
+  log_warn "Preserving every rollback/backup artifact and active journal ${UPDATE_JOURNAL_PATH:-unknown} for manual recovery. Context: VMID=${VMID:-unknown}, run=${UPDATE_RUN_ID:-unknown}, authority_backup=${UPDATE_DB_BACKUP_PATH:-none}. Do not begin a new update or assume the service is safe until this is resolved by hand."
   exit 1
 }

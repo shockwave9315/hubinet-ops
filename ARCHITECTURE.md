@@ -155,6 +155,15 @@ bootstrap, never a second bootstrap: it never invokes
 VMID/network, and never rotates the PVE identity/token secret, the HA
 bearer, or the host-control key.
 
+Every invocation, including `--dry-run`, first takes a non-blocking
+kernel-backed `flock` lease on the PVE host at
+`/var/lib/hubinet-ops/update-state/vmid-<vmid>.lock`. The descriptor remains
+open across recovery, ownership verification, planning, confirmation,
+staging, activation, acceptance, rollback, and cleanup. Legitimate updates
+for one VMID are therefore single-flight while different VMIDs remain
+independent; an unheld lock file after process death or reboot is not a stale
+lock.
+
 ```text
 --vmid <N>
   -> prove installation ownership (host-control key comment, authorized_keys
@@ -238,6 +247,28 @@ positively reports the service non-running; every load-bearing removal is
 independently re-proved absent before restoration; restoring a systemd unit
 requires a successful daemon reload; and a restored authority database must
 have its service ownership and mode successfully reinstated before restart.
+
+The same PVE-host directory contains at most one active bounded recovery
+journal per VMID (`vmid-<vmid>.journal`). It records the update run-id, the
+already-verified installation run-id, rollback-armed state, requirements and
+authority classifications, the authority backup path when applicable, and
+only the existing rollback ledger markers needed by `update-activate.sh`.
+Each load-bearing checkpoint uses a flushed temporary file, atomic rename,
+and directory flush before its destructive transition. On the next
+invocation, the journal is inspected after taking the VMID lease and before
+any new-run ownership or planning read. The updater re-verifies the same
+installation and then either cleans a pre-mutation interruption or re-enters
+the existing fail-closed rollback machinery with the prior run-id.
+
+Successful recovery proves the restored service active and healthy, clears
+the journal, and exits with an instruction to rerun; it never starts the
+requested new plan in that invocation. If any ownership, service-state,
+path-state, restore, start, or health proof is unavailable, the active
+journal and referenced artifacts remain and every new update is blocked for
+manual recovery. This covers ordinary races, process death, and host restart
+under normal local-filesystem semantics. It is not a defense against a
+malicious PVE root/administrator, hostile filesystem or kernel behavior, or
+deliberate manual mutation of updater state.
 
 See `deploy/README-update-proxmox-0.5.md` for the operator runbook.
 

@@ -77,6 +77,7 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import shutil
 import sys
 import tarfile
@@ -495,6 +496,11 @@ def _exec_inner(vmid, inner, state):
         if dst.exists() and dst.is_dir() and not src.is_dir():
             return 1
         shutil.move(str(src), str(dst))
+        if fail_key is not None and SCENARIO.get("kill_updater_after_move") == fail_key:
+            # Actual untrappable updater disappearance: the fake command
+            # has completed the selected atomic rename, then SIGKILLs its
+            # parent updater shell. No EXIT trap or rollback code runs.
+            os.kill(os.getppid(), signal.SIGKILL)
         return 0
 
     if inner[0] == "cp":
@@ -1058,6 +1064,10 @@ def _exec_systemctl(vmid, args, state):
             return 1
         entry["service"] = "active"
         _save_state(state)
+        if SCENARIO.get("kill_updater_after_target_start") and call_number == 1:
+            # Later interruption witness: target service has actually
+            # started, but acceptance/source-marker completion has not.
+            os.kill(os.getppid(), signal.SIGKILL)
         return 0
     if args == ["daemon-reload"]:
         call_number = state.get("daemon_reload_calls", 0) + 1
