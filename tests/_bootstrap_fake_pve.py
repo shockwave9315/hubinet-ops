@@ -1036,6 +1036,42 @@ def _exec_systemctl(vmid, args, state):
         entry["service_enabled"] = False
         _save_state(state)
         return 0
+    # Bare `enable`/`disable` (no --now) -- the in-place updater's temporary
+    # service-autostart guard (deploy/lib/update-activate.sh). Real systemd
+    # semantics: these only add/remove the boot-activation symlink; they
+    # never start or stop the currently-running unit, and a disabled unit
+    # can still be started by hand. The three seams below reproduce the
+    # three realistic ways such a command lies about what it did.
+    if args == ["disable", "hubinet-ops"]:
+        call_number = state.get("service_autostart_disable_calls", 0) + 1
+        state["service_autostart_disable_calls"] = call_number
+        _save_state(state)
+        if _fail("service_autostart_disable_mutate_then_fail"):
+            # Boot activation IS actually removed, yet the command reports
+            # failure. Recovery must already be armed at this point.
+            entry["service_enabled"] = False
+            _save_state(state)
+            return 1
+        if _fail("service_autostart_disable"):
+            return 1
+        if _fail("service_autostart_disable_noop_success"):
+            # Reports success while the unit stays enabled. The caller must
+            # trust an independent unit-file-state probe, never this code.
+            return 0
+        entry["service_enabled"] = False
+        _save_state(state)
+        return 0
+    if args == ["enable", "hubinet-ops"]:
+        call_number = state.get("service_autostart_enable_calls", 0) + 1
+        state["service_autostart_enable_calls"] = call_number
+        _save_state(state)
+        if _fail("service_autostart_enable"):
+            return 1
+        if _fail("service_autostart_enable_noop_success"):
+            return 0
+        entry["service_enabled"] = True
+        _save_state(state)
+        return 0
     if args == ["stop", "hubinet-ops"]:
         call_number = state.get("service_stop_calls", 0) + 1
         state["service_stop_calls"] = call_number
@@ -1096,6 +1132,21 @@ def _exec_systemctl(vmid, args, state):
             state_val = "not-a-systemd-state"
         _log("service-state", state_val)
         sys.stdout.write(state_val + "\n")
+        return 0
+    if args == ["show", "hubinet-ops", "--property=UnitFileState", "--value"]:
+        call_number = state.get("service_enabled_probe_calls", 0) + 1
+        state["service_enabled_probe_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_service_enabled_probe")
+        if _fail("service_enabled_probe") or (
+            fail_nth is not None and call_number == int(fail_nth)
+        ):
+            return 1
+        unit_file_state = "enabled" if entry.get("service_enabled", False) else "disabled"
+        if _fail("service_enabled_probe_malformed"):
+            unit_file_state = "not-a-unit-file-state"
+        _log("unit-file-state", unit_file_state)
+        sys.stdout.write(unit_file_state + "\n")
         return 0
     if args == ["is-active", "hubinet-ops"]:
         state_val = SCENARIO.get("service_active_override", entry.get("service", "inactive"))
@@ -1774,6 +1825,33 @@ class FakePveEnvironment:
 
     def state(self) -> dict[str, Any]:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def simulate_pve_ct_reboot(self, vmid: str) -> None:
+        """One bounded PVE-host/CT restart, over the state this fake already
+        tracks -- not a second reboot simulator.
+
+        Semantics, exactly the ones the updater's autostart guard depends on:
+
+        - the CT comes back RUNNING when its installation-time onboot flag
+          says so (bootstrap's final state is onboot=1, and the updater
+          never changes it);
+        - inside the CT, systemd boot-activates hubinet-ops IF AND ONLY IF
+          the unit file is currently ENABLED. A unit the updater disabled
+          for its mutation window stays inactive, so no half-swapped
+          app/venv/unit/helper/database state can ever auto-run.
+
+        Nothing else about the installation is invented here: files, the
+        durable updater journal and every rollback artifact survive the
+        restart exactly as they were, which is the whole point.
+        """
+        state = self.state()
+        entry = state["vmids"].setdefault(vmid, {})
+        entry["started"] = str(entry.get("onboot", "1")) == "1"
+        if entry["started"] and entry.get("service_enabled", False):
+            entry["service"] = "active"
+        else:
+            entry["service"] = "inactive"
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
 
 def default_scenario() -> dict[str, Any]:

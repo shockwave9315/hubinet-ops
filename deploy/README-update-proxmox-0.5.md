@@ -175,7 +175,40 @@ Before the old service is stopped, any failure (staging, source-provenance
 recheck, a build failure in a staged virtualenv) leaves the existing
 installation completely untouched.
 
-Once a service stop is attempted, a failure at any later point — including
+### Boot activation during the update window
+
+An update rewrites several pieces of one runtime, so there is a window in
+which the installation on disk is deliberately incoherent. Your CT keeps
+`onboot=1` and would come back by itself after a PVE host power loss, and an
+enabled `hubinet-ops.service` would then be auto-started by systemd — against
+a half-swapped installation, long before you had a chance to rerun the
+updater.
+
+The updater therefore **temporarily disables `hubinet-ops`'s boot
+activation** for its mutation window. As the first mutation it re-proves the
+unit is currently enabled, records that intent durably, runs
+`systemctl disable hubinet-ops`, and then proves systemd's own
+`UnitFileState` really is `disabled` before anything else is touched.
+
+- Your CT's `onboot` setting is **not** changed, and the unit is never
+  masked or replaced.
+- `disable` does not stop a running service; the updater's own explicit stop
+  does that a moment later.
+- The updater still starts the service by hand for target acceptance —
+  systemd permits starting a disabled unit — so the new build is fully
+  exercised while it still cannot auto-start at boot.
+- The unit stays disabled through target start, discovery/host-control/
+  firewall acceptance, and installed-source marker activation.
+- `systemctl enable hubinet-ops` is issued, and positively proven, only
+  after the target is fully accepted with a coherent source marker — and on
+  every rollback or recovery path before recovery is declared complete.
+
+So if the PVE host or the CT reboots mid-update, Hubinet Ops simply does not
+come up until the updater has finished recovering it. A finished, successful
+update always leaves the service **enabled and active** again; if it did not,
+the run failed and rolled back, or stopped hard and told you so.
+
+Once boot activation or a service stop is attempted, a failure at any later point — including
 a stop command that changed systemd state but returned failure, and a failure
 partway through swapping any single artifact, not only one after that swap
 fully completes — triggers a coherent rollback: every changed
@@ -184,8 +217,9 @@ host helper, and the installed-source marker) is restored from its
 retained rollback copy, and — if a destructive authority reset had already
 happened — the validated pre-update database backup is restored in place
 of the newly-created target database, so a failed update never leaves old
-code paired with an incompatible new schema or a new source marker. The
-old service is then restarted and its liveness re-verified.
+code paired with an incompatible new schema or a new source marker. Boot
+activation is then re-enabled and proven, and the old service is restarted
+and its liveness re-verified.
 
 If rollback itself cannot complete, the updater stops hard, preserves every
 rollback/backup artifact for manual recovery, and prints the exact state
@@ -195,18 +229,20 @@ After SIGKILL, host reboot, or another exit that bypassed the shell trap, the
 next invocation takes the same VMID lock and checks this journal before it
 starts a new ownership/planning pass. It re-verifies that VMID still carries
 the same bootstrap ownership chain. If rollback was not armed, it removes
-only that run's staged artifacts and proves the existing service active and
-healthy. If rollback was armed, it loads the prior run-id and markers and
-calls the same rollback implementation described below. Once the old service
-is positively restored, active, and healthy, recovery marks the journal
+only that run's staged artifacts and proves the existing service enabled,
+active, and healthy. If rollback was armed, it loads the prior run-id and
+markers and calls the same rollback implementation described below. Once the
+old service is positively restored, enabled, active, and healthy, recovery
+marks the journal
 recovered, performs final run-owned cleanup, removes the journal, and exits
 successfully with a message requiring the update to be rerun. The requested
 new target is deliberately not planned or activated in that recovery
 invocation.
 
 If recovery cannot re-prove ownership, non-running service state before a
-rollback mutation, a required rollback path/postcondition, restored startup,
-or health, it exits non-zero and retains the active journal plus rollback and
+rollback mutation, a required rollback path/postcondition, restored boot
+activation, restored startup, or health, it exits non-zero and retains the
+active journal plus rollback and
 authority-backup artifacts. The diagnostic prints the VMID, interrupted run
 ID, journal path, and authority backup path when applicable. Every later
 invocation encounters the same recovery gate; no fresh plan can begin until
@@ -215,8 +251,12 @@ and resolves the recorded state.
 
 Rollback first issues a stop request and positively proves through systemd
 that the service is non-running before touching any managed file. Service
-state and rollback-path existence are three-valued: a failed transport,
-failed probe, or malformed answer is unknown, never "stopped" or "absent."
+state, unit-file enablement, and rollback-path existence are three-valued: a
+failed transport, failed probe, or malformed answer is unknown, never
+"stopped", "disabled", "enabled", or "absent." A `disable`/`enable` request
+that mutates state and still returns failure, or that reports success
+without changing anything, is caught by that separate proof rather than
+believed.
 Every load-bearing live-path removal is independently proved absent before a
 rollback rename. A restored unit must be successfully reloaded into systemd,
 and a restored authority database must regain `hubinetops:hubinetops` ownership

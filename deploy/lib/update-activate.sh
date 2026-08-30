@@ -6,8 +6,16 @@
 # update_activate_and_accept is fixed and never reordered (AGENTS.md task
 # prompt section 20). update-proxmox-0.5.sh's own EXIT trap calls
 # update_rollback_on_failure whenever the process exits non-zero after the
-# a service stop was attempted (ledger_has
-# update-service-stop-attempted), never before.
+# rollback/recovery boundary has been crossed -- that is, once removal of
+# the service's boot activation OR a service stop has been ATTEMPTED (see
+# _update_rollback_boundary_crossed in update-recovery.sh) -- never before.
+#
+# The first mutation of the window is the temporary service-autostart
+# guard (_update_disable_service_autostart): hubinet-ops is `disable`d for
+# the whole mutation window so a PVE/CT reboot can never boot-activate a
+# half-swapped installation, and enablement is restored and positively
+# proven again by either _update_restore_service_autostart on success or
+# update_rollback_on_failure on every recovery path.
 #
 # Rollback invariant (corrective pass): for every rollback-managed
 # artifact (app, venv+requirements, systemd unit), a durable
@@ -35,6 +43,7 @@ UPDATE_POST_BACKEND_INSTANCE_ID=""
 UPDATE_PRE_NFTABLES_CONF=""
 UPDATE_DISPLAY_NAME=""
 _UPDATE_SERVICE_STATE_DETAIL="unknown"
+_UPDATE_SERVICE_ENABLED_DETAIL="unknown"
 
 # Three-valued service-state probe. Return 0 means the service is active
 # or transitioning and therefore MUST be treated as potentially running;
@@ -84,6 +93,113 @@ _update_wait_until_service_stopped() {
   return 1
 }
 
+# Three-valued unit-file enablement probe. Return 0 means systemd
+# positively reported the unit file as `enabled` -- i.e. systemd WILL
+# boot-activate hubinet-ops after a PVE/CT restart; return 1 means systemd
+# positively reported `disabled` -- it will NOT; return 2 means the outer
+# pct call, the systemd read, or its output was not trustworthy. UNKNOWN is
+# never proof of either state: it is never permission to begin the mutation
+# window, and never permission to declare an update or a rollback complete.
+# Enablement is read from systemd's own explicit unit-file state rather
+# than inferred from any command's ambiguous exit status.
+_update_probe_service_enabled() {
+  local output status
+  output="$(pct exec "${VMID}" -- systemctl show hubinet-ops --property=UnitFileState --value 2>/dev/null)" \
+    && status=0 || status=$?
+  if (( status != 0 )); then
+    _UPDATE_SERVICE_ENABLED_DETAIL="unknown (probe exit ${status})"
+    return 2
+  fi
+  case "${output}" in
+    enabled)
+      _UPDATE_SERVICE_ENABLED_DETAIL="enabled"
+      return 0
+      ;;
+    disabled)
+      _UPDATE_SERVICE_ENABLED_DETAIL="disabled"
+      return 1
+      ;;
+    *)
+      _UPDATE_SERVICE_ENABLED_DETAIL="unknown (unsupported unit-file state: ${output:-empty})"
+      return 2
+      ;;
+  esac
+}
+
+# _update_disable_service_autostart: the temporary service-autostart guard
+# that makes this updater's mutation window survive a PVE host power loss.
+#
+# Without it, a reachable sequence exists: the old service is stopped, the
+# app is moved aside, the target app is activated, the PVE host loses power,
+# the CT auto-starts (onboot=1, which this updater never changes), and an
+# still-ENABLED hubinet-ops.service is boot-activated by systemd against a
+# HALF-SWAPPED installation -- a target app paired with the old venv, or a
+# freshly-activated unit paired with an old helper/database -- long before
+# any later updater invocation could read the durable journal and roll back.
+#
+# The minimum existing systemd mechanism prevents that: for the whole
+# mutation window the unit file is `disable`d, so systemd never
+# boot-activates it. The unit is NOT masked, NOT replaced, and NOT
+# permanently disabled; the CT's own onboot flag is untouched; and the
+# updater can still `systemctl start` the disabled unit by hand for target
+# acceptance, exactly as systemd permits. Normal boot enablement is
+# restored only once the target is fully accepted and its installed-source
+# marker is coherent (_update_restore_service_autostart), or by rollback.
+_update_disable_service_autostart() {
+  local rc
+  # Re-prove the pre-update contract (an enabled installation) immediately
+  # before the first mutation, not only during planning.
+  if _update_probe_service_enabled; then
+    :
+  else
+    rc=$?
+    die "refusing to begin the update mutation window: hubinet-ops is not provably enabled inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL})"
+  fi
+
+  # Arm recovery BEFORE the disable request is issued. `systemctl disable`
+  # can mutate the unit-file state and still return non-zero, and the
+  # process can be SIGKILLed between the request and any success-only
+  # marker -- so a marker written afterwards would leave a genuinely
+  # disabled installation with no durable record that it must be
+  # re-enabled. The EXIT/recovery boundary treats this marker as
+  # rollback-armed even though no service stop has been requested yet.
+  UPDATE_ROLLBACK_ARMED="1"
+  update_journal_record update-service-autostart-disable-attempted "${VMID}"
+
+  run_logged pct exec "${VMID}" -- systemctl disable hubinet-ops \
+    || die "failed to request removal of hubinet-ops boot activation inside container ${VMID}; the resulting unit-file state is ambiguous and rollback recovery is required"
+
+  # A zero exit is not proof either: prove the actual unit-file state.
+  if _update_probe_service_enabled; then
+    die "hubinet-ops is still enabled inside container ${VMID} after the autostart-disable request -- refusing to mutate an installation systemd would boot-activate half-swapped"
+  else
+    rc=$?
+  fi
+  (( rc == 1 )) \
+    || die "could not positively prove hubinet-ops boot activation disabled inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL}) -- refusing to mutate an installation that may still auto-start at boot"
+  ledger_record update-service-autostart-disabled "${VMID}"
+  log_info "hubinet-ops boot activation is temporarily disabled for this update's mutation window (the CT's own onboot setting is unchanged)"
+}
+
+# _update_restore_service_autostart: put hubinet-ops back under normal boot
+# activation and POSITIVELY prove it. Returns 0 only when systemd itself
+# reports the unit file as `enabled`; a zero exit from `systemctl enable`
+# is never accepted as proof on its own. Callers decide what a failure
+# means (a success-path die, or a rollback hard stop) -- this helper never
+# exits by itself.
+_update_restore_service_autostart() {
+  local rc
+  run_logged pct exec "${VMID}" -- systemctl enable hubinet-ops \
+    || log_warn "the systemctl enable request for hubinet-ops returned failure inside container ${VMID}; proving the actual unit-file state before deciding"
+  if _update_probe_service_enabled; then
+    log_info "hubinet-ops boot activation is restored (unit-file state: enabled)"
+    return 0
+  else
+    rc=$?
+  fi
+  return 1
+}
+
 _update_read_display_name() {
   local inventory_text line raw
   inventory_text="$(pct exec "${VMID}" -- cat /etc/hubinet-ops/inventory.yaml 2>/dev/null)"
@@ -125,9 +241,17 @@ update_activate_and_accept() {
   _update_recheck_source_commit
   _update_capture_pre_mutation_facts
 
-  # Arm rollback BEFORE the first stop request. The request may mutate
-  # systemd state and still return non-zero (or the process may be
-  # interrupted before a success-only marker could be written).
+  # Step 3a -- FIRST mutation of the window: temporarily remove
+  # hubinet-ops from boot activation, so no intermediate half-swapped
+  # state below can be auto-started by systemd after a PVE/CT reboot.
+  # This both arms recovery and journals its own attempted-marker before
+  # issuing the disable request; see _update_disable_service_autostart.
+  _update_disable_service_autostart
+
+  # Rollback is already armed by the autostart guard above. The stop
+  # request may still mutate systemd state and return non-zero (or the
+  # process may be interrupted before a success-only marker could be
+  # written), so its own attempted-marker is likewise journaled first.
   UPDATE_ROLLBACK_ARMED="1"
   update_journal_record update-service-stop-attempted "${VMID}"
   run_logged pct exec "${VMID}" -- systemctl stop hubinet-ops \
@@ -231,6 +355,17 @@ update_activate_and_accept() {
   log_pass "acceptance"
 
   _update_write_source_marker
+
+  # The target is fully accepted and its installed-source marker is
+  # coherent -- and only now may normal boot activation be restored, and
+  # positively proven, before the journal records this run as completed.
+  # This leaves exactly one narrow crash window (accepted + coherent
+  # marker + re-enabled, journal not yet completed): a reboot there starts
+  # the fully accepted TARGET installation, never a mixed one, and a later
+  # active-journal recovery may still conservatively roll it back.
+  _update_restore_service_autostart \
+    || die "the target installation was fully accepted, but hubinet-ops boot activation could not be proven restored inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL})"
+
   _update_finish_summary
 }
 
@@ -555,6 +690,18 @@ update_rollback_on_failure() {
   _update_rollback_venv_and_requirements
   _update_rollback_app
 
+  # Every rollback-managed artifact is back at its pre-update content, so
+  # the installation is coherent again and may safely be boot-activated.
+  # If this run ever ATTEMPTED to remove boot activation, restoring and
+  # positively proving it is load-bearing: a rollback that left the unit
+  # disabled would silently convert a recovered installation into one that
+  # never comes back after the next PVE/CT restart. Never inferred from
+  # the enable command's own exit status.
+  if ledger_has update-service-autostart-disable-attempted "${VMID}"; then
+    _update_restore_service_autostart \
+      || _update_rollback_hard_stop "restored the pre-update installation's files, but could not prove hubinet-ops boot activation re-enabled inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL}) -- it would not start again after a reboot"
+  fi
+
   run_logged pct exec "${VMID}" -- systemctl start hubinet-ops \
     || _update_rollback_hard_stop "restored the pre-update installation's files, but could not start hubinet-ops inside container ${VMID}"
 
@@ -574,7 +721,7 @@ update_rollback_on_failure() {
     || _update_rollback_hard_stop "restored the pre-update installation and it reports active, but the unauthenticated health probe returned nothing"
 
   update_journal_resolve recovered
-  log_warn "rollback complete -- the pre-update installation is running again (exit ${exit_code})"
+  log_warn "rollback complete -- the pre-update installation is enabled, running again, and healthy (exit ${exit_code})"
 }
 
 # _update_ct_path_state: three-valued read-only existence check of a fixed

@@ -176,6 +176,8 @@ lock.
      confirmation, or --yes --allow-authority-reset non-interactively, when
      the authority schema requires a reset)
   -> stage every replacement while the old service is still healthy
+  -> temporarily disable the service's boot activation (the first mutation
+     of the window), then stop it
   -> activate in one fixed order (app, venv+requirements if changed, unit
      if changed, PVE helper same-path content swap if changed, authority
      preserve-or-reset), retaining rollback material
@@ -183,10 +185,13 @@ lock.
      extended with an optional minimum-committed-sequence floor to prove a
      genuine post-restart cycle; host-control forced-boundary re-probe;
      firewall byte-identical + active)
-  -> on any failure after a service stop was attempted: first positively
-     prove the service non-running, then perform coherent rollback,
-     including a validated authority-database backup restore when a
-     destructive reset had already happened
+  -> restore boot activation and positively prove it enabled, then record
+     the run completed
+  -> on any failure after boot activation or a service stop was attempted:
+     first positively prove the service non-running, then perform coherent
+     rollback, including a validated authority-database backup restore when
+     a destructive reset had already happened, and re-prove the restored
+     service enabled before declaring recovery complete
 ```
 
 **Authority schema decision.** `deploy/lib/hubinet-ops-authority-tool.py`
@@ -240,9 +245,37 @@ target failure after a destructive authority reset restores the coherent
 paired with a new, incompatible schema, and never a new installed-source
 marker paired with a rolled-back old installation.
 
-Service and rollback-path inspection are explicitly three-valued: a failed
-or malformed probe is unknown, never evidence that the service is stopped or
-that a path is absent. Rollback does not mutate any managed file until systemd
+**Temporary service-autostart guard.** Bootstrap leaves the CT at
+`onboot=1` and `hubinet-ops.service` enabled, so without a guard a PVE host
+power loss part-way through an update would bring the CT back and let
+systemd boot-activate a half-swapped runtime — a target app paired with the
+old venv, or a freshly activated unit paired with an old helper or database
+— before any later updater invocation could read the journal and roll back.
+The updater therefore removes the service's *boot activation* for the whole
+mutation window, using the minimum existing systemd mechanism: immediately
+before the first mutation it re-proves the unit enabled, arms rollback,
+durably journals an autostart-disable-attempted marker, and only then runs
+`systemctl disable hubinet-ops`, positively proving the resulting
+`UnitFileState`. The CT's own `onboot` setting is never changed, the unit is
+never masked or replaced, and the updater still starts the disabled unit by
+hand for target acceptance, exactly as systemd permits. The unit stays
+disabled through target start, discovery/host-control/firewall acceptance,
+and installed-source marker activation; `systemctl enable hubinet-ops` is
+issued and *proven* only once the target is fully accepted with a coherent
+marker, before the journal records the run completed — and equally on every
+rollback and startup-recovery path, before recovery may be declared
+complete. A reboot during the mutation window therefore leaves the service
+inactive; the one remaining narrow window (accepted target, coherent marker,
+enablement restored, journal not yet completed) can only start the fully
+accepted target installation, never a mixed one.
+
+Service, unit-file-enablement, and rollback-path inspection are explicitly
+three-valued: a failed or malformed probe is unknown, never evidence that
+the service is stopped, that boot activation is disabled or restored, or
+that a path is absent. Enablement in particular is read from systemd's own
+`UnitFileState` rather than inferred from a command's exit status — a
+`disable`/`enable` request may mutate state and still fail, or report
+success without changing anything. Rollback does not mutate any managed file until systemd
 positively reports the service non-running; every load-bearing removal is
 independently re-proved absent before restoration; restoring a systemd unit
 requires a successful daemon reload; and a restored authority database must
@@ -260,8 +293,8 @@ any new-run ownership or planning read. The updater re-verifies the same
 installation and then either cleans a pre-mutation interruption or re-enters
 the existing fail-closed rollback machinery with the prior run-id.
 
-Successful recovery proves the restored service active and healthy, clears
-the journal, and exits with an instruction to rerun; it never starts the
+Successful recovery proves the restored service enabled, active, and
+healthy, clears the journal, and exits with an instruction to rerun; it never starts the
 requested new plan in that invocation. If any ownership, service-state,
 path-state, restore, start, or health proof is unavailable, the active
 journal and referenced artifacts remain and every new update is blocked for

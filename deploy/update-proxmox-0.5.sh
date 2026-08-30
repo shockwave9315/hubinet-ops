@@ -168,16 +168,16 @@ _update_exit_trap() {
     rm -f -- "${BOOTSTRAP_LEDGER}"
     exit "${exit_code}"
   fi
-  if (( exit_code != 0 )) && ledger_has update-service-stop-attempted "${VMID}"; then
+  if (( exit_code != 0 )) && _update_rollback_boundary_crossed; then
     update_rollback_on_failure "${exit_code}"
   elif (( exit_code != 0 )); then
-    log_warn "update did not complete (exit ${exit_code}) before any service stop was attempted -- the existing installation was never touched"
+    log_warn "update did not complete (exit ${exit_code}) before the rollback boundary was crossed -- neither boot activation nor a service stop had been attempted, so the existing installation was never touched"
     if [[ "${UPDATE_JOURNAL_STATE:-}" == "active" ]]; then
-      if _update_prove_service_active_and_healthy; then
+      if _update_prove_service_enabled_active_and_healthy; then
         update_journal_resolve recovered
       else
         update_stage_cleanup 2>/dev/null || true
-        log_warn "the pre-mutation service did not prove active + healthy; preserving ${UPDATE_JOURNAL_PATH} for the next recovery invocation"
+        log_warn "the pre-mutation service did not prove enabled + active + healthy; preserving ${UPDATE_JOURNAL_PATH} for the next recovery invocation"
       fi
     else
       update_stage_cleanup 2>/dev/null || true

@@ -604,6 +604,10 @@ class TestInstalledSourceMarkerAndRepeatedUpdates:
         assert result_a.returncode == 0, result_a.stderr
         sha_a = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip()
         assert sha_a == git_head_sha(target_a)
+        # The updater temporarily disables boot activation for its mutation
+        # window; every update must hand the installation back ENABLED, or
+        # the next PVE/CT restart would silently never bring Hubinet back.
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
 
         target_b = build_update_target_checkout(
             tmp_path / "target-b", REPO_ROOT, requirements_text="fastapi==0.200.0\n"
@@ -613,6 +617,7 @@ class TestInstalledSourceMarkerAndRepeatedUpdates:
         sha_b = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip()
         assert sha_b == git_head_sha(target_b)
         assert sha_b != sha_a
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
 
         post_state = env.state()
         assert post_state["pve_users"] == pre_state["pve_users"]
@@ -1299,3 +1304,285 @@ class TestExactComparatorCorrectionPass3:
         assert result.returncode != 0
         assert "required command 'cmp' not found" in result.stderr
         assert not env.log_lines()
+
+
+# ---------------------------------------------------------------------------
+# N. Temporary service-autostart guard -- the PVE/CT reboot family.
+#
+#    The durable journal already reconnects a LATER updater invocation to an
+#    interrupted run. It cannot, by itself, stop systemd from boot-activating
+#    a half-swapped installation first: bootstrap leaves the CT at onboot=1
+#    and hubinet-ops.service enabled, so a PVE power loss mid-update used to
+#    mean "CT comes back, enabled unit auto-starts, target app runs against
+#    the old venv / partial unit / partial database" long before any operator
+#    reran the updater.
+#
+#    deploy/lib/update-activate.sh's _update_disable_service_autostart closes
+#    that window with the minimum existing systemd mechanism: the unit is
+#    `disable`d as the FIRST mutation and stays disabled through target
+#    start, acceptance and source-marker activation; boot activation is
+#    restored and POSITIVELY proven only on a fully accepted target, or by
+#    rollback. The CT's own onboot flag is never touched.
+#
+#    Every test below drives one real interruption and then one real
+#    simulated PVE/CT restart through the existing fake environment's own
+#    bounded FakePveEnvironment.simulate_pve_ct_reboot action.
+# ---------------------------------------------------------------------------
+
+
+class TestServiceAutostartGuardAgainstReboot:
+    def test_reboot_after_live_app_moved_aside_cannot_autostart_mixed_runtime(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="a" * 40,
+            scenario_overrides={"kill_updater_after_move": "mv_live_app_to_rollback"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-reboot-a", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        # Armed by the autostart guard itself, before the disable request.
+        assert "ledger=update-service-autostart-disable-attempted" in journal_text
+        assert "rollback_armed=1" in journal_text
+        # Mid-mutation state: no live app at all, boot activation removed.
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is False
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        rebooted = env.state()["vmids"][FAKE_VMID]
+        assert rebooted["started"] is True, "the CT still auto-starts: onboot is never changed"
+        assert rebooted["service"] == "inactive", (
+            "a disabled hubinet-ops must NOT be boot-activated against a "
+            "half-swapped installation"
+        )
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app").exists()
+
+        before_recovery = len(env.log_lines())
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "detected prior updater journal" in recovered.stderr
+        assert "previous interrupted update" in recovered.stderr
+        assert "Phase U2" not in recovered.stderr, "recovery must not start a new plan"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not journal.exists()
+        recovery_lines = env.log_lines()[before_recovery:]
+        assert not any(line.startswith("pct push") for line in recovery_lines)
+
+    def test_reboot_after_app_activation_before_venv_swap_never_autostarts(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="b" * 40,
+            installed_requirements="fastapi==0.100.0\n",
+            scenario_overrides={"kill_updater_after_move": "mv_staged_app_to_live"},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-reboot-b", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        # The exact incoherent pairing this guard exists for: the TARGET app
+        # is live, but the venv/requirements swap has not happened yet.
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert (
+            env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt")
+            == "fastapi==0.100.0\n"
+        )
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        journal_text = journal.read_text(encoding="utf-8")
+        assert "ledger=update-service-autostart-disable-attempted" in journal_text
+        assert "ledger=update-venv-activation-attempted" not in journal_text
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        rebooted = env.state()["vmids"][FAKE_VMID]
+        assert rebooted["started"] is True
+        assert rebooted["service"] == "inactive", (
+            "new app + old venv must never be auto-started after a reboot"
+        )
+
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert (
+            env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt")
+            == "fastapi==0.100.0\n"
+        )
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not journal.exists()
+
+    def test_reboot_after_target_start_before_acceptance_stays_inactive(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="c" * 40,
+            scenario_overrides={"kill_updater_after_target_start": True},
+        )
+        target = build_update_target_checkout(tmp_path / "target-reboot-c", REPO_ROOT)
+
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        mid = env.state()["vmids"][FAKE_VMID]
+        # The updater is allowed to start the DISABLED unit by hand for
+        # target acceptance -- systemd permits exactly that.
+        assert mid["service"] == "active"
+        assert mid["service_enabled"] is False
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        rebooted = env.state()["vmids"][FAKE_VMID]
+        assert rebooted["started"] is True
+        assert rebooted["service"] == "inactive", (
+            "an unaccepted target must not survive a reboot as a running service"
+        )
+
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "Phase U2" not in recovered.stderr
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "c" * 40
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+    def test_disable_that_mutates_then_fails_is_already_armed_and_rolls_back(self, tmp_path):
+        # `systemctl disable` really removes boot activation and STILL
+        # returns non-zero. Recovery is armed before the request is issued,
+        # so the resulting rollback restores the enabled + active old
+        # service rather than leaving a permanently disabled installation.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="d" * 40,
+            scenario_overrides={"fail": ["service_autostart_disable_mutate_then_fail"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-disable-mutate-fail", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service_enabled"] is True
+        assert post["service"] == "active"
+        # Nothing beyond the autostart guard was ever mutated.
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "d" * 40
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+        # A reboot now finds a fully coherent, enabled installation again.
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_disable_reporting_success_without_disabling_refuses_to_mutate(self, tmp_path):
+        # Positive control for the three-valued unit-file-state probe: a
+        # zero exit from `systemctl disable` is never proof. The updater
+        # must refuse to enter the mutation window while systemd would
+        # still boot-activate the unit.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="e" * 40,
+            scenario_overrides={"fail": ["service_autostart_disable_noop_success"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-disable-noop", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "still enabled" in result.stderr
+        assert "rollback complete" in result.stderr
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service_enabled"] is True
+        assert post["service"] == "active"
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "e" * 40
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+    def test_recovery_that_cannot_re_enable_hard_stops_and_retains_state(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="f" * 40,
+            scenario_overrides={"kill_updater_after_move": "mv_live_app_to_rollback"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-enable-fail", REPO_ROOT)
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario["fail"] = ["service_autostart_enable"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        blocked = _run(env.env, _base_args(target))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        assert "boot activation re-enabled" in blocked.stderr
+        assert "rollback complete" not in blocked.stderr
+        assert "Phase U2" not in blocked.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=active" in journal.read_text(encoding="utf-8")
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is False
+        # Run-owned artifacts are retained for manual recovery, never cleaned.
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.staged-*"))
+
+    def test_success_path_enable_reporting_success_without_enabling_is_not_accepted(self, tmp_path):
+        # The mirror-image positive control on the success path: acceptance
+        # passed and the source marker is coherent, but `systemctl enable`
+        # only CLAIMS to have restored boot activation. That is never
+        # accepted as a completed update, and the resulting rollback cannot
+        # prove enablement either -- so it hard stops instead of lying.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"fail": ["service_autostart_enable_noop_success"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-enable-noop", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "in-place update: PASS" not in result.stdout
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is False
+        # The pre-update marker is restored -- never a new SHA paired with a
+        # rolled-back old application payload.
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "1" * 40
+
+    def test_successful_update_ends_enabled_active_and_journal_free(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="2" * 40)
+        target = build_update_target_checkout(tmp_path / "target-guard-success", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+        # Exact guard ordering: disable is the FIRST mutation (before the
+        # service stop), the target is started and accepted while still
+        # disabled, and enablement is restored only after the installed-
+        # source marker has been activated.
+        stderr = result.stderr
+        disable_at = stderr.index("systemctl disable hubinet-ops")
+        stop_at = stderr.index("systemctl stop hubinet-ops")
+        start_at = stderr.index("systemctl start hubinet-ops")
+        acceptance_at = stderr.index("Phase U5")
+        marker_at = stderr.rindex(".hubinet-source-commit")
+        enable_at = stderr.index("systemctl enable hubinet-ops")
+        assert disable_at < stop_at < start_at < acceptance_at < marker_at < enable_at
+
+        # And a restart of the finished installation brings Hubinet back.
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"

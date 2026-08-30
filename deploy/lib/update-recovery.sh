@@ -54,6 +54,7 @@ _update_set_run_paths() {
 
 _update_journal_marker_is_recovery_relevant() {
   case "$1" in
+    update-service-autostart-disable-attempted|\
     update-service-stop-attempted|\
     update-app-activation-attempted|\
     update-venv-activation-attempted|\
@@ -182,8 +183,29 @@ _update_journal_load() {
   _update_set_run_paths
 }
 
-_update_prove_service_active_and_healthy() {
+# The rollback/recovery boundary. Crossed as soon as this run has
+# ATTEMPTED to remove the service's boot activation -- the FIRST mutation
+# of the activation window, issued before any service stop -- and
+# therefore strictly earlier than the old service-stop-only boundary. A
+# non-zero exit after the autostart-disable attempt can never take the
+# "the existing installation was never touched" path, which would leave a
+# disabled unit behind that no future reboot would ever start.
+_update_rollback_boundary_crossed() {
+  ledger_has update-service-autostart-disable-attempted "${VMID}" \
+    || ledger_has update-service-stop-attempted "${VMID}"
+}
+
+# The terminal proof that an installation is coherently in service:
+# ENABLED for boot activation, active now, and answering its own
+# unauthenticated health probe. Enablement is part of the proof because
+# this updater temporarily disables boot activation for its mutation
+# window (see _update_disable_service_autostart): an installation that is
+# merely active-and-healthy but still disabled would silently fail to come
+# back after the next PVE/CT restart, so it is never a recovered,
+# completed, or untouched state.
+_update_prove_service_enabled_active_and_healthy() {
   local state health_body
+  _update_probe_service_enabled || return 1
   state="$(pct exec "${VMID}" -- systemctl is-active hubinet-ops 2>/dev/null || true)"
   [[ "${state}" == "active" ]] || return 1
   health_body="$(pct exec "${VMID}" -- curl -fsS "http://127.0.0.1:8787/r0/v1/health" 2>/dev/null || true)"
@@ -240,8 +262,8 @@ update_startup_recovery_gate() {
   _update_set_run_paths
 
   if [[ "${UPDATE_JOURNAL_STATE}" == "completed" || "${UPDATE_JOURNAL_STATE}" == "recovered" ]]; then
-    _update_prove_service_active_and_healthy \
-      || _update_rollback_hard_stop "run ${UPDATE_RUN_ID} was durably marked ${UPDATE_JOURNAL_STATE}, but VMID ${VMID} does not now prove active + healthy"
+    _update_prove_service_enabled_active_and_healthy \
+      || _update_rollback_hard_stop "run ${UPDATE_RUN_ID} was durably marked ${UPDATE_JOURNAL_STATE}, but VMID ${VMID} does not now prove enabled + active + healthy"
     update_journal_resolve "${UPDATE_JOURNAL_STATE}"
     _UPDATE_STARTUP_RECOVERY_IN_PROGRESS="0"
     log_warn "previous updater run ${UPDATE_RUN_ID} was already ${detected_state}; final cleanup is complete. Rerun the requested update."
@@ -254,8 +276,8 @@ update_startup_recovery_gate() {
     # No service stop/destructive transition was armed. Remove only this
     # run's staged artifacts, then positively prove the untouched service.
     _update_cleanup_recovered_run_artifacts
-    _update_prove_service_active_and_healthy \
-      || _update_rollback_hard_stop "interrupted run ${UPDATE_RUN_ID} had not armed rollback, but the existing service does not prove active + healthy"
+    _update_prove_service_enabled_active_and_healthy \
+      || _update_rollback_hard_stop "interrupted run ${UPDATE_RUN_ID} had not armed rollback, but the existing service does not prove enabled + active + healthy"
     update_journal_checkpoint recovered
     _update_journal_clear
   fi
