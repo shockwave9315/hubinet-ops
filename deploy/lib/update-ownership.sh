@@ -26,13 +26,13 @@ _update_require_ct_path() {
 
 update_ownership_verify() {
   local vmid="$1" mode="${2:-normal}" expected_run_id="${3:-}"
-  [[ "${mode}" == "normal" || "${mode}" == "recovery" ]] \
+  [[ "${mode}" == "normal" || "${mode}" == "recovery" || "${mode}" == "revalidate" ]] \
     || die "internal error: unsupported ownership verification mode '${mode}'"
-  if [[ "${mode}" == "recovery" ]]; then
-    log_phase "Interrupted-run recovery: re-verify installation ownership (VMID ${vmid})"
-  else
-    log_phase "Phase U1: verify installation ownership (VMID ${vmid})"
-  fi
+  case "${mode}" in
+    recovery) log_phase "Interrupted-run recovery: re-verify installation ownership (VMID ${vmid})" ;;
+    revalidate) log_phase "Immediately-before-mutation ownership fence (VMID ${vmid})" ;;
+    *) log_phase "Phase U1: verify installation ownership (VMID ${vmid})" ;;
+  esac
 
   local status_output
   status_output="$(pct status "${vmid}" 2>&1)" \
@@ -43,7 +43,12 @@ update_ownership_verify() {
   _update_require_ct_path "${vmid}" /etc/hubinet-ops/inventory.yaml "the R0 config file"
   _update_require_ct_path "${vmid}" /etc/hubinet-ops/agent.env "agent.env"
   _update_require_ct_path "${vmid}" "${HOST_CONTROL_CT_PRIVATE_KEY}.pub" "the host-control public key"
-  if [[ "${mode}" == "normal" ]]; then
+  # "revalidate" runs immediately before the FIRST managed-state mutation
+  # (correction pass 9, P1, section 10) -- unlike "recovery" (which may run
+  # after an interrupted swap has legitimately moved a live payload path
+  # aside), nothing has moved yet here, so the full live-path set is
+  # required exactly like "normal".
+  if [[ "${mode}" == "normal" || "${mode}" == "revalidate" ]]; then
     _update_require_ct_path "${vmid}" /opt/hubinet-ops/app "the application payload directory"
     _update_require_ct_path "${vmid}" /opt/hubinet-ops/requirements.txt "requirements.txt"
     _update_require_ct_path "${vmid}" /opt/hubinet-ops/.venv "the service virtualenv"
@@ -67,8 +72,11 @@ update_ownership_verify() {
   UPDATE_VMID_RUN_ID="${key_comment#"${marker_prefix}"}"
   [[ -n "${UPDATE_VMID_RUN_ID}" ]] \
     || die "ownership verification failed: could not recover a non-empty run-id from container ${vmid}'s host-control public-key comment"
-  if [[ "${mode}" == "recovery" && "${UPDATE_VMID_RUN_ID}" != "${expected_run_id}" ]]; then
-    die "interrupted-update recovery ownership failed: VMID ${vmid} now carries installation run-id ${UPDATE_VMID_RUN_ID}, expected ${expected_run_id}; preserving the journal and rollback artifacts"
+  if [[ ( "${mode}" == "recovery" || "${mode}" == "revalidate" ) && "${UPDATE_VMID_RUN_ID}" != "${expected_run_id}" ]]; then
+    if [[ "${mode}" == "recovery" ]]; then
+      die "interrupted-update recovery ownership failed: VMID ${vmid} now carries installation run-id ${UPDATE_VMID_RUN_ID}, expected ${expected_run_id}; preserving the journal and rollback artifacts"
+    fi
+    die "immediately-before-mutation ownership fence failed: VMID ${vmid} now carries installation run-id ${UPDATE_VMID_RUN_ID}, expected the originally-approved ${expected_run_id} -- a legitimate PVE operator/tool action (e.g. removing this CT and restoring another as VMID ${vmid}) may have replaced the installation between planning and mutation. Refusing to disable autostart, stop the service, or mutate any live artifact; no rollback is needed because nothing has been touched"
   fi
 
   UPDATE_AUTH_MARKER="hubinet-ops-package-scan-vmid-${vmid}-${UPDATE_VMID_RUN_ID}"

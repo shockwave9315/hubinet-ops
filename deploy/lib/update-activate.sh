@@ -285,11 +285,32 @@ _update_recheck_source_commit() {
     || die "SOURCE_DIR became dirty between confirmation and activation -- refusing to activate"
 }
 
+_update_revalidate_before_mutation() {
+  update_ownership_verify "${VMID}" revalidate "${UPDATE_INSTALLATION_RUN_ID}"
+  _update_revalidate_plan_fence
+  _update_preflight_ct_sync
+}
+
 update_activate_and_accept() {
   log_phase "Phase U4: activate"
 
   _update_recheck_source_commit
   _update_capture_pre_mutation_facts
+
+  # Immediately-before-mutation fence (correction pass 9, P1, sections 10
+  # and 11): the per-VMID flock only serializes legitimate updater
+  # invocations -- it does not stop a legitimate PVE operator/tool from
+  # removing this CT and restoring another as the same VMID, or restoring
+  # a snapshot of THIS SAME installation identity that rolls its live
+  # software/database state backward, between planning and mutation. This
+  # re-verifies the full ownership chain against the originally-approved
+  # installation run-id and re-derives the bounded plan fingerprint,
+  # BEFORE the autostart-disable request below (the first mutation of the
+  # window) -- so a mismatch fails before autostart is touched, before the
+  # service is stopped, and before any live artifact is mutated. It also
+  # proves the CT durability barrier itself is usable before entering the
+  # mutation window at all.
+  _update_revalidate_before_mutation
 
   # Step 3a -- FIRST mutation of the window: temporarily remove
   # hubinet-ops from boot activation, so no intermediate half-swapped
@@ -319,6 +340,12 @@ update_activate_and_accept() {
   update_journal_record update-app-activation-attempted "${VMID}"
   run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/app "/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}" \
     || die "failed to move the live application payload aside inside container ${VMID}"
+  # Durability barrier (correction pass 9, P1): if power is lost BEFORE
+  # this completes, target activation has not yet happened -- recovery may
+  # observe either side of the uncommitted rename below, but the old
+  # installation remains the only runtime candidate. Once target
+  # activation is allowed, the rollback material must already be durable.
+  _update_durability_barrier_ct "/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}"
   run_logged pct exec "${VMID}" -- mv "${UPDATE_APP_STAGED_PATH}" /opt/hubinet-ops/app \
     || die "failed to activate the staged application payload inside container ${VMID}"
   ledger_record update-app-activated "${VMID}"
@@ -348,6 +375,11 @@ update_activate_and_accept() {
       || { pct exec "${VMID}" -- rm -f "${unit_rollback_tmp_path}" >/dev/null 2>&1 || true; die "failed to preserve the active systemd unit inside container ${VMID}"; }
     run_logged pct exec "${VMID}" -- mv "${unit_rollback_tmp_path}" "${unit_rollback_path}" \
       || die "failed to finalize the preserved systemd unit inside container ${VMID}"
+    # Durability barrier (correction pass 9, P1): the finalized rollback
+    # copy must be durable before the attempted-marker is journaled and
+    # the live unit is replaced -- this is the exact Codex witness, but
+    # not the only artifact requiring the rule (see this file's header).
+    _update_durability_barrier_ct "${unit_rollback_path}"
     update_journal_record update-unit-activation-attempted "${VMID}"
     run_logged pct exec "${VMID}" -- mv "${UPDATE_UNIT_STAGED_PATH}" /etc/systemd/system/hubinet-ops.service \
       || die "failed to activate the staged systemd unit inside container ${VMID}"
@@ -360,6 +392,10 @@ update_activate_and_accept() {
   if [[ "${UPDATE_HELPER_CHANGED}" == "1" ]]; then
     cp "${UPDATE_HELPER_HOST_PATH}" "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" \
       || die "failed to preserve the active PVE host helper before activation"
+    # Durability barrier (correction pass 9, P1) -- host-side: the same
+    # rule applies to rollback-managed state on the PVE host filesystem,
+    # not only inside the CT.
+    _update_durability_barrier_host "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}"
     update_journal_record update-helper-activated "${VMID}"
     mv "${UPDATE_HELPER_STAGED_HOST_PATH}" "${UPDATE_HELPER_HOST_PATH}" \
       || die "failed to activate the staged PVE host helper (same-path atomic rename)"
@@ -397,13 +433,37 @@ update_activate_and_accept() {
 
   _update_write_source_marker
 
-  # The target is fully accepted and its installed-source marker is
-  # coherent -- and only now may normal boot activation be restored, and
+  # Final accepted-target durability barrier (correction pass 9, P1,
+  # section 7): acceptance and the installed-source marker are proven, but
+  # the new live app/venv/unit/helper/marker content this run activated
+  # still only had to survive namespace mutation in the running kernel --
+  # never yet a proof it would survive a power loss. An accepted target
+  # must not become "journal = completed, rollback artifacts deleted"
+  # while its new live content still only exists in cache. Bounded to what
+  # this run actually mutated -- never flushed merely for ceremony.
+  _update_durability_barrier_ct /opt/hubinet-ops
+  if [[ "${UPDATE_UNIT_CHANGED}" == "1" ]]; then
+    _update_durability_barrier_ct /etc/systemd/system
+  fi
+  if [[ "${UPDATE_AUTHORITY_ACTION}" == "reset_required" ]]; then
+    _update_durability_barrier_ct /var/lib/hubinet-ops
+  fi
+  if [[ "${UPDATE_HELPER_CHANGED}" == "1" ]]; then
+    _update_durability_barrier_host "${UPDATE_HELPER_HOST_PATH}"
+  fi
+
+  # The target is fully accepted, its installed-source marker is coherent,
+  # and every live filesystem this run mutated has crossed its durability
+  # barrier -- and only now may normal boot activation be restored, and
   # positively proven, before the journal records this run as completed.
   # This leaves exactly one narrow crash window (accepted + coherent
-  # marker + re-enabled, journal not yet completed): a reboot there starts
-  # the fully accepted TARGET installation, never a mixed one, and a later
-  # active-journal recovery may still conservatively roll it back.
+  # marker + durable + re-enabled, journal not yet completed): a reboot
+  # there starts the fully accepted TARGET installation, never a mixed
+  # one, and a later active-journal recovery may still conservatively roll
+  # it back. If the durability barrier above fails, the target is NOT
+  # completed: `die` leaves the rollback boundary already crossed, so the
+  # existing EXIT-trap recovery performs a coherent rollback exactly as it
+  # would for any other activation-window failure.
   _update_restore_service_autostart \
     || die "the target installation was fully accepted, but hubinet-ops boot activation could not be proven restored inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL})"
 
@@ -470,6 +530,11 @@ _update_activate_venv_and_requirements() {
   (( path_state_rc == 1 )) \
     || die "could not prove the live virtualenv path ${live_venv} absent inside container ${VMID} before building the target environment"
 
+  # Durability barrier (correction pass 9, P1): the preserved old
+  # environment must be durable BEFORE the target is built at the final
+  # live pathname -- same reasoning as the app payload above.
+  _update_durability_barrier_ct "${rollback_venv}"
+
   run_logged pct exec "${VMID}" -- python3 "${UPDATE_VENV_STAGE_TOOL_CT_PATH}" "${live_venv}" "${UPDATE_REQUIREMENTS_STAGED_PATH}" \
     || die "failed to build the target virtualenv at ${live_venv} inside container ${VMID}; the pre-update environment is preserved at ${rollback_venv} and rollback recovery is required"
   run_logged pct exec "${VMID}" -- chown -R hubinetops:hubinetops "${live_venv}" \
@@ -479,11 +544,25 @@ _update_activate_venv_and_requirements() {
 
   run_logged pct exec "${VMID}" -- mv /opt/hubinet-ops/requirements.txt "/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}" \
     || die "failed to move the active requirements.txt aside inside container ${VMID}"
+  # Durability barrier (correction pass 9, P1): the preserved old
+  # requirements.txt must be durable before the staged target is activated.
+  _update_durability_barrier_ct "/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}"
   run_logged pct exec "${VMID}" -- mv "${UPDATE_REQUIREMENTS_STAGED_PATH}" /opt/hubinet-ops/requirements.txt \
     || die "failed to activate the staged requirements.txt inside container ${VMID}"
   ledger_record update-venv-activated "${VMID}"
 }
 
+# _update_perform_authority_reset: the backup/remove durability barriers
+# required here (correction pass 9, P1, section 5) are deliberately NOT
+# separate shell-level `sync` calls beside this function -- they are
+# implemented INSIDE hubinet-ops-authority-tool.py itself. `backup`
+# reports "ok": true only after its destination has crossed its own
+# fsync-based durability barrier, and `remove` reports "ok": true only
+# after the containing directory's removal state has been synchronized
+# (see that script's own docstring/cmd_backup/cmd_remove). So the ordinary
+# ok:true gates already used below are, unchanged, the exact durability
+# proof this transition needs: backup ok:true -> durable backup exists;
+# THEN reset-attempted is journaled; THEN remove is called.
 _update_perform_authority_reset() {
   local backup_dir backup_ct_path tool_output status
   backup_dir="/var/lib/hubinet-ops/update-backups/${UPDATE_RUN_ID}"
@@ -655,6 +734,10 @@ _update_write_source_marker() {
     update_journal_record update-marker-activation-attempted "${VMID}"
     run_logged pct exec "${VMID}" -- mv "${marker_path}" "${marker_rollback_path}" \
       || die "failed to move the pre-update installed-source marker aside inside container ${VMID}"
+    # Durability barrier (correction pass 9, P1): only when an old marker
+    # actually existed is there rollback material to flush -- an absent
+    # precondition has nothing to make durable here.
+    _update_durability_barrier_ct "${marker_rollback_path}"
   else
     path_state_rc=$?
     (( path_state_rc == 1 )) \
@@ -688,6 +771,7 @@ _update_rollback_marker() {
       if ! pct exec "${VMID}" -- mv "${marker_rollback_path}" "${marker_path}" >/dev/null 2>&1; then
         _update_rollback_hard_stop "could not restore the pre-update installed-source marker inside container ${VMID}"
       fi
+      _update_durability_barrier_ct_or_hard_stop "${marker_path}" "restoring the pre-update installed-source marker"
       return 0
     else
       path_state_rc=$?
@@ -696,8 +780,13 @@ _update_rollback_marker() {
       _update_rollback_hard_stop "could not determine whether the pre-update installed-source marker rollback artifact exists inside container ${VMID}"
     fi
     # The atomic live->rollback move did not happen. Prove the old live
-    # marker is still present, then preserve it untouched.
+    # marker is still present, then preserve it untouched. Ambiguous with
+    # a prior rollback attempt of this same run having already fully
+    # restored and consumed the rollback artifact -- both cases require
+    # the same action, so (re-)establish the barrier defensively either
+    # way (section 6).
     if _update_ct_path_state "${marker_path}"; then
+      _update_durability_barrier_ct_or_hard_stop "${marker_path}" "replaying the already-restored installed-source marker"
       return 0
     fi
     path_state_rc=$?
@@ -711,6 +800,7 @@ _update_rollback_marker() {
     (( path_state_rc == 1 )) \
       || _update_rollback_hard_stop "could not prove the installed-source marker rollback path absent"
     _update_remove_ct_path_and_prove_absent "${marker_path}" file "target installed-source marker"
+    _update_durability_barrier_ct_or_hard_stop /opt/hubinet-ops "restoring the absent pre-update installed-source marker state"
   else
     # Structurally unreachable since correction pass 7 -- the attempted
     # marker is now journaled only together with a proven precondition
@@ -917,6 +1007,7 @@ _update_rollback_host_helper() {
       rm -f -- "${restore_tmp}" 2>/dev/null || true
       _update_rollback_hard_stop "could not atomically restore the pre-update PVE host helper onto ${UPDATE_HELPER_PATH} -- the preserved copy at ${rollback_path} is untouched; restore it manually before retrying"
     fi
+    _update_durability_barrier_host_or_hard_stop "${UPDATE_HELPER_HOST_PATH}" "restoring the pre-update PVE host helper"
     return 0
   fi
 
@@ -925,6 +1016,9 @@ _update_rollback_host_helper() {
   # reported as corruption on that evidence alone.
   [[ -f "${UPDATE_HELPER_HOST_PATH}" && -x "${UPDATE_HELPER_HOST_PATH}" ]] \
     || _update_rollback_hard_stop "the preserved pre-update PVE host helper (${rollback_path}) is absent and the live helper ${UPDATE_HELPER_PATH} is not an executable regular file -- restore it manually before retrying"
+  # Replay of an already-restored artifact: re-establish the barrier
+  # before treating it as terminally restored (section 6).
+  _update_durability_barrier_host_or_hard_stop "${UPDATE_HELPER_HOST_PATH}" "replaying the already-restored PVE host helper"
 }
 
 # _update_rollback_authority (correction pass 8, P2): restoring the
@@ -1007,6 +1101,11 @@ _update_rollback_authority() {
   pct exec "${VMID}" -- chmod 0640 /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 \
     || _update_rollback_hard_stop "could not restore authority database mode with chmod 0640 inside container ${VMID}"
 
+  # Durability barrier (correction pass 9, P1): the restored copy must be
+  # durable BEFORE update-authority-restored is journaled -- that marker
+  # must never describe an old DB that only existed in cache.
+  _update_durability_barrier_ct_or_hard_stop /var/lib/hubinet-ops/authority.db "restoring the pre-update authority database"
+
   # Positively inspect what was actually restored before claiming it, and
   # make that fact durable BEFORE the old service is allowed to start and
   # write to it.
@@ -1074,6 +1173,9 @@ _update_rollback_unit() {
     if ! pct exec "${VMID}" -- mv "${rollback_path}" "${live_path}" >/dev/null 2>&1; then
       _update_rollback_hard_stop "could not restore the pre-update systemd unit inside container ${VMID}"
     fi
+    # Rollback restoration must also become durable (correction pass 9,
+    # P1, section 6), before daemon-reload lets systemd act on it.
+    _update_durability_barrier_ct_or_hard_stop "${live_path}" "restoring the pre-update systemd unit"
     pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 \
       || _update_rollback_hard_stop "systemctl daemon-reload failed after restoring the pre-update unit inside container ${VMID}; refusing to restart under an unproven loaded unit definition"
     return 0
@@ -1096,6 +1198,11 @@ _update_rollback_unit() {
   # activation was ever attempted, a daemon-reload is unconditionally
   # required before the restored old service may be started.
   if _update_ct_path_state "${live_path}"; then
+    # A replay finding this artifact already restored still must
+    # (re-)establish its durability barrier before treating it as
+    # terminally restored -- "it exists" is never equivalent to "it
+    # survived the next power loss" (correction pass 9, P1, section 6).
+    _update_durability_barrier_ct_or_hard_stop "${live_path}" "replaying the already-restored systemd unit"
     pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 \
       || _update_rollback_hard_stop "systemctl daemon-reload failed inside container ${VMID} while replaying the unit rollback of run ${UPDATE_RUN_ID}; the pre-update unit file is in place but systemd may still hold the target definition, so restarting under an unproven loaded unit definition is refused"
     return 0
@@ -1120,12 +1227,15 @@ _update_rollback_venv_and_requirements() {
     if ! pct exec "${VMID}" -- mv "${rollback_venv}" /opt/hubinet-ops/.venv >/dev/null 2>&1; then
       _update_rollback_hard_stop "could not restore the pre-update virtualenv inside container ${VMID}"
     fi
+    _update_durability_barrier_ct_or_hard_stop /opt/hubinet-ops/.venv "restoring the pre-update virtualenv"
   else
     path_state_rc=$?
     (( path_state_rc == 1 )) \
       || _update_rollback_hard_stop "could not determine whether the pre-update virtualenv rollback artifact exists inside container ${VMID}"
     if _update_ct_path_state /opt/hubinet-ops/.venv; then
-      :
+      # Replay of an already-restored artifact: re-establish the barrier
+      # before treating it as terminally restored (section 6).
+      _update_durability_barrier_ct_or_hard_stop /opt/hubinet-ops/.venv "replaying the already-restored virtualenv"
     else
       path_state_rc=$?
       _update_rollback_hard_stop "the virtualenv rollback artifact is absent and the live pre-update virtualenv is $( (( path_state_rc == 1 )) && printf 'absent' || printf 'unknown' )"
@@ -1138,12 +1248,13 @@ _update_rollback_venv_and_requirements() {
     if ! pct exec "${VMID}" -- mv "${rollback_requirements}" /opt/hubinet-ops/requirements.txt >/dev/null 2>&1; then
       _update_rollback_hard_stop "could not restore the pre-update requirements.txt inside container ${VMID}"
     fi
+    _update_durability_barrier_ct_or_hard_stop /opt/hubinet-ops/requirements.txt "restoring the pre-update requirements.txt"
   else
     path_state_rc=$?
     (( path_state_rc == 1 )) \
       || _update_rollback_hard_stop "could not determine whether the pre-update requirements.txt rollback artifact exists inside container ${VMID}"
     if _update_ct_path_state /opt/hubinet-ops/requirements.txt; then
-      :
+      _update_durability_barrier_ct_or_hard_stop /opt/hubinet-ops/requirements.txt "replaying the already-restored requirements.txt"
     else
       path_state_rc=$?
       _update_rollback_hard_stop "the requirements.txt rollback artifact is absent and the live pre-update file is $( (( path_state_rc == 1 )) && printf 'absent' || printf 'unknown' )"
@@ -1165,6 +1276,9 @@ _update_rollback_app() {
       _update_rollback_hard_stop "could not determine whether the pre-update application rollback artifact exists inside container ${VMID}"
     fi
     if _update_ct_path_state /opt/hubinet-ops/app; then
+      # Replay of an already-restored artifact: re-establish the barrier
+      # before treating it as terminally restored (section 6).
+      _update_durability_barrier_ct_or_hard_stop /opt/hubinet-ops/app "replaying the already-restored application payload"
       return 0
     fi
     path_state_rc=$?
@@ -1174,6 +1288,7 @@ _update_rollback_app() {
   if ! pct exec "${VMID}" -- mv "${rollback_path}" /opt/hubinet-ops/app >/dev/null 2>&1; then
     _update_rollback_hard_stop "could not restore the pre-update application payload inside container ${VMID}"
   fi
+  _update_durability_barrier_ct_or_hard_stop /opt/hubinet-ops/app "restoring the pre-update application payload"
 }
 
 _update_rollback_hard_stop() {

@@ -215,6 +215,66 @@ class TestBackup:
         assert rc != 0
         assert not dest.exists()
 
+    # -- Correction pass 9, P1: the durability barrier "backup" itself must
+    # cross before ever reporting ok:true -- so the caller
+    # (deploy/lib/update-activate.sh) never needs its own separate
+    # shell-level sync for this transition; see test G in the task prompt's
+    # durability test contract.
+
+    def test_backup_crosses_durability_barrier_before_reporting_ok(self, tmp_path):
+        src = tmp_path / "authority.db"
+        dest = tmp_path / "backup" / "authority.db"
+        dest.parent.mkdir()
+        _make_authority_db(src)
+        calls = []
+        real_fsync_file_and_dir = authority_tool._fsync_file_and_dir
+
+        def spy(path):
+            # The backup file must already exist, validated and
+            # integrity-checked, by the time the barrier is invoked --
+            # i.e. the barrier crosses strictly AFTER content validation
+            # and strictly BEFORE ok:true is ever printed.
+            assert os.path.exists(path)
+            calls.append(path)
+            return real_fsync_file_and_dir(path)
+
+        authority_tool._fsync_file_and_dir = spy
+        try:
+            rc = authority_tool.cmd_backup([str(src), str(dest), MARKER, "8", BACKEND_ID])
+        finally:
+            authority_tool._fsync_file_and_dir = real_fsync_file_and_dir
+        assert rc == 0
+        assert calls == [str(dest)]
+
+    def test_backup_fails_closed_when_durability_barrier_fails(self, tmp_path, monkeypatch, capsys):
+        src = tmp_path / "authority.db"
+        dest = tmp_path / "backup.db"
+        _make_authority_db(src)
+        monkeypatch.setattr(authority_tool, "_fsync_file_and_dir", lambda path: False)
+        rc = authority_tool.cmd_backup([str(src), str(dest), MARKER, "8", BACKEND_ID])
+        assert rc != 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {"ok": False, "reason": "backup_durability_barrier_failed"}
+        # A backup that never crossed its durability barrier is never left
+        # behind as a misleading, seemingly-complete artifact.
+        assert not dest.exists()
+
+
+class TestDurabilityBarrierHelpers:
+    def test_fsync_dir_succeeds_on_a_real_directory(self, tmp_path):
+        assert authority_tool._fsync_dir(str(tmp_path)) is True
+
+    def test_fsync_dir_fails_closed_on_a_nonexistent_directory(self, tmp_path):
+        assert authority_tool._fsync_dir(str(tmp_path / "does-not-exist")) is False
+
+    def test_fsync_file_and_dir_succeeds_on_a_real_file(self, tmp_path):
+        target = tmp_path / "file.txt"
+        target.write_text("x", encoding="utf-8")
+        assert authority_tool._fsync_file_and_dir(str(target)) is True
+
+    def test_fsync_file_and_dir_fails_closed_on_a_nonexistent_file(self, tmp_path):
+        assert authority_tool._fsync_file_and_dir(str(tmp_path / "missing.txt")) is False
+
 
 class TestRemove:
     def test_removes_db_and_sidecars(self, tmp_path):
@@ -318,6 +378,43 @@ class TestRemove:
         assert payload["reason"].startswith("still_present_after_remove:")
         assert db.exists()
 
+    # -- Correction pass 9, P1: the removal's durability barrier must cross
+    # AFTER positive absence is independently re-verified and BEFORE
+    # ok:true is ever reported.
+
+    def test_remove_crosses_durability_barrier_after_verifying_absence(self, tmp_path):
+        db = tmp_path / "authority.db"
+        _make_authority_db(db)
+        calls = []
+        real_fsync_dir = authority_tool._fsync_dir
+
+        def spy(dir_path):
+            assert not db.exists(), "the barrier must run only after removal is verified"
+            calls.append(dir_path)
+            return real_fsync_dir(dir_path)
+
+        authority_tool._fsync_dir = spy
+        try:
+            rc = authority_tool.cmd_remove([str(db)])
+        finally:
+            authority_tool._fsync_dir = real_fsync_dir
+        assert rc == 0
+        assert calls == [str(tmp_path)]
+
+    def test_remove_fails_closed_when_durability_barrier_fails(self, tmp_path, monkeypatch, capsys):
+        db = tmp_path / "authority.db"
+        _make_authority_db(db)
+        monkeypatch.setattr(authority_tool, "_fsync_dir", lambda path: False)
+        rc = authority_tool.cmd_remove([str(db)])
+        assert rc != 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {"ok": False, "reason": "remove_durability_barrier_failed"}
+        # The removal itself genuinely happened in the running kernel --
+        # only the durability PROOF failed, which is exactly why the
+        # caller must still fail closed rather than trust "the file is
+        # gone" as sufficient.
+        assert not db.exists()
+
 
 class TestUpdateProbe:
     def test_missing_agent_env_reports_reason(self, tmp_path, monkeypatch, capsys):
@@ -371,6 +468,24 @@ class TestUpdateProbe:
         assert payload["health"] == "healthy"
 
 
+class _FakeAcceptClock:
+    """Deterministic fake for time.monotonic/time.sleep -- advances only
+    when .sleep() is called (never sleeps for real), so a bounded
+    acceptance-polling test proves real ordering/timeout behavior without
+    ever waiting in real time (AGENTS.md task prompt correction pass 9)."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+        self.sleep_calls = 0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleep_calls += 1
+        self.now += seconds
+
+
 class TestAcceptScriptMinSequenceExtension:
     """The in-place updater reuses hubinet-ops-bootstrap-accept.py's
     committed-source check with an added optional floor -- see
@@ -397,29 +512,143 @@ class TestAcceptScriptMinSequenceExtension:
         reason = accept_script._check_committed_source(self._source(1), min_sequence_exclusive=1)
         assert reason is not None
         assert "committed-sequence-not-past-baseline" in reason
+        assert accept_script._committed_source_failure_is_transient(reason)
 
-    def test_main_accepts_optional_fourth_argument(self, monkeypatch, capsys):
-        monkeypatch.setattr(accept_script, "read_bearer_token", lambda: "token")
+    def test_context_mismatch_under_an_unmet_floor_is_immediate_not_transient(self):
+        # Correction pass 9, P1 test C: a real structural problem (context
+        # mismatch) must never be masked as "not yet" merely because the
+        # sequence also happens to be at or below the floor.
+        source = self._source(1)
+        source["current_context"] = dict(source["current_context"])
+        first_field = accept_script.CONTEXT_FIELDS[0]
+        source["current_context"][first_field] = "a-different-value"
+        reason = accept_script._check_committed_source(source, min_sequence_exclusive=5)
+        assert reason is not None
+        assert "committed-current-context-mismatch" in reason
+        assert not accept_script._committed_source_failure_is_transient(reason)
 
-        def fake_get_json(path, token):
-            if path == "/backend":
-                return {"backend_instance_id": BACKEND_ID}
-            source = self._source(1)
-            source.update({"name": "Home Proxmox", "health": "healthy", "freshness": "fresh"})
-            return {"sources": [source], "nodes": [{"n": 1}], "resources": []}
-
-        monkeypatch.setattr(accept_script, "get_json", fake_get_json)
-        monkeypatch.setattr(sys, "argv", ["accept.py", "Home Proxmox", "5", "1"])
-        rc = accept_script.main()
-        assert rc == 1
-        out = capsys.readouterr().out
-        assert "committed-sequence-not-past-baseline" in out
+    def test_invalid_outcome_under_an_unmet_floor_is_immediate_not_transient(self):
+        source = self._source(1)
+        source["latest_completed_outcome"] = "partial"
+        reason = accept_script._check_committed_source(source, min_sequence_exclusive=5)
+        assert reason is not None
+        assert "latest-completed-outcome-not-success" in reason
+        assert not accept_script._committed_source_failure_is_transient(reason)
 
     def test_main_rejects_invalid_floor_argument(self, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv", ["accept.py", "Home Proxmox", "5", "not-a-number"])
         rc = accept_script.main()
         assert rc == 1
         assert "invalid min-committed-sequence-exclusive" in capsys.readouterr().out
+
+    def _install_fake_clock(self, monkeypatch) -> _FakeAcceptClock:
+        clock = _FakeAcceptClock()
+        monkeypatch.setattr(accept_script.time, "monotonic", clock.monotonic)
+        monkeypatch.setattr(accept_script.time, "sleep", clock.sleep)
+        return clock
+
+    def _healthy_fresh_source_response(self, sequence: int) -> dict:
+        source = self._source(sequence)
+        source.update({"name": "Home Proxmox", "health": "healthy", "freshness": "fresh"})
+        return {"sources": [source], "nodes": [{"n": 1}], "resources": []}
+
+    def test_main_polls_through_transient_baseline_then_passes(self, monkeypatch, capsys):
+        # Test A (AGENTS.md task prompt correction pass 9): baseline=10,
+        # snapshots 10/10/11 (all otherwise healthy/fresh) must PASS inside
+        # the same bounded acceptance invocation -- no second timeout, no
+        # bash-level retry, entirely the script's own existing poll loop.
+        monkeypatch.setattr(accept_script, "read_bearer_token", lambda: "token")
+        clock = self._install_fake_clock(monkeypatch)
+        sequences = iter([10, 10, 11])
+        calls = {"backend": 0, "snapshot": 0}
+
+        def fake_get_json(path, token):
+            if path == "/backend":
+                calls["backend"] += 1
+                return {"backend_instance_id": BACKEND_ID}
+            calls["snapshot"] += 1
+            return self._healthy_fresh_source_response(next(sequences))
+
+        monkeypatch.setattr(accept_script, "get_json", fake_get_json)
+        monkeypatch.setattr(sys, "argv", ["accept.py", "Home Proxmox", "300", "10"])
+        rc = accept_script.main()
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        last_line = out.strip().splitlines()[-1]
+        assert last_line.startswith("PASS"), out
+        assert "last_committed_run_sequence=11" in last_line
+        assert calls["snapshot"] == 3
+        # Two transient not-past-baseline polls before the passing one.
+        assert clock.sleep_calls == 2
+
+    def test_main_times_out_when_sequence_never_advances(self, monkeypatch, capsys):
+        # Test B: sequence remains at the baseline forever -> FAIL via the
+        # EXISTING discovery timeout, never a second invented timeout.
+        monkeypatch.setattr(accept_script, "read_bearer_token", lambda: "token")
+        clock = self._install_fake_clock(monkeypatch)
+
+        def fake_get_json(path, token):
+            if path == "/backend":
+                return {"backend_instance_id": BACKEND_ID}
+            return self._healthy_fresh_source_response(10)
+
+        monkeypatch.setattr(accept_script, "get_json", fake_get_json)
+        monkeypatch.setattr(sys, "argv", ["accept.py", "Home Proxmox", "6", "10"])
+        rc = accept_script.main()
+        out = capsys.readouterr().out
+        assert rc == 1, out
+        last_line = out.strip().splitlines()[-1]
+        assert last_line.startswith("FAIL discovery-timeout"), out
+        assert "committed-sequence-not-past-baseline" in last_line
+        # The fake clock only ever advances via time.sleep -- proves the
+        # loop actually polled repeatedly (never a single immediate FAIL)
+        # before genuinely exhausting the configured deadline.
+        assert clock.sleep_calls >= 2
+        assert clock.now >= 6
+
+    def test_main_ordinary_call_with_no_floor_is_unaffected(self, monkeypatch, capsys):
+        # Test D: an ordinary bootstrap call (no 4th argument) must PASS
+        # immediately on the first coherent snapshot, exactly as before.
+        monkeypatch.setattr(accept_script, "read_bearer_token", lambda: "token")
+        clock = self._install_fake_clock(monkeypatch)
+
+        def fake_get_json(path, token):
+            if path == "/backend":
+                return {"backend_instance_id": BACKEND_ID}
+            return self._healthy_fresh_source_response(1)
+
+        monkeypatch.setattr(accept_script, "get_json", fake_get_json)
+        monkeypatch.setattr(sys, "argv", ["accept.py", "Home Proxmox", "180"])
+        rc = accept_script.main()
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert out.strip().splitlines()[-1].startswith("PASS"), out
+        assert clock.sleep_calls == 0
+
+    def test_main_immediate_context_mismatch_under_baseline_never_retries(self, monkeypatch, capsys):
+        # Test C at the main()/loop level: a real structural problem must
+        # fail on the FIRST poll, never be retried through to timeout.
+        monkeypatch.setattr(accept_script, "read_bearer_token", lambda: "token")
+        clock = self._install_fake_clock(monkeypatch)
+
+        def fake_get_json(path, token):
+            if path == "/backend":
+                return {"backend_instance_id": BACKEND_ID}
+            response = self._healthy_fresh_source_response(1)
+            source = response["sources"][0]
+            source["current_context"] = dict(source["current_context"])
+            first_field = accept_script.CONTEXT_FIELDS[0]
+            source["current_context"][first_field] = "a-different-value"
+            return response
+
+        monkeypatch.setattr(accept_script, "get_json", fake_get_json)
+        monkeypatch.setattr(sys, "argv", ["accept.py", "Home Proxmox", "300", "5"])
+        rc = accept_script.main()
+        out = capsys.readouterr().out
+        assert rc == 1, out
+        last_line = out.strip().splitlines()[-1]
+        assert "committed-current-context-mismatch" in last_line, out
+        assert clock.sleep_calls == 0
 
 
 # ---------------------------------------------------------------------------

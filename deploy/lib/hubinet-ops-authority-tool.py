@@ -14,7 +14,7 @@ makes one coherent backup via the sqlite3 stdlib backup API, and removes a
 database file (plus WAL/SHM sidecars) once a caller-validated backup
 exists. The target runtime is solely responsible for creating a fresh
 schema after a reset -- see AGENTS.md/STATUS.md and
-deploy/lib/update-authority.sh.
+deploy/lib/update-activate.sh (the only caller).
 
 Subcommands (argv[1]):
 
@@ -52,31 +52,47 @@ Subcommands (argv[1]):
       database, which is not guaranteed point-in-time consistent), then
       reopens the backup read-only and re-validates PRAGMA
       integrity_check plus the same marker/version/backend-identity
-      facts against the backup itself. Prints one JSON object:
+      facts against the backup itself. Only THEN (correction pass 9, P1)
+      does it cross the durability barrier this backup depends on: fsync
+      the backup file's data and fsync its containing directory, so the
+      backup is actually durable -- not merely namespace-visible in the
+      running kernel -- before this ever reports success. Prints one JSON
+      object:
         {"ok": true, "backup_path": "...", "backend_instance_id": "..."}
       or
         {"ok": false, "reason": "<short-code>"}
-      On any failure, <dest_path> is removed if this invocation created
-      it, so a failed backup never leaves a partial/misleading file
-      behind. Exit code is 0 only when "ok" is true; non-zero on both
-      argv errors and every reported "ok": false, so a bash caller can
-      use returncode alone as the fail-closed gate while offering `inspect`-
-      style JSON on both stdout paths for a specific reason.
+      On any failure, including the durability barrier itself failing,
+      <dest_path> is removed if this invocation created it, so a failed
+      backup never leaves a partial/misleading/unsynced file behind. Exit
+      code is 0 only when "ok" is true; non-zero on both argv errors and
+      every reported "ok": false, so a bash caller can use returncode
+      alone as the fail-closed gate while offering `inspect`-style JSON on
+      both stdout paths for a specific reason. The caller
+      (deploy/lib/update-activate.sh) therefore never needs its own
+      separate shell-level sync call for this transition: "ok": true from
+      `backup` already IS the durability proof.
 
   remove <db_path>
       Removes <db_path> and its WAL/SHM sidecars (<db_path>-wal,
       <db_path>-shm). Idempotent -- a missing file is not an error. Never
-      called by update-authority.sh except immediately after a `backup`
-      subcommand has reported "ok": true for the exact same database.
-      Fails closed: for each of the three paths, a present-but-unremovable
-      file (permission error, busy handle, read-only filesystem, ...) is
-      an immediate {"ok": false, "reason": "<short-code>"} with a non-zero
-      exit -- never silently swallowed. After every removal attempt, this
-      command independently re-verifies (a fresh existence check, not the
-      unlink call's own reported success) that all three paths are
-      actually absent before ever printing {"ok": true}; if any target is
-      still present after that verification, it is still {"ok": false}.
-      Never prints {"ok": true} on a best-effort basis.
+      called except immediately after a `backup` subcommand has reported
+      "ok": true for the exact same database (see
+      deploy/lib/update-activate.sh, the only caller). Fails closed: for
+      each of the three paths, a present-but-unremovable file (permission
+      error, busy handle, read-only filesystem, ...) is an immediate
+      {"ok": false, "reason": "<short-code>"} with a non-zero exit --
+      never silently swallowed. After every removal attempt, this command
+      independently re-verifies (a fresh existence check, not the unlink
+      call's own reported success) that all three paths are actually
+      absent, THEN (correction pass 9, P1) crosses the durability barrier
+      for the removal itself -- fsync the containing directory, so the
+      removed directory entries are durable, not merely absent from the
+      running kernel's view -- before ever printing {"ok": true}. If any
+      target is still present after verification, or the durability
+      barrier itself fails, this is still {"ok": false}. Never prints
+      {"ok": true} on a best-effort basis. The caller therefore never
+      needs its own separate shell-level sync call for this transition
+      either.
 
 Never writes schema DDL, never opens a write connection to <db_path> in
 `inspect` mode, and never touches secrets -- only structural authority
@@ -115,6 +131,43 @@ def _path_entry_state(path: str) -> str:
             return _PATH_ABSENT
         return _PATH_UNKNOWN
     return _PATH_EXISTS
+
+
+def _fsync_dir(dir_path: str) -> bool:
+    """Durability barrier for one directory: fsync it so directory-entry
+    changes (a file created inside it, or removed from it) are durable, not
+    merely visible in the running kernel's namespace. Returns False on any
+    OSError -- callers must treat that as load-bearing (AGENTS.md task
+    prompt correction pass 9): fail closed, never warn-and-continue."""
+    try:
+        dir_fd = os.open(dir_path or ".", os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        return False
+    finally:
+        os.close(dir_fd)
+    return True
+
+
+def _fsync_file_and_dir(file_path: str) -> bool:
+    """Durability barrier for one file: fsync the file's own data, then
+    fsync its containing directory (the file's own fsync alone does not
+    guarantee the directory entry that makes it findable is durable).
+    Returns False on any OSError; see _fsync_dir."""
+    try:
+        file_fd = os.open(file_path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(file_fd)
+    except OSError:
+        return False
+    finally:
+        os.close(file_fd)
+    return _fsync_dir(os.path.dirname(os.path.abspath(file_path)))
 
 
 def _is_canonical_uuid(value: object) -> bool:
@@ -312,6 +365,19 @@ def cmd_backup(argv: list[str]) -> int:
         print(json.dumps({"ok": False, "reason": "backup_integrity_check_not_ok"}))
         return 1
 
+    # Durability barrier (correction pass 9, P1): this backup is the ONLY
+    # old-DB recovery material once the caller's destructive reset begins.
+    # A validated-but-unsynced backup file proves the namespace operation
+    # completed in the running kernel, not that it would survive a
+    # subsequent host power loss -- so "ok": true is never returned until
+    # this file (and the directory entry that makes it findable) has
+    # actually crossed that barrier. Load-bearing: never warn-and-continue.
+    if not _fsync_file_and_dir(dest_path):
+        if dest_created_here:
+            _silent_unlink(dest_path)
+        print(json.dumps({"ok": False, "reason": "backup_durability_barrier_failed"}))
+        return 1
+
     print(json.dumps({
         "ok": True,
         "backup_path": os.path.abspath(dest_path),
@@ -388,6 +454,17 @@ def cmd_remove(argv: list[str]) -> int:
             "ok": False,
             "reason": "still_present_after_remove:" + ",".join(os.path.basename(p) for p in still_present),
         }))
+        return 1
+
+    # Durability barrier (correction pass 9, P1): the caller's next step
+    # (destructively restoring/recreating this path) assumes the old DB is
+    # genuinely gone. Positive absence in this running kernel is not proof
+    # that removal would survive a subsequent host power loss -- fsync the
+    # containing directory so the removed directory entries are durable
+    # before "ok": true is ever returned. Load-bearing: never
+    # warn-and-continue.
+    if not _fsync_dir(os.path.dirname(os.path.abspath(db_path))):
+        print(json.dumps({"ok": False, "reason": "remove_durability_barrier_failed"}))
         return 1
 
     print(json.dumps({"ok": True}, separators=(",", ":")))

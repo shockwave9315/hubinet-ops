@@ -2747,3 +2747,367 @@ class TestAuthorityRestoredCheckpointP2:
         assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
         assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+
+# ---------------------------------------------------------------------------
+# AA. Correction pass 9, P1 -- filesystem durability barriers.
+#
+# The durable host journal proves a namespace mv/cp/rm completed in the
+# running kernel; it does not by itself prove the state a LATER transition
+# depends on would survive a subsequent host power loss. Each forward
+# barrier below is the CT/host-side `sync -f` deploy/lib/update-recovery.sh
+# now issues before the destructive transition that depends on the
+# preceding rollback-preservation move -- see that file's own header
+# comment and update-activate.sh's per-artifact call sites.
+# ---------------------------------------------------------------------------
+
+
+class TestForwardDurabilityBarrierOrdering:
+    def test_app_barrier_crosses_between_preservation_and_activation(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-barrier-app-order", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        preserve_at = stderr.index("-- mv /opt/hubinet-ops/app /opt/hubinet-ops/app.rollback-")
+        barrier_at = stderr.index("-- sync -f /opt/hubinet-ops/app.rollback-")
+        activate_at = stderr.index("-- mv /opt/hubinet-ops/app.staged-")
+        assert preserve_at < barrier_at < activate_at
+
+    def test_venv_barrier_crosses_between_preservation_and_final_path_build(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_requirements="fastapi==0.100.0\n")
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-venv-order", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        preserve_at = stderr.index("-- mv /opt/hubinet-ops/.venv /opt/hubinet-ops/.venv.rollback-")
+        barrier_at = stderr.index("-- sync -f /opt/hubinet-ops/.venv.rollback-")
+        # rindex, not index: the build tool is also `pct push`-ed during
+        # staging (well before activation), so the FIRST occurrence of
+        # this substring is that push, not the actual execution below.
+        build_at = stderr.rindex("hubinet-ops-update-venv-stage.py")
+        assert preserve_at < barrier_at < build_at
+
+    def test_requirements_barrier_crosses_between_preservation_and_activation(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_requirements="fastapi==0.100.0\n")
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-reqs-order", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        preserve_at = stderr.index(
+            "-- mv /opt/hubinet-ops/requirements.txt /opt/hubinet-ops/requirements.txt.rollback-"
+        )
+        barrier_at = stderr.index("-- sync -f /opt/hubinet-ops/requirements.txt.rollback-")
+        activate_at = stderr.index("-- mv /opt/hubinet-ops/requirements.txt.staged-")
+        assert preserve_at < barrier_at < activate_at
+
+    def test_unit_barrier_crosses_between_finalized_rollback_copy_and_activation(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-unit-order", REPO_ROOT, unit_text="[Unit]\nDescription=changed\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        finalize_at = stderr.index("-- mv /etc/systemd/system/hubinet-ops.service.rollback-tmp-")
+        barrier_at = stderr.index("-- sync -f /etc/systemd/system/hubinet-ops.service.rollback-")
+        activate_at = stderr.index("-- mv /etc/systemd/system/hubinet-ops.service.staged-")
+        assert finalize_at < barrier_at < activate_at
+
+    def test_marker_barrier_crosses_between_preservation_and_activation(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="8" * 40)
+        target = build_update_target_checkout(tmp_path / "target-barrier-marker-order", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        preserve_at = stderr.index(
+            "-- mv /opt/hubinet-ops/.hubinet-source-commit /opt/hubinet-ops/.hubinet-source-commit.rollback-"
+        )
+        barrier_at = stderr.index("-- sync -f /opt/hubinet-ops/.hubinet-source-commit.rollback-")
+        activate_at = stderr.index("-- mv /opt/hubinet-ops/.hubinet-source-commit.staged-")
+        assert preserve_at < barrier_at < activate_at
+
+    def test_final_target_barrier_crosses_between_marker_write_and_boot_reenable(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="9" * 40)
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-final-order", REPO_ROOT, unit_text="[Unit]\nDescription=changed\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        marker_at = stderr.rindex("-- mv /opt/hubinet-ops/.hubinet-source-commit.staged-")
+        app_barrier_at = stderr.rindex("-- sync -f /opt/hubinet-ops")
+        unit_barrier_at = stderr.rindex("-- sync -f /etc/systemd/system")
+        enable_at = stderr.index("systemctl enable hubinet-ops")
+        assert marker_at < app_barrier_at < enable_at
+        assert marker_at < unit_barrier_at < enable_at
+
+
+class TestForwardDurabilityBarrierFailureSeams:
+    def test_app_barrier_failure_rolls_back(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="1" * 40,
+            scenario_overrides={"fail": ["ct_sync_app_rollback"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-barrier-app-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "1" * 40
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_venv_barrier_failure_rolls_back(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_requirements="fastapi==0.100.0\n",
+            scenario_overrides={"fail": ["ct_sync_venv_rollback"]},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-venv-fail", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/.venv/bin/pip").exists()
+
+    def test_requirements_barrier_failure_rolls_back(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_requirements="fastapi==0.100.0\n",
+            scenario_overrides={"fail": ["ct_sync_requirements_rollback"]},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-reqs-fail", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == "fastapi==0.100.0\n"
+
+    def test_unit_barrier_failure_rolls_back(self, tmp_path):
+        env = seed_installed_environment(tmp_path, scenario_overrides={"fail": ["ct_sync_unit_rollback"]})
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-unit-fail", REPO_ROOT, unit_text="[Unit]\nDescription=changed\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert "changed" not in env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service")
+
+    def test_marker_barrier_failure_rolls_back(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="2" * 40,
+            scenario_overrides={"fail": ["ct_sync_marker_rollback"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-barrier-marker-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "2" * 40
+
+    def test_host_helper_forward_barrier_failure_rolls_back(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        env_with_fault = dict(env.env, HUBINET_OPS_TEST_FAIL_HOST_SYNC="rollback-")
+        original_helper = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py")
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-helper-fail",
+            REPO_ROOT,
+            helper_text="#!/usr/bin/env python3\n# changed helper\n",
+        )
+        result = _run(env_with_fault, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert "changed helper" not in _helper_host_path(env).read_text(encoding="utf-8")
+
+    def test_ct_sync_preflight_failure_stops_before_any_mutation(self, tmp_path):
+        env = seed_installed_environment(tmp_path, scenario_overrides={"fail": ["ct_sync_preflight"]})
+        target = build_update_target_checkout(tmp_path / "target-barrier-preflight-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "durability barrier (sync -f) is not usable" in result.stderr
+        assert not any("systemctl disable" in line for line in result.stderr.splitlines())
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+
+    def test_final_target_barrier_failure_rolls_back_even_after_full_acceptance(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="3" * 40,
+            scenario_overrides={"fail": ["ct_sync_final_app_dir"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-barrier-final-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        # Acceptance genuinely passed and the marker was genuinely written
+        # before the barrier failed -- rollback must still undo all of it.
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "3" * 40
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+
+    def test_authority_restore_barrier_failure_hard_stops(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["ct_sync_authority_restore"],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-authority-restore-fail", REPO_ROOT, schema_version=8
+        )
+        result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "restoring the pre-update authority database" in result.stderr
+        assert "rollback complete" not in result.stderr
+        # The namespace-level restore already happened -- only the
+        # durability proof failed.
+        restored = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
+        assert restored["schema_version"] == 7
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
+
+
+# ---------------------------------------------------------------------------
+# AB. Correction pass 9, P1 -- rollback restoration must also cross its own
+#     durability barrier, including on a REPLAY that finds an artifact
+#     already restored (section 6).
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackRestorationDurabilityBarrier:
+    def test_app_restore_barrier_failure_hard_stops(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="4" * 40,
+            scenario_overrides={"fail": ["mv_staged_app_to_live", "ct_sync_app_restore"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-barrier-app-restore-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "restoring the pre-update application payload" in result.stderr
+        assert "rollback complete" not in result.stderr
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
+
+    def test_replay_of_already_restored_unit_re_establishes_barrier_before_daemon_reload(self, tmp_path):
+        original_unit = (REPO_ROOT / "deploy" / "hubinet-ops-0.5.service").read_text(encoding="utf-8")
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "kill_updater_after_move": "mv_rollback_unit_to_live",
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-barrier-unit-replay",
+            REPO_ROOT,
+            unit_text="[Unit]\nDescription=changed target unit\n",
+        )
+        interrupted = _run(env.env, _base_args(target))
+        assert interrupted.returncode == -9
+        assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == original_unit
+
+        scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+        scenario.pop("kill_updater_after_move", None)
+        scenario["fail"] = ["ct_sync_unit_restore"]
+        env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+        blocked = _run(env.env, _base_args(target))
+        assert blocked.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in blocked.stderr
+        assert "replaying the already-restored systemd unit" in blocked.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        # Recovery never reached its own daemon-reload -- the barrier
+        # failed first.
+        assert env.state()["daemon_reload_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# AC. Correction pass 9, P1 -- immediately-before-mutation ownership + plan
+#     fence.
+# ---------------------------------------------------------------------------
+
+
+class TestImmediatelyBeforeMutationFence:
+    def test_ordinary_update_passes_through_the_new_fence_and_succeeds(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-fence-ordinary", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert "Immediately-before-mutation ownership fence" in result.stderr
+
+    def test_different_installation_run_id_after_staging_is_rejected_before_mutation(self, tmp_path):
+        # Test A: a legitimate PVE operator/tool action (e.g. restoring a
+        # different CT as this same VMID) between planning and mutation.
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "swap_installation_identity_after_pubkey_reads": {
+                    "after_read_number": 1,
+                    "new_run_id": "b" * 32,
+                },
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target-fence-identity-swap", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "immediately-before-mutation ownership fence failed" in result.stderr
+        assert f"now carries installation run-id {'b' * 32}" in result.stderr
+        assert not any("systemctl disable" in line for line in result.stderr.splitlines())
+        assert not any("systemctl stop" in line for line in result.stderr.splitlines())
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+
+    def test_requirements_drift_after_planning_is_rejected_before_mutation(self, tmp_path):
+        # Test B: same installation run-id, but a bounded plan-critical
+        # fact drifted between operator approval and mutation.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_requirements="fastapi==0.100.0\n",
+            scenario_overrides={
+                "drift_ct_file_after_read": {
+                    "/opt/hubinet-ops/requirements.txt": {
+                        "after_read_number": 2,
+                        "new_content": "fastapi==0.999.0\n",
+                    },
+                },
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-fence-reqs-drift", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "immediately-before-mutation plan fence failed" in result.stderr
+        assert "requirements.txt changed since the approved plan" in result.stderr
+        assert not any("systemctl disable" in line for line in result.stderr.splitlines())
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_discovery_sequence_advancing_normally_does_not_reject(self, tmp_path):
+        # Test C: an ordinary background discovery cycle between planning
+        # and mutation must never invalidate the update.
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={"update_probe_sequence_increments_each_call": True},
+        )
+        target = build_update_target_checkout(tmp_path / "target-fence-sequence-ok", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert "plan fence failed" not in result.stderr
+        assert "ownership fence failed" not in result.stderr

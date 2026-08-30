@@ -23,6 +23,11 @@ UPDATE_PRE_BACKEND_INSTANCE_ID=""
 UPDATE_PRE_COMMITTED_SEQUENCE=""
 UPDATE_HA_REENROLL_REQUIRED="0"
 
+UPDATE_PLAN_FENCE_REQUIREMENTS_TMP=""
+UPDATE_PLAN_FENCE_UNIT_TMP=""
+UPDATE_PLAN_FENCE_HELPER_TMP=""
+UPDATE_PLAN_FENCE_SCALAR=""
+
 # _json_field_from_text <json-text> <key>: prints the string/int/bool
 # value (as text) of a top-level key from a small, already-trusted JSON
 # object this repository's own helper scripts produced -- never operator-
@@ -398,4 +403,92 @@ update_plan_confirm() {
     || die "no confirmation could be read from stdin for the destructive authority reset -- aborting. No managed-state mutation has occurred."
   [[ "${reply}" == "reset" ]] \
     || die "destructive authority reset was not explicitly authorized -- aborting. No managed-state mutation has occurred."
+}
+
+# --- Immediately-before-mutation plan fence (correction pass 9, P1, ------
+# section 11) -----------------------------------------------------------
+#
+# The per-VMID updater flock and the ownership fence
+# (update_ownership_verify's "revalidate" mode) together close the
+# "different installation entirely" TOCTOU class between planning and
+# mutation. They do NOT close a narrower one: a PVE snapshot/restore can
+# legitimately preserve the installation run-id while rolling its LIVE
+# software/database state backward. This bounded, in-memory plan
+# fingerprint closes that gap for exactly the facts that define THIS
+# approved plan -- captured once, immediately after operator approval, and
+# re-derived/compared immediately before the first managed-state mutation.
+#
+# Deliberately excludes every naturally-changing runtime fact (discovery
+# sequence, observed timestamps, ordinary authority DB contents,
+# package-scan rows): an ordinary background discovery cycle occurring
+# while the operator reads the plan must never invalidate it. This is one
+# bounded fence for this invocation, not a generic CAS framework or new
+# durable state.
+
+# _update_capture_plan_fence: call once, immediately after
+# update_plan_confirm succeeds (never for --dry-run, which never mutates).
+_update_capture_plan_fence() {
+  UPDATE_PLAN_FENCE_REQUIREMENTS_TMP="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
+  UPDATE_PLAN_FENCE_UNIT_TMP="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
+  UPDATE_PLAN_FENCE_HELPER_TMP="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
+  _update_installed_ct_file_to_file /opt/hubinet-ops/requirements.txt "${UPDATE_PLAN_FENCE_REQUIREMENTS_TMP}"
+  _update_installed_ct_file_to_file /etc/systemd/system/hubinet-ops.service "${UPDATE_PLAN_FENCE_UNIT_TMP}"
+  local helper_host_path
+  helper_host_path="$(_host_control_host_path "${UPDATE_HELPER_PATH}")"
+  cat "${helper_host_path}" >"${UPDATE_PLAN_FENCE_HELPER_TMP}" 2>/dev/null || : >"${UPDATE_PLAN_FENCE_HELPER_TMP}"
+
+  UPDATE_PLAN_FENCE_SCALAR="run_id=${UPDATE_INSTALLATION_RUN_ID} authority_action=${UPDATE_AUTHORITY_ACTION} authority_marker=${UPDATE_CURRENT_SCHEMA_MARKER} authority_schema_version=${UPDATE_CURRENT_SCHEMA_VERSION} backend_instance_id=${UPDATE_PRE_BACKEND_INSTANCE_ID}"
+}
+
+# _update_revalidate_plan_fence: re-reads the SAME bounded facts
+# immediately before the first mutation and requires them to still match
+# exactly -- byte-exact for the three file-based facts (via
+# _update_files_differ_exact, never a `$(...)`-stripped-newline string
+# compare), plain string equality for the scalar facts. Any mismatch fails
+# BEFORE any managed-state mutation, telling the operator to rerun
+# planning/approval. UPDATE_TOOL_CT_PATH/UPDATE_PROBE_CT_PATH are already
+# present in the container from Phase U2 (update_plan_push_tools); this
+# never re-pushes or re-plans anything else.
+_update_revalidate_plan_fence() {
+  [[ -n "${UPDATE_PLAN_FENCE_REQUIREMENTS_TMP}" ]] \
+    || die "internal error: the plan fence was never captured before revalidation"
+
+  local fresh_requirements_tmp fresh_unit_tmp fresh_helper_tmp
+  fresh_requirements_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
+  fresh_unit_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
+  fresh_helper_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
+  _update_installed_ct_file_to_file /opt/hubinet-ops/requirements.txt "${fresh_requirements_tmp}"
+  _update_installed_ct_file_to_file /etc/systemd/system/hubinet-ops.service "${fresh_unit_tmp}"
+  local helper_host_path
+  helper_host_path="$(_host_control_host_path "${UPDATE_HELPER_PATH}")"
+  cat "${helper_host_path}" >"${fresh_helper_tmp}" 2>/dev/null || : >"${fresh_helper_tmp}"
+
+  if _update_files_differ_exact "${UPDATE_PLAN_FENCE_REQUIREMENTS_TMP}" "${fresh_requirements_tmp}"; then
+    die "immediately-before-mutation plan fence failed: the installed requirements.txt changed since the approved plan was classified -- refusing to mutate; rerun planning/approval"
+  fi
+  if _update_files_differ_exact "${UPDATE_PLAN_FENCE_UNIT_TMP}" "${fresh_unit_tmp}"; then
+    die "immediately-before-mutation plan fence failed: the installed systemd unit changed since the approved plan was classified -- refusing to mutate; rerun planning/approval"
+  fi
+  if _update_files_differ_exact "${UPDATE_PLAN_FENCE_HELPER_TMP}" "${fresh_helper_tmp}"; then
+    die "immediately-before-mutation plan fence failed: the installed PVE host helper changed since the approved plan was classified -- refusing to mutate; rerun planning/approval"
+  fi
+
+  local inspect_output inspect_status fresh_marker fresh_version
+  inspect_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" inspect /var/lib/hubinet-ops/authority.db 2>/dev/null)" \
+    && inspect_status=0 || inspect_status=$?
+  (( inspect_status == 0 )) && _json_bool_field_is_true "${inspect_output}" "ok" \
+    || die "immediately-before-mutation plan fence failed: could not re-read the authority database's identity -- refusing to mutate; rerun planning/approval"
+  fresh_marker="$(_json_field_from_text "${inspect_output}" "marker")"
+  fresh_version="$(_json_field_from_text "${inspect_output}" "schema_version")"
+
+  local probe_output probe_status fresh_backend_instance_id
+  probe_output="$(pct exec "${VMID}" -- python3 "${UPDATE_PROBE_CT_PATH}" 2>/dev/null)" \
+    && probe_status=0 || probe_status=$?
+  (( probe_status == 0 )) && _json_bool_field_is_true "${probe_output}" "ok" \
+    || die "immediately-before-mutation plan fence failed: could not re-read the live backend identity -- refusing to mutate; rerun planning/approval"
+  fresh_backend_instance_id="$(_json_field_from_text "${probe_output}" "backend_instance_id")"
+
+  local fresh_scalar="run_id=${UPDATE_INSTALLATION_RUN_ID} authority_action=${UPDATE_AUTHORITY_ACTION} authority_marker=${fresh_marker} authority_schema_version=${fresh_version} backend_instance_id=${fresh_backend_instance_id}"
+  [[ "${fresh_scalar}" == "${UPDATE_PLAN_FENCE_SCALAR}" ]] \
+    || die "immediately-before-mutation plan fence failed: the authority schema identity or backend instance changed since the approved plan was classified (was: ${UPDATE_PLAN_FENCE_SCALAR}; now: ${fresh_scalar}) -- refusing to mutate; rerun planning/approval"
 }

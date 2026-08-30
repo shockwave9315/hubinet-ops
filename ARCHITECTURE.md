@@ -185,7 +185,11 @@ lock.
      inside this window
   -> start + accept (reused bootstrap discovery-acceptance contract,
      extended with an optional minimum-committed-sequence floor to prove a
-     genuine post-restart cycle; host-control forced-boundary re-probe;
+     genuine post-restart cycle -- a committed source that is otherwise
+     fully coherent but has not yet published a run past that floor is a
+     TRANSIENT condition and keeps polling within the existing discovery
+     timeout, never an immediate failure; every other incoherence is still
+     immediate and terminal; host-control forced-boundary re-probe;
      firewall byte-identical + active)
   -> restore boot activation and positively prove it enabled, then record
      the run completed
@@ -371,6 +375,56 @@ manual recovery. This covers ordinary races, process death, and host restart
 under normal local-filesystem semantics. It is not a defense against a
 malicious PVE root/administrator, hostile filesystem or kernel behavior, or
 deliberate manual mutation of updater state.
+
+**Filesystem durability barriers.** The durable host journal above proves a
+namespace `mv`/`cp`/`rm` completed in the *running kernel*; it does not by
+itself prove the data+metadata ordering a later transition depends on would
+survive a subsequent PVE host power loss. Recovery material and activated
+artifacts live on the Hubinet CT filesystem and, for the PVE host
+package-scan helper, the PVE host filesystem itself. The one explicit rule:
+before proceeding past a recovery-critical transition, the filesystem
+containing the state the *next* transition relies on must have completed a
+durability barrier — GNU coreutils `sync -f <path>` (already required and
+already used by the journal itself), never a bare `sync`, a snapshot, a
+WAL, or a transaction library. Applied throughout `update-activate.sh`: the
+preserved old app/venv/requirements/unit/PVE-helper/installed-source-marker
+is flushed before its replacement is activated; a restored artifact
+(forward rollback or a later replay that finds it already restored) is
+flushed again before rollback proceeds to the next artifact or the terminal
+service restart; and the accepted target's own live filesystem state is
+flushed once more — after acceptance and the installed-source marker, before
+boot activation is restored and the journal records the run completed — so
+an accepted target can never end up durably marked "completed" while its
+live content still only exists in cache. The authority database's own two
+durability transitions (the pre-reset backup, and the reset removal) are
+implemented *inside* `hubinet-ops-authority-tool.py` itself: `backup` and
+`remove` report `"ok": true` only after fsync-ing their own result, so the
+caller's existing `ok:true` gate already is the durability proof. A barrier
+failure is load-bearing — it fails the run and triggers the same coherent
+rollback as any other activation-window failure, never warn-and-continue.
+
+**Immediately-before-mutation ownership and plan fence.** The per-VMID
+`flock` only serializes legitimate updater invocations; it does not stop a
+legitimate PVE operator/tool action — removing this CT and restoring
+another as the same VMID, or restoring a snapshot of the *same*
+installation identity that rolls its live software/database state
+backward — between planning and mutation. Immediately before the first
+managed-state mutation (the autostart-disable request), the updater
+re-verifies the full ownership chain against the originally-approved
+installation run-id (`update_ownership_verify`'s `revalidate` mode) and
+re-derives a small, bounded, in-memory plan fingerprint captured right
+after operator approval — installation run-id, the installed
+requirements.txt/systemd-unit/PVE-helper content, the authority schema
+marker/version, the pre-update `backend_instance_id`, and the planned
+authority action. Deliberately excludes every naturally-changing runtime
+fact (discovery sequence, timestamps, ordinary authority DB contents,
+package-scan rows), so an ordinary background discovery cycle while the
+operator reads the plan never invalidates it. A mismatch fails before
+autostart is touched, before the service is stopped, and before any live
+artifact is mutated — the operator is told to rerun planning/approval. This
+is validation/fencing for ordinary operational races, not a second lock
+system, and it does not attempt to prevent every ordinary PVE lifecycle
+command in general.
 
 See `deploy/README-update-proxmox-0.5.md` for the operator runbook.
 

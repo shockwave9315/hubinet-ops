@@ -103,13 +103,16 @@ rollback remain unimplemented future stages.
 ## In-place product update lifecycle
 
 Generic (non-workload) in-place Hubinet Ops updates are implemented and have
-complete automated validation (focused pytest for the two Python helpers,
+complete automated validation (focused pytest for the Python helpers,
 sandboxed shell smoke coverage for `deploy/update-proxmox-0.5.sh` exercising
 a code-only update, a `requirements.txt` change, a systemd-unit change, a PVE
 helper change, an authorized destructive authority reset with coherent
 backup, a refused reset, rollback after a target failure that followed a
 destructive reset, ownership/provenance fail-closed paths, the installed-
-source marker, and repeated updates on one synthetic installation). The
+source marker, repeated updates on one synthetic installation, filesystem
+durability-barrier ordering and failure seams (forward activation, rollback
+restoration including replay, and the final accepted-target barrier before
+completion), and the immediately-before-mutation ownership/plan fence). The
 first real operator Human0 validation of this updater against an actual
 Proxmox host is still pending — see `deploy/README-update-proxmox-0.5.md`.
 Workload package update job execution remains a separate, unimplemented

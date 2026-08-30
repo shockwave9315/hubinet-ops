@@ -16,6 +16,100 @@ UPDATE_ROLLBACK_ARMED="0"
 UPDATE_INSTALLATION_RUN_ID=""
 _UPDATE_STARTUP_RECOVERY_IN_PROGRESS="0"
 
+# --- Filesystem durability barriers (correction pass 9, P1) ----------------
+#
+# The durable host journal above (update_journal_checkpoint) is not
+# sufficient on its own. Recovery material and activated artifacts also
+# live on the Hubinet CT filesystem and, for the PVE host package-scan
+# helper, the PVE host filesystem itself. A `cp`/`mv`/`rm` returning
+# success proves the namespace operation completed in the RUNNING KERNEL --
+# it does not by itself prove the data+metadata ordering a later
+# transition depends on would survive a subsequent host power loss. The
+# one explicit rule applied throughout update-activate.sh: BEFORE
+# proceeding past a recovery-critical transition, the filesystem
+# containing the state the NEXT transition relies on must have completed a
+# durability barrier.
+#
+# GNU coreutils `sync -f <path>` (Debian/PVE, exactly like the journal's
+# own existing use of it above) issues a filesystem synchronization for
+# the filesystem CONTAINING <path> -- exactly the granularity every
+# invariant below needs, without a daemon, a snapshot, a WAL, or a
+# transaction library. A barrier failure is LOAD-BEARING: `die` here is
+# deliberate -- fail closed / rollback, never warn-and-continue.
+
+# _update_durability_barrier_ct <path>: durability barrier for the CT
+# filesystem containing <path>.
+_update_durability_barrier_ct() {
+  local path="$1"
+  run_logged pct exec "${VMID}" -- sync -f "${path}" \
+    || die "durability barrier failed for ${path} inside container ${VMID} -- the preceding state may not survive a power loss; refusing to proceed past this transition"
+}
+
+# _update_durability_barrier_host <path>: the same durability barrier for a
+# path on the PVE host filesystem itself (never inside pct exec).
+#
+# HUBINET_OPS_TEST_FAIL_HOST_SYNC (a space-separated list of substrings),
+# consulted only when HUBINET_OPS_TEST_MODE=1, is a narrow test-only
+# fault-injection seam -- the same escape-hatch convention as
+# HUBINET_OPS_TEST_HOST_ROOT in bootstrap-host-control.sh -- letting the
+# hermetic test suite exercise this failure path (the run-id suffix in a
+# real barrier path is unpredictable ahead of time, so this matches by
+# substring, not by exact path) without depending on real filesystem
+# permission tricks inside the sandboxed test host root. It is inert
+# whenever HUBINET_OPS_TEST_MODE is not "1", so production behavior is
+# always the real `sync -f`.
+_update_durability_barrier_host() {
+  local path="$1" needle
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]]; then
+    for needle in ${HUBINET_OPS_TEST_FAIL_HOST_SYNC:-}; do
+      [[ -n "${needle}" && "${path}" == *"${needle}"* ]] \
+        && die "durability barrier failed for ${path} on the PVE host filesystem (simulated test failure) -- refusing to proceed past this transition"
+    done
+  fi
+  run_logged sync -f "${path}" \
+    || die "durability barrier failed for ${path} on the PVE host filesystem -- the preceding state may not survive a power loss; refusing to proceed past this transition"
+}
+
+# _update_durability_barrier_ct_or_hard_stop / _host_or_hard_stop: the same
+# two barriers above, for use from WITHIN a rollback-restore helper
+# (update-activate.sh's _update_rollback_*), which are already
+# mid-recovery and report failure via _update_rollback_hard_stop (preserve
+# every rollback/backup artifact and the active journal for manual
+# recovery) rather than die -- calling die there would `exit` from deep
+# inside the EXIT trap's own rollback call, skipping the rest of that
+# trap's cleanup, exactly like any other hard stop inside these helpers
+# already does today for every other failure they can hit.
+_update_durability_barrier_ct_or_hard_stop() {
+  local path="$1" context="$2"
+  pct exec "${VMID}" -- sync -f "${path}" >/dev/null 2>&1 \
+    || _update_rollback_hard_stop "durability barrier failed for ${path} inside container ${VMID} while ${context} -- the restored state may not survive a power loss"
+}
+
+_update_durability_barrier_host_or_hard_stop() {
+  local path="$1" context="$2" needle
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]]; then
+    for needle in ${HUBINET_OPS_TEST_FAIL_HOST_SYNC:-}; do
+      [[ -n "${needle}" && "${path}" == *"${needle}"* ]] \
+        && _update_rollback_hard_stop "durability barrier failed for ${path} on the PVE host filesystem (simulated test failure) while ${context}"
+    done
+  fi
+  sync -f "${path}" \
+    || _update_rollback_hard_stop "durability barrier failed for ${path} on the PVE host filesystem while ${context} -- the restored state may not survive a power loss"
+}
+
+# _update_preflight_ct_sync: proves `sync -f` is usable inside this
+# container BEFORE any managed-state mutation begins (AGENTS.md task
+# prompt correction pass 9, section 3: preflight/prove sync is available
+# where required before entering mutation). Uses agent.env -- already
+# proven present by update_ownership_verify, and never itself a
+# rollback-managed mutation target -- as a bounded, always-live, always
+# distinguishable probe target; a no-op barrier, since nothing has changed
+# yet.
+_update_preflight_ct_sync() {
+  run_logged pct exec "${VMID}" -- sync -f /etc/hubinet-ops/agent.env \
+    || die "the CT durability barrier (sync -f) is not usable inside container ${VMID} -- refusing to begin the update mutation window without it"
+}
+
 _update_state_host_path() {
   _host_control_host_path "/var/lib/hubinet-ops/update-state"
 }

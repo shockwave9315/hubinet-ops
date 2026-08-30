@@ -92,6 +92,18 @@ before any mutation:
 
 Any mismatch stops the run before anything is staged or mutated.
 
+This whole chain, plus a small bounded fingerprint of the approved plan
+(the installed requirements.txt/unit/PVE-helper content, the authority
+schema identity, and `backend_instance_id`), is re-verified again
+*immediately before the first mutation* — after staging, right before the
+service's boot activation is temporarily disabled. This catches a
+legitimate PVE operator/tool action between planning and mutation (e.g. a
+different CT restored as this same VMID, or a snapshot restore that rolls
+live state backward while keeping the same installation identity). A
+mismatch here stops the run the same way, before anything is mutated;
+rerun planning/approval. An ordinary background discovery cycle while you
+read the plan is never a mismatch.
+
 ## What the plan shows
 
 Before staging or mutating anything, the updater prints:

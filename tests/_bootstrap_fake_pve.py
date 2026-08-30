@@ -384,6 +384,44 @@ def _activation_fail_key(op, src_norm, dst_norm):
     return None
 
 
+# Correction pass 9, P1 -- deterministic fake failure seams for every
+# `pct exec <vmid> -- sync -f <path>` durability barrier
+# deploy/lib/update-recovery.sh's _update_durability_barrier_ct (and its
+# _or_hard_stop rollback-side variant) issues. Each entry is a distinct,
+# addressable "fail" key so a test can interrupt the updater exactly
+# BETWEEN a preceding namespace mutation and the transition it gates,
+# without also tripping unrelated barrier calls that happen to target
+# neighboring live paths in the same run (e.g. the preflight probe and the
+# app rollback-restore barrier both eventually touch /opt/hubinet-ops, but
+# never the SAME exact path -- see each helper's own call site).
+_CT_SYNC_FAIL_RULES = [
+    ("exact", "/etc/hubinet-ops/agent.env", "ct_sync_preflight"),
+    ("prefix", "/opt/hubinet-ops/app.rollback-", "ct_sync_app_rollback"),
+    ("exact", "/opt/hubinet-ops/app", "ct_sync_app_restore"),
+    ("prefix", "/opt/hubinet-ops/.venv.rollback-", "ct_sync_venv_rollback"),
+    ("exact", "/opt/hubinet-ops/.venv", "ct_sync_venv_restore"),
+    ("prefix", "/opt/hubinet-ops/requirements.txt.rollback-", "ct_sync_requirements_rollback"),
+    ("exact", "/opt/hubinet-ops/requirements.txt", "ct_sync_requirements_restore"),
+    ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-", "ct_sync_unit_rollback"),
+    ("exact", "/etc/systemd/system/hubinet-ops.service", "ct_sync_unit_restore"),
+    ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.rollback-", "ct_sync_marker_rollback"),
+    ("exact", "/opt/hubinet-ops/.hubinet-source-commit", "ct_sync_marker_restore"),
+    ("exact", "/var/lib/hubinet-ops/authority.db", "ct_sync_authority_restore"),
+    ("exact", "/opt/hubinet-ops", "ct_sync_final_app_dir"),
+    ("exact", "/etc/systemd/system", "ct_sync_final_unit_dir"),
+    ("exact", "/var/lib/hubinet-ops", "ct_sync_final_authority_dir"),
+]
+
+
+def _ct_sync_fail_key(normalized_path):
+    for mode, value, key in _CT_SYNC_FAIL_RULES:
+        if mode == "exact" and normalized_path == value:
+            return key
+        if mode == "prefix" and normalized_path.startswith(value):
+            return key
+    return None
+
+
 _ROLLBACK_REMOVE_KEYS = {
     "/opt/hubinet-ops/app": "rm_live_app",
     "/opt/hubinet-ops/.venv": "rm_live_venv",
@@ -598,7 +636,30 @@ def _exec_inner(vmid, inner, state):
             return 1
         return 0
 
+    if inner[0] == "sync":
+        # Correction pass 9, P1 -- CT-side durability barrier fake. This
+        # hermetic fake CT filesystem has no real "not yet durable" state
+        # to simulate (every write it performs is already synchronous
+        # against the actual pytest-host filesystem underlying tmp_path),
+        # so success here means only "the operation was requested against
+        # a real path this fake CT owns" -- see _CT_SYNC_FAIL_RULES for
+        # the deterministic failure seams that let a test simulate the
+        # barrier itself failing.
+        args = [a for a in inner[1:] if a != "-f"]
+        if len(args) != 1:
+            return 2
+        normalized = _normalize_ct_arg(args[0])
+        fail_key = _ct_sync_fail_key(normalized)
+        if fail_key is not None and _fail(fail_key):
+            return 1
+        if not _ct_path(vmid, args[0]).exists():
+            return 1
+        return 0
+
     if inner[0] == "cat":
+        _maybe_drift_ct_file_on_read(vmid, inner[1], state)
+        if _normalize_ct_arg(inner[1]) == "/etc/hubinet-ops/host-control/id_ed25519.pub":
+            _maybe_swap_installation_identity_on_pubkey_read(vmid, state)
         path = _ct_path(vmid, inner[1])
         if not path.exists():
             return 1
@@ -699,7 +760,7 @@ def _exec_inner(vmid, inner, state):
     if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-update-probe"):
         if not _pushed_ct_script_exists(vmid, inner[1]):
             return _missing_python_script(inner[1])
-        return _exec_update_probe(vmid)
+        return _exec_update_probe(vmid, state)
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-update-venv-stage.py"):
         if not _pushed_ct_script_exists(vmid, inner[1]):
@@ -884,7 +945,7 @@ def _exec_venv_stage(vmid, args):
     return 0
 
 
-def _exec_update_probe(vmid):
+def _exec_update_probe(vmid, state=None):
     # Simulates deploy/lib/hubinet-ops-update-probe.py's own observable
     # JSON contract -- one bounded, non-waiting read of current state,
     # driven by "update_probe_*" scenario keys (default: mirrors the
@@ -899,6 +960,19 @@ def _exec_update_probe(vmid):
         SCENARIO.get("discovery_backend_instance_id", "fake-backend-instance-id"),
     )
     sequence = SCENARIO.get("update_probe_sequence", SCENARIO.get("discovery_committed_sequence", 1))
+    # Correction pass 9, P1, section 11, test C: an opt-in incrementing
+    # sequence -- each call for this VMID reports one more than the last --
+    # proves the immediately-before-mutation plan fence never depends on
+    # last_committed_run_sequence staying still between its own two probe
+    # reads (Phase U2's classification probe and the fence's own re-probe),
+    # exactly like an ordinary background discovery cycle running while the
+    # operator reads the plan.
+    if SCENARIO.get("update_probe_sequence_increments_each_call") and state is not None:
+        counts = state.setdefault("update_probe_call_counts", {})
+        key = str(vmid)
+        counts[key] = counts.get(key, 0) + 1
+        sequence = sequence + counts[key] - 1
+        _save_state(state)
     print(json.dumps({
         "ok": True,
         "backend_instance_id": backend_id,
@@ -933,6 +1007,96 @@ def _exec_apt_get(args, state=None):
             _maybe_replace_identity_before_failure("apt_get", state)
         return 1
     return 0
+
+
+# Correction pass 9, P1, section 11 -- deterministic test hooks for the
+# immediately-before-mutation plan fence
+# (deploy/lib/update-plan.sh::_update_capture_plan_fence /
+# _update_revalidate_plan_fence). Both fire from the CT-side `cat` handler
+# below, counting reads of one specific path per VMID (persisted through
+# the shared state file, since each `pct exec ... cat ...` is its own
+# subprocess with no shared Python state).
+
+
+def _maybe_drift_ct_file_on_read(vmid, ct_path_arg, state):
+    """SCENARIO['drift_ct_file_after_read'] = {<ct-path>: {"after_read_number":
+    N, "new_content": "..."}}. After the Nth read of <ct-path> for this
+    VMID, the file's content is rewritten before this (the N+1'th) and
+    every subsequent read -- simulating an out-of-band content change to
+    one bounded plan-critical fact between plan-fence capture and
+    revalidation (test B in the task prompt's own contract)."""
+    drift_rules = SCENARIO.get("drift_ct_file_after_read", {})
+    normalized = _normalize_ct_arg(ct_path_arg)
+    rule = drift_rules.get(normalized)
+    if not rule:
+        return
+    counts = state.setdefault("ct_file_read_counts", {})
+    key = f"{vmid}:{normalized}"
+    already = counts.get(key, 0)
+    if already == rule.get("after_read_number") and not state.get(f"drifted:{key}"):
+        target = _ct_path(vmid, ct_path_arg)
+        target.write_text(rule["new_content"], encoding="utf-8")
+        state[f"drifted:{key}"] = True
+    counts[key] = already + 1
+    _save_state(state)
+
+
+def _maybe_swap_installation_identity_on_pubkey_read(vmid, state):
+    """SCENARIO['swap_installation_identity_after_pubkey_reads'] =
+    {"after_read_number": N, "new_run_id": "..."}. After the Nth read of
+    the CT host-control public key for this VMID, every ownership marker
+    deploy/lib/update-ownership.sh's chain checks (CT pubkey comment,
+    host authorized_keys marker/forced-command helper, PVE user/token
+    comments) is rewritten to a coherent DIFFERENT installation run-id --
+    simulating a legitimate PVE operator/tool action (e.g. restoring a
+    different CT as this same VMID) between planning and mutation (test A
+    in the task prompt's own contract). The swap is atomic and one-shot
+    per VMID."""
+    plan = SCENARIO.get("swap_installation_identity_after_pubkey_reads")
+    if not plan:
+        return
+    counts = state.setdefault("pubkey_read_counts", {})
+    key = str(vmid)
+    already = counts.get(key, 0)
+    if already == plan.get("after_read_number") and not state.get(f"identity_swapped:{key}"):
+        new_run_id = plan["new_run_id"]
+        new_marker = f"hubinet-ops-package-scan-vmid-{vmid}-{new_run_id}"
+        pub_path = _ct_path(vmid, "/etc/hubinet-ops/host-control/id_ed25519.pub")
+        pub_path.write_text(
+            f"ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE= {new_marker}\n",
+            encoding="utf-8",
+        )
+        host_root = Path(os.environ.get("HUBINET_OPS_TEST_HOST_ROOT", "/"))
+        new_helper_path = f"/usr/local/libexec/hubinet-package-scan-helper-{new_run_id}"
+        authorized_keys = host_root / "root" / ".ssh" / "authorized_keys"
+        lines = [
+            line for line in authorized_keys.read_text(encoding="utf-8").splitlines()
+            if f"vmid-{vmid}-" not in line
+        ]
+        lines.append(
+            f'command="{new_helper_path}",no-port-forwarding,no-agent-forwarding,'
+            f"no-X11-forwarding,no-pty ssh-ed25519 "
+            f"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE= {new_marker}"
+        )
+        authorized_keys.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        libexec_dir = host_root / "usr" / "local" / "libexec"
+        existing_helpers = sorted(libexec_dir.glob("hubinet-package-scan-helper-*"))
+        new_helper_host = host_root / new_helper_path.lstrip("/")
+        new_helper_host.parent.mkdir(parents=True, exist_ok=True)
+        if existing_helpers:
+            new_helper_host.write_bytes(existing_helpers[0].read_bytes())
+        else:
+            new_helper_host.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        new_helper_host.chmod(0o755)
+        state.setdefault("pve_users", {}).setdefault("hubinetops@pve", {})["comment"] = (
+            f"Hubinet Ops 0.5 R0 read-only discovery (created by bootstrap-proxmox-0.5.sh; run={new_run_id})"
+        )
+        state.setdefault("pve_tokens", {}).setdefault("hubinetops@pve!r0-readonly", {})["comment"] = (
+            f"R0 read-only discovery token (created by bootstrap-proxmox-0.5.sh; run={new_run_id})"
+        )
+        state[f"identity_swapped:{key}"] = True
+    counts[key] = already + 1
+    _save_state(state)
 
 
 def _maybe_replace_identity_before_failure(trigger, state):
