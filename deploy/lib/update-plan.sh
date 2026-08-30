@@ -87,9 +87,38 @@ _update_target_file_text() {
   git -C "${SOURCE_DIR}" show "${SOURCE_HEAD_SHA}:${relative_path}" 2>/dev/null
 }
 
-_update_installed_ct_file_text() {
-  local path="$1"
-  pct exec "${VMID}" -- cat "${path}" 2>/dev/null
+# --- P2 (correction pass 2): byte-exact classification ---------------------
+#
+# The "changed" classification above (still used for advisory/schema-
+# constant extraction, where it is fine) is NOT safe for the exact-content
+# comparisons below: bash command substitution `$(...)` silently strips
+# every trailing newline byte from captured output, so two files differing
+# ONLY in trailing-newline bytes (e.g. installed "foo\n" vs. target
+# "foo\n\n") would compare equal and be misclassified "unchanged" --
+# contrary to this updater's exact-content/exact-approved-commit contract.
+# These helpers instead redirect the EXACT bytes straight to a file (a
+# redirect never strips anything, unlike a substitution) and compare with
+# `cmp`, never a string comparison of substitution-captured content.
+
+_update_target_file_to_file() {
+  local relative_path="$1" dest_path="$2"
+  git -C "${SOURCE_DIR}" show "${SOURCE_HEAD_SHA}:${relative_path}" >"${dest_path}" 2>/dev/null
+}
+
+_update_installed_ct_file_to_file() {
+  local path="$1" dest_path="$2"
+  # `|| : >"${dest_path}"` deliberately swallows a missing/unreadable
+  # installed file into "empty" rather than letting this statement's own
+  # non-zero exit trip `set -e` -- an absent installed file must classify
+  # as "changed" (compared against a non-empty target), never crash the
+  # updater outright.
+  pct exec "${VMID}" -- cat "${path}" >"${dest_path}" 2>/dev/null || : >"${dest_path}"
+}
+
+# _update_files_differ_exact: true (exit 0) if the two given files differ
+# byte-for-byte.
+_update_files_differ_exact() {
+  ! cmp -s "$1" "$2"
 }
 
 _update_read_installed_source_sha() {
@@ -109,32 +138,38 @@ _update_read_installed_source_sha() {
 }
 
 _update_classify_requirements() {
-  local installed target
-  installed="$(_update_installed_ct_file_text /opt/hubinet-ops/requirements.txt)"
-  target="$(_update_target_file_text requirements.txt)"
-  [[ -n "${target}" ]] || die "target commit ${SOURCE_HEAD_SHA} has no requirements.txt -- refusing to plan an update against an unreadable target"
-  if [[ "${installed}" != "${target}" ]]; then
+  local installed_tmp target_tmp
+  installed_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-classify.XXXXXX")"
+  target_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-classify.XXXXXX")"
+  _update_installed_ct_file_to_file /opt/hubinet-ops/requirements.txt "${installed_tmp}"
+  _update_target_file_to_file requirements.txt "${target_tmp}" \
+    || die "target commit ${SOURCE_HEAD_SHA} has no requirements.txt -- refusing to plan an update against an unreadable target"
+  if _update_files_differ_exact "${installed_tmp}" "${target_tmp}"; then
     UPDATE_REQUIREMENTS_CHANGED="1"
   fi
 }
 
 _update_classify_unit() {
-  local installed target
-  installed="$(_update_installed_ct_file_text /etc/systemd/system/hubinet-ops.service)"
-  target="$(_update_target_file_text deploy/hubinet-ops-0.5.service)"
-  [[ -n "${target}" ]] || die "target commit ${SOURCE_HEAD_SHA} has no deploy/hubinet-ops-0.5.service -- refusing to plan an update against an unreadable target"
-  if [[ "${installed}" != "${target}" ]]; then
+  local installed_tmp target_tmp
+  installed_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-classify.XXXXXX")"
+  target_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-classify.XXXXXX")"
+  _update_installed_ct_file_to_file /etc/systemd/system/hubinet-ops.service "${installed_tmp}"
+  _update_target_file_to_file deploy/hubinet-ops-0.5.service "${target_tmp}" \
+    || die "target commit ${SOURCE_HEAD_SHA} has no deploy/hubinet-ops-0.5.service -- refusing to plan an update against an unreadable target"
+  if _update_files_differ_exact "${installed_tmp}" "${target_tmp}"; then
     UPDATE_UNIT_CHANGED="1"
   fi
 }
 
 _update_classify_helper() {
-  local helper_host_path installed target
+  local helper_host_path installed_tmp target_tmp
   helper_host_path="$(_host_control_host_path "${UPDATE_HELPER_PATH}")"
-  installed="$(cat "${helper_host_path}" 2>/dev/null)"
-  target="$(_update_target_file_text deploy/hubinet-package-scan-helper.py)"
-  [[ -n "${target}" ]] || die "target commit ${SOURCE_HEAD_SHA} has no deploy/hubinet-package-scan-helper.py -- refusing to plan an update against an unreadable target"
-  if [[ "${installed}" != "${target}" ]]; then
+  installed_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-classify.XXXXXX")"
+  target_tmp="$(secret_tmpfile "/tmp/hubinet-ops-update-classify.XXXXXX")"
+  cat "${helper_host_path}" >"${installed_tmp}" 2>/dev/null || : >"${installed_tmp}"
+  _update_target_file_to_file deploy/hubinet-package-scan-helper.py "${target_tmp}" \
+    || die "target commit ${SOURCE_HEAD_SHA} has no deploy/hubinet-package-scan-helper.py -- refusing to plan an update against an unreadable target"
+  if _update_files_differ_exact "${installed_tmp}" "${target_tmp}"; then
     UPDATE_HELPER_CHANGED="1"
   fi
 }

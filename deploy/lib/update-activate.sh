@@ -117,15 +117,26 @@ update_activate_and_accept() {
     ledger_record update-venv-activated "${VMID}"
   fi
 
-  # Step 7 -- systemd unit, only if changed. The `cp` that preserves the
-  # active unit is not itself destructive to the live path, but the
-  # attempted-marker is still recorded before it (not after the
-  # destructive `mv`) so rollback is armed even if the `cp` itself is the
-  # step that fails.
+  # Step 7 -- systemd unit, only if changed. (P1-B correction pass 2:) a
+  # plain `cp` is NOT atomic -- a realistic failure (ENOSPC/EIO/etc mid-
+  # write) can leave a PARTIAL destination behind while the live unit
+  # remains completely intact, and rollback must never treat mere
+  # existence of the canonical rollback-<UPDATE_RUN_ID> path as proof of
+  # a complete, trustworthy preserving copy. So the live unit is first
+  # copied to a run-owned TEMP candidate; only once that copy has fully
+  # succeeded is it atomically renamed (same filesystem, so this rename
+  # itself either fully happens or leaves nothing) into the canonical
+  # rollback path -- and only THEN is the attempted-marker recorded,
+  # immediately before the one actually destructive step (the `mv` of
+  # the staged unit onto the live path).
   if [[ "${UPDATE_UNIT_CHANGED}" == "1" ]]; then
+    local unit_rollback_path="/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}"
+    local unit_rollback_tmp_path="/etc/systemd/system/hubinet-ops.service.rollback-tmp-${UPDATE_RUN_ID}"
+    run_logged pct exec "${VMID}" -- cp /etc/systemd/system/hubinet-ops.service "${unit_rollback_tmp_path}" \
+      || { pct exec "${VMID}" -- rm -f "${unit_rollback_tmp_path}" >/dev/null 2>&1 || true; die "failed to preserve the active systemd unit inside container ${VMID}"; }
+    run_logged pct exec "${VMID}" -- mv "${unit_rollback_tmp_path}" "${unit_rollback_path}" \
+      || die "failed to finalize the preserved systemd unit inside container ${VMID}"
     ledger_record update-unit-activation-attempted "${VMID}"
-    run_logged pct exec "${VMID}" -- cp /etc/systemd/system/hubinet-ops.service "/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}" \
-      || die "failed to preserve the active systemd unit inside container ${VMID}"
     run_logged pct exec "${VMID}" -- mv "${UPDATE_UNIT_STAGED_PATH}" /etc/systemd/system/hubinet-ops.service \
       || die "failed to activate the staged systemd unit inside container ${VMID}"
     ledger_record update-unit-activated "${VMID}"
@@ -193,6 +204,24 @@ _update_perform_authority_reset() {
   fi
   UPDATE_DB_BACKUP_PATH="${backup_ct_path}"
   ledger_record update-authority-backed-up "${VMID}"
+
+  # P1-A correction pass 2: the durable rollback-arming marker must be
+  # recorded AFTER the coherent backup is validated but BEFORE the first
+  # potentially destructive removal below -- not only after `remove`
+  # fully succeeds. cmd_remove's own unlink loop is sequential (db, then
+  # -wal, then -shm); an intermediate unlink can succeed on an earlier
+  # path and then fail on a later one, so `remove` itself can report
+  # "ok": false having already mutated live state. If the attempted-
+  # marker were recorded only after a fully successful `remove`, that
+  # intermediate failure would die here with NO marker recorded at all,
+  # and update_rollback_on_failure would then skip authority restoration
+  # entirely (see its own `ledger_has update-authority-reset-attempted`
+  # check below) -- leaving old code paired with a missing/partial
+  # authority database. Rollback itself never trusts this marker to mean
+  # "reset completed"; it always re-proves removal of whatever target/
+  # partial state remains before ever copying the validated backup back
+  # (see update_rollback_on_failure).
+  ledger_record update-authority-reset-attempted "${VMID}"
 
   tool_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" remove /var/lib/hubinet-ops/authority.db 2>/dev/null)" \
     && status=0 || status=$?
@@ -392,7 +421,7 @@ update_rollback_on_failure() {
   # attempted artifact is restored before the service is started again.
   _update_rollback_marker
 
-  if ledger_has update-authority-reset "${VMID}"; then
+  if ledger_has update-authority-reset-attempted "${VMID}"; then
     # Fail-closed rollback (P1-B): removal of the NEW/target database must
     # be PROVEN successful (cmd_remove's own ok:true, which already means
     # every one of db/wal/shm was independently re-verified absent -- see

@@ -551,6 +551,75 @@ class TestAuthorityRemoveFailClosedRollback:
 
 
 # ---------------------------------------------------------------------------
+# N2. P1-A (correction pass 2) -- the authority-reset "attempted" marker
+#     must be recorded AFTER the validated backup but BEFORE the first
+#     destructive removal, so an INTERMEDIATE failure inside `remove`
+#     itself (one sidecar path already unlinked, a later one failing)
+#     still triggers a coherent rollback of the authority database instead
+#     of silently skipping it because no marker was ever recorded.
+# ---------------------------------------------------------------------------
+
+
+class TestAuthorityResetAttemptedBeforeDestructiveRemoveP1A:
+    def test_rollback_restores_old_db_after_intermediate_remove_failure(self, tmp_path):
+        # Witness: the coherent backup succeeds; the forward reset's own
+        # `remove` call (1st) is the one that fails PARTWAY THROUGH --
+        # the fake's "fail_nth_authority_remove_partial" seam actually
+        # unlinks the underlying db path before reporting "ok": false,
+        # exactly like a real cmd_remove() whose db unlink succeeded but
+        # whose -wal/-shm unlink then failed. Under the old code, the
+        # "update-authority-reset" ledger marker was only ever recorded
+        # AFTER a fully successful `remove`, so this die would leave NO
+        # marker recorded and rollback would skip authority restoration
+        # outright, leaving old code paired with a missing database.
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            scenario_overrides={"fail_nth_authority_remove_partial": 1},
+        )
+        target = build_update_target_checkout(tmp_path / "target-v8-partial-remove", REPO_ROOT, schema_version=8)
+        result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert result.returncode != 0
+
+        db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
+        assert db["schema_version"] == 7, (
+            "the OLD authority database must be restored even when the forward reset's own "
+            "`remove` call failed partway through (one path already unlinked)"
+        )
+        assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+
+
+# ---------------------------------------------------------------------------
+# M2. P1-B (correction pass 2) -- the systemd unit's preserving `cp` is not
+#     atomic; rollback must never treat a PARTIAL destination left behind
+#     by a failed copy as complete, trustworthy pre-update state.
+# ---------------------------------------------------------------------------
+
+
+class TestSystemdUnitPartialPreservingCopyP1B:
+    def test_partial_preserving_copy_never_corrupts_rollback(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path, scenario_overrides={"fail": ["cp_live_unit_to_rollback_partial"]}
+        )
+        pre_unit = env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service")
+        target = build_update_target_checkout(
+            tmp_path / "target-unit-partial-fail", REPO_ROOT, unit_text="[Unit]\nDescription=changed\n"
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        # The live unit must remain byte-identical -- rollback must not
+        # have replaced it with the partial backup (there was nothing
+        # valid to roll back to in the first place: the canonical
+        # rollback-<UPDATE_RUN_ID> path is only ever finalized AFTER a
+        # fully successful preserving copy).
+        assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == pre_unit
+        assert "changed" not in env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service")
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+
+# ---------------------------------------------------------------------------
 # O. P2-A -- staging must be exact and run-owned/clean.
 # ---------------------------------------------------------------------------
 
@@ -669,3 +738,57 @@ class TestPreserveSchemaObjectsP2C:
         target = build_update_target_checkout(tmp_path / "target-schema-ok", REPO_ROOT)
         result = _run(env.env, _base_args(target))
         assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# R. P2 (correction pass 2) -- artifact classification must be genuinely
+#    byte-exact. deploy/lib/update-plan.sh previously classified
+#    requirements.txt/the systemd unit/the PVE helper by comparing content
+#    captured through bash command substitution, which silently strips
+#    trailing newline bytes -- two files differing ONLY in a trailing
+#    newline could be misclassified "unchanged" and so never replaced. An
+#    artifact classified "unchanged" is never touched at all, so if this
+#    regressed, the installed content below would still be the ORIGINAL
+#    (pre-update) text rather than the target's -- see
+#    deploy/lib/update-plan.sh's _update_files_differ_exact /
+#    _update_target_file_to_file / _update_installed_ct_file_to_file.
+# ---------------------------------------------------------------------------
+
+
+class TestByteExactClassificationP2:
+    def test_requirements_trailing_newline_only_change_is_detected(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_requirements="fastapi==0.116.1\n")
+        target_text = "fastapi==0.116.1\n\n"
+        target = build_update_target_checkout(
+            tmp_path / "target-reqs-newline", REPO_ROOT, requirements_text=target_text,
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/requirements.txt") == target_text
+
+    def test_unit_trailing_newline_only_change_is_detected(self, tmp_path):
+        installed_text = "[Unit]\nDescription=hubinet-ops\n"
+        target_text = installed_text + "\n"
+        env = seed_installed_environment(tmp_path, installed_unit_text=installed_text)
+        target = build_update_target_checkout(
+            tmp_path / "target-unit-newline", REPO_ROOT, unit_text=target_text,
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == target_text
+        assert any("daemon-reload" in line for line in env.log_lines())
+
+    def test_helper_trailing_newline_only_change_is_detected(self, tmp_path):
+        installed_text = "#!/usr/bin/env python3\n# helper\n"
+        target_text = installed_text + "\n"
+        env = seed_installed_environment(tmp_path, installed_helper_text=installed_text)
+        helper_path = (
+            Path(env.env["HUBINET_OPS_TEST_HOST_ROOT"])
+            / "usr" / "local" / "libexec" / f"hubinet-package-scan-helper-{FAKE_RUN_ID}"
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-helper-newline", REPO_ROOT, helper_text=target_text,
+        )
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert helper_path.read_text(encoding="utf-8") == target_text

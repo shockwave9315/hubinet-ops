@@ -473,6 +473,24 @@ def _exec_inner(vmid, inner, state):
         src_norm = _normalize_ct_arg(cp_args[0])
         dst_norm = _normalize_ct_arg(cp_args[1])
         fail_key = _activation_fail_key("cp", src_norm, dst_norm)
+        # "<fail_key>_partial" (P1-B correction pass 2): simulates a
+        # realistic NON-atomic `cp` failure (ENOSPC/EIO/etc partway
+        # through the write) -- unlike the ordinary fail_key case below
+        # (the command fails before creating any destination at all,
+        # simulating a `cp` that never started writing), this leaves a
+        # PARTIAL destination file behind. Proves a caller never treats
+        # mere existence of a rollback-copy destination as complete,
+        # trustworthy pre-update state.
+        if fail_key is not None and _fail(f"{fail_key}_partial"):
+            src = _ct_path(vmid, cp_args[0])
+            dst = _ct_path(vmid, cp_args[1])
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.exists() and src.is_file():
+                content = src.read_bytes()
+                dst.write_bytes(content[: max(1, len(content) // 2)])
+            else:
+                dst.write_bytes(b"partial")
+            return 1
         if fail_key is not None and _fail(fail_key):
             return 1
         src = _ct_path(vmid, cp_args[0])
@@ -625,6 +643,25 @@ def _exec_authority_tool(vmid, args, state):
         fail_nth = SCENARIO.get("fail_nth_authority_remove")
         if fail_nth is not None and call_number == int(fail_nth):
             print(json.dumps({"ok": False, "reason": "simulated_remove_failure"}))
+            return 1
+        # "fail_nth_authority_remove_partial": N (P1-A correction pass 2)
+        # -- simulates the REAL cmd_remove()'s own intermediate-unlink-
+        # failure shape: its sequential unlink loop (db, then -wal, then
+        # -shm) can succeed on an earlier path and only fail on a LATER
+        # one, so the call as a whole still reports "ok": false having
+        # already mutated live state. This fake has no real wal/shm
+        # sidecars to partially remove (the whole fake "db" is one JSON
+        # blob), so it approximates the same observable shape directly:
+        # the underlying db path IS actually removed, but "ok": false is
+        # still what the caller sees -- proving a caller that only arms
+        # rollback after a fully successful `remove` would find no
+        # marker recorded despite the live database already being gone.
+        fail_nth_partial = SCENARIO.get("fail_nth_authority_remove_partial")
+        if fail_nth_partial is not None and call_number == int(fail_nth_partial):
+            target = _ct_path(vmid, args[1])
+            if target.exists():
+                target.unlink()
+            print(json.dumps({"ok": False, "reason": "simulated_partial_remove_failure"}))
             return 1
     if _fail(f"authority_tool_{subcommand}"):
         print(json.dumps({"ok": False, "reason": "simulated_failure"}))
