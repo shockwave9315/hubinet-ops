@@ -18,6 +18,13 @@ deploy/lib/update-authority.sh.
 
 Subcommands (argv[1]):
 
+  path-state <path>
+      Read-only. Reports whether one updater-owned path exists as
+      {"ok": true, "exists": true|false}. An OS-level probe error is
+      {"ok": false, "reason": "path_probe_failed"} with non-zero exit.
+      The bash caller independently restricts paths to its fixed live and
+      run-owned rollback paths before invoking this operation.
+
   inspect <db_path>
       Read-only. Prints one JSON object to stdout:
         {"ok": true, "exists": true, "marker": "...", "schema_version": N,
@@ -196,6 +203,19 @@ def cmd_inspect(argv: list[str]) -> int:
     return 0
 
 
+def cmd_path_state(argv: list[str]) -> int:
+    if len(argv) != 1:
+        print(json.dumps({"ok": False, "reason": "usage"}))
+        return 2
+    try:
+        exists = os.path.exists(argv[0])
+    except OSError:
+        print(json.dumps({"ok": False, "reason": "path_probe_failed"}))
+        return 1
+    print(json.dumps({"ok": True, "exists": exists}, separators=(",", ":")))
+    return 0
+
+
 def cmd_backup(argv: list[str]) -> int:
     if len(argv) != 5:
         print(json.dumps({"ok": False, "reason": "usage"}))
@@ -338,6 +358,8 @@ def main() -> int:
         print(json.dumps({"ok": False, "reason": "usage"}))
         return 2
     subcommand, rest = sys.argv[1], sys.argv[2:]
+    if subcommand == "path-state":
+        return cmd_path_state(rest)
     if subcommand == "inspect":
         return cmd_inspect(rest)
     if subcommand == "backup":

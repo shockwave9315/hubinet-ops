@@ -156,9 +156,10 @@ Before the old service is stopped, any failure (staging, source-provenance
 recheck, a build failure in a staged virtualenv) leaves the existing
 installation completely untouched.
 
-After the service is stopped, a failure at any later point — including a
-failure partway through swapping any single artifact, not only one after
-that swap fully completes — triggers a coherent rollback: every changed
+Once a service stop is attempted, a failure at any later point — including
+a stop command that changed systemd state but returned failure, and a failure
+partway through swapping any single artifact, not only one after that swap
+fully completes — triggers a coherent rollback: every changed
 artifact (app payload, virtualenv + `requirements.txt`, systemd unit, PVE
 host helper, and the installed-source marker) is restored from its
 retained rollback copy, and — if a destructive authority reset had already
@@ -170,6 +171,17 @@ old service is then restarted and its liveness re-verified.
 If rollback itself cannot complete, the updater stops hard, preserves every
 rollback/backup artifact for manual recovery, and prints the exact state
 left behind rather than claiming a false recovery.
+
+Rollback first issues a stop request and positively proves through systemd
+that the service is non-running before touching any managed file. Service
+state and rollback-path existence are three-valued: a failed transport,
+failed probe, or malformed answer is unknown, never "stopped" or "absent."
+Every load-bearing live-path removal is independently proved absent before a
+rollback rename. A restored unit must be successfully reloaded into systemd,
+and a restored authority database must regain `hubinetops:hubinetops` ownership
+and mode `0640`, before the old service is restarted. Failure of any of these
+proofs stops rollback hard and preserves the remaining artifacts for manual
+recovery.
 
 ## Acceptance
 

@@ -792,3 +792,310 @@ class TestByteExactClassificationP2:
         result = _run(env.env, _base_args(target))
         assert result.returncode == 0, result.stderr
         assert helper_path.read_text(encoding="utf-8") == target_text
+
+
+# ---------------------------------------------------------------------------
+# S. Correction pass 3 -- service runtime state is three-valued and rollback
+#    is armed before the first stop request, not after a success-only result.
+# ---------------------------------------------------------------------------
+
+
+class TestServiceStateMachineCorrectionPass3:
+    def test_stop_mutates_then_fails_still_runs_recovery(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={"fail": ["service_stop_mutate_then_fail"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-stop-mutate-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert "before any service stop was attempted" not in result.stderr
+        assert env.state()["service_stop_calls"] == 2
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/__init__.py").exists()
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+
+    def test_target_start_mutates_then_fails_is_stopped_and_rolled_back(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={"fail": ["service_start_mutate_then_fail"]},
+        )
+        target = build_update_target_checkout(tmp_path / "target-start-mutate-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        state = env.state()
+        assert state["service_start_calls"] == 2
+        assert state["service_stop_calls"] == 2
+        assert state["vmids"][FAKE_VMID]["service"] == "active"
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+
+        lines = env.log_lines()
+        rollback_stop = next(
+            i for i, line in enumerate(lines)
+            if "systemctl stop hubinet-ops" in line
+            and i > next(j for j, row in enumerate(lines) if "systemctl start hubinet-ops" in row)
+        )
+        stopped_proof = next(
+            i for i, line in enumerate(lines[rollback_stop + 1 :], rollback_stop + 1)
+            if "systemctl show hubinet-ops --property=ActiveState --value" in line
+        )
+        first_app_mutation = next(
+            i for i, line in enumerate(lines[rollback_stop + 1 :], rollback_stop + 1)
+            if "rm -rf /opt/hubinet-ops/app" in line
+        )
+        assert rollback_stop < stopped_proof < first_app_mutation
+
+    def test_rollback_stop_failure_hard_stops_before_any_rollback_mutation(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail_nth_service_stop": 2,
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target-rollback-stop-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "positively prove hubinet-ops non-running" in result.stderr
+        assert "rollback complete" not in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        rollback_artifacts = list(
+            env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*")
+        )
+        assert rollback_artifacts
+        assert not any("rm -rf /opt/hubinet-ops/app" in line for line in env.log_lines())
+
+    def test_unknown_service_state_is_never_treated_as_stopped(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                # Forward stop proof is call 1. Every rollback probe is
+                # then an unknown outer-command failure.
+                "fail_service_state_probe_after": 1,
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target-state-unknown", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "unknown (probe exit" in result.stderr
+        assert "rollback complete" not in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert not any("rm -rf /opt/hubinet-ops/app" in line for line in env.log_lines())
+
+
+# ---------------------------------------------------------------------------
+# T. Correction pass 3 -- rollback path existence and removal postconditions
+#    are three-valued and fail closed before a restore rename.
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackPathProofCorrectionPass3:
+    def test_path_probe_transport_failure_preserves_target_and_rollback_artifact(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "path_probe_transport_fail_prefixes": [
+                    "/opt/hubinet-ops/app.rollback-"
+                ],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target-path-probe-unknown", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "could not determine whether the pre-update application rollback artifact exists" in result.stderr
+        assert "rollback complete" not in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
+        assert env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        rollback_artifacts = list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert rollback_artifacts
+        assert not any("rm -rf /opt/hubinet-ops/app" in line for line in env.log_lines())
+
+    def test_partial_rm_hard_stops_without_nesting_rollback_directory(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["rm_live_app_partial"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target-partial-rm", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "path still exists, so restoration was not attempted" in result.stderr
+        assert "rollback complete" not in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
+        live_app = env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app")
+        rollback_artifacts = list(live_app.parent.glob("app.rollback-*"))
+        assert live_app.is_dir()
+        assert rollback_artifacts
+        assert not list(live_app.glob("app.rollback-*")), "rollback directory must never be nested"
+        lines = env.log_lines()
+        rm_index = next(i for i, line in enumerate(lines) if "rm -rf /opt/hubinet-ops/app" in line)
+        assert not any(
+            "mv /opt/hubinet-ops/app.rollback-" in line
+            for line in lines[rm_index + 1 :]
+        )
+
+
+# ---------------------------------------------------------------------------
+# U. Correction pass 3 -- restored unit reload and authority DB metadata are
+#    load-bearing rollback steps.
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackLoadBearingStepsCorrectionPass3:
+    def test_rollback_daemon_reload_failure_prevents_service_restart(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail_nth_daemon_reload": 2,
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-rollback-reload-fail",
+            REPO_ROOT,
+            unit_text="[Unit]\nDescription=target unit\n",
+        )
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "daemon-reload failed after restoring the pre-update unit" in result.stderr
+        assert "rollback complete" not in result.stderr
+        state = env.state()
+        assert state["daemon_reload_calls"] == 2
+        assert state["service_start_calls"] == 1
+        assert state["vmids"][FAKE_VMID]["service"] == "inactive"
+        assert "target unit" not in env.ct_file_text(
+            FAKE_VMID, "/etc/systemd/system/hubinet-ops.service"
+        )
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+
+    @pytest.mark.parametrize(
+        ("failure_key", "diagnostic"),
+        [
+            ("authority_restore_chown", "chown hubinetops:hubinetops"),
+            ("authority_restore_chmod", "chmod 0640"),
+        ],
+    )
+    def test_authority_restore_metadata_failure_is_attributed_and_hard_stops(
+        self, tmp_path, failure_key, diagnostic
+    ):
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": [failure_key],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / failure_key, REPO_ROOT, schema_version=8
+        )
+        result = _run(
+            env.env,
+            _base_args(target, extra=["--allow-authority-reset"]),
+        )
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert diagnostic in result.stderr
+        assert "rollback complete" not in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
+        restored = json.loads(
+            env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db")
+        )
+        assert restored["schema_version"] == 7
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+
+
+# ---------------------------------------------------------------------------
+# V. Correction pass 3 -- cmp is preflighted and its 0/1/>1 outcomes are
+#    equal/different/error, respectively.
+# ---------------------------------------------------------------------------
+
+
+class TestExactComparatorCorrectionPass3:
+    def test_cmp_zero_classifies_equal(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-cmp-equal", REPO_ROOT)
+        result = _run(env.env, _base_args(target, extra=["--dry-run"]))
+        assert result.returncode == 0, result.stderr
+        assert "requirements.txt:              unchanged" in result.stdout
+        assert "systemd unit:                  unchanged" in result.stdout
+        assert "PVE host helper:               unchanged" in result.stdout
+
+    def test_cmp_one_classifies_different(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_requirements="old==1\n")
+        target = build_update_target_checkout(
+            tmp_path / "target-cmp-different", REPO_ROOT, requirements_text="new==2\n"
+        )
+        result = _run(env.env, _base_args(target, extra=["--dry-run"]))
+        assert result.returncode == 0, result.stderr
+        assert "requirements.txt:              changed" in result.stdout
+
+    def test_cmp_exit_two_fails_planning_before_service_mutation(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path, scenario_overrides={"fail": ["cmp_error"]}
+        )
+        target = build_update_target_checkout(tmp_path / "target-cmp-error", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "exact comparison failed" in result.stderr
+        assert "cmp exit 2" in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not any("systemctl stop hubinet-ops" in line for line in env.log_lines())
+
+    def test_missing_cmp_fails_preflight(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-cmp-missing", REPO_ROOT)
+        preflight_bin = tmp_path / "preflight-bin"
+        preflight_bin.mkdir()
+        required_before_cmp = {
+            "bash": shutil.which("bash"),
+            "dirname": shutil.which("dirname"),
+            "git": shutil.which("git"),
+            "python3": shutil.which("python3"),
+            "pct": str(env.bin_dir / "pct"),
+            "pveum": str(env.bin_dir / "pveum"),
+        }
+        for name, source in required_before_cmp.items():
+            assert source is not None
+            (preflight_bin / name).symlink_to(source)
+
+        missing_env = dict(env.env)
+        missing_env["PATH"] = str(preflight_bin)
+        result = subprocess.run(
+            [
+                required_before_cmp["bash"],
+                str(UPDATE_SCRIPT),
+                *_base_args(target),
+            ],
+            cwd=str(REPO_ROOT),
+            env=missing_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode != 0
+        assert "required command 'cmp' not found" in result.stderr
+        assert not env.log_lines()

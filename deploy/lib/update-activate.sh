@@ -6,7 +6,8 @@
 # update_activate_and_accept is fixed and never reordered (AGENTS.md task
 # prompt section 20). update-proxmox-0.5.sh's own EXIT trap calls
 # update_rollback_on_failure whenever the process exits non-zero after the
-# service was stopped (ledger_has update-service-stopped), never before.
+# a service stop was attempted (ledger_has
+# update-service-stop-attempted), never before.
 #
 # Rollback invariant (corrective pass): for every rollback-managed
 # artifact (app, venv+requirements, systemd unit), a durable
@@ -33,6 +34,55 @@ UPDATE_DB_BACKUP_PATH=""
 UPDATE_POST_BACKEND_INSTANCE_ID=""
 UPDATE_PRE_NFTABLES_CONF=""
 UPDATE_DISPLAY_NAME=""
+_UPDATE_SERVICE_STATE_DETAIL="unknown"
+
+# Three-valued service-state probe. Return 0 means the service is active
+# or transitioning and therefore MUST be treated as potentially running;
+# return 1 means systemd positively reported a non-running state; return 2
+# means the outer pct call, the systemd read, or its output was not
+# trustworthy. UNKNOWN is never permission to mutate rollback-managed
+# files.
+_update_probe_service_state() {
+  local output status
+  output="$(pct exec "${VMID}" -- systemctl show hubinet-ops --property=ActiveState --value 2>/dev/null)" \
+    && status=0 || status=$?
+  if (( status != 0 )); then
+    _UPDATE_SERVICE_STATE_DETAIL="unknown (probe exit ${status})"
+    return 2
+  fi
+  case "${output}" in
+    active|activating|reloading|deactivating)
+      _UPDATE_SERVICE_STATE_DETAIL="${output}"
+      return 0
+      ;;
+    inactive|failed)
+      _UPDATE_SERVICE_STATE_DETAIL="${output}"
+      return 1
+      ;;
+    *)
+      _UPDATE_SERVICE_STATE_DETAIL="unknown (malformed state: ${output:-empty})"
+      return 2
+      ;;
+  esac
+}
+
+_update_wait_until_service_stopped() {
+  local waited=0 rc
+  while (( waited < BOOTSTRAP_SERVICE_TIMEOUT_SECONDS )); do
+    if _update_probe_service_state; then
+      : # active or transitioning: keep waiting
+    else
+      rc=$?
+      if (( rc == 1 )); then
+        return 0
+      fi
+      # UNKNOWN may be transient, but is never treated as stopped.
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  return 1
+}
 
 _update_read_display_name() {
   local inventory_text line raw
@@ -75,19 +125,15 @@ update_activate_and_accept() {
   _update_recheck_source_commit
   _update_capture_pre_mutation_facts
 
+  # Arm rollback BEFORE the first stop request. The request may mutate
+  # systemd state and still return non-zero (or the process may be
+  # interrupted before a success-only marker could be written).
+  ledger_record update-service-stop-attempted "${VMID}"
   run_logged pct exec "${VMID}" -- systemctl stop hubinet-ops \
-    || die "failed to stop hubinet-ops inside container ${VMID} -- the old installation was never mutated"
-  local waited=0 state=""
-  while (( waited < BOOTSTRAP_SERVICE_TIMEOUT_SECONDS )); do
-    state="$(pct exec "${VMID}" -- systemctl is-active hubinet-ops 2>/dev/null || true)"
-    [[ "${state}" != "active" ]] && break
-    sleep 1
-    waited=$(( waited + 1 ))
-  done
-  [[ "${state}" != "active" ]] \
-    || die "hubinet-ops did not stop within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s inside container ${VMID}"
-  # From this ledger marker onward, a non-zero exit triggers
-  # update_rollback_on_failure via the EXIT trap.
+    || die "failed to request a stop of hubinet-ops inside container ${VMID}; resulting service state is ambiguous and rollback recovery is required"
+  _update_wait_until_service_stopped \
+    || die "could not positively prove hubinet-ops stopped within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s inside container ${VMID} (last state: ${_UPDATE_SERVICE_STATE_DETAIL})"
+  # Diagnostic only; the EXIT rollback boundary is the attempted marker.
   ledger_record update-service-stopped "${VMID}"
 
   # Step 4 -- activate app payload atomically. The attempted-marker is
@@ -159,6 +205,7 @@ update_activate_and_accept() {
   fi
 
   # Step 10 -- start service.
+  ledger_record update-service-start-attempted "${VMID}"
   run_logged pct exec "${VMID}" -- systemctl start hubinet-ops \
     || die "failed to start hubinet-ops inside container ${VMID} after activation"
   ledger_record update-service-started "${VMID}"
@@ -327,9 +374,18 @@ _update_write_source_marker() {
 
   # From here on, the live marker may be mutated -- record intent first.
   ledger_record update-marker-activation-attempted "${VMID}"
-  if _update_ct_path_exists "${marker_path}"; then
+  local path_state_rc
+  if _update_ct_path_state "${marker_path}"; then
+    ledger_record update-marker-precondition-exists "${VMID}"
     run_logged pct exec "${VMID}" -- mv "${marker_path}" "${marker_rollback_path}" \
       || die "failed to move the pre-update installed-source marker aside inside container ${VMID}"
+  else
+    path_state_rc=$?
+    if (( path_state_rc == 1 )); then
+      ledger_record update-marker-precondition-absent "${VMID}"
+    else
+      die "could not prove whether the pre-update installed-source marker exists inside container ${VMID} -- refusing to mutate it"
+    fi
   fi
   run_logged pct exec "${VMID}" -- mv "${marker_staged_path}" "${marker_path}" \
     || die "failed to activate the installed-source marker inside container ${VMID}"
@@ -350,13 +406,38 @@ _update_rollback_marker() {
   ledger_has update-marker-activation-attempted "${VMID}" || return 0
   local marker_path="/opt/hubinet-ops/.hubinet-source-commit"
   local marker_rollback_path="${marker_path}.rollback-${UPDATE_RUN_ID}"
-  if _update_ct_path_exists "${marker_rollback_path}"; then
-    pct exec "${VMID}" -- rm -f "${marker_path}" >/dev/null 2>&1 || true
-    if ! pct exec "${VMID}" -- mv "${marker_rollback_path}" "${marker_path}" >/dev/null 2>&1; then
-      _update_rollback_hard_stop "could not restore the pre-update installed-source marker inside container ${VMID}"
+  local path_state_rc
+  if ledger_has update-marker-precondition-exists "${VMID}"; then
+    if _update_ct_path_state "${marker_rollback_path}"; then
+      _update_remove_ct_path_and_prove_absent "${marker_path}" file "installed-source marker"
+      if ! pct exec "${VMID}" -- mv "${marker_rollback_path}" "${marker_path}" >/dev/null 2>&1; then
+        _update_rollback_hard_stop "could not restore the pre-update installed-source marker inside container ${VMID}"
+      fi
+      return 0
+    else
+      path_state_rc=$?
     fi
+    if (( path_state_rc == 2 )); then
+      _update_rollback_hard_stop "could not determine whether the pre-update installed-source marker rollback artifact exists inside container ${VMID}"
+    fi
+    # The atomic live->rollback move did not happen. Prove the old live
+    # marker is still present, then preserve it untouched.
+    if _update_ct_path_state "${marker_path}"; then
+      return 0
+    fi
+    path_state_rc=$?
+    _update_rollback_hard_stop "the pre-update installed-source marker was known to exist, but its rollback artifact is absent and the live marker is $( (( path_state_rc == 1 )) && printf 'absent' || printf 'unknown' )"
+  elif ledger_has update-marker-precondition-absent "${VMID}"; then
+    if _update_ct_path_state "${marker_rollback_path}"; then
+      _update_rollback_hard_stop "an installed-source marker rollback artifact exists even though the pre-update marker was proven absent"
+    else
+      path_state_rc=$?
+    fi
+    (( path_state_rc == 1 )) \
+      || _update_rollback_hard_stop "could not prove the installed-source marker rollback path absent"
+    _update_remove_ct_path_and_prove_absent "${marker_path}" file "target installed-source marker"
   else
-    pct exec "${VMID}" -- rm -f "${marker_path}" >/dev/null 2>&1 || true
+    _update_rollback_hard_stop "installed-source marker activation was attempted without a recorded, proven precondition"
   fi
 }
 
@@ -406,12 +487,16 @@ PRESERVED
 
 update_rollback_on_failure() {
   local exit_code="$1"
-  log_warn "update failed (exit ${exit_code}) after the service was stopped -- rolling back to the coherent pre-update installation"
+  log_warn "update failed (exit ${exit_code}) after a service stop was attempted -- recovering the coherent pre-update installation"
 
-  if ledger_has update-service-started "${VMID}"; then
-    pct exec "${VMID}" -- systemctl stop hubinet-ops >/dev/null 2>&1 \
-      || log_warn "could not stop the newly-started (failed) service during rollback"
-  fi
+  # The target service may be running even when a start/stop command
+  # returned failure before its success marker was recorded. Always issue
+  # a stop request, then prove a definitively non-running state before the
+  # first rollback mutation. A warning-and-continue is forbidden here.
+  pct exec "${VMID}" -- systemctl stop hubinet-ops >/dev/null 2>&1 \
+    || log_warn "rollback stop request returned failure; proving live service state before any rollback mutation"
+  _update_wait_until_service_stopped \
+    || _update_rollback_hard_stop "could not positively prove hubinet-ops non-running before rollback mutation (last state: ${_UPDATE_SERVICE_STATE_DETAIL})"
 
   # Undo order below roughly mirrors LIFO (the installed-source marker is
   # always the LAST thing activation touches, so it is undone first here);
@@ -446,8 +531,10 @@ update_rollback_on_failure() {
     if ! pct exec "${VMID}" -- cp "${UPDATE_DB_BACKUP_PATH}" /var/lib/hubinet-ops/authority.db >/dev/null 2>&1; then
       _update_rollback_hard_stop "could not restore the pre-update authority database backup (${UPDATE_DB_BACKUP_PATH}) to /var/lib/hubinet-ops/authority.db -- the backup itself is preserved and untouched; restore it manually before restarting the service"
     fi
-    pct exec "${VMID}" -- chown hubinetops:hubinetops /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 || true
-    pct exec "${VMID}" -- chmod 0640 /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 || true
+    pct exec "${VMID}" -- chown hubinetops:hubinetops /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 \
+      || _update_rollback_hard_stop "could not restore authority database ownership with chown hubinetops:hubinetops inside container ${VMID}"
+    pct exec "${VMID}" -- chmod 0640 /var/lib/hubinet-ops/authority.db >/dev/null 2>&1 \
+      || _update_rollback_hard_stop "could not restore authority database mode with chmod 0640 inside container ${VMID}"
   fi
 
   if ledger_has update-helper-activated "${VMID}"; then
@@ -482,11 +569,53 @@ update_rollback_on_failure() {
   log_warn "rollback complete -- the pre-update installation is running again (exit ${exit_code})"
 }
 
-# _update_ct_path_exists: read-only existence check of a fixed, known,
-# rollback-owned CT path -- never used to guess at an arbitrary path.
-_update_ct_path_exists() {
+# _update_ct_path_state: three-valued read-only existence check of a fixed
+# live or run-owned rollback path. Return 0=EXISTS, 1=ABSENT, 2=UNKNOWN.
+# Both the outer pct success and the helper's explicit JSON answer are
+# required. Never infer ABSENT from a failed transport/command.
+_update_ct_path_state() {
   local path="$1"
-  pct exec "${VMID}" -- test -e "${path}" >/dev/null 2>&1
+  local marker_path="/opt/hubinet-ops/.hubinet-source-commit"
+  local allowed="0" candidate
+  for candidate in \
+    "${marker_path}" "${marker_path}.rollback-${UPDATE_RUN_ID}" \
+    /opt/hubinet-ops/app "/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}" \
+    /opt/hubinet-ops/.venv "/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}" \
+    /opt/hubinet-ops/requirements.txt "/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}" \
+    /etc/systemd/system/hubinet-ops.service "/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}"; do
+    if [[ "${path}" == "${candidate}" ]]; then
+      allowed="1"
+      break
+    fi
+  done
+  [[ "${allowed}" == "1" ]] || return 2
+
+  local output status exists
+  output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" path-state "${path}" 2>/dev/null)" \
+    && status=0 || status=$?
+  (( status == 0 )) && _json_bool_field_is_true "${output}" "ok" || return 2
+  exists="$(_json_field_from_text "${output}" "exists")" || return 2
+  case "${exists}" in
+    1) return 0 ;;
+    0) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+_update_remove_ct_path_and_prove_absent() {
+  local path="$1" kind="$2" label="$3" probe_rc
+  case "${kind}" in
+    file) pct exec "${VMID}" -- rm -f "${path}" >/dev/null 2>&1 || true ;;
+    tree) pct exec "${VMID}" -- rm -rf "${path}" >/dev/null 2>&1 || true ;;
+    *) _update_rollback_hard_stop "internal error: unsupported rollback removal kind '${kind}'" ;;
+  esac
+  if _update_ct_path_state "${path}"; then
+    _update_rollback_hard_stop "could not remove the live ${label} inside container ${VMID}; the path still exists, so restoration was not attempted"
+  else
+    probe_rc=$?
+  fi
+  (( probe_rc == 1 )) \
+    || _update_rollback_hard_stop "could not prove the live ${label} path absent inside container ${VMID}; restoration was not attempted"
 }
 
 # _update_rollback_unit: state-inspection restore, not marker-implies-
@@ -502,11 +631,22 @@ _update_ct_path_exists() {
 _update_rollback_unit() {
   ledger_has update-unit-activation-attempted "${VMID}" || return 0
   local rollback_path="/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}"
-  _update_ct_path_exists "${rollback_path}" || return 0
+  local path_state_rc
+  if _update_ct_path_state "${rollback_path}"; then
+    :
+  else
+    path_state_rc=$?
+    if (( path_state_rc == 1 )); then
+      _update_rollback_hard_stop "the finalized pre-update systemd unit rollback artifact is absent inside container ${VMID}"
+    fi
+    _update_rollback_hard_stop "could not determine whether the pre-update systemd unit rollback artifact exists inside container ${VMID}"
+  fi
+  _update_remove_ct_path_and_prove_absent /etc/systemd/system/hubinet-ops.service file "systemd unit"
   if ! pct exec "${VMID}" -- mv "${rollback_path}" /etc/systemd/system/hubinet-ops.service >/dev/null 2>&1; then
     _update_rollback_hard_stop "could not restore the pre-update systemd unit inside container ${VMID}"
   fi
-  pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 || true
+  pct exec "${VMID}" -- systemctl daemon-reload >/dev/null 2>&1 \
+    || _update_rollback_hard_stop "systemctl daemon-reload failed after restoring the pre-update unit inside container ${VMID}; refusing to restart under an unproven loaded unit definition"
 }
 
 # _update_rollback_venv_and_requirements: same state-inspection discipline
@@ -518,18 +658,39 @@ _update_rollback_venv_and_requirements() {
   ledger_has update-venv-activation-attempted "${VMID}" || return 0
 
   local rollback_venv="/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}"
-  if _update_ct_path_exists "${rollback_venv}"; then
-    pct exec "${VMID}" -- rm -rf /opt/hubinet-ops/.venv >/dev/null 2>&1 || true
+  local path_state_rc
+  if _update_ct_path_state "${rollback_venv}"; then
+    _update_remove_ct_path_and_prove_absent /opt/hubinet-ops/.venv tree "virtualenv"
     if ! pct exec "${VMID}" -- mv "${rollback_venv}" /opt/hubinet-ops/.venv >/dev/null 2>&1; then
       _update_rollback_hard_stop "could not restore the pre-update virtualenv inside container ${VMID}"
+    fi
+  else
+    path_state_rc=$?
+    (( path_state_rc == 1 )) \
+      || _update_rollback_hard_stop "could not determine whether the pre-update virtualenv rollback artifact exists inside container ${VMID}"
+    if _update_ct_path_state /opt/hubinet-ops/.venv; then
+      :
+    else
+      path_state_rc=$?
+      _update_rollback_hard_stop "the virtualenv rollback artifact is absent and the live pre-update virtualenv is $( (( path_state_rc == 1 )) && printf 'absent' || printf 'unknown' )"
     fi
   fi
 
   local rollback_requirements="/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}"
-  if _update_ct_path_exists "${rollback_requirements}"; then
-    pct exec "${VMID}" -- rm -f /opt/hubinet-ops/requirements.txt >/dev/null 2>&1 || true
+  if _update_ct_path_state "${rollback_requirements}"; then
+    _update_remove_ct_path_and_prove_absent /opt/hubinet-ops/requirements.txt file "requirements.txt"
     if ! pct exec "${VMID}" -- mv "${rollback_requirements}" /opt/hubinet-ops/requirements.txt >/dev/null 2>&1; then
       _update_rollback_hard_stop "could not restore the pre-update requirements.txt inside container ${VMID}"
+    fi
+  else
+    path_state_rc=$?
+    (( path_state_rc == 1 )) \
+      || _update_rollback_hard_stop "could not determine whether the pre-update requirements.txt rollback artifact exists inside container ${VMID}"
+    if _update_ct_path_state /opt/hubinet-ops/requirements.txt; then
+      :
+    else
+      path_state_rc=$?
+      _update_rollback_hard_stop "the requirements.txt rollback artifact is absent and the live pre-update file is $( (( path_state_rc == 1 )) && printf 'absent' || printf 'unknown' )"
     fi
   fi
 }
@@ -539,8 +700,21 @@ _update_rollback_venv_and_requirements() {
 _update_rollback_app() {
   ledger_has update-app-activation-attempted "${VMID}" || return 0
   local rollback_path="/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}"
-  _update_ct_path_exists "${rollback_path}" || return 0
-  pct exec "${VMID}" -- rm -rf /opt/hubinet-ops/app >/dev/null 2>&1 || true
+  local path_state_rc
+  if _update_ct_path_state "${rollback_path}"; then
+    :
+  else
+    path_state_rc=$?
+    if (( path_state_rc == 2 )); then
+      _update_rollback_hard_stop "could not determine whether the pre-update application rollback artifact exists inside container ${VMID}"
+    fi
+    if _update_ct_path_state /opt/hubinet-ops/app; then
+      return 0
+    fi
+    path_state_rc=$?
+    _update_rollback_hard_stop "the application rollback artifact is absent and the live pre-update application is $( (( path_state_rc == 1 )) && printf 'absent' || printf 'unknown' )"
+  fi
+  _update_remove_ct_path_and_prove_absent /opt/hubinet-ops/app tree "application payload"
   if ! pct exec "${VMID}" -- mv "${rollback_path}" /opt/hubinet-ops/app >/dev/null 2>&1; then
     _update_rollback_hard_stop "could not restore the pre-update application payload inside container ${VMID}"
   fi

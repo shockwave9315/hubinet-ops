@@ -174,7 +174,8 @@ bearer, or the host-control key.
      extended with an optional minimum-committed-sequence floor to prove a
      genuine post-restart cycle; host-control forced-boundary re-probe;
      firewall byte-identical + active)
-  -> on any failure after the service was stopped: coherent rollback,
+  -> on any failure after a service stop was attempted: first positively
+     prove the service non-running, then perform coherent rollback,
      including a validated authority-database backup restore when a
      destructive reset had already happened
 ```
@@ -229,6 +230,14 @@ target failure after a destructive authority reset restores the coherent
 *old* installation, database included — the updater never leaves old code
 paired with a new, incompatible schema, and never a new installed-source
 marker paired with a rolled-back old installation.
+
+Service and rollback-path inspection are explicitly three-valued: a failed
+or malformed probe is unknown, never evidence that the service is stopped or
+that a path is absent. Rollback does not mutate any managed file until systemd
+positively reports the service non-running; every load-bearing removal is
+independently re-proved absent before restoration; restoring a systemd unit
+requires a successful daemon reload; and a restored authority database must
+have its service ownership and mode successfully reinstated before restart.
 
 See `deploy/README-update-proxmox-0.5.md` for the operator runbook.
 

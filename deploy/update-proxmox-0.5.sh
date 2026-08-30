@@ -141,6 +141,7 @@ require_command pct "Proxmox container control"
 require_command pveum "Proxmox user/permission management"
 require_command git "source commit verification"
 require_command python3 "JSON parsing and authority database inspection"
+require_command cmp "byte-exact update-plan artifact comparison"
 
 # ---------------------------------------------------------------------------
 # Ledger / secret-file lifecycle -- exactly the same mechanism bootstrap
@@ -161,10 +162,10 @@ UPDATE_RUN_ID="$(_generate_run_id)"
 _update_exit_trap() {
   local exit_code=$?
   trap - EXIT
-  if (( exit_code != 0 )) && ledger_has update-service-stopped "${VMID}"; then
+  if (( exit_code != 0 )) && ledger_has update-service-stop-attempted "${VMID}"; then
     update_rollback_on_failure "${exit_code}"
   elif (( exit_code != 0 )); then
-    log_warn "update did not complete (exit ${exit_code}) before any service was stopped -- the existing installation was never touched"
+    log_warn "update did not complete (exit ${exit_code}) before any service stop was attempted -- the existing installation was never touched"
     update_stage_cleanup 2>/dev/null || true
   fi
   cleanup_secret_files

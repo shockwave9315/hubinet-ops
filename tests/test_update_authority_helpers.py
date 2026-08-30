@@ -148,6 +148,27 @@ class TestInspect:
         assert payload["backend_instance_id"] == BACKEND_ID
 
 
+class TestPathState:
+    def test_reports_exists_and_absent_without_conflating_them(self, tmp_path, capsys):
+        present = tmp_path / "present"
+        present.write_text("x", encoding="utf-8")
+
+        assert authority_tool.cmd_path_state([str(present)]) == 0
+        assert json.loads(capsys.readouterr().out) == {"ok": True, "exists": True}
+
+        assert authority_tool.cmd_path_state([str(tmp_path / "absent")]) == 0
+        assert json.loads(capsys.readouterr().out) == {"ok": True, "exists": False}
+
+    def test_probe_error_is_not_reported_as_absent(self, tmp_path, monkeypatch, capsys):
+        def _raise(_path):
+            raise OSError("simulated probe failure")
+
+        monkeypatch.setattr(authority_tool.os.path, "exists", _raise)
+        assert authority_tool.cmd_path_state([str(tmp_path / "unknown")]) != 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload == {"ok": False, "reason": "path_probe_failed"}
+
+
 class TestBackup:
     def test_successful_backup_is_coherent_and_validated(self, tmp_path):
         src = tmp_path / "authority.db"

@@ -365,6 +365,15 @@ def _activation_fail_key(op, src_norm, dst_norm):
     return None
 
 
+_ROLLBACK_REMOVE_KEYS = {
+    "/opt/hubinet-ops/app": "rm_live_app",
+    "/opt/hubinet-ops/.venv": "rm_live_venv",
+    "/opt/hubinet-ops/requirements.txt": "rm_live_requirements",
+    "/etc/systemd/system/hubinet-ops.service": "rm_live_unit",
+    "/opt/hubinet-ops/.hubinet-source-commit": "rm_live_marker",
+}
+
+
 def _matches_run_owned_ct_script(raw_arg, base_name):
     # deploy/lib/update-plan.sh (P2-A/small-cleanup, AGENTS.md) now pushes
     # this planning tool to a run-id-suffixed path
@@ -440,6 +449,28 @@ def _exec_inner(vmid, inner, state):
         for raw_target in targets:
             normalized_target = _normalize_ct_arg(raw_target)
             target_path = _ct_path(vmid, normalized_target)
+            remove_key = _ROLLBACK_REMOVE_KEYS.get(normalized_target)
+            if remove_key is not None and _fail(f"{remove_key}_partial"):
+                # Realistic mutate-then-fail: remove some content while
+                # leaving the load-bearing destination path itself in
+                # place. A subsequent directory `mv` could otherwise
+                # nest its source inside this surviving directory.
+                if target_path.is_dir():
+                    children = sorted(target_path.iterdir(), key=lambda item: item.name)
+                    if children:
+                        child = children[0]
+                        if child.is_dir():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+                elif target_path.exists():
+                    target_path.write_bytes(b"partial")
+                return 1
+            if remove_key is not None and _fail(f"{remove_key}_noop_success"):
+                # The command reports success but the path remains. The
+                # caller must trust an independent postcondition probe,
+                # never this return code.
+                continue
             if target_path.is_dir():
                 shutil.rmtree(target_path, ignore_errors=True)
             elif target_path.exists():
@@ -504,10 +535,20 @@ def _exec_inner(vmid, inner, state):
             shutil.copyfile(str(src), str(dst))
         return 0
 
-    if inner[:2] == ["chown", "root:hubinetops"] or inner[0] == "chown":
+    if inner[0] == "chown":
+        if (
+            _normalize_ct_arg(inner[-1]) == "/var/lib/hubinet-ops/authority.db"
+            and _fail("authority_restore_chown")
+        ):
+            return 1
         return 0
 
     if inner[0] == "chmod":
+        if (
+            _normalize_ct_arg(inner[-1]) == "/var/lib/hubinet-ops/authority.db"
+            and _fail("authority_restore_chmod")
+        ):
+            return 1
         return 0
 
     if inner[0] == "cat":
@@ -627,6 +668,18 @@ def _exec_authority_tool(vmid, args, state):
     if not args:
         return 2
     subcommand = args[0]
+    if subcommand == "path-state" and len(args) == 2:
+        normalized = _normalize_ct_arg(args[1])
+        failure_prefixes = SCENARIO.get("path_probe_transport_fail_prefixes", [])
+        if isinstance(failure_prefixes, str):
+            failure_prefixes = [failure_prefixes]
+        if _fail("path_probe_transport") or any(
+            normalized.startswith(prefix) for prefix in failure_prefixes
+        ):
+            # Outer pct/transport failure: deliberately no JSON answer.
+            return 1
+        print(json.dumps({"ok": True, "exists": _ct_path(vmid, args[1]).exists()}))
+        return 0
     if subcommand == "remove":
         # "fail_nth_authority_remove": N -- fails only the Nth call this
         # run makes to `remove` (1-indexed), succeeding on every other
@@ -978,20 +1031,61 @@ def _exec_systemctl(vmid, args, state):
         _save_state(state)
         return 0
     if args == ["stop", "hubinet-ops"]:
+        call_number = state.get("service_stop_calls", 0) + 1
+        state["service_stop_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_service_stop")
+        if fail_nth is not None and call_number == int(fail_nth):
+            return 1
+        if _fail("service_stop_mutate_then_fail") and call_number == 1:
+            entry["service"] = "inactive"
+            _save_state(state)
+            return 1
         if _fail("service_stop"):
             return 1
         entry["service"] = "inactive"
         _save_state(state)
         return 0
     if args == ["start", "hubinet-ops"]:
+        call_number = state.get("service_start_calls", 0) + 1
+        state["service_start_calls"] = call_number
+        _save_state(state)
+        if _fail("service_start_mutate_then_fail") and call_number == 1:
+            entry["service"] = "active"
+            _save_state(state)
+            return 1
         if _fail("service_start_after_stop"):
             return 1
         entry["service"] = "active"
         _save_state(state)
         return 0
     if args == ["daemon-reload"]:
+        call_number = state.get("daemon_reload_calls", 0) + 1
+        state["daemon_reload_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_daemon_reload")
+        if fail_nth is not None and call_number == int(fail_nth):
+            return 1
         if _fail("daemon_reload"):
             return 1
+        return 0
+    if args == ["show", "hubinet-ops", "--property=ActiveState", "--value"]:
+        call_number = state.get("service_state_probe_calls", 0) + 1
+        state["service_state_probe_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_service_state_probe")
+        fail_after = SCENARIO.get("fail_service_state_probe_after")
+        if (
+            _fail("service_state_probe")
+            or (fail_nth is not None and call_number == int(fail_nth))
+            or (fail_after is not None and call_number > int(fail_after))
+        ):
+            return 1
+        state_val = SCENARIO.get("service_state_override", entry.get("service", "inactive"))
+        if _fail("service_state_probe_malformed"):
+            state_val = "not-a-systemd-state"
+        _log("service-state", state_val)
+        sys.stdout.write(state_val + "\n")
         return 0
     if args == ["is-active", "hubinet-ops"]:
         state_val = SCENARIO.get("service_active_override", entry.get("service", "inactive"))
@@ -1609,6 +1703,21 @@ def cmd_nft(args):
     return 2
 
 
+def cmd_cmp(args):
+    _log("cmp", *args)
+    if _fail("cmp_error"):
+        return 2
+    operands = [arg for arg in args if not arg.startswith("-")]
+    if len(operands) != 2:
+        return 2
+    try:
+        left = Path(operands[0]).read_bytes()
+        right = Path(operands[1]).read_bytes()
+    except OSError:
+        return 2
+    return 0 if left == right else 1
+
+
 DISPATCH = {
     "pct": cmd_pct,
     "pveum": cmd_pveum,
@@ -1616,6 +1725,7 @@ DISPATCH = {
     "pvesh": cmd_pvesh,
     "pvesm": cmd_pvesm,
     "dpkg": cmd_dpkg,
+    "cmp": cmd_cmp,
 }
 
 
@@ -1706,7 +1816,7 @@ def default_scenario() -> dict[str, Any]:
     }
 
 
-_FAKE_COMMANDS = ("pct", "pveum", "pveam", "pvesh", "pvesm", "nft", "dpkg")
+_FAKE_COMMANDS = ("pct", "pveum", "pveam", "pvesh", "pvesm", "nft", "dpkg", "cmp")
 
 
 def build_minimal_source_checkout(tmp_path: Path, repo_root: Path) -> Path:

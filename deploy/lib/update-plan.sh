@@ -115,10 +115,21 @@ _update_installed_ct_file_to_file() {
   pct exec "${VMID}" -- cat "${path}" >"${dest_path}" 2>/dev/null || : >"${dest_path}"
 }
 
-# _update_files_differ_exact: true (exit 0) if the two given files differ
-# byte-for-byte.
+# _update_files_differ_exact: true (exit 0) only if the two files are
+# positively known to differ byte-for-byte; false (exit 1) only if they
+# are positively known equal. Any other cmp outcome is a planning error,
+# never a normal "changed" classification.
 _update_files_differ_exact() {
-  ! cmp -s "$1" "$2"
+  local rc
+  if cmp -s "$1" "$2"; then
+    return 1
+  else
+    rc=$?
+  fi
+  if (( rc == 1 )); then
+    return 0
+  fi
+  die "exact comparison failed for planning inputs '$1' and '$2' (cmp exit ${rc}) -- refusing to classify an artifact from an unknown comparison result"
 }
 
 _update_read_installed_source_sha() {
