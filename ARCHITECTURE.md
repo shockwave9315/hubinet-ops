@@ -145,6 +145,72 @@ The Home Assistant half ships separately through HACS. HA never receives a
 Proxmox credential; it authenticates only to the Hubinet backend with the
 backend's own bearer token.
 
+## In-place product updates
+
+`deploy/update-proxmox-0.5.sh` (+ `deploy/lib/update-*.sh`) is the
+product-facing update entrypoint for an *existing* installation — install
+once, update many times. It is a separate PVE-host operator action from
+bootstrap, never a second bootstrap: it never invokes
+`deploy/install-0.5.0-fresh.sh`, never recreates the LXC or changes its
+VMID/network, and never rotates the PVE identity/token secret, the HA
+bearer, or the host-control key.
+
+```text
+--vmid <N>
+  -> prove installation ownership (host-control key comment, authorized_keys
+     forced-command marker, PVE user/token comments, all cross-checked
+     against one recovered run-id; exact effective PVE privilege set)
+  -> classify target artifacts against one exact confirmed git commit
+     (app payload always replaced; requirements.txt/unit/PVE helper/
+     authority schema each compared exact-content)
+  -> print the exact plan; require approval (a dedicated second
+     confirmation, or --yes --allow-authority-reset non-interactively, when
+     the authority schema requires a reset)
+  -> stage every replacement while the old service is still healthy
+  -> activate in one fixed order (app, venv+requirements if changed, unit
+     if changed, PVE helper same-path content swap if changed, authority
+     preserve-or-reset), retaining rollback material
+  -> start + accept (reused bootstrap discovery-acceptance contract,
+     extended with an optional minimum-committed-sequence floor to prove a
+     genuine post-restart cycle; host-control forced-boundary re-probe;
+     firewall byte-identical + active)
+  -> on any failure after the service was stopped: coherent rollback,
+     including a validated authority-database backup restore when a
+     destructive reset had already happened
+```
+
+**Authority schema decision.** `deploy/lib/hubinet-ops-authority-tool.py`
+(run inside the CT) is a small, read-only-first inspector: it reads
+`authority_schema`'s marker/version and `backend_instance.backend_instance_id`
+and reports whether the database is recognizable — never a security proof,
+just enough to classify. The target schema is read statically (a regex over
+the target commit's `app/inventory/store.py` text, never an executed import)
+so the updater never has to run target application code to plan. Same
+schema: preserve, untouched. Different schema: no migration exists in this
+product's current scope (see `AGENTS.md`) — a coherent backup
+(`sqlite3`'s stdlib online backup API, integrity-checked and re-validated
+against the pre-reset identity before the live file is removed) followed by
+removal; the target runtime creates its own fresh schema on next start. The
+updater never writes authority schema DDL itself.
+
+**PVE host helper update contract.** The forced-command `authorized_keys`
+line, the pinned host-control key, and `known_hosts` are never touched.
+Only the helper file's *content* is ever replaced, staged as a temp file
+in the same directory and atomically renamed over the existing path — same
+path, new content, exactly like `deploy/hubinet-package-scan-helper.py`'s
+own request/response version check already expects.
+
+**Rollback.** Filesystem rollback material
+(`app.rollback-<runid>`, `.venv.rollback-<runid>`, a preserved copy of the
+systemd unit, a preserved copy of the PVE helper) is retained until
+acceptance succeeds, using the same ledger mechanism
+(`deploy/lib/bootstrap-common.sh`) bootstrap's own rollback already relies
+on. A target failure after a destructive authority reset restores the
+coherent *old* installation, database included — the updater never leaves
+old code paired with a new, incompatible schema.
+
+See `deploy/README-update-proxmox-0.5.md` for the operator runbook.
+
 ## Package scanning for LXC
 
 Implemented channel:

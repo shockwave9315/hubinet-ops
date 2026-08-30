@@ -31,13 +31,19 @@ a guest in Proxmox never requires touching this repository or its config.
   a concise backend-published approval-status sensor. Approval never executes
   an update.
 - An automated Proxmox bootstrap that provisions the whole backend.
+- An in-place updater for an existing installation: install once, update
+  many times, preserving identity/config/credentials.
 
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
 installs packages. Update execution, jobs, snapshots, healthchecks, and
 rollback are not built yet — see `STATUS.md`.
 
-Schema v8 has no v7 migration. Existing pre-release deployments must use a
-fresh backend database/fresh deployment and re-enroll Home Assistant.
+Schema v8 has no v7 migration. An existing pre-release deployment uses
+`deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
+authority schema, backs it up, and resets only the authority database (with
+explicit operator authorization) while preserving the LXC, its VMID/network,
+PVE identity/token, and every other credential/config file. Home Assistant
+re-enrollment is required only after that explicit reset.
 
 ## Installation
 
@@ -48,8 +54,16 @@ fresh unprivileged Debian LXC at the next free VMID, provisions a
 least-privilege PVE token, sets up TLS trust, installs the service, provisions
 a dedicated pinned-key/forced-command package-scan boundary, writes the config,
 and applies an nftables boundary — after one upfront confirmation of the full
-plan. See [`deploy/README-bootstrap-proxmox-0.5.md`](deploy/README-bootstrap-proxmox-0.5.md)
+plan. This is the first-install / disaster-recovery / deliberate-rebuild path
+only. See [`deploy/README-bootstrap-proxmox-0.5.md`](deploy/README-bootstrap-proxmox-0.5.md)
 and [`deploy/README-0.5-firewall.md`](deploy/README-0.5-firewall.md).
+
+**Updating an existing backend.** `deploy/update-proxmox-0.5.sh --vmid <N>`
+updates an already-bootstrapped installation in place — it verifies
+ownership, prints an exact plan, and preserves identity/config/credentials
+(and the authority database, unless an incompatible pre-release schema
+requires an explicit, backed-up reset). It never re-runs the fresh
+installer. See [`deploy/README-update-proxmox-0.5.md`](deploy/README-update-proxmox-0.5.md).
 
 **Home Assistant integration (via HACS).**
 
@@ -88,8 +102,8 @@ change:
 python -m compileall -q app custom_components tests scripts
 pytest -q
 bash -n deploy/install-0.5.0-fresh.sh
-for f in deploy/bootstrap-proxmox-0.5.sh deploy/lib/*.sh; do bash -n "$f"; done
-for f in deploy/bootstrap-proxmox-0.5.sh deploy/lib/*.sh; do python scripts/validate_hermetic_shell_boundary.py "$f"; done
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/update-proxmox-0.5.sh deploy/lib/*.sh; do bash -n "$f"; done
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/update-proxmox-0.5.sh deploy/lib/*.sh; do python scripts/validate_hermetic_shell_boundary.py "$f"; done
 python scripts/validate_yaml.py
 python scripts/check_tracked_files.py
 ```
@@ -138,7 +152,7 @@ development or agent session.
 | `app/package_scan_host_control.py` | bounded typed SSH client for the forced PVE helper |
 | `custom_components/hubinet_ops/` | Home Assistant integration |
 | `config/inventory.example.yaml`, `.env.r0.example` | config and secrets templates |
-| `deploy/` | Proxmox bootstrap, in-CT installer, systemd unit, firewall docs |
+| `deploy/` | Proxmox bootstrap, in-place updater, in-CT installer, systemd unit, firewall docs |
 | `scripts/` | YAML, tracked-file, and shell-boundary validators |
 | `tests/` | pytest suite |
 

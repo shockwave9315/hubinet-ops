@@ -100,6 +100,15 @@ package is a violation, and may only happen inside an approved update job.
 - Arbitrary remote shell. Every host-side operation is typed and allowlisted.
 - Managing Proxmox hosts Hubinet was not deliberately pointed at.
 
+## Product lifecycle
+
+Hubinet Ops itself is installed once and updated in place. Fresh bootstrap
+(`deploy/bootstrap-proxmox-0.5.sh`) is the first-install, disaster-recovery,
+and deliberate-rebuild path; ordinary code updates use
+`deploy/update-proxmox-0.5.sh` against the existing installation and must
+not require destroying it. See `ARCHITECTURE.md`, "In-place product
+updates".
+
 ## Current state
 
 What is built today and what comes next is in `STATUS.md`.

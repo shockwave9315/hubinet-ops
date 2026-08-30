@@ -29,7 +29,33 @@
   failure-is-unknown semantics. It never installs packages.
 - **Bootstrap and deployment** — `deploy/bootstrap-proxmox-0.5.sh` provisions a
   fresh unprivileged LXC, a least-privilege PVE identity, TLS trust, a dedicated
-  forced-command scan boundary, the service, and an nftables boundary.
+  forced-command scan boundary, the service, and an nftables boundary. This
+  remains the first-install/disaster-recovery/deliberate-rebuild entrypoint
+  only.
+- **In-place product updates** — `deploy/update-proxmox-0.5.sh` updates an
+  *existing* installation identified by `--vmid`, in place: install once,
+  update many times. It cross-verifies the CT's ownership chain against the
+  PVE identity before touching anything; classifies the app payload,
+  `requirements.txt`, the systemd unit, the PVE host helper, and the
+  authority schema against one exact target git commit; prints the exact
+  plan and requires approval before any mutation (`--dry-run` stops there);
+  stages every replacement while the old service is still healthy; then
+  activates in a fixed order, with filesystem rollback material retained
+  until acceptance passes. A schema-compatible target preserves the
+  authority database, `backend_instance_id`, and every credential/config
+  file untouched — no PVE identity rotation, no config rewrite, no venv
+  rebuild unless `requirements.txt` changed, no PVE helper rewrite unless its
+  content changed. An incompatible authority schema requires explicit
+  operator authorization (a dedicated interactive confirmation, or
+  `--yes --allow-authority-reset` non-interactively), makes one coherent
+  SQLite backup of the current authority database (validated before
+  anything is removed), then resets only that database — never the LXC,
+  network, PVE identity, or other credentials — and reports that Home
+  Assistant re-enrollment is required. A target failure after that reset is
+  rolled back to the coherent pre-update installation, authority database
+  included, never leaving old code paired with a new schema. Package/job
+  execution updates are out of scope for this stage — see
+  `deploy/README-update-proxmox-0.5.md`.
 
 The PVE API inventory surface remains read-only. The backend's sole mutation
 route records Hubinet approval authority state only. Package scanning may write
@@ -74,6 +100,21 @@ Hubinet observes current guest state. Human0 validates only the currently
 implemented scope; update execution, job-owned snapshots, healthchecks, and
 rollback remain unimplemented future stages.
 
+## In-place product update lifecycle
+
+Generic (non-workload) in-place Hubinet Ops updates are implemented and have
+complete automated validation (focused pytest for the two Python helpers,
+sandboxed shell smoke coverage for `deploy/update-proxmox-0.5.sh` exercising
+a code-only update, a `requirements.txt` change, a systemd-unit change, a PVE
+helper change, an authorized destructive authority reset with coherent
+backup, a refused reset, rollback after a target failure that followed a
+destructive reset, ownership/provenance fail-closed paths, the installed-
+source marker, and repeated updates on one synthetic installation). The
+first real operator Human0 validation of this updater against an actual
+Proxmox host is still pending — see `deploy/README-update-proxmox-0.5.md`.
+Workload package update job execution remains a separate, unimplemented
+future stage after that Human0.
+
 ## Exact update-plan approval
 
 - **Implemented:** fresh exact-plan presentation, explicit durable approval of
@@ -99,15 +140,18 @@ rollback remain unimplemented future stages.
   Assistant imports POSIX `fcntl` at collection time. The pinned Linux suite in
   the existing local CI equivalent and GitHub CI is the compatibility gate. Do
   not patch Home Assistant or fake `fcntl` around this.
-- `deploy/bootstrap-proxmox-0.5.sh` is only executed for real inside the
-  hardened Docker smoke sandbox. GitHub uses the guarded
-  `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the existing Linux
-  devbox local CI invokes the same Dockerfile and sandbox entrypoint directly
-  without faking GitHub runner markers.
-- Pre-release: schema v8 is incompatible with v7. Existing deployments require
-  a fresh backend database/fresh deployment and Home Assistant re-enrollment.
-  There is no v7-to-v8 migration path, and none is planned before the first
-  release.
+- `deploy/bootstrap-proxmox-0.5.sh` and `deploy/update-proxmox-0.5.sh` are
+  only executed for real inside the hardened Docker smoke sandbox. GitHub
+  uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
+  existing Linux devbox local CI invokes the same Dockerfile and sandbox
+  entrypoint directly without faking GitHub runner markers.
+- Pre-release: schema v8 is incompatible with v7, and there is no v7-to-v8
+  migration path. An existing installation now uses `deploy/update-proxmox-0.5.sh`
+  for this: it detects the incompatible authority schema, backs it up, and
+  resets only the authority database (see "In-place product updates" below)
+  while preserving the LXC, its VMID/network, PVE identity/token, and every
+  other credential/config file. Home Assistant re-enrollment is required only
+  after that explicit reset, not for an ordinary code-only update.
 - Package origin, description, security classification, and reboot-required
   stay unknown unless reliable evidence is present. The first parser derives
   origin/security from stable-English APT simulation evidence and leaves
