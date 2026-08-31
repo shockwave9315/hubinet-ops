@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 import textwrap
@@ -77,8 +78,10 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import shutil
 import sys
+import tarfile
 from pathlib import Path
 
 FAKE_STORAGE = "local-lxc"
@@ -129,13 +132,50 @@ def _fail(kind):
     return kind in SCENARIO.get("fail", [])
 
 
+def _unit_install_links(vmid):
+    """The set of boot-activation links the CURRENT hubinet-ops.service
+    unit file's own [Install] section declares (PR #65 correction pass
+    13, P2 test model) -- a `WantedBy=<target>` line implies a
+    `<target>.wants/hubinet-ops.service` link, and an `Alias=<name>` line
+    implies a top-level `<name>` link, exactly mirroring real systemd's
+    unit-file-generator symlinks. Narrowly scoped to what the stale-link
+    regression needs to represent; not a general systemd model.
+    """
+    unit_path = _ct_path(vmid, "/etc/systemd/system/hubinet-ops.service")
+    if not unit_path.exists():
+        return set()
+    links = set()
+    in_install = False
+    for raw_line in unit_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_install = line == "[Install]"
+            continue
+        if not in_install or not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "WantedBy":
+            links.update(f"{target}.wants/hubinet-ops.service" for target in value.split())
+        elif key == "Alias":
+            links.update(value.split())
+    return links
+
+
 _CT_PATH_ANCHORS = (
     "etc/hubinet-ops",
     "var/lib/hubinet-ops",
+    "opt/hubinet-ops",
     "tmp/hubinet-ops-src",
     "tmp/nftables.conf",
     "tmp/hubinet-ops-src.tar.gz",
     "tmp/hubinet-ops-bootstrap-accept.py",
+    "tmp/hubinet-ops-update-src",
+    "tmp/hubinet-ops-update-src.tar.gz",
+    "tmp/hubinet-ops-authority-tool",  # matches both the fixed and the
+    "tmp/hubinet-ops-update-probe",    # run-id-suffixed pushed path shape
+    "tmp/hubinet-ops-update-venv-stage.py",
 )
 
 
@@ -309,6 +349,17 @@ def cmd_pct(args):
         vmid, host_path, ct_path = args[1], args[2], args[3]
         if _fail("pct_push"):
             sys.exit(1)
+        # "pct_push_fail_dest_suffixes": [...] -- fail only the pushes
+        # whose CT destination ends with one of these suffixes. A blanket
+        # "fail every push" cannot express "this ONE staged artifact could
+        # not be transferred", which is what a Phase U3 staging-failure
+        # regression needs (every other push in the same run must still
+        # succeed so the run actually reaches staging).
+        suffixes = SCENARIO.get("pct_push_fail_dest_suffixes", [])
+        if isinstance(suffixes, str):
+            suffixes = [suffixes]
+        if any(_normalize_ct_arg(ct_path).endswith(suffix) for suffix in suffixes):
+            sys.exit(1)
         dest = _ct_path(vmid, ct_path)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(_resolve_host_path(host_path), dest)
@@ -322,6 +373,143 @@ def cmd_pct(args):
 
     _log("pct", "UNHANDLED", *args)
     sys.exit(2)
+
+
+# Deterministic fake failure seams for the in-place updater's individual
+# CT-side mv/cp activation steps (deploy/lib/update-activate.sh) -- keyed
+# by the LOGICAL (run-id-independent) source/destination shape of each
+# move, so a test can force exactly one intermediate activation step to
+# fail without knowing UPDATE_RUN_ID (random per invocation) in advance.
+# ("exact", value) matches a normalized CT path exactly; ("prefix", value)
+# matches anything starting with value (used for the run-id-suffixed
+# staged-/rollback- side of each move).
+_ACTIVATION_MOVE_FAIL_RULES = [
+    ("mv", ("exact", "/opt/hubinet-ops/app"), ("prefix", "/opt/hubinet-ops/app.rollback-"), "mv_live_app_to_rollback"),
+    ("mv", ("prefix", "/opt/hubinet-ops/app.staged-"), ("exact", "/opt/hubinet-ops/app"), "mv_staged_app_to_live"),
+    ("mv", ("exact", "/opt/hubinet-ops/.venv"), ("prefix", "/opt/hubinet-ops/.venv.rollback-"), "mv_live_venv_to_rollback"),
+    ("mv", ("prefix", "/opt/hubinet-ops/.venv.staged-"), ("exact", "/opt/hubinet-ops/.venv"), "mv_staged_venv_to_live"),
+    ("mv", ("exact", "/opt/hubinet-ops/requirements.txt"), ("prefix", "/opt/hubinet-ops/requirements.txt.rollback-"), "mv_live_requirements_to_rollback"),
+    ("mv", ("prefix", "/opt/hubinet-ops/requirements.txt.staged-"), ("exact", "/opt/hubinet-ops/requirements.txt"), "mv_staged_requirements_to_live"),
+    ("cp", ("exact", "/etc/systemd/system/hubinet-ops.service"), ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-"), "cp_live_unit_to_rollback"),
+    ("mv", ("prefix", "/etc/systemd/system/hubinet-ops.service.staged-"), ("exact", "/etc/systemd/system/hubinet-ops.service"), "mv_staged_unit_to_live"),
+    # ROLLBACK-side restore of the preserved old unit. Needed as its own
+    # seam (correction pass 8, P2) so a test can interrupt the updater
+    # exactly BETWEEN "the old unit file is back on the live path" and
+    # "systemd has been told about it", the reachable state in which a
+    # replayed rollback must still daemon-reload.
+    ("mv", ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-"), ("exact", "/etc/systemd/system/hubinet-ops.service"), "mv_rollback_unit_to_live"),
+    ("mv", ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.rollback-"), "mv_live_marker_to_rollback"),
+    ("mv", ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.staged-"), ("exact", "/opt/hubinet-ops/.hubinet-source-commit"), "mv_staged_marker_to_live"),
+]
+
+
+def _match_endpoint(mode_value, normalized_path):
+    mode, value = mode_value
+    return normalized_path == value if mode == "exact" else normalized_path.startswith(value)
+
+
+def _activation_fail_key(op, src_norm, dst_norm):
+    for rule_op, src_rule, dst_rule, key in _ACTIVATION_MOVE_FAIL_RULES:
+        if rule_op == op and _match_endpoint(src_rule, src_norm) and _match_endpoint(dst_rule, dst_norm):
+            return key
+    return None
+
+
+# Correction pass 9, P1 -- deterministic fake failure seams for every
+# `pct exec <vmid> -- sync -f <path>` durability barrier
+# deploy/lib/update-recovery.sh's _update_durability_barrier_ct (and its
+# _or_hard_stop rollback-side variant) issues. Each entry is a distinct,
+# addressable "fail" key so a test can interrupt the updater exactly
+# BETWEEN a preceding namespace mutation and the transition it gates,
+# without also tripping unrelated barrier calls that happen to target
+# neighboring live paths in the same run (e.g. the preflight probe and the
+# app rollback-restore barrier both eventually touch /opt/hubinet-ops, but
+# never the SAME exact path -- see each helper's own call site).
+_CT_SYNC_FAIL_RULES = [
+    ("exact", "/etc/hubinet-ops/agent.env", "ct_sync_preflight"),
+    ("prefix", "/opt/hubinet-ops/app.rollback-", "ct_sync_app_rollback"),
+    ("exact", "/opt/hubinet-ops/app", "ct_sync_app_restore"),
+    ("prefix", "/opt/hubinet-ops/.venv.rollback-", "ct_sync_venv_rollback"),
+    ("exact", "/opt/hubinet-ops/.venv", "ct_sync_venv_restore"),
+    ("prefix", "/opt/hubinet-ops/requirements.txt.rollback-", "ct_sync_requirements_rollback"),
+    ("exact", "/opt/hubinet-ops/requirements.txt", "ct_sync_requirements_restore"),
+    ("prefix", "/etc/systemd/system/hubinet-ops.service.rollback-", "ct_sync_unit_rollback"),
+    ("exact", "/etc/systemd/system/hubinet-ops.service", "ct_sync_unit_restore"),
+    ("prefix", "/opt/hubinet-ops/.hubinet-source-commit.rollback-", "ct_sync_marker_rollback"),
+    ("exact", "/opt/hubinet-ops/.hubinet-source-commit", "ct_sync_marker_restore"),
+    ("exact", "/var/lib/hubinet-ops/authority.db", "ct_sync_authority_restore"),
+    ("exact", "/opt/hubinet-ops", "ct_sync_final_app_dir"),
+    ("exact", "/etc/systemd/system", "ct_sync_final_unit_dir"),
+    ("exact", "/var/lib/hubinet-ops", "ct_sync_final_authority_dir"),
+    # Correction pass 10, P1 -- the newly-created run-scoped authority
+    # backup directory's own ancestry-link barrier (see
+    # _update_perform_authority_reset in update-activate.sh). A prefix
+    # rule because the exact path is run-id-suffixed and unpredictable
+    # ahead of time, exactly like the rollback-copy prefix rules above.
+    ("prefix", "/var/lib/hubinet-ops/update-backups/", "ct_sync_authority_backup_dir"),
+]
+
+
+def _ct_sync_fail_key(normalized_path):
+    for mode, value, key in _CT_SYNC_FAIL_RULES:
+        if mode == "exact" and normalized_path == value:
+            return key
+        if mode == "prefix" and normalized_path.startswith(value):
+            return key
+    return None
+
+
+_ROLLBACK_REMOVE_KEYS = {
+    "/opt/hubinet-ops/app": "rm_live_app",
+    "/opt/hubinet-ops/.venv": "rm_live_venv",
+    "/opt/hubinet-ops/requirements.txt": "rm_live_requirements",
+    "/etc/systemd/system/hubinet-ops.service": "rm_live_unit",
+    "/opt/hubinet-ops/.hubinet-source-commit": "rm_live_marker",
+}
+
+
+def _matches_run_owned_ct_script(raw_arg, base_name):
+    # deploy/lib/update-plan.sh (P2-A/small-cleanup, AGENTS.md) now pushes
+    # this planning tool to a run-id-suffixed path
+    # ("<base_name>-<UPDATE_RUN_ID>.py"), never the fixed "<base_name>.py"
+    # name -- match either shape so this fake dispatcher recognizes it
+    # regardless of which naming convention produced the pushed path.
+    # UPDATE_RUN_ID itself has two legal shapes (PR #65 correction pass
+    # 13, P2, mirroring deploy/lib/update-recovery.sh's own
+    # _update_is_valid_run_id): normal 32-char lowercase hex, or the
+    # numeric "<digits>-<digits>-<digits>" fallback -- both must be
+    # recognized here, or a run that legitimately generated a fallback-
+    # shaped id can never even get this script recognized as its own.
+    normalized = raw_arg.replace("\\", "/")
+    return bool(
+        re.search(
+            rf"(^|/){re.escape(base_name)}(-[0-9a-f]+|-[0-9]+-[0-9]+-[0-9]+)?\.py$",
+            normalized,
+        )
+    )
+
+
+# Correction pass 7 (P1 test realism): a simulated
+# `pct exec <vmid> -- python3 <ct-script-path> ...` must never INVENT the
+# execution of a file that does not exist in this fake CT filesystem.
+# Matching the argv shape alone hid a real defect: the run-owned authority
+# helper lives in the container's volatile /tmp, and a genuine PVE/CT
+# reboot clears it, so "the updater re-pushed what it needs" and "the
+# updater silently depended on a file that is gone" were indistinguishable
+# in this fake. These two helpers make the fake fail exactly like real
+# python3 does instead.
+def _pushed_ct_script_exists(vmid, raw_arg):
+    return _ct_path(vmid, raw_arg).is_file()
+
+
+def _missing_python_script(raw_arg):
+    normalized = _normalize_ct_arg(raw_arg)
+    _log("pct", "exec", "python3", "MISSING-SCRIPT", normalized)
+    sys.stderr.write(
+        f"python3: can't open file '{normalized}': [Errno 2] No such file or directory\n"
+    )
+    # Real CPython's own exit status for an unopenable script argument.
+    return 2
 
 
 def _exec_inner(vmid, inner, state):
@@ -356,24 +544,201 @@ def _exec_inner(vmid, inner, state):
         )
         return 2
 
+    if inner[0] == "tar" and "-xzf" in inner:
+        # The in-place updater's own staging step (unlike the bootstrap
+        # installer, which never inspects extracted content) needs this
+        # extraction to be real: later fake commands (cp -a, cat, ...)
+        # read the extracted files back. Still fully hermetic --
+        # Python's own stdlib tarfile against a tarball `pct push` already
+        # copied for real onto this same simulated CT filesystem.
+        if _fail("tar_extract"):
+            return 1
+        tarball_arg = inner[inner.index("-xzf") + 1]
+        dest_arg = inner[inner.index("-C") + 1] if "-C" in inner else "."
+        tarball_path = _ct_path(vmid, tarball_arg)
+        dest_path = _ct_path(vmid, dest_arg)
+        dest_path.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tarball_path, "r:gz") as archive:
+            archive.extractall(dest_path, filter="data")  # noqa: S202 -- trusted, test-only tarball
+        return 0
+
     if inner[0] == "tar":
-        # Extraction is not content-inspected by any test assertion; a
-        # no-op is sufficient and keeps the fake hermetic.
         return 0
 
     if inner[0] == "rm":
-        normalized_target = _normalize_ct_arg(inner[-1])
-        if normalized_target == "/etc/hubinet-ops/host-control":
-            shutil.rmtree(_ct_path(vmid, normalized_target), ignore_errors=True)
+        # Generalized (beyond the original host-control-only special
+        # case): the in-place updater's own rollback/cleanup steps
+        # `rm -rf` several different staged/rollback paths, and a later
+        # `mv` into a path this didn't actually remove would otherwise
+        # nest incorrectly (Python's shutil.move moves INTO an existing
+        # directory rather than replacing it) -- so this fake must really
+        # remove each named target, not merely report success.
+        targets = [a for a in inner[1:] if not a.startswith("-")]
+        for raw_target in targets:
+            normalized_target = _normalize_ct_arg(raw_target)
+            target_path = _ct_path(vmid, normalized_target)
+            remove_key = _ROLLBACK_REMOVE_KEYS.get(normalized_target)
+            if remove_key is not None and _fail(f"{remove_key}_partial"):
+                # Realistic mutate-then-fail: remove some content while
+                # leaving the load-bearing destination path itself in
+                # place. A subsequent directory `mv` could otherwise
+                # nest its source inside this surviving directory.
+                if target_path.is_dir():
+                    children = sorted(target_path.iterdir(), key=lambda item: item.name)
+                    if children:
+                        child = children[0]
+                        if child.is_dir():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+                elif target_path.exists():
+                    target_path.write_bytes(b"partial")
+                return 1
+            if remove_key is not None and _fail(f"{remove_key}_noop_success"):
+                # The command reports success but the path remains. The
+                # caller must trust an independent postcondition probe,
+                # never this return code.
+                continue
+            if target_path.is_dir():
+                shutil.rmtree(target_path, ignore_errors=True)
+            elif target_path.exists():
+                target_path.unlink()
         return 0
 
-    if inner[:2] == ["chown", "root:hubinetops"] or inner[0] == "chown":
+    if inner[0] == "mv" and len(inner) >= 3:
+        src_norm = _normalize_ct_arg(inner[-2])
+        dst_norm = _normalize_ct_arg(inner[-1])
+        fail_key = _activation_fail_key("mv", src_norm, dst_norm)
+        if fail_key is not None and _fail(fail_key):
+            # Simulates the realistic failure shape: the command fails
+            # before mutating anything (a real rename() is atomic --
+            # either it fully happens or nothing does), so neither src
+            # nor dst is touched.
+            return 1
+        src = _ct_path(vmid, inner[-2])
+        dst = _ct_path(vmid, inner[-1])
+        if not src.exists():
+            return 1
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists() and dst.is_dir() and not src.is_dir():
+            return 1
+        shutil.move(str(src), str(dst))
+        if fail_key is not None and SCENARIO.get("kill_updater_after_move") == fail_key:
+            # Actual untrappable updater disappearance: the fake command
+            # has completed the selected atomic rename, then SIGKILLs its
+            # parent updater shell. No EXIT trap or rollback code runs.
+            os.kill(os.getppid(), signal.SIGKILL)
+        return 0
+
+    if inner[0] == "cp":
+        cp_args = [a for a in inner[1:] if not a.startswith("-")]
+        if len(cp_args) != 2:
+            return 2
+        src_norm = _normalize_ct_arg(cp_args[0])
+        dst_norm = _normalize_ct_arg(cp_args[1])
+        fail_key = _activation_fail_key("cp", src_norm, dst_norm)
+        # "<fail_key>_partial" (P1-B correction pass 2): simulates a
+        # realistic NON-atomic `cp` failure (ENOSPC/EIO/etc partway
+        # through the write) -- unlike the ordinary fail_key case below
+        # (the command fails before creating any destination at all,
+        # simulating a `cp` that never started writing), this leaves a
+        # PARTIAL destination file behind. Proves a caller never treats
+        # mere existence of a rollback-copy destination as complete,
+        # trustworthy pre-update state.
+        if fail_key is not None and _fail(f"{fail_key}_partial"):
+            src = _ct_path(vmid, cp_args[0])
+            dst = _ct_path(vmid, cp_args[1])
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if src.exists() and src.is_file():
+                content = src.read_bytes()
+                dst.write_bytes(content[: max(1, len(content) // 2)])
+            else:
+                dst.write_bytes(b"partial")
+            return 1
+        if fail_key is not None and _fail(fail_key):
+            return 1
+        src = _ct_path(vmid, cp_args[0])
+        dst = _ct_path(vmid, cp_args[1])
+        if not src.exists():
+            return 1
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(str(src), str(dst), dirs_exist_ok=True)
+        else:
+            shutil.copyfile(str(src), str(dst))
+        return 0
+
+    if inner[0] == "chown":
+        if (
+            _normalize_ct_arg(inner[-1]) == "/var/lib/hubinet-ops/authority.db"
+            and _fail("authority_restore_chown")
+        ):
+            return 1
         return 0
 
     if inner[0] == "chmod":
+        if (
+            _normalize_ct_arg(inner[-1]) == "/var/lib/hubinet-ops/authority.db"
+            and _fail("authority_restore_chmod")
+        ):
+            return 1
+        return 0
+
+    if inner[0] == "sync":
+        # Correction pass 9, P1 -- CT-side durability barrier fake. This
+        # hermetic fake CT filesystem has no real "not yet durable" state
+        # to simulate (every write it performs is already synchronous
+        # against the actual pytest-host filesystem underlying tmp_path),
+        # so success here means only "the operation was requested against
+        # a real path this fake CT owns" -- see _CT_SYNC_FAIL_RULES for
+        # the deterministic failure seams that let a test simulate the
+        # barrier itself failing.
+        args = [a for a in inner[1:] if a != "-f"]
+        if len(args) != 1:
+            return 2
+        normalized = _normalize_ct_arg(args[0])
+
+        # Correction pass 10, P1 -- the temporary autostart-enablement
+        # guard now crosses THREE distinct `sync -f /etc/systemd/system`
+        # calls within a single run (disable-side, success-enable-side,
+        # rollback-enable-side); all three share the same literal path, so
+        # a single path-keyed fail rule cannot target just one of them.
+        # fail_nth_unit_dir_sync selects which ORDINAL call to this exact
+        # path fails, the same idiom already used for
+        # fail_nth_service_stop/fail_nth_daemon_reload/etc above.
+        if normalized == "/etc/systemd/system":
+            call_number = state.get("unit_dir_sync_calls", 0) + 1
+            state["unit_dir_sync_calls"] = call_number
+            _save_state(state)
+            fail_nth = SCENARIO.get("fail_nth_unit_dir_sync")
+            if fail_nth is not None and call_number == int(fail_nth):
+                return 1
+
+        fail_key = _ct_sync_fail_key(normalized)
+        if fail_key is not None and _fail(fail_key):
+            return 1
+        if not _ct_path(vmid, args[0]).exists():
+            return 1
+
+        if normalized == "/etc/systemd/system":
+            # Correction pass 10, P1 -- this barrier is the one that
+            # commits the CT's current in-kernel autostart-enablement view
+            # (entry["service_enabled"], mutated synchronously by the bare
+            # `systemctl enable`/`disable hubinet-ops` fakes above) into
+            # DURABLE state that survives simulate_pve_ct_reboot. Before
+            # this point, an enable/disable is exactly as volatile as any
+            # other uncommitted namespace mutation this fake already
+            # discards on reboot.
+            entry = state["vmids"].setdefault(vmid, {})
+            entry["durable_service_enabled"] = entry.get("service_enabled", False)
+            entry["durable_service_enable_links"] = list(entry.get("service_enable_links", []))
+            _save_state(state)
         return 0
 
     if inner[0] == "cat":
+        _maybe_drift_ct_file_on_read(vmid, inner[1], state)
+        if _normalize_ct_arg(inner[1]) == "/etc/hubinet-ops/host-control/id_ed25519.pub":
+            _maybe_swap_installation_identity_on_pubkey_read(vmid, state)
         path = _ct_path(vmid, inner[1])
         if not path.exists():
             return 1
@@ -457,13 +822,245 @@ def _exec_inner(vmid, inner, state):
         return _exec_sh_c(inner[2])
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-accept.py"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
         return _exec_discovery_accept(vmid, inner[2:])
 
     if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-bootstrap-resolve-dns.py"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
         return _exec_resolve_dns(inner[2:])
+
+    if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-authority-tool"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
+        return _exec_authority_tool(vmid, inner[2:], state)
+
+    if inner[0] == "python3" and _matches_run_owned_ct_script(inner[1], "hubinet-ops-update-probe"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
+        return _exec_update_probe(vmid, state)
+
+    if inner[0] == "python3" and inner[1].replace("\\", "/").endswith("hubinet-ops-update-venv-stage.py"):
+        if not _pushed_ct_script_exists(vmid, inner[1]):
+            return _missing_python_script(inner[1])
+        return _exec_venv_stage(vmid, inner[2:])
 
     _log("pct", "exec", "UNHANDLED", *inner)
     return 2
+
+
+def _exec_authority_tool(vmid, args, state):
+    # Simulates deploy/lib/hubinet-ops-authority-tool.py's OWN observable
+    # JSON contract without a real sqlite database -- a fake "authority.db"
+    # is simply a small JSON object {"marker", "schema_version",
+    # "backend_instance_id"} written directly at the CT path by whatever
+    # seeded/activated it (see seed_authority_db / the real production
+    # code path, both of which write through this same simulated
+    # filesystem). This keeps the shell-level orchestration tests
+    # (staging/activation/rollback order, ledger gating) exercised
+    # against realistic pass/fail outcomes while the REAL tool's own
+    # sqlite/backup/integrity-check logic is covered by direct pytest
+    # unit tests against the real script (no fake needed there).
+    if not args:
+        return 2
+    subcommand = args[0]
+    if subcommand == "path-state" and len(args) == 2:
+        normalized = _normalize_ct_arg(args[1])
+        failure_prefixes = SCENARIO.get("path_probe_transport_fail_prefixes", [])
+        if isinstance(failure_prefixes, str):
+            failure_prefixes = [failure_prefixes]
+        if _fail("path_probe_transport") or any(
+            normalized.startswith(prefix) for prefix in failure_prefixes
+        ):
+            # Outer pct/transport failure: deliberately no JSON answer.
+            return 1
+        print(json.dumps({"ok": True, "exists": _ct_path(vmid, args[1]).exists()}))
+        return 0
+    if subcommand == "remove":
+        # "fail_nth_authority_remove": N -- fails only the Nth call this
+        # run makes to `remove` (1-indexed), succeeding on every other
+        # call. Needed because update-activate.sh's forward reset path and
+        # its own rollback-on-later-failure path both call `remove` with
+        # IDENTICAL argv (the same db_path) -- a blanket "always fail
+        # remove" scenario key cannot distinguish "fail the ORIGINAL
+        # reset" from "fail removal of the newly-created target database
+        # DURING rollback" (see AGENTS.md P1-B fail-closed-rollback
+        # regression), so this counts real calls instead.
+        call_number = state.get("authority_tool_remove_calls", 0) + 1
+        state["authority_tool_remove_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_authority_remove")
+        if fail_nth is not None and call_number == int(fail_nth):
+            print(json.dumps({"ok": False, "reason": "simulated_remove_failure"}))
+            return 1
+        # "fail_nth_authority_remove_partial": N (P1-A correction pass 2)
+        # -- simulates the REAL cmd_remove()'s own intermediate-unlink-
+        # failure shape: its sequential unlink loop (db, then -wal, then
+        # -shm) can succeed on an earlier path and only fail on a LATER
+        # one, so the call as a whole still reports "ok": false having
+        # already mutated live state. This fake has no real wal/shm
+        # sidecars to partially remove (the whole fake "db" is one JSON
+        # blob), so it approximates the same observable shape directly:
+        # the underlying db path IS actually removed, but "ok": false is
+        # still what the caller sees -- proving a caller that only arms
+        # rollback after a fully successful `remove` would find no
+        # marker recorded despite the live database already being gone.
+        fail_nth_partial = SCENARIO.get("fail_nth_authority_remove_partial")
+        if fail_nth_partial is not None and call_number == int(fail_nth_partial):
+            target = _ct_path(vmid, args[1])
+            if target.exists():
+                target.unlink()
+            print(json.dumps({"ok": False, "reason": "simulated_partial_remove_failure"}))
+            return 1
+    if _fail(f"authority_tool_{subcommand}"):
+        print(json.dumps({"ok": False, "reason": "simulated_failure"}))
+        return 1
+    if subcommand == "inspect":
+        path = _ct_path(vmid, args[1])
+        if not path.exists() or path.stat().st_size == 0:
+            print(json.dumps({"ok": False, "exists": False, "reason": "missing_or_empty"}))
+            return 0
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            print(json.dumps({"ok": False, "exists": True, "reason": "structurally_unreadable"}))
+            return 0
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("marker"), str)
+            or not isinstance(data.get("schema_version"), int)
+            or not isinstance(data.get("backend_instance_id"), str)
+        ):
+            print(json.dumps({"ok": False, "exists": True, "reason": "structurally_unreadable"}))
+            return 0
+        if data["marker"] != "hubinet_ops_0_5_authority":
+            print(json.dumps({"ok": False, "exists": True, "reason": "marker_mismatch"}))
+            return 0
+        print(json.dumps({
+            "ok": True, "exists": True, "marker": data["marker"],
+            "schema_version": data["schema_version"],
+            "backend_instance_id": data["backend_instance_id"],
+            "schema_objects": data.get("schema_objects", []),
+        }))
+        return 0
+    if subcommand == "backup" and len(args) == 6:
+        db_arg, dest_arg, exp_marker, exp_version, exp_backend = args[1:6]
+        src = _ct_path(vmid, db_arg)
+        if not src.exists() or src.stat().st_size == 0:
+            print(json.dumps({"ok": False, "reason": "live_recheck_missing_or_empty"}))
+            return 1
+        try:
+            data = json.loads(src.read_text())
+        except (OSError, ValueError):
+            print(json.dumps({"ok": False, "reason": "live_recheck_structurally_unreadable"}))
+            return 1
+        if (
+            data.get("marker") != exp_marker
+            or str(data.get("schema_version")) != str(exp_version)
+            or data.get("backend_instance_id") != exp_backend
+        ):
+            print(json.dumps({"ok": False, "reason": "live_recheck_context_changed"}))
+            return 1
+        dest = _ct_path(vmid, dest_arg)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(data), encoding="utf-8")
+        print(json.dumps({
+            "ok": True, "backup_path": dest_arg,
+            "backend_instance_id": data["backend_instance_id"],
+        }))
+        return 0
+    if subcommand == "remove" and len(args) == 2:
+        target = _ct_path(vmid, args[1])
+        if target.exists():
+            target.unlink()
+        print(json.dumps({"ok": True}))
+        return 0
+    print(json.dumps({"ok": False, "reason": "usage"}))
+    return 2
+
+
+def _exec_venv_stage(vmid, args):
+    # Simulates deploy/lib/hubinet-ops-update-venv-stage.py's own
+    # observable contract without invoking a real venv/pip anywhere.
+    #
+    # Correction pass 8 (P1): the destination is now the FINAL live venv
+    # pathname, never a staging pathname that something later renames, so
+    # this fake reproduces the two properties that correction depends on:
+    #
+    #   - the generated console entrypoint embeds the ABSOLUTE path of the
+    #     environment it was built in (exactly why a real virtualenv is
+    #     not relocatable), so an orchestration test can read the
+    #     activated /opt/hubinet-ops/.venv/bin/pip back and see which
+    #     pathname it was actually built at;
+    #   - a failed build leaves a PARTIAL environment behind at that final
+    #     pathname ("venv_create" fails after the directory exists but
+    #     before pip; "pip_install" fails with the environment fully
+    #     created), which is what rollback must remove and prove absent.
+    #
+    # "kill_updater_during_venv_build" additionally SIGKILLs the updater
+    # once a partial environment exists at the final path -- the reboot /
+    # untrappable-interruption witness for a final-path build.
+    if len(args) != 2:
+        return 2
+    venv_path = _ct_path(vmid, args[0])
+    if venv_path.exists():
+        sys.stderr.write(f"refusing to build into an already-existing path: {args[0]}\n")
+        return 1
+    if not _ct_path(vmid, args[1]).is_file():
+        sys.stderr.write(f"requirements file does not exist: {args[1]}\n")
+        return 1
+    (venv_path / "bin").mkdir(parents=True, exist_ok=True)
+    if _fail("venv_create"):
+        return 1
+    (venv_path / "bin" / "pip").write_text(
+        f"#!{_normalize_ct_arg(args[0])}/bin/python\n", encoding="utf-8"
+    )
+    (venv_path / "bin" / "python3").write_text("#!/bin/sh\n", encoding="utf-8")
+    if SCENARIO.get("kill_updater_during_venv_build"):
+        os.kill(os.getppid(), signal.SIGKILL)
+    if _fail("pip_install"):
+        return 1
+    return 0
+
+
+def _exec_update_probe(vmid, state=None):
+    # Simulates deploy/lib/hubinet-ops-update-probe.py's own observable
+    # JSON contract -- one bounded, non-waiting read of current state,
+    # driven by "update_probe_*" scenario keys (default: mirrors the
+    # discovery_* keys already used by _exec_discovery_accept so a test
+    # scenario only needs to set one consistent set of facts for both the
+    # pre-update probe and the post-update acceptance check).
+    if _fail("update_probe"):
+        print(json.dumps({"ok": False, "reason": "backend_endpoint_unreachable: simulated"}))
+        return 0
+    backend_id = SCENARIO.get(
+        "update_probe_backend_instance_id",
+        SCENARIO.get("discovery_backend_instance_id", "fake-backend-instance-id"),
+    )
+    sequence = SCENARIO.get("update_probe_sequence", SCENARIO.get("discovery_committed_sequence", 1))
+    # Correction pass 9, P1, section 11, test C: an opt-in incrementing
+    # sequence -- each call for this VMID reports one more than the last --
+    # proves the immediately-before-mutation plan fence never depends on
+    # last_committed_run_sequence staying still between its own two probe
+    # reads (Phase U2's classification probe and the fence's own re-probe),
+    # exactly like an ordinary background discovery cycle running while the
+    # operator reads the plan.
+    if SCENARIO.get("update_probe_sequence_increments_each_call") and state is not None:
+        counts = state.setdefault("update_probe_call_counts", {})
+        key = str(vmid)
+        counts[key] = counts.get(key, 0) + 1
+        sequence = sequence + counts[key] - 1
+        _save_state(state)
+    print(json.dumps({
+        "ok": True,
+        "backend_instance_id": backend_id,
+        "service_active": True,
+        "last_committed_run_sequence": sequence,
+        "health": "healthy",
+        "freshness": "fresh",
+    }))
+    return 0
 
 
 def _exec_resolve_dns(args):
@@ -489,6 +1086,96 @@ def _exec_apt_get(args, state=None):
             _maybe_replace_identity_before_failure("apt_get", state)
         return 1
     return 0
+
+
+# Correction pass 9, P1, section 11 -- deterministic test hooks for the
+# immediately-before-mutation plan fence
+# (deploy/lib/update-plan.sh::_update_capture_plan_fence_from_classification /
+# _update_revalidate_plan_fence). Both fire from the CT-side `cat` handler
+# below, counting reads of one specific path per VMID (persisted through
+# the shared state file, since each `pct exec ... cat ...` is its own
+# subprocess with no shared Python state).
+
+
+def _maybe_drift_ct_file_on_read(vmid, ct_path_arg, state):
+    """SCENARIO['drift_ct_file_after_read'] = {<ct-path>: {"after_read_number":
+    N, "new_content": "..."}}. After the Nth read of <ct-path> for this
+    VMID, the file's content is rewritten before this (the N+1'th) and
+    every subsequent read -- simulating an out-of-band content change to
+    one bounded plan-critical fact between plan-fence capture and
+    revalidation (test B in the task prompt's own contract)."""
+    drift_rules = SCENARIO.get("drift_ct_file_after_read", {})
+    normalized = _normalize_ct_arg(ct_path_arg)
+    rule = drift_rules.get(normalized)
+    if not rule:
+        return
+    counts = state.setdefault("ct_file_read_counts", {})
+    key = f"{vmid}:{normalized}"
+    already = counts.get(key, 0)
+    if already == rule.get("after_read_number") and not state.get(f"drifted:{key}"):
+        target = _ct_path(vmid, ct_path_arg)
+        target.write_text(rule["new_content"], encoding="utf-8")
+        state[f"drifted:{key}"] = True
+    counts[key] = already + 1
+    _save_state(state)
+
+
+def _maybe_swap_installation_identity_on_pubkey_read(vmid, state):
+    """SCENARIO['swap_installation_identity_after_pubkey_reads'] =
+    {"after_read_number": N, "new_run_id": "..."}. After the Nth read of
+    the CT host-control public key for this VMID, every ownership marker
+    deploy/lib/update-ownership.sh's chain checks (CT pubkey comment,
+    host authorized_keys marker/forced-command helper, PVE user/token
+    comments) is rewritten to a coherent DIFFERENT installation run-id --
+    simulating a legitimate PVE operator/tool action (e.g. restoring a
+    different CT as this same VMID) between planning and mutation (test A
+    in the task prompt's own contract). The swap is atomic and one-shot
+    per VMID."""
+    plan = SCENARIO.get("swap_installation_identity_after_pubkey_reads")
+    if not plan:
+        return
+    counts = state.setdefault("pubkey_read_counts", {})
+    key = str(vmid)
+    already = counts.get(key, 0)
+    if already == plan.get("after_read_number") and not state.get(f"identity_swapped:{key}"):
+        new_run_id = plan["new_run_id"]
+        new_marker = f"hubinet-ops-package-scan-vmid-{vmid}-{new_run_id}"
+        pub_path = _ct_path(vmid, "/etc/hubinet-ops/host-control/id_ed25519.pub")
+        pub_path.write_text(
+            f"ssh-ed25519 QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE= {new_marker}\n",
+            encoding="utf-8",
+        )
+        host_root = Path(os.environ.get("HUBINET_OPS_TEST_HOST_ROOT", "/"))
+        new_helper_path = f"/usr/local/libexec/hubinet-package-scan-helper-{new_run_id}"
+        authorized_keys = host_root / "root" / ".ssh" / "authorized_keys"
+        lines = [
+            line for line in authorized_keys.read_text(encoding="utf-8").splitlines()
+            if f"vmid-{vmid}-" not in line
+        ]
+        lines.append(
+            f'command="{new_helper_path}",no-port-forwarding,no-agent-forwarding,'
+            f"no-X11-forwarding,no-pty ssh-ed25519 "
+            f"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE= {new_marker}"
+        )
+        authorized_keys.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        libexec_dir = host_root / "usr" / "local" / "libexec"
+        existing_helpers = sorted(libexec_dir.glob("hubinet-package-scan-helper-*"))
+        new_helper_host = host_root / new_helper_path.lstrip("/")
+        new_helper_host.parent.mkdir(parents=True, exist_ok=True)
+        if existing_helpers:
+            new_helper_host.write_bytes(existing_helpers[0].read_bytes())
+        else:
+            new_helper_host.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        new_helper_host.chmod(0o755)
+        state.setdefault("pve_users", {}).setdefault("hubinetops@pve", {})["comment"] = (
+            f"Hubinet Ops 0.5 R0 read-only discovery (created by bootstrap-proxmox-0.5.sh; run={new_run_id})"
+        )
+        state.setdefault("pve_tokens", {}).setdefault("hubinetops@pve!r0-readonly", {})["comment"] = (
+            f"R0 read-only discovery token (created by bootstrap-proxmox-0.5.sh; run={new_run_id})"
+        )
+        state[f"identity_swapped:{key}"] = True
+    counts[key] = already + 1
+    _save_state(state)
 
 
 def _maybe_replace_identity_before_failure(trigger, state):
@@ -574,6 +1261,24 @@ def _exec_discovery_accept(vmid, args):
     source_name = SCENARIO.get("discovery_source_name", expected_name)
     resource_count = SCENARIO.get("discovery_resource_count", 0)
     node_count = SCENARIO.get("discovery_node_count", 1)
+    committed_sequence = SCENARIO.get("discovery_committed_sequence", 1)
+    # A 3rd positional argument mirrors the real script's own optional
+    # min-committed-sequence-exclusive extension (see
+    # deploy/lib/hubinet-ops-bootstrap-accept.py) -- used by the in-place
+    # updater's post-update, DB-preserving acceptance check to prove a
+    # genuine completed cycle happened AFTER the restart, not merely that
+    # the pre-update state is still being reported.
+    if len(args) >= 3:
+        try:
+            min_sequence_exclusive = int(args[2])
+        except ValueError:
+            min_sequence_exclusive = 0
+        if min_sequence_exclusive and committed_sequence <= min_sequence_exclusive:
+            print(
+                f"FAIL committed-sequence-not-past-baseline "
+                f"got={committed_sequence!r} baseline={min_sequence_exclusive!r}"
+            )
+            return 1
 
     state = _load_state()
     if not _firewall_permits_local_and_reply_traffic(vmid, state):
@@ -631,7 +1336,7 @@ def _exec_discovery_accept(vmid, args):
     print(
         f"PASS backend_instance_id={backend_id} "
         f"source_health=healthy source_freshness=fresh "
-        f"last_committed_run_sequence=1 "
+        f"last_committed_run_sequence={committed_sequence} "
         f"node_count={node_count} resource_count={resource_count}"
     )
     return 0
@@ -651,6 +1356,175 @@ def _exec_systemctl(vmid, args, state):
         entry["service_enabled"] = False
         _save_state(state)
         return 0
+    # Bare `enable`/`disable` (no --now) -- the in-place updater's temporary
+    # service-autostart guard (deploy/lib/update-activate.sh). Real systemd
+    # semantics: these only add/remove the boot-activation symlink; they
+    # never start or stop the currently-running unit, and a disabled unit
+    # can still be started by hand. The three seams below reproduce the
+    # three realistic ways such a command lies about what it did.
+    if args == ["disable", "hubinet-ops"]:
+        call_number = state.get("service_autostart_disable_calls", 0) + 1
+        state["service_autostart_disable_calls"] = call_number
+        _save_state(state)
+        if _fail("service_autostart_disable_mutate_then_fail"):
+            # Boot activation IS actually removed, yet the command reports
+            # failure. Recovery must already be armed at this point.
+            entry["service_enabled"] = False
+            entry["service_enable_links"] = []
+            _save_state(state)
+            return 1
+        if _fail("service_autostart_disable"):
+            return 1
+        if _fail("service_autostart_disable_noop_success"):
+            # Reports success while the unit stays enabled. The caller must
+            # trust an independent unit-file-state probe, never this code.
+            return 0
+        entry["service_enabled"] = False
+        # Real `systemctl disable` removes every symlink CURRENTLY
+        # installed for this unit, regardless of whether it matches the
+        # unit file's present [Install] section -- unlike `enable`, it is
+        # not merely additive against the current declaration. This is
+        # the exact property that makes `reenable` (disable-then-enable,
+        # below) reset stale links a differently-configured unit left
+        # behind.
+        entry["service_enable_links"] = []
+        _save_state(state)
+        return 0
+    if args == ["enable", "hubinet-ops"]:
+        call_number = state.get("service_autostart_enable_calls", 0) + 1
+        state["service_autostart_enable_calls"] = call_number
+        _save_state(state)
+        if _fail("service_autostart_enable"):
+            return 1
+        if _fail("service_autostart_enable_noop_success"):
+            return 0
+        entry["service_enabled"] = True
+        # Plain `enable` is ADDITIVE only: it ensures the links the
+        # CURRENT unit file declares exist, but never removes a link a
+        # DIFFERENT (earlier) unit definition installed.
+        links = set(entry.get("service_enable_links", []))
+        links |= _unit_install_links(vmid)
+        entry["service_enable_links"] = sorted(links)
+        _save_state(state)
+        return 0
+    if args == ["reenable", "hubinet-ops"]:
+        call_number = state.get("service_autostart_reenable_calls", 0) + 1
+        state["service_autostart_reenable_calls"] = call_number
+        _save_state(state)
+        if _fail("service_autostart_reenable"):
+            # "service_autostart_reenable_exit_code": N (PR #65 correction
+            # pass 15, P3) -- a distinctive nonzero exit rather than a
+            # generic 1, so a test can prove _update_restore_service_
+            # autostart's diagnostic captures the REAL underlying command
+            # status (not the exit status of a negated `! cmd` compound
+            # condition, which is always 0 in that branch regardless of
+            # what the command actually returned).
+            return int(SCENARIO.get("service_autostart_reenable_exit_code", 1))
+        # PR #65 correction pass 14, P2: there is deliberately no
+        # "service_autostart_reenable_noop_success" seam here (a `reenable`
+        # that reports success while never actually resetting the links).
+        # The caller (_update_restore_service_autostart) trusts a
+        # successful `systemctl reenable` exit as the one thing that
+        # actually proves the stale-link reset happened -- a bounded,
+        # trusted-systemd-command assumption, not something an independent
+        # UnitFileState probe can substitute for (see that helper's own
+        # comment). Modeling systemd itself lying about its exit code is
+        # out of scope: it would require a full link-enumeration verifier
+        # this test model deliberately does not build.
+        # `reenable` == disable (remove EVERY currently-installed link,
+        # regardless of the current unit file's content) followed by
+        # enable (add back exactly what the CURRENT unit file declares).
+        entry["service_enabled"] = True
+        entry["service_enable_links"] = sorted(_unit_install_links(vmid))
+        _save_state(state)
+        return 0
+    if args == ["stop", "hubinet-ops"]:
+        call_number = state.get("service_stop_calls", 0) + 1
+        state["service_stop_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_service_stop")
+        if fail_nth is not None and call_number == int(fail_nth):
+            return 1
+        if _fail("service_stop_mutate_then_fail") and call_number == 1:
+            entry["service"] = "inactive"
+            _save_state(state)
+            return 1
+        if _fail("service_stop"):
+            return 1
+        entry["service"] = "inactive"
+        _save_state(state)
+        return 0
+    if args == ["start", "hubinet-ops"]:
+        call_number = state.get("service_start_calls", 0) + 1
+        state["service_start_calls"] = call_number
+        _save_state(state)
+        if _fail("service_start_mutate_then_fail") and call_number == 1:
+            entry["service"] = "active"
+            _save_state(state)
+            return 1
+        if _fail("service_start_after_stop"):
+            return 1
+        if call_number == 1 and SCENARIO.get("target_service_failed_after_start"):
+            entry["service"] = "failed"
+        else:
+            entry["service"] = "active"
+        _save_state(state)
+        if SCENARIO.get("kill_updater_after_target_start") and call_number == 1:
+            # Later interruption witness: target service has actually
+            # started, but acceptance/source-marker completion has not.
+            os.kill(os.getppid(), signal.SIGKILL)
+        kill_after_call = SCENARIO.get("kill_updater_after_service_start_call")
+        if kill_after_call is not None and call_number == int(kill_after_call):
+            # Same untrappable-disappearance shape, aimed at an arbitrary
+            # start in the run. Start #2 is the ROLLBACK's own restart of
+            # the restored old installation -- the point at which the old
+            # service is live again and may legitimately write new
+            # authority state, while the journal is still active.
+            os.kill(os.getppid(), signal.SIGKILL)
+        return 0
+    if args == ["daemon-reload"]:
+        call_number = state.get("daemon_reload_calls", 0) + 1
+        state["daemon_reload_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_daemon_reload")
+        if fail_nth is not None and call_number == int(fail_nth):
+            return 1
+        if _fail("daemon_reload"):
+            return 1
+        return 0
+    if args == ["show", "hubinet-ops", "--property=ActiveState", "--value"]:
+        call_number = state.get("service_state_probe_calls", 0) + 1
+        state["service_state_probe_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_service_state_probe")
+        fail_after = SCENARIO.get("fail_service_state_probe_after")
+        if (
+            _fail("service_state_probe")
+            or (fail_nth is not None and call_number == int(fail_nth))
+            or (fail_after is not None and call_number > int(fail_after))
+        ):
+            return 1
+        state_val = SCENARIO.get("service_state_override", entry.get("service", "inactive"))
+        if _fail("service_state_probe_malformed"):
+            state_val = "not-a-systemd-state"
+        _log("service-state", state_val)
+        sys.stdout.write(state_val + "\n")
+        return 0
+    if args == ["show", "hubinet-ops", "--property=UnitFileState", "--value"]:
+        call_number = state.get("service_enabled_probe_calls", 0) + 1
+        state["service_enabled_probe_calls"] = call_number
+        _save_state(state)
+        fail_nth = SCENARIO.get("fail_nth_service_enabled_probe")
+        if _fail("service_enabled_probe") or (
+            fail_nth is not None and call_number == int(fail_nth)
+        ):
+            return 1
+        unit_file_state = "enabled" if entry.get("service_enabled", False) else "disabled"
+        if _fail("service_enabled_probe_malformed"):
+            unit_file_state = "not-a-unit-file-state"
+        _log("unit-file-state", unit_file_state)
+        sys.stdout.write(unit_file_state + "\n")
+        return 0
     if args == ["is-active", "hubinet-ops"]:
         state_val = SCENARIO.get("service_active_override", entry.get("service", "inactive"))
         sys.stdout.write(state_val + "\n")
@@ -668,6 +1542,10 @@ def _exec_systemctl(vmid, args, state):
         return 0
     if args == ["status", "hubinet-ops-hostd"]:
         return 0 if SCENARIO.get("legacy_present", {}).get("hostd") else 1
+    if args == ["is-active", "nftables"]:
+        active = entry.get("nftables_active", False)
+        sys.stdout.write(("active" if active else "inactive") + "\n")
+        return 0 if active else 3
     if args[:1] == ["enable"] and "nftables" in args:
         return 0
     if args[:1] == ["restart"] and "nftables" in args:
@@ -852,6 +1730,47 @@ def _exec_curl(vmid, args):
         if _fail("backend_health"):
             return 7
         state = _load_state()
+        # "health_fail_first_n": N -- the first N health requests of this
+        # run get no answer, every later one succeeds. Deterministic
+        # (a persisted call counter, never a wall-clock sleep) simulation
+        # of the ordinary Type=simple readiness race: systemd reports the
+        # unit active as soon as the process is exec'd, which is strictly
+        # earlier than the moment uvicorn has bound 127.0.0.1:8787.
+        fail_first = SCENARIO.get("health_fail_first_n")
+        if fail_first is not None:
+            call_number = state.get("backend_health_calls", 0) + 1
+            state["backend_health_calls"] = call_number
+            _save_state(state)
+            if call_number <= int(fail_first):
+                return 7
+        # "health_stall_first_n": N (PR #65 correction pass 15, P1) -- the
+        # first N health requests of this run simulate a target that
+        # ACCEPTS the connection but stalls before sending a usable HTTP
+        # response: the exact shape an unbounded curl call could hang on
+        # forever. This fake never actually hangs (there is no real TCP
+        # connection to stall, and the hermetic suite must stay fast); it
+        # instead enforces the production CONTRACT this scenario exists to
+        # prove -- the caller must bound THIS request itself with
+        # `--max-time` -- and, only once that contract is met, reports
+        # curl's own real exit code for an expired transfer deadline (28,
+        # "Operation timeout"), deterministically via a persisted call
+        # counter, never a wall-clock sleep. A caller that regressed to an
+        # unbounded call gets a distinct, never-a-real-curl-exit-code (99)
+        # failure instead of this test hanging.
+        stall_first = SCENARIO.get("health_stall_first_n")
+        if stall_first is not None:
+            call_number = state.get("backend_health_calls", 0) + 1
+            state["backend_health_calls"] = call_number
+            _save_state(state)
+            if call_number <= int(stall_first):
+                if "--max-time" not in args:
+                    sys.stderr.write(
+                        "FAKE-CURL: health_stall_first_n requires the caller to pass "
+                        "its own --max-time; an unbounded curl call would hang here "
+                        "against a real stalled target\n"
+                    )
+                    return 99
+                return 28
         if not _firewall_permits_local_and_reply_traffic(vmid, state):
             # Simulates the packet being silently dropped by this CT's own
             # active firewall -- curl reports "no response" (exit 7),
@@ -1263,6 +2182,21 @@ def cmd_nft(args):
     return 2
 
 
+def cmd_cmp(args):
+    _log("cmp", *args)
+    if _fail("cmp_error"):
+        return 2
+    operands = [arg for arg in args if not arg.startswith("-")]
+    if len(operands) != 2:
+        return 2
+    try:
+        left = Path(operands[0]).read_bytes()
+        right = Path(operands[1]).read_bytes()
+    except OSError:
+        return 2
+    return 0 if left == right else 1
+
+
 DISPATCH = {
     "pct": cmd_pct,
     "pveum": cmd_pveum,
@@ -1270,6 +2204,7 @@ DISPATCH = {
     "pvesh": cmd_pvesh,
     "pvesm": cmd_pvesm,
     "dpkg": cmd_dpkg,
+    "cmp": cmd_cmp,
 }
 
 
@@ -1308,6 +2243,61 @@ class FakePveEnvironment:
 
     def state(self) -> dict[str, Any]:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def simulate_pve_ct_reboot(self, vmid: str) -> None:
+        """One bounded PVE-host/CT restart, over the state this fake already
+        tracks -- not a second reboot simulator.
+
+        Semantics, exactly the ones the updater's autostart guard depends on:
+
+        - the CT comes back RUNNING when its installation-time onboot flag
+          says so (bootstrap's final state is onboot=1, and the updater
+          never changes it);
+        - inside the CT, systemd boot-activates hubinet-ops IF AND ONLY IF
+          the unit file is currently ENABLED. A unit the updater disabled
+          for its mutation window stays inactive, so no half-swapped
+          app/venv/unit/helper/database state can ever auto-run;
+        - the container's /tmp is VOLATILE and comes back empty, exactly
+          as a real restarted CT's does (correction pass 7, P1). This
+          fake previously preserved it, which silently hid the updater's
+          dependence on run-owned /tmp helpers surviving a reboot.
+
+        Nothing else about the installation is invented here. Everything
+        durable survives the restart exactly as it was -- /opt rollback
+        and staged artifacts, /var/lib authority backups and data, and the
+        host-side updater journal, lock and helper artifacts -- which is
+        the whole point.
+        """
+        ct_tmp = self.ct_root / vmid / "tmp"
+        if ct_tmp.exists():
+            shutil.rmtree(ct_tmp)
+        ct_tmp.mkdir(parents=True)
+
+        state = self.state()
+        entry = state["vmids"].setdefault(vmid, {})
+        entry["started"] = str(entry.get("onboot", "1")) == "1"
+        # Correction pass 10, P1: boot activation is decided from the
+        # DURABLE enablement fact, not the in-kernel one -- a `systemctl
+        # enable`/`disable hubinet-ops` that never crossed its own CT
+        # filesystem barrier (sync -f /etc/systemd/system) is exactly as
+        # volatile as any other uncommitted namespace mutation this fake
+        # already discards on reboot (see the "sync" dispatcher above,
+        # which is what actually commits service_enabled into
+        # durable_service_enabled). Falls back to whatever service_enabled
+        # already is when no barrier has ever run for this vmid yet -- the
+        # ordinary case for every test whose fixture never exercises the
+        # updater's autostart guard at all, matching this fake's
+        # bootstrap-seeded default of a durably enabled installation.
+        durable_enabled = entry.get("durable_service_enabled", entry.get("service_enabled", False))
+        entry["service_enabled"] = durable_enabled
+        entry["service_enable_links"] = list(
+            entry.get("durable_service_enable_links", entry.get("service_enable_links", []))
+        )
+        if entry["started"] and durable_enabled:
+            entry["service"] = "active"
+        else:
+            entry["service"] = "inactive"
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
 
 def default_scenario() -> dict[str, Any]:
@@ -1360,7 +2350,7 @@ def default_scenario() -> dict[str, Any]:
     }
 
 
-_FAKE_COMMANDS = ("pct", "pveum", "pveam", "pvesh", "pvesm", "nft", "dpkg")
+_FAKE_COMMANDS = ("pct", "pveum", "pveam", "pvesh", "pvesm", "nft", "dpkg", "cmp")
 
 
 def build_minimal_source_checkout(tmp_path: Path, repo_root: Path) -> Path:

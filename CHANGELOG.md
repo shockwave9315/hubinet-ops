@@ -38,6 +38,17 @@ hostile administrator of the managed environment is out of scope. See
   non-destructive to workload packages: it may refresh package-manager metadata
   and run simulations, but never installs, upgrades, removes, autoremoves, or
   configures a workload package.
+- **In-place product updates.** `deploy/update-proxmox-0.5.sh` updates an
+  *existing* installation without destroying it: cross-verified ownership,
+  exact-plan classification and approval, staged activation with filesystem
+  rollback, and an explicit, backed-up authority-database reset only when the
+  target schema is incompatible (Home Assistant re-enrollment is required only
+  then). Fresh bootstrap remains first-install/disaster-recovery only.
+  Interrupted runs are recovered from a durable per-VMID journal: recovery
+  restores the run-owned authority helper (a real PVE/CT restart clears the
+  container's volatile `/tmp`) before entering rollback, and rollback is
+  replayable, so a second recovery after a partial rollback completes instead
+  of misreporting already-restored artifacts as corruption.
 
 Unchanged: PVE autodiscovery, dynamic backend inventory, the GET-only PVE
 runtime, source health/freshness behavior, the Home Assistant snapshot contract

@@ -80,11 +80,14 @@ PY
 
 echo "sandbox self-test: passed"
 
-# The actual bootstrap smoke suite -- the only test file that executes
-# deploy/bootstrap-proxmox-0.5.sh (against the hermetic fake-command PATH
-# from tests/_bootstrap_fake_pve.py, still never touching a real pct/
-# pveum/pveam/pvesh/pvesm/nft/network/PVE/HA endpoint even inside this
-# already-network-isolated container). This is the only place in the
-# repository this file is ever invoked from.
+# The actual bootstrap + in-place-update smoke suites -- the only test
+# files that execute deploy/bootstrap-proxmox-0.5.sh and
+# deploy/update-proxmox-0.5.sh (against the hermetic fake-command PATH
+# from tests/_bootstrap_fake_pve.py / tests/_update_fake_pve.py, still
+# never touching a real pct/pveum/pveam/pvesh/pvesm/nft/network/PVE/HA
+# endpoint even inside this already-network-isolated container). This is
+# the only place in the repository either file is ever invoked from.
 cd /repo
-python3 -m pytest -q /repo/tests/test_bootstrap_proxmox_0_5_smoke.py
+python3 -m pytest -q \
+  /repo/tests/test_bootstrap_proxmox_0_5_smoke.py \
+  /repo/tests/test_update_proxmox_0_5_smoke.py

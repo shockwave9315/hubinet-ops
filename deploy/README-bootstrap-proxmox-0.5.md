@@ -1,5 +1,12 @@
 # Automated Proxmox bootstrap
 
+**This is the first-install / disaster-recovery / deliberate-rebuild path
+only.** To update an *existing* Hubinet Ops installation in place, use
+`deploy/update-proxmox-0.5.sh` instead — see
+[`deploy/README-update-proxmox-0.5.md`](README-update-proxmox-0.5.md). Never
+re-run this bootstrap against an installation you want to preserve; it
+creates a fresh LXC and fresh identity every time.
+
 `deploy/bootstrap-proxmox-0.5.sh` provisions the whole Hubinet Ops backend on
 a Proxmox host: a fresh unprivileged Debian 13 LXC, the runtime deployed into
 it via `deploy/install-0.5.0-fresh.sh` (unmodified), a least-privilege PVE

@@ -54,6 +54,23 @@ Changes no runtime state -- this script only ever reads the
 already-published snapshot; see app/inventory/publication.py for the
 read side.
 
+The optional 4th argument (min-committed-sequence-exclusive) lets the
+in-place updater (deploy/lib/update-activate.sh) reuse this exact contract
+for a post-restart, DB-preserving acceptance check: it requires
+last_committed_run_sequence to exceed a caller-supplied floor, proving a
+genuine discovery cycle completed AFTER the restart. Immediately after
+restart the backend may legitimately still be publishing the OLD
+successful/healthy/fresh snapshot while the first new discovery collection
+is in flight -- an ordinary asynchronous-scheduler race, not a failure. So
+when the committed source is otherwise fully coherent and only
+last_committed_run_sequence has not yet cleared that floor, this script
+keeps polling within its existing bounded timeout instead of treating it as
+terminal; every other failure (a malformed outcome, a missing timestamp, a
+committed/current context mismatch, ...) remains an immediate, non-retryable
+FAIL regardless of the floor. See _check_committed_source and
+_committed_source_failure_is_transient below. A bootstrap call with no
+floor (the original 2/3-argument contract) is unaffected.
+
 Prints one final line to stdout: "PASS ..." or "FAIL <reason>", plus INFO
 lines for diagnostics. Exit code 0 only on a genuine PASS.
 """
@@ -117,11 +134,36 @@ def get_json(path: str, token: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _check_committed_source(source: dict) -> str | None:
+# The one TRANSIENT acceptance condition (correction pass 9, P1): the
+# committed source is otherwise fully coherent, but hasn't yet published a
+# discovery cycle past the caller's baseline sequence. See
+# _check_committed_source's docstring and _committed_source_failure_is_transient
+# below.
+_NOT_PAST_BASELINE_PREFIX = "committed-sequence-not-past-baseline"
+
+
+def _check_committed_source(source: dict, *, min_sequence_exclusive: int = 0) -> str | None:
     """Returns None if the source proves a genuinely committed, fresh,
     current success; otherwise a FAIL reason string (never raises -- the
     caller decides whether a given reason is worth continuing to poll
     for, e.g. simply not-yet-fresh, versus an immediate terminal stop).
+
+    Checks are ordered so that `_NOT_PAST_BASELINE_PREFIX` -- the one
+    TRANSIENT condition the in-place updater's post-restart, DB-preserving
+    acceptance check (deploy/lib/update-activate.sh) polls through -- is
+    evaluated LAST, only once every other coherence fact about the
+    committed source has already been proven. Immediately after a restart
+    the backend may legitimately still be publishing the OLD
+    successful/healthy/fresh snapshot while the first new discovery
+    collection is in flight; that is an ordinary asynchronous-scheduler
+    race, not a failure. This ordering guarantees the not-past-baseline
+    reason is returned if and only if the committed source is otherwise
+    fully coherent -- a malformed outcome, an invalid sequence type, a
+    missing timestamp, or a committed/current context mismatch is detected
+    and returned FIRST, and remains a terminal, non-retryable FAIL
+    regardless of where last_committed_run_sequence sits relative to any
+    floor. See main()'s own retry loop and
+    _committed_source_failure_is_transient below.
     """
     if source.get("latest_completed_outcome") != SUCCESSFUL_OUTCOME:
         return f"latest-completed-outcome-not-success got={source.get('latest_completed_outcome')!r}"
@@ -146,12 +188,38 @@ def _check_committed_source(source: dict) -> str | None:
                 f"committed={committed.get(field)!r} current={current.get(field)!r}"
             )
 
+    if min_sequence_exclusive and sequence <= min_sequence_exclusive:
+        return (
+            f"{_NOT_PAST_BASELINE_PREFIX} "
+            f"got={sequence!r} baseline={min_sequence_exclusive!r}"
+        )
+
     return None
 
 
+def _committed_source_failure_is_transient(reason: str) -> bool:
+    """True only for the one retryable acceptance condition -- see
+    _check_committed_source's docstring for why its ordering makes this
+    prefix check sufficient: every other reason it can return is terminal.
+    """
+    return reason.startswith(_NOT_PAST_BASELINE_PREFIX)
+
+
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("FAIL usage: hubinet-ops-bootstrap-accept.py <expected-display-name> <timeout-seconds>")
+    # A 4th, optional argument lets the in-place updater
+    # (deploy/lib/update-activate.sh) reuse this exact acceptance contract
+    # for a POST-UPDATE, DB-PRESERVING check instead of copying it: when
+    # given and > 0, the committed run sequence must exceed this floor,
+    # proving a genuine completed discovery cycle happened AFTER the
+    # update restarted the service, not merely that the pre-update state
+    # was still being reported. Omitted (or "0"), this is the original,
+    # unextended bootstrap contract -- any positive sequence passes,
+    # exactly as before.
+    if len(sys.argv) not in (3, 4):
+        print(
+            "FAIL usage: hubinet-ops-bootstrap-accept.py <expected-display-name> "
+            "<timeout-seconds> [min-committed-sequence-exclusive]"
+        )
         return 1
     expected_display_name = sys.argv[1]
     try:
@@ -159,6 +227,16 @@ def main() -> int:
     except ValueError:
         print("FAIL invalid timeout-seconds argument")
         return 1
+    min_committed_sequence_exclusive = 0
+    if len(sys.argv) == 4:
+        try:
+            min_committed_sequence_exclusive = int(sys.argv[3])
+        except ValueError:
+            print("FAIL invalid min-committed-sequence-exclusive argument")
+            return 1
+        if min_committed_sequence_exclusive < 0:
+            print("FAIL invalid min-committed-sequence-exclusive argument")
+            return 1
 
     try:
         token = read_bearer_token()
@@ -209,10 +287,28 @@ def main() -> int:
                 # PASS on it.
                 last_health = f"healthy/{source.get('freshness')}"
             else:
-                committed_check_failure = _check_committed_source(source)
-                if committed_check_failure is not None:
+                committed_check_failure = _check_committed_source(
+                    source, min_sequence_exclusive=min_committed_sequence_exclusive
+                )
+                if committed_check_failure is not None and not _committed_source_failure_is_transient(
+                    committed_check_failure
+                ):
                     print(f"FAIL {committed_check_failure}")
                     return 1
+                if committed_check_failure is not None:
+                    # NOT YET, not INVALID: the committed source is
+                    # otherwise fully coherent, it simply has not published
+                    # a discovery cycle past the caller's baseline sequence
+                    # yet -- keep polling within the SAME bounded deadline
+                    # below (correction pass 9, P1). No second timeout is
+                    # invented, and a bootstrap call with no floor can never
+                    # reach this branch (min_sequence_exclusive is 0).
+                    last_health = f"healthy/fresh ({committed_check_failure})"
+                    if time.monotonic() >= deadline:
+                        print(f"FAIL discovery-timeout last_health={last_health}")
+                        return 1
+                    time.sleep(POLL_INTERVAL_SECONDS)
+                    continue
 
                 nodes = snapshot.get("nodes")
                 if not isinstance(nodes, list) or len(nodes) == 0:
