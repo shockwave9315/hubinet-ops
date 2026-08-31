@@ -1412,7 +1412,14 @@ def _exec_systemctl(vmid, args, state):
         state["service_autostart_reenable_calls"] = call_number
         _save_state(state)
         if _fail("service_autostart_reenable"):
-            return 1
+            # "service_autostart_reenable_exit_code": N (PR #65 correction
+            # pass 15, P3) -- a distinctive nonzero exit rather than a
+            # generic 1, so a test can prove _update_restore_service_
+            # autostart's diagnostic captures the REAL underlying command
+            # status (not the exit status of a negated `! cmd` compound
+            # condition, which is always 0 in that branch regardless of
+            # what the command actually returned).
+            return int(SCENARIO.get("service_autostart_reenable_exit_code", 1))
         # PR #65 correction pass 14, P2: there is deliberately no
         # "service_autostart_reenable_noop_success" seam here (a `reenable`
         # that reports success while never actually resetting the links).
@@ -1736,6 +1743,34 @@ def _exec_curl(vmid, args):
             _save_state(state)
             if call_number <= int(fail_first):
                 return 7
+        # "health_stall_first_n": N (PR #65 correction pass 15, P1) -- the
+        # first N health requests of this run simulate a target that
+        # ACCEPTS the connection but stalls before sending a usable HTTP
+        # response: the exact shape an unbounded curl call could hang on
+        # forever. This fake never actually hangs (there is no real TCP
+        # connection to stall, and the hermetic suite must stay fast); it
+        # instead enforces the production CONTRACT this scenario exists to
+        # prove -- the caller must bound THIS request itself with
+        # `--max-time` -- and, only once that contract is met, reports
+        # curl's own real exit code for an expired transfer deadline (28,
+        # "Operation timeout"), deterministically via a persisted call
+        # counter, never a wall-clock sleep. A caller that regressed to an
+        # unbounded call gets a distinct, never-a-real-curl-exit-code (99)
+        # failure instead of this test hanging.
+        stall_first = SCENARIO.get("health_stall_first_n")
+        if stall_first is not None:
+            call_number = state.get("backend_health_calls", 0) + 1
+            state["backend_health_calls"] = call_number
+            _save_state(state)
+            if call_number <= int(stall_first):
+                if "--max-time" not in args:
+                    sys.stderr.write(
+                        "FAKE-CURL: health_stall_first_n requires the caller to pass "
+                        "its own --max-time; an unbounded curl call would hang here "
+                        "against a real stalled target\n"
+                    )
+                    return 99
+                return 28
         if not _firewall_permits_local_and_reply_traffic(vmid, state):
             # Simulates the packet being silently dropped by this CT's own
             # active firewall -- curl reports "no response" (exit 7),

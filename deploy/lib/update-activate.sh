@@ -159,14 +159,30 @@ _update_wait_until_service_stopped() {
 # not going to make it active by being waited on -- so that state returns
 # early instead of burning the whole deadline. `activating`/`inactive` are
 # ordinary transitional answers during a start and are simply retried.
+#
+# The health request itself must be bounded (PR #65 correction pass 15,
+# P1). A bounded OUTER loop does not by itself bound an unbounded INNER
+# curl: if the target accepts the TCP connection but stalls before
+# sending a usable HTTP response, an unbounded `curl` blocks this call
+# forever, the outer loop never regains control to re-check its deadline,
+# and "bounded readiness" is false. `--max-time` gives curl its own
+# transfer deadline -- computed fresh each iteration as whatever remains
+# of THIS SAME BOOTSTRAP_SERVICE_TIMEOUT_SECONDS budget, never a second,
+# independent timeout -- so the outer deadline and the inner request
+# describe exactly one bounded budget, never two stacked ones. Elapsed
+# time is real wall-clock time (bash's own $SECONDS), not a fixed
+# per-iteration counter, because a bounded curl call can itself now
+# legitimately consume several seconds of the budget.
 _update_wait_until_service_active_and_healthy() {
-  local waited=0 state="" health_body=""
-  while (( waited < BOOTSTRAP_SERVICE_TIMEOUT_SECONDS )); do
+  local start_seconds="${SECONDS}" elapsed=0 state="" health_body="" remaining
+  while (( elapsed < BOOTSTRAP_SERVICE_TIMEOUT_SECONDS )); do
     state="$(pct exec "${VMID}" -- systemctl is-active hubinet-ops 2>/dev/null || true)"
     if [[ "${state}" == "active" ]]; then
-      health_body="$(pct exec "${VMID}" -- curl -fsS "http://127.0.0.1:8787/r0/v1/health" 2>/dev/null || true)"
+      remaining=$(( BOOTSTRAP_SERVICE_TIMEOUT_SECONDS - elapsed ))
+      (( remaining < 1 )) && remaining=1
+      health_body="$(pct exec "${VMID}" -- curl -fsS --max-time "${remaining}" "http://127.0.0.1:8787/r0/v1/health" 2>/dev/null || true)"
       if [[ -n "${health_body}" ]]; then
-        _UPDATE_SERVICE_READINESS_DETAIL="active and healthy after ${waited}s"
+        _UPDATE_SERVICE_READINESS_DETAIL="active and healthy after ${elapsed}s"
         return 0
       fi
       _UPDATE_SERVICE_READINESS_DETAIL="active, but the unauthenticated health probe has not answered yet"
@@ -177,7 +193,7 @@ _update_wait_until_service_active_and_healthy() {
       _UPDATE_SERVICE_READINESS_DETAIL="last service state: ${state:-unknown}"
     fi
     sleep 1
-    waited=$(( waited + 1 ))
+    elapsed=$(( SECONDS - start_seconds ))
   done
   return 1
 }
@@ -341,13 +357,21 @@ _update_restore_service_autostart() {
     reenable) cmd="reenable" ;;
     *) die "internal error: unsupported autostart-restore mode '${mode}'" ;;
   esac
-  if ! run_logged pct exec "${VMID}" -- systemctl "${cmd}" hubinet-ops; then
-    rc=$?
+  # PR #65 correction pass 15, P3: the real command status must be
+  # captured BEFORE any negation -- `if ! run_logged ...; then rc=$?; fi`
+  # reads `$?` from the NEGATED `!` compound condition, which is always 0
+  # inside that branch, not the underlying systemctl command's own exit
+  # status. The safety behavior this guards (reenable fails closed on any
+  # nonzero) was already correct; only the diagnostic was false. This
+  # `&&`/`||` form (same idiom as _update_probe_service_state above)
+  # captures the real status either way and never trips `set -e`.
+  run_logged pct exec "${VMID}" -- systemctl "${cmd}" hubinet-ops && rc=0 || rc=$?
+  if (( rc != 0 )); then
     if [[ "${mode}" == "reenable" ]]; then
       _UPDATE_SERVICE_ENABLED_DETAIL="systemctl reenable returned failure (exit ${rc}); a pre-existing enabled unit-file state is never accepted as proof the stale enablement links were actually reset"
       return 1
     fi
-    log_warn "the systemctl ${cmd} request for hubinet-ops returned failure inside container ${VMID}; proving the actual unit-file state before deciding"
+    log_warn "the systemctl ${cmd} request for hubinet-ops returned failure (exit ${rc}) inside container ${VMID}; proving the actual unit-file state before deciding"
   fi
   if _update_probe_service_enabled; then
     log_info "hubinet-ops boot activation is restored (unit-file state: enabled)"
@@ -953,22 +977,22 @@ _update_finish_summary() {
   _update_test_term_checkpoint after_completed_checkpoint
 
   # Success: clean up rollback material and staged leftovers -- nothing
-  # here is managed state a future update depends on.
-  pct exec "${VMID}" -- rm -rf \
-    "/opt/hubinet-ops/app.rollback-${UPDATE_RUN_ID}" \
-    "/opt/hubinet-ops/.venv.rollback-${UPDATE_RUN_ID}" \
-    "/opt/hubinet-ops/requirements.txt.rollback-${UPDATE_RUN_ID}" \
-    "/etc/systemd/system/hubinet-ops.service.rollback-${UPDATE_RUN_ID}" \
-    "/opt/hubinet-ops/.hubinet-source-commit.rollback-${UPDATE_RUN_ID}" \
-    "${UPDATE_CT_SOURCE_DIR}" \
-    >/dev/null 2>&1 || true
-  if [[ "${UPDATE_HELPER_CHANGED}" == "1" ]]; then
-    rm -f "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" 2>/dev/null || true
-  fi
-  _update_cleanup_plan_tools
+  # here is managed state a future update depends on. PR #65 correction
+  # pass 15, P2: this is now the SAME strict, idempotent, run-owned
+  # cleanup startup recovery already performs for a completed/recovered
+  # journal (_update_cleanup_recovered_run_artifacts), not a second,
+  # divergent, best-effort ("|| true") cleanup contract -- and every step
+  # in it is load-bearing: a failure hard-stops (exit 1) with the
+  # `completed` journal already durable on disk. The EXIT trap's terminal-
+  # checkpoint rule (see update-proxmox-0.5.sh) means that is NEVER
+  # reinterpreted as permission to roll back -- the next invocation's
+  # existing startup-recovery `completed` path (update_startup_recovery_
+  # gate) re-proves enabled+active+healthy, retries this exact cleanup,
+  # and only then clears the journal. `completed` must never mean
+  # "rollback material may or may not still be lying around forever".
+  _update_cleanup_recovered_run_artifacts
   # Test-only (correction pass 13, P1): exercise a real TERM here, after
-  # SOME rollback artifacts are already destroyed but before the journal
-  # is cleared.
+  # cleanup has fully run but before the journal is cleared.
   _update_test_term_checkpoint after_completed_partial_cleanup
   _update_journal_clear
 

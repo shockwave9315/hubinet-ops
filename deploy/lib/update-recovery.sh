@@ -343,19 +343,57 @@ _update_rollback_boundary_crossed() {
 # merely active-and-healthy but still disabled would silently fail to come
 # back after the next PVE/CT restart, so it is never a recovered,
 # completed, or untouched state.
+#
+# PR #65 correction pass 15, P2: the active+health half of this proof used
+# to be a ONE-SHOT request, not a bounded poll. hubinet-ops.service is
+# Type=simple, so systemd reports `active` as soon as the process is
+# exec'd -- strictly earlier than the moment uvicorn has actually bound
+# 127.0.0.1:8787. After a genuine PVE/CT reboot that race is entirely
+# ordinary, and a one-shot probe fired at exactly the wrong instant would
+# hard-stop startup recovery (or block resolving an already-accepted
+# `completed`/`recovered` journal) even though the service becomes healthy
+# moments later. Enablement is checked FIRST and remains a single
+# positive probe -- it is a static fact about a unit-file symlink, not
+# something that becomes true by being waited on, and UNKNOWN/DISABLED
+# must fail closed immediately rather than spend any of the readiness
+# budget below. Only once enablement is proven does this reuse the exact
+# same bounded systemd-active + HTTP-health poll (against the same
+# existing BOOTSTRAP_SERVICE_TIMEOUT_SECONDS, itself now bounding its own
+# inner curl request -- see _update_wait_until_service_active_and_healthy)
+# that forward target activation and rollback already use, rather than a
+# third, independent readiness implementation.
 _update_prove_service_enabled_active_and_healthy() {
-  local state health_body
   _update_probe_service_enabled || return 1
-  state="$(pct exec "${VMID}" -- systemctl is-active hubinet-ops 2>/dev/null || true)"
-  [[ "${state}" == "active" ]] || return 1
-  health_body="$(pct exec "${VMID}" -- curl -fsS "http://127.0.0.1:8787/r0/v1/health" 2>/dev/null || true)"
-  [[ -n "${health_body}" ]]
+  _update_wait_until_service_active_and_healthy
 }
 
 # Removes only paths deterministically owned by the loaded run-id. This is
 # called only after either rollback restored and proved the old service, or
-# a completed/recovered record already proves coherence.
+# a completed/recovered record already proves coherence -- including,
+# since PR #65 correction pass 15 (P2), from _update_finish_summary itself
+# on the ordinary forward-success path, so a `completed` run's cleanup and
+# a later recovery replay's cleanup are the exact same strict, idempotent
+# contract rather than two divergent ones.
+#
+# Every step below is load-bearing: a failure hard-stops (preserving the
+# durable journal and every remaining artifact for the next invocation's
+# replay) rather than logging and continuing, so a `completed`/`recovered`
+# journal is only ever cleared once every run-owned artifact it still
+# references has actually been proven removed.
+#
+# HUBINET_OPS_TEST_FAIL_CT_CLEANUP / HUBINET_OPS_TEST_FAIL_CT_PLAN_TOOL_
+# CLEANUP / HUBINET_OPS_TEST_FAIL_HOST_CLEANUP, consulted only when
+# HUBINET_OPS_TEST_MODE=1, are narrow test-only fault-injection seams
+# (the same convention as HUBINET_OPS_TEST_FAIL_JOURNAL_CLEAR/
+# HUBINET_OPS_TEST_FAIL_HOST_SYNC above) letting the hermetic test suite
+# exercise each of this function's three independent failure points --
+# and their idempotent replay on a later invocation -- without depending
+# on real filesystem/transport faults. Inert whenever HUBINET_OPS_TEST_
+# MODE is not "1", so production behavior is always the real commands.
 _update_cleanup_recovered_run_artifacts() {
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" && "${HUBINET_OPS_TEST_FAIL_CT_CLEANUP:-0}" == "1" ]]; then
+    _update_rollback_hard_stop "could not remove run-owned staged/rollback artifacts for interrupted run ${UPDATE_RUN_ID} (simulated test failure)"
+  fi
   pct exec "${VMID}" -- rm -rf \
     "${UPDATE_CT_SOURCE_TARBALL}" \
     "${UPDATE_CT_SOURCE_DIR}" \
@@ -371,9 +409,23 @@ _update_cleanup_recovered_run_artifacts() {
     "/opt/hubinet-ops/.hubinet-source-commit.rollback-${UPDATE_RUN_ID}" \
     >/dev/null 2>&1 \
     || _update_rollback_hard_stop "could not remove run-owned staged/rollback artifacts for interrupted run ${UPDATE_RUN_ID}"
-  pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" "${UPDATE_PROBE_CT_PATH}" \
-    /tmp/hubinet-ops-update-venv-stage.py >/dev/null 2>&1 \
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" && "${HUBINET_OPS_TEST_FAIL_CT_PLAN_TOOL_CLEANUP:-0}" == "1" ]]; then
+    _update_rollback_hard_stop "could not remove run-owned planning/staging tools for interrupted run ${UPDATE_RUN_ID} (simulated test failure)"
+  fi
+  pct exec "${VMID}" -- rm -f "${UPDATE_TOOL_CT_PATH}" "${UPDATE_PROBE_CT_PATH}" >/dev/null 2>&1 \
     || _update_rollback_hard_stop "could not remove run-owned planning/staging tools for interrupted run ${UPDATE_RUN_ID}"
+  # The virtualenv build helper is only ever pushed when requirements
+  # actually changed (_update_stage_venv_builder) -- a code-only update
+  # never creates it, so this stays bounded to runs that could plausibly
+  # have it, rather than issuing an unconditional no-op `rm -f` against a
+  # path this run never touched.
+  if [[ "${UPDATE_REQUIREMENTS_CHANGED:-0}" == "1" ]]; then
+    pct exec "${VMID}" -- rm -f /tmp/hubinet-ops-update-venv-stage.py >/dev/null 2>&1 \
+      || _update_rollback_hard_stop "could not remove the run-owned virtualenv build helper for interrupted run ${UPDATE_RUN_ID}"
+  fi
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" && "${HUBINET_OPS_TEST_FAIL_HOST_CLEANUP:-0}" == "1" ]]; then
+    _update_rollback_hard_stop "could not remove host-side run-owned helper artifacts for interrupted run ${UPDATE_RUN_ID} (simulated test failure)"
+  fi
   rm -f -- "${UPDATE_HELPER_STAGED_HOST_PATH}" \
     "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" \
     "${UPDATE_HELPER_HOST_PATH}.restore-tmp-${UPDATE_RUN_ID}" \
@@ -450,7 +502,7 @@ update_startup_recovery_gate() {
 
   if [[ "${UPDATE_JOURNAL_STATE}" == "completed" || "${UPDATE_JOURNAL_STATE}" == "recovered" ]]; then
     _update_prove_service_enabled_active_and_healthy \
-      || _update_rollback_hard_stop "run ${UPDATE_RUN_ID} was durably marked ${UPDATE_JOURNAL_STATE}, but VMID ${VMID} does not now prove enabled + active + healthy"
+      || _update_rollback_hard_stop "run ${UPDATE_RUN_ID} was durably marked ${UPDATE_JOURNAL_STATE}, but VMID ${VMID} does not now prove enabled + active + healthy within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (enabled: ${_UPDATE_SERVICE_ENABLED_DETAIL}; readiness: ${_UPDATE_SERVICE_READINESS_DETAIL})"
     update_journal_resolve "${UPDATE_JOURNAL_STATE}"
     _UPDATE_STARTUP_RECOVERY_IN_PROGRESS="0"
     log_warn "previous updater run ${UPDATE_RUN_ID} was already ${detected_state}; final cleanup is complete. Rerun the requested update."

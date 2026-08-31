@@ -2641,6 +2641,111 @@ class TestForwardTargetHealthReadinessP2:
 
 
 # ---------------------------------------------------------------------------
+# Correction pass 15, P1 -- a BOUNDED readiness loop does not by itself
+# bound an UNBOUNDED inner curl call. If the target accepts the TCP
+# connection but stalls before sending a usable HTTP response, an
+# unbounded curl blocks the outer loop's own deadline check forever.
+# Every health request _update_wait_until_service_active_and_healthy
+# issues must carry its own `--max-time`, computed as whatever remains of
+# the SAME BOOTSTRAP_SERVICE_TIMEOUT_SECONDS budget -- never a second,
+# independent timeout.
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedHealthRequestP1:
+    def test_production_health_request_always_carries_max_time(self, tmp_path):
+        # D: static proof the actual curl invocation is bounded, on an
+        # ordinary successful run (both the target and, incidentally, any
+        # acceptance-time probe).
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-max-time-present", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        curl_health_lines = [
+            line
+            for line in env.log_lines()
+            if "curl" in line and "/r0/v1/health" in line
+        ]
+        assert curl_health_lines, "expected at least one health curl invocation"
+        assert all("--max-time" in line for line in curl_health_lines)
+
+    def test_target_health_stall_recovers_within_the_same_deadline(self, tmp_path):
+        # Delayed-success regression: the first few health requests stall
+        # (TCP accepted, no usable response) and are bounded by --max-time;
+        # a later request inside the SAME deadline succeeds.
+        env = seed_installed_environment(
+            tmp_path, scenario_overrides={"health_stall_first_n": 3}
+        )
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "10"
+        target = build_update_target_checkout(tmp_path / "target-stall-then-ready", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert "FAKE-CURL" not in result.stderr
+        assert env.state()["backend_health_calls"] == 4
+        assert "target HTTP readiness: systemd active and health endpoint ready" in result.stderr
+
+    def test_target_health_stall_past_deadline_is_bounded_and_hard_stops(self, tmp_path):
+        # Stalled-request regression: the health endpoint NEVER answers
+        # usefully, for either the target OR the restored old service (a
+        # persistent network-level stall, not something rolling back code
+        # can fix). Without --max-time this would hang the FIRST bounded
+        # loop forever; with it, that deadline is reached in bounded time
+        # and rollback is attempted -- which then, correctly, also cannot
+        # prove the restored old service healthy within ITS OWN bounded
+        # deadline, and hard-stops preserving the active journal (exactly
+        # test_health_never_ready_hard_stops_and_retains_every_artifact's
+        # existing shape). The witness this test exists for is that BOTH
+        # bounded waits actually terminate -- neither one hangs the
+        # process -- not that rollback can magically fix a stalled network.
+        env = seed_installed_environment(
+            tmp_path, scenario_overrides={"health_stall_first_n": 999}
+        )
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "3"
+        target = build_update_target_checkout(tmp_path / "target-stall-forever", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "FAKE-CURL" not in result.stderr
+        assert "did not prove systemd active AND answer" in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=active" in journal.read_text(encoding="utf-8")
+
+    def test_rollback_health_stall_recovers_within_the_same_deadline(self, tmp_path):
+        # Same bounded contract on the ROLLBACK side: forward activation is
+        # forced to fail post-start (via acceptance), and the restored old
+        # service's own readiness poll must survive a stalled request too.
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "health_stall_first_n": 3,
+            },
+        )
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "10"
+        target = build_update_target_checkout(tmp_path / "target-rollback-stall-then-ready", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "FAKE-CURL" not in result.stderr
+        assert "rollback complete" in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in result.stderr
+        assert env.state()["backend_health_calls"] >= 4
+
+    # A permanent (never-succeeds) stall necessarily affects the FIRST
+    # bounded wait it reaches -- forward target activation, since that
+    # runs before Phase U5/acceptance can ever trigger a rollback -- so
+    # that bounded-hard-stop witness is test_target_health_stall_past_
+    # deadline_is_bounded_and_hard_stops above, not a rollback-specific
+    # scenario; this fake's stall counter has no way to target "only the
+    # restored old service's own calls" while leaving the target's calls
+    # unaffected.
+
+
+# ---------------------------------------------------------------------------
 # Correction pass 8, P2 -- a REPLAYED unit rollback must still reload
 # systemd. "The old unit file is back on the live path" is a fact about the
 # filesystem and is never proof that the systemd MANAGER stopped holding
@@ -3707,6 +3812,239 @@ class TestTerminalCheckpointNeverRollsBack:
 
 
 # ---------------------------------------------------------------------------
+# Correction pass 15, P2 -- the `completed` journal must survive until
+# every run-owned cleanup operation this run's own terminal cleanup
+# performs has actually succeeded (_update_cleanup_recovered_run_
+# artifacts, now reused by _update_finish_summary instead of a second,
+# divergent "|| true" cleanup). A cleanup failure here is NEVER silently
+# swallowed: it hard-stops with the completed journal still durable, and
+# the next invocation's existing startup-recovery `completed` path
+# retries the exact same cleanup and only then clears the journal.
+# ---------------------------------------------------------------------------
+
+
+class TestCompletedCleanupStrictBeforeJournalClear:
+    def test_ct_cleanup_failure_retains_journal_and_replay_finishes_it(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="7" * 40)
+        env_with_fault = dict(env.env, HUBINET_OPS_TEST_FAIL_CT_CLEANUP="1")
+        target = build_update_target_checkout(tmp_path / "target-ct-cleanup-fail", REPO_ROOT)
+
+        first = _run(env_with_fault, _base_args(target))
+        assert first.returncode != 0
+        assert "rollback complete" not in first.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" in first.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+        # The target is fully accepted and live, and the leftover rollback
+        # artifact this run's cleanup could not remove is still there,
+        # proving cleanup really failed rather than being skipped.
+        assert (
+            "Fake target store.py"
+            in env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py")
+        )
+        assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+
+        # A later invocation (fault cleared) resolves the surviving
+        # `completed` journal through the existing startup-recovery path:
+        # re-proves enabled+active+healthy, retries the SAME strict
+        # cleanup, removes the leftover, and only then clears the journal.
+        second = _run(env.env, _base_args(target))
+        assert second.returncode == 0, second.stderr
+        assert "was already" in second.stderr
+        assert not journal.exists()
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+
+    def test_host_helper_cleanup_failure_retains_journal_and_replay_finishes_it(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="8" * 40, installed_helper_text=OLD_HELPER_TEXT
+        )
+        env_with_fault = dict(env.env, HUBINET_OPS_TEST_FAIL_HOST_CLEANUP="1")
+        target = build_update_target_checkout(
+            tmp_path / "target-host-cleanup-fail", REPO_ROOT, helper_text=NEW_HELPER_TEXT
+        )
+
+        first = _run(env_with_fault, _base_args(target))
+        assert first.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in first.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+        helper_live = _helper_host_path(env)
+        assert helper_live.read_text(encoding="utf-8") == NEW_HELPER_TEXT
+        # The CT-side steps (this fault is the LAST of the three cleanup
+        # steps) already fully succeeded -- only the host-side leftover
+        # survives.
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert list(helper_live.parent.glob(f"{helper_live.name}.rollback-*"))
+
+        second = _run(env.env, _base_args(target))
+        assert second.returncode == 0, second.stderr
+        assert "was already" in second.stderr
+        assert not journal.exists()
+        assert not list(helper_live.parent.glob(f"{helper_live.name}.rollback-*"))
+
+    def test_partial_cleanup_then_later_step_fails_replay_finishes_remaining(self, tmp_path):
+        # Some cleanup already succeeded (CT rollback/staged artifacts and
+        # planning tools), a LATER step fails (the host-side helper) -- the
+        # journal is retained, and a replay idempotently finishes only
+        # what remains rather than re-doing (or falsely re-failing on)
+        # what is already gone.
+        env = seed_installed_environment(
+            tmp_path, installed_source_sha="9" * 40, installed_helper_text=OLD_HELPER_TEXT
+        )
+        env_with_fault = dict(env.env, HUBINET_OPS_TEST_FAIL_HOST_CLEANUP="1")
+        target = build_update_target_checkout(
+            tmp_path / "target-partial-cleanup", REPO_ROOT, helper_text=NEW_HELPER_TEXT
+        )
+
+        first = _run(env_with_fault, _base_args(target))
+        assert first.returncode != 0
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob(".venv.rollback-*"))
+        helper_live = _helper_host_path(env)
+        assert list(helper_live.parent.glob(f"{helper_live.name}.rollback-*"))
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+
+        second = _run(env.env, _base_args(target))
+        assert second.returncode == 0, second.stderr
+        assert not journal.exists()
+        assert not list(helper_live.parent.glob(f"{helper_live.name}.rollback-*"))
+
+    def test_ordinary_successful_update_still_clears_journal_immediately(self, tmp_path):
+        # Negative control: the strict cleanup contract changes nothing
+        # about the ordinary success case -- the journal is gone after a
+        # single successful invocation, no replay required.
+        env = seed_installed_environment(tmp_path, installed_source_sha="b" * 40)
+        target = build_update_target_checkout(tmp_path / "target-ordinary-cleanup", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+
+
+def _override_scenario(env, **overrides):
+    scenario = json.loads(env.scenario_path.read_text(encoding="utf-8"))
+    scenario.update(overrides)
+    env.scenario_path.write_text(json.dumps(scenario), encoding="utf-8")
+
+
+def _reset_health_call_counter(env):
+    state = env.state()
+    state["backend_health_calls"] = 0
+    env.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Correction pass 15, P2/finding #3 -- terminal (`completed`/`recovered`)
+# startup recovery must use the SAME bounded systemd-active + HTTP-health
+# poll as forward activation and rollback, not a one-shot proof
+# (_update_prove_service_enabled_active_and_healthy now reuses
+# _update_wait_until_service_active_and_healthy after a single positive
+# enablement probe). After a genuine PVE/CT reboot, systemd reports the
+# Type=simple unit `active` strictly before uvicorn has bound its port --
+# exactly the same ordinary readiness race already corrected on the
+# forward/rollback paths; a one-shot probe fired at the wrong instant
+# would hard-stop resolving an already-accepted `completed` journal.
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalReadinessBoundedReuseP2:
+    def test_completed_journal_survives_reboot_with_delayed_health(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="c" * 40)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_completed_checkpoint")
+        target = build_update_target_checkout(tmp_path / "target-terminal-reboot-delay", REPO_ROOT)
+
+        interrupted = _run(env_with_term, _base_args(target))
+        assert interrupted.returncode == 143
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        rebooted = env.state()["vmids"][FAKE_VMID]
+        # systemd reports `active` immediately (Type=simple) -- strictly
+        # before uvicorn has necessarily answered its own health endpoint.
+        assert rebooted["service"] == "active"
+        assert rebooted["service_enabled"] is True
+
+        _reset_health_call_counter(env)
+        _override_scenario(env, health_fail_first_n=3)
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "10"
+
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "was already" in recovered.stderr
+        assert env.state()["backend_health_calls"] == 4
+        assert not journal.exists()
+
+    def test_completed_journal_survives_reboot_with_stalled_health(self, tmp_path):
+        # Same race, but through the bounded --max-time contract (finding
+        # #1) rather than an ordinary connection-refused retry.
+        env = seed_installed_environment(tmp_path, installed_source_sha="1234" * 10)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_completed_checkpoint")
+        target = build_update_target_checkout(tmp_path / "target-terminal-reboot-stall", REPO_ROOT)
+
+        interrupted = _run(env_with_term, _base_args(target))
+        assert interrupted.returncode == 143
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        _reset_health_call_counter(env)
+        _override_scenario(env, health_stall_first_n=3)
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "10"
+
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "FAKE-CURL" not in recovered.stderr
+        assert env.state()["backend_health_calls"] == 4
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+    def test_completed_journal_health_never_ready_after_reboot_hard_stops_and_retains_journal(
+        self, tmp_path
+    ):
+        env = seed_installed_environment(tmp_path, installed_source_sha="5678" * 10)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_completed_checkpoint")
+        target = build_update_target_checkout(tmp_path / "target-terminal-reboot-dead", REPO_ROOT)
+
+        interrupted = _run(env_with_term, _base_args(target))
+        assert interrupted.returncode == 143
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        _override_scenario(env, fail=["backend_health"])
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "3"
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "does not now prove enabled + active + healthy" in result.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+
+    def test_completed_journal_systemd_failed_after_reboot_is_terminal_hard_stop(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="9abc" * 10)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_completed_checkpoint")
+        target = build_update_target_checkout(tmp_path / "target-terminal-reboot-failed", REPO_ROOT)
+
+        interrupted = _run(env_with_term, _base_args(target))
+        assert interrupted.returncode == 143
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        _override_scenario(env, service_active_override="failed")
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
 # AG. PR #65 correction pass 13, P2 -- the interrupted-update journal
 #     validator must accept every run-id shape the shared
 #     bootstrap-common.sh::_generate_run_id can actually produce, including
@@ -3958,6 +4296,34 @@ class TestRollbackResetsStaleEnablementLinks:
             {"graphical.target.wants/hubinet-ops.service", "hubinet-target.service"}
         )
         assert post["service"] != "active"
+
+    def test_reenable_failure_diagnostic_reports_the_real_distinctive_exit_status(self, tmp_path):
+        # PR #65 correction pass 15, P3 -- `if ! run_logged ...; then
+        # rc=$?; fi` read `$?` from the NEGATED `!` compound condition
+        # (always 0 in that branch), not the underlying `systemctl
+        # reenable`'s own exit status. The safety behavior was already
+        # correct (fail closed on any nonzero); only the diagnostic was
+        # false. A distinctive, non-generic exit code proves the real
+        # status is now captured and surfaced.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="f" * 40,
+            installed_unit_text=self.OLD_UNIT,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["service_autostart_reenable"],
+                "service_autostart_reenable_exit_code": 17,
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-reenable-distinctive-rc", REPO_ROOT, unit_text=self.NEW_UNIT
+        )
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "exit 17" in result.stderr
+        assert "rollback complete" not in result.stderr
 
     def test_unchanged_unit_rollback_never_calls_reenable(self, tmp_path):
         env = seed_installed_environment(
