@@ -163,6 +163,10 @@ _update_classify_requirements() {
   if _update_files_differ_exact "${installed_tmp}" "${target_tmp}"; then
     UPDATE_REQUIREMENTS_CHANGED="1"
   fi
+  # The exact installed bytes used above are also the immutable
+  # invocation-local plan-fence baseline. Never re-read the live file to
+  # manufacture a second baseline after the operator has seen the plan.
+  UPDATE_PLAN_FENCE_REQUIREMENTS_TMP="${installed_tmp}"
 }
 
 _update_classify_unit() {
@@ -175,6 +179,7 @@ _update_classify_unit() {
   if _update_files_differ_exact "${installed_tmp}" "${target_tmp}"; then
     UPDATE_UNIT_CHANGED="1"
   fi
+  UPDATE_PLAN_FENCE_UNIT_TMP="${installed_tmp}"
 }
 
 _update_classify_helper() {
@@ -188,6 +193,7 @@ _update_classify_helper() {
   if _update_files_differ_exact "${installed_tmp}" "${target_tmp}"; then
     UPDATE_HELPER_CHANGED="1"
   fi
+  UPDATE_PLAN_FENCE_HELPER_TMP="${installed_tmp}"
 }
 
 # _update_target_authority_schema: a static, non-executing read of the
@@ -327,11 +333,19 @@ update_plan_classify() {
   _update_classify_helper
   _update_classify_authority
   _update_pre_probe
+  _update_capture_plan_fence_from_classification
 
   log_pass "classification complete"
 }
 
 update_plan_print() {
+  local requirements_plan
+  if [[ "${UPDATE_REQUIREMENTS_CHANGED}" == "1" ]]; then
+    requirements_plan="changed -- service is stopped; current virtualenv is preserved for rollback; target virtualenv is built at the FINAL live path /opt/hubinet-ops/.venv; pip installs the exact target requirements DURING the maintenance window (which can extend downtime); activation failure restores the prior environment"
+  else
+    requirements_plan="unchanged -- existing virtualenv is preserved; no virtualenv rebuild or pip/dependency installation occurs"
+  fi
+
   cat <<PLAN
 
 Hubinet Ops in-place update plan
@@ -341,7 +355,7 @@ Installed source commit:       ${UPDATE_INSTALLED_SHA}
 Target source commit:          ${SOURCE_HEAD_SHA}
 backend_instance_id (before):  ${UPDATE_PRE_BACKEND_INSTANCE_ID}
 Application payload:           replace (tracked files at target commit)
-requirements.txt:              $( [[ "${UPDATE_REQUIREMENTS_CHANGED}" == "1" ]] && printf 'changed -- new venv will be staged and swapped' || printf 'unchanged -- venv untouched, no pip/apt run' )
+requirements.txt:              ${requirements_plan}
 systemd unit:                  $( [[ "${UPDATE_UNIT_CHANGED}" == "1" ]] && printf 'changed -- will be replaced during activation' || printf 'unchanged -- left in place' )
 PVE host helper:               $( [[ "${UPDATE_HELPER_CHANGED}" == "1" ]] && printf 'changed -- content will be replaced at the SAME path (%s)' "${UPDATE_HELPER_PATH}" || printf 'unchanged -- left in place' )
 Authority schema:              ${UPDATE_CURRENT_SCHEMA_VERSION} -> ${UPDATE_TARGET_SCHEMA_VERSION}
@@ -415,8 +429,11 @@ update_plan_confirm() {
 # legitimately preserve the installation run-id while rolling its LIVE
 # software/database state backward. This bounded, in-memory plan
 # fingerprint closes that gap for exactly the facts that define THIS
-# approved plan -- captured once, immediately after operator approval, and
-# re-derived/compared immediately before the first managed-state mutation.
+# approved plan. Its file baselines ARE the exact installed-byte files
+# already used by classification, and its scalar baseline is finalized
+# from the original ownership/classification values before the plan is
+# displayed. Live state is re-read and compared immediately before the
+# first managed-state mutation.
 #
 # Deliberately excludes every naturally-changing runtime fact (discovery
 # sequence, observed timestamps, ordinary authority DB contents,
@@ -425,19 +442,18 @@ update_plan_confirm() {
 # bounded fence for this invocation, not a generic CAS framework or new
 # durable state.
 
-# _update_capture_plan_fence: call once, immediately after
-# update_plan_confirm succeeds (never for --dry-run, which never mutates).
-_update_capture_plan_fence() {
-  UPDATE_PLAN_FENCE_REQUIREMENTS_TMP="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
-  UPDATE_PLAN_FENCE_UNIT_TMP="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
-  UPDATE_PLAN_FENCE_HELPER_TMP="$(secret_tmpfile "/tmp/hubinet-ops-update-planfence.XXXXXX")"
-  _update_installed_ct_file_to_file /opt/hubinet-ops/requirements.txt "${UPDATE_PLAN_FENCE_REQUIREMENTS_TMP}"
-  _update_installed_ct_file_to_file /etc/systemd/system/hubinet-ops.service "${UPDATE_PLAN_FENCE_UNIT_TMP}"
-  local helper_host_path
-  helper_host_path="$(_host_control_host_path "${UPDATE_HELPER_PATH}")"
-  cat "${helper_host_path}" >"${UPDATE_PLAN_FENCE_HELPER_TMP}" 2>/dev/null || : >"${UPDATE_PLAN_FENCE_HELPER_TMP}"
+# _update_capture_plan_fence_from_classification: called exactly once at
+# the end of update_plan_classify, after every scalar classification fact
+# has been established and before the plan is displayed. The three file
+# baselines were assigned directly by their classification reads above;
+# this function must never read live installation state.
+_update_capture_plan_fence_from_classification() {
+  [[ -n "${UPDATE_PLAN_FENCE_REQUIREMENTS_TMP}" \
+     && -n "${UPDATE_PLAN_FENCE_UNIT_TMP}" \
+     && -n "${UPDATE_PLAN_FENCE_HELPER_TMP}" ]] \
+    || die "internal error: classification did not retain every file-based plan-fence baseline"
 
-  UPDATE_PLAN_FENCE_SCALAR="run_id=${UPDATE_INSTALLATION_RUN_ID} authority_action=${UPDATE_AUTHORITY_ACTION} authority_marker=${UPDATE_CURRENT_SCHEMA_MARKER} authority_schema_version=${UPDATE_CURRENT_SCHEMA_VERSION} backend_instance_id=${UPDATE_PRE_BACKEND_INSTANCE_ID}"
+  UPDATE_PLAN_FENCE_SCALAR="run_id=${UPDATE_INSTALLATION_RUN_ID} authority_action=${UPDATE_AUTHORITY_ACTION} authority_marker=${UPDATE_CURRENT_SCHEMA_MARKER} authority_schema_version=${UPDATE_CURRENT_SCHEMA_VERSION} authority_backend_instance_id=${UPDATE_CURRENT_BACKEND_INSTANCE_ID} live_backend_instance_id=${UPDATE_PRE_BACKEND_INSTANCE_ID}"
 }
 
 # _update_revalidate_plan_fence: re-reads the SAME bounded facts
@@ -473,13 +489,14 @@ _update_revalidate_plan_fence() {
     die "immediately-before-mutation plan fence failed: the installed PVE host helper changed since the approved plan was classified -- refusing to mutate; rerun planning/approval"
   fi
 
-  local inspect_output inspect_status fresh_marker fresh_version
+  local inspect_output inspect_status fresh_marker fresh_version fresh_authority_backend_instance_id
   inspect_output="$(pct exec "${VMID}" -- python3 "${UPDATE_TOOL_CT_PATH}" inspect /var/lib/hubinet-ops/authority.db 2>/dev/null)" \
     && inspect_status=0 || inspect_status=$?
   (( inspect_status == 0 )) && _json_bool_field_is_true "${inspect_output}" "ok" \
     || die "immediately-before-mutation plan fence failed: could not re-read the authority database's identity -- refusing to mutate; rerun planning/approval"
   fresh_marker="$(_json_field_from_text "${inspect_output}" "marker")"
   fresh_version="$(_json_field_from_text "${inspect_output}" "schema_version")"
+  fresh_authority_backend_instance_id="$(_json_field_from_text "${inspect_output}" "backend_instance_id")"
 
   local probe_output probe_status fresh_backend_instance_id
   probe_output="$(pct exec "${VMID}" -- python3 "${UPDATE_PROBE_CT_PATH}" 2>/dev/null)" \
@@ -488,7 +505,15 @@ _update_revalidate_plan_fence() {
     || die "immediately-before-mutation plan fence failed: could not re-read the live backend identity -- refusing to mutate; rerun planning/approval"
   fresh_backend_instance_id="$(_json_field_from_text "${probe_output}" "backend_instance_id")"
 
-  local fresh_scalar="run_id=${UPDATE_INSTALLATION_RUN_ID} authority_action=${UPDATE_AUTHORITY_ACTION} authority_marker=${fresh_marker} authority_schema_version=${fresh_version} backend_instance_id=${fresh_backend_instance_id}"
+  local fresh_authority_action
+  if [[ "${fresh_marker}" == "${UPDATE_TARGET_SCHEMA_MARKER}" \
+        && "${fresh_version}" == "${UPDATE_TARGET_SCHEMA_VERSION}" ]]; then
+    fresh_authority_action="preserve"
+  else
+    fresh_authority_action="reset_required"
+  fi
+
+  local fresh_scalar="run_id=${UPDATE_VMID_RUN_ID} authority_action=${fresh_authority_action} authority_marker=${fresh_marker} authority_schema_version=${fresh_version} authority_backend_instance_id=${fresh_authority_backend_instance_id} live_backend_instance_id=${fresh_backend_instance_id}"
   [[ "${fresh_scalar}" == "${UPDATE_PLAN_FENCE_SCALAR}" ]] \
     || die "immediately-before-mutation plan fence failed: the authority schema identity or backend instance changed since the approved plan was classified (was: ${UPDATE_PLAN_FENCE_SCALAR}; now: ${fresh_scalar}) -- refusing to mutate; rerun planning/approval"
 }

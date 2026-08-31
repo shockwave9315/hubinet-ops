@@ -183,7 +183,8 @@ lock.
      preserve-or-reset), retaining rollback material; a changed
      requirements.txt BUILDS the new virtualenv at its final live path
      inside this window
-  -> start + accept (reused bootstrap discovery-acceptance contract,
+  -> start, prove systemd active + local HTTP health within the existing
+     service timeout, then accept (reused bootstrap discovery contract,
      extended with an optional minimum-committed-sequence floor to prove a
      genuine post-restart cycle -- a committed source that is otherwise
      fully coherent but has not yet published a run past that floor is a
@@ -436,8 +437,9 @@ backward — between planning and mutation. Immediately before the first
 managed-state mutation (the autostart-disable request), the updater
 re-verifies the full ownership chain against the originally-approved
 installation run-id (`update_ownership_verify`'s `revalidate` mode) and
-re-derives a small, bounded, in-memory plan fingerprint captured right
-after operator approval — installation run-id, the installed
+re-derives a small, bounded, in-memory plan fingerprint whose immutable
+baseline comes directly from the original classification reads, before
+the plan is displayed — installation run-id, the installed
 requirements.txt/systemd-unit/PVE-helper content, the authority schema
 marker/version, the pre-update `backend_instance_id`, and the planned
 authority action. Deliberately excludes every naturally-changing runtime

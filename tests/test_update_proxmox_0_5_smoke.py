@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import selectors
 from pathlib import Path
 import shutil
 import subprocess
@@ -55,6 +56,69 @@ def _run(env, args, *, timeout=30):
     result.stdout = result.stdout.decode("utf-8", errors="replace")
     result.stderr = result.stderr.decode("utf-8", errors="replace")
     return result
+
+
+def _run_with_mutation_after_plan(env, args, mutation, *, timeout=30):
+    """Run interactively, mutating only after the complete plan is visible."""
+    interactive_args = [arg for arg in args if arg not in {"--non-interactive", "--yes"}]
+    argv = ["bash", str(UPDATE_SCRIPT), *interactive_args]
+    process = subprocess.Popen(
+        argv,
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    chunks = {"stdout": [], "stderr": []}
+    approved = False
+    deadline = time.monotonic() + timeout
+    plan_end = b"not required (backend_instance_id is preserved)\n"
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                raise subprocess.TimeoutExpired(argv, timeout)
+            for key, _ in selector.select(timeout=min(0.1, remaining)):
+                chunk = key.fileobj.read1(65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                chunks[key.data].append(chunk)
+                if not approved and plan_end in b"".join(chunks["stdout"]):
+                    # update_plan_confirm cannot return until this write.
+                    # Therefore classification and the displayed plan used
+                    # the old facts, while fence revalidation sees the drift.
+                    mutation()
+                    process.stdin.write(b"y\n")
+                    process.stdin.flush()
+                    process.stdin.close()
+                    approved = True
+        returncode = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        raise
+    finally:
+        selector.close()
+
+    assert approved, "the updater exited before displaying the complete approval plan"
+    return subprocess.CompletedProcess(
+        argv,
+        returncode,
+        b"".join(chunks["stdout"]).decode("utf-8", errors="replace"),
+        b"".join(chunks["stderr"]).decode("utf-8", errors="replace"),
+    )
 
 
 def _base_args(target_dir, *, vmid=FAKE_VMID, expected_sha=None, extra=()):
@@ -182,7 +246,7 @@ class TestCodeOnlyUpdate:
 
 
 # ---------------------------------------------------------------------------
-# B. requirements.txt change -- new venv staged and swapped, never in-place.
+# B. requirements.txt change -- new venv built at its final live path.
 # ---------------------------------------------------------------------------
 
 
@@ -430,6 +494,35 @@ class TestDryRun:
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").exists()
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
         assert not any("systemctl" in line and "stop" in line for line in env.log_lines())
+
+
+class TestOperatorPlanVirtualenvContract:
+    def test_changed_requirements_describe_live_path_maintenance_build(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_requirements="old==1\n")
+        target = build_update_target_checkout(
+            tmp_path / "target-plan-reqs-changed", REPO_ROOT, requirements_text="new==2\n"
+        )
+        result = _run(env.env, _base_args(target, extra=["--dry-run"]))
+        assert result.returncode == 0, result.stderr
+        plan = result.stdout
+        assert "service is stopped" in plan
+        assert "current virtualenv is preserved for rollback" in plan
+        assert "FINAL live path /opt/hubinet-ops/.venv" in plan
+        assert "pip installs the exact target requirements DURING the maintenance window" in plan
+        assert "can extend downtime" in plan
+        assert "activation failure restores the prior environment" in plan
+        assert "staged and swapped" not in plan
+        assert "stage and swap" not in plan
+
+    def test_unchanged_requirements_describe_no_dependency_install(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-plan-reqs-unchanged", REPO_ROOT)
+        result = _run(env.env, _base_args(target, extra=["--dry-run"]))
+        assert result.returncode == 0, result.stderr
+        assert (
+            "requirements.txt:              unchanged -- existing virtualenv is preserved; "
+            "no virtualenv rebuild or pip/dependency installation occurs"
+        ) in result.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -2483,6 +2576,64 @@ class TestRollbackHealthReadinessP2:
 
 
 # ---------------------------------------------------------------------------
+# Correction pass 11, P2 -- target startup readiness has the same bounded
+# systemd-active + HTTP-health contract as rollback, before Phase U5.
+# ---------------------------------------------------------------------------
+
+
+class TestForwardTargetHealthReadinessP2:
+    def test_delayed_target_health_reaches_phase_u5_and_succeeds(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path, scenario_overrides={"health_fail_first_n": 3}
+        )
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "6"
+        target = build_update_target_checkout(tmp_path / "target-forward-slow-health", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode == 0, result.stderr
+        assert env.state()["backend_health_calls"] == 4
+        start_at = result.stderr.index("systemctl start hubinet-ops")
+        ready_at = result.stderr.index(
+            "target HTTP readiness: systemd active and health endpoint ready"
+        )
+        acceptance_at = result.stderr.index("Phase U5: acceptance")
+        assert start_at < ready_at < acceptance_at
+
+    def test_target_health_timeout_triggers_coherent_rollback(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            # Exactly the three target-side probes fail. The first rollback
+            # health probe is call four and succeeds deterministically.
+            scenario_overrides={"health_fail_first_n": 3},
+        )
+        env.env["BOOTSTRAP_SERVICE_TIMEOUT_SECONDS"] = "3"
+        target = build_update_target_checkout(tmp_path / "target-forward-health-timeout", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "did not prove systemd active AND answer" in result.stderr
+        assert "Phase U5: acceptance" not in result.stderr
+        assert "rollback complete" in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in result.stderr
+        assert env.state()["backend_health_calls"] == 4
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+
+    def test_target_systemd_failed_is_terminal_and_never_passes_readiness(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path, scenario_overrides={"target_service_failed_after_start": True}
+        )
+        target = build_update_target_checkout(tmp_path / "target-forward-systemd-failed", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "systemd reports the unit as failed" in result.stderr
+        assert "target HTTP readiness: systemd active and health endpoint ready" not in result.stderr
+        assert "Phase U5: acceptance" not in result.stderr
+        assert "rollback complete" in result.stderr
+
+
+# ---------------------------------------------------------------------------
 # Correction pass 8, P2 -- a REPLAYED unit rollback must still reload
 # systemd. "The old unit file is back on the live path" is a fact about the
 # filesystem and is never proof that the systemd MANAGER stopped holding
@@ -3277,29 +3428,82 @@ class TestImmediatelyBeforeMutationFence:
         assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
         assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
 
-    def test_requirements_drift_after_planning_is_rejected_before_mutation(self, tmp_path):
-        # Test B: same installation run-id, but a bounded plan-critical
-        # fact drifted between operator approval and mutation.
-        env = seed_installed_environment(
-            tmp_path,
-            installed_requirements="fastapi==0.100.0\n",
-            scenario_overrides={
-                "drift_ct_file_after_read": {
-                    "/opt/hubinet-ops/requirements.txt": {
-                        "after_read_number": 2,
-                        "new_content": "fastapi==0.999.0\n",
-                    },
-                },
-            },
+    def test_requirements_restore_after_unchanged_classification_is_rejected(self, tmp_path):
+        # Exact correction-pass-11 witness: classification says unchanged,
+        # the same-installation snapshot restore happens only after the
+        # complete plan is displayed, and the original classification bytes
+        # (not a later baseline re-read) reject it before mutation.
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-fence-reqs-drift", REPO_ROOT)
+        result = _run_with_mutation_after_plan(
+            env.env,
+            _base_args(target),
+            lambda: env.ct_file(FAKE_VMID, "/opt/hubinet-ops/requirements.txt").write_text(
+                "fastapi==0.100.0\n", encoding="utf-8"
+            ),
         )
-        target = build_update_target_checkout(
-            tmp_path / "target-fence-reqs-drift", REPO_ROOT, requirements_text="fastapi==0.116.1\n"
-        )
-        result = _run(env.env, _base_args(target))
         assert result.returncode != 0
         assert "immediately-before-mutation plan fence failed" in result.stderr
         assert "requirements.txt changed since the approved plan" in result.stderr
         assert not any("systemctl disable" in line for line in result.stderr.splitlines())
+        assert not any("systemctl stop" in line for line in result.stderr.splitlines())
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_changed_unit_drift_after_plan_is_rejected_before_mutation(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(
+            tmp_path / "target-fence-unit-drift",
+            REPO_ROOT,
+            unit_text="[Unit]\nDescription=approved target unit\n",
+        )
+        result = _run_with_mutation_after_plan(
+            env.env,
+            _base_args(target),
+            lambda: env.ct_file(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service").write_text(
+                "[Unit]\nDescription=restored snapshot unit\n", encoding="utf-8"
+            ),
+        )
+        assert result.returncode != 0
+        assert "installed systemd unit changed since the approved plan" in result.stderr
+        assert "systemctl disable" not in result.stderr
+        assert "systemctl stop" not in result.stderr
+
+    def test_changed_helper_drift_after_plan_is_rejected_before_mutation(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(
+            tmp_path / "target-fence-helper-drift",
+            REPO_ROOT,
+            helper_text="#!/usr/bin/env python3\n# approved target helper\n",
+        )
+        helper_path = (
+            Path(env.env["HUBINET_OPS_TEST_HOST_ROOT"])
+            / "usr/local/libexec"
+            / f"hubinet-package-scan-helper-{FAKE_RUN_ID}"
+        )
+        result = _run_with_mutation_after_plan(
+            env.env,
+            _base_args(target),
+            lambda: helper_path.write_text(
+                "#!/usr/bin/env python3\n# restored snapshot helper\n", encoding="utf-8"
+            ),
+        )
+        assert result.returncode != 0
+        assert "installed PVE host helper changed since the approved plan" in result.stderr
+        assert "systemctl disable" not in result.stderr
+        assert "systemctl stop" not in result.stderr
+
+    def test_trailing_newline_drift_after_plan_is_rejected_byte_exactly(self, tmp_path):
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-fence-newline-drift", REPO_ROOT)
+        requirements_path = env.ct_file(FAKE_VMID, "/opt/hubinet-ops/requirements.txt")
+        result = _run_with_mutation_after_plan(
+            env.env,
+            _base_args(target),
+            lambda: requirements_path.write_bytes(requirements_path.read_bytes() + b"\n"),
+        )
+        assert result.returncode != 0
+        assert "requirements.txt changed since the approved plan" in result.stderr
+        assert "systemctl disable" not in result.stderr
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
 
     def test_discovery_sequence_advancing_normally_does_not_reject(self, tmp_path):

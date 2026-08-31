@@ -229,10 +229,6 @@ if [[ "${UPDATE_DRY_RUN}" == "1" ]]; then
 fi
 
 update_plan_confirm
-# Bounded plan fingerprint (correction pass 9, P1, section 11): captured
-# once, right after operator approval, and re-verified immediately before
-# the first mutation by _update_revalidate_before_mutation.
-_update_capture_plan_fence
 update_stage_all
 update_activate_and_accept
 

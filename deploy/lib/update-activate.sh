@@ -53,7 +53,7 @@ UPDATE_PRE_NFTABLES_CONF=""
 UPDATE_DISPLAY_NAME=""
 _UPDATE_SERVICE_STATE_DETAIL="unknown"
 _UPDATE_SERVICE_ENABLED_DETAIL="unknown"
-_UPDATE_ROLLBACK_READINESS_DETAIL="unknown"
+_UPDATE_SERVICE_READINESS_DETAIL="unknown"
 
 # Three-valued service-state probe. Return 0 means the service is active
 # or transitioning and therefore MUST be treated as potentially running;
@@ -103,9 +103,9 @@ _update_wait_until_service_stopped() {
   return 1
 }
 
-# _update_wait_until_service_active_and_healthy (correction pass 8, P2):
-# the bounded readiness proof a RESTARTED pre-update installation must
-# pass before rollback may be called complete.
+# _update_wait_until_service_active_and_healthy (correction passes 8/11,
+# P2): the bounded readiness proof any freshly started installation must
+# pass before target acceptance or rollback completion.
 #
 # The old code proved `active` in a bounded loop and then issued the
 # application health request EXACTLY ONCE. hubinet-ops.service is
@@ -136,15 +136,15 @@ _update_wait_until_service_active_and_healthy() {
     if [[ "${state}" == "active" ]]; then
       health_body="$(pct exec "${VMID}" -- curl -fsS "http://127.0.0.1:8787/r0/v1/health" 2>/dev/null || true)"
       if [[ -n "${health_body}" ]]; then
-        _UPDATE_ROLLBACK_READINESS_DETAIL="active and healthy after ${waited}s"
+        _UPDATE_SERVICE_READINESS_DETAIL="active and healthy after ${waited}s"
         return 0
       fi
-      _UPDATE_ROLLBACK_READINESS_DETAIL="active, but the unauthenticated health probe has not answered yet"
+      _UPDATE_SERVICE_READINESS_DETAIL="active, but the unauthenticated health probe has not answered yet"
     elif [[ "${state}" == "failed" ]]; then
-      _UPDATE_ROLLBACK_READINESS_DETAIL="systemd reports the restored unit as failed"
+      _UPDATE_SERVICE_READINESS_DETAIL="systemd reports the unit as failed"
       return 1
     else
-      _UPDATE_ROLLBACK_READINESS_DETAIL="last service state: ${state:-unknown}"
+      _UPDATE_SERVICE_READINESS_DETAIL="last service state: ${state:-unknown}"
     fi
     sleep 1
     waited=$(( waited + 1 ))
@@ -432,16 +432,9 @@ update_activate_and_accept() {
     || die "failed to start hubinet-ops inside container ${VMID} after activation"
   ledger_record update-service-started "${VMID}"
 
-  waited=0
-  state=""
-  while (( waited < BOOTSTRAP_SERVICE_TIMEOUT_SECONDS )); do
-    state="$(pct exec "${VMID}" -- systemctl is-active hubinet-ops 2>/dev/null || true)"
-    [[ "${state}" == "active" ]] && break
-    sleep 1
-    waited=$(( waited + 1 ))
-  done
-  [[ "${state}" == "active" ]] \
-    || die "hubinet-ops did not become active within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s after activation (last state: ${state:-unknown})"
+  _update_wait_until_service_active_and_healthy \
+    || die "hubinet-ops did not prove systemd active AND answer its unauthenticated health endpoint within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s after target activation (${_UPDATE_SERVICE_READINESS_DETAIL})"
+  log_pass "target HTTP readiness: systemd active and health endpoint ready"
 
   log_pass "activation complete"
 
@@ -966,7 +959,7 @@ update_rollback_on_failure() {
     || _update_rollback_hard_stop "restored the pre-update installation's files, but could not start hubinet-ops inside container ${VMID}"
 
   _update_wait_until_service_active_and_healthy \
-    || _update_rollback_hard_stop "restored the pre-update installation's files, but it did not prove active AND answer its own unauthenticated health probe within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (${_UPDATE_ROLLBACK_READINESS_DETAIL})"
+    || _update_rollback_hard_stop "restored the pre-update installation's files, but it did not prove active AND answer its own unauthenticated health probe within ${BOOTSTRAP_SERVICE_TIMEOUT_SECONDS}s (${_UPDATE_SERVICE_READINESS_DETAIL})"
 
   update_journal_resolve recovered
   log_warn "rollback complete -- the pre-update installation is enabled, running again, and healthy (exit ${exit_code})"

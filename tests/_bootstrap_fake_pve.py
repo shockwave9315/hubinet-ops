@@ -1047,7 +1047,7 @@ def _exec_apt_get(args, state=None):
 
 # Correction pass 9, P1, section 11 -- deterministic test hooks for the
 # immediately-before-mutation plan fence
-# (deploy/lib/update-plan.sh::_update_capture_plan_fence /
+# (deploy/lib/update-plan.sh::_update_capture_plan_fence_from_classification /
 # _update_revalidate_plan_fence). Both fire from the CT-side `cat` handler
 # below, counting reads of one specific path per VMID (persisted through
 # the shared state file, since each `pct exec ... cat ...` is its own
@@ -1375,7 +1375,10 @@ def _exec_systemctl(vmid, args, state):
             return 1
         if _fail("service_start_after_stop"):
             return 1
-        entry["service"] = "active"
+        if call_number == 1 and SCENARIO.get("target_service_failed_after_start"):
+            entry["service"] = "failed"
+        else:
+            entry["service"] = "active"
         _save_state(state)
         if SCENARIO.get("kill_updater_after_target_start") and call_number == 1:
             # Later interruption witness: target service has actually
