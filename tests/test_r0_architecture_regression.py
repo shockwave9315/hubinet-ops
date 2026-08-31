@@ -258,6 +258,125 @@ def test_next_a_job_authority_has_recovery_but_no_production_issuance_surface() 
         assert "execute_package_update" not in text, rel_path
 
 
+def test_job_owned_snapshot_safety_is_not_production_reachable() -> None:
+    """The snapshot primitives exist internally and stay dark.
+
+    Nothing on the production HTTP, Home Assistant, scheduler, bootstrap, or
+    updater paths may construct or call the snapshot orchestrator, its host
+    control, or the authority's snapshot transitions.
+    """
+
+    snapshot_symbols = (
+        "package_update_snapshot",
+        "PackageUpdateSnapshotOrchestrator",
+        "SshPackageUpdateSnapshotHostControl",
+        "ensure_job_owned_snapshot",
+        "record_package_update_snapshot_intent",
+        "record_package_update_snapshot_task",
+        "confirm_package_update_snapshot",
+        "select_package_update_rollback_target",
+        "record_package_update_preflight_passed",
+        "create_pre_update_snapshot",
+        "hubinet-package-snapshot-helper",
+    )
+    for rel_path in (
+        "app/inventory_runtime.py",
+        "app/inventory_scheduler.py",
+        "app/package_scan_scheduler.py",
+        "app/package_scan.py",
+        "app/package_scan_host_control.py",
+        "app/inventory_runtime_config.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/transport_http.py",
+        "custom_components/hubinet_ops/coordinator.py",
+        "deploy/bootstrap-proxmox-0.5.sh",
+        "deploy/update-proxmox-0.5.sh",
+        "deploy/install-0.5.0-fresh.sh",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for symbol in snapshot_symbols:
+            assert symbol not in text, (rel_path, symbol)
+
+
+def test_bootstrap_and_updater_deploy_no_snapshot_helper_or_key() -> None:
+    """No mutating helper, forced-command line, key, or PVE privilege ships."""
+
+    for rel_path in ("deploy", "deploy/lib"):
+        directory = REPO_ROOT / rel_path
+        for path in sorted(directory.glob("*.sh")):
+            text = path.read_text(encoding="utf-8")
+            assert "snapshot-helper" not in text, path
+            assert "hubinet-package-snapshot" not in text, path
+
+    # The deployed PVE privilege set stays exactly the audit-only pair: no
+    # VM.Snapshot or VM.Snapshot.Rollback is provisioned anywhere.
+    for path in sorted((REPO_ROOT / "deploy").rglob("*")):
+        if path.is_file() and path.suffix in (".sh", ".py"):
+            text = path.read_text(encoding="utf-8")
+            assert "VM.Snapshot" not in text, path
+            assert "VM.Snapshot.Rollback" not in text, path
+
+
+def test_the_snapshot_helper_is_a_separate_file_from_the_scan_helper() -> None:
+    scan = REPO_ROOT / "deploy/hubinet-package-scan-helper.py"
+    snapshot = REPO_ROOT / "deploy/hubinet-package-snapshot-helper.py"
+    assert scan.exists() and snapshot.exists()
+    scan_text = scan.read_text(encoding="utf-8")
+    # The scan helper gained no snapshot capability of any kind.
+    for forbidden in (
+        "snapshot",
+        "pvesh create",
+        "vzsnapshot",
+        "VM.Snapshot",
+    ):
+        assert forbidden not in scan_text, forbidden
+
+
+def test_the_snapshot_helper_exposes_no_delete_or_rollback_operation() -> None:
+    text = (REPO_ROOT / "deploy/hubinet-package-snapshot-helper.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(text)
+    operations = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "OPERATIONS"
+                for target in node.targets
+            )
+        ):
+            operations = ast.literal_eval(node.value)
+    assert operations == (
+        "inspect_job_snapshot_state",
+        "create_pre_update_snapshot",
+    )
+    # `pvesh` is only ever invoked with a read or a create verb.
+    verbs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Tuple) and node.elts:
+            first = node.elts[0]
+            if isinstance(first, ast.Constant) and first.value == "pvesh":
+                second = node.elts[1]
+                assert isinstance(second, ast.Constant), ast.dump(node)
+                verbs.add(second.value)
+    assert verbs == {"get", "create"}
+
+
+def test_no_package_or_apt_mutation_exists_anywhere_in_the_backend() -> None:
+    for path in sorted((REPO_ROOT / "app").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        for forbidden in (
+            '"apt-get", "install"',
+            '"apt-get", "upgrade"',
+            '"apt-get", "dist-upgrade"',
+            '"dpkg"',
+            "apt-get install",
+            "apt-get upgrade",
+        ):
+            assert forbidden not in text, (path, forbidden)
+
+
 def test_next_a_keeps_forced_helper_scan_only_and_adds_no_mutation_operation() -> None:
     helper = (REPO_ROOT / "deploy/hubinet-package-scan-helper.py").read_text(
         encoding="utf-8"

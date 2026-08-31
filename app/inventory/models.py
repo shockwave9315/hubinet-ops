@@ -46,12 +46,46 @@ class PackageUpdateJobStatus(StrEnum):
 class PackageUpdateCheckpoint(StrEnum):
     ISSUED = "issued"
     PREFLIGHT_PASSED = "preflight_passed"
+    SNAPSHOT_MAY_HAVE_STARTED = "snapshot_may_have_started"
     SNAPSHOT_CONFIRMED = "snapshot_confirmed"
     MUTATION_MAY_HAVE_STARTED = "mutation_may_have_started"
     MUTATION_COMPLETED = "mutation_completed"
     HEALTH_STARTED = "health_started"
     ROLLBACK_MAY_HAVE_STARTED = "rollback_may_have_started"
     ROLLBACK_COMPLETED = "rollback_completed"
+
+
+#: Durable checkpoint order. ``snapshot_may_have_started`` is the write-ahead
+#: uncertainty boundary: once a job reaches it, a PVE snapshot mutation may
+#: already have been submitted, so nothing may ever conclude that no PVE
+#: mutation happened. Used by the schema and by every typed transition; the
+#: SQL CHECK/trigger set in ``store.py`` encodes exactly this order.
+CHECKPOINT_ORDER: tuple[PackageUpdateCheckpoint, ...] = (
+    PackageUpdateCheckpoint.ISSUED,
+    PackageUpdateCheckpoint.PREFLIGHT_PASSED,
+    PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+    PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+    PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+    PackageUpdateCheckpoint.MUTATION_COMPLETED,
+    PackageUpdateCheckpoint.HEALTH_STARTED,
+    PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
+    PackageUpdateCheckpoint.ROLLBACK_COMPLETED,
+)
+
+_CHECKPOINT_RANKS = {
+    checkpoint: rank for rank, checkpoint in enumerate(CHECKPOINT_ORDER, start=1)
+}
+
+
+def checkpoint_rank(checkpoint: PackageUpdateCheckpoint) -> int:
+    """Return the durable ordinal of one package-update checkpoint."""
+
+    try:
+        return _CHECKPOINT_RANKS[PackageUpdateCheckpoint(checkpoint)]
+    except (KeyError, ValueError) as exc:
+        raise AuthorityInvariantError(
+            "unknown package update checkpoint"
+        ) from exc
 
 
 class PackageUpdateEventLevel(StrEnum):
@@ -63,6 +97,12 @@ class PackageUpdateEventLevel(StrEnum):
 class PackageUpdateEventType(StrEnum):
     JOB_ISSUED = "job_issued"
     RESTART_INTERRUPTED = "restart_interrupted"
+    PREFLIGHT_PASSED = "preflight_passed"
+    SNAPSHOT_INTENT_RECORDED = "snapshot_intent_recorded"
+    SNAPSHOT_TASK_OBSERVED = "snapshot_task_observed"
+    SNAPSHOT_CONFIRMED = "snapshot_confirmed"
+    SNAPSHOT_OUTCOME_UNCERTAIN = "snapshot_outcome_uncertain"
+    SNAPSHOT_FAILED = "snapshot_failed"
 
 
 class PackageScanFailure(StrEnum):
@@ -381,7 +421,10 @@ class PackageUpdateJob:
     package_count: int
     status: PackageUpdateJobStatus
     checkpoint: PackageUpdateCheckpoint
+    snapshot_operation_id: str | None
     snapshot_name: str | None
+    snapshot_intent_recorded_at: str | None
+    snapshot_task_upid: str | None
     snapshot_confirmed_at: str | None
     mutation_may_have_started_at: str | None
     mutation_completed_at: str | None
@@ -391,6 +434,72 @@ class PackageUpdateJob:
     terminalized_at: str | None
     terminal_reason: str | None
     packages: tuple[PackageUpdateJobPackage, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateSnapshotIdentity:
+    """One package update job's single deterministic pre-update snapshot.
+
+    Both fields are derived from immutable job identity, so the exact same
+    job derives the exact same identity after any restart. ``snapshot_name``
+    is the physical PVE key; ``snapshot_operation_id`` keys the host-side
+    durable operation journal.
+    """
+
+    snapshot_operation_id: str
+    snapshot_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotOwnership:
+    """Strict structured Hubinet ownership metadata carried by a snapshot.
+
+    This, never the snapshot name, is the ownership proof. Anything that does
+    not parse into exactly this shape is treated as malformed and fails
+    closed rather than being silently skipped.
+    """
+
+    protocol: int
+    kind: str
+    job_id: str
+    resource_id: str
+    resource_continuity_revision: int
+    inventory_source_id: str
+    backend_instance_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ObservedSnapshot:
+    """One canonical observation of a PVE LXC snapshot listing entry.
+
+    ``is_current_pseudo_entry`` marks PVE's synthetic ``current`` row, which
+    is never a real snapshot. ``incomplete`` marks an entry PVE still reports
+    a ``snapstate`` for, i.e. a snapshot operation that has not finished.
+    ``ownership_malformed`` marks an entry that looks Hubinet-owned but whose
+    metadata did not parse strictly.
+    """
+
+    name: str
+    description: str
+    is_current_pseudo_entry: bool = False
+    incomplete: bool = False
+    snaptime: int | None = None
+    parent: str | None = None
+    ownership: SnapshotOwnership | None = None
+    ownership_malformed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateRollbackTarget:
+    """The one snapshot a specific package update job may roll back to."""
+
+    job_id: str
+    resource_id: str
+    expected_vmid: int
+    expected_node_name: str
+    snapshot_name: str
+    snapshot_operation_id: str
+    snapshot_confirmed_at: str
 
 
 @dataclass(frozen=True, slots=True)

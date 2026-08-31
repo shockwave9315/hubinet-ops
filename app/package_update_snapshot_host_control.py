@@ -1,0 +1,325 @@
+"""Dark bounded SSH transport for job-owned pre-update snapshot operations.
+
+**Not production-reachable and not deployed.** No production configuration,
+key, or `authorized_keys` entry exists for this channel: `app/inventory_runtime.py`
+never constructs it, and neither bootstrap nor the product updater installs
+its helper or key. It is instantiated only by hermetic tests in this stage.
+
+It is a separate, purpose-specific client from `app/package_scan_host_control.py`
+and deliberately does not resurrect the removed generic `app/host_control.py`:
+pinned known-hosts trust, strict typed JSON, bounded request and response
+sizes, bounded timeouts, no password authentication, no agent or port
+forwarding, no interactive shell, and no arbitrary remote command.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+import json
+from pathlib import Path
+import re
+from typing import Any
+
+from app.inventory import ObservedSnapshot, SnapshotOwnership
+from app.package_scan_host_control import (
+    BoundedProcessResult,
+    ProcessRunner,
+    _bounded_process_runner,
+)
+from app.package_update_snapshot import (
+    HostSnapshotResult,
+    PackageUpdateSnapshotError,
+    SnapshotEvidenceError,
+    SnapshotOperationOutcome,
+    classify_task_status,
+    parse_canonical_snapshot_listing,
+)
+
+
+_HOST_RE = re.compile(r"[A-Za-z0-9_.:-]+")
+_USER_RE = re.compile(r"[A-Za-z0-9_.-]+")
+_NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")
+_SNAPSHOT_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{1,39}")
+_MAX_REQUEST_BYTES = 8192
+
+#: Outcomes the dark helper may report, mapped onto the orchestrator's typed
+#: vocabulary. ``absent`` is only produced by the read-only inspect operation.
+_OUTCOMES = {
+    "completed": SnapshotOperationOutcome.COMPLETED,
+    "failed": SnapshotOperationOutcome.FAILED,
+    "uncertain": SnapshotOperationOutcome.UNCERTAIN,
+    "absent": SnapshotOperationOutcome.FAILED,
+}
+
+
+class SshPackageUpdateSnapshotHostControl:
+    """One bounded typed request per snapshot operation, over pinned-key SSH."""
+
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        user: str,
+        private_key_path: Path,
+        known_hosts_path: Path,
+        timeout_seconds: int,
+        max_result_bytes: int,
+        runner: ProcessRunner = _bounded_process_runner,
+    ) -> None:
+        if (
+            not isinstance(host, str)
+            or not _HOST_RE.fullmatch(host)
+            or host.startswith("-")
+        ):
+            raise ValueError("host-control host is invalid")
+        if (
+            not isinstance(user, str)
+            or not _USER_RE.fullmatch(user)
+            or user.startswith("-")
+        ):
+            raise ValueError("host-control user is invalid")
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("host-control port is invalid")
+        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 3600:
+            raise ValueError("host-control timeout is invalid")
+        if (
+            type(max_result_bytes) is not int
+            or not 1024 <= max_result_bytes <= 16 * 1024 * 1024
+        ):
+            raise ValueError("host-control result bound is invalid")
+        key_path = Path(private_key_path)
+        hosts_path = Path(known_hosts_path)
+        if not key_path.is_absolute() or not hosts_path.is_absolute():
+            raise ValueError("host-control trust paths must be absolute")
+        self._host = host
+        self._port = port
+        self._user = user
+        self._private_key_path = key_path
+        self._known_hosts_path = hosts_path
+        self._timeout_seconds = timeout_seconds
+        self._max_result_bytes = max_result_bytes
+        self._runner = runner
+
+    # -- typed operations ------------------------------------------------
+
+    def create_pre_update_snapshot(
+        self,
+        *,
+        snapshot_operation_id: str,
+        snapshot_name: str,
+        vmid: int,
+        expected_node: str,
+        ownership: SnapshotOwnership,
+    ) -> HostSnapshotResult:
+        return self._request(
+            "create_pre_update_snapshot",
+            snapshot_operation_id=snapshot_operation_id,
+            snapshot_name=snapshot_name,
+            vmid=vmid,
+            expected_node=expected_node,
+            ownership=ownership,
+        )
+
+    def inspect_job_snapshot_state(
+        self,
+        *,
+        snapshot_operation_id: str,
+        snapshot_name: str,
+        vmid: int,
+        expected_node: str,
+        ownership: SnapshotOwnership,
+    ) -> HostSnapshotResult:
+        return self._request(
+            "inspect_job_snapshot_state",
+            snapshot_operation_id=snapshot_operation_id,
+            snapshot_name=snapshot_name,
+            vmid=vmid,
+            expected_node=expected_node,
+            ownership=ownership,
+        )
+
+    # -- transport -------------------------------------------------------
+
+    def _request(
+        self,
+        operation: str,
+        *,
+        snapshot_operation_id: str,
+        snapshot_name: str,
+        vmid: int,
+        expected_node: str,
+        ownership: SnapshotOwnership,
+    ) -> HostSnapshotResult:
+        if operation not in (
+            "create_pre_update_snapshot",
+            "inspect_job_snapshot_state",
+        ):
+            raise ValueError("unsupported snapshot host-control operation")
+        if type(vmid) is not int or not 100 <= vmid <= 999_999_999:
+            raise ValueError("vmid must be a valid PVE integer VMID")
+        if not isinstance(expected_node, str) or not _NODE_RE.fullmatch(expected_node):
+            raise ValueError("expected_node is invalid")
+        if not isinstance(snapshot_name, str) or not _SNAPSHOT_NAME_RE.fullmatch(
+            snapshot_name
+        ):
+            raise ValueError("snapshot_name is not a valid PVE snapshot name")
+        if not isinstance(ownership, SnapshotOwnership):
+            raise ValueError("ownership metadata is required")
+
+        request = {
+            "request_version": 1,
+            "operation": operation,
+            "target": {"vmid": vmid, "expected_node": expected_node},
+            "operation_identity": {
+                "snapshot_operation_id": snapshot_operation_id,
+                "snapshot_name": snapshot_name,
+            },
+            # Typed fields only. The helper builds the snapshot description
+            # from these itself, so no free text ever crosses this boundary.
+            "ownership": {
+                "job_id": ownership.job_id,
+                "resource_id": ownership.resource_id,
+                "resource_continuity_revision": ownership.resource_continuity_revision,
+                "inventory_source_id": ownership.inventory_source_id,
+                "backend_instance_id": ownership.backend_instance_id,
+            },
+        }
+        encoded = json.dumps(
+            request, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        if len(encoded) > _MAX_REQUEST_BYTES:
+            raise PackageUpdateSnapshotError(
+                "host-control request exceeded its structural bound"
+            )
+        result = self._runner(
+            self._argv(), encoded, float(self._timeout_seconds), self._max_result_bytes
+        )
+        return self._parse(result, snapshot_operation_id)
+
+    def _argv(self) -> tuple[str, ...]:
+        return (
+            "ssh",
+            "-T",
+            "-p",
+            str(self._port),
+            "-i",
+            str(self._private_key_path),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"UserKnownHostsFile={self._known_hosts_path}",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ClearAllForwardings=yes",
+            f"{self._user}@{self._host}",
+        )
+
+    def _parse(
+        self, result: BoundedProcessResult, snapshot_operation_id: str
+    ) -> HostSnapshotResult:
+        # Every transport-level failure is an UNCERTAIN outcome, never a
+        # failure: a lost answer says nothing about whether PVE ran the
+        # mutation, and the caller must not resubmit on it.
+        if result.timed_out:
+            return self._uncertain(
+                snapshot_operation_id, "host-control request timed out"
+            )
+        if result.output_exceeded:
+            return self._uncertain(
+                snapshot_operation_id,
+                "host-control result exceeded its configured bound",
+            )
+        if result.returncode != 0 and not result.stdout:
+            return self._uncertain(
+                snapshot_operation_id, "host-control SSH execution failed"
+            )
+        try:
+            payload = json.loads(result.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            return self._uncertain(
+                snapshot_operation_id, "host-control returned a malformed response"
+            )
+        return self._parse_payload(payload, snapshot_operation_id)
+
+    def _parse_payload(
+        self, payload: Any, snapshot_operation_id: str
+    ) -> HostSnapshotResult:
+        if not isinstance(payload, Mapping) or payload.get("response_version") != 1:
+            return self._uncertain(
+                snapshot_operation_id, "host-control returned an unsupported response"
+            )
+        if payload.get("snapshot_operation_id") != snapshot_operation_id:
+            return self._uncertain(
+                snapshot_operation_id,
+                "host-control answered a different snapshot operation",
+            )
+        if payload.get("ok") is not True:
+            error = payload.get("error")
+            classification = "unclassified"
+            if isinstance(error, Mapping):
+                classification = str(error.get("classification") or "unclassified")[
+                    :100
+                ]
+            return self._uncertain(
+                snapshot_operation_id,
+                f"host-control reported a failure ({classification})",
+            )
+        outcome = _OUTCOMES.get(str(payload.get("outcome")))
+        if outcome is None:
+            return self._uncertain(
+                snapshot_operation_id, "host-control returned an unknown outcome"
+            )
+        task_upid = payload.get("task_upid")
+        if task_upid is not None and (
+            not isinstance(task_upid, str) or len(task_upid) > 300
+        ):
+            return self._uncertain(
+                snapshot_operation_id, "host-control returned a malformed task identity"
+            )
+        task = None
+        raw_task = payload.get("task")
+        if raw_task is not None:
+            try:
+                task = classify_task_status(raw_task)
+            except SnapshotEvidenceError:
+                return self._uncertain(
+                    snapshot_operation_id,
+                    "host-control returned a malformed task status",
+                )
+        snapshots: tuple[ObservedSnapshot, ...] | None = None
+        raw_snapshots = payload.get("snapshots")
+        if raw_snapshots is not None:
+            try:
+                snapshots = parse_canonical_snapshot_listing(raw_snapshots)
+            except SnapshotEvidenceError:
+                return self._uncertain(
+                    snapshot_operation_id,
+                    "host-control returned a malformed snapshot listing",
+                )
+        reason = payload.get("reason")
+        return HostSnapshotResult(
+            outcome=outcome,
+            snapshot_operation_id=snapshot_operation_id,
+            task_upid=task_upid,
+            task=task,
+            snapshots=snapshots,
+            reason=str(reason)[:500] if isinstance(reason, str) else None,
+        )
+
+    @staticmethod
+    def _uncertain(snapshot_operation_id: str, reason: str) -> HostSnapshotResult:
+        return HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.UNCERTAIN,
+            snapshot_operation_id=snapshot_operation_id,
+            reason=reason,
+        )

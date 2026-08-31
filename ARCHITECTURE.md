@@ -22,10 +22,11 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v9). Schema v9 retains the
-immutable scan/approval authority and adds internal, purpose-specific durable
-package-update jobs, copied exact package rows, global active-job ownership,
-and append-only job events. There is no migration from v8; pre-release installs
+database (marker `hubinet_ops_0_5_authority`, schema v10). Schema v10 retains
+the immutable scan/approval authority and internal durable package-update jobs,
+and adds the job-owned snapshot operation identity, its write-ahead uncertainty
+checkpoint, the observed PVE task identity, and SQL-level state-machine
+invariants over all of them. There is no migration from v9; pre-release installs
 use the product updater's explicit backed-up authority reset and require Home
 Assistant re-enrollment.
 
@@ -77,12 +78,98 @@ Hubinet credential. QEMU is published as unsupported.
 Package-update job authority is persistence-only in this stage. A directly
 instantiated `InventoryAuthority` can issue and revalidate one globally
 single-flight job from a current exact approval, and startup interrupts any
-pre-mutation active job so it cannot auto-run after restart. The production
-HTTP and Home Assistant surfaces cannot issue a job, and there is no job
-consumer, PVE snapshot mutation, workload package mutation, healthcheck, or
-rollback implementation. Authority revalidation is necessary but not
-sufficient permission for future mutation: the activation stage must also
-prove exact APT simulation/equality immediately before execution.
+pre-package-mutation active job so it cannot auto-run after restart. The
+production HTTP and Home Assistant surfaces cannot issue a job, and there is
+no job consumer, workload package mutation, healthcheck, or rollback
+execution. Authority revalidation is necessary but not sufficient permission
+for future mutation: the activation stage must also prove exact APT
+simulation/equality immediately before execution.
+
+## Job-owned snapshot safety
+
+The safety primitives for one update job's single pre-update PVE snapshot
+exist internally and are **not production-reachable**. Nothing on the HTTP,
+Home Assistant, scheduler, bootstrap, or updater path can create a PVE
+snapshot, and no snapshot helper, key, or PVE mutation privilege is deployed.
+There is still no workload package mutation anywhere.
+
+```text
+issued -> preflight_passed -> snapshot_may_have_started
+       -> snapshot_confirmed -> (mutation, still unimplemented)
+```
+
+**The uncertainty boundary.** `snapshot_may_have_started` is a write-ahead
+checkpoint committed durably *before* any snapshot mutation request can be
+sent. Once a job reaches it, nothing may conclude that no PVE mutation
+happened. Startup recovery therefore interrupts `issued`, `preflight_passed`,
+and `snapshot_confirmed` jobs — all provably before package mutation, with a
+confirmed snapshot simply retained — but leaves a
+`snapshot_may_have_started` job active, still owning the global destructive
+slot, with its evidence fenced. It never replays a snapshot operation and
+never guesses an outcome.
+
+**Identity.** `app/inventory/snapshot_identity.py` derives one job's snapshot
+name and snapshot operation id purely from immutable identity (backend
+instance, job, resource incarnation, continuity revision), so the same job
+derives the same identity after any restart and two jobs never collide. The
+name satisfies PVE's verified `pve-snapshot-name` contract (`pve-configid`,
+maxLength 40, `current`/`vzdump` reserved). **The name is only the physical
+PVE key and is never ownership proof.** Ownership is a strict structured
+metadata record carried in the snapshot's PVE description; malformed,
+incomplete, duplicate, or mismatching metadata fails closed, and a
+Hubinet-looking snapshot that will not parse is reported as ambiguous rather
+than silently skipped.
+
+**Verified PVE semantics.** Read from current Proxmox VE sources rather than
+inherited from Hubinet 0.4: snapshot create is asynchronous and returns a UPID
+immediately, so a returned POST proves nothing; task status is
+`running`/`stopped` plus an optional `exitstatus`, and PVE's own rule treats
+only `OK` and `WARNINGS: <n>` as non-errors, so `stopped` alone is never
+success; the snapshot listing includes PVE's synthetic `current` pseudo-entry
+and carries `snapstate` for unfinished snapshots; and an LXC snapshot
+description does not round-trip byte-identically, because the config parser
+appends a newline to every line it reads back. A terminal successful task is
+therefore necessary but never sufficient — a fresh canonical listing is
+re-read and strictly matched in every case before `snapshot_confirmed`.
+
+**Host-side durable journal.** `deploy/hubinet-package-snapshot-helper.py` is
+a separate file and a separate logical privilege boundary from the scan
+helper, which stays scan-only. It exposes two typed operations
+(`inspect_job_snapshot_state`, `create_pre_update_snapshot`), no delete, no
+rollback submission, no arbitrary shell or argv, and it re-derives the
+snapshot identity from the request's own ownership facts rather than trusting
+the name it was handed. Each mutation is journaled on the PVE host under an
+`flock` held per VMID, keyed by the operation identity:
+`intent -> submitted -> task_known -> terminal`, each transition an fsynced
+atomic rename. A journal still reading `intent` proves submission was never
+attempted; `submitted` is the genuinely uncertain window and is **never**
+resubmitted — it may only be recovered as success on strict evidence (the
+exact snapshot, exact ownership metadata, complete, and the guest carrying no
+in-flight config lock), otherwise the answer is `uncertain`. An identical
+retry reattaches; the same operation identity with a different request is
+refused.
+
+**Same-job rollback.** A job may roll back only to the snapshot that exact job
+created and confirmed. `select_package_update_rollback_target` re-proves the
+name, the full structured ownership metadata, `resource_id`, the continuity
+revision, that the entry is a real snapshot rather than the `current`
+pseudo-entry, and that canonical state is unambiguous. There is no
+caller-supplied snapshot name, no "latest Hubinet snapshot", and no fallback
+to another job's snapshot; a reused VMID never transfers rollback authority to
+a different incarnation. **Rollback submission is deliberately not
+implemented**: only the authorization/selection contract exists, and execution
+is left to the later activation stage rather than being shipped to a lower
+safety bar.
+
+**No deletion.** This stage deletes nothing — not foreign snapshots, not
+manual PVE snapshots, not old, failed, or interrupted-job Hubinet snapshots.
+Retention is separate future work.
+
+`app/package_update_snapshot.py` (orchestration) and
+`app/package_update_snapshot_host_control.py` (a purpose-specific pinned-key
+SSH client, not a revival of the removed generic `app/host_control.py`) are
+instantiated only by hermetic tests. `tests/test_r0_architecture_regression.py`
+proves production reachability did not increase.
 
 ## Identity
 
@@ -197,7 +284,7 @@ lock.
   -> start, prove systemd active + local HTTP health within the existing
      service timeout, then accept (reused bootstrap discovery contract,
      extended with an optional minimum-committed-sequence floor to prove a
-     genuine post-restart cycle -- a committed source that is otherwise
+     genuine post-restart cycle — a committed source that is otherwise
      fully coherent but has not yet published a run past that floor is a
      TRANSIENT condition and keeps polling within the existing discovery
      timeout, never an immediate failure; every other incoherence is still
@@ -505,9 +592,10 @@ Properties that channel must have:
   binding/generation/continuity/VMID/node context, and the same fresh healthy
   committed source context captured when the scan was issued.
 
-Job-owned snapshot mutation, update execution, healthchecks, rollback,
-lifecycle mutation, and QEMU package execution remain future work. Exact APT
-execution must also resolve multiarch package identity rather than guessing it.
+Update execution, healthchecks, rollback execution, lifecycle mutation, and
+QEMU package execution remain future work; job-owned snapshot safety exists
+internally but cannot be invoked by production. Exact APT execution must also
+resolve multiarch package identity rather than guessing it.
 
 ## Ordinary safety rules (all layers, now and later)
 
