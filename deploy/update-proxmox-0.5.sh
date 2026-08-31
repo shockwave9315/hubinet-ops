@@ -168,7 +168,35 @@ _update_exit_trap() {
     rm -f -- "${BOOTSTRAP_LEDGER}"
     exit "${exit_code}"
   fi
-  if (( exit_code != 0 )) && _update_rollback_boundary_crossed; then
+  # Terminal-checkpoint rule (PR #65 correction pass 13, P1): once THIS
+  # run's journal durably records `completed` (the target is accepted,
+  # durable, and boot-enabled -- see _update_finish_summary) or
+  # `recovered` (the pre-update installation was already fully restored
+  # and proven -- see update_rollback_on_failure's own update_journal_
+  # resolve call), that state is TERMINAL. Rollback material may already
+  # be partially or fully deleted by the time this trap runs (cleanup
+  # after `completed` removes it; `update_journal_resolve` after
+  # `recovered` does too), so a later non-zero exit here -- a TERM, or a
+  # cleanup step itself failing -- must NEVER be reinterpreted as
+  # permission to roll back. _update_rollback_boundary_crossed only
+  # answers "did this run ever attempt the FIRST mutation"; it says
+  # nothing about whether the run has since reached a terminal, already-
+  # accepted state, and rollback trusts old rollback-<UPDATE_RUN_ID>
+  # material that a completed run may have already destroyed. Rolling
+  # back from here could destroy the accepted target and pair old code
+  # with an already-removed authority backup, or overwrite a target
+  # database with a stale one.
+  #
+  # Remaining work past `completed`/`recovered` is cleanup-only. If it
+  # does not finish, a surviving journal in either state is safely
+  # resolved by the next invocation's existing startup-recovery path
+  # (update_startup_recovery_gate), which re-proves enabled + active +
+  # healthy before ever clearing it -- never by rolling back here.
+  if [[ "${UPDATE_JOURNAL_STATE:-}" == "completed" || "${UPDATE_JOURNAL_STATE:-}" == "recovered" ]]; then
+    if (( exit_code != 0 )); then
+      log_warn "update process exited (${exit_code}) after this run's journal durably recorded '${UPDATE_JOURNAL_STATE}' -- that state is terminal and is never rolled back; any unfinished cleanup will be completed by the next updater invocation's startup recovery"
+    fi
+  elif (( exit_code != 0 )) && _update_rollback_boundary_crossed; then
     update_rollback_on_failure "${exit_code}"
   elif (( exit_code != 0 )); then
     log_warn "update did not complete (exit ${exit_code}) before the rollback boundary was crossed -- neither boot activation nor a service stop had been attempted, so the existing installation was never touched"

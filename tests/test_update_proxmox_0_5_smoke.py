@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import re
 import selectors
 from pathlib import Path
 import shutil
@@ -2111,7 +2112,10 @@ class TestPartialRollbackRetryP2A:
             installed_unit_text=OLD_UNIT_TEXT,
             scenario_overrides={
                 "discovery_result": "backend_unreachable",
-                "fail": ["service_autostart_enable"],
+                # PR #65 correction pass 13, P2: the unit changed, so
+                # rollback's own boot-enable step now uses `reenable` (to
+                # reset any stale target-only link), not plain `enable`.
+                "fail": ["service_autostart_reenable"],
             },
         )
         target = build_update_target_checkout(
@@ -2172,7 +2176,10 @@ class TestPartialRollbackRetryP2A:
             installed_unit_text=OLD_UNIT_TEXT,
             scenario_overrides={
                 "discovery_result": "backend_unreachable",
-                "fail": ["service_autostart_enable"],
+                # PR #65 correction pass 13, P2: the unit changed, so
+                # rollback's own boot-enable step now uses `reenable` (to
+                # reset any stale target-only link), not plain `enable`.
+                "fail": ["service_autostart_reenable"],
             },
         )
         target = build_update_target_checkout(
@@ -3567,3 +3574,340 @@ class TestImmediatelyBeforeMutationFence:
         assert result.returncode == 0, result.stderr
         assert "plan fence failed" not in result.stderr
         assert "ownership fence failed" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# AF. PR #65 correction pass 13, P1 -- the terminal `completed`/`recovered`
+#     journal checkpoint must never be reinterpreted as permission to roll
+#     back, even though the rollback boundary was crossed earlier in the
+#     same run and rollback material may already be partially or fully
+#     destroyed by the time a later TERM or cleanup failure reaches the
+#     EXIT trap.
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalCheckpointNeverRollsBack:
+    def test_term_immediately_after_completed_checkpoint_is_never_rolled_back(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="1" * 40)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_completed_checkpoint")
+        target = build_update_target_checkout(tmp_path / "target-term-completed", REPO_ROOT)
+        result = _run(env_with_term, _base_args(target))
+
+        assert result.returncode == 143
+        assert "rollback complete" not in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in result.stderr
+        assert "terminal and is never rolled back" in result.stderr
+        # No rollback artifact was removed yet, and the target is exactly
+        # what this run activated -- never undone.
+        assert (
+            "Fake target store.py"
+            in env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py")
+        )
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+        # A surviving `completed` journal is legitimate here -- cleanup-
+        # only, resolved by the next invocation's existing startup
+        # recovery.
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        if journal.exists():
+            assert "state=completed" in journal.read_text(encoding="utf-8")
+
+    def test_term_after_partial_completed_cleanup_is_never_rolled_back(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="2" * 40)
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_completed_partial_cleanup")
+        target = build_update_target_checkout(tmp_path / "target-term-partial-cleanup", REPO_ROOT)
+        result = _run(env_with_term, _base_args(target))
+
+        assert result.returncode == 143
+        assert "rollback complete" not in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in result.stderr
+        # Some rollback artifacts are already destroyed -- rollback must
+        # never attempt to restore old app/venv/unit/db from here.
+        assert not list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
+        assert (
+            "Fake target store.py"
+            in env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py")
+        )
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+
+    def test_authority_reset_completed_witness_never_restores_old_db(self, tmp_path):
+        # The destructive schema-reset witness: after a completed run whose
+        # authority action was reset_required, a TERM landing after the
+        # completed checkpoint (with rollback material already partly
+        # destroyed) must never see the old validated backup copied back
+        # over the TARGET database.
+        new_backend_instance_id = "44444444-4444-4444-8444-444444444444"
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            scenario_overrides={"discovery_backend_instance_id": new_backend_instance_id},
+        )
+        env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_completed_partial_cleanup")
+        target = build_update_target_checkout(
+            tmp_path / "target-term-schema-reset", REPO_ROOT, schema_version=8
+        )
+        result = _run(env_with_term, _base_args(target, extra=["--allow-authority-reset"]))
+
+        assert result.returncode == 143
+        assert "rollback complete" not in result.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in result.stderr
+        # A completed reset removes the old live database and never
+        # recreates it itself (the target runtime does that on its own
+        # next start -- see TestAuthorityReset's own positive control).
+        # The witness: a TERM after the completed checkpoint must NEVER
+        # see the retained OLD backup copied back over this absent path.
+        db_path = env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db")
+        assert not db_path.exists()
+        backups_root = env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/update-backups")
+        backup_files = list(backups_root.rglob("authority.db"))
+        assert backup_files, "expected the retained authority DB backup"
+        backup_data = json.loads(backup_files[0].read_text(encoding="utf-8"))
+        assert backup_data["schema_version"] == 7
+        assert backup_data["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+
+    def test_journal_clear_failure_after_completed_is_resolved_by_next_invocation(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="3" * 40)
+        env_with_fault = dict(env.env, HUBINET_OPS_TEST_FAIL_JOURNAL_CLEAR="1")
+        target = build_update_target_checkout(tmp_path / "target-journal-clear-fail", REPO_ROOT)
+
+        first = _run(env_with_fault, _base_args(target))
+        assert first.returncode != 0
+        assert "rollback complete" not in first.stderr
+        assert "ROLLBACK COULD NOT BE COMPLETED" not in first.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        assert "state=completed" in journal.read_text(encoding="utf-8")
+        assert (
+            "Fake target store.py"
+            in env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py")
+        )
+
+        # The next invocation's existing startup-recovery `completed` path
+        # resolves it -- proving enabled+active+healthy first -- never by
+        # rolling back.
+        second = _run(env.env, _base_args(target))
+        assert second.returncode == 0, second.stderr
+        assert "was already" in second.stderr
+        assert not journal.exists()
+
+    def test_active_before_completed_still_rolls_back(self, tmp_path):
+        # Negative control: this fix must not weaken ordinary ACTIVE-state
+        # rollback -- a failure strictly BEFORE the completed checkpoint
+        # still rolls back exactly as before.
+        env = seed_installed_environment(
+            tmp_path, scenario_overrides={"discovery_result": "backend_unreachable"}
+        )
+        target = build_update_target_checkout(tmp_path / "target-active-still-rolls-back", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# AG. PR #65 correction pass 13, P2 -- the interrupted-update journal
+#     validator must accept every run-id shape the shared
+#     bootstrap-common.sh::_generate_run_id can actually produce, including
+#     its numeric fallback, while still rejecting anything else.
+# ---------------------------------------------------------------------------
+
+
+def _write_hand_crafted_journal(env, *, run_id, installation_run_id=FAKE_RUN_ID, state="active", rollback_armed="0"):
+    path = _update_state_path(env, FAKE_VMID, "journal")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "format=hubinet-ops-update-journal-v1\n"
+        f"state={state}\n"
+        f"vmid={FAKE_VMID}\n"
+        f"run_id={run_id}\n"
+        f"installation_run_id={installation_run_id}\n"
+        f"rollback_armed={rollback_armed}\n"
+        "requirements_changed=0\n"
+        "authority_action=\n"
+        "db_backup_path=\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestRunIdValidatorAcceptsGeneratorFormats:
+    def test_fallback_shaped_run_id_journal_loads_and_recovery_proceeds(self, tmp_path):
+        # state=active, rollback_armed=0: the simplest recovery path
+        # (cleanup this run's own staged artifacts, then prove the
+        # untouched pre-mutation service). Isolates "does the validator
+        # accept this run_id shape at all" from the full rollback machinery.
+        env = seed_installed_environment(tmp_path)
+        journal = _write_hand_crafted_journal(env, run_id="1700000000123456789-4242-1111122222")
+        target = build_update_target_checkout(tmp_path / "target-run-id-fallback-simple", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert "was recovered" in result.stderr
+        assert "failed validation" not in result.stderr
+        assert "has an invalid run id" not in result.stderr
+        assert not journal.exists()
+
+    @pytest.mark.parametrize(
+        "bad_run_id",
+        [
+            "../../etc/passwd",
+            "run/id",
+            "run id",
+            "not-hex-but-alphabetic",
+            "1-2-",
+            "",
+        ],
+    )
+    def test_malformed_run_id_variants_are_rejected_and_journal_preserved(self, tmp_path, bad_run_id):
+        env = seed_installed_environment(tmp_path)
+        journal = _write_hand_crafted_journal(env, run_id=bad_run_id)
+        target = build_update_target_checkout(tmp_path / "target-bad-run-id", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0, bad_run_id
+        assert "has an invalid run id" in result.stderr, (bad_run_id, result.stderr)
+        assert journal.exists()
+        assert not any("systemctl disable" in line for line in result.stderr.splitlines())
+
+    def test_normal_hex_run_id_journal_still_loads(self, tmp_path):
+        # Regression control for the existing, unmodified branch of the
+        # validator.
+        env = seed_installed_environment(tmp_path)
+        journal = _write_hand_crafted_journal(env, run_id="a1b2c3d4e5f60718293a4b5c6d7e8f90")
+        target = build_update_target_checkout(tmp_path / "target-run-id-hex", REPO_ROOT)
+
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        assert "was recovered" in result.stderr
+        assert not journal.exists()
+
+    def test_fallback_shaped_active_rollback_armed_run_recovers_coherently(self, tmp_path):
+        # The strongest regression: a REAL fallback-shaped UPDATE_RUN_ID
+        # (HUBINET_OPS_TEST_FORCE_RUN_ID_FALLBACK, exercising
+        # bootstrap-common.sh::_generate_run_id's own fallback branch),
+        # SIGKILLed mid-rollback-armed mutation, recovered on the next
+        # invocation exactly like the existing hex-run-id interruption
+        # tests -- proving every run-owned path this run's journal
+        # reconstructs (authority helper, rollback artifacts) still
+        # resolves correctly under the fallback shape.
+        env = seed_installed_environment(
+            tmp_path,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "kill_updater_after_move": "mv_live_app_to_rollback",
+            },
+        )
+        env_forced_fallback = dict(env.env, HUBINET_OPS_TEST_FORCE_RUN_ID_FALLBACK="1")
+        target = build_update_target_checkout(tmp_path / "target-run-id-fallback-armed", REPO_ROOT)
+
+        interrupted = _run(env_forced_fallback, _base_args(target))
+        assert interrupted.returncode == -9
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        journal_text = journal.read_text(encoding="utf-8")
+        run_id = _journal_run_id(journal_text)
+        assert re.fullmatch(r"[0-9]+-[0-9]+-[0-9]+", run_id), run_id
+
+        recovered = _run(env.env, _base_args(target))
+        assert recovered.returncode == 0, recovered.stderr
+        assert "was recovered" in recovered.stderr
+        assert "failed validation" not in recovered.stderr
+        assert not journal.exists()
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# AH. PR #65 correction pass 13, P2 -- rollback of a systemd unit whose
+#     [Install] section changed must reset the unit's boot-activation
+#     links to the RESTORED old unit's own declaration (`systemctl
+#     reenable`), not merely add the old links on top of whatever the
+#     (now-superseded) target unit's own `enable` already installed
+#     (`systemctl enable` is additive only).
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackResetsStaleEnablementLinks:
+    OLD_UNIT = "[Unit]\nDescription=pre-update unit\n\n[Install]\nWantedBy=multi-user.target\n"
+    NEW_UNIT = (
+        "[Unit]\nDescription=target unit\n\n"
+        "[Install]\nWantedBy=graphical.target\nAlias=hubinet-target.service\n"
+    )
+
+    def test_changed_unit_rollback_resets_stale_target_links(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="f" * 40,
+            installed_unit_text=self.OLD_UNIT,
+            # Target activation, including its own `systemctl enable`,
+            # genuinely succeeds -- only the FINAL unit-enablement
+            # durability barrier (the third /etc/systemd/system barrier in
+            # a changed-unit run: disable-side, unit-content, final
+            # enable) fails, exactly the finding's own scenario.
+            scenario_overrides={"fail_nth_unit_dir_sync": 3},
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-stale-links", REPO_ROOT, unit_text=self.NEW_UNIT
+        )
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        enable_at = result.stderr.index("systemctl enable hubinet-ops")
+        reenable_at = result.stderr.index("systemctl reenable hubinet-ops")
+        assert enable_at < reenable_at
+
+        assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == self.OLD_UNIT
+        links = env.state()["vmids"][FAKE_VMID]["service_enable_links"]
+        assert links == ["multi-user.target.wants/hubinet-ops.service"]
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service"] == "active"
+        assert post["service_enabled"] is True
+
+        # And the reset is genuinely durable.
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        state_after_reboot = env.state()["vmids"][FAKE_VMID]
+        assert state_after_reboot["service"] == "active"
+        assert state_after_reboot["service_enable_links"] == ["multi-user.target.wants/hubinet-ops.service"]
+
+    def test_reenable_failure_hard_stops_without_false_recovery(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="e" * 40,
+            installed_unit_text=self.OLD_UNIT,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                "fail": ["service_autostart_reenable"],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-stale-links-reenable-fail", REPO_ROOT, unit_text=self.NEW_UNIT
+        )
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "re-enabled (reenable)" in result.stderr
+        assert "rollback complete" not in result.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        # The old unit FILE is already restored -- only re-enrolling its
+        # boot-activation links failed.
+        assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == self.OLD_UNIT
+
+    def test_unchanged_unit_rollback_never_calls_reenable(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="0" * 40,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-stale-links-unchanged", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        assert "systemctl reenable" not in result.stderr
+        assert env.state()["vmids"][FAKE_VMID].get("service_autostart_reenable_calls", 0) == 0

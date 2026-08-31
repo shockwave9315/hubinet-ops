@@ -584,8 +584,18 @@ print(len(data))
 # real Linux PVE host); a defensive, still-unpredictable-enough fallback
 # if /dev/urandom is somehow unavailable (never expected in practice).
 _generate_run_id() {
-  local id
-  id="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  local id=""
+  # HUBINET_OPS_TEST_FORCE_RUN_ID_FALLBACK (PR #65 correction pass 13, P2),
+  # consulted only when HUBINET_OPS_TEST_MODE=1, is a narrow test-only
+  # seam -- the same convention as HUBINET_OPS_TEST_FAIL_HOST_SYNC in
+  # deploy/lib/update-recovery.sh -- that deterministically exercises the
+  # fallback branch below in the hermetic sandbox, where /dev/urandom is
+  # always genuinely available and the fallback would otherwise never be
+  # reachable by any test. Inert whenever HUBINET_OPS_TEST_MODE is not
+  # "1", so production behavior always tries /dev/urandom first.
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" != "1" || "${HUBINET_OPS_TEST_FORCE_RUN_ID_FALLBACK:-0}" != "1" ]]; then
+    id="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n')"
+  fi
   if [[ -z "${id}" ]]; then
     id="$(date +%s%N 2>/dev/null || date +%s)-$$-${RANDOM}${RANDOM}"
   fi

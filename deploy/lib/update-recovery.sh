@@ -149,6 +149,30 @@ _update_set_run_paths() {
   fi
 }
 
+# _update_is_valid_run_id: accepts exactly the two legal output shapes of
+# the shared bootstrap-common.sh::_generate_run_id (PR #65 correction pass
+# 13, P2) -- never a broader "any path-safe text" grammar.
+#
+# Normal path: 32 lowercase hex characters (16 random bytes from
+# /dev/urandom, hex-encoded).
+#
+# Fallback path (used only when /dev/urandom yields nothing, never
+# expected on a real Linux PVE host but still a legal generator output):
+# exactly "<digits>-<digits>-<digits>" (`${timestamp}-$$-${RANDOM}${RANDOM}`,
+# each component numeric).
+#
+# A run-id journaled by an updater invocation that itself hit the fallback
+# path previously failed this function's old ^[0-9a-f]+$-only check, which
+# made that journal unrecoverable after SIGKILL/reboot even though the
+# updater legitimately created it. Path safety stays load-bearing: no
+# slash, dot, whitespace, or other character ever matches either branch.
+_update_is_valid_run_id() {
+  local value="$1"
+  [[ "${value}" =~ ^[0-9a-f]+$ ]] && return 0
+  [[ "${value}" =~ ^[0-9]+-[0-9]+-[0-9]+$ ]] && return 0
+  return 1
+}
+
 _update_journal_marker_is_recovery_relevant() {
   case "$1" in
     update-service-autostart-disable-attempted|\
@@ -212,6 +236,16 @@ update_journal_record() {
 }
 
 _update_journal_clear() {
+  # Test-only fault injection (PR #65 correction pass 13, P1):
+  # HUBINET_OPS_TEST_FAIL_JOURNAL_CLEAR, consulted only when
+  # HUBINET_OPS_TEST_MODE=1, simulates journal-clear itself failing after
+  # a terminal (completed/recovered) checkpoint is already durable -- the
+  # real `rm` on this host-side path is never faked by the pct-exec fake-
+  # command layer, so this is the same kind of narrow seam as
+  # HUBINET_OPS_TEST_FAIL_HOST_SYNC above.
+  if [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" && "${HUBINET_OPS_TEST_FAIL_JOURNAL_CLEAR:-0}" == "1" ]]; then
+    die "could not remove resolved updater journal ${UPDATE_JOURNAL_PATH} (simulated test failure)"
+  fi
   rm -f -- "${UPDATE_JOURNAL_PATH}" \
     || die "could not remove resolved updater journal ${UPDATE_JOURNAL_PATH}"
   sync -f "${UPDATE_STATE_DIR}" \
@@ -261,12 +295,13 @@ _update_journal_load() {
   [[ "${format}" == "hubinet-ops-update-journal-v1" \
      && ( "${state}" == "active" || "${state}" == "completed" || "${state}" == "recovered" ) \
      && "${journal_vmid}" == "${VMID}" \
-     && "${run_id}" =~ ^[0-9a-f]+$ \
      && "${installation_run_id}" =~ ^[0-9A-Za-z_-]+$ \
      && ( "${rollback_armed}" == "0" || "${rollback_armed}" == "1" ) \
      && ( "${requirements_changed}" == "0" || "${requirements_changed}" == "1" ) \
      && ( -z "${authority_action}" || "${authority_action}" == "preserve" || "${authority_action}" == "reset_required" ) ]] \
     || die "interrupted-update journal ${UPDATE_JOURNAL_PATH} failed validation; preserve it and recover VMID ${VMID} manually"
+  _update_is_valid_run_id "${run_id}" \
+    || die "interrupted-update journal ${UPDATE_JOURNAL_PATH} has an invalid run id; preserve it and recover VMID ${VMID} manually"
   [[ -z "${db_backup_path}" || "${db_backup_path}" == "/var/lib/hubinet-ops/update-backups/${run_id}/authority.db" ]] \
     || die "interrupted-update journal ${UPDATE_JOURNAL_PATH} has an invalid authority backup path; preserve it and recover manually"
 

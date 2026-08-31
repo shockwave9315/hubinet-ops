@@ -132,6 +132,37 @@ def _fail(kind):
     return kind in SCENARIO.get("fail", [])
 
 
+def _unit_install_links(vmid):
+    """The set of boot-activation links the CURRENT hubinet-ops.service
+    unit file's own [Install] section declares (PR #65 correction pass
+    13, P2 test model) -- a `WantedBy=<target>` line implies a
+    `<target>.wants/hubinet-ops.service` link, and an `Alias=<name>` line
+    implies a top-level `<name>` link, exactly mirroring real systemd's
+    unit-file-generator symlinks. Narrowly scoped to what the stale-link
+    regression needs to represent; not a general systemd model.
+    """
+    unit_path = _ct_path(vmid, "/etc/systemd/system/hubinet-ops.service")
+    if not unit_path.exists():
+        return set()
+    links = set()
+    in_install = False
+    for raw_line in unit_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_install = line == "[Install]"
+            continue
+        if not in_install or not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "WantedBy":
+            links.update(f"{target}.wants/hubinet-ops.service" for target in value.split())
+        elif key == "Alias":
+            links.update(value.split())
+    return links
+
+
 _CT_PATH_ANCHORS = (
     "etc/hubinet-ops",
     "var/lib/hubinet-ops",
@@ -443,8 +474,19 @@ def _matches_run_owned_ct_script(raw_arg, base_name):
     # ("<base_name>-<UPDATE_RUN_ID>.py"), never the fixed "<base_name>.py"
     # name -- match either shape so this fake dispatcher recognizes it
     # regardless of which naming convention produced the pushed path.
+    # UPDATE_RUN_ID itself has two legal shapes (PR #65 correction pass
+    # 13, P2, mirroring deploy/lib/update-recovery.sh's own
+    # _update_is_valid_run_id): normal 32-char lowercase hex, or the
+    # numeric "<digits>-<digits>-<digits>" fallback -- both must be
+    # recognized here, or a run that legitimately generated a fallback-
+    # shaped id can never even get this script recognized as its own.
     normalized = raw_arg.replace("\\", "/")
-    return bool(re.search(rf"(^|/){re.escape(base_name)}(-[0-9a-f]+)?\.py$", normalized))
+    return bool(
+        re.search(
+            rf"(^|/){re.escape(base_name)}(-[0-9a-f]+|-[0-9]+-[0-9]+-[0-9]+)?\.py$",
+            normalized,
+        )
+    )
 
 
 # Correction pass 7 (P1 test realism): a simulated
@@ -689,6 +731,7 @@ def _exec_inner(vmid, inner, state):
             # discards on reboot.
             entry = state["vmids"].setdefault(vmid, {})
             entry["durable_service_enabled"] = entry.get("service_enabled", False)
+            entry["durable_service_enable_links"] = list(entry.get("service_enable_links", []))
             _save_state(state)
         return 0
 
@@ -1327,6 +1370,7 @@ def _exec_systemctl(vmid, args, state):
             # Boot activation IS actually removed, yet the command reports
             # failure. Recovery must already be armed at this point.
             entry["service_enabled"] = False
+            entry["service_enable_links"] = []
             _save_state(state)
             return 1
         if _fail("service_autostart_disable"):
@@ -1336,6 +1380,14 @@ def _exec_systemctl(vmid, args, state):
             # trust an independent unit-file-state probe, never this code.
             return 0
         entry["service_enabled"] = False
+        # Real `systemctl disable` removes every symlink CURRENTLY
+        # installed for this unit, regardless of whether it matches the
+        # unit file's present [Install] section -- unlike `enable`, it is
+        # not merely additive against the current declaration. This is
+        # the exact property that makes `reenable` (disable-then-enable,
+        # below) reset stale links a differently-configured unit left
+        # behind.
+        entry["service_enable_links"] = []
         _save_state(state)
         return 0
     if args == ["enable", "hubinet-ops"]:
@@ -1347,6 +1399,30 @@ def _exec_systemctl(vmid, args, state):
         if _fail("service_autostart_enable_noop_success"):
             return 0
         entry["service_enabled"] = True
+        # Plain `enable` is ADDITIVE only: it ensures the links the
+        # CURRENT unit file declares exist, but never removes a link a
+        # DIFFERENT (earlier) unit definition installed.
+        links = set(entry.get("service_enable_links", []))
+        links |= _unit_install_links(vmid)
+        entry["service_enable_links"] = sorted(links)
+        _save_state(state)
+        return 0
+    if args == ["reenable", "hubinet-ops"]:
+        call_number = state.get("service_autostart_reenable_calls", 0) + 1
+        state["service_autostart_reenable_calls"] = call_number
+        _save_state(state)
+        if _fail("service_autostart_reenable"):
+            return 1
+        if _fail("service_autostart_reenable_noop_success"):
+            # Reports success while stale links or the enabled state were
+            # never actually reset. The caller must trust an independent
+            # unit-file-state probe, never this code.
+            return 0
+        # `reenable` == disable (remove EVERY currently-installed link,
+        # regardless of the current unit file's content) followed by
+        # enable (add back exactly what the CURRENT unit file declares).
+        entry["service_enabled"] = True
+        entry["service_enable_links"] = sorted(_unit_install_links(vmid))
         _save_state(state)
         return 0
     if args == ["stop", "hubinet-ops"]:
@@ -2173,6 +2249,9 @@ class FakePveEnvironment:
         # bootstrap-seeded default of a durably enabled installation.
         durable_enabled = entry.get("durable_service_enabled", entry.get("service_enabled", False))
         entry["service_enabled"] = durable_enabled
+        entry["service_enable_links"] = list(
+            entry.get("durable_service_enable_links", entry.get("service_enable_links", []))
+        )
         if entry["started"] and durable_enabled:
             entry["service"] = "active"
         else:

@@ -55,6 +55,36 @@ _UPDATE_SERVICE_STATE_DETAIL="unknown"
 _UPDATE_SERVICE_ENABLED_DETAIL="unknown"
 _UPDATE_SERVICE_READINESS_DETAIL="unknown"
 
+# _update_test_term_checkpoint <name>: test-only self-TERM injection point
+# (PR #65 correction pass 13, P1). HUBINET_OPS_TEST_TERM_AT, consulted
+# only when HUBINET_OPS_TEST_MODE=1, is a space-separated list of
+# checkpoint names -- delivering SIGTERM to this same process at exactly
+# the named point lets the hermetic test suite exercise the REAL `trap
+# 'exit 143' TERM` / _update_exit_trap machinery at specific points inside
+# the mutation window. Unlike every pct-exec-routed CT-side mutation, the
+# terminal journal checkpoint and its cleanup in _update_finish_summary
+# run entirely on the PVE HOST side, so no fake-command layer can reach
+# them the way tests/_bootstrap_fake_pve.py's kill_updater_after_move
+# reaches a CT-side `mv` -- this is the same kind of narrow, always-inert-
+# in-production seam as HUBINET_OPS_TEST_FAIL_HOST_SYNC above. Inert
+# whenever HUBINET_OPS_TEST_MODE is not "1", so production behavior never
+# calls this at all.
+_update_test_term_checkpoint() {
+  local name="$1" needle
+  [[ "${HUBINET_OPS_TEST_MODE:-0}" == "1" ]] || return 0
+  for needle in ${HUBINET_OPS_TEST_TERM_AT:-}; do
+    if [[ "${needle}" == "${name}" ]]; then
+      kill -TERM $$
+    fi
+  done
+  # A non-matching needle leaves the `for` loop's own exit status at the
+  # failed `[[ ]]` test's (1) -- under this script's `set -e`, a bare
+  # nonzero-returning function call trips errexit immediately, well
+  # before any actual TERM is ever delivered for a LATER checkpoint name.
+  # This must always return 0 when it does not match.
+  return 0
+}
+
 # Three-valued service-state probe. Return 0 means the service is active
 # or transitioning and therefore MUST be treated as potentially running;
 # return 1 means systemd positively reported a non-running state; return 2
@@ -253,14 +283,42 @@ _update_disable_service_autostart() {
 
 # _update_restore_service_autostart: put hubinet-ops back under normal boot
 # activation and POSITIVELY prove it. Returns 0 only when systemd itself
-# reports the unit file as `enabled`; a zero exit from `systemctl enable`
-# is never accepted as proof on its own. Callers decide what a failure
-# means (a success-path die, or a rollback hard stop) -- this helper never
-# exits by itself.
+# reports the unit file as `enabled`; a zero exit from `systemctl enable`/
+# `systemctl reenable` is never accepted as proof on its own. Callers
+# decide what a failure means (a success-path die, or a rollback hard
+# stop) -- this helper never exits by itself.
+#
+# mode (PR #65 correction pass 13, P2) selects the systemctl verb:
+#
+#   enable   (default) -- the ordinary case. Only ADDS the enablement
+#            links implied by the CURRENT unit file's [Install] section;
+#            it never removes a link that a DIFFERENT unit definition
+#            previously installed.
+#   reenable -- required whenever the live unit file this call is
+#            re-enabling may not be the same [Install] content that was
+#            last enabled. `reenable` resets the unit's installed
+#            enablement links to exactly what its current [Install]
+#            section declares, atomically removing any stale link a
+#            differently-configured unit left behind first.
+#
+# Concretely: rollback restores the OLD unit file onto the live path
+# (_update_rollback_unit) only after this run may already have enabled a
+# CHANGED target unit (a different WantedBy=/Alias=) during forward
+# activation. A plain `enable` on the restored old unit would then add the
+# old links back without ever removing the target-only links the earlier
+# enable created, leaving stale boot-activation links behind. See
+# update_rollback_on_failure's own caller for exactly which case selects
+# `reenable`; an update whose unit never changed keeps the simpler
+# `enable` behavior unconditionally.
 _update_restore_service_autostart() {
-  local rc
-  run_logged pct exec "${VMID}" -- systemctl enable hubinet-ops \
-    || log_warn "the systemctl enable request for hubinet-ops returned failure inside container ${VMID}; proving the actual unit-file state before deciding"
+  local mode="${1:-enable}" cmd rc
+  case "${mode}" in
+    enable) cmd="enable" ;;
+    reenable) cmd="reenable" ;;
+    *) die "internal error: unsupported autostart-restore mode '${mode}'" ;;
+  esac
+  run_logged pct exec "${VMID}" -- systemctl "${cmd}" hubinet-ops \
+    || log_warn "the systemctl ${cmd} request for hubinet-ops returned failure inside container ${VMID}; proving the actual unit-file state before deciding"
   if _update_probe_service_enabled; then
     log_info "hubinet-ops boot activation is restored (unit-file state: enabled)"
     return 0
@@ -859,6 +917,10 @@ _update_finish_summary() {
   # these two steps is cleanup-only on the next invocation, never a false
   # request to roll an already-accepted target back.
   update_journal_checkpoint completed
+  # Test-only (correction pass 13, P1): exercise a real TERM here, after
+  # the completed checkpoint is durable but before any rollback artifact
+  # is removed -- see _update_test_term_checkpoint's own docstring.
+  _update_test_term_checkpoint after_completed_checkpoint
 
   # Success: clean up rollback material and staged leftovers -- nothing
   # here is managed state a future update depends on.
@@ -874,6 +936,10 @@ _update_finish_summary() {
     rm -f "${UPDATE_HELPER_HOST_PATH}.rollback-${UPDATE_RUN_ID}" 2>/dev/null || true
   fi
   _update_cleanup_plan_tools
+  # Test-only (correction pass 13, P1): exercise a real TERM here, after
+  # SOME rollback artifacts are already destroyed but before the journal
+  # is cleared.
+  _update_test_term_checkpoint after_completed_partial_cleanup
   _update_journal_clear
 
   cat <<SUMMARY
@@ -941,8 +1007,22 @@ update_rollback_on_failure() {
   # never comes back after the next PVE/CT restart. Never inferred from
   # the enable command's own exit status.
   if ledger_has update-service-autostart-disable-attempted "${VMID}"; then
-    _update_restore_service_autostart \
-      || _update_rollback_hard_stop "restored the pre-update installation's files, but could not prove hubinet-ops boot activation re-enabled inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL}) -- it would not start again after a reboot"
+    # PR #65 correction pass 13, P2: the just-restored unit file
+    # (_update_rollback_unit, above) may hold a DIFFERENT [Install]
+    # section than whatever unit definition was last enabled during
+    # forward activation -- reaching this point at all means the unit was
+    # once disabled and is now being re-enabled, but only a unit this run
+    # actually swapped (update-unit-activation-attempted) could have been
+    # enabled under a changed [Install] section in between. `reenable`
+    # resets installed links to exactly the restored old unit's current
+    # [Install] section, atomically dropping any stale target-only link;
+    # plain `enable` never removes a link a different unit definition
+    # installed. An update whose unit never changed keeps the simpler,
+    # unmodified `enable` behavior.
+    local autostart_restore_mode="enable"
+    ledger_has update-unit-activation-attempted "${VMID}" && autostart_restore_mode="reenable"
+    _update_restore_service_autostart "${autostart_restore_mode}" \
+      || _update_rollback_hard_stop "restored the pre-update installation's files, but could not prove hubinet-ops boot activation re-enabled (${autostart_restore_mode}) inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL}) -- it would not start again after a reboot"
     # Durability barrier (correction pass 10, P1): the restored enablement
     # state itself must survive a subsequent power loss BEFORE the old
     # service is started again -- the same invariant as the forward-path
