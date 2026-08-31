@@ -4,12 +4,16 @@
 
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
-- **Persistent backend inventory, scans, and approvals** — SQLite authority
-  database (schema v8):
+- **Persistent backend inventory, scans, approvals, and internal jobs** —
+  SQLite authority database (schema v9):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
-  source context, and durable exact-plan approval facts.
+  source context, durable exact-plan approval facts, and internal durable
+  package-update job authority. Jobs copy immutable approval/context provenance
+  and exact package rows, use UUID request idempotency, own one global active
+  slot, record append-only events, and are interrupted before mutation on
+  restart.
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus exactly
   one authority-only mutation,
   `PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
@@ -58,10 +62,12 @@
   `deploy/README-update-proxmox-0.5.md`.
 
 The PVE API inventory surface remains read-only. The backend's sole mutation
-route records Hubinet approval authority state only. Package scanning may write
-APT index/cache metadata but never changes workload packages. There is no
-update execution, update job, snapshot mutation, healthcheck, rollback,
-lifecycle mutation, policy, or endpoint failover.
+route records Hubinet approval authority state only. Internal update-job
+issuance is not production-reachable: there is no HTTP/HA creation control and
+no worker or scheduler consuming jobs. Package scanning may write APT
+index/cache metadata but never changes workload packages. There is no PVE
+job-owned snapshot mutation, workload package mutation, healthcheck execution,
+rollback execution, lifecycle mutation, policy, or endpoint failover.
 
 ## Human0 validation
 
@@ -113,10 +119,12 @@ source marker, repeated updates on one synthetic installation, filesystem
 durability-barrier ordering and failure seams (forward activation, rollback
 restoration including replay, and the final accepted-target barrier before
 completion), and the immediately-before-mutation ownership/plan fence). The
-first real operator Human0 validation of this updater against an actual
-Proxmox host is still pending — see `deploy/README-update-proxmox-0.5.md`.
-Workload package update job execution remains a separate, unimplemented
-future stage after that Human0.
+first real operator Human0 validation of this updater completed against CT110
+using installed source commit
+`61d2bc6b04658db39d5120e1f52624450305e93b`: the service was enabled and
+active, health passed, the test requirement was removed, and the authority
+database was present. Workload package update execution remains a separate,
+unimplemented future stage.
 
 ## Exact update-plan approval
 
@@ -127,13 +135,28 @@ future stage after that Human0.
   source context is unchanged. Changed, failed, interrupted, unsupported, or
   unavailable plans are not effectively approved.
 - Approval is authority state only. This stage cannot install or upgrade
-  packages and does not create jobs or PVE snapshots.
+  packages or create PVE snapshots. Internal job issuance copies that approval
+  provenance but is not exposed to production callers.
+
+## Durable package-update job authority
+
+- **Implemented internally:** atomic issuance of one non-empty current exact
+  plan, historical approval provenance, frozen source/resource locator context,
+  immutable copied package rows, request-id retry semantics, global durable
+  single-flight, current-authority revalidation, append-only events, and
+  pre-mutation restart interruption.
+- **Not activated:** no HTTP or Home Assistant job control, executor, PVE
+  snapshot operation, package mutation, healthcheck, or rollback path exists.
+  Reserved later checkpoint vocabulary is inert.
 
 ## Next
 
-- Job execution with a fresh job-owned snapshot and live output.
-- Healthcheck after update.
-- Same-job rollback.
+- Job-owned snapshot safety, including a recoverable identity for the actual
+  PVE snapshot operation/task.
+- Exact APT execution simulation/equality, including a proven multiarch package
+  identity contract.
+- Package execution with post-mutation crash recovery, then healthcheck and
+  same-job rollback.
 - Lifecycle controls (start/stop/reboot) and manual snapshot operations.
 
 ## Known limitations
@@ -148,7 +171,7 @@ future stage after that Human0.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v8 is incompatible with v7, and there is no v7-to-v8
+- Pre-release: schema v9 is incompatible with v8, and there is no v8-to-v9
   migration path. An existing installation now uses `deploy/update-proxmox-0.5.sh`
   for this: it detects the incompatible authority schema, backs it up, and
   resets only the authority database (see "In-place product updates" below)

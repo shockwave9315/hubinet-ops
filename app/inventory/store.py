@@ -27,6 +27,13 @@ from .models import (
     PackageScanPackage,
     PackageScanRun,
     PackagePlanApproval,
+    PackageUpdateCheckpoint,
+    PackageUpdateEventLevel,
+    PackageUpdateEventType,
+    PackageUpdateJob,
+    PackageUpdateJobEvent,
+    PackageUpdateJobPackage,
+    PackageUpdateJobStatus,
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
@@ -39,7 +46,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 8
+AUTHORITY_SCHEMA_VERSION = 9
 BUSY_TIMEOUT_MS = 5_000
 
 _REQUIRED_TABLES = frozenset(
@@ -57,6 +64,9 @@ _REQUIRED_TABLES = frozenset(
         "package_scan_runs",
         "package_scan_packages",
         "package_plan_approvals",
+        "package_update_jobs",
+        "package_update_job_packages",
+        "package_update_job_events",
         "canonicalization_migrations",
     }
 )
@@ -81,6 +91,18 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "one_active_package_scan_per_resource",
         "package_scan_issuance_immutable",
         "package_scan_terminalization_once",
+        "package_scan_package_insert_before_completion",
+        "package_scan_package_update_immutable",
+        "package_scan_package_delete_immutable",
+        "one_active_package_update_job_globally",
+        "package_update_job_issuance_immutable",
+        "package_update_job_terminalization_once",
+        "package_update_job_no_delete",
+        "package_update_job_package_insert_during_issuance",
+        "package_update_job_package_update_immutable",
+        "package_update_job_package_delete_immutable",
+        "package_update_job_event_update_immutable",
+        "package_update_job_event_delete_immutable",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -258,6 +280,36 @@ class InventoryAuthorityStore:
                 (resource_id,),
             ).fetchone()
         return _package_plan_approval(row) if row is not None else None
+
+    def package_update_job(self, job_id: str) -> PackageUpdateJob:
+        with self._read_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM package_update_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise AuthorityNotFound("package update job does not exist")
+            return _package_update_job(connection, row)
+
+    def list_package_update_jobs(self) -> tuple[PackageUpdateJob, ...]:
+        with self._read_transaction() as connection:
+            rows = connection.execute(
+                "SELECT * FROM package_update_jobs ORDER BY issued_at, job_id"
+            ).fetchall()
+            return tuple(_package_update_job(connection, row) for row in rows)
+
+    def list_package_update_job_events(
+        self, job_id: str, *, limit: int = 100
+    ) -> tuple[PackageUpdateJobEvent, ...]:
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("event limit must be an integer from 1 through 200")
+        with self._read_connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM (SELECT * FROM package_update_job_events "
+                "WHERE job_id=? ORDER BY sequence DESC LIMIT ?) "
+                "ORDER BY sequence",
+                (job_id, limit),
+            ).fetchall()
+        return tuple(_package_update_job_event(row) for row in rows)
 
     def record_counts(self) -> dict[str, int]:
         """Return bounded schema diagnostics without exposing SQL execution."""
@@ -876,12 +928,102 @@ def _package_plan_approval(row: sqlite3.Row) -> PackagePlanApproval:
     )
 
 
+def _package_update_job(
+    connection: sqlite3.Connection, row: sqlite3.Row
+) -> PackageUpdateJob:
+    package_rows = connection.execute(
+        "SELECT * FROM package_update_job_packages WHERE job_id=? "
+        "ORDER BY package_index",
+        (str(row["job_id"]),),
+    ).fetchall()
+    packages = tuple(
+        PackageUpdateJobPackage(
+            package_index=int(package["package_index"]),
+            package_name=str(package["package_name"]),
+            installed_version=str(package["installed_version"]),
+            candidate_version=str(package["candidate_version"]),
+            origin=package["origin"],
+            description=package["description"],
+            security=_optional_sqlite_boolean(package["security"], "security"),
+        )
+        for package in package_rows
+    )
+    if int(row["package_count"]) != len(packages):
+        raise AuthorityInvariantError(
+            "package update job package count does not match immutable rows"
+        )
+    return PackageUpdateJob(
+        job_id=str(row["job_id"]),
+        request_id=str(row["request_id"]),
+        issued_at=str(row["issued_at"]),
+        resource_id=str(row["resource_id"]),
+        approval_id=str(row["approval_id"]),
+        approval_reviewed_scan_run_id=str(row["approval_reviewed_scan_run_id"]),
+        approved_plan_fingerprint=str(row["approved_plan_fingerprint"]),
+        approval_approved_at=str(row["approval_approved_at"]),
+        current_plan_scan_run_id=str(row["current_plan_scan_run_id"]),
+        inventory_source_id=str(row["inventory_source_id"]),
+        committed_source_config_revision=int(
+            row["committed_source_config_revision"]
+        ),
+        committed_endpoint_id=str(row["committed_endpoint_id"]),
+        committed_canonical_transport_locator=str(
+            row["committed_canonical_transport_locator"]
+        ),
+        committed_canonicalization_contract_version=int(
+            row["committed_canonicalization_contract_version"]
+        ),
+        committed_transport_trust_revision=int(
+            row["committed_transport_trust_revision"]
+        ),
+        provider_contract_version=int(row["provider_contract_version"]),
+        expected_resource_type=str(row["expected_resource_type"]),
+        expected_binding_id=str(row["expected_binding_id"]),
+        expected_locator_generation=int(row["expected_locator_generation"]),
+        expected_resource_continuity_revision=int(
+            row["expected_resource_continuity_revision"]
+        ),
+        expected_vmid=int(row["expected_vmid"]),
+        expected_node_id=str(row["expected_node_id"]),
+        expected_node_name=str(row["expected_node_name"]),
+        package_count=int(row["package_count"]),
+        status=PackageUpdateJobStatus(str(row["status"])),
+        checkpoint=PackageUpdateCheckpoint(str(row["checkpoint"])),
+        snapshot_name=row["snapshot_name"],
+        snapshot_confirmed_at=row["snapshot_confirmed_at"],
+        mutation_may_have_started_at=row["mutation_may_have_started_at"],
+        mutation_completed_at=row["mutation_completed_at"],
+        health_started_at=row["health_started_at"],
+        rollback_may_have_started_at=row["rollback_may_have_started_at"],
+        rollback_completed_at=row["rollback_completed_at"],
+        terminalized_at=row["terminalized_at"],
+        terminal_reason=row["terminal_reason"],
+        packages=packages,
+    )
+
+
+def _package_update_job_event(row: sqlite3.Row) -> PackageUpdateJobEvent:
+    details = json.loads(str(row["details_json"]))
+    if not isinstance(details, dict):
+        raise AuthorityInvariantError("package update job event details are invalid")
+    return PackageUpdateJobEvent(
+        job_id=str(row["job_id"]),
+        sequence=int(row["sequence"]),
+        created_at=str(row["created_at"]),
+        level=PackageUpdateEventLevel(str(row["level"])),
+        stage=PackageUpdateCheckpoint(str(row["stage"])),
+        event_type=PackageUpdateEventType(str(row["event_type"])),
+        message=str(row["message"]),
+        details=details,
+    )
+
+
 _SCHEMA_STATEMENTS = (
     """
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 8)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 9)
     )
     """,
     """
@@ -1333,6 +1475,121 @@ _SCHEMA_STATEMENTS = (
     )
     """,
     """
+    CREATE TABLE package_update_jobs (
+        job_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        issued_at TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        approval_id TEXT NOT NULL,
+        approval_reviewed_scan_run_id TEXT NOT NULL,
+        approved_plan_fingerprint TEXT NOT NULL
+            CHECK(length(approved_plan_fingerprint) = 64),
+        approval_approved_at TEXT NOT NULL,
+        current_plan_scan_run_id TEXT NOT NULL,
+        inventory_source_id TEXT NOT NULL,
+        committed_source_config_revision INTEGER NOT NULL
+            CHECK(typeof(committed_source_config_revision) = 'integer' AND
+                  committed_source_config_revision > 0),
+        committed_endpoint_id TEXT NOT NULL,
+        committed_canonical_transport_locator TEXT NOT NULL,
+        committed_canonicalization_contract_version INTEGER NOT NULL
+            CHECK(typeof(committed_canonicalization_contract_version) = 'integer' AND
+                  committed_canonicalization_contract_version > 0),
+        committed_transport_trust_revision INTEGER NOT NULL
+            CHECK(typeof(committed_transport_trust_revision) = 'integer' AND
+                  committed_transport_trust_revision > 0),
+        provider_contract_version INTEGER NOT NULL
+            CHECK(typeof(provider_contract_version) = 'integer' AND
+                  provider_contract_version > 0),
+        expected_resource_type TEXT NOT NULL CHECK(expected_resource_type = 'lxc'),
+        expected_binding_id TEXT NOT NULL,
+        expected_locator_generation INTEGER NOT NULL
+            CHECK(typeof(expected_locator_generation) = 'integer' AND
+                  expected_locator_generation > 0),
+        expected_resource_continuity_revision INTEGER NOT NULL
+            CHECK(typeof(expected_resource_continuity_revision) = 'integer' AND
+                  expected_resource_continuity_revision > 0),
+        expected_vmid INTEGER NOT NULL
+            CHECK(typeof(expected_vmid) = 'integer' AND expected_vmid > 0),
+        expected_node_id TEXT NOT NULL,
+        expected_node_name TEXT NOT NULL CHECK(length(trim(expected_node_name)) > 0),
+        package_count INTEGER NOT NULL
+            CHECK(typeof(package_count) = 'integer' AND package_count > 0),
+        status TEXT NOT NULL CHECK(status IN (
+            'active', 'succeeded', 'blocked', 'failed', 'rolled_back',
+            'interrupted', 'manual_intervention')),
+        checkpoint TEXT NOT NULL CHECK(checkpoint IN (
+            'issued', 'preflight_passed', 'snapshot_confirmed',
+            'mutation_may_have_started', 'mutation_completed', 'health_started',
+            'rollback_may_have_started', 'rollback_completed')),
+        snapshot_name TEXT CHECK(snapshot_name IS NULL OR
+            (length(trim(snapshot_name)) > 0 AND length(snapshot_name) <= 200)),
+        snapshot_confirmed_at TEXT,
+        mutation_may_have_started_at TEXT,
+        mutation_completed_at TEXT,
+        health_started_at TEXT,
+        rollback_may_have_started_at TEXT,
+        rollback_completed_at TEXT,
+        terminalized_at TEXT,
+        terminal_reason TEXT CHECK(terminal_reason IS NULL OR
+            (length(trim(terminal_reason)) > 0 AND length(terminal_reason) <= 500)),
+        FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id),
+        FOREIGN KEY(approval_reviewed_scan_run_id)
+            REFERENCES package_scan_runs(scan_run_id),
+        FOREIGN KEY(current_plan_scan_run_id) REFERENCES package_scan_runs(scan_run_id),
+        FOREIGN KEY(expected_binding_id) REFERENCES resource_locator_bindings(binding_id),
+        FOREIGN KEY(inventory_source_id, expected_node_id)
+            REFERENCES inventory_nodes(inventory_source_id, node_id),
+        CHECK((status = 'active' AND terminalized_at IS NULL AND terminal_reason IS NULL) OR
+              (status != 'active' AND terminalized_at IS NOT NULL AND
+               terminal_reason IS NOT NULL))
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX one_active_package_update_job_globally
+    ON package_update_jobs((1)) WHERE status = 'active'
+    """,
+    """
+    CREATE TABLE package_update_job_packages (
+        job_id TEXT NOT NULL,
+        package_index INTEGER NOT NULL
+            CHECK(typeof(package_index) = 'integer' AND package_index >= 0),
+        package_name TEXT NOT NULL
+            CHECK(length(trim(package_name)) > 0 AND length(package_name) <= 300),
+        installed_version TEXT NOT NULL
+            CHECK(length(trim(installed_version)) > 0 AND length(installed_version) <= 500),
+        candidate_version TEXT NOT NULL
+            CHECK(length(trim(candidate_version)) > 0 AND length(candidate_version) <= 500),
+        origin TEXT CHECK(origin IS NULL OR length(origin) <= 500),
+        description TEXT CHECK(description IS NULL OR length(description) <= 500),
+        security INTEGER CHECK(security IS NULL OR security = 1),
+        PRIMARY KEY(job_id, package_index),
+        UNIQUE(job_id, package_name),
+        FOREIGN KEY(job_id) REFERENCES package_update_jobs(job_id)
+            DEFERRABLE INITIALLY DEFERRED
+    )
+    """,
+    """
+    CREATE TABLE package_update_job_events (
+        job_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL
+            CHECK(typeof(sequence) = 'integer' AND sequence > 0),
+        created_at TEXT NOT NULL,
+        level TEXT NOT NULL CHECK(level IN ('info', 'warning', 'error')),
+        stage TEXT NOT NULL CHECK(stage IN (
+            'issued', 'preflight_passed', 'snapshot_confirmed',
+            'mutation_may_have_started', 'mutation_completed', 'health_started',
+            'rollback_may_have_started', 'rollback_completed')),
+        event_type TEXT NOT NULL CHECK(length(trim(event_type)) > 0 AND
+            length(event_type) <= 100),
+        message TEXT NOT NULL CHECK(length(trim(message)) > 0 AND length(message) <= 500),
+        details_json TEXT NOT NULL CHECK(length(details_json) <= 4000 AND
+            json_valid(details_json) AND json_type(details_json) = 'object'),
+        PRIMARY KEY(job_id, sequence),
+        FOREIGN KEY(job_id) REFERENCES package_update_jobs(job_id)
+    )
+    """,
+    """
     CREATE TRIGGER backend_instance_identity_immutable
     BEFORE UPDATE OF backend_instance_id, created_at ON backend_instance
     BEGIN SELECT RAISE(ABORT, 'backend instance identity is immutable'); END
@@ -1447,5 +1704,83 @@ _SCHEMA_STATEMENTS = (
     BEFORE UPDATE ON package_scan_runs
     WHEN OLD.lifecycle = 'completed'
     BEGIN SELECT RAISE(ABORT, 'package scan run is already terminal'); END
+    """,
+    """
+    CREATE TRIGGER package_scan_package_insert_before_completion
+    BEFORE INSERT ON package_scan_packages
+    WHEN NOT EXISTS (
+        SELECT 1 FROM package_scan_runs
+        WHERE scan_run_id=NEW.scan_run_id AND lifecycle='running'
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'package scan exact rows may only be inserted before completion'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_scan_package_update_immutable
+    BEFORE UPDATE ON package_scan_packages
+    BEGIN SELECT RAISE(ABORT, 'package scan exact rows are immutable'); END
+    """,
+    """
+    CREATE TRIGGER package_scan_package_delete_immutable
+    BEFORE DELETE ON package_scan_packages
+    BEGIN SELECT RAISE(ABORT, 'package scan exact rows are immutable'); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_issuance_immutable
+    BEFORE UPDATE OF job_id, request_id, issued_at, resource_id, approval_id,
+                     approval_reviewed_scan_run_id, approved_plan_fingerprint,
+                     approval_approved_at, current_plan_scan_run_id,
+                     inventory_source_id, committed_source_config_revision,
+                     committed_endpoint_id, committed_canonical_transport_locator,
+                     committed_canonicalization_contract_version,
+                     committed_transport_trust_revision, provider_contract_version,
+                     expected_resource_type, expected_binding_id,
+                     expected_locator_generation,
+                     expected_resource_continuity_revision, expected_vmid,
+                     expected_node_id, expected_node_name, package_count
+    ON package_update_jobs
+    BEGIN SELECT RAISE(ABORT, 'package update job issuance fields are immutable'); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_terminalization_once
+    BEFORE UPDATE ON package_update_jobs
+    WHEN OLD.status != 'active'
+    BEGIN SELECT RAISE(ABORT, 'package update job is already terminal'); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_no_delete
+    BEFORE DELETE ON package_update_jobs
+    BEGIN SELECT RAISE(ABORT, 'package update jobs are immutable retained authority'); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_package_insert_during_issuance
+    BEFORE INSERT ON package_update_job_packages
+    WHEN EXISTS (
+        SELECT 1 FROM package_update_jobs WHERE job_id=NEW.job_id
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'package update job rows may only be inserted during atomic issuance'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_package_update_immutable
+    BEFORE UPDATE ON package_update_job_packages
+    BEGIN SELECT RAISE(ABORT, 'package update job package rows are immutable'); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_package_delete_immutable
+    BEFORE DELETE ON package_update_job_packages
+    BEGIN SELECT RAISE(ABORT, 'package update job package rows are immutable'); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_event_update_immutable
+    BEFORE UPDATE ON package_update_job_events
+    BEGIN SELECT RAISE(ABORT, 'package update job events are append-only'); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_event_delete_immutable
+    BEFORE DELETE ON package_update_job_events
+    BEGIN SELECT RAISE(ABORT, 'package update job events are append-only'); END
     """,
 )

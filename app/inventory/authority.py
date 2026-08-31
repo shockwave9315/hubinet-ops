@@ -27,6 +27,11 @@ from .models import (
     PackageScanPackage,
     PackageScanRun,
     PackagePlanApproval,
+    PackageUpdateCheckpoint,
+    PackageUpdateEventLevel,
+    PackageUpdateEventType,
+    PackageUpdateJob,
+    PackageUpdateJobStatus,
 )
 from .discovery import (
     BaselineCompleteness,
@@ -996,6 +1001,490 @@ class InventoryAuthority:
         if result is None:
             raise AuthorityInvariantError("package plan approval was not captured")
         return result
+
+    def issue_package_update_job(
+        self, resource_id: str, approval_id: str, request_id: str
+    ) -> PackageUpdateJob:
+        """Atomically freeze one approved, current, non-empty package plan.
+
+        This is an internal authority operation in this stage. Production has
+        no route, scheduler, or worker that calls it, and issuance itself
+        performs no PVE, snapshot, or workload mutation.
+        """
+
+        canonical_resource_id = _require_uuid(resource_id, "resource_id")
+        canonical_approval_id = _require_uuid(approval_id, "approval_id")
+        canonical_request_id = _require_uuid(request_id, "request_id")
+        rejected_current_authority = False
+        result_job_id: str | None = None
+
+        with self._store._transaction() as connection:
+            existing = connection.execute(
+                "SELECT job_id, resource_id, approval_id "
+                "FROM package_update_jobs WHERE request_id=?",
+                (canonical_request_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["resource_id"]) != canonical_resource_id
+                    or str(existing["approval_id"]) != canonical_approval_id
+                ):
+                    raise AuthorityConflict(
+                        "request_id was already used for another package update request"
+                    )
+                result_job_id = str(existing["job_id"])
+            else:
+                resource = self._require_package_scan_target(
+                    connection, canonical_resource_id
+                )
+                if str(resource["resource_type"]) != "lxc":
+                    raise AuthorityConflict(
+                        "package update jobs support LXC resources only"
+                    )
+
+                approval = connection.execute(
+                    "SELECT * FROM package_plan_approvals WHERE resource_id=?",
+                    (canonical_resource_id,),
+                ).fetchone()
+                if approval is None:
+                    raise AuthorityConflict(
+                        "package update job requires a current package plan approval"
+                    )
+                if str(approval["approval_id"]) != canonical_approval_id:
+                    raise AuthorityConflict(
+                        "approval_id does not identify the current package plan approval"
+                    )
+
+                reviewed = self._require_package_scan_run_row(
+                    connection, str(approval["reviewed_scan_run_id"])
+                )
+                if str(reviewed["resource_id"]) != canonical_resource_id:
+                    raise AuthorityInvariantError(
+                        "package plan approval references another resource"
+                    )
+                if (
+                    str(reviewed["lifecycle"])
+                    != PackageScanLifecycle.COMPLETED.value
+                    or str(reviewed["outcome"])
+                    != PackageScanOutcome.SUCCESS.value
+                ):
+                    raise AuthorityInvariantError(
+                        "package plan approval does not reference a successful exact plan"
+                    )
+                reviewed_fingerprint = self._successful_package_scan_fingerprint(
+                    connection, reviewed
+                )
+                approved_fingerprint = str(
+                    approval["approved_plan_fingerprint"]
+                )
+                if reviewed_fingerprint != approved_fingerprint:
+                    raise AuthorityInvariantError(
+                        "approved package plan fingerprint does not match reviewed exact rows"
+                    )
+
+                current = self._latest_package_scan_row(
+                    connection, canonical_resource_id
+                )
+                if current is None or (
+                    str(current["lifecycle"])
+                    != PackageScanLifecycle.COMPLETED.value
+                    or str(current["outcome"])
+                    != PackageScanOutcome.SUCCESS.value
+                ):
+                    raise AuthorityConflict(
+                        "latest package scan attempt is not a successful exact plan"
+                    )
+                current_fingerprint = self._successful_package_scan_fingerprint(
+                    connection, current
+                )
+                if current_fingerprint != approved_fingerprint:
+                    raise AuthorityConflict(
+                        "current package plan does not match the approved plan"
+                    )
+
+                decision_time = self._authority_decision_time()
+                self._materialize_due_expiry_in_transaction(
+                    connection,
+                    str(current["inventory_source_id"]),
+                    now=decision_time,
+                )
+                if not (
+                    self._package_scan_is_current_and_approvable(
+                        connection, current
+                    )
+                    and self._package_scan_context_matches_reviewed(
+                        current, reviewed
+                    )
+                ):
+                    # Commit any freshness expiry materialized above while
+                    # refusing issuance. No job rows have been written.
+                    rejected_current_authority = True
+                else:
+                    packages = connection.execute(
+                        "SELECT * FROM package_scan_packages WHERE scan_run_id=? "
+                        "ORDER BY package_index",
+                        (str(current["scan_run_id"]),),
+                    ).fetchall()
+                    if not packages:
+                        raise AuthorityConflict(
+                            "package update job requires a non-empty exact plan"
+                        )
+                    job_id = _new_uuid()
+                    issued_at = _timestamp(decision_time)
+
+                    # The child FK is deferred specifically so immutable job
+                    # package rows can be inserted before their parent. The
+                    # parent insert seals that exact set against later INSERT,
+                    # UPDATE, or DELETE in the same atomic transaction.
+                    connection.executemany(
+                        "INSERT INTO package_update_job_packages("
+                        "job_id, package_index, package_name, installed_version, "
+                        "candidate_version, origin, description, security) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            (
+                                job_id,
+                                int(package["package_index"]),
+                                str(package["package_name"]),
+                                str(package["installed_version"]),
+                                str(package["candidate_version"]),
+                                package["origin"],
+                                package["description"],
+                                package["security"],
+                            )
+                            for package in packages
+                        ),
+                    )
+                    try:
+                        connection.execute(
+                            "INSERT INTO package_update_jobs("
+                            "job_id, request_id, issued_at, resource_id, approval_id, "
+                            "approval_reviewed_scan_run_id, approved_plan_fingerprint, "
+                            "approval_approved_at, current_plan_scan_run_id, "
+                            "inventory_source_id, committed_source_config_revision, "
+                            "committed_endpoint_id, committed_canonical_transport_locator, "
+                            "committed_canonicalization_contract_version, "
+                            "committed_transport_trust_revision, provider_contract_version, "
+                            "expected_resource_type, expected_binding_id, "
+                            "expected_locator_generation, "
+                            "expected_resource_continuity_revision, expected_vmid, "
+                            "expected_node_id, expected_node_name, package_count, "
+                            "status, checkpoint) "
+                            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                            "?, ?, ?, ?, ?, ?, ?, ?, 'active', 'issued')",
+                            (
+                                job_id,
+                                canonical_request_id,
+                                issued_at,
+                                canonical_resource_id,
+                                canonical_approval_id,
+                                str(approval["reviewed_scan_run_id"]),
+                                approved_fingerprint,
+                                str(approval["approved_at"]),
+                                str(current["scan_run_id"]),
+                                str(current["inventory_source_id"]),
+                                int(current["committed_source_config_revision"]),
+                                str(current["committed_endpoint_id"]),
+                                str(current["committed_canonical_transport_locator"]),
+                                int(
+                                    current[
+                                        "committed_canonicalization_contract_version"
+                                    ]
+                                ),
+                                int(current["committed_transport_trust_revision"]),
+                                int(current["provider_contract_version"]),
+                                str(resource["resource_type"]),
+                                str(current["expected_binding_id"]),
+                                int(current["expected_locator_generation"]),
+                                int(current["expected_resource_continuity_revision"]),
+                                int(current["expected_vmid"]),
+                                str(current["expected_node_id"]),
+                                str(current["expected_node_name"]),
+                                len(packages),
+                            ),
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        raise AuthorityConflict(
+                            "another active package update job owns the global slot"
+                        ) from exc
+                    self._append_package_update_job_event(
+                        connection,
+                        job_id=job_id,
+                        created_at=issued_at,
+                        level=PackageUpdateEventLevel.INFO,
+                        stage=PackageUpdateCheckpoint.ISSUED,
+                        event_type=PackageUpdateEventType.JOB_ISSUED,
+                        message="package update job authority issued",
+                        details={
+                            "approval_reviewed_scan_run_id": str(
+                                approval["reviewed_scan_run_id"]
+                            ),
+                            "current_plan_scan_run_id": str(current["scan_run_id"]),
+                        },
+                    )
+                    self._after_package_update_job_issuance(
+                        connection, job_id=job_id
+                    )
+                    result_job_id = job_id
+
+        if rejected_current_authority:
+            raise AuthorityConflict(
+                "approved package plan or its current authority context is stale"
+            )
+        if result_job_id is None:
+            raise AuthorityInvariantError("package update job issuance was not captured")
+        return self._store.package_update_job(result_job_id)
+
+    def revalidate_package_update_job(self, job_id: str) -> PackageUpdateJob:
+        """Revalidate the current authority half of future mutation safety.
+
+        Passing this check is necessary but deliberately not sufficient
+        permission for package mutation. A future activation stage must call
+        it again close to mutation and must also prove exact APT execution
+        simulation/equality before any package operation.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        rejected_current_authority = False
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if str(job["expected_resource_type"]) != "lxc":
+                raise AuthorityInvariantError(
+                    "package update job has an unsupported frozen resource type"
+                )
+
+            decision_time = self._authority_decision_time()
+            self._materialize_due_expiry_in_transaction(
+                connection,
+                str(job["inventory_source_id"]),
+                now=decision_time,
+            )
+            if not (
+                self._package_scan_context_is_current(connection, job)
+                and self._package_scan_source_context_is_current(connection, job)
+            ):
+                rejected_current_authority = True
+            else:
+                current = self._latest_package_scan_row(
+                    connection, str(job["resource_id"])
+                )
+                if current is None or (
+                    str(current["lifecycle"])
+                    != PackageScanLifecycle.COMPLETED.value
+                    or str(current["outcome"])
+                    != PackageScanOutcome.SUCCESS.value
+                ):
+                    raise AuthorityConflict(
+                        "latest package scan attempt is not a successful exact plan"
+                    )
+                if not (
+                    self._package_scan_is_current_and_approvable(
+                        connection, current
+                    )
+                    and self._package_scan_context_matches_job(current, job)
+                ):
+                    raise AuthorityConflict(
+                        "latest package scan authority context does not match the job"
+                    )
+                fingerprint = self._successful_package_scan_fingerprint(
+                    connection, current
+                )
+                if fingerprint != str(job["approved_plan_fingerprint"]):
+                    raise AuthorityConflict(
+                        "latest package plan fingerprint does not match the job"
+                    )
+                current_triplets = self._package_material_triplets(
+                    connection,
+                    table="package_scan_packages",
+                    owner_column="scan_run_id",
+                    owner_id=str(current["scan_run_id"]),
+                )
+                job_triplets = self._package_material_triplets(
+                    connection,
+                    table="package_update_job_packages",
+                    owner_column="job_id",
+                    owner_id=canonical_job_id,
+                )
+                if not current_triplets or current_triplets != job_triplets:
+                    raise AuthorityConflict(
+                        "current exact package material does not match the job"
+                    )
+
+        if rejected_current_authority:
+            raise AuthorityConflict(
+                "package update job resource or source authority context is stale"
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def recover_interrupted_package_update_jobs(self) -> tuple[str, ...]:
+        """Interrupt pre-mutation jobs; preserve unknown later states intact.
+
+        No legitimate NEXT-A method can reach a mutation checkpoint. If a
+        future/reserved row is nevertheless present at or beyond
+        ``mutation_may_have_started``, this recovery pass leaves it active and
+        leaves the global slot owned. It never replays work, guesses success,
+        or silently frees destructive ownership.
+        """
+
+        recovered_at = _timestamp(self._now())
+        pre_mutation = (
+            PackageUpdateCheckpoint.ISSUED.value,
+            PackageUpdateCheckpoint.PREFLIGHT_PASSED.value,
+            PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED.value,
+        )
+        with self._store._transaction() as connection:
+            rows = connection.execute(
+                "SELECT job_id, checkpoint FROM package_update_jobs "
+                "WHERE status='active' AND checkpoint IN (?, ?, ?) "
+                "ORDER BY issued_at, job_id",
+                pre_mutation,
+            ).fetchall()
+            recovered = tuple(str(row["job_id"]) for row in rows)
+            for row in rows:
+                job_id = str(row["job_id"])
+                reason = "backend restarted before package mutation began"
+                updated = connection.execute(
+                    "UPDATE package_update_jobs SET status='interrupted', "
+                    "terminalized_at=?, terminal_reason=? "
+                    "WHERE job_id=? AND status='active'",
+                    (recovered_at, reason, job_id),
+                )
+                if updated.rowcount != 1:
+                    raise AuthorityConflict(
+                        "package update job recovery lost durable ownership"
+                    )
+                self._append_package_update_job_event(
+                    connection,
+                    job_id=job_id,
+                    created_at=recovered_at,
+                    level=PackageUpdateEventLevel.WARNING,
+                    stage=PackageUpdateCheckpoint(str(row["checkpoint"])),
+                    event_type=PackageUpdateEventType.RESTART_INTERRUPTED,
+                    message=reason,
+                    details={},
+                )
+        return recovered
+
+    @staticmethod
+    def _latest_package_scan_row(
+        connection: sqlite3.Connection, resource_id: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT * FROM package_scan_runs WHERE resource_id=? "
+            "ORDER BY attempt_sequence DESC LIMIT 1",
+            (resource_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _require_package_update_job_row(
+        connection: sqlite3.Connection, job_id: str
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM package_update_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise AuthorityNotFound("package update job does not exist")
+        return row
+
+    @staticmethod
+    def _package_scan_context_matches_job(
+        current: sqlite3.Row, job: sqlite3.Row
+    ) -> bool:
+        fields = (
+            "resource_id",
+            "inventory_source_id",
+            "committed_source_config_revision",
+            "committed_endpoint_id",
+            "committed_canonical_transport_locator",
+            "committed_canonicalization_contract_version",
+            "committed_transport_trust_revision",
+            "provider_contract_version",
+            "expected_binding_id",
+            "expected_locator_generation",
+            "expected_resource_continuity_revision",
+            "expected_vmid",
+            "expected_node_id",
+            "expected_node_name",
+        )
+        return all(current[field] == job[field] for field in fields)
+
+    @staticmethod
+    def _package_material_triplets(
+        connection: sqlite3.Connection,
+        *,
+        table: str,
+        owner_column: str,
+        owner_id: str,
+    ) -> tuple[tuple[str, str, str], ...]:
+        allowed = {
+            ("package_scan_packages", "scan_run_id"),
+            ("package_update_job_packages", "job_id"),
+        }
+        if (table, owner_column) not in allowed:
+            raise AuthorityInvariantError("unsupported package material source")
+        rows = connection.execute(
+            f"SELECT package_name, installed_version, candidate_version "
+            f"FROM {table} WHERE {owner_column}=? ORDER BY package_index",
+            (owner_id,),
+        ).fetchall()
+        return tuple(
+            (
+                str(row["package_name"]),
+                str(row["installed_version"]),
+                str(row["candidate_version"]),
+            )
+            for row in rows
+        )
+
+    @staticmethod
+    def _append_package_update_job_event(
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        created_at: str,
+        level: PackageUpdateEventLevel,
+        stage: PackageUpdateCheckpoint,
+        event_type: PackageUpdateEventType,
+        message: str,
+        details: Mapping[str, object],
+    ) -> None:
+        canonical_message = _require_text(message, "event message", max_length=500)
+        if not isinstance(details, Mapping):
+            raise ValueError("event details must be a mapping")
+        details_json = json.dumps(
+            dict(details), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        )
+        if len(details_json) > 4000:
+            raise ValueError("event details exceed the durable bound")
+        sequence = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 "
+                "FROM package_update_job_events WHERE job_id=?",
+                (job_id,),
+            ).fetchone()[0]
+        )
+        connection.execute(
+            "INSERT INTO package_update_job_events("
+            "job_id, sequence, created_at, level, stage, event_type, message, "
+            "details_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job_id,
+                sequence,
+                created_at,
+                level.value,
+                stage.value,
+                event_type.value,
+                canonical_message,
+                details_json,
+            ),
+        )
+
+    def _after_package_update_job_issuance(
+        self, connection: sqlite3.Connection, *, job_id: str
+    ) -> None:
+        """Test seam after all issuance writes, inside the transaction."""
 
     @staticmethod
     def _require_package_scan_target(

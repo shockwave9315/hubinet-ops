@@ -22,11 +22,12 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v8). Schema v8 adds
-immutable source-context issuance facts to package scans and one durable exact
-plan approval fact per resource. There is no migration from v7; pre-release
-installs recreate the authority database and require Home Assistant
-re-enrollment.
+database (marker `hubinet_ops_0_5_authority`, schema v9). Schema v9 retains the
+immutable scan/approval authority and adds internal, purpose-specific durable
+package-update jobs, copied exact package rows, global active-job ownership,
+and append-only job events. There is no migration from v8; pre-release installs
+use the product updater's explicit backed-up authority reset and require Home
+Assistant re-enrollment.
 
 - `store.py` — schema, transactions, CAS/fencing for discovery-run ownership,
   backend/source/global-revision bookkeeping.
@@ -72,6 +73,16 @@ current node differs from the PVE node the helper is running on, it routes
 that same fixed `pct exec` shape to the guest's node over root's existing
 Proxmox cluster-member SSH trust rather than executing locally — no per-node
 Hubinet credential. QEMU is published as unsupported.
+
+Package-update job authority is persistence-only in this stage. A directly
+instantiated `InventoryAuthority` can issue and revalidate one globally
+single-flight job from a current exact approval, and startup interrupts any
+pre-mutation active job so it cannot auto-run after restart. The production
+HTTP and Home Assistant surfaces cannot issue a job, and there is no job
+consumer, PVE snapshot mutation, workload package mutation, healthcheck, or
+rollback implementation. Authority revalidation is necessary but not
+sufficient permission for future mutation: the activation stage must also
+prove exact APT simulation/equality immediately before execution.
 
 ## Identity
 
@@ -494,8 +505,9 @@ Properties that channel must have:
   binding/generation/continuity/VMID/node context, and the same fresh healthy
   committed source context captured when the scan was issued.
 
-Update execution, job-owned snapshots, healthchecks, rollback, lifecycle
-mutation, and QEMU package execution remain future work.
+Job-owned snapshot mutation, update execution, healthchecks, rollback,
+lifecycle mutation, and QEMU package execution remain future work. Exact APT
+execution must also resolve multiarch package identity rather than guessing it.
 
 ## Ordinary safety rules (all layers, now and later)
 

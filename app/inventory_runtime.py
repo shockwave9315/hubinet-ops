@@ -111,6 +111,10 @@ def create_read_only_app(
 
     store = InventoryAuthorityStore(config.authority_db_path)
     authority = InventoryAuthority(store, now=now)
+    # NEXT-A has no update executor. Startup only terminalizes active jobs
+    # that are provably still pre-mutation; reserved mutation-intent states
+    # stay durably fenced for a later recovery implementation.
+    authority.recover_interrupted_package_update_jobs()
     authority.recover_interrupted_package_scans()
     scheduler_kwargs: dict[str, Any] = {"start": start_scheduler}
     if now is not None:

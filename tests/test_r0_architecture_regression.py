@@ -238,6 +238,43 @@ def test_r0_production_modules_define_only_exact_plan_approval_mutation() -> Non
     )
 
 
+def test_next_a_job_authority_has_recovery_but_no_production_issuance_surface() -> None:
+    runtime = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
+    assert "authority.issue_package_update_job(" not in runtime
+    assert runtime.count("authority.recover_interrupted_package_update_jobs()") == 1
+    assert runtime.index("recover_interrupted_package_update_jobs") < runtime.index(
+        "scheduler: R0Scheduler = bootstrap_and_start_r0_runtime("
+    )
+
+    for rel_path in (
+        "app/inventory_scheduler.py",
+        "app/package_scan_scheduler.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/transport_http.py",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        assert "issue_package_update_job" not in text, rel_path
+        assert "start_package_update" not in text, rel_path
+        assert "execute_package_update" not in text, rel_path
+
+
+def test_next_a_keeps_forced_helper_scan_only_and_adds_no_mutation_operation() -> None:
+    helper = (REPO_ROOT / "deploy/hubinet-package-scan-helper.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'payload["operation"] != "scan_packages"' in helper
+    for forbidden in (
+        "execute_packages",
+        "install_packages",
+        "pct snapshot",
+        "pct rollback",
+        '"apt-get", "install"',
+        '"apt-get", "upgrade"',
+        '"apt-get", "dist-upgrade"',
+    ):
+        assert forbidden not in helper
+
+
 def test_r0_config_loader_has_no_static_workload_inventory_concept() -> None:
     # AST-exact check (not a substring scan, which would false-positive on
     # this module's own negative-documentation prose, e.g. "no configured
