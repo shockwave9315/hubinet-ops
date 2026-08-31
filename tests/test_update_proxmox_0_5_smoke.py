@@ -3758,6 +3758,14 @@ class TestRunIdValidatorAcceptsGeneratorFormats:
             "not-hex-but-alphabetic",
             "1-2-",
             "",
+            # PR #65 correction pass 14, P2: the normal branch is exactly
+            # the 32 lowercase-hex characters _generate_run_id's normal
+            # path can produce, not the broader "any length of hex" the
+            # old ^[0-9a-f]+$ check accepted.
+            "a",
+            "a1b2c3d4e5f60718293a4b5c6d7e8f9",  # 31 hex chars
+            "a1b2c3d4e5f60718293a4b5c6d7e8f900",  # 33 hex chars
+            "A1B2C3D4E5F60718293A4B5C6D7E8F90",  # uppercase 32 hex chars
         ],
     )
     def test_malformed_run_id_variants_are_rejected_and_journal_preserved(self, tmp_path, bad_run_id):
@@ -3897,6 +3905,59 @@ class TestRollbackResetsStaleEnablementLinks:
         # The old unit FILE is already restored -- only re-enrolling its
         # boot-activation links failed.
         assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == self.OLD_UNIT
+
+    def test_reenable_failure_after_target_already_enabled_hard_stops(self, tmp_path):
+        # PR #65 correction pass 14, P2 -- exact missing witness. Unlike
+        # test_reenable_failure_hard_stops_without_false_recovery above
+        # (which forces rollback via an EARLIER discovery failure, before
+        # the target's own `systemctl enable` ever runs, so the unit is
+        # still disabled and the UnitFileState probe trivially catches the
+        # failed reenable), this enters rollback only AFTER the target's
+        # forward `systemctl enable` has already succeeded -- exactly the
+        # third /etc/systemd/system durability barrier
+        # (fail_nth_unit_dir_sync=3, the same seam
+        # test_changed_unit_rollback_resets_stale_target_links uses for its
+        # successful case) -- so target-only links are already installed
+        # and UnitFileState is already "enabled" GOING IN to the failed
+        # rollback reenable. A probe-only proof would (incorrectly) accept
+        # that pre-existing state as evidence the reenable's stale-link
+        # reset actually happened.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="d" * 40,
+            installed_unit_text=self.OLD_UNIT,
+            scenario_overrides={
+                "fail_nth_unit_dir_sync": 3,
+                "fail": ["service_autostart_reenable"],
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-stale-links-already-enabled-reenable-fail",
+            REPO_ROOT,
+            unit_text=self.NEW_UNIT,
+        )
+        result = _run(env.env, _base_args(target))
+
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "re-enabled (reenable)" in result.stderr
+        assert "rollback complete" not in result.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        # The old unit FILE is already restored -- only re-enrolling its
+        # boot-activation links failed.
+        assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == self.OLD_UNIT
+        # The pre-existing (target-only) enabled state must never be
+        # mistaken for a successfully restored boot activation: the stale
+        # target links from forward activation are still exactly what is
+        # installed -- the old unit's own links were never re-established
+        # -- and the old service is never restarted on a failed proof.
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service_enabled"] is True
+        assert post["service_enable_links"] == sorted(
+            {"graphical.target.wants/hubinet-ops.service", "hubinet-target.service"}
+        )
+        assert post["service"] != "active"
 
     def test_unchanged_unit_rollback_never_calls_reenable(self, tmp_path):
         env = seed_installed_environment(

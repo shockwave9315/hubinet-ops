@@ -282,11 +282,9 @@ _update_disable_service_autostart() {
 }
 
 # _update_restore_service_autostart: put hubinet-ops back under normal boot
-# activation and POSITIVELY prove it. Returns 0 only when systemd itself
-# reports the unit file as `enabled`; a zero exit from `systemctl enable`/
-# `systemctl reenable` is never accepted as proof on its own. Callers
-# decide what a failure means (a success-path die, or a rollback hard
-# stop) -- this helper never exits by itself.
+# activation and POSITIVELY prove it. Callers decide what a failure means
+# (a success-path die, or a rollback hard stop) -- this helper never exits
+# by itself.
 #
 # mode (PR #65 correction pass 13, P2) selects the systemctl verb:
 #
@@ -310,6 +308,32 @@ _update_disable_service_autostart() {
 # update_rollback_on_failure's own caller for exactly which case selects
 # `reenable`; an update whose unit never changed keeps the simpler
 # `enable` behavior unconditionally.
+#
+# Command-status semantics are MODE-SPECIFIC (PR #65 correction pass 14,
+# P2), because a positive UnitFileState=enabled probe alone proves
+# different things depending on the mode:
+#
+#   enable   -- a zero exit from `systemctl enable` is never accepted as
+#            proof on its own (it can mutate state and still fail, or the
+#            process can be killed before its exit is observed), so a
+#            command failure here only logs a warning and falls through
+#            to the UnitFileState probe. That probe is sufficient for
+#            this mode's whole contract -- "boot activation exists" --
+#            and a unit that was already enabled before this call still
+#            satisfies it.
+#   reenable -- the load-bearing contract is stronger: the stale,
+#            differently-configured links left by a superseded unit were
+#            actually reset, not merely that SOME enabled state now
+#            exists. A pre-existing UnitFileState=enabled (e.g. the
+#            TARGET unit this run enabled during forward activation,
+#            before rollback restored the old unit file over it) would
+#            still read back as enabled even if `reenable` failed and
+#            reset nothing -- so the probe cannot distinguish "reenable
+#            actually reset the links" from "something was already
+#            enabled". Only a successful `systemctl reenable` itself --
+#            the bounded, trusted systemd operation -- is what proves the
+#            reset happened; a failed one fails this helper closed
+#            immediately, before ever consulting the probe.
 _update_restore_service_autostart() {
   local mode="${1:-enable}" cmd rc
   case "${mode}" in
@@ -317,8 +341,14 @@ _update_restore_service_autostart() {
     reenable) cmd="reenable" ;;
     *) die "internal error: unsupported autostart-restore mode '${mode}'" ;;
   esac
-  run_logged pct exec "${VMID}" -- systemctl "${cmd}" hubinet-ops \
-    || log_warn "the systemctl ${cmd} request for hubinet-ops returned failure inside container ${VMID}; proving the actual unit-file state before deciding"
+  if ! run_logged pct exec "${VMID}" -- systemctl "${cmd}" hubinet-ops; then
+    rc=$?
+    if [[ "${mode}" == "reenable" ]]; then
+      _UPDATE_SERVICE_ENABLED_DETAIL="systemctl reenable returned failure (exit ${rc}); a pre-existing enabled unit-file state is never accepted as proof the stale enablement links were actually reset"
+      return 1
+    fi
+    log_warn "the systemctl ${cmd} request for hubinet-ops returned failure inside container ${VMID}; proving the actual unit-file state before deciding"
+  fi
   if _update_probe_service_enabled; then
     log_info "hubinet-ops boot activation is restored (unit-file state: enabled)"
     return 0

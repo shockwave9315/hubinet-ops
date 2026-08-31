@@ -166,9 +166,16 @@ _update_set_run_paths() {
 # made that journal unrecoverable after SIGKILL/reboot even though the
 # updater legitimately created it. Path safety stays load-bearing: no
 # slash, dot, whitespace, or other character ever matches either branch.
+#
+# The normal branch (PR #65 correction pass 14) is exactly the 32
+# lowercase-hex characters _generate_run_id's normal path can actually
+# produce -- ^[0-9a-f]+$ is broader than that generator can ever emit
+# (it also accepts 1, 31, or 33 hex characters, none of them a real
+# run-id), so it is tightened to ^[0-9a-f]{32}$ rather than left as a
+# generic "looks like hex" check.
 _update_is_valid_run_id() {
   local value="$1"
-  [[ "${value}" =~ ^[0-9a-f]+$ ]] && return 0
+  [[ "${value}" =~ ^[0-9a-f]{32}$ ]] && return 0
   [[ "${value}" =~ ^[0-9]+-[0-9]+-[0-9]+$ ]] && return 0
   return 1
 }

@@ -1413,11 +1413,17 @@ def _exec_systemctl(vmid, args, state):
         _save_state(state)
         if _fail("service_autostart_reenable"):
             return 1
-        if _fail("service_autostart_reenable_noop_success"):
-            # Reports success while stale links or the enabled state were
-            # never actually reset. The caller must trust an independent
-            # unit-file-state probe, never this code.
-            return 0
+        # PR #65 correction pass 14, P2: there is deliberately no
+        # "service_autostart_reenable_noop_success" seam here (a `reenable`
+        # that reports success while never actually resetting the links).
+        # The caller (_update_restore_service_autostart) trusts a
+        # successful `systemctl reenable` exit as the one thing that
+        # actually proves the stale-link reset happened -- a bounded,
+        # trusted-systemd-command assumption, not something an independent
+        # UnitFileState probe can substitute for (see that helper's own
+        # comment). Modeling systemd itself lying about its exit code is
+        # out of scope: it would require a full link-enumeration verifier
+        # this test model deliberately does not build.
         # `reenable` == disable (remove EVERY currently-installed link,
         # regardless of the current unit file's content) followed by
         # enable (add back exactly what the CURRENT unit file declares).
