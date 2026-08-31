@@ -442,7 +442,8 @@ baseline comes directly from the original classification reads, before
 the plan is displayed — installation run-id, the installed
 requirements.txt/systemd-unit/PVE-helper content, the authority schema
 marker/version, the pre-update `backend_instance_id`, and the planned
-authority action. Deliberately excludes every naturally-changing runtime
+authority action, plus the target-required table/index/trigger set for a
+`preserve` action. Deliberately excludes every naturally-changing runtime
 fact (discovery sequence, timestamps, ordinary authority DB contents,
 package-scan rows), so an ordinary background discovery cycle while the
 operator reads the plan never invalidates it. A mismatch fails before

@@ -3506,6 +3506,55 @@ class TestImmediatelyBeforeMutationFence:
         assert "systemctl disable" not in result.stderr
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
 
+    def test_preserve_schema_object_drift_after_plan_is_rejected_before_mutation(self, tmp_path):
+        # Exact correction-pass-12 witness: preserve classification sees
+        # the complete target-required object set, then only one required
+        # index disappears after the complete plan is displayed. Marker,
+        # version, backend identity, and installation run-id stay fixed.
+        env = seed_installed_environment(tmp_path)
+        target = build_update_target_checkout(tmp_path / "target-fence-schema-drift", REPO_ROOT)
+        authority_path = env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db")
+
+        def remove_required_index():
+            authority = json.loads(authority_path.read_text(encoding="utf-8"))
+            authority["schema_objects"].remove("one_active_endpoint_per_source")
+            authority_path.write_text(json.dumps(authority), encoding="utf-8")
+
+        result = _run_with_mutation_after_plan(
+            env.env,
+            _base_args(target),
+            remove_required_index,
+        )
+        assert result.returncode != 0
+        assert "immediately-before-mutation plan fence failed" in result.stderr
+        assert "required schema objects" in result.stderr
+        assert "rerun planning/approval" in result.stderr
+        assert "systemctl disable" not in result.stderr
+        assert "systemctl stop" not in result.stderr
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+
+    def test_reset_required_does_not_require_old_schema_objects_to_match_target(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            schema_objects=["legacy_authority_table"],
+            scenario_overrides={
+                "discovery_backend_instance_id": "22222222-2222-4222-8222-222222222222",
+            },
+        )
+        target = build_update_target_checkout(
+            tmp_path / "target-fence-reset-schema-control", REPO_ROOT, schema_version=8
+        )
+        result = _run(
+            env.env,
+            _base_args(target, extra=["--allow-authority-reset"]),
+        )
+        assert result.returncode == 0, result.stderr
+        assert "plan fence failed" not in result.stderr
+        assert "RESET" in result.stdout
+
     def test_discovery_sequence_advancing_normally_does_not_reject(self, tmp_path):
         # Test C: an ordinary background discovery cycle between planning
         # and mutation must never invalidate the update.

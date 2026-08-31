@@ -245,6 +245,7 @@ print(" ".join(sorted(names)))
     || die "could not statically determine the required authority schema-object set from target commit ${SOURCE_HEAD_SHA}'s app/inventory/store.py"
 }
 
+# _update_preserve_schema_objects_match /
 # _update_verify_preserve_schema_objects (P2-C): a matching marker/
 # version/backend-identity classification alone is weaker than the
 # target runtime's own schema validation (app/inventory/store.py's
@@ -258,7 +259,7 @@ print(" ".join(sorted(names)))
 # target's statically-extracted required set -- BEFORE the service is
 # ever stopped. A mismatch here is not an authority reset (no version
 # transition exists to justify one); it fails closed instead.
-_update_verify_preserve_schema_objects() {
+_update_preserve_schema_objects_match() {
   local inspect_output="$1"
   python3 -c '
 import json, sys
@@ -266,8 +267,18 @@ data = json.loads(sys.argv[1])
 actual = set(data.get("schema_objects") or [])
 expected = set(sys.argv[2].split())
 sys.exit(0 if actual == expected else 1)
-' "${inspect_output}" "${UPDATE_TARGET_SCHEMA_OBJECTS}" \
-    || die "the current authority database's marker/schema_version look schema-preserving-compatible (marker=${UPDATE_CURRENT_SCHEMA_MARKER}, version=${UPDATE_CURRENT_SCHEMA_VERSION}), but its actual schema objects (tables/indexes/triggers) do not match target commit ${SOURCE_HEAD_SHA}'s required set for that version -- refusing a schema-preserving update against a structurally drifted database (this is not an authority reset; no version transition exists for this classification). Investigate and repair the database manually before retrying."
+' "${inspect_output}" "${UPDATE_TARGET_SCHEMA_OBJECTS}"
+}
+
+_update_verify_preserve_schema_objects() {
+  local inspect_output="$1" context="${2:-classification}"
+  if _update_preserve_schema_objects_match "${inspect_output}"; then
+    return 0
+  fi
+  if [[ "${context}" == "plan_fence" ]]; then
+    die "immediately-before-mutation plan fence failed: the authority database's required schema objects (tables/indexes/triggers) changed since the approved preserve plan was classified -- refusing to mutate or silently switch to an authority reset; investigate the structural drift and rerun planning/approval"
+  fi
+  die "the current authority database's marker/schema_version look schema-preserving-compatible (marker=${UPDATE_CURRENT_SCHEMA_MARKER}, version=${UPDATE_CURRENT_SCHEMA_VERSION}), but its actual schema objects (tables/indexes/triggers) do not match target commit ${SOURCE_HEAD_SHA}'s required set for that version -- refusing a schema-preserving update against a structurally drifted database (this is not an authority reset; no version transition exists for this classification). Investigate and repair the database manually before retrying."
 }
 
 _update_classify_authority() {
@@ -497,6 +508,16 @@ _update_revalidate_plan_fence() {
   fresh_marker="$(_json_field_from_text "${inspect_output}" "marker")"
   fresh_version="$(_json_field_from_text "${inspect_output}" "schema_version")"
   fresh_authority_backend_instance_id="$(_json_field_from_text "${inspect_output}" "backend_instance_id")"
+
+  # Preserve classification depends on the exact required table/index/
+  # trigger set, not only marker/version/backend identity. Re-run that
+  # same proof from this fresh inspect immediately before mutation. A
+  # reset-required plan deliberately does not require the old schema to
+  # have the target's object set: its explicitly approved action replaces
+  # the old authority database after taking a validated backup.
+  if [[ "${UPDATE_AUTHORITY_ACTION}" == "preserve" ]]; then
+    _update_verify_preserve_schema_objects "${inspect_output}" plan_fence
+  fi
 
   local probe_output probe_status fresh_backend_instance_id
   probe_output="$(pct exec "${VMID}" -- python3 "${UPDATE_PROBE_CT_PATH}" 2>/dev/null)" \
