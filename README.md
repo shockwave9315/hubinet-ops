@@ -30,15 +30,22 @@ a guest in Proxmox never requires touching this repository or its config.
   explicit durable approval through a second native Home Assistant action, and
   a concise backend-published approval-status sensor. Approval never executes
   an update.
+- Internal durable package-update job authority that freezes one current,
+  non-empty approved exact plan with immutable approval/source/resource
+  provenance, copied package rows, request-id idempotency, global single-flight,
+  and pre-mutation restart interruption. Job issuance is not exposed through
+  HTTP or Home Assistant and does not execute workload changes.
 - An automated Proxmox bootstrap that provisions the whole backend.
 - An in-place updater for an existing installation: install once, update
   many times, preserving identity/config/credentials.
 
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
-installs packages. Update execution, jobs, snapshots, healthchecks, and
-rollback are not built yet — see `STATUS.md`.
+installs packages. Internal durable package-update job authority is built, but
+it is not production-reachable. Job-owned PVE snapshot mutation, workload
+package execution, healthchecks, and rollback are not built yet — see
+`STATUS.md`.
 
-Schema v8 has no v7 migration. An existing pre-release deployment uses
+Schema v9 has no v8 migration. An existing pre-release deployment uses
 `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
 authority schema, backs it up, and resets only the authority database (with
 explicit operator authorization) while preserving the LXC, its VMID/network,
@@ -143,7 +150,7 @@ development or agent session.
 
 | Path | What it is |
 | --- | --- |
-| `app/inventory/` | durable authority subsystem: identity, discovery, reconciliation, publication |
+| `app/inventory/` | durable authority subsystem: identity, discovery, reconciliation, publication, internal package-update job authority |
 | `app/inventory_runtime.py` | production composition root and bounded HTTP API |
 | `app/inventory_runtime_config.py` | source-centric config loader |
 | `app/inventory_scheduler.py` | discovery scheduler and restart recovery |
