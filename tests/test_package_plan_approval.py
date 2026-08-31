@@ -357,6 +357,10 @@ def test_internal_exact_row_mismatch_refuses_approval(tmp_path: Path) -> None:
     _, store, authority, resource = _system(tmp_path)
     reviewed = _successful_plan(authority, resource.resource_id)
     with store._transaction() as connection:
+        # Simulate corruption below the normal v9 schema boundary. Ordinary
+        # SQL is now rejected by package_scan_package_update_immutable; the
+        # approval recomputation remains a separate defense in depth.
+        connection.execute("DROP TRIGGER package_scan_package_update_immutable")
         connection.execute(
             "UPDATE package_scan_packages SET candidate_version='tampered' "
             "WHERE scan_run_id=? AND package_index=0",

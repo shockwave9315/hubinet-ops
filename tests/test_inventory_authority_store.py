@@ -27,6 +27,7 @@ def test_fresh_authority_database_initializes_one_persistent_backend(
 ) -> None:
     path = tmp_path / "authority.db"
     store = InventoryAuthorityStore(path, now=fixed_now)
+    assert AUTHORITY_SCHEMA_VERSION == 9
 
     backend = store.backend_instance()
     parsed = uuid.UUID(backend.backend_instance_id)
@@ -111,7 +112,7 @@ def test_unknown_nonempty_database_is_rejected_without_modification(
         assert connection.execute("SELECT value FROM unrelated").fetchone()[0] == "retained"
 
 
-@pytest.mark.parametrize("old_version", (1, 2, 3, 4, 5, 6, 7))
+@pytest.mark.parametrize("old_version", (1, 2, 3, 4, 5, 6, 7, 8))
 def test_older_dormant_authority_schema_is_rejected_without_migration(
     tmp_path: Path, old_version: int
 ) -> None:

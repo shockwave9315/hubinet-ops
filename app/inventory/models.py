@@ -33,6 +33,38 @@ class PackageScanOutcome(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+class PackageUpdateJobStatus(StrEnum):
+    ACTIVE = "active"
+    SUCCEEDED = "succeeded"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+    ROLLED_BACK = "rolled_back"
+    INTERRUPTED = "interrupted"
+    MANUAL_INTERVENTION = "manual_intervention"
+
+
+class PackageUpdateCheckpoint(StrEnum):
+    ISSUED = "issued"
+    PREFLIGHT_PASSED = "preflight_passed"
+    SNAPSHOT_CONFIRMED = "snapshot_confirmed"
+    MUTATION_MAY_HAVE_STARTED = "mutation_may_have_started"
+    MUTATION_COMPLETED = "mutation_completed"
+    HEALTH_STARTED = "health_started"
+    ROLLBACK_MAY_HAVE_STARTED = "rollback_may_have_started"
+    ROLLBACK_COMPLETED = "rollback_completed"
+
+
+class PackageUpdateEventLevel(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
+
+
+class PackageUpdateEventType(StrEnum):
+    JOB_ISSUED = "job_issued"
+    RESTART_INTERRUPTED = "restart_interrupted"
+
+
 class PackageScanFailure(StrEnum):
     GUEST_UNAVAILABLE = "guest_unavailable"
     UNSUPPORTED_RESOURCE_TYPE = "unsupported_resource_type"
@@ -308,3 +340,66 @@ class PackagePlanApproval:
     reviewed_scan_run_id: str
     approved_plan_fingerprint: str
     approved_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateJobPackage:
+    package_index: int
+    package_name: str
+    installed_version: str
+    candidate_version: str
+    origin: str | None = None
+    description: str | None = None
+    security: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateJob:
+    job_id: str
+    request_id: str
+    issued_at: str
+    resource_id: str
+    approval_id: str
+    approval_reviewed_scan_run_id: str
+    approved_plan_fingerprint: str
+    approval_approved_at: str
+    current_plan_scan_run_id: str
+    inventory_source_id: str
+    committed_source_config_revision: int
+    committed_endpoint_id: str
+    committed_canonical_transport_locator: str
+    committed_canonicalization_contract_version: int
+    committed_transport_trust_revision: int
+    provider_contract_version: int
+    expected_resource_type: str
+    expected_binding_id: str
+    expected_locator_generation: int
+    expected_resource_continuity_revision: int
+    expected_vmid: int
+    expected_node_id: str
+    expected_node_name: str
+    package_count: int
+    status: PackageUpdateJobStatus
+    checkpoint: PackageUpdateCheckpoint
+    snapshot_name: str | None
+    snapshot_confirmed_at: str | None
+    mutation_may_have_started_at: str | None
+    mutation_completed_at: str | None
+    health_started_at: str | None
+    rollback_may_have_started_at: str | None
+    rollback_completed_at: str | None
+    terminalized_at: str | None
+    terminal_reason: str | None
+    packages: tuple[PackageUpdateJobPackage, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateJobEvent:
+    job_id: str
+    sequence: int
+    created_at: str
+    level: PackageUpdateEventLevel
+    stage: PackageUpdateCheckpoint
+    event_type: PackageUpdateEventType
+    message: str
+    details: Mapping[str, Any]
