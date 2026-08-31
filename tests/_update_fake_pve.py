@@ -89,6 +89,12 @@ def seed_installed_environment(
         "arch": "amd64",
         "service": "active",
         "service_enabled": True,
+        # A freshly bootstrapped installation's enablement is already
+        # durable (the real bootstrap installer's own systemd activation
+        # long predates any in-place update run) -- see correction pass
+        # 10's durable_service_enabled/simulate_pve_ct_reboot model in
+        # tests/_bootstrap_fake_pve.py.
+        "durable_service_enabled": True,
         "nftables_active": True,
     }
     state["pve_users"]["hubinetops@pve"] = {

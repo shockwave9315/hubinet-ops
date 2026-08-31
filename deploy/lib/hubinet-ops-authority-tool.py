@@ -67,10 +67,24 @@ Subcommands (argv[1]):
       code is 0 only when "ok" is true; non-zero on both argv errors and
       every reported "ok": false, so a bash caller can use returncode
       alone as the fail-closed gate while offering `inspect`-style JSON on
-      both stdout paths for a specific reason. The caller
-      (deploy/lib/update-activate.sh) therefore never needs its own
-      separate shell-level sync call for this transition: "ok": true from
-      `backup` already IS the durability proof.
+      both stdout paths for a specific reason.
+
+      IMPORTANT (correction pass 10, P1): this file+immediate-directory
+      fsync is necessary but, on its own, NOT sufficient proof that the
+      backup is destructively usable. <dest_path>'s containing run
+      directory (deploy/lib/update-activate.sh's
+      update-backups/${UPDATE_RUN_ID}, and possibly update-backups/
+      itself) is typically newly created by the SAME caller run that
+      invokes this command -- fsyncing that directory proves the backup
+      FILE's own directory entry is durable, but does not prove the
+      directory-entry link that ties that newly-created ancestry into ITS
+      OWN parent(s) survived a crash. So "ok": true here is proof that the
+      backup's own bytes and its immediate containing directory entry are
+      durable, but the caller (deploy/lib/update-activate.sh) still
+      crosses one additional CT filesystem-level `sync -f` barrier over
+      the backup's run directory itself -- closing that newly-created
+      ancestry -- BEFORE ever treating this backup as the destructively-
+      usable proof that gates removing the live database.
 
   remove <db_path>
       Removes <db_path> and its WAL/SHM sidecars (<db_path>-wal,

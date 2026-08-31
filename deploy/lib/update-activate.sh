@@ -15,7 +15,16 @@
 # the whole mutation window so a PVE/CT reboot can never boot-activate a
 # half-swapped installation, and enablement is restored and positively
 # proven again by either _update_restore_service_autostart on success or
-# update_rollback_on_failure on every recovery path.
+# update_rollback_on_failure on every recovery path. The temporary
+# disabled/enabled unit-file state is itself ordinary filesystem state
+# under /etc/systemd/system (correction pass 10, P1) -- it crosses the
+# same CT filesystem durability barrier as every other rollback-critical
+# artifact below, on all three sides: immediately after the disable
+# request is proven (before the service is stopped or anything else is
+# mutated), immediately after the final restore-enable is proven on
+# success (before the journal records the run completed), and immediately
+# after restore-enable is proven during rollback/recovery (before the old
+# service is started again).
 #
 # Rollback invariant (corrective pass): for every rollback-managed
 # artifact (app, venv+requirements, systemd unit), a durable
@@ -227,6 +236,17 @@ _update_disable_service_autostart() {
   fi
   (( rc == 1 )) \
     || die "could not positively prove hubinet-ops boot activation disabled inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL}) -- refusing to mutate an installation that may still auto-start at boot"
+
+  # Durability barrier (correction pass 10, P1): `systemctl disable` itself
+  # only mutates the unit-file symlink state under /etc/systemd/system --
+  # ordinary filesystem state, exactly like every other artifact this
+  # mutation window depends on. Proving UnitFileState==disabled above only
+  # proves the RUNNING KERNEL's view; without this barrier a power loss
+  # immediately afterwards could still resurrect an ENABLED unit on the
+  # next boot, defeating the whole point of this guard. This must cross
+  # the barrier BEFORE the service is stopped or any artifact mutated.
+  _update_durability_barrier_ct /etc/systemd/system
+
   ledger_record update-service-autostart-disabled "${VMID}"
   log_info "hubinet-ops boot activation is temporarily disabled for this update's mutation window (the CT's own onboot setting is unchanged)"
 }
@@ -467,6 +487,16 @@ update_activate_and_accept() {
   _update_restore_service_autostart \
     || die "the target installation was fully accepted, but hubinet-ops boot activation could not be proven restored inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL})"
 
+  # Durability barrier (correction pass 10, P1): the just-restored
+  # enablement state itself must be durable BEFORE this run is journaled
+  # completed -- exactly the same invariant as every other durability
+  # barrier in this file, applied to the unit-file-enablement fact rather
+  # than to app/venv/unit/authority content. A failure here dies with the
+  # rollback boundary already crossed, so the existing EXIT-trap recovery
+  # performs a coherent rollback exactly as it would for any other
+  # activation-window failure.
+  _update_durability_barrier_ct /etc/systemd/system
+
   _update_finish_summary
 }
 
@@ -581,6 +611,24 @@ _update_perform_authority_reset() {
   fi
   UPDATE_DB_BACKUP_PATH="${backup_ct_path}"
   ledger_record update-authority-backed-up "${VMID}"
+
+  # Durability barrier (correction pass 10, P1): the helper's own
+  # file-plus-immediate-directory fsync (hubinet-ops-authority-tool.py's
+  # _fsync_file_and_dir) proves the backup FILE's bytes and its immediate
+  # parent directory entry are durable -- but ${backup_dir} (and possibly
+  # its own parent, update-backups/) was JUST created by the `install -d`
+  # above, in this same run. Fsyncing a file's immediate directory does
+  # NOT prove the directory ENTRY LINKING that newly-created directory
+  # into ITS OWN parent survived a crash -- an ancestor link is a distinct
+  # fact from the leaf file/directory's own durability. A CT filesystem-
+  # level barrier over the run's own backup directory closes that
+  # ancestry, exactly like every other newly-created durability-critical
+  # path in this file (`sync -f` synchronizes the whole containing
+  # filesystem, not merely one directory). Only once this barrier passes
+  # is the backup treated as destructively usable: the reset-attempted
+  # marker is journaled and the live database removed after this point,
+  # never before it.
+  _update_durability_barrier_ct "${backup_dir}"
 
   # P1-A correction pass 2: the durable rollback-arming marker must be
   # recorded AFTER the coherent backup is validated but BEFORE the first
@@ -902,6 +950,16 @@ update_rollback_on_failure() {
   if ledger_has update-service-autostart-disable-attempted "${VMID}"; then
     _update_restore_service_autostart \
       || _update_rollback_hard_stop "restored the pre-update installation's files, but could not prove hubinet-ops boot activation re-enabled inside container ${VMID} (${_UPDATE_SERVICE_ENABLED_DETAIL}) -- it would not start again after a reboot"
+    # Durability barrier (correction pass 10, P1): the restored enablement
+    # state itself must survive a subsequent power loss BEFORE the old
+    # service is started again -- the same invariant as the forward-path
+    # barriers in _update_disable_service_autostart and
+    # update_activate_and_accept, applied here on the rollback/recovery
+    # side. A replay that finds the unit already enabled still runs this
+    # unconditionally, re-establishing the barrier before terminal
+    # recovery (section 6 discipline, same as every other rollback-
+    # restoration barrier in this file).
+    _update_durability_barrier_ct_or_hard_stop /etc/systemd/system "restoring hubinet-ops boot activation"
   fi
 
   run_logged pct exec "${VMID}" -- systemctl start hubinet-ops \

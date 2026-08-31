@@ -410,6 +410,12 @@ _CT_SYNC_FAIL_RULES = [
     ("exact", "/opt/hubinet-ops", "ct_sync_final_app_dir"),
     ("exact", "/etc/systemd/system", "ct_sync_final_unit_dir"),
     ("exact", "/var/lib/hubinet-ops", "ct_sync_final_authority_dir"),
+    # Correction pass 10, P1 -- the newly-created run-scoped authority
+    # backup directory's own ancestry-link barrier (see
+    # _update_perform_authority_reset in update-activate.sh). A prefix
+    # rule because the exact path is run-id-suffixed and unpredictable
+    # ahead of time, exactly like the rollback-copy prefix rules above.
+    ("prefix", "/var/lib/hubinet-ops/update-backups/", "ct_sync_authority_backup_dir"),
 ]
 
 
@@ -649,11 +655,41 @@ def _exec_inner(vmid, inner, state):
         if len(args) != 1:
             return 2
         normalized = _normalize_ct_arg(args[0])
+
+        # Correction pass 10, P1 -- the temporary autostart-enablement
+        # guard now crosses THREE distinct `sync -f /etc/systemd/system`
+        # calls within a single run (disable-side, success-enable-side,
+        # rollback-enable-side); all three share the same literal path, so
+        # a single path-keyed fail rule cannot target just one of them.
+        # fail_nth_unit_dir_sync selects which ORDINAL call to this exact
+        # path fails, the same idiom already used for
+        # fail_nth_service_stop/fail_nth_daemon_reload/etc above.
+        if normalized == "/etc/systemd/system":
+            call_number = state.get("unit_dir_sync_calls", 0) + 1
+            state["unit_dir_sync_calls"] = call_number
+            _save_state(state)
+            fail_nth = SCENARIO.get("fail_nth_unit_dir_sync")
+            if fail_nth is not None and call_number == int(fail_nth):
+                return 1
+
         fail_key = _ct_sync_fail_key(normalized)
         if fail_key is not None and _fail(fail_key):
             return 1
         if not _ct_path(vmid, args[0]).exists():
             return 1
+
+        if normalized == "/etc/systemd/system":
+            # Correction pass 10, P1 -- this barrier is the one that
+            # commits the CT's current in-kernel autostart-enablement view
+            # (entry["service_enabled"], mutated synchronously by the bare
+            # `systemctl enable`/`disable hubinet-ops` fakes above) into
+            # DURABLE state that survives simulate_pve_ct_reboot. Before
+            # this point, an enable/disable is exactly as volatile as any
+            # other uncommitted namespace mutation this fake already
+            # discards on reboot.
+            entry = state["vmids"].setdefault(vmid, {})
+            entry["durable_service_enabled"] = entry.get("service_enabled", False)
+            _save_state(state)
         return 0
 
     if inner[0] == "cat":
@@ -2120,7 +2156,21 @@ class FakePveEnvironment:
         state = self.state()
         entry = state["vmids"].setdefault(vmid, {})
         entry["started"] = str(entry.get("onboot", "1")) == "1"
-        if entry["started"] and entry.get("service_enabled", False):
+        # Correction pass 10, P1: boot activation is decided from the
+        # DURABLE enablement fact, not the in-kernel one -- a `systemctl
+        # enable`/`disable hubinet-ops` that never crossed its own CT
+        # filesystem barrier (sync -f /etc/systemd/system) is exactly as
+        # volatile as any other uncommitted namespace mutation this fake
+        # already discards on reboot (see the "sync" dispatcher above,
+        # which is what actually commits service_enabled into
+        # durable_service_enabled). Falls back to whatever service_enabled
+        # already is when no barrier has ever run for this vmid yet -- the
+        # ordinary case for every test whose fixture never exercises the
+        # updater's autostart guard at all, matching this fake's
+        # bootstrap-seeded default of a durably enabled installation.
+        durable_enabled = entry.get("durable_service_enabled", entry.get("service_enabled", False))
+        entry["service_enabled"] = durable_enabled
+        if entry["started"] and durable_enabled:
             entry["service"] = "active"
         else:
             entry["service"] = "inactive"

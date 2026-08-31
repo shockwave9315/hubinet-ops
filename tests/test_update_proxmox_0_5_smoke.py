@@ -2841,10 +2841,18 @@ class TestForwardDurabilityBarrierOrdering:
         stderr = result.stderr
         marker_at = stderr.rindex("-- mv /opt/hubinet-ops/.hubinet-source-commit.staged-")
         app_barrier_at = stderr.rindex("-- sync -f /opt/hubinet-ops")
-        unit_barrier_at = stderr.rindex("-- sync -f /etc/systemd/system")
         enable_at = stderr.index("systemctl enable hubinet-ops")
+        # Correction pass 10, P1: /etc/systemd/system is now barriered
+        # THREE times in this scenario -- the disable-side guard (well
+        # before marker_at), this unit-CONTENT barrier (because the unit
+        # text changed, between the marker write and re-enable), and the
+        # NEW autostart-enablement barrier (after enable_at, covered by
+        # TestAutostartEnablementDurabilityBarrier below). `.index(...,
+        # marker_at)` finds the first occurrence at/after marker_at,
+        # isolating this content barrier specifically.
+        unit_content_barrier_at = stderr.index("-- sync -f /etc/systemd/system", marker_at)
         assert marker_at < app_barrier_at < enable_at
-        assert marker_at < unit_barrier_at < enable_at
+        assert marker_at < unit_content_barrier_at < enable_at
 
 
 class TestForwardDurabilityBarrierFailureSeams:
@@ -3035,6 +3043,201 @@ class TestRollbackRestorationDurabilityBarrier:
         # Recovery never reached its own daemon-reload -- the barrier
         # failed first.
         assert env.state()["daemon_reload_calls"] == 1
+
+
+# ---------------------------------------------------------------------------
+# AD. Correction pass 10, P1 -- the temporary autostart disable/enable
+#     unit-file state is itself ordinary filesystem state under
+#     /etc/systemd/system, and must cross the SAME CT durability barrier as
+#     every other rollback-critical artifact, on all three sides: the
+#     disable side (before the service is stopped or anything else is
+#     mutated), the successful re-enable side (before the journal records
+#     the run completed), and the rollback/recovery re-enable side (before
+#     the old service is started again).
+# ---------------------------------------------------------------------------
+
+
+class TestAutostartEnablementDurabilityBarrier:
+    def test_disable_barrier_crosses_before_stop_and_any_mutation(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="a" * 40)
+        target = build_update_target_checkout(tmp_path / "target-autostart-disable-order", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        disable_at = stderr.index("systemctl disable hubinet-ops")
+        barrier_at = stderr.index("-- sync -f /etc/systemd/system")
+        stop_at = stderr.index("systemctl stop hubinet-ops")
+        assert disable_at < barrier_at < stop_at
+
+    def test_disable_barrier_failure_stops_before_service_stop_and_rolls_back_durably(self, tmp_path):
+        # fail_nth_unit_dir_sync=1: the FIRST call to `sync -f
+        # /etc/systemd/system` in this run is always the disable-side
+        # barrier (it is the very first mutation of the whole window), so
+        # this targets it precisely without also tripping the later
+        # success/rollback-side barriers that share the same literal path.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="b" * 40,
+            scenario_overrides={"fail_nth_unit_dir_sync": 1},
+        )
+        target = build_update_target_checkout(tmp_path / "target-autostart-disable-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "durability barrier failed for /etc/systemd/system" in result.stderr
+        # No service stop and no live artifact mutation past the barrier.
+        assert not any("systemctl stop" in line for line in result.stderr.splitlines())
+        assert "rollback complete" in result.stderr
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
+        assert env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip() == "b" * 40
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service_enabled"] is True
+        assert post["service"] == "active"
+
+        # And the restored enablement genuinely IS durable -- not merely
+        # namespace-visible in the running kernel.
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_success_enable_barrier_crosses_after_enable_before_reboot_durability(self, tmp_path):
+        env = seed_installed_environment(tmp_path, installed_source_sha="c" * 40)
+        target = build_update_target_checkout(tmp_path / "target-autostart-enable-order", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        enable_at = stderr.index("systemctl enable hubinet-ops")
+        # The FIRST /etc/systemd/system barrier at/after enable_at is this
+        # new success-side barrier (the disable-side one, much earlier in
+        # the run, is strictly before enable_at).
+        barrier_at = stderr.index("-- sync -f /etc/systemd/system", enable_at)
+        assert enable_at < barrier_at
+        assert "in-place update: PASS" in result.stdout
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+
+        # The one remaining narrow crash window this barrier closes: a
+        # reboot after a fully accepted, durably-enabled target.
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_rollback_enable_barrier_succeeds_and_durably_restores_boot_activation(self, tmp_path):
+        # Unlike the forward-path barriers, rollback-restoration barriers
+        # (_update_durability_barrier_ct_or_hard_stop) are deliberately not
+        # run_logged (see update-recovery.sh's own header comment on that
+        # helper family), so there is no "-- sync -f ..." log line to
+        # order against here. The failure-injection test below already
+        # proves the barrier gates the old service's restart (a failed
+        # barrier means the old service is never restarted); this test
+        # proves the SUCCESS side of that same ordering end-to-end: after
+        # a late-failure rollback, the restored enablement is genuinely
+        # DURABLE, not merely the in-kernel view.
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="d" * 40,
+            scenario_overrides={"discovery_result": "backend_unreachable"},
+        )
+        target = build_update_target_checkout(tmp_path / "target-autostart-rollback-order", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+        post = env.state()["vmids"][FAKE_VMID]
+        assert post["service_enabled"] is True
+        assert post["service"] == "active"
+
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+
+    def test_rollback_enable_barrier_failure_hard_stops_without_false_recovery(self, tmp_path):
+        env = seed_installed_environment(
+            tmp_path,
+            installed_source_sha="e" * 40,
+            scenario_overrides={
+                "discovery_result": "backend_unreachable",
+                # Call #1 is the disable-side barrier (succeeds); call #2
+                # is this rollback's own re-enable barrier, since this
+                # scenario's unit text never changes (no content-final
+                # barrier call in between).
+                "fail_nth_unit_dir_sync": 2,
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target-autostart-rollback-fail", REPO_ROOT)
+        result = _run(env.env, _base_args(target))
+        assert result.returncode != 0
+        assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
+        assert "restoring hubinet-ops boot activation" in result.stderr
+        assert "rollback complete" not in result.stderr
+        journal = _update_state_path(env, FAKE_VMID, "journal")
+        assert journal.exists()
+        # The old service is never (re)started after a failed re-enable
+        # barrier -- only the earlier TARGET start (before acceptance
+        # failed) appears.
+        assert result.stderr.count("systemctl start hubinet-ops") == 1
+        # `systemctl enable` itself succeeded in the running kernel, but
+        # its own durability barrier failed -- this is exactly the gap
+        # this fix closes: the in-kernel view is misleadingly "enabled"
+        # while durability is not yet proven.
+        assert env.state()["vmids"][FAKE_VMID]["service_enabled"] is True
+        env.simulate_pve_ct_reboot(FAKE_VMID)
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive", (
+            "the enable request succeeded in the running kernel, but its own "
+            "durability barrier failed -- a reboot here must not resurrect it"
+        )
+
+
+# ---------------------------------------------------------------------------
+# AE. Correction pass 10, P1 -- the newly-created authority backup run
+#     directory's ancestry link into its own parent(s) is not proven durable
+#     by the authority-tool helper's own file+immediate-directory fsync
+#     alone; the caller crosses one more explicit CT filesystem barrier over
+#     the backup's run directory before ever treating it as destructively
+#     usable.
+# ---------------------------------------------------------------------------
+
+
+class TestAuthorityBackupAncestryDurabilityBarrier:
+    def test_backup_dir_barrier_crosses_after_creation_before_boot_reenable(self, tmp_path):
+        new_backend_instance_id = "33333333-3333-4333-8333-333333333333"
+        env = seed_installed_environment(
+            tmp_path, schema_version=7,
+            scenario_overrides={"discovery_backend_instance_id": new_backend_instance_id},
+        )
+        target = build_update_target_checkout(tmp_path / "target-backup-ancestry-order", REPO_ROOT, schema_version=8)
+        result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert result.returncode == 0, result.stderr
+        stderr = result.stderr
+        install_at = stderr.index("install -d -o hubinetops -g hubinetops -m 0750")
+        barrier_at = stderr.index("-- sync -f /var/lib/hubinet-ops/update-backups/")
+        enable_at = stderr.index("systemctl enable hubinet-ops")
+        assert install_at < barrier_at < enable_at
+
+    def test_backup_dir_barrier_failure_blocks_reset_and_preserves_live_db(self, tmp_path):
+        new_backend_instance_id = "44444444-4444-4444-8444-444444444444"
+        env = seed_installed_environment(
+            tmp_path,
+            schema_version=7,
+            scenario_overrides={
+                "discovery_backend_instance_id": new_backend_instance_id,
+                "fail": ["ct_sync_authority_backup_dir"],
+            },
+        )
+        target = build_update_target_checkout(tmp_path / "target-backup-ancestry-fail", REPO_ROOT, schema_version=8)
+        result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
+        assert result.returncode != 0
+        assert "rollback complete" in result.stderr
+
+        # The old live database was NEVER removed: the reset-attempted
+        # marker (which gates the destructive `remove`) is only journaled
+        # AFTER this barrier passes.
+        db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
+        assert db["schema_version"] == 7
+        assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
+        # The coherent backup file itself was created (namespace-visible)
+        # before the barrier failed -- retained for manual diagnosis, but
+        # this run never treated it as destructively usable.
+        backups_root = env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/update-backups")
+        assert list(backups_root.rglob("authority.db"))
+        assert not _update_state_path(env, FAKE_VMID, "journal").exists()
+        assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
+        assert not env.ct_file(FAKE_VMID, "/opt/hubinet-ops/app/inventory/store.py").exists()
 
 
 # ---------------------------------------------------------------------------

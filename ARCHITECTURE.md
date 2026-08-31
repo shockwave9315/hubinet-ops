@@ -292,6 +292,16 @@ inactive; the one remaining narrow window (accepted target, coherent marker,
 enablement restored, journal not yet completed) can only start the fully
 accepted target installation, never a mixed one.
 
+The disabled/enabled unit-file state is itself ordinary filesystem state
+under `/etc/systemd/system`, not a fact `systemctl`'s exit status or a
+running-kernel probe alone proves durable — so it crosses the same CT
+filesystem durability barrier (below) as every other rollback-critical
+artifact: immediately after the disable request is proven and before the
+service is stopped or anything else is mutated; immediately after the
+final restore-enable is proven on success and before the journal records
+the run completed; and immediately after restore-enable is proven during
+rollback/recovery and before the old service is started again.
+
 Service, unit-file-enablement, and rollback-path inspection are explicitly
 three-valued: a failed or malformed probe is unknown, never evidence that
 the service is stopped, that boot activation is disabled or restored, or
@@ -398,10 +408,24 @@ an accepted target can never end up durably marked "completed" while its
 live content still only exists in cache. The authority database's own two
 durability transitions (the pre-reset backup, and the reset removal) are
 implemented *inside* `hubinet-ops-authority-tool.py` itself: `backup` and
-`remove` report `"ok": true` only after fsync-ing their own result, so the
-caller's existing `ok:true` gate already is the durability proof. A barrier
-failure is load-bearing — it fails the run and triggers the same coherent
-rollback as any other activation-window failure, never warn-and-continue.
+`remove` report `"ok": true` only after fsync-ing their own result (the
+backup file's data and its immediate containing directory; the removed
+directory entries, for `remove`). For `remove` that already is the whole
+durability proof, because the database's containing directory
+(`/var/lib/hubinet-ops`) predates this run. For `backup` it is *not* the
+whole proof: the backup's own containing directory
+(`update-backups/${UPDATE_RUN_ID}`, and possibly `update-backups/` itself)
+is typically newly created by this same run, and fsync-ing a file's
+immediate directory does not prove the directory-entry link that ties a
+newly-created directory into *its own* parent survived a crash — a distinct
+fact from the leaf file's own durability. So the caller crosses one more
+explicit CT filesystem-level `sync -f` barrier over the backup's run
+directory itself, closing that ancestry, before ever treating the backup as
+destructively usable: only after that barrier passes is the reset-attempted
+marker journaled and the live database removed. A barrier failure anywhere
+in this file is load-bearing — it fails the run and triggers the same
+coherent rollback as any other activation-window failure, never
+warn-and-continue.
 
 **Immediately-before-mutation ownership and plan fence.** The per-VMID
 `flock` only serializes legitimate updater invocations; it does not stop a
