@@ -47,7 +47,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 12
+AUTHORITY_SCHEMA_VERSION = 13
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -1041,6 +1041,7 @@ def _package_update_job(
         snapshot_confirmed_at=row["snapshot_confirmed_at"],
         mutation_operation_id=row["mutation_operation_id"],
         mutation_may_have_started_at=row["mutation_may_have_started_at"],
+        accepted_prepared_evidence_digest=row["accepted_prepared_evidence_digest"],
         mutation_completed_at=row["mutation_completed_at"],
         health_started_at=row["health_started_at"],
         rollback_may_have_started_at=row["rollback_may_have_started_at"],
@@ -1072,7 +1073,7 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 12)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 13)
     )
     """,
     """
@@ -1609,6 +1610,19 @@ _SCHEMA_STATEMENTS = (
             CHECK(mutation_operation_id IS NULL OR
                   length(mutation_operation_id) = 36),
         mutation_may_have_started_at TEXT,
+        -- The digest of the EXACT preparation evidence the arming
+        -- transaction accepted, committed in that same transaction as one
+        -- coherent write-ahead authority fact with the operation identity
+        -- and the timestamp. It is what makes "only the invocation whose
+        -- evidence authority actually accepted may submit" a durable fact
+        -- rather than an ordering assumption: a concurrent PREPARE that
+        -- lost the arming race carries a different digest and can never
+        -- reach the host.
+        accepted_prepared_evidence_digest TEXT
+            CHECK(accepted_prepared_evidence_digest IS NULL OR
+                  (length(accepted_prepared_evidence_digest) = 64 AND
+                   accepted_prepared_evidence_digest GLOB '[0-9a-f]*' AND
+                   NOT accepted_prepared_evidence_digest GLOB '*[^0-9a-f]*')),
         mutation_completed_at TEXT,
         health_started_at TEXT,
         rollback_may_have_started_at TEXT,
@@ -1650,18 +1664,22 @@ _SCHEMA_STATEMENTS = (
         -- job can never claim a completed mutation it never armed.
         CHECK({_checkpoint_rank_sql('checkpoint')} < 5 OR
               (mutation_operation_id IS NOT NULL AND
-               mutation_may_have_started_at IS NOT NULL)),
+               mutation_may_have_started_at IS NOT NULL AND
+               accepted_prepared_evidence_digest IS NOT NULL)),
         CHECK({_checkpoint_rank_sql('checkpoint')} >= 5 OR
               (mutation_operation_id IS NULL AND
-               mutation_may_have_started_at IS NULL)),
+               mutation_may_have_started_at IS NULL AND
+               accepted_prepared_evidence_digest IS NULL)),
         CHECK({_checkpoint_rank_sql('checkpoint')} < 6 OR
               mutation_completed_at IS NOT NULL),
         CHECK({_checkpoint_rank_sql('checkpoint')} >= 6 OR
               mutation_completed_at IS NULL),
-        -- A completed mutation can never exist without the write-ahead
-        -- uncertainty boundary that must precede it.
+        -- A completed mutation can never exist without EVERY write-ahead
+        -- arming fact that must precede it.
         CHECK(mutation_completed_at IS NULL OR
-              mutation_may_have_started_at IS NOT NULL)
+              (mutation_may_have_started_at IS NOT NULL AND
+               mutation_operation_id IS NOT NULL AND
+               accepted_prepared_evidence_digest IS NOT NULL))
     )
     """,
     """
@@ -1951,13 +1969,17 @@ _SCHEMA_STATEMENTS = (
     """,
     """
     CREATE TRIGGER package_update_job_mutation_identity_immutable
-    BEFORE UPDATE OF mutation_operation_id, mutation_may_have_started_at
+    BEFORE UPDATE OF mutation_operation_id, mutation_may_have_started_at,
+                     accepted_prepared_evidence_digest
     ON package_update_jobs
     WHEN (OLD.mutation_operation_id IS NOT NULL
-          OR OLD.mutation_may_have_started_at IS NOT NULL)
+          OR OLD.mutation_may_have_started_at IS NOT NULL
+          OR OLD.accepted_prepared_evidence_digest IS NOT NULL)
      AND (NEW.mutation_operation_id IS NOT OLD.mutation_operation_id
           OR NEW.mutation_may_have_started_at
-             IS NOT OLD.mutation_may_have_started_at)
+             IS NOT OLD.mutation_may_have_started_at
+          OR NEW.accepted_prepared_evidence_digest
+             IS NOT OLD.accepted_prepared_evidence_digest)
     BEGIN SELECT RAISE(ABORT,
         'package update job mutation operation identity is write-once'
     ); END

@@ -23,12 +23,14 @@ transport parser.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 from types import ModuleType
 import uuid
 
@@ -43,6 +45,8 @@ from app.inventory import (
     PackageScanPackage,
     PackageUpdateCheckpoint,
     PackageUpdateEventType,
+    PackageMutationArmOutcome,
+    PackageMutationEvidenceNotAccepted,
     PackageUpdateExecutionOutcome,
     PackageUpdateJobStatus,
 )
@@ -106,6 +110,14 @@ BACKGROUND_PACKAGES = (
 # ===========================================================================
 
 
+#: A well-formed prepared-evidence digest for tests that arm authority
+#: directly rather than through a real host PREPARE. Its VALUE is arbitrary;
+#: what matters is that authority now refuses to arm without one and refuses
+#: to submit with a different one.
+ARBITRARY_EVIDENCE_DIGEST = "a" * 64
+OTHER_EVIDENCE_DIGEST = "b" * 64
+
+
 class FakeGuest:
     """A deterministic stand-in for one running Debian LXC guest.
 
@@ -134,6 +146,13 @@ class FakeGuest:
              BACKGROUND_PACKAGES}
         )
         self.unfinished: dict[tuple[str, str], str] = {}
+        #: The guest-side files the helper stages, keyed by absolute path.
+        #: Contents arrive as stdin payload bytes, never as command text.
+        self.staged_files: dict[str, bytes] = {}
+        #: Set by the test once the job's operation identity is known, so
+        #: the fake can assert the real command carries that operation's own
+        #: action gate.
+        self.mutation_operation_id: str | None = None
         #: What a fresh `apt-get -s upgrade` would report. Defaults to the
         #: approved plan; tests move it to model a real package-manager race.
         self.simulated = approved
@@ -206,7 +225,7 @@ class FakeGuest:
 
     # -- the runner the helper calls ----------------------------------
 
-    def runner(self, argv, timeout, max_output):
+    def runner(self, argv, timeout, max_output, stdin=b""):
         argv = tuple(argv)
         if argv[:2] == ("pvesh", "get") and argv[2] == "/cluster/status":
             return self._ok(
@@ -227,10 +246,13 @@ class FakeGuest:
                 )
             return self._ok(json.dumps(rows).encode())
         if argv[:2] == ("pct", "exec"):
-            return self._guest(argv[4:])
+            return self._guest(argv[4:], stdin)
         raise AssertionError(f"unexpected host command: {argv}")
 
-    def _guest(self, tail):
+    def _guest(self, tail, stdin=b""):
+        staged = self._staging(tail, stdin)
+        if staged is not None:
+            return staged
         if tail[-1] == "/etc/os-release":
             return self._ok(OS_RELEASE.encode())
         if tail[-1] == "--version":
@@ -250,9 +272,40 @@ class FakeGuest:
                 self.simulation_stderr.encode(),
             )
         if tail[-1] == "upgrade":
-            assert tuple(tail) == helper.MUTATION_ARGV, tail
+            assert tuple(tail) == helper.mutation_argv(self.mutation_operation_id), tail
+            # The real gate lives in the guest. A fake that mutated without
+            # one staged would be proving something that cannot happen.
+            verifier = helper.guest_verifier_path(self.mutation_operation_id)
+            assert verifier in self.staged_files, "mutation ran with no action gate"
             return helper.CommandResult(self._apply_mutation(), b"upgraded\n", b"")
         raise AssertionError(f"unexpected guest command: {tail}")
+
+    def _staging(self, tail, stdin):
+        """Model the fixed staging argv shapes, payload on stdin only."""
+
+        command = tail[2] if len(tail) > 2 else ""
+        if command == "rm":
+            root = tail[-1]
+            for path in [p for p in self.staged_files if p.startswith(root)]:
+                del self.staged_files[path]
+            return self._ok(b"")
+        if command == "mkdir":
+            return self._ok(b"")
+        if command == "dd":
+            assert tail[3].startswith("of="), tail
+            self.staged_files[tail[3][3:]] = stdin
+            return self._ok(b"")
+        if command == "chmod":
+            return self._ok(b"")
+        if command == "sha256sum":
+            lines = []
+            for path in tail[3:]:
+                if path not in self.staged_files:
+                    return helper.CommandResult(1, b"", b"No such file\n")
+                digest = hashlib.sha256(self.staged_files[path]).hexdigest()
+                lines.append(f"{digest}  {path}\n")
+            return self._ok("".join(lines).encode())
+        return None
 
     @staticmethod
     def _ok(stdout: bytes):
@@ -331,6 +384,9 @@ class HelperBackedHostControl:
 
     def _call(self, request, operation, *, prepared_evidence_digest=None):
         self.calls.append(operation)
+        # The guest fake asserts the real command carries THIS operation's
+        # own action gate, so it needs the identity the backend derived.
+        self.guest.mutation_operation_id = request.mutation_operation_id
         if operation in self.fail_operation:
             raise self.fail_operation[operation]
         payload = build_host_request(
@@ -507,9 +563,16 @@ def test_arming_commits_the_write_ahead_boundary_with_its_identity(
     )
     identity = authority.package_update_mutation_identity(job.job_id)
 
-    outcome, armed = authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    outcome, arm, armed = authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
 
     assert outcome is PackageUpdateExecutionOutcome.MATCHED
+    # THIS invocation committed the boundary, so only it may submit.
+    assert arm is PackageMutationArmOutcome.ARMED_NOW
+    assert armed.accepted_prepared_evidence_digest == ARBITRARY_EVIDENCE_DIGEST
     assert armed.checkpoint is PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED
     assert armed.status is PackageUpdateJobStatus.ACTIVE
     assert armed.mutation_operation_id == identity.mutation_operation_id
@@ -539,11 +602,23 @@ def test_arming_is_idempotent_and_never_creates_a_second_boundary(
     tmp_path: Path,
 ) -> None:
     _, store, authority, _, _, _, job, _, _, _ = _armed_system(tmp_path)
-    _, first = authority.arm_package_update_mutation(job.job_id, job_packages(job))
-    outcome, second = authority.arm_package_update_mutation(
-        job.job_id, job_packages(job)
+    _, first_arm, first = authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
+    assert first_arm is PackageMutationArmOutcome.ARMED_NOW
+    # A second arming -- even one carrying DIFFERENT evidence -- re-proves
+    # the identity and returns the existing durable boundary. It never
+    # replaces the accepted digest, and it never claims the right to submit.
+    outcome, second_arm, second = authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=OTHER_EVIDENCE_DIGEST,
     )
     assert outcome is PackageUpdateExecutionOutcome.MATCHED
+    assert second_arm is PackageMutationArmOutcome.ALREADY_ARMED
+    assert second.accepted_prepared_evidence_digest == ARBITRARY_EVIDENCE_DIGEST
     assert second.mutation_may_have_started_at == first.mutation_may_have_started_at
     assert second.mutation_operation_id == first.mutation_operation_id
     assert (
@@ -560,7 +635,11 @@ def test_arming_requires_a_confirmed_snapshot(tmp_path: Path) -> None:
     _, _, authority, resource, _, approval = _approved_system(tmp_path)
     job = _issue(authority, resource, approval)
     with pytest.raises(AuthorityConflict, match="not awaiting the package mutation"):
-        authority.arm_package_update_mutation(job.job_id, job_packages(job))
+        authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
     assert (
         authority.package_update_job(job.job_id).mutation_may_have_started_at is None
     )
@@ -770,10 +849,12 @@ def test_authority_going_stale_between_arming_and_submission_seals(
     )
     original = authority.arm_package_update_mutation
 
-    def _arm_then_drift(job_id, fresh_packages):
-        outcome, armed = original(job_id, fresh_packages)
+    def _arm_then_drift(job_id, fresh_packages, *, prepared_evidence_digest):
+        outcome, arm, armed = original(
+            job_id, fresh_packages, prepared_evidence_digest=prepared_evidence_digest
+        )
         authority.rotate_transport_trust(resource.inventory_source_id)
-        return outcome, armed
+        return outcome, arm, armed
 
     authority.arm_package_update_mutation = _arm_then_drift
 
@@ -1000,7 +1081,11 @@ def test_crash_after_arming_before_submission_seals_and_releases(
     # Prepare, arm, then "crash" before the submission critical section.
     request = authority.package_update_mutation_request(job.job_id)
     host.prepare_exact_package_mutation(request)
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
 
     recovered = orchestrator.recover_job_owned_mutation(job.job_id)
 
@@ -1170,7 +1255,11 @@ def test_a_delayed_request_can_never_mutate_after_a_recovery_seal(
     )
     request = authority.package_update_mutation_request(job.job_id)
     prepared = host.prepare_exact_package_mutation(request)
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
 
     # Recovery seals the operation first.
     sealed = orchestrator.recover_job_owned_mutation(job.job_id)
@@ -1239,7 +1328,11 @@ def test_a_recovery_invocation_never_submits_even_with_a_clean_host(
     _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
         tmp_path
     )
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
     # The host journal is completely absent: nothing was ever prepared.
     result = orchestrator.recover_job_owned_mutation(job.job_id)
 
@@ -1327,7 +1420,11 @@ def test_sql_refuses_a_checkpoint_regression_out_of_the_mutation_window(
     tmp_path: Path,
 ) -> None:
     _, store, authority, _, _, _, job, *_ = _armed_system(tmp_path)
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
     _assert_sql_rejected(
         store,
         "UPDATE package_update_jobs SET checkpoint='snapshot_confirmed' WHERE job_id=?",
@@ -1339,7 +1436,11 @@ def test_two_jobs_can_never_share_one_mutation_operation_identity(
     tmp_path: Path,
 ) -> None:
     _, store, authority, _, _, _, job, *_ = _armed_system(tmp_path)
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
     armed = store.package_update_job(job.job_id)
     with pytest.raises(sqlite3.DatabaseError):
         with store._transaction() as connection:
@@ -1419,7 +1520,11 @@ def test_completion_refuses_a_proof_over_another_jobs_material(
     _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
         tmp_path
     )
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
     # Post-state that lands some other plan entirely.
     with pytest.raises(AuthorityConflict, match="completion proof did not hold"):
         authority.complete_package_update_mutation(
@@ -1457,7 +1562,7 @@ def test_the_submission_critical_section_never_wraps_the_package_command(
     inside: list[str] = []
     original = authority.execute_package_mutation_submission_if_current
 
-    def _traced(job_id, submit):
+    def _traced(job_id, submit, *, prepared_evidence_digest):
         def _wrapped():
             before = len(guest.mutations)
             result = submit()
@@ -1467,7 +1572,9 @@ def test_the_submission_critical_section_never_wraps_the_package_command(
             )
             return result
 
-        return original(job_id, _wrapped)
+        return original(
+            job_id, _wrapped, prepared_evidence_digest=prepared_evidence_digest
+        )
 
     authority.execute_package_mutation_submission_if_current = _traced
     result = orchestrator.execute_job_owned_mutation(job.job_id)
@@ -1564,7 +1671,11 @@ def test_a_host_answering_about_another_operation_is_never_a_release(
     _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
         tmp_path
     )
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
 
     class WrongOperation:
         def inspect_package_mutation_state(self, request):
@@ -1586,7 +1697,11 @@ def test_an_unreadable_host_is_never_a_release(tmp_path: Path) -> None:
     _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
         tmp_path
     )
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
     host.fail_operation["inspect_package_mutation_state"] = TimeoutError("gone")
 
     result = orchestrator.recover_job_owned_mutation(job.job_id)
@@ -1615,7 +1730,11 @@ def test_a_submission_that_wins_the_writer_lock_defeats_a_racing_seal(
     )
     request = authority.package_update_mutation_request(job.job_id)
     prepared = host.prepare_exact_package_mutation(request)
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
 
     def _submit_inside_the_seal(connection, *, job_id):
         # A concurrent, authorized submission crossing the host boundary
@@ -1654,7 +1773,11 @@ def test_a_failed_seal_never_releases_the_job(tmp_path: Path) -> None:
     )
     request = authority.package_update_mutation_request(job.job_id)
     host.prepare_exact_package_mutation(request)
-    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
     host.fail_operation["seal_mutation_never_submitted"] = RuntimeError("no answer")
 
     result = orchestrator.recover_job_owned_mutation(job.job_id)
@@ -1663,3 +1786,281 @@ def test_a_failed_seal_never_releases_the_job(tmp_path: Path) -> None:
     fenced = store.package_update_job(job.job_id)
     assert fenced.status is PackageUpdateJobStatus.ACTIVE
     assert fenced.checkpoint is PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED
+
+
+# ===========================================================================
+# J. CONCURRENT PREPARE, AND THE ONE ACCEPTED EVIDENCE DIGEST
+#
+# Two invocations can both observe ACTIVE @ snapshot_confirmed, both prepare
+# fresh evidence, and both derive the SAME deterministic operation identity.
+# Identity therefore cannot be what decides who may submit. Exactly one
+# evidence digest becomes authority-accepted, and only the invocation
+# carrying it can cause a real package command.
+# ===========================================================================
+
+
+def test_exactly_one_evidence_digest_can_ever_become_authority_accepted(
+    tmp_path: Path,
+) -> None:
+    """A real interleaving, not two sequential calls.
+
+    Both threads are released from one barrier INSIDE the arming window, so
+    they genuinely contend for the write-ahead transition.
+    """
+
+    _, store, authority, _, _, _, job, _, _, _ = _armed_system(tmp_path)
+    digests = ["1" * 64, "2" * 64]
+    barrier = threading.Barrier(len(digests))
+    outcomes: list[tuple] = []
+    lock = threading.Lock()
+
+    def _arm(digest: str) -> None:
+        barrier.wait(timeout=10)
+        try:
+            result = authority.arm_package_update_mutation(
+                job.job_id, job_packages(job), prepared_evidence_digest=digest
+            )
+        except Exception as exc:  # noqa: BLE001 - the loser's failure is data
+            result = exc
+        with lock:
+            outcomes.append((digest, result))
+
+    threads = [threading.Thread(target=_arm, args=(digest,)) for digest in digests]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    armed = store.package_update_job(job.job_id)
+    assert armed.checkpoint is PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED
+    assert armed.accepted_prepared_evidence_digest in digests
+
+    winners = [
+        digest
+        for digest, result in outcomes
+        if not isinstance(result, Exception)
+        and result[1] is PackageMutationArmOutcome.ARMED_NOW
+    ]
+    assert winners == [armed.accepted_prepared_evidence_digest]
+    # Exactly one write-ahead boundary event, no matter who raced.
+    assert (
+        _events(store, job.job_id).count(
+            PackageUpdateEventType.MUTATION_MAY_HAVE_STARTED
+        )
+        == 1
+    )
+
+
+def test_only_the_accepted_digest_reaches_the_host_submission(
+    tmp_path: Path,
+) -> None:
+    """The loser's submission is refused BEFORE the callback.
+
+    And it is refused with a narrow type that is deliberately NOT the
+    seal-eligible one: the invocation whose evidence WAS accepted may be
+    submitting a real package command at this very moment, so claiming "never
+    submitted" on its behalf would be false.
+    """
+
+    _, store, authority, _, _, _, job, guest, host, _ = _armed_system(tmp_path)
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
+    callbacks: list[str] = []
+
+    with pytest.raises(PackageMutationEvidenceNotAccepted):
+        authority.execute_package_mutation_submission_if_current(
+            job.job_id,
+            lambda: callbacks.append("submitted"),
+            prepared_evidence_digest=OTHER_EVIDENCE_DIGEST,
+        )
+
+    assert callbacks == []
+    assert guest.mutations == []
+    assert "execute_exact_package_mutation" not in host.calls
+    # Still armed, still fenced, still owning the global slot.
+    unchanged = store.package_update_job(job.job_id)
+    assert unchanged.status is PackageUpdateJobStatus.ACTIVE
+    assert unchanged.checkpoint is PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED
+    assert unchanged.accepted_prepared_evidence_digest == ARBITRARY_EVIDENCE_DIGEST
+
+    # The accepted digest still works: the refusal fenced nothing permanently.
+    authority.execute_package_mutation_submission_if_current(
+        job.job_id,
+        lambda: callbacks.append("submitted"),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
+    assert callbacks == ["submitted"]
+
+
+def test_an_invocation_that_lost_the_arming_race_becomes_recovery_only(
+    tmp_path: Path,
+) -> None:
+    """Deriving the same operation identity is not permission to submit."""
+
+    _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
+        tmp_path
+    )
+    original = authority.arm_package_update_mutation
+
+    def _lose_the_race(job_id, fresh_packages, *, prepared_evidence_digest):
+        # Another invocation commits the boundary with ITS evidence first.
+        original(
+            job_id,
+            fresh_packages,
+            prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+        )
+        return original(
+            job_id, fresh_packages, prepared_evidence_digest=prepared_evidence_digest
+        )
+
+    authority.arm_package_update_mutation = _lose_the_race
+
+    result = orchestrator.execute_job_owned_mutation(job.job_id)
+
+    assert guest.mutations == []
+    assert "execute_exact_package_mutation" not in host.calls
+    assert result.status is not MutationStageStatus.COMPLETED
+    assert (
+        store.package_update_job(job.job_id).accepted_prepared_evidence_digest
+        == ARBITRARY_EVIDENCE_DIGEST
+    )
+
+
+def test_the_accepted_evidence_digest_is_write_once_in_sql(tmp_path: Path) -> None:
+    _, store, authority, _, _, _, job, _, _, _ = _armed_system(tmp_path)
+    authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="write-once"):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_jobs "
+                "SET accepted_prepared_evidence_digest=? WHERE job_id=?",
+                (OTHER_EVIDENCE_DIGEST, job.job_id),
+            )
+
+    assert (
+        store.package_update_job(job.job_id).accepted_prepared_evidence_digest
+        == ARBITRARY_EVIDENCE_DIGEST
+    )
+
+
+@pytest.mark.parametrize(
+    "digest",
+    ["", "z" * 64, "A" * 64, "a" * 63, "a" * 65],
+)
+def test_sql_refuses_a_malformed_accepted_evidence_digest(
+    tmp_path: Path, digest
+) -> None:
+    _, store, authority, _, _, _, job, _, _, _ = _armed_system(tmp_path)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_jobs "
+                "SET checkpoint='mutation_may_have_started', "
+                "mutation_operation_id=?, mutation_may_have_started_at=?, "
+                "accepted_prepared_evidence_digest=? WHERE job_id=?",
+                (str(uuid.uuid4()), "2024-01-01T00:00:00+00:00", digest, job.job_id),
+            )
+
+
+def test_sql_refuses_an_armed_job_with_no_accepted_evidence_digest(
+    tmp_path: Path,
+) -> None:
+    """The arming facts are one indivisible write-ahead authority fact."""
+
+    _, store, authority, _, _, _, job, _, _, _ = _armed_system(tmp_path)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_jobs "
+                "SET checkpoint='mutation_may_have_started', "
+                "mutation_operation_id=?, mutation_may_have_started_at=? "
+                "WHERE job_id=?",
+                (str(uuid.uuid4()), "2024-01-01T00:00:00+00:00", job.job_id),
+            )
+
+
+def test_sql_refuses_a_completed_mutation_without_its_accepted_evidence(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, _, _, _, job, _, _, _ = _armed_system(tmp_path)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with store._transaction() as connection:
+            connection.execute(
+                "UPDATE package_update_jobs SET checkpoint='mutation_completed', "
+                "mutation_operation_id=?, mutation_may_have_started_at=?, "
+                "mutation_completed_at=? WHERE job_id=?",
+                (
+                    str(uuid.uuid4()),
+                    "2024-01-01T00:00:00+00:00",
+                    "2024-01-01T00:01:00+00:00",
+                    job.job_id,
+                ),
+            )
+
+
+def test_an_orphaned_prepare_refuses_without_stranding_the_global_slot(
+    tmp_path: Path,
+) -> None:
+    """Immutable intent refuses cleanly, and is not a stuck job.
+
+    A PREPARE whose backend then died leaves a durable host `intent` that a
+    later invocation may NOT re-prepare: that digest may already be the one
+    authority accepted, and a digest cannot reconstruct the evidence it
+    summarizes. So the invocation refuses with nothing armed and nothing
+    mutated.
+
+    It is NOT sealed here. The job never crossed the write-ahead boundary --
+    it is still ACTIVE at `snapshot_confirmed` -- so the armed-job release
+    path does not apply, and the existing startup contract resolves it:
+    `snapshot_confirmed` is startup-interruptible, so restart recovery
+    terminalizes the job and frees the one global destructive slot.
+    """
+
+    _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
+        tmp_path
+    )
+    request = authority.package_update_mutation_request(job.job_id)
+    # A previous, now-dead invocation prepared this exact operation.
+    host.prepare_exact_package_mutation(request)
+    assert host.journal.read(request.mutation_operation_id)["phase"] == "intent"
+    orphaned_digest = host.journal.read(request.mutation_operation_id)[
+        "prepared_evidence_digest"
+    ]
+
+    result = orchestrator.execute_job_owned_mutation(job.job_id)
+
+    assert result.status is MutationStageStatus.HOST_FAILURE
+    assert "immutable" in (result.reason or "")
+    assert guest.mutations == []
+    assert "execute_exact_package_mutation" not in host.calls
+    # The accepted evidence was never replaced, and nothing was armed.
+    assert (
+        host.journal.read(request.mutation_operation_id)["prepared_evidence_digest"]
+        == orphaned_digest
+    )
+    assert host.journal.read(request.mutation_operation_id)["phase"] == "intent"
+    unchanged = store.package_update_job(job.job_id)
+    assert unchanged.status is PackageUpdateJobStatus.ACTIVE
+    assert unchanged.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert unchanged.mutation_may_have_started_at is None
+    assert unchanged.accepted_prepared_evidence_digest is None
+
+    # And it is not stranded: the existing startup contract frees the slot,
+    # retaining the confirmed pre-update snapshot and fabricating no rollback
+    # authority.
+    assert authority.recover_interrupted_package_update_jobs() == (job.job_id,)
+    recovered = store.package_update_job(job.job_id)
+    assert recovered.status is PackageUpdateJobStatus.INTERRUPTED
+    assert recovered.snapshot_confirmed_at is not None
+    assert recovered.mutation_may_have_started_at is None

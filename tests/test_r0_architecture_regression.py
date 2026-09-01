@@ -7,7 +7,9 @@ into legacy, mutation, or static-inventory behavior. See ARCHITECTURE.md.
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
+import sys
 
 import httpx
 import pytest
@@ -716,18 +718,61 @@ def test_the_mutation_helper_runs_exactly_one_fixed_bounded_package_command() ->
     ):
         assert forbidden not in text, forbidden
 
-    # The one real package command is a fixed module-level tuple built from
-    # literals only, never from request data.
+    # The one real package command's options are a fixed module-level tuple
+    # built from literals only, never from request data.
     module = ast.parse(text, filename="hubinet-package-mutation-helper.py")
     argv = None
     for node in ast.walk(module):
         if (
             isinstance(node, ast.AnnAssign)
             and isinstance(node.target, ast.Name)
-            and node.target.id == "MUTATION_ARGV"
+            and node.target.id == "_MUTATION_BASE_OPTIONS"
         ):
             argv = ast.literal_eval(node.value)
-    assert isinstance(argv, tuple) and argv, "MUTATION_ARGV must be a literal tuple"
+    assert isinstance(argv, tuple) and argv, (
+        "_MUTATION_BASE_OPTIONS must be a literal tuple"
+    )
     assert all(isinstance(item, str) for item in argv)
-    assert argv[-1] == "upgrade"
     assert "Dpkg::Options::=--force-confold" in argv
+
+    # The two options that complete it install the pre-dpkg action gate. Both
+    # are f-strings over ONE name -- the verifier path, which is itself
+    # derived only from a canonical UUID -- so no request text, package
+    # value, or shell fragment can enter the command line.
+    spec = importlib.util.spec_from_file_location(
+        "hubinet_package_mutation_helper_r0",
+        REPO_ROOT / "deploy" / "hubinet-package-mutation-helper.py",
+    )
+    assert spec is not None and spec.loader is not None
+    helper = importlib.util.module_from_spec(spec)
+    # `slots=True` dataclasses re-create their class and look it up through
+    # sys.modules, so the module must be registered before it is executed.
+    sys.modules[spec.name] = helper
+    spec.loader.exec_module(helper)
+    operation_id = "55555555-5555-4555-8555-555555555555"
+    full = helper.mutation_argv(operation_id)
+    assert full[: len(argv)] == argv
+    assert full[-1] == "upgrade"
+    verifier = helper.guest_verifier_path(operation_id)
+    assert list(full[len(argv):-1]) == [
+        "-o",
+        f"DPkg::Pre-Install-Pkgs::={verifier}",
+        "-o",
+        f"DPkg::Tools::Options::{verifier}::Version=3",
+    ]
+    # Staged strictly under Hubinet's own ephemeral guest root, and nowhere
+    # a persistent guest artifact could outlive the operation.
+    assert verifier.startswith("/run/hubinet-ops/package-mutation/")
+
+    # The verifier itself is a guest-side artifact this product never
+    # deploys: neither bootstrap nor the updater writes it, and it exists
+    # only for the duration of one operation inside one guest's tmpfs.
+    for rel_path in (
+        "deploy/bootstrap-proxmox-0.5.sh",
+        "deploy/update-proxmox-0.5.sh",
+        "deploy/install-0.5.0-fresh.sh",
+    ):
+        installed = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        assert "hubinet-package-mutation-helper" not in installed
+        assert "Pre-Install-Pkgs" not in installed
+        assert "/run/hubinet-ops/package-mutation" not in installed

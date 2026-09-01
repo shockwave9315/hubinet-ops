@@ -90,6 +90,8 @@ from app.inventory import (
     HostMutationState,
     InventoryAuthority,
     MutationSubmissionRefusedBeforeCallback,
+    PackageMutationArmOutcome,
+    PackageMutationEvidenceNotAccepted,
     PackageScanFailure,
     PackageUpdateCheckpoint,
     PackageUpdateExecutionOutcome,
@@ -407,6 +409,39 @@ class PackageUpdateMutationOrchestrator:
                     f"the job is not armed ({prepared.state.value})"
                 ),
             )
+        if all(
+            field is None
+            for field in (
+                prepared.prepared_evidence_digest,
+                prepared.simulation_stdout,
+                prepared.native_architecture,
+                prepared.installed_inventory,
+                prepared.os_release,
+            )
+        ):
+            # The host holds a durable `intent` it will not replace, so this
+            # invocation has no prepared evidence and can never arm. That is
+            # deliberate: a second PREPARE must not be able to overwrite the
+            # digest authority may already have accepted, and a digest cannot
+            # reconstruct the evidence it summarizes.
+            #
+            # It is reported as an ordinary pre-mutation host failure, not
+            # routed to the seal. The job has NOT crossed the write-ahead
+            # boundary -- it is still ACTIVE at `snapshot_confirmed` -- so the
+            # armed-job release path does not apply to it, and the existing
+            # startup contract already resolves it: `snapshot_confirmed` is a
+            # startup-interruptible checkpoint, so restart recovery
+            # terminalizes the job and frees the global slot. Nothing is
+            # stranded, and nothing claims a mutation that did not happen.
+            return MutationStageResult(
+                status=MutationStageStatus.HOST_FAILURE,
+                job=job,
+                failure_class=PackageScanFailure.EXECUTION_FAILED,
+                reason=(
+                    prepared.reason
+                    or "host holds immutable prepared evidence for this operation"
+                ),
+            )
         if (
             prepared.prepared_evidence_digest is None
             or prepared.simulation_stdout is None
@@ -438,11 +473,13 @@ class PackageUpdateMutationOrchestrator:
                 reason=str(exc),
             )
 
-        # C. The write-ahead uncertainty boundary. Exact equality and the
-        #    checkpoint commit in ONE transaction.
+        # C. The write-ahead uncertainty boundary. Exact equality, the
+        #    accepted evidence digest, and the checkpoint commit in ONE
+        #    transaction.
+        digest = prepared.prepared_evidence_digest
         try:
-            outcome, job = self._authority.arm_package_update_mutation(
-                job.job_id, fresh_packages
+            outcome, armed, job = self._authority.arm_package_update_mutation(
+                job.job_id, fresh_packages, prepared_evidence_digest=digest
             )
         except PackageUpdateExecutionAuthorityTemporarilyUnavailable as exc:
             return MutationStageResult(
@@ -463,17 +500,31 @@ class PackageUpdateMutationOrchestrator:
             return MutationStageResult(
                 status=MutationStageStatus.AUTHORITY_STALE, job=job
             )
+        if armed is not PackageMutationArmOutcome.ARMED_NOW:
+            # Some other invocation committed the accepted evidence for this
+            # job. Deriving the same deterministic operation identity is not
+            # permission to submit -- only carrying the digest authority
+            # actually accepted is, and this invocation does not. It becomes
+            # recovery-only, which can observe, complete, or seal, but never
+            # submit.
+            return self.recover_job_owned_mutation(job.job_id)
 
         # D. The submission critical section. This is the ONLY place in the
         #    product that may cause a real package command to run.
-        digest = prepared.prepared_evidence_digest
         try:
             submitted = self._authority.execute_package_mutation_submission_if_current(
                 job.job_id,
                 lambda: self._host_control.execute_exact_package_mutation(
                     request, prepared_evidence_digest=digest
                 ),
+                prepared_evidence_digest=digest,
             )
+        except PackageMutationEvidenceNotAccepted as exc:
+            # Structurally guaranteed zero callbacks, but NEVER routed to the
+            # seal: the invocation whose evidence authority did accept may be
+            # mutating right now. Stay armed, stay fenced, resolve from
+            # durable evidence alone.
+            return self._uncertain(job, str(exc))
         except MutationSubmissionRefusedBeforeCallback:
             # Structurally guaranteed: current authority proved false BEFORE
             # the callback ran, so the host was never asked to mutate. That

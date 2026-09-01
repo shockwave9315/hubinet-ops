@@ -37,13 +37,33 @@ env LC_ALL=C DEBIAN_FRONTEND=noninteractive
     -o APT::Ignore-Hold=false
     -o Dpkg::Options::=--force-confdef
     -o Dpkg::Options::=--force-confold
+    -o DPkg::Pre-Install-Pkgs::=/run/hubinet-ops/package-mutation/<op>/verify-action-set
+    -o DPkg::Tools::Options::/run/hubinet-ops/package-mutation/<op>/verify-action-set::Version=3
     upgrade
 ```
 
 Fixed argv. No shell. No caller-supplied option, package name, version, or
 command text ever reaches it -- the approved package material is used only
 to *refuse* the mutation, never to build it, so there is structurally no
-value a package name could take that changes what runs.
+value a package name could take that changes what runs. `<op>` is this
+job's own canonical `mutation_operation_id` UUID and is the only
+interpolated value anywhere in the command line.
+
+## The pre-dpkg action gate
+
+The two hook options install this operation's own exact action gate (see
+`build_action_set_verifier`). APT locking does not span two `apt-get`
+invocations, so between PREPARE's simulation and this command an ordinary
+actor can complete an `apt-get update`, release a hold, add a source, or
+change a pin, and the real resolver can then legitimately choose a
+DIFFERENT action set while every installed version still matches the
+approved plan. The gate makes this invocation's OWN resolved action stream
+the thing that must equal the authority-accepted material, and APT aborts
+before dpkg receives any package operation if it does not.
+
+It does not replace the post-state completion proof, which stays: the gate
+PREVENTS unapproved material reaching dpkg; the post-state proof PROVES the
+exact approved transition actually completed.
 
 **Why it cannot exceed the approved plan** (traced in current upstream
 `apt-team/apt`, not assumed):
@@ -181,10 +201,34 @@ DPKG_UNFINISHED_STATUS_WORDS = frozenset(
     }
 )
 
-#: The complete, fixed argv of the ONE real workload package command this
-#: product supports. Built here, never from the request: the approved
-#: material is only ever used to refuse.
-MUTATION_ARGV: tuple[str, ...] = (
+#: Hubinet-owned ephemeral staging root INSIDE the managed guest. `/run` is
+#: a tmpfs on every supported Debian-family system, so nothing staged here
+#: survives a guest reboot, and the whole root is removed and recreated
+#: under this guest's per-VMID lease immediately before each submission --
+#: a crash leftover is therefore harmless and can never authorize a later
+#: job. The path is a code-owned literal; only the canonical operation UUID
+#: (`_canonical_uuid`) is interpolated.
+GUEST_STAGING_ROOT = "/run/hubinet-ops/package-mutation"
+GUEST_VERIFIER_NAME = "verify-action-set"
+GUEST_MANIFEST_NAME = "expected-actions"
+
+#: First line of the staged manifest. It binds those exact bytes to exactly
+#: one mutation operation, and the verifier -- which carries the same
+#: operation id as its own literal -- refuses anything else.
+MANIFEST_HEADER = "hubinet-ops-package-mutation-actions v1"
+
+#: Strict grammar for every value that becomes a manifest field. The
+#: manifest is a whitespace-separated record format, so a name or version
+#: carrying whitespace, a newline, or a non-printable byte could otherwise
+#: forge an extra approved action. Debian's own package-name and version
+#: grammars are narrower than these, so a legitimate row always passes and
+#: anything else fails closed before a single file is staged.
+MANIFEST_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+._-]*")
+MANIFEST_VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9+.~:_-]*")
+
+#: The fixed options of the ONE real workload package command, minus the
+#: two that name this operation's own pre-dpkg action gate.
+_MUTATION_BASE_OPTIONS: tuple[str, ...] = (
     "env",
     "LC_ALL=C",
     "DEBIAN_FRONTEND=noninteractive",
@@ -210,8 +254,290 @@ MUTATION_ARGV: tuple[str, ...] = (
     "Dpkg::Options::=--force-confdef",
     "-o",
     "Dpkg::Options::=--force-confold",
-    "upgrade",
 )
+
+
+def guest_staging_directory(mutation_operation_id: str) -> str:
+    """This operation's own staging directory inside the guest."""
+
+    operation = _canonical_uuid(mutation_operation_id, "mutation_operation_id")
+    return f"{GUEST_STAGING_ROOT}/{operation}"
+
+
+def guest_verifier_path(mutation_operation_id: str) -> str:
+    return f"{guest_staging_directory(mutation_operation_id)}/{GUEST_VERIFIER_NAME}"
+
+
+def guest_manifest_path(mutation_operation_id: str) -> str:
+    return f"{guest_staging_directory(mutation_operation_id)}/{GUEST_MANIFEST_NAME}"
+
+
+def mutation_argv(mutation_operation_id: str) -> tuple[str, ...]:
+    """The complete, fixed argv of the ONE real workload package command.
+
+    Built here, never from the request: the approved material is only ever
+    used to REFUSE the mutation, never to construct it, so there is
+    structurally no value a package name or version could take that changes
+    what runs.
+
+    The two trailing options install this operation's own pre-dpkg action
+    gate (see :func:`build_action_set_verifier`). Both values are code-owned
+    literals plus one canonical UUID; neither carries a package value, a
+    request-provided option, or any shell fragment. APT natively invokes a
+    `DPkg::Pre-Install-Pkgs` command through a shell, but the command here
+    is a single bare path with no metacharacter, no argument, and no
+    expansion, so that native shell step has nothing left to interpret --
+    which is why this is not an "arbitrary command string across a
+    privileged boundary": there is no request-derived text in it at all.
+
+    The hook command MUST stay a bare path: APT keys
+    `DPkg::Tools::Options::<cmd>::Version` on the exact command string, and a
+    command containing a space does not resolve its own version option --
+    APT then falls back to protocol Version 1, which the verifier rejects.
+    Command-line `-o` is applied after every configuration file, so an
+    ordinary guest `apt.conf`/`apt.conf.d` snippet can neither `#clear` this
+    hook out of the list nor pin it back to an older protocol.
+    """
+
+    verifier = guest_verifier_path(mutation_operation_id)
+    return (
+        *_MUTATION_BASE_OPTIONS,
+        "-o",
+        f"DPkg::Pre-Install-Pkgs::={verifier}",
+        "-o",
+        f"DPkg::Tools::Options::{verifier}::Version=3",
+        "upgrade",
+    )
+
+
+def build_expected_action_manifest(
+    mutation_operation_id: str, packages: list[dict[str, str]]
+) -> str:
+    """Render the exact V3 action set the approved plan is allowed to produce.
+
+    One canonical, whitespace-separated record per action, in APT's own
+    Version 3 field order:
+
+    ```text
+    <name> <old version> <old arch> <ma> <dir> <new version> <new arch> <ma> <action>
+    ```
+
+    Every approved upgrade contributes exactly two actions -- the unpack of
+    its `.deb` and its configure -- because that is what APT's Version 3
+    stream emits for an upgraded binary, verified against real APT output.
+
+    Three fields are deliberately canonicalized rather than bound:
+
+    - the two MultiArch-type fields become `-`. APT reports the MultiArch
+      type *of the very version being acted on*, and that legitimately
+      differs between the installed and candidate versions of one package
+      (observed: `becomesall 2.0 amd64 none < 2.1 all foreign`). PREPARE
+      cannot learn the candidate's MultiArch type from the simulation, so
+      binding it would fail-close on legal upgrades while adding nothing:
+      (name, version, architecture) is already the complete binary identity
+      dpkg acts on. The verifier still requires each field to be one of
+      APT's four documented type words, so a malformed record fails closed.
+    - the `.deb` path becomes the class token `UNPACK`. Where APT cached the
+      archive is not part of the approved transition, and the archive's
+      contents are already pinned by name, version, and architecture.
+
+    Both architecture fields ARE bound exactly, and to the same value: the
+    canonical simulation parser (`app/package_scan.py`) refuses any row
+    whose candidate architecture differs from its proven installed
+    architecture, so no approved row can ever need two. This matters because
+    a Version 3 record carries the package name WITHOUT its architecture
+    qualifier, so the architecture fields are the only thing distinguishing
+    `foo:amd64` from `foo:i386`.
+    """
+
+    operation = _canonical_uuid(mutation_operation_id, "mutation_operation_id")
+    lines = [f"{MANIFEST_HEADER} {operation}"]
+    for package in packages:
+        name = package["package_name"]
+        architecture = package["architecture"]
+        installed = package["installed_version"]
+        candidate = package["candidate_version"]
+        if not MANIFEST_NAME_RE.fullmatch(name):
+            raise MutationError(
+                "malformed_plan",
+                "approved package name cannot be expressed as an exact action",
+            )
+        if not ARCHITECTURE_RE.fullmatch(architecture):
+            raise MutationError(
+                "malformed_plan",
+                "approved package architecture cannot be expressed as an "
+                "exact action",
+            )
+        for version in (installed, candidate):
+            if not MANIFEST_VERSION_RE.fullmatch(version):
+                raise MutationError(
+                    "malformed_plan",
+                    "approved package version cannot be expressed as an "
+                    "exact action",
+                )
+        if installed == candidate:
+            raise MutationError(
+                "malformed_plan",
+                "approved package material is not an upgrade",
+            )
+        for action in ("UNPACK", "CONFIGURE"):
+            lines.append(
+                f"{name} {installed} {architecture} - < "
+                f"{candidate} {architecture} - {action}"
+            )
+    return "".join(f"{line}\n" for line in lines)
+
+
+def build_action_set_verifier(mutation_operation_id: str) -> str:
+    """Render this operation's pre-dpkg action gate.
+
+    ## What it is
+
+    A `DPkg::Pre-Install-Pkgs` hook running APT's protocol **Version 3**. APT
+    invokes every such hook once per `pkgDPkgPM::Go()`, BEFORE the loop that
+    invokes dpkg, passing the complete resolved action list for the whole
+    transaction; if a hook exits non-zero APT aborts and dpkg never receives
+    a single package operation. Both properties are upstream behaviour
+    (`apt-pkg/deb/dpkgpm.cc`: `RunScriptsWithPkgs("DPkg::Pre-Install-Pkgs")`
+    ahead of the dpkg loop, `SendPkgsInfo` over the entire `List`, and
+    `_error->Error("Failure running script ...")` returning false) and were
+    re-verified against a real `apt` in an isolated APT root: a hook exiting
+    1 left the dpkg invocation count at zero.
+
+    ## Why it exists
+
+    APT locking does not span two separate `apt-get` invocations. Between
+    this stage's PREPARE simulation and the real upgrade, an ordinary actor
+    can complete an `apt-get update`, change a pin, add a source, or release
+    a hold, so the real resolver can legitimately choose a *different* action
+    set while every installed version still matches the approved plan. The
+    post-state proof would notice afterwards -- but the unapproved package
+    would already be installed. This gate makes the real invocation's own
+    resolved action stream the thing that must equal the authority-accepted
+    material, before dpkg is reached.
+
+    ## Runtime
+
+    `/bin/sh` plus `sort`, `tail`, and `printf`. `dash` (which provides
+    `/bin/sh`) and `coreutils` are both `Essential: yes` under Debian
+    Policy, so this adds no product prerequisite to the supported guest
+    contract and needs no Python, Perl, or awk inside the guest. The script
+    takes no argument and reads the stream from stdin -- APT's default
+    `InfoFD` -- deliberately avoiding `<&$APT_HOOK_INFO_FD`, which is a
+    syntax error in `dash` and would abort the mutation for the wrong
+    reason.
+
+    Only two code-owned literals are substituted: this operation's canonical
+    UUID and the staging path derived from it. No package name, version, or
+    other request value ever enters the script text.
+    """
+
+    operation = _canonical_uuid(mutation_operation_id, "mutation_operation_id")
+    directory = guest_staging_directory(operation)
+    return f"""#!/bin/sh
+# Hubinet Ops exact package-mutation action gate.
+#
+# Generated per operation by deploy/hubinet-package-mutation-helper.py and
+# staged into this guest's tmpfs. Never edited in place, never reused across
+# operations. Refusing here aborts APT before dpkg receives any package
+# operation.
+set -u
+LC_ALL=C
+export LC_ALL
+
+OPERATION='{operation}'
+DIR='{directory}'
+MANIFEST="$DIR/{GUEST_MANIFEST_NAME}"
+WANT="$DIR/expected.sorted"
+GOT="$DIR/observed.sorted"
+
+refuse() {{
+    echo "hubinet-ops: refusing package mutation before dpkg: $1" >&2
+    exit 1
+}}
+
+[ -f "$MANIFEST" ] || refuse "expected action manifest is missing"
+
+# The manifest header binds these bytes to exactly this operation, so a
+# leftover manifest from any other operation can never authorize this one.
+IFS= read -r header < "$MANIFEST" || refuse "expected action manifest is empty"
+[ "$header" = "{MANIFEST_HEADER} $OPERATION" ] ||
+    refuse "expected action manifest belongs to another operation"
+
+# 1. Protocol. APT silently falls back to its highest supported version when
+#    a newer one is requested, and a hook command it cannot key an option to
+#    simply gets Version 1, so the marker is REQUIRED to read Version 3.
+IFS= read -r protocol || refuse "hook protocol stream was empty"
+[ "$protocol" = "VERSION 3" ] ||
+    refuse "hook protocol is not Version 3"
+
+# 2. APT's configuration space, terminated by one empty line. Every special
+#    character in it is %-encoded, so no key or value can contain a raw
+#    newline and this terminator is unambiguous.
+saw_blank=no
+while IFS= read -r line; do
+    if [ -z "$line" ]; then
+        saw_blank=yes
+        break
+    fi
+done
+[ "$saw_blank" = yes ] || refuse "hook protocol stream had no action section"
+
+# 3. The exact action stream APT is about to hand dpkg, normalized into the
+#    manifest's own canonical form.
+while read -r pkg oldv olda oldm dir newv newa newm action rest; do
+    [ -n "$pkg" ] || continue
+    [ -z "$rest" ] || refuse "action record has unexpected trailing fields"
+    [ -n "$oldm" ] && [ -n "$newm" ] && [ -n "$action" ] ||
+        refuse "action record is truncated"
+    for multiarch in "$oldm" "$newm"; do
+        case "$multiarch" in
+            same|foreign|allowed|none) ;;
+            *) refuse "action record has an unknown MultiArch type" ;;
+        esac
+    done
+    case "$action" in
+        '**CONFIGURE**') class=CONFIGURE ;;
+        '**REMOVE**') refuse "APT planned to remove an installed package" ;;
+        /*.deb) class=UNPACK ;;
+        *) refuse "APT planned an action this product does not perform" ;;
+    esac
+    printf '%s %s %s - %s %s %s - %s\\n' \\
+        "$pkg" "$oldv" "$olda" "$dir" "$newv" "$newa" "$class"
+done > "$GOT.raw" || refuse "could not read the resolved action stream"
+
+# 4. Exact action-set equality against the authority-accepted material.
+#    Both sides are sorted here, in this guest, under the same collation, so
+#    the comparison is an exact multiset equality that does not depend on
+#    the order APT happens to plan its transaction in.
+tail -n +2 "$MANIFEST" | sort > "$WANT" ||
+    refuse "could not read the approved action set"
+sort < "$GOT.raw" > "$GOT" || refuse "could not order the resolved action set"
+[ -s "$WANT" ] || refuse "approved action set is empty"
+[ -s "$GOT" ] || refuse "resolved action set is empty"
+
+exec 3< "$WANT" || refuse "could not open the approved action set"
+exec 4< "$GOT" || refuse "could not open the resolved action set"
+while :; do
+    want=''
+    got=''
+    IFS= read -r want <&3
+    want_read=$?
+    IFS= read -r got <&4
+    got_read=$?
+    if [ "$want_read" -ne 0 ] && [ "$got_read" -ne 0 ]; then
+        break
+    fi
+    [ "$want_read" -eq 0 ] && [ "$got_read" -eq 0 ] ||
+        refuse "resolved action set is not the approved action set"
+    [ "$want" = "$got" ] ||
+        refuse "resolved action differs from the approved plan"
+done
+exec 3<&-
+exec 4<&-
+
+exit 0
+"""
 
 NATIVE_ARCHITECTURE_ARGV = ("env", "LC_ALL=C", "dpkg", "--print-architecture")
 INSTALLED_INVENTORY_ARGV = (
@@ -232,7 +558,9 @@ class CommandResult:
     output_exceeded: bool = False
 
 
-Runner = Callable[[tuple[str, ...], float, int], CommandResult]
+#: A bounded command runner. `stdin` carries structured payload BYTES for
+#: the staging commands only; it is never command text and never argv.
+Runner = Callable[..., CommandResult]
 
 
 class RequestError(ValueError):
@@ -249,17 +577,35 @@ class MutationError(RuntimeError):
 
 
 def _run_bounded(
-    argv: tuple[str, ...], timeout: float, max_output: int
+    argv: tuple[str, ...], timeout: float, max_output: int, stdin: bytes = b""
 ) -> CommandResult:
     process = subprocess.Popen(  # noqa: S603 - every argv shape is fixed above
         argv,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE if stdin else subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         close_fds=True,
     )
     assert process.stdout is not None
     assert process.stderr is not None
+    if stdin:
+        # Structured payload bytes only -- never command text, never argv.
+        # Written before the output pump starts, which is safe because the
+        # only commands given a payload stream it straight to a file (`dd`,
+        # or `ssh` forwarding to it) and produce no output of their own, so
+        # there is no output backpressure to deadlock against. A child that
+        # exits early closes the pipe instead of blocking, and that shows up
+        # as a non-zero return code below rather than an exception here.
+        assert process.stdin is not None
+        try:
+            process.stdin.write(stdin)
+        except BrokenPipeError:
+            pass
+        finally:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, "stdout")
     selector.register(process.stderr, selectors.EVENT_READ, "stderr")
@@ -761,8 +1107,9 @@ def _command(
     *,
     max_output: int = MAX_COMMAND_OUTPUT_BYTES,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
+    stdin: bytes = b"",
 ) -> CommandResult:
-    result = runner(argv, timeout, max_output)
+    result = runner(argv, timeout, max_output, stdin)
     if result.timed_out:
         raise MutationError("timeout", "package mutation command timed out")
     if result.output_exceeded:
@@ -872,6 +1219,7 @@ def _run_guest_command(
     *,
     max_output: int = MAX_COMMAND_OUTPUT_BYTES,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
+    stdin: bytes = b"",
 ) -> CommandResult:
     """Run one fixed ``pct exec`` shape on whichever node currently holds it.
 
@@ -881,11 +1229,29 @@ def _run_guest_command(
     inter-node SSH trust Proxmox itself provisions -- no new Hubinet
     credential on that node, and no request-provided or arbitrary text ever
     reaches either command.
+
+    **This dispatcher owns the live-target invariant.** A VMID is an
+    execution locator, not identity: PVE can free one and reuse it for an
+    unrelated guest at any moment. So every single guest command -- the
+    architecture read, the dpkg inventory reads on both sides of the
+    mutation, the staging of the action gate, `apt-get update`, the
+    simulation, and the one real package command -- is preceded here by its
+    own fresh :func:`revalidate_live_target`. Callers cannot opt out and
+    cannot amortize one check across two commands, which is what made a
+    "validate once, then run several commands" caller able to send its
+    second command to a replacement guest.
+
+    :func:`revalidate_live_target` and :func:`_local_node` issue `pvesh`
+    commands on the host through :func:`_command` directly, never through
+    this dispatcher, so the invariant cannot recurse.
     """
 
+    revalidate_live_target(runner, vmid, expected_node)
     inner = ("pct", "exec", str(vmid), "--", *tail)
     if expected_node == local_node:
-        result = _command(runner, inner, max_output=max_output, timeout=timeout)
+        result = _command(
+            runner, inner, max_output=max_output, timeout=timeout, stdin=stdin
+        )
     else:
         argv = (
             "ssh",
@@ -895,7 +1261,9 @@ def _run_guest_command(
             f"root@{expected_node}",
             shlex.join(inner),
         )
-        result = _command(runner, argv, max_output=max_output, timeout=timeout)
+        result = _command(
+            runner, argv, max_output=max_output, timeout=timeout, stdin=stdin
+        )
     if result.returncode == 255:
         raise MutationError(
             "execution_failed", "could not execute package command in guest"
@@ -999,6 +1367,115 @@ def _read_guest_state(
             "execution_failed", "could not read guest installed package inventory"
         )
     return native_architecture, installed_inventory
+
+
+def stage_action_set_gate(
+    runner: Runner,
+    request: Mapping[str, Any],
+    local_node: str,
+) -> dict[str, str]:
+    """Stage this operation's pre-dpkg action gate inside the guest.
+
+    Runs strictly BEFORE the journal reaches `submitted`, so a staging
+    failure is an ordinary pre-submission refusal: nothing was mutated, the
+    operation stays at `intent`, and recovery can still seal it.
+
+    Every step is a fixed argv shape; the only interpolated values are this
+    file's own literal paths and the canonical operation UUID. **No package
+    name or version is ever an argument.** The manifest and the verifier
+    travel as structured payload BYTES on the command's stdin, never as
+    command text, argv, or a shell fragment, so there is no value the
+    approved material could take that changes what executes.
+
+    Staleness is closed by construction. The whole Hubinet staging root is
+    removed and this operation's directory recreated under this guest's
+    per-VMID lease, so a crash leftover from any earlier operation is gone
+    before anything can consult it; and even if one somehow survived, the
+    manifest header and the verifier's own literal both name an operation
+    id, so a foreign manifest is refused rather than obeyed.
+
+    Finally the staged bytes are read back and their digests compared to
+    what was sent. That is what makes the gate integrity-bound to *this*
+    operation rather than to whatever happens to sit at the path.
+    """
+
+    mutation_operation_id = request["mutation_operation_id"]
+    vmid = request["vmid"]
+    expected_node = request["expected_node"]
+    directory = guest_staging_directory(mutation_operation_id)
+    manifest_path = guest_manifest_path(mutation_operation_id)
+    verifier_path = guest_verifier_path(mutation_operation_id)
+    manifest = build_expected_action_manifest(
+        mutation_operation_id, request["expected_packages"]
+    ).encode("utf-8")
+    verifier = build_action_set_verifier(mutation_operation_id).encode("utf-8")
+
+    def _step(tail: tuple[str, ...], failure: str, *, stdin: bytes = b"") -> str:
+        result = _run_guest_command(
+            runner,
+            vmid,
+            expected_node,
+            local_node,
+            tail,
+            max_output=64 * 1024,
+            stdin=stdin,
+        )
+        if result.returncode != 0:
+            raise MutationError("execution_failed", failure)
+        stdout, _ = _decode(result)
+        return stdout
+
+    _step(
+        ("env", "LC_ALL=C", "rm", "-rf", GUEST_STAGING_ROOT),
+        "could not clear the guest package-mutation staging root",
+    )
+    _step(
+        ("env", "LC_ALL=C", "mkdir", "-p", "-m", "0700", directory),
+        "could not create the guest package-mutation staging directory",
+    )
+    _step(
+        ("env", "LC_ALL=C", "dd", f"of={manifest_path}", "status=none"),
+        "could not stage the approved action manifest",
+        stdin=manifest,
+    )
+    _step(
+        ("env", "LC_ALL=C", "dd", f"of={verifier_path}", "status=none"),
+        "could not stage the package-mutation action gate",
+        stdin=verifier,
+    )
+    _step(
+        ("env", "LC_ALL=C", "chmod", "0500", verifier_path),
+        "could not make the package-mutation action gate executable",
+    )
+
+    observed = _step(
+        ("env", "LC_ALL=C", "sha256sum", manifest_path, verifier_path),
+        "could not verify the staged package-mutation action gate",
+    )
+    digests: dict[str, str] = {}
+    for line in observed.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if len(fields) != 2 or not FINGERPRINT_RE.fullmatch(fields[0]):
+            raise MutationError(
+                "execution_failed",
+                "guest returned a malformed staged action gate digest",
+            )
+        digests[fields[1]] = fields[0]
+    expected = {
+        manifest_path: hashlib.sha256(manifest).hexdigest(),
+        verifier_path: hashlib.sha256(verifier).hexdigest(),
+    }
+    if digests != expected:
+        # The bytes at the paths the real command will consult are not the
+        # bytes this operation produced. Refuse before submission rather
+        # than run a mutation gated by something else.
+        raise MutationError(
+            "mutation_state_mismatch",
+            "staged package-mutation action gate does not match this operation",
+        )
+    return expected
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1651,38 @@ def _prepare(
         record = _require_matching_request(
             journal.read(request["mutation_operation_id"]), fingerprint
         )
+        if record is not None and record["phase"] == "intent":
+            # An intent already exists for this exact operation, and the
+            # digest it carries may ALREADY be the one authority accepted
+            # and armed. Recomputing evidence here and overwriting that
+            # digest is precisely how a second, concurrent PREPARE could
+            # replace the material the arming transaction bound itself to,
+            # so it is refused outright.
+            #
+            # The journal deliberately retains only the digest, never the
+            # evidence, so this cannot instead return "the same evidence
+            # again": a digest cannot reconstruct what it summarizes, and
+            # pretending otherwise would be a fabrication. An orphaned
+            # intent -- a PREPARE whose backend died before arming -- is
+            # therefore never permission to execute. Recovery inspects it
+            # and seals it through the existing pre-submission seal, which
+            # blocks the job and releases the global slot without ever
+            # claiming a mutation happened.
+            # Reported as the durable phase with NO evidence rather than as
+            # an error, so the backend can route it to the existing
+            # pre-submission seal instead of leaving the job holding the one
+            # global destructive slot with nothing able to resolve it. The
+            # seal decision still belongs to this journal: `_seal_never_
+            # submitted` refuses once the phase has moved past `intent`.
+            return _response(
+                request,
+                "intent",
+                running=False,
+                reason=(
+                    "package mutation preparation already exists for this "
+                    "operation and its accepted evidence is immutable"
+                ),
+            )
         if record is not None and record["phase"] != "intent":
             # Already past preparation -- sealed, submitted, or finished.
             # Preparing again would be meaningless and must never look like
@@ -1191,7 +1700,6 @@ def _prepare(
 
         local_node = _local_node(runner)
 
-        revalidate_live_target(runner, vmid, expected_node)
         os_result = _run_guest_command(
             runner, vmid, expected_node, local_node,
             ("env", "LC_ALL=C", "cat", "/etc/os-release"),
@@ -1203,7 +1711,6 @@ def _prepare(
                 "guest_unavailable", "guest OS release metadata is unavailable"
             )
 
-        revalidate_live_target(runner, vmid, expected_node)
         apt_version_result = _run_guest_command(
             runner, vmid, expected_node, local_node,
             ("env", "LC_ALL=C", "apt-get", "--version"),
@@ -1223,7 +1730,6 @@ def _prepare(
         # Execution-time candidate state must be current, not a reuse of the
         # original scan's stale indexes. Writing APT's own index and cache
         # metadata is explicitly non-mutating for workload packages.
-        revalidate_live_target(runner, vmid, expected_node)
         update = _run_guest_command(
             runner, vmid, expected_node, local_node,
             (
@@ -1240,7 +1746,6 @@ def _prepare(
         # the mutation: the real command deliberately never refreshes again,
         # so it resolves against exactly the index state this simulation was
         # computed from.
-        revalidate_live_target(runner, vmid, expected_node)
         simulation = _run_guest_command(
             runner, vmid, expected_node, local_node,
             ("env", "LC_ALL=C", "DEBIAN_FRONTEND=noninteractive", "apt-get", "-s", "upgrade"),
@@ -1249,7 +1754,6 @@ def _prepare(
         if simulation.returncode != 0:
             raise _package_failure("simulation", simulation_stderr)
 
-        revalidate_live_target(runner, vmid, expected_node)
         native_architecture, installed_inventory = _read_guest_state(
             runner, vmid, expected_node, local_node
         )
@@ -1359,7 +1863,6 @@ def _execute(
         # crosses that boundary exactly once.
         # -------------------------------------------------------------
         local_node = _local_node(runner)
-        revalidate_live_target(runner, vmid, expected_node)
         native_architecture, pre_inventory = _read_guest_state(
             runner, vmid, expected_node, local_node
         )
@@ -1388,6 +1891,15 @@ def _execute(
                 "guest installed package state no longer matches the approved "
                 f"plan for {len(drifted)} package(s)",
             )
+
+        # The pre-dpkg action gate is staged while the journal is still at
+        # `intent`, so a staging failure refuses cleanly and remains
+        # sealable. It also means that if this VMID is reused by another
+        # guest before the detached runner reaches `apt-get`, that guest
+        # simply has no verifier at the hook path -- APT then fails the
+        # hook and aborts before dpkg, independently of the runner's own
+        # final target revalidation.
+        stage_action_set_gate(runner, request, local_node)
 
         journal.write(
             {
@@ -1504,9 +2016,18 @@ def run_mutation(
     exit_code = 1
     output_tail = ""
     try:
+        # `_run_guest_command` revalidates the live target immediately
+        # before dispatching, so this -- the last practical instant before
+        # the one real package command -- is where a VMID that was freed
+        # and reused after `submitted` was journaled is caught. If it
+        # fails, `apt-get` is never launched and the MutationError below
+        # journals a truthful terminal failure. It is deliberately NOT
+        # sealed as never-submitted: `submitted` is already durable, so the
+        # backend can no longer use the pre-submission release contract,
+        # and this operation keeps its ownership and its fence.
         result = _run_guest_command(
             runner, vmid, expected_node, local_node,
-            MUTATION_ARGV,
+            mutation_argv(request["mutation_operation_id"]),
             timeout=MUTATION_COMMAND_TIMEOUT_SECONDS,
         )
         exit_code = int(result.returncode)

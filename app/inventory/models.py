@@ -181,6 +181,27 @@ class PackageUpdateExecutionOutcome(StrEnum):
     AUTHORITY_STALE = "authority_stale"
 
 
+class PackageMutationArmOutcome(StrEnum):
+    """Which invocation actually committed the write-ahead arming facts.
+
+    ``MATCHED`` alone is not enough for a caller that wants to submit. Two
+    invocations can both prepare fresh evidence, both find the job ACTIVE at
+    ``snapshot_confirmed``, and both derive the same deterministic
+    ``mutation_operation_id``; exactly one of them commits its evidence
+    digest, and the other must not be able to submit merely because the
+    identity it derived happens to match. So the arming transition reports
+    which one it was.
+    """
+
+    #: THIS invocation atomically committed the checkpoint together with its
+    #: own accepted evidence digest. Only it may enter the submit-capable
+    #: path, and only with that same digest.
+    ARMED_NOW = "armed_now"
+    #: The job was already armed by some earlier or concurrent invocation.
+    #: This caller is recovery-only and may never submit.
+    ALREADY_ARMED = "already_armed"
+
+
 class PackageScanFailure(StrEnum):
     GUEST_UNAVAILABLE = "guest_unavailable"
     UNSUPPORTED_RESOURCE_TYPE = "unsupported_resource_type"
@@ -260,6 +281,25 @@ class MutationSubmissionRefusedBeforeCallback(AuthorityConflict):
     raised by that same method stays ordinary :class:`AuthorityConflict`:
     those say nothing about whether the host was asked to mutate, and must
     never be routed into the durable seal path.
+    """
+
+
+class PackageMutationEvidenceNotAccepted(AuthorityConflict):
+    """A submitting caller did not carry the accepted preparation evidence.
+
+    Raised by
+    :meth:`InventoryAuthority.execute_package_mutation_submission_if_current`
+    when the digest the caller supplies is not the
+    ``accepted_prepared_evidence_digest`` the arming transaction durably
+    committed. It means a DIFFERENT invocation's evidence is the one
+    authority accepted, so this caller may never submit -- and, critically,
+    it is a distinct type from
+    :class:`MutationSubmissionRefusedBeforeCallback` precisely so it can
+    never be routed into the pre-submission seal: the invocation that did
+    win the arming race may be submitting a real package command at this
+    very moment, and sealing the operation "never submitted" on its behalf
+    would be a lie. The callback ran zero times; the job stays ACTIVE,
+    armed, and fenced, and this caller becomes recovery-only.
     """
 
 
@@ -542,6 +582,11 @@ class PackageUpdateJob:
     snapshot_confirmed_at: str | None
     mutation_operation_id: str | None
     mutation_may_have_started_at: str | None
+    #: The digest of the EXACT preparation evidence the arming transaction
+    #: accepted. Committed together with the write-ahead checkpoint, and
+    #: write-once from then on, so only the invocation carrying this exact
+    #: digest may cross the submission boundary.
+    accepted_prepared_evidence_digest: str | None
     mutation_completed_at: str | None
     health_started_at: str | None
     rollback_may_have_started_at: str | None

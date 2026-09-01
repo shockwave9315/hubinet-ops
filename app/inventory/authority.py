@@ -40,6 +40,8 @@ from .models import (
     PackageUpdateJob,
     PackageUpdateJobStatus,
     MutationSubmissionRefusedBeforeCallback,
+    PackageMutationArmOutcome,
+    PackageMutationEvidenceNotAccepted,
     PackageUpdateMutationIdentity,
     PackageUpdateMutationRequest,
     PackageUpdateRollbackTarget,
@@ -2726,7 +2728,13 @@ class InventoryAuthority:
         self,
         job_id: str,
         fresh_packages: tuple[PackageScanPackage, ...],
-    ) -> tuple[PackageUpdateExecutionOutcome, PackageUpdateJob]:
+        *,
+        prepared_evidence_digest: str,
+    ) -> tuple[
+        PackageUpdateExecutionOutcome,
+        PackageMutationArmOutcome,
+        PackageUpdateJob,
+    ]:
         """Durably commit the write-ahead package-mutation uncertainty boundary.
 
         This is the package equivalent of
@@ -2773,10 +2781,24 @@ class InventoryAuthority:
         (:meth:`execute_package_mutation_submission_if_current`) before a
         package command is sent. Re-arming an already-armed job is
         idempotent: the same derived identity is re-proved and the existing
-        durable boundary is returned, never a second one.
+        durable boundary is returned, never a second one -- but the second
+        return value then reports
+        :attr:`PackageMutationArmOutcome.ALREADY_ARMED`, and ONLY the
+        invocation that gets ``ARMED_NOW`` may go on to submit. Two
+        concurrent invocations derive the same deterministic operation
+        identity, so identity alone can never decide who submits; the
+        accepted evidence digest is what does.
+
+        ``prepared_evidence_digest`` is the digest of the EXACT preparation
+        evidence this invocation just proved the material from. It commits
+        in this same transaction, so the accepted material, the operation
+        identity, the timestamp, and the checkpoint are one indivisible
+        write-ahead authority fact -- there is no window in which a job is
+        armed against evidence nothing recorded.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
+        digest = _require_evidence_digest(prepared_evidence_digest)
         fresh_material = frozenset(
             (
                 package.package_name,
@@ -2788,6 +2810,7 @@ class InventoryAuthority:
         )
         decided_at = _timestamp(self._now())
         outcome: PackageUpdateExecutionOutcome | None = None
+        armed = PackageMutationArmOutcome.ALREADY_ARMED
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
@@ -2817,6 +2840,7 @@ class InventoryAuthority:
                 )
                 if job_material and job_material == fresh_material:
                     outcome = PackageUpdateExecutionOutcome.MATCHED
+                    armed = PackageMutationArmOutcome.ARMED_NOW
                     identity = self._mutation_identity_in_transaction(
                         connection, job
                     )
@@ -2826,6 +2850,7 @@ class InventoryAuthority:
                         identity=identity,
                         recorded_at=decided_at,
                         package_count=len(job_material),
+                        accepted_evidence_digest=digest,
                     )
                 else:
                     outcome = PackageUpdateExecutionOutcome.MISMATCHED
@@ -2863,7 +2888,7 @@ class InventoryAuthority:
             raise AuthorityInvariantError(
                 "package mutation arming decision was not captured"
             )
-        return outcome, self._store.package_update_job(canonical_job_id)
+        return outcome, armed, self._store.package_update_job(canonical_job_id)
 
     def _commit_package_mutation_intent(
         self,
@@ -2873,16 +2898,30 @@ class InventoryAuthority:
         identity: PackageUpdateMutationIdentity,
         recorded_at: str,
         package_count: int,
+        accepted_evidence_digest: str,
     ) -> None:
+        # ONE statement, so the checkpoint, the operation identity, the
+        # timestamp, and the accepted evidence digest are a single coherent
+        # write-ahead fact -- never a proof in one write and a commit in
+        # another. The `IS NULL` guards make it a compare-and-set: exactly
+        # one of two concurrent invocations can win it, and the loser's
+        # evidence is therefore never what authority accepted.
         updated = connection.execute(
             "UPDATE package_update_jobs "
             "SET checkpoint='mutation_may_have_started', "
-            "mutation_operation_id=?, mutation_may_have_started_at=? "
+            "mutation_operation_id=?, mutation_may_have_started_at=?, "
+            "accepted_prepared_evidence_digest=? "
             "WHERE job_id=? AND status='active' "
             "AND checkpoint='snapshot_confirmed' "
             "AND mutation_operation_id IS NULL "
-            "AND mutation_may_have_started_at IS NULL",
-            (identity.mutation_operation_id, recorded_at, job_id),
+            "AND mutation_may_have_started_at IS NULL "
+            "AND accepted_prepared_evidence_digest IS NULL",
+            (
+                identity.mutation_operation_id,
+                recorded_at,
+                accepted_evidence_digest,
+                job_id,
+            ),
         )
         if updated.rowcount != 1:
             raise AuthorityConflict(
@@ -2901,11 +2940,12 @@ class InventoryAuthority:
             details={
                 "mutation_operation_id": identity.mutation_operation_id,
                 "package_count": package_count,
+                "accepted_prepared_evidence_digest": accepted_evidence_digest,
             },
         )
 
     def execute_package_mutation_submission_if_current(
-        self, job_id: str, submit: Callable[[], _T]
+        self, job_id: str, submit: Callable[[], _T], *, prepared_evidence_digest: str
     ) -> _T:
         """Run one bounded host mutation submission while authority holds.
 
@@ -2931,6 +2971,16 @@ class InventoryAuthority:
         writer-contention policy". Polling the operation, and proving its
         completion, happen strictly outside this transaction.
 
+        ``prepared_evidence_digest`` is re-proved against the durable
+        ``accepted_prepared_evidence_digest`` INSIDE this same transaction,
+        before ``submit`` is called. That is what closes the second half of
+        the concurrent-PREPARE race: two invocations can both prepare fresh
+        evidence and both derive the same deterministic operation identity,
+        but only one of them committed its digest in the arming transaction,
+        and only that one can get past this check. A mismatch raises
+        :class:`PackageMutationEvidenceNotAccepted` with the callback having
+        run zero times.
+
         A stale authority context refuses BEFORE ``submit`` is ever called,
         raising :class:`MutationSubmissionRefusedBeforeCallback` -- a
         distinct, narrow subclass of :class:`AuthorityConflict` that
@@ -2938,13 +2988,36 @@ class InventoryAuthority:
         caller may route it into the durable seal path. A terminal job or a
         wrong checkpoint stays an ordinary :class:`AuthorityConflict` and
         says nothing about whether ``submit`` ran.
+
+        :class:`PackageMutationEvidenceNotAccepted` is deliberately NOT that
+        seal-eligible type. "My evidence is not the accepted one" means some
+        OTHER invocation legitimately holds the right to submit and may be
+        exercising it right now; sealing the operation "never submitted" on
+        the strength of this caller's failure would be false. It stays a
+        plain conflict, and the caller becomes recovery-only.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
+        digest = _require_evidence_digest(prepared_evidence_digest)
         host_result: _T | None = None
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             self._require_armed_package_mutation_job(job)
+            accepted = job["accepted_prepared_evidence_digest"]
+            if not isinstance(accepted, str) or not accepted:
+                raise AuthorityInvariantError(
+                    "armed package update job has no accepted prepared "
+                    "evidence digest"
+                )
+            if accepted != digest:
+                # Refused before the callback, and deliberately not through
+                # the seal-eligible type: the invocation whose evidence WAS
+                # accepted may be submitting a real package command right
+                # now.
+                raise PackageMutationEvidenceNotAccepted(
+                    "package mutation submission does not carry the prepared "
+                    "evidence this job's arming transaction accepted"
+                )
             current_authority_holds = self._package_update_job_authority_is_current(
                 connection, job
             )
@@ -4305,6 +4378,22 @@ def _require_architecture(value: str) -> str:
         or not _ARCHITECTURE_RE.fullmatch(value)
     ):
         raise ValueError("architecture must be a bounded lowercase dpkg architecture")
+    return value
+
+
+_EVIDENCE_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _require_evidence_digest(value: str) -> str:
+    """Exactly 64 lowercase hex characters, or nothing at all.
+
+    The same shape the durable CHECK constraint enforces, rejected here so a
+    malformed digest can never reach a transaction that would otherwise
+    abort mid-way through the write-ahead arming fact.
+    """
+
+    if not isinstance(value, str) or not _EVIDENCE_DIGEST_RE.fullmatch(value):
+        raise ValueError("prepared evidence digest is invalid")
     return value
 
 
