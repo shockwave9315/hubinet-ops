@@ -128,13 +128,14 @@ def _packages() -> tuple[PackageScanPackage, ...]:
     return (
         PackageScanPackage(
             "zlib1g",
+            "amd64",
             "1:1.2.13.dfsg-1",
             "1:1.2.13.dfsg-2",
             "Debian:12/stable-security",
             "compression library",
             True,
         ),
-        PackageScanPackage("apt", "2.6.1", "2.6.2"),
+        PackageScanPackage("apt", "amd64", "2.6.1", "2.6.2"),
     )
 
 
@@ -307,6 +308,7 @@ def test_success_persists_sorted_exact_plan_and_material_fingerprint(tmp_path: P
     metadata_changed = tuple(
         PackageScanPackage(
             item.package_name,
+            item.architecture,
             item.installed_version,
             item.candidate_version,
             "different origin",
@@ -478,6 +480,8 @@ class SuccessfulHostControl:
         return HostScanResult(
             context=expected_host_context(run),
             os_release='ID=debian\nVERSION_ID="12"\n',
+            native_architecture="amd64\n",
+            installed_inventory="",
             simulation_stdout=(
                 "Reading package lists...\n"
                 "Building dependency tree...\n"

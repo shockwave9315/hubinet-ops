@@ -116,6 +116,26 @@ class PackageUpdateEventType(StrEnum):
     SNAPSHOT_FAILED = "snapshot_failed"
     SNAPSHOT_BLOCKED_BEFORE_SUBMISSION = "snapshot_blocked_before_submission"
     SNAPSHOT_RETAINED_AUTHORITY_STALE = "snapshot_retained_authority_stale"
+    EXECUTION_PLAN_VERIFIED = "execution_plan_verified"
+    EXECUTION_PLAN_MISMATCH = "execution_plan_mismatch"
+    EXECUTION_AUTHORITY_STALE_RELEASED = "execution_authority_stale_released"
+
+
+class PackageUpdateExecutionOutcome(StrEnum):
+    """Result of comparing a fresh execution-time plan against a frozen job.
+
+    This is the in-memory/typed result of one equality decision. It is never
+    itself persisted as a durable "safe to mutate" flag: a ``MATCHED``
+    outcome leaves the job's checkpoint at ``snapshot_confirmed`` untouched,
+    while ``MISMATCHED`` and ``AUTHORITY_STALE`` both terminalize the job as
+    ``blocked`` (retained snapshot, released global slot, no rollback
+    authority) for their own distinct, truthful reasons. See
+    ``ARCHITECTURE.md``, "Execution-time plan equality".
+    """
+
+    MATCHED = "matched"
+    MISMATCHED = "mismatched"
+    AUTHORITY_STALE = "authority_stale"
 
 
 class PackageScanFailure(StrEnum):
@@ -365,6 +385,7 @@ class ResourceTermination:
 @dataclass(frozen=True, slots=True)
 class PackageScanPackage:
     package_name: str
+    architecture: str
     installed_version: str
     candidate_version: str
     origin: str | None = None
@@ -417,6 +438,7 @@ class PackagePlanApproval:
 class PackageUpdateJobPackage:
     package_index: int
     package_name: str
+    architecture: str
     installed_version: str
     candidate_version: str
     origin: str | None = None

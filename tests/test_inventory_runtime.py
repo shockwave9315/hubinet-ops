@@ -387,7 +387,7 @@ def _discover_lxc_plan(app, config, monkeypatch):
         run.scan_run_id,
         os_id="debian",
         os_version="12",
-        packages=(PackageScanPackage("apt", "2.6.1", "2.6.2"),),
+        packages=(PackageScanPackage("apt", "amd64", "2.6.1", "2.6.2"),),
         reboot_required=None,
     )
     return resource, completed
@@ -475,7 +475,7 @@ def test_package_plan_approval_route_accepts_exact_reference_and_refuses_stale_r
         plan_b_run.scan_run_id,
         os_id="debian",
         os_version="12",
-        packages=(PackageScanPackage("apt", "2.6.1", "2.6.9"),),
+        packages=(PackageScanPackage("apt", "amd64", "2.6.1", "2.6.9"),),
         reboot_required=None,
     )
     stale = client.put(

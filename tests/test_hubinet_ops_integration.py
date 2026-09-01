@@ -1204,6 +1204,7 @@ def exact_plan_resource(
     packages = packages or (
         PackageScanPackage(
             name="apt",
+            architecture="amd64",
             installed_version="2.6.1",
             candidate_version="2.6.2",
             origin="Debian:12/stable",
@@ -1212,6 +1213,7 @@ def exact_plan_resource(
         ),
         PackageScanPackage(
             name="zlib1g",
+            architecture="amd64",
             installed_version="1.2.13",
             candidate_version="1.2.14",
             origin="Debian:12/stable-security",
@@ -1221,6 +1223,7 @@ def exact_plan_resource(
     )
     material = [
         {
+            "architecture": package.architecture,
             "candidate_version": package.candidate_version,
             "installed_version": package.installed_version,
             "package_name": package.name,
@@ -1293,6 +1296,7 @@ async def test_view_update_plan_reads_fresh_snapshot_and_returns_exact_rows(
     assert response["packages"] == [
         {
             "name": "apt",
+            "architecture": "amd64",
             "installed_version": "2.6.1",
             "candidate_version": "2.6.2",
             "origin": "Debian:12/stable",
@@ -1301,6 +1305,7 @@ async def test_view_update_plan_reads_fresh_snapshot_and_returns_exact_rows(
         },
         {
             "name": "zlib1g",
+            "architecture": "amd64",
             "installed_version": "1.2.13",
             "candidate_version": "1.2.14",
             "origin": "Debian:12/stable-security",

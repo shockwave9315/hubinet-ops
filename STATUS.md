@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v10):
+  SQLite authority database (schema v11):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -13,9 +13,11 @@
   package-update job authority. Jobs copy immutable approval/context provenance
   and exact package rows, use UUID request idempotency, own one global active
   slot, record append-only events, and are interrupted before package mutation
-  on restart. Schema v10 adds the job-owned snapshot operation identity, its
+  on restart. Schema v10 added the job-owned snapshot operation identity, its
   write-ahead uncertainty checkpoint, the observed PVE task identity, and
-  SQL-level state-machine invariants over all of them.
+  SQL-level state-machine invariants over all of them. Schema v11 adds the
+  explicit, material `architecture` column to package rows (see
+  "Execution-time plan equality" below).
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus exactly
   one authority-only mutation,
   `PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
@@ -65,12 +67,14 @@
 
 The PVE API inventory surface remains read-only. The backend's sole mutation
 route records Hubinet approval authority state only. Internal update-job
-issuance and job-owned snapshot safety are not production-reachable: there is
-no HTTP/HA creation control and no worker or scheduler consuming jobs, and no
-snapshot helper, key, or PVE mutation privilege is deployed. Package scanning
-may write APT index/cache metadata but never changes workload packages. There
-is no workload package mutation, healthcheck execution, rollback execution,
-snapshot deletion, lifecycle mutation, policy, or endpoint failover.
+issuance, job-owned snapshot safety, and the execution-time plan equality gate
+are not production-reachable: there is no HTTP/HA creation control and no
+worker or scheduler consuming jobs, and no snapshot helper, execution helper,
+key, or PVE mutation privilege is deployed. Package scanning may write APT
+index/cache metadata but never changes workload packages, and neither does
+the execution-time gate's own metadata refresh. There is no workload package
+mutation, healthcheck execution, rollback execution, snapshot deletion,
+lifecycle mutation, policy, or endpoint failover.
 
 ## Human0 validation
 
@@ -197,10 +201,60 @@ unimplemented future stage.
   polling transaction open; task polling and canonical confirmation still run
   strictly outside both writer critical sections.
 
+## Execution-time plan equality
+
+- **Implemented internally:** a proven multiarch binary-package identity
+  contract -- durable identity is `(package_name, architecture)`, and
+  architecture is *proven* from the guest's own independent dpkg installed
+  inventory (`dpkg-query -W`, `dpkg --print-architecture` -- fixed,
+  argument-less commands) and cross-checked against APT's `-s upgrade`
+  candidate description, never inferred from that candidate description
+  alone; a package changing between an architecture-specific binary and
+  `Architecture: all` is out of scope and fails closed. Architecture is now
+  explicit material identity in the plan fingerprint, approval, and every
+  durable package row (schema v11). Every APT `Conf` (configure) action is
+  validated and must be bound to an approved `Inst` row -- a standalone,
+  contradictory, or duplicate `Conf`, or any evidence of pre-existing
+  unfinished dpkg state, fails the plan closed rather than silently
+  disappearing. One canonical parser
+  (`app/package_scan.py::parse_apt_simulation`) is shared, unchanged, by
+  both package scanning and this gate. A dark orchestrator
+  (`app/package_update_execution.py`) runs, for one job at exactly
+  `snapshot_confirmed`: a fresh execution-time APT metadata refresh,
+  simulation, and dpkg identity read over a separate dark pinned-key SSH
+  transport and forced-command PVE helper
+  (`deploy/hubinet-package-update-helper.py`, exposing exactly one
+  non-mutating operation), then an atomic authority comparison
+  (`InventoryAuthority.evaluate_package_update_execution_plan`) of that fresh
+  canonical material against the job's immutable frozen rows -- complete-set
+  equality only, never subset/name-only matching. An exact match changes
+  nothing durable about the job (no checkpoint advance, no persisted
+  permission flag); a mismatch terminalizes the job `blocked`, retaining its
+  confirmed snapshot and releasing the global slot without granting rollback
+  authority. A provably stale current-authority context at this same
+  pre-mutation gate is likewise never left dangling ACTIVE: both the gate's
+  cheap pre-host check
+  (`InventoryAuthority.revalidate_or_release_stale_package_update_execution`)
+  and the post-host comparison atomically terminalize the job `blocked` the
+  moment staleness is proven, so the one global destructive slot can never
+  be starved by an obsolete job with only a backend restart as a way out --
+  a job that goes terminal for an unrelated reason while a host round trip
+  is in flight is never mistaken for this and never overwritten. A newest
+  RUNNING package scan is transient rather than stale: the gate returns a
+  retryable result, preserves the ACTIVE snapshot-confirmed job and retained
+  snapshot, and avoids the host round trip when the scan is already visible
+  at the pre-host check. Once that scan completes failed/unknown, the old job
+  is stale and releases normally.
+- **Not activated:** no HTTP, Home Assistant, scheduler, bootstrap, or updater
+  path can invoke this gate; the execution helper is a separate dark file
+  that is **not deployed**, with no key or `authorized_keys` entry and no
+  extra PVE privilege. This stage performs zero workload package mutation,
+  and a successful equality pass is deliberately not a durable "safe to
+  mutate" permit: the future mutation stage must re-run this exact gate again
+  immediately before it mutates anything, not trust an earlier pass.
+
 ## Next
 
-- Exact APT execution simulation/equality, including a proven multiarch package
-  identity contract.
 - Package execution with post-mutation crash recovery, then healthcheck and
   same-job rollback execution.
 - Production activation of the update lifecycle.
@@ -219,8 +273,8 @@ unimplemented future stage.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v10 is incompatible with v9, and there is no v9-to-v10
-  migration path. An existing installation now uses `deploy/update-proxmox-0.5.sh`
+- Pre-release: schema v11 is incompatible with v10 and v9, and there is no
+  in-place migration path. An existing installation now uses `deploy/update-proxmox-0.5.sh`
   for this: it detects the incompatible authority schema, backs it up, and
   resets only the authority database (see "In-place product updates" below)
   while preserving the LXC, its VMID/network, PVE identity/token, and every

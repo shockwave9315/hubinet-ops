@@ -68,11 +68,12 @@ def validate_package_scan_snapshot(scan: "PackageScanSnapshot") -> None:
             r"[0-9a-f]{64}", scan.plan_fingerprint
         ):
             raise ValueError("successful package scan fingerprint is malformed")
-        names = [package.name for package in scan.packages]
-        if names != sorted(names) or len(names) != len(set(names)):
+        identities = [(package.name, package.architecture) for package in scan.packages]
+        if identities != sorted(identities) or len(identities) != len(set(identities)):
             raise ValueError("package rows must be unique and deterministic")
         material = [
             {
+                "architecture": package.architecture,
                 "candidate_version": package.candidate_version,
                 "installed_version": package.installed_version,
                 "package_name": package.name,

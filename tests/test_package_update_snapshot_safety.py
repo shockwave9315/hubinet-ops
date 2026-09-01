@@ -1437,10 +1437,12 @@ def test_a_persisted_identity_that_contradicts_its_derivation_is_an_invariant_er
 # ===========================================================================
 
 
-def test_a_fresh_database_initializes_at_schema_v10(tmp_path: Path) -> None:
+def test_a_fresh_database_initializes_at_the_current_schema_version(
+    tmp_path: Path,
+) -> None:
     from app.inventory.store import AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION
 
-    assert AUTHORITY_SCHEMA_VERSION == 10
+    assert AUTHORITY_SCHEMA_VERSION == 11
     store = InventoryAuthorityStore(tmp_path / "authority.db")
     with sqlite3.connect(tmp_path / "authority.db") as connection:
         marker, version = connection.execute(
@@ -1449,8 +1451,8 @@ def test_a_fresh_database_initializes_at_schema_v10(tmp_path: Path) -> None:
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
     assert (marker, version, user_version) == (
         AUTHORITY_SCHEMA_MARKER,
-        10,
-        10,
+        AUTHORITY_SCHEMA_VERSION,
+        AUTHORITY_SCHEMA_VERSION,
     )
     assert store.list_package_update_jobs() == ()
 

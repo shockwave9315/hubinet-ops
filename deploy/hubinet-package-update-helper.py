@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
-"""Forced-command PVE boundary for Hubinet's sole package-scan operation."""
+"""Dark forced-command PVE boundary for the execution-time APT plan gate.
+
+**Not deployed.** Bootstrap and the product updater never install this file,
+never provision an `authorized_keys` forced-command entry for it, and never
+grant it or the identity that would run it any PVE privilege. It exists in
+this repository only so hermetic tests can exercise the execution-time plan
+equality gate end to end; see `app/package_update_execution_host_control.py`
+and `ARCHITECTURE.md`, "Execution-time plan equality".
+
+It is a separate file and a separate logical privilege boundary from
+`deploy/hubinet-package-scan-helper.py`, which stays the only helper
+production ever deploys and remains scan-only. Keeping this one dark and
+distinct means NEXT-C cannot accidentally make job execution
+production-reachable merely by extending an already-deployed boundary, and
+the future mutation stage will need a deliberately stronger execution
+boundary of its own anyway.
+
+Exposes exactly ONE typed, non-mutating operation: `simulate_exact_update_plan`
+-- a fixed APT metadata refresh (`apt-get update -qq --error-on=any`) plus a
+fixed upgrade simulation (`apt-get -s upgrade`), against the caller's own
+frozen expected VMID/node, re-validated live immediately before each guest
+command. No install, upgrade, dist-upgrade, remove, autoremove, or dpkg
+configure/install ever appears in this file's argv, and none may be added to
+it: the boundary intentionally has no capability to mutate a workload.
+"""
 
 from __future__ import annotations
 
@@ -50,7 +74,7 @@ class RequestError(ValueError):
     pass
 
 
-class ScanError(RuntimeError):
+class ExecutionError(RuntimeError):
     def __init__(self, classification: str, message: str) -> None:
         super().__init__(message)
         self.classification = classification
@@ -132,21 +156,24 @@ def validate_request(payload: Any) -> dict[str, Any]:
         "target",
         "context",
     }:
-        raise RequestError("request must have the exact package-scan shape")
-    if payload["request_version"] != 1 or payload["operation"] != "scan_packages":
+        raise RequestError("request must have the exact execution-plan shape")
+    if (
+        payload["request_version"] != 1
+        or payload["operation"] != "simulate_exact_update_plan"
+    ):
         raise RequestError("unknown host-control operation")
     target = payload["target"]
     context = payload["context"]
     if not isinstance(target, Mapping) or set(target) != {"vmid", "expected_node"}:
-        raise RequestError("target must have the exact package-scan shape")
+        raise RequestError("target must have the exact execution-plan shape")
     if not isinstance(context, Mapping) or set(context) != {
-        "scan_run_id",
+        "job_id",
         "resource_id",
         "binding_id",
         "locator_generation",
         "resource_continuity_revision",
     }:
-        raise RequestError("context must have the exact package-scan shape")
+        raise RequestError("context must have the exact execution-plan shape")
     vmid = target["vmid"]
     if type(vmid) is not int or not 100 <= vmid <= 999_999_999:
         raise RequestError("vmid must be a valid PVE integer VMID")
@@ -154,7 +181,7 @@ def validate_request(payload: Any) -> dict[str, Any]:
     if not isinstance(expected_node, str) or not NODE_RE.fullmatch(expected_node):
         raise RequestError("expected_node is invalid")
     normalized_context = {
-        "scan_run_id": _canonical_uuid(context["scan_run_id"], "scan_run_id"),
+        "job_id": _canonical_uuid(context["job_id"], "job_id"),
         "resource_id": _canonical_uuid(context["resource_id"], "resource_id"),
         "binding_id": _canonical_uuid(context["binding_id"], "binding_id"),
         "locator_generation": _positive_integer(
@@ -177,18 +204,20 @@ def _command(
 ) -> CommandResult:
     result = runner(argv, COMMAND_TIMEOUT_SECONDS, max_output)
     if result.timed_out:
-        raise ScanError("timeout", "package scan command timed out")
+        raise ExecutionError("timeout", "package update execution command timed out")
     if result.output_exceeded:
-        raise ScanError("execution_failed", "package scan command output exceeded its bound")
+        raise ExecutionError(
+            "execution_failed",
+            "package update execution command output exceeded its bound",
+        )
     return result
 
 
 def _local_node(runner: Runner) -> str:
     """Ask this PVE node's own trusted local state who it is.
 
-    Uses ``/cluster/status``, the same authoritative source the backend's
-    discovery provider already uses to derive local node identity (see
-    ``app/inventory/provider.py``), so no new trust source is introduced.
+    Uses the same authoritative `/cluster/status` source as the scan helper
+    and the backend's own discovery provider -- no new trust source.
     """
 
     result = _command(
@@ -197,13 +226,15 @@ def _local_node(runner: Runner) -> str:
         max_output=1 * 1024 * 1024,
     )
     if result.returncode != 0:
-        raise ScanError("execution_failed", "could not read local PVE cluster status")
+        raise ExecutionError("execution_failed", "could not read local PVE cluster status")
     try:
         rows = json.loads(result.stdout.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise ScanError("execution_failed", "local PVE cluster status was malformed") from exc
+        raise ExecutionError(
+            "execution_failed", "local PVE cluster status was malformed"
+        ) from exc
     if not isinstance(rows, list):
-        raise ScanError("execution_failed", "local PVE cluster status was malformed")
+        raise ExecutionError("execution_failed", "local PVE cluster status was malformed")
     local_nodes = [
         row.get("name")
         for row in rows
@@ -216,7 +247,7 @@ def _local_node(runner: Runner) -> str:
         or not isinstance(local_nodes[0], str)
         or not NODE_RE.fullmatch(local_nodes[0])
     ):
-        raise ScanError("execution_failed", "local PVE node identity is ambiguous")
+        raise ExecutionError("execution_failed", "local PVE node identity is ambiguous")
     return local_nodes[0]
 
 
@@ -231,13 +262,12 @@ def _run_guest_command(
 ) -> CommandResult:
     """Run one fixed ``pct exec`` shape on whichever node currently holds it.
 
-    ``tail`` is always one of this file's own fixed argv shapes. When the
-    guest is local, it runs directly. Otherwise it is routed to the expected
-    cluster member over root's existing passwordless inter-node SSH trust
-    that Proxmox itself provisions on cluster join/migration -- no new
-    Hubinet credential is provisioned on that node. The remote command is
-    still built only from fixed constants plus the validated integer VMID;
-    no request-provided or arbitrary text ever reaches it.
+    Identical routing contract to the scan helper's own
+    ``_run_guest_command``: ``tail`` is always one of this file's own fixed
+    argv shapes, and a non-local guest is routed to its expected cluster
+    member over root's existing passwordless inter-node SSH trust Proxmox
+    itself provisions -- no new Hubinet credential on that node, and no
+    request-provided or arbitrary text ever reaches either command.
     """
 
     inner = ("pct", "exec", str(vmid), "--", *tail)
@@ -254,45 +284,50 @@ def _run_guest_command(
         )
         result = _command(runner, argv, max_output=max_output)
     if result.returncode == 255:
-        raise ScanError(
-            "execution_failed", "could not execute package scan command in guest"
+        raise ExecutionError(
+            "execution_failed",
+            "could not execute package update execution command in guest",
         )
     return result
 
 
-def _current_target(
-    runner: Runner, vmid: int, expected_node: str
-) -> None:
+def _current_target(runner: Runner, vmid: int, expected_node: str) -> None:
     result = _command(
         runner,
         ("pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"),
         max_output=4 * 1024 * 1024,
     )
     if result.returncode != 0:
-        raise ScanError("execution_failed", "could not read current PVE target state")
+        raise ExecutionError("execution_failed", "could not read current PVE target state")
     try:
         rows = json.loads(result.stdout.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
-        raise ScanError("execution_failed", "current PVE target state was malformed") from exc
+        raise ExecutionError(
+            "execution_failed", "current PVE target state was malformed"
+        ) from exc
     if not isinstance(rows, list):
-        raise ScanError("execution_failed", "current PVE target state was malformed")
+        raise ExecutionError("execution_failed", "current PVE target state was malformed")
     matches = [row for row in rows if isinstance(row, Mapping) and row.get("vmid") == vmid]
     if len(matches) != 1:
-        raise ScanError("guest_unavailable", "guest is missing or unavailable")
+        raise ExecutionError("guest_unavailable", "guest is missing or unavailable")
     row = matches[0]
     if row.get("type") != "lxc":
-        raise ScanError("unsupported_resource_type", "current PVE resource is not an LXC guest")
+        raise ExecutionError(
+            "unsupported_resource_type", "current PVE resource is not an LXC guest"
+        )
     if row.get("node") != expected_node:
-        raise ScanError("stale_target", "guest node changed after scan issuance")
+        raise ExecutionError("stale_target", "guest node changed after job issuance")
     if row.get("status") != "running":
-        raise ScanError("guest_unavailable", "guest is not running")
+        raise ExecutionError("guest_unavailable", "guest is not running")
 
 
 def _decode_output(result: CommandResult) -> tuple[str, str]:
     try:
         return result.stdout.decode("utf-8"), result.stderr.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ScanError("execution_failed", "package scan command output was not UTF-8") from exc
+        raise ExecutionError(
+            "execution_failed", "package update execution command output was not UTF-8"
+        ) from exc
 
 
 def _parse_os_release(text: str) -> tuple[str, str]:
@@ -302,41 +337,43 @@ def _parse_os_release(text: str) -> tuple[str, str]:
         if not line or line.startswith("#"):
             continue
         if "=" not in line:
-            raise ScanError("unsupported_os", "guest OS release metadata is malformed")
+            raise ExecutionError("unsupported_os", "guest OS release metadata is malformed")
         key, value = line.split("=", 1)
         if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or key in values:
-            raise ScanError("unsupported_os", "guest OS release metadata is malformed")
+            raise ExecutionError("unsupported_os", "guest OS release metadata is malformed")
         try:
             parsed = shlex.split(value, posix=True)
         except ValueError as exc:
-            raise ScanError("unsupported_os", "guest OS release metadata is malformed") from exc
+            raise ExecutionError(
+                "unsupported_os", "guest OS release metadata is malformed"
+            ) from exc
         if len(parsed) > 1:
-            raise ScanError("unsupported_os", "guest OS release metadata is ambiguous")
+            raise ExecutionError("unsupported_os", "guest OS release metadata is ambiguous")
         values[key] = parsed[0] if parsed else ""
     os_id = values.get("ID", "").lower()
     version = values.get("VERSION_ID") or values.get("VERSION_CODENAME") or ""
     if os_id not in {"debian", "ubuntu"}:
-        raise ScanError("unsupported_os", "guest operating system is not Debian or Ubuntu")
+        raise ExecutionError("unsupported_os", "guest operating system is not Debian or Ubuntu")
     if not version:
-        raise ScanError("unsupported_os", "guest operating system version is unknown")
+        raise ExecutionError("unsupported_os", "guest operating system version is unknown")
     return os_id, version
 
 
 def _parse_apt_version(text: str) -> tuple[int, int, int]:
     lines = text.splitlines()
     if not lines or not (match := APT_VERSION_RE.fullmatch(lines[0])):
-        raise ScanError("execution_failed", "guest APT version output was malformed")
+        raise ExecutionError("execution_failed", "guest APT version output was malformed")
     major, minor, patch = match.groups()
     return int(major), int(minor), int(patch)
 
 
-def _package_failure(stage: str, stderr: str) -> ScanError:
+def _package_failure(stage: str, stderr: str) -> ExecutionError:
     lowered = stderr.lower()
     if any(pattern in lowered for pattern in BUSY_PATTERNS):
-        return ScanError("package_manager_busy", "APT or dpkg is busy")
+        return ExecutionError("package_manager_busy", "APT or dpkg is busy")
     if stage == "metadata_refresh":
-        return ScanError("metadata_refresh_failed", "APT metadata refresh failed")
-    return ScanError("simulation_failed", "APT upgrade simulation failed")
+        return ExecutionError("metadata_refresh_failed", "APT metadata refresh failed")
+    return ExecutionError("simulation_failed", "APT upgrade simulation failed")
 
 
 def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, Any]:
@@ -344,8 +381,6 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
     vmid = request["vmid"]
     expected_node = request["expected_node"]
     context = request["context"]
-    os_release = ""
-    os_id = os_version = None
     try:
         local_node = _local_node(runner)
 
@@ -357,8 +392,8 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         )
         os_release, _ = _decode_output(os_result)
         if os_result.returncode != 0:
-            raise ScanError("guest_unavailable", "guest OS release metadata is unavailable")
-        os_id, os_version = _parse_os_release(os_release)
+            raise ExecutionError("guest_unavailable", "guest OS release metadata is unavailable")
+        _parse_os_release(os_release)
 
         _current_target(runner, vmid, expected_node)
         apt_version_result = _run_guest_command(
@@ -368,13 +403,18 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         )
         apt_version_stdout, _ = _decode_output(apt_version_result)
         if apt_version_result.returncode != 0:
-            raise ScanError("execution_failed", "could not determine guest APT version")
+            raise ExecutionError("execution_failed", "could not determine guest APT version")
         if _parse_apt_version(apt_version_stdout) < MINIMUM_APT_VERSION:
-            raise ScanError(
+            raise ExecutionError(
                 "unsupported_os",
                 "guest APT version does not support strict metadata refresh",
             )
 
+        # Metadata refresh: execution-time candidate state must be current,
+        # not a reuse of the original scan's stale indexes. This writes only
+        # APT's own index/cache metadata, which PRODUCT.md's "What package
+        # scanning may do" already treats as non-mutating; it never touches
+        # a workload package.
         _current_target(runner, vmid, expected_node)
         update = _run_guest_command(
             runner, vmid, expected_node, local_node,
@@ -388,6 +428,9 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         if update.returncode != 0:
             raise _package_failure("metadata_refresh", update_stderr)
 
+        # Simulation only (`-s`): never a real upgrade. See
+        # PRODUCT.md, "What package scanning may do", and
+        # ARCHITECTURE.md, "Execution-time plan equality".
         _current_target(runner, vmid, expected_node)
         simulation = _run_guest_command(
             runner, vmid, expected_node, local_node,
@@ -414,7 +457,7 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         )
         native_architecture, _ = _decode_output(native_arch_result)
         if native_arch_result.returncode != 0:
-            raise ScanError(
+            raise ExecutionError(
                 "execution_failed", "could not determine guest native architecture"
             )
 
@@ -429,17 +472,10 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         )
         installed_inventory, _ = _decode_output(inventory_result)
         if inventory_result.returncode != 0:
-            raise ScanError(
+            raise ExecutionError(
                 "execution_failed", "could not read guest installed package inventory"
             )
 
-        _current_target(runner, vmid, expected_node)
-        reboot = _run_guest_command(
-            runner, vmid, expected_node, local_node,
-            ("test", "-e", "/var/run/reboot-required"),
-            max_output=4096,
-        )
-        reboot_required = True if reboot.returncode == 0 else None
         return {
             "response_version": 1,
             "ok": True,
@@ -448,10 +484,9 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
             "native_architecture": native_architecture,
             "installed_inventory": installed_inventory,
             "simulation": {"returncode": 0, "stdout": simulation_stdout},
-            "reboot_required": reboot_required,
         }
-    except ScanError as exc:
-        response: dict[str, Any] = {
+    except ExecutionError as exc:
+        return {
             "response_version": 1,
             "ok": False,
             "context": context,
@@ -460,9 +495,6 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
                 "message": exc.message[:500],
             },
         }
-        if os_id is not None and os_version is not None:
-            response["os"] = {"id": os_id, "version": os_version}
-        return response
 
 
 def main() -> int:
@@ -488,7 +520,7 @@ def main() -> int:
             sys.stdout.write(json.dumps(response, ensure_ascii=True, separators=(",", ":")))
             return 0 if response.get("ok") is True else 1
         except (UnicodeDecodeError, ValueError, RequestError) as exc:
-            error = str(exc)[:500] or "malformed package-scan request"
+            error = str(exc)[:500] or "malformed execution-plan request"
     response = {
         "response_version": 1,
         "ok": False,

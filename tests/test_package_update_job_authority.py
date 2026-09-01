@@ -292,7 +292,7 @@ def test_changed_plan_and_failed_or_interrupted_latest_attempt_fail_issuance(
             _successful_plan(
                 authority,
                 resource.resource_id,
-                (PackageScanPackage("apt", "2.6.1", "2.6.9"),),
+                (PackageScanPackage("apt", "amd64", "2.6.1", "2.6.9"),),
             )
             match = "does not match"
         else:
@@ -447,7 +447,7 @@ def test_revalidation_fails_changed_or_failed_latest_plan(tmp_path: Path) -> Non
             _successful_plan(
                 authority,
                 resource.resource_id,
-                (PackageScanPackage("apt", "2.6.1", "2.6.9"),),
+                (PackageScanPackage("apt", "amd64", "2.6.1", "2.6.9"),),
             )
         else:
             latest = authority.issue_package_scan(resource.resource_id)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 import hashlib
 import json
 import re
@@ -34,6 +35,7 @@ from .models import (
     PackageUpdateCheckpoint,
     PackageUpdateEventLevel,
     PackageUpdateEventType,
+    PackageUpdateExecutionOutcome,
     PackageUpdateJob,
     PackageUpdateJobStatus,
     PackageUpdateRollbackTarget,
@@ -57,6 +59,16 @@ from .store import InventoryAuthorityStore
 
 
 _T = TypeVar("_T")
+
+
+class PackageUpdateExecutionAuthorityTemporarilyUnavailable(AuthorityConflict):
+    """Current execution authority cannot be decided while a scan is running."""
+
+
+class _PackageUpdateJobAuthorityState(StrEnum):
+    CURRENT = "current"
+    STALE = "stale"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
 
 
 class InventoryAuthority:
@@ -785,14 +797,15 @@ class InventoryAuthority:
             else:
                 connection.executemany(
                     "INSERT INTO package_scan_packages("
-                    "scan_run_id, package_index, package_name, installed_version, "
-                    "candidate_version, origin, description, security) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    "scan_run_id, package_index, package_name, architecture, "
+                    "installed_version, candidate_version, origin, description, "
+                    "security) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         (
                             canonical_run_id,
                             index,
                             package.package_name,
+                            package.architecture,
                             package.installed_version,
                             package.candidate_version,
                             package.origin,
@@ -1154,14 +1167,15 @@ class InventoryAuthority:
                     # UPDATE, or DELETE in the same atomic transaction.
                     connection.executemany(
                         "INSERT INTO package_update_job_packages("
-                        "job_id, package_index, package_name, installed_version, "
-                        "candidate_version, origin, description, security) "
-                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                        "job_id, package_index, package_name, architecture, "
+                        "installed_version, candidate_version, origin, "
+                        "description, security) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             (
                                 job_id,
                                 int(package["package_index"]),
                                 str(package["package_name"]),
+                                str(package["architecture"]),
                                 str(package["installed_version"]),
                                 str(package["candidate_version"]),
                                 package["origin"],
@@ -1276,9 +1290,9 @@ class InventoryAuthority:
             )
         return self._store.package_update_job(canonical_job_id)
 
-    def _package_update_job_authority_is_current(
+    def _package_update_job_current_authority_detail(
         self, connection: sqlite3.Connection, job: sqlite3.Row
-    ) -> bool:
+    ) -> tuple[_PackageUpdateJobAuthorityState, str | None]:
         """Re-prove every current-authority predicate inside ONE transaction.
 
         This is the whole "current authority still permits this job to
@@ -1291,9 +1305,18 @@ class InventoryAuthority:
         verify live PVE VMID/type/node facts, never a backend resource
         incarnation) would catch it.
 
-        Returns ``False`` for a stale resource/source context so the caller
-        can commit any freshness expiry materialized here before refusing.
-        Hard incoherences still raise.
+        Returns ``(CURRENT, None)`` when current, ``(STALE, reason)`` for
+        every ORDINARY way current authority can no longer support this
+        frozen job -- a moved/changed resource or source context, or the
+        current world simply moving on from the approved plan (the latest
+        completed scan is no longer a successful exact plan, its context no
+        longer matches the job, its fingerprint changed, or its exact
+        material changed). A newest RUNNING scan instead returns
+        ``(TEMPORARILY_UNAVAILABLE, reason)``: it has not produced a new plan
+        or failure yet, so the execution gate must remain fail closed without
+        destroying the job. ``reason`` is non-``None`` for plan drift and
+        temporary unavailability, preserving the generic wrapper's prior
+        :class:`AuthorityConflict` behavior. Hard incoherences still raise.
         """
 
         if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
@@ -1314,45 +1337,88 @@ class InventoryAuthority:
             self._package_scan_context_is_current(connection, job)
             and self._package_scan_source_context_is_current(connection, job)
         ):
-            return False
+            return _PackageUpdateJobAuthorityState.STALE, None
 
         current = self._latest_package_scan_row(connection, str(job["resource_id"]))
-        if current is None or (
+        if current is None:
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "latest package scan attempt is not a successful exact plan",
+            )
+        if str(current["lifecycle"]) == PackageScanLifecycle.RUNNING.value:
+            return (
+                _PackageUpdateJobAuthorityState.TEMPORARILY_UNAVAILABLE,
+                "latest package scan attempt is still running",
+            )
+        if (
             str(current["lifecycle"]) != PackageScanLifecycle.COMPLETED.value
             or str(current["outcome"]) != PackageScanOutcome.SUCCESS.value
         ):
-            raise AuthorityConflict(
-                "latest package scan attempt is not a successful exact plan"
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "latest package scan attempt is not a successful exact plan",
             )
         if not (
             self._package_scan_is_current_and_approvable(connection, current)
             and self._package_scan_context_matches_job(current, job)
         ):
-            raise AuthorityConflict(
-                "latest package scan authority context does not match the job"
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "latest package scan authority context does not match the job",
             )
+        # A stored fingerprint that no longer matches a recomputation from
+        # its own exact rows is corruption, not staleness; raised, not
+        # returned, by _successful_package_scan_fingerprint itself.
         fingerprint = self._successful_package_scan_fingerprint(connection, current)
         if fingerprint != str(job["approved_plan_fingerprint"]):
-            raise AuthorityConflict(
-                "latest package plan fingerprint does not match the job"
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "latest package plan fingerprint does not match the job",
             )
-        current_triplets = self._package_material_triplets(
+        current_material = self._package_material_rows(
             connection,
             table="package_scan_packages",
             owner_column="scan_run_id",
             owner_id=str(current["scan_run_id"]),
         )
-        job_triplets = self._package_material_triplets(
+        job_material = self._package_material_rows(
             connection,
             table="package_update_job_packages",
             owner_column="job_id",
             owner_id=job_id,
         )
-        if not current_triplets or current_triplets != job_triplets:
-            raise AuthorityConflict(
-                "current exact package material does not match the job"
+        if not current_material or current_material != job_material:
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "current exact package material does not match the job",
             )
-        return True
+        return _PackageUpdateJobAuthorityState.CURRENT, None
+
+    def _package_update_job_authority_is_current(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> bool:
+        """Bool-returning current-authority proof, unchanged for existing callers.
+
+        A thin, behavior-preserving wrapper over
+        :meth:`_package_update_job_current_authority_detail`: every caller
+        predating the execution-time plan gate (preflight, snapshot intent,
+        snapshot submission, snapshot confirmation, the generic job
+        revalidation) keeps exactly its existing contract -- ``False`` for a
+        stale resource/source context, :class:`AuthorityConflict` raised for
+        the current world having moved on from the approved plan. See
+        ``evaluate_package_update_execution_plan`` /
+        ``revalidate_or_release_stale_package_update_execution`` for the
+        gate that instead needs to tell those two apart.
+        """
+
+        state, reason = self._package_update_job_current_authority_detail(
+            connection, job
+        )
+        if state is _PackageUpdateJobAuthorityState.CURRENT:
+            return True
+        if reason is not None:
+            raise AuthorityConflict(reason)
+        return False
 
     def _snapshot_identity_in_transaction(
         self, connection: sqlite3.Connection, job: sqlite3.Row
@@ -2247,6 +2313,304 @@ class InventoryAuthority:
             )
         return matches[0]
 
+    @staticmethod
+    def _require_active_execution_gate_job(job: sqlite3.Row) -> None:
+        """Shared checkpoint guard for the execution-time plan gate.
+
+        The job must be exactly ACTIVE at ``snapshot_confirmed`` -- the only
+        window this gate is ever meaningful in. A job that has since gone
+        terminal for some other reason, or has not yet reached this
+        checkpoint, is never overwritten or reopened: this raises an
+        ordinary :class:`AuthorityConflict` and the caller's transaction
+        writes nothing.
+        """
+
+        if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+            raise AuthorityConflict("package update job is terminal")
+        if (
+            PackageUpdateCheckpoint(str(job["checkpoint"]))
+            is not PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+        ):
+            raise AuthorityConflict(
+                "package update job is not awaiting the execution-time plan gate"
+            )
+
+    def _terminalize_execution_gate_job_if_authority_stale(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        decided_at: str,
+    ) -> bool:
+        """Re-prove current authority; terminalize BLOCKED if it is stale.
+
+        Must be called from inside a transaction that already re-read the
+        job row and proved it is ACTIVE at ``snapshot_confirmed`` in THIS
+        same transaction -- the proof here and any terminalization it
+        authorizes are therefore atomic with each other: no other writer can
+        interleave between "authority is proven stale" and "the job is
+        released", and a caller that finds authority current here is
+        guaranteed that fact was true at commit time, not from some earlier,
+        possibly stale, read.
+
+        The job is exactly ACTIVE at ``snapshot_confirmed`` here by
+        construction (no package mutation has begun), so terminalizing it is
+        always pre-mutation-safe: the confirmed snapshot is retained,
+        ``mutation_may_have_started_at`` stays NULL, and the job releases
+        the one global destructive slot without ever gaining rollback
+        authority. This is a deliberately conservative policy: current
+        authority for THIS job's exact frozen material may in principle
+        become available again later (a fresh scan could reproduce it), but
+        the operator can always issue and approve a fresh plan/job, and
+        leaving a provably stale job ACTIVE would otherwise be able to
+        starve the global slot forever with no path back except a backend
+        restart -- which must never be the ordinary release mechanism (see
+        ARCHITECTURE.md, "Execution-time plan equality").
+
+        Uses :meth:`_package_update_job_current_authority_detail` directly,
+        not the bool-returning :meth:`_package_update_job_authority_is_current`
+        wrapper: both of that method's "not current" cases -- a moved/
+        changed resource or source context, and the current world having
+        moved on from the approved plan entirely (a completed failed scan,
+        or a completed success whose context, fingerprint, or exact material
+        changed) -- are equally ordinary staleness at THIS pre-mutation
+        checkpoint and must equally release the job. A latest RUNNING scan is
+        distinct: it raises the narrow retryable transient refusal without a
+        write. A hard incoherence still propagates as an uncaught exception
+        here, exactly as it always has -- never mislabeled as staleness, and
+        never turned into a stale-release write.
+
+        Returns ``True`` (and has terminalized the job) when authority was
+        proven stale here; ``False`` (job unchanged) when it is current; and
+        raises :class:`PackageUpdateExecutionAuthorityTemporarilyUnavailable`
+        with the job untouched when the newest scan is still RUNNING.
+        """
+
+        authority_state, stale_reason = (
+            self._package_update_job_current_authority_detail(connection, job)
+        )
+        job_id = str(job["job_id"])
+        self._after_package_update_authority_proof(connection, job_id=job_id)
+        if authority_state is _PackageUpdateJobAuthorityState.CURRENT:
+            return False
+        if authority_state is _PackageUpdateJobAuthorityState.TEMPORARILY_UNAVAILABLE:
+            raise PackageUpdateExecutionAuthorityTemporarilyUnavailable(
+                stale_reason
+                or "package update execution authority is temporarily unavailable"
+            )
+        reason = (
+            f"package update job's current resource/source/approval authority "
+            f"became stale before package mutation ({stale_reason})"
+            if stale_reason is not None
+            else (
+                "package update job's current resource/source/approval "
+                "authority became stale before package mutation"
+            )
+        ) + "; retained but released for a fresh plan and job"
+        updated = connection.execute(
+            "UPDATE package_update_jobs SET status='blocked', "
+            "terminalized_at=?, terminal_reason=? "
+            "WHERE job_id=? AND status='active' AND checkpoint='snapshot_confirmed'",
+            (decided_at, reason, job_id),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job stale-authority release lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=decided_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+            event_type=PackageUpdateEventType.EXECUTION_AUTHORITY_STALE_RELEASED,
+            message=reason,
+            details={},
+        )
+        return True
+
+    def revalidate_or_release_stale_package_update_execution(
+        self, job_id: str
+    ) -> tuple[bool, PackageUpdateJob]:
+        """Cheap pre-host authority check for the execution-time plan gate.
+
+        Intended as an optimization immediately before the (potentially
+        multi-minute) host round trip: avoid spending it on a job authority
+        has already moved past. Requires the job ACTIVE at exactly
+        ``snapshot_confirmed`` (an ordinary :class:`AuthorityConflict`
+        otherwise, job untouched), then atomically re-proves current
+        authority and, if it is stale, terminalizes the job the exact same
+        way :meth:`evaluate_package_update_execution_plan` would -- see
+        :meth:`_terminalize_execution_gate_job_if_authority_stale` and
+        ARCHITECTURE.md, "Execution-time plan equality". This is deliberately
+        a distinct, narrower check from :meth:`revalidate_package_update_job`
+        (which never terminalizes anything and remains a pure, generic
+        "is authority still current" read usable at any checkpoint).
+
+        Returns ``(True, job)`` when authority is current (job unchanged) or
+        ``(False, job)`` when it was just proven stale and released. If the
+        newest package scan is still RUNNING, raises the narrow
+        :class:`PackageUpdateExecutionAuthorityTemporarilyUnavailable` and
+        leaves the job unchanged for a retry after the scan completes.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        decided_at = _timestamp(self._now())
+        released = False
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_active_execution_gate_job(job)
+            released = self._terminalize_execution_gate_job_if_authority_stale(
+                connection, job, decided_at
+            )
+        return (not released), self._store.package_update_job(canonical_job_id)
+
+    def evaluate_package_update_execution_plan(
+        self,
+        job_id: str,
+        fresh_packages: tuple[PackageScanPackage, ...],
+    ) -> tuple[PackageUpdateExecutionOutcome, PackageUpdateJob]:
+        """Compare a fresh execution-time APT plan against one job's frozen material.
+
+        This is the equality half of the execution-time gate (see
+        ``ARCHITECTURE.md``, "Execution-time plan equality"). ``fresh_packages``
+        MUST already be the canonical parse of a metadata-refreshed, freshly
+        re-simulated APT upgrade read from the live guest: this method
+        performs no host I/O of its own, so it can run inside one short
+        authority-store writer transaction instead of holding that lock
+        across the (potentially multi-minute) host round trip a caller must
+        perform first, outside any transaction -- exactly like every other
+        snapshot-safety transition holds the writer lock only across a
+        single bounded operation, never across PVE's own asynchronous work.
+
+        The job must currently be ACTIVE at exactly ``snapshot_confirmed``:
+        this gate exists specifically for the window after the job's own
+        snapshot is confirmed and before any package mutation. A job that
+        has since gone terminal for some other reason, or has not yet
+        reached this checkpoint, is never overwritten or reopened -- that
+        raises an ordinary :class:`AuthorityConflict` and leaves the job
+        exactly as it was.
+
+        Current job/source/resource/approval authority is re-proved inside
+        the SAME transaction as the comparison and any terminal write, so
+        nothing can invalidate the job between the proof and the decision it
+        authorizes. Unlike most other package-update transitions, a stale
+        authority context here does NOT merely refuse: it terminalizes the
+        job as ``blocked`` in this same transaction (see
+        :meth:`_terminalize_execution_gate_job_if_authority_stale`), because
+        leaving a provably stale job ACTIVE at this pre-mutation checkpoint
+        would otherwise starve the one global destructive slot forever, with
+        a backend restart as the only way out -- which must never be the
+        ordinary release mechanism. This returns
+        :attr:`PackageUpdateExecutionOutcome.AUTHORITY_STALE` for that case.
+        A newest RUNNING package scan is not stale: it raises the narrow
+        retryable
+        :class:`PackageUpdateExecutionAuthorityTemporarilyUnavailable` with
+        no durable write, because no new exact plan or failure exists yet.
+
+        An exact material match -- the complete frozen job material set
+        equals the complete fresh material set, never subset/superset/
+        name-only matching -- returns
+        :attr:`PackageUpdateExecutionOutcome.MATCHED` and changes nothing
+        durable about the job: no checkpoint advances, no new persisted flag
+        is written, and it remains exactly at ``snapshot_confirmed``. A
+        successful match is evidence for this one invocation, never a
+        timeless mutation permit (see ``PRODUCT.md`` rule 2); only a
+        non-authorizing diagnostic event is appended. The next stage that
+        actually mutates packages MUST re-run this exact gate immediately
+        before it does, not trust this result from earlier.
+
+        Any mismatch -- an added, removed, or changed package, an
+        architecture change, or an empty fresh plan where the job is
+        non-empty -- returns :attr:`PackageUpdateExecutionOutcome.MISMATCHED`
+        and terminalizes the job as ``blocked`` in the same transaction: the
+        job's already-confirmed snapshot is retained, but the job releases
+        the global destructive slot and never gains rollback authority. The
+        operator must obtain a current scan/plan and approve it again.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        fresh_material = frozenset(
+            (
+                package.package_name,
+                package.architecture,
+                package.installed_version,
+                package.candidate_version,
+            )
+            for package in _validate_package_plan(fresh_packages)
+        )
+        decided_at = _timestamp(self._now())
+        outcome: PackageUpdateExecutionOutcome | None = None
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_active_execution_gate_job(job)
+            # The authority proof (and, on staleness or mismatch, the
+            # terminal write) share this one transaction with the equality
+            # decision, so nothing can invalidate the job between the proof
+            # just taken and the decision it authorizes.
+            if self._terminalize_execution_gate_job_if_authority_stale(
+                connection, job, decided_at
+            ):
+                outcome = PackageUpdateExecutionOutcome.AUTHORITY_STALE
+            else:
+                job_material = self._package_material_rows(
+                    connection,
+                    table="package_update_job_packages",
+                    owner_column="job_id",
+                    owner_id=canonical_job_id,
+                )
+                if job_material and job_material == fresh_material:
+                    outcome = PackageUpdateExecutionOutcome.MATCHED
+                    self._append_package_update_job_event(
+                        connection,
+                        job_id=canonical_job_id,
+                        created_at=decided_at,
+                        level=PackageUpdateEventLevel.INFO,
+                        stage=PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+                        event_type=PackageUpdateEventType.EXECUTION_PLAN_VERIFIED,
+                        message=(
+                            "fresh execution-time APT simulation exactly "
+                            "matched this job's frozen approved material"
+                        ),
+                        details={"package_count": len(job_material)},
+                    )
+                else:
+                    outcome = PackageUpdateExecutionOutcome.MISMATCHED
+                    reason = (
+                        "fresh execution-time APT simulation no longer "
+                        "exactly matches this job's frozen approved material"
+                    )
+                    updated = connection.execute(
+                        "UPDATE package_update_jobs SET status='blocked', "
+                        "terminalized_at=?, terminal_reason=? "
+                        "WHERE job_id=? AND status='active' "
+                        "AND checkpoint='snapshot_confirmed'",
+                        (decided_at, reason, canonical_job_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise AuthorityConflict(
+                            "package update job execution-plan mismatch "
+                            "lost durable ownership"
+                        )
+                    self._append_package_update_job_event(
+                        connection,
+                        job_id=canonical_job_id,
+                        created_at=decided_at,
+                        level=PackageUpdateEventLevel.ERROR,
+                        stage=PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+                        event_type=PackageUpdateEventType.EXECUTION_PLAN_MISMATCH,
+                        message=reason,
+                        details={
+                            "job_package_count": len(job_material),
+                            "fresh_package_count": len(fresh_material),
+                        },
+                    )
+
+        if outcome is None:
+            raise AuthorityInvariantError(
+                "execution-time plan comparison was not captured"
+            )
+        return outcome, self._store.package_update_job(canonical_job_id)
+
     #: Checkpoints from which ordinary startup may safely terminalize an
     #: active job. Every one of them is provably before any PVE snapshot
     #: submission *and* before any package mutation:
@@ -2360,13 +2724,26 @@ class InventoryAuthority:
         return all(current[field] == job[field] for field in fields)
 
     @staticmethod
-    def _package_material_triplets(
+    def _package_material_rows(
         connection: sqlite3.Connection,
         *,
         table: str,
         owner_column: str,
         owner_id: str,
-    ) -> tuple[tuple[str, str, str], ...]:
+    ) -> frozenset[tuple[str, str, str, str]]:
+        """Read one owner's complete material set: (name, arch, installed, candidate).
+
+        A ``frozenset``, not an ordered tuple: material equality is a set
+        comparison over the complete rows, never an ordering-sensitive one
+        (row order is presentation, not material -- see
+        ``package_plan_fingerprint``), and never subset/superset matching.
+        The (package_name, architecture) part of each row is unique by
+        construction (the ``UNIQUE(scan_run_id/job_id, package_name,
+        architecture)`` constraint and :func:`_validate_package_plan`'s own
+        duplicate check), so the frozenset never silently collapses two
+        distinct rows.
+        """
+
         allowed = {
             ("package_scan_packages", "scan_run_id"),
             ("package_update_job_packages", "job_id"),
@@ -2374,13 +2751,14 @@ class InventoryAuthority:
         if (table, owner_column) not in allowed:
             raise AuthorityInvariantError("unsupported package material source")
         rows = connection.execute(
-            f"SELECT package_name, installed_version, candidate_version "
+            f"SELECT package_name, architecture, installed_version, candidate_version "
             f"FROM {table} WHERE {owner_column}=? ORDER BY package_index",
             (owner_id,),
         ).fetchall()
-        return tuple(
+        return frozenset(
             (
                 str(row["package_name"]),
+                str(row["architecture"]),
                 str(row["installed_version"]),
                 str(row["candidate_version"]),
             )
@@ -2593,6 +2971,7 @@ class InventoryAuthority:
         packages = tuple(
             PackageScanPackage(
                 package_name=str(row["package_name"]),
+                architecture=str(row["architecture"]),
                 installed_version=str(row["installed_version"]),
                 candidate_version=str(row["candidate_version"]),
                 origin=row["origin"],
@@ -3249,31 +3628,55 @@ def _optional_bounded_text(
     return _require_text(value, field_name, max_length=max_length)
 
 
+#: A dpkg/APT architecture string: 'all' (Architecture: all) or a real
+#: architecture triplet such as 'amd64', 'i386', 'arm64'. Lowercase
+#: alphanumeric segments joined by single hyphens, matching what
+#: ``pkgCache::VerIterator::Arch()`` ever actually produces -- never
+#: guessed, and never inferred from caller-supplied text. See
+#: ARCHITECTURE.md, "Binary package identity".
+_ARCHITECTURE_RE = re.compile(r"[a-z][a-z0-9]*(-[a-z0-9]+)*")
+
+
+def _require_architecture(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not (2 <= len(value) <= 32)
+        or not _ARCHITECTURE_RE.fullmatch(value)
+    ):
+        raise ValueError("architecture must be a bounded lowercase dpkg architecture")
+    return value
+
+
 def _validate_package_plan(
     packages: tuple[PackageScanPackage, ...],
 ) -> tuple[PackageScanPackage, ...]:
     if not isinstance(packages, tuple):
         raise ValueError("packages must be a tuple")
     normalized: list[PackageScanPackage] = []
-    names: set[str] = set()
+    identities: set[tuple[str, str]] = set()
     for package in packages:
         if not isinstance(package, PackageScanPackage):
             raise ValueError("packages must contain PackageScanPackage values")
         name = _require_text(package.package_name, "package_name", max_length=300)
+        architecture = _require_architecture(package.architecture)
         installed = _require_text(
             package.installed_version, "installed_version", max_length=500
         )
         candidate = _require_text(
             package.candidate_version, "candidate_version", max_length=500
         )
-        if name in names:
-            raise ValueError("package plan contains a duplicate package name")
-        names.add(name)
+        identity = (name, architecture)
+        if identity in identities:
+            raise ValueError(
+                "package plan contains a duplicate (package_name, architecture)"
+            )
+        identities.add(identity)
         if package.security not in {True, None}:
             raise ValueError("package security must be true or unknown")
         normalized.append(
             PackageScanPackage(
                 package_name=name,
+                architecture=architecture,
                 installed_version=installed,
                 candidate_version=candidate,
                 origin=_optional_bounded_text(
@@ -3285,15 +3688,27 @@ def _validate_package_plan(
                 security=package.security,
             )
         )
-    return tuple(sorted(normalized, key=lambda package: package.package_name))
+    return tuple(
+        sorted(normalized, key=lambda package: (package.package_name, package.architecture))
+    )
 
 
 def package_plan_fingerprint(packages: tuple[PackageScanPackage, ...]) -> str:
-    """SHA-256 of canonical JSON for only the exact material package plan."""
+    """SHA-256 of canonical JSON for only the exact material package plan.
+
+    The material tuple is ``(package_name, architecture, installed_version,
+    candidate_version)``. Architecture is material identity, not
+    presentation metadata: two rows with the same name and versions but
+    different architectures are two different binary packages (see
+    ARCHITECTURE.md, "Binary package identity") and therefore two different
+    plans. Row ordering, origin, description, and security never affect the
+    fingerprint.
+    """
 
     canonical = _validate_package_plan(packages)
     payload = [
         {
+            "architecture": package.architecture,
             "candidate_version": package.candidate_version,
             "installed_version": package.installed_version,
             "package_name": package.package_name,

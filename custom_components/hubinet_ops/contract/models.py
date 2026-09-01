@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+import re
 from types import MappingProxyType
 from typing import Any
 
@@ -154,9 +155,17 @@ class PackageScanError:
             raise ValueError("package scan error message is invalid")
 
 
+#: A dpkg/APT architecture string: 'all' (Architecture: all) or a real
+#: architecture triplet such as 'amd64'/'i386'/'arm64'. See
+#: ARCHITECTURE.md, "Binary package identity" -- (name, architecture) is
+#: the durable binary-package identity, never name alone.
+_ARCHITECTURE_RE = re.compile(r"[a-z][a-z0-9]*(-[a-z0-9]+)*")
+
+
 @dataclass(frozen=True, slots=True)
 class PackageScanPackage:
     name: str
+    architecture: str
     installed_version: str
     candidate_version: str
     origin: str | None = None
@@ -171,6 +180,12 @@ class PackageScanPackage:
         ):
             if not isinstance(value, str) or not value or len(value) > maximum:
                 raise ValueError(f"package scan {field_name} is invalid")
+        if (
+            not isinstance(self.architecture, str)
+            or not (2 <= len(self.architecture) <= 32)
+            or not _ARCHITECTURE_RE.fullmatch(self.architecture)
+        ):
+            raise ValueError("package scan architecture is invalid")
         for value, field_name in (
             (self.origin, "origin"),
             (self.description, "description"),

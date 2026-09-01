@@ -1,20 +1,32 @@
-"""Bounded SSH transport for the sole package-scan host-control operation."""
+"""Dark bounded SSH transport for the execution-time APT plan equality gate.
+
+**Not production-reachable and not deployed.** No production configuration,
+key, or `authorized_keys` entry exists for this channel: `app/inventory_runtime.py`
+never constructs it, and neither bootstrap nor the product updater installs
+its helper or key. It is instantiated only by hermetic tests in this stage.
+
+It is a separate, purpose-specific client and logical privilege boundary
+from `app/package_scan_host_control.py`: it targets the not-deployed
+`deploy/hubinet-package-update-helper.py` forced-command boundary, never
+`deploy/hubinet-package-scan-helper.py`. It reuses the same bounded-process
+runner every other typed host-control transport uses -- one implementation
+of "run a fixed argv with a deadline and a byte cap", not a third one -- and
+the same pinned-key, no-password, no-forwarding, no-arbitrary-command SSH
+posture as the snapshot transport.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 import json
-import os
 from pathlib import Path
 import re
-import selectors
-import subprocess
-import time
 from typing import Any
 
-from app.inventory import BOUNDED_PROCESS_CLEANUP_SECONDS, PackageScanFailure, PackageScanRun
-from app.package_scan import HostScanFailure, HostScanResult, expected_host_context
+from app.inventory import PackageScanFailure, PackageUpdateJob
+from app.package_scan import HostScanFailure
+from app.package_scan_host_control import ProcessRunner, _bounded_process_runner
+from app.package_update_execution import HostExecutionResult, expected_execution_host_context
 
 
 _HOST_RE = re.compile(r"[A-Za-z0-9_.:-]+")
@@ -22,77 +34,7 @@ _USER_RE = re.compile(r"[A-Za-z0-9_.-]+")
 _MAX_REQUEST_BYTES = 4096
 
 
-@dataclass(frozen=True, slots=True)
-class BoundedProcessResult:
-    returncode: int
-    stdout: bytes
-    stderr: bytes
-    timed_out: bool = False
-    output_exceeded: bool = False
-
-
-ProcessRunner = Callable[[tuple[str, ...], bytes, float, int], BoundedProcessResult]
-
-
-def _bounded_process_runner(
-    argv: tuple[str, ...], input_bytes: bytes, timeout: float, max_output: int
-) -> BoundedProcessResult:
-    process = subprocess.Popen(  # noqa: S603 - argv is fixed/validated and never a shell
-        argv,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        close_fds=True,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    assert process.stderr is not None
-    process.stdin.write(input_bytes)
-    process.stdin.close()
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-    output = {"stdout": bytearray(), "stderr": bytearray()}
-    started = time.monotonic()
-    timed_out = False
-    exceeded = False
-    try:
-        while selector.get_map():
-            remaining = timeout - (time.monotonic() - started)
-            if remaining <= 0:
-                timed_out = True
-                process.kill()
-                break
-            for key, _ in selector.select(min(remaining, 0.2)):
-                chunk = os.read(key.fileobj.fileno(), 65536)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                output[key.data].extend(chunk)
-                if len(output["stdout"]) + len(output["stderr"]) > max_output:
-                    exceeded = True
-                    process.kill()
-                    break
-            if exceeded:
-                break
-    finally:
-        selector.close()
-        # This is the reap allowance `app.inventory.contention_policy`
-        # attributes to a snapshot host critical section that actually times
-        # out -- it happens after `timeout` has elapsed but before this
-        # runner (and the caller's writer transaction, when this runner is
-        # reused by the snapshot host-control transport) returns.
-        process.wait(timeout=BOUNDED_PROCESS_CLEANUP_SECONDS)
-    return BoundedProcessResult(
-        process.returncode,
-        bytes(output["stdout"][: max_output + 1]),
-        bytes(output["stderr"][: max_output + 1]),
-        timed_out,
-        exceeded,
-    )
-
-
-class SshPackageScanHostControl:
+class SshPackageUpdateExecutionHostControl:
     def __init__(
         self,
         *,
@@ -136,14 +78,14 @@ class SshPackageScanHostControl:
         self._max_result_bytes = max_result_bytes
         self._runner = runner
 
-    def scan_packages(self, run: PackageScanRun) -> HostScanResult:
-        context = expected_host_context(run)
+    def simulate_exact_update_plan(self, job: PackageUpdateJob) -> HostExecutionResult:
+        context = expected_execution_host_context(job)
         request = {
             "request_version": 1,
-            "operation": "scan_packages",
+            "operation": "simulate_exact_update_plan",
             "target": {
-                "vmid": run.expected_vmid,
-                "expected_node": run.expected_node_name,
+                "vmid": job.expected_vmid,
+                "expected_node": job.expected_node_name,
             },
             "context": context,
         }
@@ -207,7 +149,7 @@ class SshPackageScanHostControl:
 
 def _parse_response(
     payload: Any, expected_context: Mapping[str, Any]
-) -> HostScanResult:
+) -> HostExecutionResult:
     if not isinstance(payload, Mapping) or payload.get("response_version") != 1:
         raise HostScanFailure(
             PackageScanFailure.EXECUTION_FAILED,
@@ -217,7 +159,7 @@ def _parse_response(
     if not isinstance(context, Mapping) or dict(context) != dict(expected_context):
         raise HostScanFailure(
             PackageScanFailure.STALE_TARGET,
-            "host-control response context does not match the scan request",
+            "host-control response context does not match the execution request",
         )
     if payload.get("ok") is not True:
         error = payload.get("error")
@@ -233,18 +175,12 @@ def _parse_response(
                 PackageScanFailure.EXECUTION_FAILED,
                 "host-control returned an unknown failure classification",
             ) from exc
-        message = str(error.get("message") or "package scan failed")[:500]
-        os_data = payload.get("os")
-        os_id = os_version = None
-        if isinstance(os_data, Mapping):
-            os_id = str(os_data.get("id") or "")[:100] or None
-            os_version = str(os_data.get("version") or "")[:200] or None
-        raise HostScanFailure(failure, message, os_id, os_version)
+        message = str(error.get("message") or "package update execution failed")[:500]
+        raise HostScanFailure(failure, message)
     os_release = payload.get("os_release")
     native_architecture = payload.get("native_architecture")
     installed_inventory = payload.get("installed_inventory")
     simulation = payload.get("simulation")
-    reboot_required = payload.get("reboot_required")
     if (
         not isinstance(os_release, str)
         or not isinstance(native_architecture, str)
@@ -253,17 +189,15 @@ def _parse_response(
         or type(simulation.get("returncode")) is not int
         or not isinstance(simulation.get("stdout"), str)
         or simulation["returncode"] != 0
-        or reboot_required not in {True, None}
     ):
         raise HostScanFailure(
             PackageScanFailure.EXECUTION_FAILED,
-            "host-control returned malformed successful scan evidence",
+            "host-control returned malformed successful execution evidence",
         )
-    return HostScanResult(
+    return HostExecutionResult(
         context=dict(context),
         os_release=os_release,
         native_architecture=native_architecture,
         installed_inventory=installed_inventory,
         simulation_stdout=simulation["stdout"],
-        reboot_required=reboot_required,
     )

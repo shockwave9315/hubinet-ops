@@ -155,6 +155,7 @@ def _package_scan_snapshot(payload: Any) -> PackageScanSnapshot:
         packages=tuple(
             PackageScanPackage(
                 name=str(package["name"]),
+                architecture=str(package["architecture"]),
                 installed_version=str(package["installed_version"]),
                 candidate_version=str(package["candidate_version"]),
                 origin=package.get("origin"),

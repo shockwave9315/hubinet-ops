@@ -37,11 +37,15 @@ stops being shown as current, without hand-maintained cards.
 
 **Package/update scanning.** Automatic, scheduled scanning of installed and
 available packages inside managed guests. LXC on Debian/Ubuntu is the first
-target. The operator sees the exact package detail: name, installed version,
-candidate version, origin, description, and further metadata — including
-security classification and reboot-required only where those can be
-established reliably. A field that cannot be established reliably is reported
-as unknown, never guessed.
+target. The operator sees the exact package detail: name, architecture,
+installed version, candidate version, origin, description, and further
+metadata — including security classification and reboot-required only where
+those can be established reliably. A field that cannot be established
+reliably is reported as unknown, never guessed. Architecture is part of a
+binary package's durable identity, not presentation metadata: `libfoo` for
+`amd64` and `libfoo` for `i386` are two different packages, and the operator
+can tell them apart in the exact plan (see `ARCHITECTURE.md`, "Binary package
+identity").
 
 **Update plan and approval.** Scanning produces a concrete plan: exactly which
 packages would change, from which version to which version. The operator reads
