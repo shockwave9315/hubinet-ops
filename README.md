@@ -40,14 +40,17 @@ a guest in Proxmox never requires touching this repository or its config.
   many times, preserving identity/config/credentials.
 
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
-installs packages. Internal durable package-update job authority and job-owned
-snapshot safety are built, but neither is production-reachable: no HTTP, Home
-Assistant, scheduler, bootstrap, or updater path can create a PVE snapshot, and
-no snapshot helper, key, or PVE mutation privilege is deployed. Workload package
-execution, healthchecks, and rollback execution are not built yet — see
-`STATUS.md`.
+installs packages. Internal durable package-update job authority, job-owned
+snapshot safety, the execution-time plan equality gate, and crash-safe workload
+package mutation are built, but none of them is production-reachable: no HTTP,
+Home Assistant, scheduler, bootstrap, or updater path can create a PVE snapshot
+or change a workload package, and no snapshot, execution, or mutation helper,
+key, or PVE mutation privilege is deployed. Healthchecks and rollback execution
+are not built yet — see `STATUS.md`.
 
-Schema v10 has no v9 migration. An existing pre-release deployment uses
+Pre-release authority schema versions are not migrated in place: the current
+schema is v12 and has no migration from v11 or earlier. An existing
+pre-release deployment uses
 `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
 authority schema, backs it up, and resets only the authority database (with
 explicit operator authorization) while preserving the LXC, its VMID/network,
