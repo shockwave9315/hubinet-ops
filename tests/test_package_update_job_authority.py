@@ -693,20 +693,25 @@ def test_reserved_mutation_intent_state_is_not_replayed_or_silently_cleared(
     other_resource, _, other_approval = _add_approved_resource(store, authority)
     job = _issue(authority, resource, approval)
     identity = authority.package_update_snapshot_identity(job.job_id)
+    mutation = authority.package_update_mutation_identity(job.job_id)
     with store._transaction() as connection:
         # Schema v10 makes mutation_may_have_started reachable only from a
-        # coherent confirmed-snapshot state, so the fixture has to establish
-        # the whole durable prefix rather than only the mutation checkpoint.
+        # coherent confirmed-snapshot state, and schema v12 additionally
+        # requires the durable mutation operation identity to exist at that
+        # checkpoint, so the fixture has to establish the whole durable
+        # prefix rather than only the mutation checkpoint.
         connection.execute(
             "UPDATE package_update_jobs SET checkpoint='mutation_may_have_started', "
             "snapshot_operation_id=?, snapshot_name=?, "
             "snapshot_intent_recorded_at=?, snapshot_confirmed_at=?, "
+            "mutation_operation_id=?, "
             "mutation_may_have_started_at=? WHERE job_id=?",
             (
                 identity.snapshot_operation_id,
                 identity.snapshot_name,
                 START.isoformat(),
                 START.isoformat(),
+                mutation.mutation_operation_id,
                 START.isoformat(),
                 job.job_id,
             ),

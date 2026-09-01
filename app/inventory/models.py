@@ -54,6 +54,43 @@ class HostSubmissionState(StrEnum):
     TERMINAL = "terminal"
 
 
+class HostMutationState(StrEnum):
+    """Durable host journal phase for one job-owned package mutation.
+
+    Deliberately fewer states than :class:`HostSubmissionState`: a package
+    mutation has no PVE task identity to capture, so there is nothing
+    between "the real package command was launched" and "it reached one
+    terminal result". ``SUBMITTED`` is therefore the whole genuinely
+    uncertain window and is NEVER resubmitted, and the two terminal phases
+    are distinct durable facts rather than one phase plus an outcome field,
+    so a reader can never mistake a failure for a success by dropping a
+    field it did not understand.
+    """
+
+    #: No journal record exists. Transient pre-submission routing evidence
+    #: only -- never a release proof, because a helper launched by a backend
+    #: that then died may not have taken its host lease yet.
+    ABSENT = "absent"
+    #: A prepare crossed the door and journaled its read-only evidence, but
+    #: no package command has been launched. Also transient routing evidence.
+    INTENT = "intent"
+    #: The durable no-future-submit fence. The ONLY evidence that may release
+    #: a job which is already past its write-ahead mutation checkpoint.
+    SEALED_NOT_SUBMITTED = "sealed_not_submitted"
+    #: The real package command was durably journaled BEFORE it was launched.
+    #: Packages may be changing right now, or may have been left partly
+    #: changed by a runner that died. Never resubmitted, never inferred to be
+    #: a failure.
+    SUBMITTED = "submitted"
+    #: The package command ran to completion and exited zero. This is host
+    #: evidence about the command, never proof that the approved mutation is
+    #: complete -- see the backend's independent completion proof.
+    TERMINAL_SUCCESS = "terminal_success"
+    #: The package command reached a terminal non-zero, killed, or timed-out
+    #: result. Packages may be partly changed.
+    TERMINAL_FAILURE = "terminal_failure"
+
+
 class PackageUpdateCheckpoint(StrEnum):
     ISSUED = "issued"
     PREFLIGHT_PASSED = "preflight_passed"
@@ -119,6 +156,12 @@ class PackageUpdateEventType(StrEnum):
     EXECUTION_PLAN_VERIFIED = "execution_plan_verified"
     EXECUTION_PLAN_MISMATCH = "execution_plan_mismatch"
     EXECUTION_AUTHORITY_STALE_RELEASED = "execution_authority_stale_released"
+    MUTATION_MAY_HAVE_STARTED = "mutation_may_have_started"
+    MUTATION_SUBMITTED = "mutation_submitted"
+    MUTATION_TERMINAL_FAILURE = "mutation_terminal_failure"
+    MUTATION_OUTCOME_UNCERTAIN = "mutation_outcome_uncertain"
+    MUTATION_COMPLETED = "mutation_completed"
+    MUTATION_BLOCKED_BEFORE_SUBMISSION = "mutation_blocked_before_submission"
 
 
 class PackageUpdateExecutionOutcome(StrEnum):
@@ -199,6 +242,24 @@ class SnapshotSubmissionRefusedBeforeCallback(AuthorityConflict):
     other reason, which a caller must not conflate with "current authority
     definitely refused before any host call". Any exception raised once the
     callback has begun executing must never be recast as this type.
+    """
+
+
+class MutationSubmissionRefusedBeforeCallback(AuthorityConflict):
+    """Current-authority proof refused a package mutation submission before
+    the host submission callback was ever invoked.
+
+    The package-mutation mirror of
+    :class:`SnapshotSubmissionRefusedBeforeCallback`, and raised ONLY by
+    :meth:`InventoryAuthority.execute_package_mutation_submission_if_current`
+    for the one case where its current-authority predicate itself proved
+    false -- structurally guaranteeing the submission callback ran zero
+    times, so no real package command can possibly have been launched by
+    this call. A terminal job, a checkpoint other than
+    ``mutation_may_have_started``, or any other lifecycle/invariant conflict
+    raised by that same method stays ordinary :class:`AuthorityConflict`:
+    those say nothing about whether the host was asked to mutate, and must
+    never be routed into the durable seal path.
     """
 
 
@@ -479,6 +540,7 @@ class PackageUpdateJob:
     snapshot_intent_recorded_at: str | None
     snapshot_task_upid: str | None
     snapshot_confirmed_at: str | None
+    mutation_operation_id: str | None
     mutation_may_have_started_at: str | None
     mutation_completed_at: str | None
     health_started_at: str | None
@@ -501,6 +563,65 @@ class PackageUpdateSnapshotIdentity:
 
     snapshot_operation_id: str
     snapshot_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateMutationRequest:
+    """Everything the dark host boundary is fenced against for one mutation.
+
+    Assembled by :meth:`InventoryAuthority.package_update_mutation_request`
+    in ONE read transaction, so every field is a consistent view of the same
+    durable job. The host binds all of it into its journal's request
+    fingerprint, so a request differing in ANY of these facts is a different
+    request and is refused rather than allowed to reuse an existing
+    operation:
+
+    - ``mutation_operation_id`` -- the deterministic job-owned identity;
+    - ``backend_instance_id``/``job_id``/``resource_id``/
+      ``resource_continuity_revision`` -- who owns the operation, and which
+      exact resource incarnation it belongs to, so a reused VMID or a
+      replaced guest can never inherit it;
+    - ``binding_id``/``locator_generation``/``vmid``/``expected_node`` -- the
+      execution locator the host independently re-validates against live PVE
+      immediately before it does anything;
+    - ``plan_fingerprint``/``packages`` -- the exact approved material. The
+      host recomputes the fingerprint from ``packages`` and refuses a request
+      whose declared digest does not describe its own package list.
+
+    ``packages`` is the material quadruple set, sorted by
+    ``(package_name, architecture)``: it is used by the host ONLY to refuse a
+    mutation whose starting state drifted, never to build the package
+    command, which is fixed argv with no package name in it at all.
+    """
+
+    mutation_operation_id: str
+    plan_fingerprint: str
+    backend_instance_id: str
+    job_id: str
+    resource_id: str
+    binding_id: str
+    locator_generation: int
+    resource_continuity_revision: int
+    vmid: int
+    expected_node: str
+    packages: tuple[tuple[str, str, str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PackageUpdateMutationIdentity:
+    """One package update job's single deterministic package mutation.
+
+    Derived purely from immutable job identity (this backend instance, the
+    job, the resource incarnation, its continuity revision), so the exact
+    same job derives the exact same operation id after any restart and no
+    other job -- including another job for the same resource incarnation, or
+    the same job on a different backend installation -- can ever derive it.
+    A reused VMID or a replaced resource therefore never inherits a mutation
+    operation. ``mutation_operation_id`` keys the host-side durable
+    at-most-once journal.
+    """
+
+    mutation_operation_id: str
 
 
 @dataclass(frozen=True, slots=True)
