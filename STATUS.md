@@ -178,6 +178,19 @@ unimplemented future stage.
   selection contract exists; executing a rollback is left to the activation
   stage rather than shipped to a lower safety bar. There is also no snapshot
   deletion or retention in this stage, and no workload package mutation.
+- **Activation requirement:** the two snapshot critical sections
+  (`execute_snapshot_submission_if_current`, `resolve_pre_submission_block`)
+  correctly hold the authority store's writer lock across one bounded host
+  round trip each; that serialization stays unchanged and correct in this
+  dark stage because nothing production-reachable can invoke it yet. Before
+  production activation, SQLite writer contention/wait policy must be sized
+  or configured consistently with the maximum bounded snapshot host
+  critical-section duration, so an ordinary concurrent authority writer
+  (discovery, package scan, approval) does not fail merely because a valid
+  snapshot host round trip legitimately exceeds today's one fixed
+  `BUSY_TIMEOUT_MS` shared by every writer. See `ARCHITECTURE.md`, "Activation
+  gate: SQLite writer-contention policy". This is not a defect of the current
+  dark stage and is not permission to hold a polling transaction open.
 
 ## Next
 

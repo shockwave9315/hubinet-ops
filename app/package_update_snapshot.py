@@ -120,8 +120,8 @@ from app.inventory import (
     PackageUpdateSnapshotIdentity,
     SnapshotIdentityError,
     SnapshotOwnership,
+    SnapshotSubmissionRefusedBeforeCallback,
     checkpoint_rank,
-    looks_like_hubinet_snapshot,
     parse_snapshot_description,
 )
 
@@ -351,10 +351,14 @@ def parse_canonical_snapshot_listing(payload: Any) -> tuple[ObservedSnapshot, ..
         try:
             ownership = parse_snapshot_description(description)
         except SnapshotIdentityError:
+            # Looks like a Hubinet snapshot but its metadata does not parse.
             ownership = None
             malformed = True
-        if ownership is None and not malformed:
-            malformed = looks_like_hubinet_snapshot(description)
+        # No further check is needed here: `parse_snapshot_description`
+        # returns ``None`` (rather than raising) only when the description
+        # makes no Hubinet ownership claim at all -- i.e. exactly when
+        # `looks_like_hubinet_snapshot` is already false -- so `ownership is
+        # None` without `malformed` can never itself be an ambiguous claim.
         observed.append(
             ObservedSnapshot(
                 name=name,
@@ -520,13 +524,18 @@ class PackageUpdateSnapshotOrchestrator:
                         ownership=ownership,
                     ),
                 )
-            except AuthorityConflict:
-                # Authority refused BEFORE the callback ever ran: the host
-                # was never asked to submit anything. That alone must never
-                # authorize a submission, but it must also never be allowed
-                # to fence this job's global slot forever purely because
-                # Hubinet's own authority context moved on -- see
-                # _resolve_pre_submission_block.
+            except SnapshotSubmissionRefusedBeforeCallback:
+                # This is the ONE case structurally guaranteed to mean
+                # current authority refused BEFORE the callback ever ran: the
+                # host was never asked to submit anything. That alone must
+                # never authorize a submission, but it must also never be
+                # allowed to fence this job's global slot forever purely
+                # because Hubinet's own authority context moved on -- see
+                # _resolve_pre_submission_block. A generic AuthorityConflict
+                # (terminal job, wrong checkpoint, or any other lifecycle
+                # conflict) says nothing about whether the host was called
+                # and must NOT be routed here -- it falls through to the
+                # ordinary uncertain path below instead.
                 return self._resolve_pre_submission_block(job, identity, ownership)
             except Exception as exc:  # noqa: BLE001 - any failure here is uncertain
                 return self._uncertain(
@@ -699,13 +708,28 @@ class PackageUpdateSnapshotOrchestrator:
         deliberately never looped on here: that window resolves, if at all,
         from one bounded canonical read, not from repeating an identical read
         that cannot change on its own.
+
+        The durable journal phase alone is not a fresh signal: it stays
+        ``task_known`` forever once a task identity is captured, whatever the
+        live PVE task itself later does. So once a read observes the task
+        ITSELF has reached a terminal PVE state (``running`` vs ``stopped``,
+        never inferred from anything else), further polling cannot make that
+        same task "more terminal" -- repeating an identical bounded read for
+        up to the whole configured timeout would be pure waste. The current
+        canonical evidence, not more waiting, decides completed/failed/
+        uncertain from here, using the existing strict rules unchanged: a
+        canonical absence is never turned into failure, and nothing here ever
+        resubmits.
         """
 
         def _pending(candidate: HostSnapshotResult) -> bool:
-            return (
-                candidate.submission_state is HostSubmissionState.TASK_KNOWN
-                and candidate.outcome is SnapshotOperationOutcome.UNCERTAIN
-            )
+            if candidate.submission_state is not HostSubmissionState.TASK_KNOWN:
+                return False
+            if candidate.outcome is not SnapshotOperationOutcome.UNCERTAIN:
+                return False
+            if candidate.task is not None and candidate.task.terminal:
+                return False
+            return True
 
         if not _pending(result):
             return result
@@ -861,9 +885,47 @@ class PackageUpdateSnapshotOrchestrator:
         )
 
     def _uncertain(self, job_id: str, reason: str) -> SnapshotStageResult:
-        job = self._authority.record_package_update_snapshot_uncertain(
-            job_id, reason[:500]
-        )
+        """Durably record uncertainty, tolerating concurrent terminalization.
+
+        A concurrent, compliant invocation of this same orchestrator can
+        terminalize (or otherwise advance) the job between whatever observed
+        the need for this call and this durable write reaching its own
+        transaction -- for example it already won the pre-submission seal, or
+        already completed submission. `record_package_update_snapshot_uncertain`
+        then refuses with `AuthorityConflict`, because there is nothing left
+        that this call may legally append. That other invocation's own
+        transaction already proved and committed the job's real outcome, so
+        it is authoritative: this call must never attempt to undo, rewrite, or
+        reopen it, and must never raise a raw concurrency exception out of the
+        public orchestration surface solely because uncertainty could no
+        longer be appended. Re-read the durable job and return a typed,
+        fenced result describing that instead, performing no further
+        mutation. If the re-read shows the job unexpectedly still eligible,
+        the conflict was a genuine invariant violation, not this race, and
+        stays fail-closed by re-raising.
+        """
+
+        try:
+            job = self._authority.record_package_update_snapshot_uncertain(
+                job_id, reason[:500]
+            )
+        except AuthorityConflict:
+            job = self._authority.package_update_job(job_id)
+            still_eligible = (
+                job.status is PackageUpdateJobStatus.ACTIVE
+                and job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            )
+            if still_eligible:
+                raise
+            return SnapshotStageResult(
+                outcome=SnapshotOperationOutcome.UNCERTAIN,
+                job=job,
+                reason=(
+                    "a concurrent invocation already resolved this job before "
+                    "this uncertainty could be durably recorded; the job's own "
+                    "current state is authoritative and was left untouched"
+                ),
+            )
         return SnapshotStageResult(
             outcome=SnapshotOperationOutcome.UNCERTAIN, job=job, reason=reason
         )

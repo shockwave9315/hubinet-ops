@@ -39,6 +39,7 @@ from .models import (
     PackageUpdateRollbackTarget,
     PackageUpdateSnapshotIdentity,
     SnapshotOwnership,
+    SnapshotSubmissionRefusedBeforeCallback,
     checkpoint_rank as _checkpoint_rank,
 )
 from .snapshot_identity import (
@@ -1617,7 +1618,15 @@ class InventoryAuthority:
         current authority still holds, and only while this transaction still
         owns the writer lock. A stale authority context refuses BEFORE
         ``submit`` is ever called, so the host is never asked to submit
-        anything for a job whose authority context has already moved on.
+        anything for a job whose authority context has already moved on --
+        that specific refusal raises :class:`SnapshotSubmissionRefusedBeforeCallback`
+        (a distinct, narrow subclass of :class:`AuthorityConflict`), never
+        the bare base type, because a caller must be able to tell "current
+        authority itself proved false before any host call" apart from a
+        terminal job or a wrong checkpoint -- both of which remain ordinary
+        :class:`AuthorityConflict` and say nothing about whether ``submit``
+        ran. Nothing this method itself does ever recasts an exception
+        ``submit`` raises after it begins executing into that narrow type.
 
         This is not a claim that SQLite and PVE are proved atomic, and it is
         not a claim that a snapshot is proved to belong to the same LXC PVE
@@ -1659,7 +1668,16 @@ class InventoryAuthority:
                 host_result = submit()
 
         if not current_authority_holds:
-            raise AuthorityConflict(
+            # This is the one specific, structurally guaranteed case: the
+            # current-authority predicate itself proved false, so `submit`
+            # was never called (see the `if current_authority_holds:` guard
+            # above, inside the same transaction). A distinct typed
+            # exception marks this exactly, so a caller may route it into the
+            # durable seal/liveness path without conflating it with the
+            # terminal-job or wrong-checkpoint conflicts raised earlier in
+            # this same method, which say nothing about whether a host call
+            # occurred.
+            raise SnapshotSubmissionRefusedBeforeCallback(
                 "package update job resource or source authority context is stale"
             )
         return host_result  # type: ignore[return-value]

@@ -672,6 +672,63 @@ def test_journal_writes_are_atomic_and_leave_no_temporary_file(
     assert record["snapshot_operation_id"] == operation_id
 
 
+def test_a_terminal_replay_never_rewrites_the_already_final_journal_record(
+    tmp_path: Path,
+) -> None:
+    """P3-8B. `_ensure_submitted` replays an already-`terminal` journal
+    record through `_finalize`, which must still re-read fresh canonical PVE
+    evidence every time, but must never rewrite the durable, already-final
+    journal record just to replay it -- zero `journal.write` calls, zero
+    filesystem mutation of already-final evidence.
+    """
+
+    ownership = _ownership()
+    operation_id, snapshot_name = _identity(ownership)
+    journal = _journal(tmp_path)
+    journal.write(
+        {
+            "journal_version": 1,
+            "snapshot_operation_id": operation_id,
+            "request_fingerprint": helper.request_fingerprint(
+                helper.validate_request(_request())
+            ),
+            "vmid": VMID,
+            "expected_node": NODE,
+            "snapshot_name": snapshot_name,
+            "phase": "terminal",
+            "outcome": "completed",
+            "reason": "recovered: canonical job-owned snapshot present",
+        }
+    )
+    path = journal.directory / f"op-{operation_id}.json"
+    before_bytes = path.read_bytes()
+    before_stat = path.stat()
+
+    write_calls: list[dict] = []
+
+    def forbidden_write(record):
+        write_calls.append(record)
+        raise AssertionError("a terminal replay must never write the journal")
+
+    journal.write = forbidden_write
+
+    pve = FakePve(
+        snapshots=[
+            {"name": "current", "description": "You are here!"},
+            _completed_snapshot(ownership, snapshot_name),
+        ]
+    )
+    response = _handle(_request(), pve, journal)
+
+    assert response["outcome"] == "completed"
+    assert response["submission_state"] == "terminal"
+    # The canonical PVE re-read is still required and reflected in the reply.
+    assert response["snapshots"] is not None
+    assert write_calls == []
+    assert path.read_bytes() == before_bytes
+    assert path.stat().st_mtime_ns == before_stat.st_mtime_ns
+
+
 # ---------------------------------------------------------------------------
 # Task semantics
 # ---------------------------------------------------------------------------
@@ -924,6 +981,11 @@ def test_an_incomplete_snapshot_under_our_name_refuses_to_submit(
         {"phase": "task_known", "task_upid": "UPID:"},  # not a decodable UPID
         {"phase": "terminal"},                          # no outcome
         {"phase": "terminal", "outcome": "maybe"},      # not a real outcome
+        # P3-8A: no writer in this contract ever journals a terminal task
+        # failure -- `_inspect` reports it live from a fresh task-status read
+        # instead, every time -- so this combination is impossible, not a
+        # legitimate state this reader must tolerate.
+        {"phase": "terminal", "outcome": "failed"},
     ],
 )
 def test_a_journal_phase_missing_its_own_facts_never_degrades_into_a_resubmit(

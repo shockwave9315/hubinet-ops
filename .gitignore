@@ -12,6 +12,7 @@ __pycache__/
 .coverage
 htmlcov/
 .venv/
+.venv-ha/
 venv/
 
 # Runtime configuration and secrets

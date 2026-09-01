@@ -137,7 +137,7 @@ ephemeral-CI Docker sandbox; it skips everywhere else by design.
 Run the backend locally with:
 
 ```bash
-uvicorn app.inventory_runtime:create_app_from_env --factory --host 127.0.0.1 --port 8787
+.venv/bin/python -m uvicorn app.inventory_runtime:create_app_from_env --factory --host 127.0.0.1 --port 8787
 ```
 
 `create_app_from_env` builds the app from a runtime config file — selected via

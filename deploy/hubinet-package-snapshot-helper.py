@@ -61,12 +61,14 @@ task_known  PVE returned a UPID                              -> caller polls tha
 terminal    outcome recorded                                 -> replay answer
 ```
 
-Every response -- from either operation -- reports this exact phase as a
-typed `submission_state` field, read straight from the journal rather than
-inferred from canonical PVE state or an error string. `absent` (no journal
-record) and `intent` permit a NEW submission but never release a backend job.
-Only `sealed_not_submitted` is a durable release proof: it is written under
-the same per-VMID lease as submission, and every delayed helper must obey it.
+Every successful (`ok: true`) response -- from either operation -- reports
+this exact phase as a typed `submission_state` field, read straight from the
+journal rather than inferred from canonical PVE state or an error string.
+`absent` (no journal record) and `intent` permit a NEW submission but never
+release a backend job. Only `sealed_not_submitted` is a durable release
+proof: it is written under the same per-VMID lease as submission, and every
+delayed helper must obey it. Failure responses do not carry this field; see
+`error.submission` below.
 
 `intent -> submitted` is an atomic rename that is fsynced before the
 subprocess is launched, so an observation of `intent` under the lease is
@@ -584,13 +586,19 @@ class OperationJournal:
                 "journal_corrupt",
                 "snapshot operation journal records a task without its identity",
             )
-        if record["phase"] == "terminal" and record.get("outcome") not in (
-            "completed",
-            "failed",
-        ):
+        if record["phase"] == "terminal" and record.get("outcome") != "completed":
+            # The current writer contract never journals any other terminal
+            # outcome: a submitted operation's PVE task failure is reported
+            # live from a fresh task-status read (see `_inspect`) and is
+            # never itself durably journaled, because task failure is
+            # permanent PVE task history and needs no durable replay of its
+            # own. A terminal record whose outcome is not "completed" is
+            # therefore impossible under this contract, not a legitimate
+            # state this reader must tolerate.
             raise SnapshotError(
                 "journal_corrupt",
-                "snapshot operation journal records a terminal phase without an outcome",
+                "snapshot operation journal records a terminal phase with an "
+                "outcome this writer contract never produces",
             )
         return record
 
@@ -1087,21 +1095,24 @@ def _seal_never_submitted(
 def _finalize(
     runner: Runner,
     request: Mapping[str, Any],
-    journal: OperationJournal,
     record: dict[str, Any],
     outcome: str,
     reason: str,
     task: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
+    """Replay an already-terminal journal record with fresh canonical evidence.
+
+    `_ensure_submitted` calls this ONLY when the journal already reads
+    `phase == "terminal"`, so `outcome`/`reason`/`task_upid` are always this
+    same durable record's own already-committed values -- never a new
+    terminalization. The canonical PVE listing is still re-read every time,
+    because canonical state itself is never cached, but the journal record
+    is durable, final, and byte-identical to what a replay would write again;
+    rewriting it would be a pointless filesystem mutation of already-final
+    evidence, fsync included. Deliberately performs zero `journal.write`.
+    """
+
     listing = list_snapshots(runner, request["vmid"], request["expected_node"])
-    if outcome in ("completed", "failed"):
-        record = {
-            **record,
-            "phase": "terminal",
-            "outcome": outcome,
-            "reason": reason[:500],
-        }
-        journal.write(record)
     return _response(
         request,
         outcome,
@@ -1129,7 +1140,7 @@ def _ensure_submitted(
             if phase == "terminal":
                 # Replay the recorded answer with fresh canonical evidence.
                 return _finalize(
-                    runner, request, journal, record,
+                    runner, request, record,
                     str(record.get("outcome", "uncertain")),
                     str(record.get("reason", "replayed journaled outcome")),
                     None,

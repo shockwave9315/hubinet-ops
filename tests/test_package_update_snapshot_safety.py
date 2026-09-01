@@ -29,6 +29,7 @@ from app.inventory import (
     PackageUpdateJobStatus,
     SnapshotIdentityError,
     SnapshotOwnership,
+    SnapshotSubmissionRefusedBeforeCallback,
     build_snapshot_ownership,
     derive_pre_update_snapshot_identity,
     encode_snapshot_description,
@@ -229,6 +230,16 @@ def test_ownership_metadata_round_trips_through_pve_description_framing() -> Non
         f'"resource_continuity_revision":1,'
         f'"inventory_source_id":"00000000-0000-0000-0000-000000000003",'
         f'"backend_instance_id":"00000000-0000-0000-0000-000000000004"}}',
+        # An otherwise well-formed payload with one extra field is rejected
+        # by the exact-shape check, not silently ignored.
+        f'{SNAPSHOT_METADATA_MARKER} {{"protocol":1,'
+        f'"kind":"pre_update",'
+        f'"job_id":"00000000-0000-0000-0000-000000000001",'
+        f'"resource_id":"00000000-0000-0000-0000-000000000002",'
+        f'"resource_continuity_revision":1,'
+        f'"inventory_source_id":"00000000-0000-0000-0000-000000000003",'
+        f'"backend_instance_id":"00000000-0000-0000-0000-000000000004",'
+        f'"extra_field":"unexpected"}}',
         "hubinet-ops-snapshot but no marker line at all",
     ],
 )
@@ -3281,6 +3292,136 @@ def test_writer_cannot_interleave_inside_the_submission_critical_section(
     assert attempted == [job.job_id]
 
 
+# ---------------------------------------------------------------------------
+# P3-5: AuthorityConflict is overloaded no longer. execute_snapshot_submission_
+# if_current raises SnapshotSubmissionRefusedBeforeCallback ONLY for the one
+# case structurally guaranteed to mean the submission callback never ran --
+# current authority itself proved false. A terminal job, a wrong checkpoint,
+# or any other lifecycle conflict remain ordinary AuthorityConflict and say
+# nothing about whether the host was called. An exception submit() itself
+# raises must never be recast as either type.
+# ---------------------------------------------------------------------------
+
+
+def test_stale_authority_refusal_is_the_specific_pre_callback_type(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    calls: list[str] = []
+    with pytest.raises(SnapshotSubmissionRefusedBeforeCallback):
+        authority.execute_snapshot_submission_if_current(
+            job.job_id, lambda: calls.append("submitted") or "unreachable"
+        )
+
+    assert calls == []
+    # The specific type IS an AuthorityConflict, so existing generic handlers
+    # still catch it -- but it must never be the bare base type.
+    assert isinstance(SnapshotSubmissionRefusedBeforeCallback("x"), AuthorityConflict)
+
+
+def test_terminal_job_refusal_is_generic_not_the_pre_callback_type(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+
+    def seal():
+        return (
+            HostSubmissionState.SEALED_NOT_SUBMITTED,
+            "sealed for this test",
+            "evidence",
+        )
+
+    blocked, _ = authority.resolve_pre_submission_block(job.job_id, seal)
+    assert blocked
+    assert store.package_update_job(job.job_id).status is PackageUpdateJobStatus.BLOCKED
+
+    calls: list[str] = []
+    with pytest.raises(AuthorityConflict, match="terminal") as excinfo:
+        authority.execute_snapshot_submission_if_current(
+            job.job_id, lambda: calls.append("submitted") or "unreachable"
+        )
+
+    assert calls == []
+    # Generic lifecycle conflict must NOT be misclassified as the specific
+    # "current authority refused before any host call" proof.
+    assert type(excinfo.value) is AuthorityConflict
+    assert not isinstance(excinfo.value, SnapshotSubmissionRefusedBeforeCallback)
+
+
+def test_wrong_checkpoint_refusal_is_generic_not_the_pre_callback_type(
+    tmp_path: Path,
+) -> None:
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    pve.on_submit = lambda fake: fake.snapshots.append(
+        {
+            "name": identity.snapshot_name,
+            "description": snapshot_helper.build_snapshot_description(
+                {
+                    "job_id": ownership.job_id,
+                    "resource_id": ownership.resource_id,
+                    "resource_continuity_revision": (
+                        ownership.resource_continuity_revision
+                    ),
+                    "inventory_source_id": ownership.inventory_source_id,
+                    "backend_instance_id": ownership.backend_instance_id,
+                }
+            )
+            + "\n",
+            "snaptime": 1_700_000_000,
+        }
+    )
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _dark_channel(pve, journal)
+    )
+    confirmed = orchestrator.ensure_job_owned_snapshot(job.job_id)
+    assert confirmed.outcome is SnapshotOperationOutcome.COMPLETED
+    assert (
+        store.package_update_job(job.job_id).checkpoint
+        is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    )
+
+    # The job is still ACTIVE, but its checkpoint has moved past the write-
+    # ahead boundary this method requires -- a second call must refuse
+    # generically, never claim the specific pre-callback proof.
+    calls: list[str] = []
+    with pytest.raises(AuthorityConflict, match="not inside a snapshot") as excinfo:
+        authority.execute_snapshot_submission_if_current(
+            job.job_id, lambda: calls.append("submitted") or "unreachable"
+        )
+
+    assert calls == []
+    assert type(excinfo.value) is AuthorityConflict
+    assert not isinstance(excinfo.value, SnapshotSubmissionRefusedBeforeCallback)
+
+
+def test_an_exception_after_the_callback_begins_is_never_recast(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+
+    class _HostExploded(RuntimeError):
+        pass
+
+    def submit():
+        raise _HostExploded("host round trip failed mid-flight")
+
+    with pytest.raises(_HostExploded):
+        authority.execute_snapshot_submission_if_current(job.job_id, submit)
+
+    # Current authority held and the callback genuinely ran, so this must
+    # propagate completely unchanged -- never AuthorityConflict, and
+    # certainly never the specific pre-callback refusal type.
+    still_active = store.package_update_job(job.job_id)
+    assert still_active.status is PackageUpdateJobStatus.ACTIVE
+    assert still_active.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+
+
 def test_reentry_with_intent_only_and_stale_authority_terminalizes_via_a_seal(
     tmp_path: Path,
 ) -> None:
@@ -3735,6 +3876,230 @@ def test_task_polling_never_holds_the_authority_writer_lock(tmp_path: Path) -> N
 
 
 # ===========================================================================
+# A known task cannot become "more terminal": stop polling once it IS
+# terminal, whatever the durable journal phase still claims.
+# ===========================================================================
+
+
+def _bounded_clock_sleep():
+    """A `sleep` that also advances `monotonic`, so a regression to the old
+    "keep polling while task_known+uncertain" behaviour degrades to a few
+    extra bounded iterations instead of hanging the test suite for real
+    seconds or looping until the full configured timeout elapses.
+    """
+
+    clock = [0.0]
+    calls: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        calls.append(seconds)
+        clock[0] += 1000.0
+
+    return sleep, calls, lambda: clock[0]
+
+
+def test_a_running_task_keeps_polling_until_it_resolves(tmp_path: Path) -> None:
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    pve.task_sequence = [
+        {"upid": upid, "status": "running"},
+        {"upid": upid, "status": "stopped", "exitstatus": "OK"},
+    ]
+    sleep, sleep_calls, monotonic = _bounded_clock_sleep()
+
+    def sleep_then_confirm(seconds: float) -> None:
+        sleep(seconds)
+        pve.snapshots.append(
+            {
+                "name": identity.snapshot_name,
+                "description": snapshot_helper.build_snapshot_description(
+                    {
+                        "job_id": ownership.job_id,
+                        "resource_id": ownership.resource_id,
+                        "resource_continuity_revision": (
+                            ownership.resource_continuity_revision
+                        ),
+                        "inventory_source_id": ownership.inventory_source_id,
+                        "backend_instance_id": ownership.backend_instance_id,
+                    }
+                )
+                + "\n",
+                "snaptime": 1_700_000_000,
+            }
+        )
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority,
+        _dark_channel(pve, journal),
+        sleep=sleep_then_confirm,
+        monotonic=monotonic,
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    # A genuinely non-terminal task still requires exactly one poll wait.
+    assert sleep_calls == [2.0]
+    assert result.outcome is SnapshotOperationOutcome.COMPLETED
+
+
+def test_terminal_ok_task_with_canonical_snapshot_completes(tmp_path: Path) -> None:
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    pve.task_sequence = [{"upid": upid, "status": "stopped", "exitstatus": "OK"}]
+    pve.on_submit = lambda fake: fake.snapshots.append(
+        {
+            "name": identity.snapshot_name,
+            "description": snapshot_helper.build_snapshot_description(
+                {
+                    "job_id": ownership.job_id,
+                    "resource_id": ownership.resource_id,
+                    "resource_continuity_revision": (
+                        ownership.resource_continuity_revision
+                    ),
+                    "inventory_source_id": ownership.inventory_source_id,
+                    "backend_instance_id": ownership.backend_instance_id,
+                }
+            )
+            + "\n",
+            "snaptime": 1_700_000_000,
+        }
+    )
+    sleep, sleep_calls, monotonic = _bounded_clock_sleep()
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority,
+        _dark_channel(pve, journal),
+        sleep=sleep,
+        monotonic=monotonic,
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.COMPLETED
+    assert result.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert sleep_calls == []
+
+
+def test_terminal_ok_task_with_canonical_absence_stays_uncertain_without_polling_the_full_timeout(
+    tmp_path: Path,
+) -> None:
+    """P3-8D. A known task that is already terminal cannot become "more
+    terminal" by polling it again: the durable journal phase stays
+    `task_known` forever once a task identity is captured, so the OLD
+    `_pending()` -- which looked only at `submission_state`/`outcome` -- would
+    keep sleeping and re-reading for up to the whole configured timeout
+    whenever canonical evidence stayed absent. The fix must recognise the
+    LIVE task is already terminal on the very first read and stop
+    immediately, letting canonical evidence (absent) decide UNCERTAIN through
+    the existing strict rules -- never fabricating failure from an absence.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    # Terminal, non-error task -- but no owned snapshot is ever added, so
+    # canonical evidence stays "absent" no matter how many times it is read.
+    pve.task_sequence = [{"upid": upid, "status": "stopped", "exitstatus": "OK"}]
+    sleep, sleep_calls, monotonic = _bounded_clock_sleep()
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority,
+        _dark_channel(pve, journal),
+        sleep=sleep,
+        monotonic=monotonic,
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    # The whole point: zero polling waits once the live task is observed
+    # terminal, never up to the full configured timeout.
+    assert sleep_calls == []
+    assert store.package_update_job(job.job_id).snapshot_task_upid == upid
+    assert store.package_update_job(job.job_id).status is PackageUpdateJobStatus.ACTIVE
+
+
+class _FixedInspectionHostControl:
+    """Every inspect call answers with the SAME fixed, already-terminal
+    result -- enough to prove the poll loop's entry decision (whether an
+    already-terminal task is still treated as pending) without needing this
+    double to simulate multiple distinct iterations.
+    """
+
+    def __init__(self, inspection_result: HostSnapshotResult) -> None:
+        self._inspection_result = inspection_result
+        self.inspect_calls = 0
+
+    def ensure_pre_update_snapshot_submitted(self, **kwargs) -> HostSnapshotResult:
+        raise AssertionError("must never submit in this test")
+
+    def inspect_job_snapshot_state(self, **kwargs) -> HostSnapshotResult:
+        self.inspect_calls += 1
+        return self._inspection_result
+
+    def seal_operation_never_submitted(self, **kwargs) -> HostSnapshotResult:
+        raise AssertionError("must never seal in this test")
+
+
+def test_terminal_task_with_unknown_exit_status_stays_uncertain_without_polling(
+    tmp_path: Path,
+) -> None:
+    """P3-8D (variant). `status == "stopped"` alone makes a task terminal
+    even with no `exitstatus` at all -- classified `SnapshotTaskState.UNKNOWN`
+    at the orchestrator/backend layer, never success, but still genuinely
+    terminal. `_pending()` must stop on it immediately, exactly like a
+    terminal OK task with absent canonical evidence, never waiting up to the
+    full configured timeout.
+    """
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+
+    task = classify_task_status({"upid": UPID, "status": "stopped"})
+    assert task.terminal
+    assert task.state is SnapshotTaskState.UNKNOWN
+
+    inspection = HostSnapshotResult(
+        outcome=SnapshotOperationOutcome.UNCERTAIN,
+        snapshot_operation_id=identity.snapshot_operation_id,
+        task_upid=UPID,
+        task=task,
+        snapshots=(),
+        submission_state=HostSubmissionState.TASK_KNOWN,
+        reason="canonical job-owned snapshot evidence: absent",
+    )
+    host = _FixedInspectionHostControl(inspection)
+    sleep, sleep_calls, monotonic = _bounded_clock_sleep()
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority,
+        host,
+        sleep=sleep,
+        monotonic=monotonic,
+        task_poll_timeout_seconds=800.0,
+        task_poll_interval_seconds=2.0,
+    )
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert sleep_calls == []
+    # One initial read decides it; the poll loop body is never entered.
+    assert host.inspect_calls == 1
+
+
+# ===========================================================================
 # The pre-submission block critical section: durable host seal -> block
 #
 # A transient host read alone is not enough. The host seal and backend block
@@ -3743,6 +4108,94 @@ def test_task_polling_never_holds_the_authority_writer_lock(tmp_path: Path) -> N
 # lease. resolve_pre_submission_block is the mirror image of
 # execute_snapshot_submission_if_current through the authority-store lock.
 # ===========================================================================
+
+
+def test_concurrent_terminalization_during_pre_submission_block_does_not_leak_a_raw_exception(
+    tmp_path: Path,
+) -> None:
+    """P3-2. A concurrent, compliant invocation can win the pre-submission
+    seal and terminalize the job while THIS invocation is still mid-flight
+    with a stale in-memory `job` snapshot (still ACTIVE at the write-ahead
+    checkpoint). This invocation's own retry into
+    `InventoryAuthority.resolve_pre_submission_block` then re-reads the job
+    fresh, finds it already terminal, and raises `AuthorityConflict` --
+    which the orchestrator's `except Exception:` handler routes into
+    `_uncertain`. That call's OWN durable write
+    (`record_package_update_snapshot_uncertain`) hits the identical
+    already-terminal precondition and used to raise a second, completely
+    unhandled `AuthorityConflict` straight out of the public orchestration
+    surface. The winning invocation's own terminal state must be left
+    completely untouched either way.
+    """
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+
+    class _NeverCalledHostControl:
+        def ensure_pre_update_snapshot_submitted(self, **kwargs):
+            raise AssertionError("must never submit")
+
+        def inspect_job_snapshot_state(self, **kwargs):
+            raise AssertionError("must never inspect in this test")
+
+        def seal_operation_never_submitted(self, **kwargs):
+            raise AssertionError(
+                "the racing seal attempt must never reach the host: the "
+                "durable job-terminal check must refuse first"
+            )
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _NeverCalledHostControl()
+    )
+
+    # Another, compliant invocation wins the seal first and terminalizes the
+    # job -- exactly as a concurrent orchestrator instance would.
+    def winning_seal():
+        return (
+            HostSubmissionState.SEALED_NOT_SUBMITTED,
+            "host durably sealed this snapshot operation before submission",
+            "winning-evidence",
+        )
+
+    blocked, _ = authority.resolve_pre_submission_block(job.job_id, winning_seal)
+    assert blocked
+    winner = store.package_update_job(job.job_id)
+    assert winner.status is PackageUpdateJobStatus.BLOCKED
+
+    # This invocation's own view of `job` is now stale (still ACTIVE at
+    # snapshot_may_have_started), exactly as it would be mid-flight.
+    result = orchestrator._resolve_pre_submission_block(job, identity, ownership)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    # The winning invocation's own terminal state is authoritative and must
+    # be left completely untouched -- never rewritten, never reopened.
+    assert result.job.status is PackageUpdateJobStatus.BLOCKED
+    assert result.job.terminal_reason == winner.terminal_reason
+    assert result.job.terminalized_at == winner.terminalized_at
+
+
+def test_uncertain_reraises_when_the_job_is_unexpectedly_still_eligible(
+    tmp_path: Path,
+) -> None:
+    """The concurrent-terminalization tolerance in `_uncertain` must not
+    swallow a genuinely unexpected conflict: if the durable job re-read still
+    shows it eligible (active, still at the write-ahead checkpoint), the
+    original conflict was not this race, and must still fail closed exactly
+    as before.
+    """
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+
+    class _AlwaysConflicts:
+        def record_package_update_snapshot_uncertain(self, job_id, reason):
+            raise AuthorityConflict("simulated unrelated invariant conflict")
+
+        def package_update_job(self, job_id):
+            return authority.package_update_job(job_id)
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(_AlwaysConflicts(), object())
+
+    with pytest.raises(AuthorityConflict, match="simulated unrelated"):
+        orchestrator._uncertain(job.job_id, "irrelevant reason")
 
 
 def test_block_wins_first_against_an_interleaving_submission_writer(

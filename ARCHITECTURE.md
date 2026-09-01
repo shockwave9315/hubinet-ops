@@ -192,9 +192,15 @@ rename. `sealed_not_submitted` can never transition to submission.
 `submitted` is the genuinely uncertain window and is **never** resubmitted.
 Taskless success uses one strict bar in both ensure and inspect recovery: the
 exact complete snapshot plus no relevant in-flight container lock. An
-identical retry reattaches; a mismatched request is refused. Every response
-carries the exact typed `submission_state`, so the backend never infers it
-from canonical PVE state or an error string.
+identical retry reattaches; a mismatched request is refused. Successful
+operation-state responses carry the exact typed `submission_state`. Error
+responses use the separate typed `error.submission` field instead, to state
+whether the helper still has transient pre-submission evidence
+(`not_submitted`) or whether submission must be treated as unknown
+(`may_have_been_submitted`); a malformed request or a main-level failure may
+carry neither. Neither channel lets the backend infer release from an error
+string or canonical absence: only `submission_state=sealed_not_submitted` is
+a durable release proof.
 
 **The submission critical section.** The write-ahead checkpoint alone leaves
 a second, narrower race open: another Hubinet writer (discovery
@@ -227,6 +233,32 @@ proved to belong to the same LXC PVE showed several minutes ago (see
 "Identity" below): the claim is that Hubinet's own current authority is held
 stable through the submission boundary, and the host independently
 re-validates the live PVE target immediately before it ever submits.
+
+**Activation gate: SQLite writer-contention policy.** `execute_snapshot_submission_if_current`
+and `resolve_pre_submission_block` deliberately hold the authority store's
+`BEGIN IMMEDIATE` writer lock across one bounded SSH host round trip each —
+that serialization is load-bearing (see above and "the pre-submission block
+critical section" below) and must remain. `InventoryAuthorityStore` currently
+sizes `PRAGMA busy_timeout`/connection `timeout` from one fixed
+`BUSY_TIMEOUT_MS = 5000` constant shared by every writer, including ordinary
+discovery/package-scan authority writes that have no reason to wait on a host
+round trip at all. Once snapshot execution is production-reachable, a
+legitimate concurrent writer (discovery, a package scan, approval) could then
+observe `database is locked` purely because a valid snapshot host round trip
+inside one of these two critical sections legitimately took longer than that
+generic timeout, even though the snapshot critical section itself was
+operating correctly. Before snapshot execution becomes production-reachable,
+SQLite writer contention/wait policy must be sized or configured consistently
+with the maximum bounded snapshot host critical-section duration, so normal
+concurrent authority writers do not fail merely because a valid snapshot host
+round trip exceeds the generic DB busy timeout. This is deliberately not
+solved in this dark stage: today there is no production caller of either
+critical section, so no concurrent writer can actually contend with one, and
+a per-critical-section busy-timeout override or similar mechanism is new
+runtime/configuration surface this PR does not introduce. This is NOT
+permission to lengthen or hold any polling transaction open — task polling
+and canonical confirmation stay strictly outside both writer critical
+sections (see above), and this gate does not change that.
 
 **Liveness after a refusal, and the pre-submission block critical section.**
 A stale authority context always refuses a NEW submission —

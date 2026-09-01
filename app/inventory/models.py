@@ -164,6 +164,24 @@ class AuthorityConflict(AuthorityError):
     """A durable ownership or lifecycle precondition did not hold."""
 
 
+class SnapshotSubmissionRefusedBeforeCallback(AuthorityConflict):
+    """Current-authority proof refused a snapshot submission before the host
+    submission callback was ever invoked.
+
+    Raised ONLY by :meth:`InventoryAuthority.execute_snapshot_submission_if_current`,
+    and ONLY for the one case where its current-authority predicate itself
+    proved false -- structurally guaranteeing the submission callback ran zero
+    times for this call. A terminal job, a checkpoint other than
+    ``snapshot_may_have_started``, or any other lifecycle/invariant conflict
+    raised by that same method remains ordinary :class:`AuthorityConflict`
+    (this being a subclass, existing generic handlers still catch it): those
+    mean the job's own durable state moved out from under the caller for some
+    other reason, which a caller must not conflate with "current authority
+    definitely refused before any host call". Any exception raised once the
+    callback has begun executing must never be recast as this type.
+    """
+
+
 class AuthorityNotFound(AuthorityError):
     """A requested durable authority record does not exist."""
 
