@@ -480,6 +480,8 @@ class SuccessfulHostControl:
         return HostScanResult(
             context=expected_host_context(run),
             os_release='ID=debian\nVERSION_ID="12"\n',
+            native_architecture="amd64\n",
+            installed_inventory="",
             simulation_stdout=(
                 "Reading package lists...\n"
                 "Building dependency tree...\n"

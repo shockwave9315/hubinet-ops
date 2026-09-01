@@ -241,10 +241,14 @@ def _parse_response(
             os_version = str(os_data.get("version") or "")[:200] or None
         raise HostScanFailure(failure, message, os_id, os_version)
     os_release = payload.get("os_release")
+    native_architecture = payload.get("native_architecture")
+    installed_inventory = payload.get("installed_inventory")
     simulation = payload.get("simulation")
     reboot_required = payload.get("reboot_required")
     if (
         not isinstance(os_release, str)
+        or not isinstance(native_architecture, str)
+        or not isinstance(installed_inventory, str)
         or not isinstance(simulation, Mapping)
         or type(simulation.get("returncode")) is not int
         or not isinstance(simulation.get("stdout"), str)
@@ -258,6 +262,8 @@ def _parse_response(
     return HostScanResult(
         context=dict(context),
         os_release=os_release,
+        native_architecture=native_architecture,
+        installed_inventory=installed_inventory,
         simulation_stdout=simulation["stdout"],
         reboot_required=reboot_required,
     )

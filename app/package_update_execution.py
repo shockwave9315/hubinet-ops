@@ -49,6 +49,8 @@ from app.package_scan import (
 class HostExecutionResult:
     context: Mapping[str, Any]
     os_release: str
+    native_architecture: str
+    installed_inventory: str
     simulation_stdout: str
 
 
@@ -76,10 +78,12 @@ class ExecutionGateStatus(StrEnum):
     #: it either has not reached this gate yet, or has already gone
     #: terminal for some other reason. Nothing was touched.
     JOB_NOT_READY = "job_not_ready"
-    #: Current job/source/resource/approval authority did not hold, either
-    #: before the host was ever called (the cheap pre-check) or when the
-    #: equality decision was proved. Zero mutation; the job was not
-    #: terminalized by this alone.
+    #: Current job/source/resource/approval authority was proven stale,
+    #: either before the host was ever called (the cheap pre-check) or when
+    #: the equality decision was proved. Zero mutation, but the job WAS
+    #: terminalized ``blocked`` in the same authority transaction that
+    #: proved the staleness, releasing the one global destructive slot --
+    #: it never leaks. See ARCHITECTURE.md, "Execution-time plan equality".
     AUTHORITY_STALE = "authority_stale"
     #: The host round trip itself failed (busy, timeout, transport failure,
     #: unsupported OS/resource, or a malformed/ambiguous simulation). Never
@@ -139,11 +143,17 @@ def run_package_update_execution_gate(
 
     # Optional cheap current-authority check before spending a (potentially
     # multi-minute) host round trip on a job that is already known stale.
-    # This is an optimization only: the authority compare below re-proves
-    # current authority again, in the same transaction as the decision it
-    # authorizes, regardless of what happens here.
+    # Unlike the generic InventoryAuthority.revalidate_package_update_job,
+    # this one is specific to the execution gate's own checkpoint and
+    # atomically terminalizes the job when it finds authority stale here --
+    # so a job never needs a backend restart to release the global slot.
+    # This is still only an optimization: the authority compare below
+    # re-proves current authority again, in its own transaction, regardless
+    # of what happens here.
     try:
-        job = authority.revalidate_package_update_job(job_id)
+        current, job = authority.revalidate_or_release_stale_package_update_execution(
+            job_id
+        )
     except AuthorityNotFound:
         return ExecutionGateOutcome(
             status=ExecutionGateStatus.JOB_NOT_READY,
@@ -151,8 +161,10 @@ def run_package_update_execution_gate(
         )
     except AuthorityConflict as exc:
         return ExecutionGateOutcome(
-            status=ExecutionGateStatus.AUTHORITY_STALE, job=job, message=str(exc)
+            status=ExecutionGateStatus.JOB_NOT_READY, job=job, message=str(exc)
         )
+    if not current:
+        return ExecutionGateOutcome(status=ExecutionGateStatus.AUTHORITY_STALE, job=job)
 
     try:
         result = host_control.simulate_exact_update_plan(job)
@@ -165,7 +177,11 @@ def run_package_update_execution_gate(
         # -- one implementation, never a second independent one -- so
         # execution-time evidence and scan-time evidence can never drift.
         parse_os_release(result.os_release)
-        fresh_packages = parse_apt_simulation(result.simulation_stdout)
+        fresh_packages = parse_apt_simulation(
+            result.simulation_stdout,
+            native_architecture=result.native_architecture,
+            installed_inventory=result.installed_inventory,
+        )
     except HostScanFailure as exc:
         return ExecutionGateOutcome(
             status=ExecutionGateStatus.HOST_FAILURE,
@@ -206,16 +222,20 @@ def run_package_update_execution_gate(
         )
     except AuthorityConflict as exc:
         # The pre-host-call checks above already proved the job was ACTIVE
-        # at snapshot_confirmed with current authority. Reaching a conflict
-        # here means one of those facts changed concurrently while the
-        # (potentially multi-minute) host round trip was in flight --
-        # either the job went terminal for some other reason, or resource/
-        # source authority went stale. Either way nothing was mutated and
-        # this decision was refused, never silently treated as a match.
+        # at snapshot_confirmed. Reaching a conflict here means the job went
+        # terminal for some other reason, or moved off this checkpoint,
+        # concurrently while the (potentially multi-minute) host round trip
+        # was in flight -- never overwritten or reopened. Ordinary current-
+        # authority staleness is handled below as a typed outcome instead of
+        # an exception (it terminalizes the job rather than merely refusing).
         return ExecutionGateOutcome(
-            status=ExecutionGateStatus.AUTHORITY_STALE, job=job, message=str(exc)
+            status=ExecutionGateStatus.JOB_NOT_READY, job=job, message=str(exc)
         )
 
     if outcome is PackageUpdateExecutionOutcome.MATCHED:
         return ExecutionGateOutcome(status=ExecutionGateStatus.MATCHED, job=decided_job)
+    if outcome is PackageUpdateExecutionOutcome.AUTHORITY_STALE:
+        return ExecutionGateOutcome(
+            status=ExecutionGateStatus.AUTHORITY_STALE, job=decided_job
+        )
     return ExecutionGateOutcome(status=ExecutionGateStatus.MISMATCHED, job=decided_job)

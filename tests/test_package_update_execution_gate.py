@@ -23,6 +23,7 @@ import pytest
 
 from app.inventory import (
     AuthorityConflict,
+    AuthorityNotFound,
     InventoryAuthority,
     PackageScanFailure,
     PackageScanPackage,
@@ -90,6 +91,15 @@ def _simulation_for(packages) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _inventory_for(packages) -> str:
+    """The independent installed-state evidence matching a package tuple."""
+
+    return "".join(
+        f"{p.package_name}\t{p.architecture}\t{p.installed_version}\tinstalled\n"
+        for p in packages
+    )
+
+
 def _ready_job(tmp_path: Path, *, packages=None):
     """One package-update job advanced to a confirmed snapshot.
 
@@ -117,9 +127,12 @@ class FakeExecutionHostControl:
     """A typed, in-memory stand-in for the dark SSH transport."""
 
     def __init__(self, *, simulation_stdout=None, os_release='ID=debian\nVERSION_ID="12"\n',
+                 native_architecture="amd64\n", installed_inventory="",
                  raises=None, wrong_context=False, side_effect=None):
         self.simulation_stdout = simulation_stdout
         self.os_release = os_release
+        self.native_architecture = native_architecture
+        self.installed_inventory = installed_inventory
         self.raises = raises
         self.wrong_context = wrong_context
         self.side_effect = side_effect
@@ -137,6 +150,8 @@ class FakeExecutionHostControl:
         return HostExecutionResult(
             context=context,
             os_release=self.os_release,
+            native_architecture=self.native_architecture,
+            installed_inventory=self.installed_inventory,
             simulation_stdout=self.simulation_stdout,
         )
 
@@ -320,7 +335,10 @@ def test_approval_invalidation_covers_architecture_exactly_like_a_version(
 
 def test_orchestrator_matches_and_appends_no_mutation_checkpoint(tmp_path: Path) -> None:
     clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
-    host_control = FakeExecutionHostControl(simulation_stdout=_simulation_for(scan.packages))
+    host_control = FakeExecutionHostControl(
+        simulation_stdout=_simulation_for(scan.packages),
+        installed_inventory=_inventory_for(scan.packages),
+    )
     result = run_package_update_execution_gate(authority, job.job_id, host_control)
     assert result.status is ExecutionGateStatus.MATCHED
     assert result.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
@@ -331,7 +349,8 @@ def test_orchestrator_matches_and_appends_no_mutation_checkpoint(tmp_path: Path)
 def test_orchestrator_mismatch_terminalizes_and_releases_the_slot(tmp_path: Path) -> None:
     clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
     host_control = FakeExecutionHostControl(
-        simulation_stdout=_simulation_for(scan.packages[:-1])
+        simulation_stdout=_simulation_for(scan.packages[:-1]),
+        installed_inventory=_inventory_for(scan.packages[:-1]),
     )
     result = run_package_update_execution_gate(authority, job.job_id, host_control)
     assert result.status is ExecutionGateStatus.MISMATCHED
@@ -387,7 +406,9 @@ def test_host_timeout_is_deterministic_and_never_mutates(tmp_path: Path) -> None
 def test_stale_host_response_context_is_a_host_failure(tmp_path: Path) -> None:
     clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
     host_control = FakeExecutionHostControl(
-        simulation_stdout=_simulation_for(scan.packages), wrong_context=True
+        simulation_stdout=_simulation_for(scan.packages),
+        installed_inventory=_inventory_for(scan.packages),
+        wrong_context=True,
     )
     result = run_package_update_execution_gate(authority, job.job_id, host_control)
     assert result.status is ExecutionGateStatus.HOST_FAILURE
@@ -396,23 +417,44 @@ def test_stale_host_response_context_is_a_host_failure(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # 12-13: authority/job state changing while the host round trip is "in flight"
+#
+# P2-3: a provably stale current-authority context at this pre-mutation gate
+# is never left dangling ACTIVE -- it is atomically terminalized `blocked`
+# in the same transaction that proves it, so the job can never starve the
+# one global destructive slot forever with only a backend restart as a way
+# out. See ARCHITECTURE.md, "Execution-time plan equality".
 # ---------------------------------------------------------------------------
 
 
-def test_authority_going_stale_during_the_host_round_trip_refuses(tmp_path: Path) -> None:
+def test_authority_going_stale_during_the_host_round_trip_is_released(
+    tmp_path: Path,
+) -> None:
     clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
 
     def _go_stale(_job) -> None:
         authority.rotate_transport_trust(resource.inventory_source_id)
 
     host_control = FakeExecutionHostControl(
-        simulation_stdout=_simulation_for(scan.packages), side_effect=_go_stale
+        simulation_stdout=_simulation_for(scan.packages),
+        installed_inventory=_inventory_for(scan.packages),
+        side_effect=_go_stale,
     )
     result = run_package_update_execution_gate(authority, job.job_id, host_control)
     assert result.status is ExecutionGateStatus.AUTHORITY_STALE
     refreshed = store.package_update_job(job.job_id)
-    assert refreshed.status is PackageUpdateJobStatus.ACTIVE
+    # Unlike a merely-refused stale check, the gate's own stale-authority
+    # path terminalizes the job -- it is never left dangling ACTIVE.
+    assert refreshed.status is PackageUpdateJobStatus.BLOCKED
     assert refreshed.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert refreshed.mutation_may_have_started_at is None
+    assert refreshed.terminalized_at is not None
+    assert "stale" in (refreshed.terminal_reason or "").lower()
+
+    # The global destructive slot is released: a second, independent
+    # approved job can now be issued.
+    other_resource, other_scan, other_approval = _add_approved_resource(store, authority)
+    other_job = _issue(authority, other_resource, other_approval)
+    assert other_job.status is PackageUpdateJobStatus.ACTIVE
 
 
 def test_job_going_terminal_during_the_host_round_trip_is_never_overwritten(
@@ -424,14 +466,103 @@ def test_job_going_terminal_during_the_host_round_trip_is_never_overwritten(
         authority.recover_interrupted_package_update_jobs()
 
     host_control = FakeExecutionHostControl(
-        simulation_stdout=_simulation_for(scan.packages[:-1]), side_effect=_terminalize
+        simulation_stdout=_simulation_for(scan.packages[:-1]),
+        installed_inventory=_inventory_for(scan.packages[:-1]),
+        side_effect=_terminalize,
+    )
+    result = run_package_update_execution_gate(authority, job.job_id, host_control)
+    # The job went terminal for a reason unrelated to authority staleness
+    # (ordinary startup interruption) while the host round trip was in
+    # flight; the gate must recognize it is no longer eligible rather than
+    # mislabeling it as a fresh stale-authority release.
+    assert result.status is ExecutionGateStatus.JOB_NOT_READY
+    refreshed = store.package_update_job(job.job_id)
+    # Still exactly the interruption the side effect caused -- never
+    # overwritten with a stale-authority or mismatch terminal reason.
+    assert refreshed.status is PackageUpdateJobStatus.INTERRUPTED
+    assert "restart" in (refreshed.terminal_reason or "").lower()
+
+
+def test_pre_host_stale_authority_check_releases_without_any_host_call(
+    tmp_path: Path,
+) -> None:
+    # Regression 22.1: the cheap pre-host check must itself terminalize a
+    # provably stale job -- no host round trip is spent on a job that is
+    # already known stale, and the slot is still released promptly.
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    authority.rotate_transport_trust(resource.inventory_source_id)
+
+    host_control = FakeExecutionHostControl(
+        simulation_stdout=_simulation_for(scan.packages),
+        installed_inventory=_inventory_for(scan.packages),
     )
     result = run_package_update_execution_gate(authority, job.job_id, host_control)
     assert result.status is ExecutionGateStatus.AUTHORITY_STALE
+    assert host_control.calls == 0
     refreshed = store.package_update_job(job.job_id)
-    # Still exactly the interruption the side effect caused -- never
-    # overwritten with a "mismatched" terminal reason.
-    assert refreshed.status is PackageUpdateJobStatus.INTERRUPTED
+    assert refreshed.status is PackageUpdateJobStatus.BLOCKED
+    assert refreshed.mutation_may_have_started_at is None
+
+    other_resource, other_scan, other_approval = _add_approved_resource(store, authority)
+    other_job = _issue(authority, other_resource, other_approval)
+    assert other_job.status is PackageUpdateJobStatus.ACTIVE
+
+
+def test_revalidate_or_release_direct_current_authority_leaves_job_unchanged(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    current, unchanged = authority.revalidate_or_release_stale_package_update_execution(
+        job.job_id
+    )
+    assert current is True
+    assert unchanged.status is PackageUpdateJobStatus.ACTIVE
+    assert unchanged.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert unchanged.terminalized_at is None
+
+
+def test_revalidate_or_release_direct_stale_authority_blocks_atomically(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    authority.rotate_transport_trust(resource.inventory_source_id)
+    current, decided = authority.revalidate_or_release_stale_package_update_execution(
+        job.job_id
+    )
+    assert current is False
+    assert decided.status is PackageUpdateJobStatus.BLOCKED
+    assert decided.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert decided.mutation_may_have_started_at is None
+    events = store.list_package_update_job_events(job.job_id)
+    assert (
+        events[-1].event_type is PackageUpdateEventType.EXECUTION_AUTHORITY_STALE_RELEASED
+    )
+    assert events[-1].level.value == "warning"
+
+
+def test_revalidate_or_release_never_terminalizes_a_job_off_this_checkpoint(
+    tmp_path: Path,
+) -> None:
+    # A generic lifecycle conflict (wrong checkpoint) is distinct from
+    # authority staleness and must never be swept into a "blocked, stale
+    # authority released" terminal write.
+    clock, store, authority, resource, scan, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    with pytest.raises(AuthorityConflict, match="not awaiting"):
+        authority.revalidate_or_release_stale_package_update_execution(job.job_id)
+    unchanged = store.package_update_job(job.job_id)
+    assert unchanged.status is PackageUpdateJobStatus.ACTIVE
+    assert unchanged.terminalized_at is None
+
+
+def test_revalidate_or_release_is_idempotent_after_release(tmp_path: Path) -> None:
+    # Regression 15 applied to the pre-host check itself: retrying against
+    # an already-released job never re-decides or double-terminalizes it.
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    authority.rotate_transport_trust(resource.inventory_source_id)
+    authority.revalidate_or_release_stale_package_update_execution(job.job_id)
+    with pytest.raises(AuthorityConflict, match="terminal"):
+        authority.revalidate_or_release_stale_package_update_execution(job.job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +603,8 @@ def test_ssh_host_control_pins_key_and_sends_the_job_owned_context(
             "ok": True,
             "context": request["context"],
             "os_release": 'ID=debian\nVERSION_ID="12"\n',
+            "native_architecture": "amd64\n",
+            "installed_inventory": _inventory_for(scan.packages),
             "simulation": {"returncode": 0, "stdout": _simulation_for(scan.packages)},
         }
         return BoundedProcessResult(0, json.dumps(response).encode(), b"")
@@ -488,6 +621,8 @@ def test_ssh_host_control_pins_key_and_sends_the_job_owned_context(
     )
     result = client.simulate_exact_update_plan(job)
     assert result.simulation_stdout == _simulation_for(scan.packages)
+    assert result.native_architecture == "amd64\n"
+    assert result.installed_inventory == _inventory_for(scan.packages)
     argv = captured["argv"]
     assert "StrictHostKeyChecking=yes" in argv
     assert argv[-1] == "hubinet-update-exec@192.0.2.11"
@@ -554,6 +689,9 @@ def test_helper_accepts_only_typed_operation_and_strict_vmid() -> None:
 
 
 def test_helper_never_contains_a_mutating_apt_or_dpkg_argv() -> None:
+    # Read-only dpkg evidence ("dpkg", "--print-architecture" and
+    # "dpkg-query") is expected in this file (see ARCHITECTURE.md, "Binary
+    # package identity"); only actual mutating shapes are forbidden.
     text = HELPER_PATH.read_text(encoding="utf-8")
     for forbidden in (
         "apt-get install",
@@ -567,7 +705,8 @@ def test_helper_never_contains_a_mutating_apt_or_dpkg_argv() -> None:
         '"apt-get", "install"',
         '"apt-get", "upgrade"',
         '"apt-get", "dist-upgrade"',
-        '"dpkg"',
+        '"dpkg", "-i"',
+        '"dpkg", "--configure"',
     ):
         assert forbidden not in text, forbidden
 
@@ -582,6 +721,8 @@ class FakeHelperRunner:
         local_node: str = "pve-a",
         os_release: str = 'ID=debian\nVERSION_ID="12"\n',
         apt_version: str = "apt 2.6.1 (amd64)\n",
+        native_architecture: str = "amd64\n",
+        installed_inventory: str = "",
         update_returncode: int = 0,
         update_stderr: str = "",
         simulation_returncode: int = 0,
@@ -594,6 +735,8 @@ class FakeHelperRunner:
         self.local_node = local_node
         self.os_release = os_release
         self.apt_version = apt_version
+        self.native_architecture = native_architecture
+        self.installed_inventory = installed_inventory
         self.update_returncode = update_returncode
         self.update_stderr = update_stderr
         self.simulation_returncode = simulation_returncode
@@ -626,6 +769,10 @@ class FakeHelperRunner:
                 self.simulation_stdout.encode(),
                 self.simulation_stderr.encode(),
             )
+        if "--print-architecture" in rendered:
+            return helper.CommandResult(0, self.native_architecture.encode(), b"")
+        if "dpkg-query" in rendered:
+            return helper.CommandResult(0, self.installed_inventory.encode(), b"")
         raise AssertionError(f"unexpected command shape: {argv!r}")
 
 
@@ -634,9 +781,13 @@ def test_helper_success_uses_only_fixed_pvesh_and_pct_shapes_and_no_reboot_check
     response = helper.handle_request(_request(), runner=runner)
     assert response["ok"] is True
     assert "reboot_required" not in response
+    assert response["native_architecture"] == "amd64\n"
+    assert response["installed_inventory"] == ""
     assert all(call[0] in {"pvesh", "pct"} for call in runner.calls)
     assert any(call[-4:] == ("apt-get", "update", "-qq", "--error-on=any") for call in runner.calls)
     assert any(call[-3:] == ("apt-get", "-s", "upgrade") for call in runner.calls)
+    assert any(call[-2:] == ("dpkg", "--print-architecture") for call in runner.calls)
+    assert any(call[-3] == "dpkg-query" for call in runner.calls)
     assert not any("/var/run/reboot-required" in " ".join(call) for call in runner.calls)
 
 
@@ -679,12 +830,19 @@ def test_helper_end_to_end_matches_the_authority_gate(tmp_path: Path) -> None:
     """
 
     clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
-    runner = FakeHelperRunner(simulation_stdout=_simulation_for(scan.packages))
+    runner = FakeHelperRunner(
+        simulation_stdout=_simulation_for(scan.packages),
+        installed_inventory=_inventory_for(scan.packages),
+    )
     response = helper.handle_request(_request(), runner=runner)
     assert response["ok"] is True
 
     from app.package_scan import parse_apt_simulation
 
-    fresh = parse_apt_simulation(response["simulation"]["stdout"])
+    fresh = parse_apt_simulation(
+        response["simulation"]["stdout"],
+        native_architecture=response["native_architecture"],
+        installed_inventory=response["installed_inventory"],
+    )
     outcome, decided = authority.evaluate_package_update_execution_plan(job.job_id, fresh)
     assert outcome is PackageUpdateExecutionOutcome.MATCHED

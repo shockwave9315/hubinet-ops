@@ -204,16 +204,26 @@ unimplemented future stage.
 ## Execution-time plan equality
 
 - **Implemented internally:** a proven multiarch binary-package identity
-  contract -- durable identity is `(package_name, architecture)`, architecture
-  is read from APT's own `-s upgrade` simulation output (never a guess, never
-  a second host round trip), and it is now explicit material identity in the
-  plan fingerprint, approval, and every durable package row (schema v11). One
-  canonical parser (`app/package_scan.py::parse_apt_simulation`) is shared,
-  unchanged, by both package scanning and this gate. A dark orchestrator
+  contract -- durable identity is `(package_name, architecture)`, and
+  architecture is *proven* from the guest's own independent dpkg installed
+  inventory (`dpkg-query -W`, `dpkg --print-architecture` -- fixed,
+  argument-less commands) and cross-checked against APT's `-s upgrade`
+  candidate description, never inferred from that candidate description
+  alone; a package changing between an architecture-specific binary and
+  `Architecture: all` is out of scope and fails closed. Architecture is now
+  explicit material identity in the plan fingerprint, approval, and every
+  durable package row (schema v11). Every APT `Conf` (configure) action is
+  validated and must be bound to an approved `Inst` row -- a standalone,
+  contradictory, or duplicate `Conf`, or any evidence of pre-existing
+  unfinished dpkg state, fails the plan closed rather than silently
+  disappearing. One canonical parser
+  (`app/package_scan.py::parse_apt_simulation`) is shared, unchanged, by
+  both package scanning and this gate. A dark orchestrator
   (`app/package_update_execution.py`) runs, for one job at exactly
-  `snapshot_confirmed`: a fresh execution-time APT metadata refresh plus
-  simulation over a separate dark pinned-key SSH transport and forced-command
-  PVE helper (`deploy/hubinet-package-update-helper.py`, exposing exactly one
+  `snapshot_confirmed`: a fresh execution-time APT metadata refresh,
+  simulation, and dpkg identity read over a separate dark pinned-key SSH
+  transport and forced-command PVE helper
+  (`deploy/hubinet-package-update-helper.py`, exposing exactly one
   non-mutating operation), then an atomic authority comparison
   (`InventoryAuthority.evaluate_package_update_execution_plan`) of that fresh
   canonical material against the job's immutable frozen rows -- complete-set
@@ -221,7 +231,15 @@ unimplemented future stage.
   nothing durable about the job (no checkpoint advance, no persisted
   permission flag); a mismatch terminalizes the job `blocked`, retaining its
   confirmed snapshot and releasing the global slot without granting rollback
-  authority.
+  authority. A provably stale current-authority context at this same
+  pre-mutation gate is likewise never left dangling ACTIVE: both the gate's
+  cheap pre-host check
+  (`InventoryAuthority.revalidate_or_release_stale_package_update_execution`)
+  and the post-host comparison atomically terminalize the job `blocked` the
+  moment staleness is proven, so the one global destructive slot can never
+  be starved by an obsolete job with only a backend restart as a way out --
+  a job that goes terminal for an unrelated reason while a host round trip
+  is in flight is never mistaken for this and never overwritten.
 - **Not activated:** no HTTP, Home Assistant, scheduler, bootstrap, or updater
   path can invoke this gate; the execution helper is a separate dark file
   that is **not deployed**, with no key or `authorized_keys` entry and no

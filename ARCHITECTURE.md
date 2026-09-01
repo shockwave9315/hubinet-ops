@@ -802,48 +802,96 @@ packages with a Multi-Arch field with the value same or with a foreign
 architecture..."), and `foo:amd64`/`foo:i386` are two fully independent
 installed packages, never one row that can collapse or overwrite the other.
 
-**Where architecture comes from, and why it is reliable.** APT's own
-`-s upgrade` simulation output already carries architecture unconditionally,
-and Hubinet parses it from there rather than adding a second host round
-trip. Reading libapt-pkg's source directly settles this (traced to
-`pkgCache::VerIterator::RelStr()` and `pkgCache::PkgIterator::FullName()` in
-`apt-pkg/pkgcache.cc`, current upstream `apt-team/apt`):
+**Architecture is proven from dpkg's own installed state, never inferred
+from APT's candidate description alone.** An earlier revision of this stage
+took the trailing architecture bracket in APT's `-s upgrade` output (see
+below) as sufficient proof of the *installed* package's architecture. That
+is not sound: that bracket describes the **candidate** version specifically
+(`RelStr()` is called on the candidate `VerIterator`), and a version's own
+`MultiArch::All` flag -- which controls whether the bracket reads `all` --
+is a property of that one version, not of the package's underlying cache
+slot; APT's `Architecture: all` version generation can attach such a version
+to a Package object whose own architecture is a real triplet. dpkg's status
+database can independently and correctly record a currently installed
+package's `Architecture` field as literally `all` (confirmed live: 508 such
+packages on this repository's own devbox), while APT's cache internals
+consider that Package to occupy the *native* architecture's slot. The two
+views can legitimately diverge for one version's own reported architecture
+without the installed package's *identity* having changed at all -- and,
+separately, an outright cross-architecture transition between versions is a
+real (if rare) possibility this stage does not need to support. Guessing the
+installed architecture from the candidate bracket alone can therefore be
+wrong in exactly the cases that matter for identity.
 
-- `RelStr()` (the `<label list>` text inside an `Inst` line's parentheses)
-  *unconditionally* appends `` [<Arch()>]`` -- the candidate version's own
-  architecture -- as the last thing it prints, for every real version. This
-  is not best-effort or omittable: it is not gated on any repository or
-  Release-file property. `Arch()` returns `"all"` for an `Architecture: all`
-  version, otherwise the real dpkg architecture string of the package the
-  version belongs to.
-- The package *name* printed before the version brackets
-  (`Pkg.FullName(Pretty=true)`) is architecture-qualified with a `:<arch>`
-  suffix **only** when the package's architecture is foreign -- not the
-  native architecture, and not `all`/`any`. For the common native case the
-  name is bare, so the name alone is never a reliable architecture source;
-  the trailing bracket is. When both are present they must agree, and a
-  contradiction fails closed rather than picking one.
-- Because `RealInstall` re-resolves the exact same `(name, arch)`
-  `PkgIterator` for both the installed and candidate version shown on one
-  `Inst` line, an ordinary `apt-get upgrade` can never show a candidate
-  architecture that differs from the installed one for that line -- there is
-  structurally only one architecture per line, not two that could disagree.
-  A genuine cross-architecture change would appear as a remove-plus-install
-  pair, which the scanner already rejects (see below).
-- This has been true since multiarch stabilized in APT (well before any
-  currently supported Debian/Ubuntu release) and was independently confirmed
-  live against this devbox's own `apt-get -s upgrade` output, including an
-  `Architecture: all` package (`[all]`) among native `[amd64]` ones.
+So the installed architecture is instead read independently from the guest's
+own dpkg status database and cross-checked, never guessed:
 
-The canonical parser (`app/package_scan.py::parse_apt_simulation`, shared
-verbatim by scanning and the execution gate below -- never two independent
-implementations) therefore extracts architecture from that trailing bracket,
-cross-validates it against an optional `:arch` name qualifier, and fails
-closed (`PackageScanParseError`) on a missing, malformed, or contradictory
-architecture, a duplicate `(name, architecture)` row, or any removal/new-
-install line -- the scanner's existing scope stays an ordinary upgrade plan
-only (see "Package scanning for LXC" above); it is not broadened to
-dist-upgrade, autoremove, install, or remove semantics by this.
+- `dpkg-query -W -f='${Package}\t${Architecture}\t${Version}\t${db:Status-Status}\n'`
+  (no package-name arguments -- lists everything; a fixed, non-caller-
+  controlled command) is the guest's complete installed-package inventory:
+  bare `Package` name, its own `Architecture` field, `Version`, and
+  `db:Status-Status` (dpkg's literal status word -- see `dpkg-query(1)`),
+  filtered to rows dpkg itself reports as `installed`. `dpkg --print-
+  architecture` (also fixed, no arguments) gives the guest's native
+  architecture.
+- For each `Inst` line, the canonical parser
+  (`app/package_scan.py::parse_apt_simulation`) resolves exactly one
+  installed `(name, architecture)` row from that independent inventory:
+  APT's own `:<arch>` name qualifier (present only for a foreign
+  architecture, per `pkgCache::PkgIterator::FullName()`) pins it directly;
+  a bare name tries the native architecture and `all` and requires
+  *exactly one* to match dpkg's inventory. Zero or two matches -- an
+  unrecorded package, or a genuine ambiguity -- fails closed rather than
+  guessing.
+- The resolved installed architecture must then agree with APT's own
+  candidate-description bracket (from `pkgCache::VerIterator::RelStr()`,
+  which unconditionally appends `` [<Arch()>]`` -- traced in
+  `apt-pkg/pkgcache.cc`, current upstream `apt-team/apt`, and independently
+  confirmed live against this devbox's own `apt-get -s upgrade` output,
+  including a real `[all]` package among native `[amd64]` ones). This is the
+  scope boundary, not an identity source: for an ordinary,
+  approvable upgrade, **installed architecture must equal candidate
+  architecture**. A package changing between an architecture-specific
+  binary and `Architecture: all` -- in either direction -- is a
+  cross-architecture transition and is out of this stage's supported scope;
+  it fails closed (`PackageScanParseError`) rather than being silently
+  relabeled from whichever side happened to be read.
+- dpkg's own installed version for that resolved `(name, architecture)` must
+  also agree exactly with APT's own displayed installed-version bracket.
+  Reading dpkg's inventory as close as possible to the APT simulation (the
+  scan and execution helpers both read it immediately *after* the
+  simulation call) bounds the ordinary concurrent-package-manager race
+  between the two reads; any disagreement -- from that race, or from
+  anything else -- fails closed rather than trusting either source alone.
+
+The canonical parser is shared verbatim by scanning and the execution gate
+below -- never two independent implementations -- and fails closed
+(`PackageScanParseError`) on a missing, malformed, or contradictory
+architecture, a missing or ambiguous installed identity, an APT/dpkg
+installed-version disagreement, a duplicate `(name, architecture)` row, or
+any removal/new-install line -- the scanner's existing scope stays an
+ordinary upgrade plan only (see "Package scanning for LXC" above); it is not
+broadened to dist-upgrade, autoremove, install, or remove semantics by this.
+
+**Every `Conf` (configure) action must be bound to an approved `Inst` row.**
+`pkgSimulate::RealConfigure` (`apt-pkg/algorithms.cc`) prints one `Conf`
+line per package APT would configure, in the exact same candidate-
+description shape an `Inst` line's parenthesized tail uses (traced
+authoritatively, not guessed from one fixture). A standalone `Conf` -- one
+whose exact `(name, candidate_version)` label does not match an approved
+`Inst` row in the very same simulation -- means a real future upgrade would
+configure a package this plan never approved, which would silently violate
+`PRODUCT.md` rule 2; it fails closed, as does a `Conf` that contradicts an
+`Inst` row's version or architecture, a duplicate `Conf` for the same
+action, and the distinct `"Conf <name> broken"` shape APT prints for an
+already-broken configure (which also registers an internal APT error).
+Separately, APT's summary printer (`apt-private/private-output.cc::Stats()`)
+appends an unconditional extra line, `"N not fully installed or removed."`,
+whenever dpkg reports a nonzero broken/unfinished-package count
+(`pkgDepCache::BadCount()`) -- pre-existing unfinished dpkg state left over
+from something else entirely, never attributable to this plan's own
+approved rows. Seeing that line at all (its count is only ever printed when
+positive) fails the plan closed rather than being silently dropped.
 
 **What is material and what is not.** The material identity/change tuple is
 `(package_name, architecture, installed_version, candidate_version)`.
@@ -887,14 +935,15 @@ is its purpose-specific pinned-key SSH transport, and
 `deploy/hubinet-package-update-helper.py` is a separate dark forced-command
 PVE boundary exposing exactly one typed, non-mutating operation
 (`simulate_exact_update_plan`): a fixed metadata refresh
-(`apt-get update -qq --error-on=any`) plus a fixed simulation
-(`apt-get -s upgrade`) against the job's own frozen expected VMID/node,
-re-validated live before each guest command -- the same non-mutating
-contract `PRODUCT.md`, "What package scanning may do" already allows. It is
-a separate file and a separate logical privilege boundary from the deployed
-scan helper and from the snapshot helper, so this stage cannot accidentally
-make job execution production-reachable by extending an already-deployed
-boundary.
+(`apt-get update -qq --error-on=any`), a fixed simulation
+(`apt-get -s upgrade`), and the two fixed, read-only dpkg identity commands
+described above (`dpkg --print-architecture`, `dpkg-query -W -f='...'`),
+against the job's own frozen expected VMID/node, re-validated live before
+each guest command -- the same non-mutating contract `PRODUCT.md`, "What
+package scanning may do" already allows. It is a separate file and a
+separate logical privilege boundary from the deployed scan helper and from
+the snapshot helper, so this stage cannot accidentally make job execution
+production-reachable by extending an already-deployed boundary.
 
 `InventoryAuthority.evaluate_package_update_execution_plan` is the equality
 transition. It requires the job ACTIVE at exactly `snapshot_confirmed`
@@ -908,6 +957,39 @@ transaction (see "SQLite writer-contention policy" above; this closes the
 same class of gap that policy already closed for the snapshot critical
 sections, before a second writer could ever actually contend with them).
 
+**A provably stale current-authority context at this gate is released, not
+left dangling.** Every other package-update transition that finds current
+authority stale simply refuses (`AuthorityConflict`) and leaves the job
+exactly as it was -- correct for checkpoints a job can still legitimately
+reach again. This gate is different: it is the last checkpoint before
+(future) package mutation, and a job sitting there is the *only* thing
+occupying the one global destructive slot. Leaving a job whose frozen
+approval context can never become current again (a rotated transport trust
+revision, a replaced resource, ...) permanently ACTIVE at this checkpoint
+would starve every future package-update job forever, with a backend restart
+as the only way out -- and a restart must never be the ordinary release
+mechanism (see "Job-owned snapshot safety" above; the same principle applied
+one checkpoint later). So both the gate's own cheap pre-host check
+(`InventoryAuthority.revalidate_or_release_stale_package_update_execution`,
+which lets the orchestrator skip the host round trip entirely for a job
+already known stale) and the post-host equality transition re-prove current
+authority and, if it is stale, atomically terminalize the job `blocked` in
+that SAME transaction (`_terminalize_execution_gate_job_if_authority_stale`)
+-- the proof and the release can never be split across two transactions,
+which would reopen exactly the check-then-commit race the rest of this
+stage is built to close. The confirmed snapshot is retained,
+`mutation_may_have_started_at` stays NULL, and the job never gains rollback
+authority; the operator must obtain and approve a fresh plan. This is a
+deliberately conservative policy -- current authority for this exact frozen
+material could in principle become available again later -- chosen because
+global-slot liveness matters more than preserving one old pre-mutation job
+through authority drift, and issuing a fresh plan/job is always available.
+A job that goes terminal for some *other* reason (an ordinary startup
+interruption, say) while a host round trip is in flight is never swept into
+this path: the checkpoint/status guard both entry points share raises an
+ordinary `AuthorityConflict` instead, and the job's actual terminal reason
+is never overwritten.
+
 A `MATCHED` result is deliberately not a durable mutation permit: it changes
 nothing about the job besides an append-only diagnostic event, and a future
 package-mutation stage MUST re-run this exact gate immediately before it
@@ -916,7 +998,9 @@ TOCTOU discipline `PRODUCT.md` rule 2 requires. A crash or restart at any
 point in this gate is safe by construction: because it never performs
 package mutation, "no package mutation may be assumed" (see "Job-owned
 snapshot safety" above) remains true, and ordinary startup recovery already
-safely interrupts a job sitting at `snapshot_confirmed`.
+safely interrupts a job sitting at `snapshot_confirmed` (including one this
+gate already matched or released -- neither creates a new state startup
+recovery does not already know how to handle).
 
 Nothing on the production HTTP, Home Assistant, scheduler, bootstrap, or
 updater path can reach any of this; `tests/test_r0_architecture_regression.py`

@@ -2250,6 +2250,130 @@ class InventoryAuthority:
             )
         return matches[0]
 
+    @staticmethod
+    def _require_active_execution_gate_job(job: sqlite3.Row) -> None:
+        """Shared checkpoint guard for the execution-time plan gate.
+
+        The job must be exactly ACTIVE at ``snapshot_confirmed`` -- the only
+        window this gate is ever meaningful in. A job that has since gone
+        terminal for some other reason, or has not yet reached this
+        checkpoint, is never overwritten or reopened: this raises an
+        ordinary :class:`AuthorityConflict` and the caller's transaction
+        writes nothing.
+        """
+
+        if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+            raise AuthorityConflict("package update job is terminal")
+        if (
+            PackageUpdateCheckpoint(str(job["checkpoint"]))
+            is not PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+        ):
+            raise AuthorityConflict(
+                "package update job is not awaiting the execution-time plan gate"
+            )
+
+    def _terminalize_execution_gate_job_if_authority_stale(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        decided_at: str,
+    ) -> bool:
+        """Re-prove current authority; terminalize BLOCKED if it is stale.
+
+        Must be called from inside a transaction that already re-read the
+        job row and proved it is ACTIVE at ``snapshot_confirmed`` in THIS
+        same transaction -- the proof here and any terminalization it
+        authorizes are therefore atomic with each other: no other writer can
+        interleave between "authority is proven stale" and "the job is
+        released", and a caller that finds authority current here is
+        guaranteed that fact was true at commit time, not from some earlier,
+        possibly stale, read.
+
+        The job is exactly ACTIVE at ``snapshot_confirmed`` here by
+        construction (no package mutation has begun), so terminalizing it is
+        always pre-mutation-safe: the confirmed snapshot is retained,
+        ``mutation_may_have_started_at`` stays NULL, and the job releases
+        the one global destructive slot without ever gaining rollback
+        authority. This is a deliberately conservative policy: current
+        authority for THIS job's exact frozen material may in principle
+        become available again later (a fresh scan could reproduce it), but
+        the operator can always issue and approve a fresh plan/job, and
+        leaving a provably stale job ACTIVE would otherwise be able to
+        starve the global slot forever with no path back except a backend
+        restart -- which must never be the ordinary release mechanism (see
+        ARCHITECTURE.md, "Execution-time plan equality").
+
+        Returns ``True`` (and has terminalized the job) when authority was
+        proven stale here; ``False`` (job unchanged) when it is current.
+        """
+
+        current_authority_holds = self._package_update_job_authority_is_current(
+            connection, job
+        )
+        job_id = str(job["job_id"])
+        self._after_package_update_authority_proof(connection, job_id=job_id)
+        if current_authority_holds:
+            return False
+        reason = (
+            "package update job's current resource/source/approval authority "
+            "became stale before package mutation; retained but released for "
+            "a fresh plan and job"
+        )
+        updated = connection.execute(
+            "UPDATE package_update_jobs SET status='blocked', "
+            "terminalized_at=?, terminal_reason=? "
+            "WHERE job_id=? AND status='active' AND checkpoint='snapshot_confirmed'",
+            (decided_at, reason, job_id),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job stale-authority release lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=decided_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+            event_type=PackageUpdateEventType.EXECUTION_AUTHORITY_STALE_RELEASED,
+            message=reason,
+            details={},
+        )
+        return True
+
+    def revalidate_or_release_stale_package_update_execution(
+        self, job_id: str
+    ) -> tuple[bool, PackageUpdateJob]:
+        """Cheap pre-host authority check for the execution-time plan gate.
+
+        Intended as an optimization immediately before the (potentially
+        multi-minute) host round trip: avoid spending it on a job authority
+        has already moved past. Requires the job ACTIVE at exactly
+        ``snapshot_confirmed`` (an ordinary :class:`AuthorityConflict`
+        otherwise, job untouched), then atomically re-proves current
+        authority and, if it is stale, terminalizes the job the exact same
+        way :meth:`evaluate_package_update_execution_plan` would -- see
+        :meth:`_terminalize_execution_gate_job_if_authority_stale` and
+        ARCHITECTURE.md, "Execution-time plan equality". This is deliberately
+        a distinct, narrower check from :meth:`revalidate_package_update_job`
+        (which never terminalizes anything and remains a pure, generic
+        "is authority still current" read usable at any checkpoint).
+
+        Returns ``(True, job)`` when authority is current (job unchanged) or
+        ``(False, job)`` when it was just proven stale and released.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        decided_at = _timestamp(self._now())
+        released = False
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_active_execution_gate_job(job)
+            released = self._terminalize_execution_gate_job_if_authority_stale(
+                connection, job, decided_at
+            )
+        return (not released), self._store.package_update_job(canonical_job_id)
+
     def evaluate_package_update_execution_plan(
         self,
         job_id: str,
@@ -2277,12 +2401,17 @@ class InventoryAuthority:
         exactly as it was.
 
         Current job/source/resource/approval authority is re-proved inside
-        the SAME transaction as the comparison and (on mismatch) the
-        terminal write, exactly like every other authority-changing
-        package-update transition. A stale authority context refuses via
-        :class:`AuthorityConflict` without writing anything durable beyond
-        any freshness expiry materialized while proving it -- see
-        ``_package_update_job_authority_is_current``.
+        the SAME transaction as the comparison and any terminal write, so
+        nothing can invalidate the job between the proof and the decision it
+        authorizes. Unlike most other package-update transitions, a stale
+        authority context here does NOT merely refuse: it terminalizes the
+        job as ``blocked`` in this same transaction (see
+        :meth:`_terminalize_execution_gate_job_if_authority_stale`), because
+        leaving a provably stale job ACTIVE at this pre-mutation checkpoint
+        would otherwise starve the one global destructive slot forever, with
+        a backend restart as the only way out -- which must never be the
+        ordinary release mechanism. This returns
+        :attr:`PackageUpdateExecutionOutcome.AUTHORITY_STALE` for that case.
 
         An exact material match -- the complete frozen job material set
         equals the complete fresh material set, never subset/superset/
@@ -2319,27 +2448,16 @@ class InventoryAuthority:
         outcome: PackageUpdateExecutionOutcome | None = None
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
-            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
-                raise AuthorityConflict("package update job is terminal")
-            if (
-                PackageUpdateCheckpoint(str(job["checkpoint"]))
-                is not PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+            self._require_active_execution_gate_job(job)
+            # The authority proof (and, on staleness or mismatch, the
+            # terminal write) share this one transaction with the equality
+            # decision, so nothing can invalidate the job between the proof
+            # just taken and the decision it authorizes.
+            if self._terminalize_execution_gate_job_if_authority_stale(
+                connection, job, decided_at
             ):
-                raise AuthorityConflict(
-                    "package update job is not awaiting the execution-time "
-                    "plan gate"
-                )
-            # The authority proof and the equality decision (and, on
-            # mismatch, the terminal write) share this one transaction, so
-            # nothing can invalidate the job between the proof just taken
-            # and the decision it authorizes.
-            current_authority_holds = self._package_update_job_authority_is_current(
-                connection, job
-            )
-            self._after_package_update_authority_proof(
-                connection, job_id=canonical_job_id
-            )
-            if current_authority_holds:
+                outcome = PackageUpdateExecutionOutcome.AUTHORITY_STALE
+            else:
                 job_material = self._package_material_rows(
                     connection,
                     table="package_update_job_packages",
@@ -2393,10 +2511,6 @@ class InventoryAuthority:
                         },
                     )
 
-        if not current_authority_holds:
-            raise AuthorityConflict(
-                "package update job resource or source authority context is stale"
-            )
         if outcome is None:
             raise AuthorityInvariantError(
                 "execution-time plan comparison was not captured"

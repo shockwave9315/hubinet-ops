@@ -178,9 +178,13 @@ def _parse_response(
         message = str(error.get("message") or "package update execution failed")[:500]
         raise HostScanFailure(failure, message)
     os_release = payload.get("os_release")
+    native_architecture = payload.get("native_architecture")
+    installed_inventory = payload.get("installed_inventory")
     simulation = payload.get("simulation")
     if (
         not isinstance(os_release, str)
+        or not isinstance(native_architecture, str)
+        or not isinstance(installed_inventory, str)
         or not isinstance(simulation, Mapping)
         or type(simulation.get("returncode")) is not int
         or not isinstance(simulation.get("stdout"), str)
@@ -193,5 +197,7 @@ def _parse_response(
     return HostExecutionResult(
         context=dict(context),
         os_release=os_release,
+        native_architecture=native_architecture,
+        installed_inventory=installed_inventory,
         simulation_stdout=simulation["stdout"],
     )

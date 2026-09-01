@@ -20,6 +20,8 @@ from app.package_scan import (
     PackageScanParseError,
     classify_command_failure,
     parse_apt_simulation,
+    parse_installed_inventory,
+    parse_native_architecture,
     parse_os_release,
 )
 from app.package_scan_host_control import (
@@ -44,6 +46,31 @@ def _load_helper() -> ModuleType:
 helper = _load_helper()
 
 
+def _inv(*entries: tuple[str, str, str], status: str = "installed") -> str:
+    """Build a fixed dpkg-query-shaped installed-inventory fixture.
+
+    ``entries`` are ``(name, architecture, version)`` triples, each an
+    independent proof of one currently installed binary package -- the same
+    shape ``dpkg-query -W -f='${Package}\\t${Architecture}\\t${Version}\\t
+    ${db:Status-Status}\\n'`` produces.
+    """
+
+    return "".join(f"{name}\t{arch}\t{version}\t{status}\n" for name, arch, version in entries)
+
+
+def _sim(
+    text: str,
+    *,
+    native: str = "amd64",
+    entries: tuple[tuple[str, str, str], ...] = (),
+):
+    """``parse_apt_simulation`` with an independently proven installed inventory."""
+
+    return parse_apt_simulation(
+        text, native_architecture=native, installed_inventory=_inv(*entries)
+    )
+
+
 DEBIAN_SIMULATION = """\
 Reading package lists...
 Building dependency tree...
@@ -55,6 +82,7 @@ Conf openssl (3.0.11-1~deb12u3 Debian-Security:12/oldstable-security [amd64])
 Conf apt (2.6.2 Debian:12/oldstable [amd64])
 2 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.
 """
+DEBIAN_INVENTORY = (("openssl", "amd64", "3.0.11-1"), ("apt", "amd64", "2.6.1"))
 
 UBUNTU_SIMULATION = """\
 Reading package lists...
@@ -64,6 +92,7 @@ Calculating upgrade...
 Inst base-files [13ubuntu10.2] (13ubuntu10.3 Ubuntu:24.04/noble-updates [amd64])
 1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
 """
+UBUNTU_INVENTORY = (("base-files", "amd64", "13ubuntu10.2"),)
 
 ZERO_SIMULATION = """\
 Reading package lists...
@@ -92,8 +121,8 @@ def test_unsupported_os_is_classified_without_guessing() -> None:
 
 
 def test_zero_and_multiple_exact_apt_updates() -> None:
-    assert parse_apt_simulation(ZERO_SIMULATION) == ()
-    debian = parse_apt_simulation(DEBIAN_SIMULATION)
+    assert _sim(ZERO_SIMULATION) == ()
+    debian = _sim(DEBIAN_SIMULATION, entries=DEBIAN_INVENTORY)
     assert tuple(item.package_name for item in debian) == ("apt", "openssl")
     assert debian[1].installed_version == "3.0.11-1"
     assert debian[1].candidate_version == "3.0.11-1~deb12u3"
@@ -101,7 +130,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
     assert debian[0].security is None
     assert debian[0].architecture == "amd64"
     assert debian[1].architecture == "amd64"
-    ubuntu = parse_apt_simulation(UBUNTU_SIMULATION)
+    ubuntu = _sim(UBUNTU_SIMULATION, entries=UBUNTU_INVENTORY)
     assert ubuntu[0].origin == "Ubuntu:24.04/noble-updates"
     assert ubuntu[0].architecture == "amd64"
     assert ubuntu[0].security is None
@@ -110,6 +139,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
 @pytest.mark.parametrize(
     (
         "change",
+        "installed_entries",
         "expected_name",
         "expected_architecture",
         "expected_installed",
@@ -120,6 +150,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
     (
         (
             "Inst foo [1.0] (1.1 Debian:stable [amd64])",
+            (("foo", "amd64", "1.0"),),
             "foo",
             "amd64",
             "1.0",
@@ -129,6 +160,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
         ),
         (
             "Inst foo [1.0] (1.1 Debian:stable [amd64]) []",
+            (("foo", "amd64", "1.0"),),
             "foo",
             "amd64",
             "1.0",
@@ -140,6 +172,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
             "Inst liblastlog2-2 [2.41-5] "
             "(2.41.5-0+deb13u1 Debian-Security:13/stable-security [amd64]) "
             "[util-linux:amd64 on liblastlog2-2:amd64] [util-linux:amd64 ]",
+            (("liblastlog2-2", "amd64", "2.41-5"),),
             "liblastlog2-2",
             "amd64",
             "2.41-5",
@@ -150,6 +183,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
         (
             "Inst foo [1.0] (1.1 Debian:stable [amd64]) "
             "[util-linux:amd64 on foo:amd64]",
+            (("foo", "amd64", "1.0"),),
             "foo",
             "amd64",
             "1.0",
@@ -160,6 +194,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
         (
             "Inst bind9-host [1:9.20.23-1~deb13u1] "
             "(1:9.20.26-1~deb13u1 Debian-Security:13/stable-security [amd64]) []",
+            (("bind9-host", "amd64", "1:9.20.23-1~deb13u1"),),
             "bind9-host",
             "amd64",
             "1:9.20.23-1~deb13u1",
@@ -168,9 +203,12 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
             True,
         ),
         (
-            # Architecture: all -- no name qualifier, "all" in the bracket.
+            # Architecture: all -- no name qualifier, "all" in the bracket,
+            # and dpkg's own installed evidence independently says "all"
+            # too (live-confirmed on this repo's own devbox).
             "Inst linux-libc-dev [6.12.101-1] "
             "(6.12.107-1 Debian-Security:13/stable-security [all])",
+            (("linux-libc-dev", "all", "6.12.101-1"),),
             "linux-libc-dev",
             "all",
             "6.12.101-1",
@@ -181,8 +219,10 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
         (
             # Foreign architecture -- APT qualifies the name with ':i386'
             # (see ARCHITECTURE.md, "Binary package identity"); the bracket
-            # inside the parens still carries the same architecture.
+            # inside the parens still carries the same architecture, and
+            # dpkg's own installed evidence must independently agree.
             "Inst libc6:i386 [2.31-13] (2.31-13+deb11u7 Debian:11/stable [i386])",
+            (("libc6", "i386", "2.31-13"),),
             "libc6",
             "i386",
             "2.31-13",
@@ -194,6 +234,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
 )
 def test_realistic_apt_shortbreaks_suffix_is_not_material_plan_data(
     change: str,
+    installed_entries: tuple[tuple[str, str, str], ...],
     expected_name: str,
     expected_architecture: str,
     expected_installed: str,
@@ -201,8 +242,9 @@ def test_realistic_apt_shortbreaks_suffix_is_not_material_plan_data(
     expected_origin: str,
     expected_security: bool | None,
 ) -> None:
-    parsed = parse_apt_simulation(
-        f"{change}\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    parsed = _sim(
+        f"{change}\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=installed_entries,
     )
     assert parsed[0].package_name == expected_name
     assert parsed[0].architecture == expected_architecture
@@ -213,14 +255,16 @@ def test_realistic_apt_shortbreaks_suffix_is_not_material_plan_data(
 
 
 def test_shortbreaks_suffix_does_not_change_material_fingerprint() -> None:
-    plain = parse_apt_simulation(
+    plain = _sim(
         "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
-        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=(("foo", "amd64", "1.0"),),
     )
-    shortbreaks = parse_apt_simulation(
+    shortbreaks = _sim(
         "Inst foo [1.0] (1.1 Debian:stable [amd64]) "
         "[util-linux:amd64 on foo:amd64] [util-linux:amd64 ]\n"
-        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=(("foo", "amd64", "1.0"),),
     )
     assert plain == shortbreaks
     assert package_plan_fingerprint(plain) == package_plan_fingerprint(shortbreaks)
@@ -234,22 +278,39 @@ def test_same_package_name_two_architectures_remain_distinct() -> None:
         "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
         "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
     )
-    parsed = parse_apt_simulation(sim)
+    parsed = _sim(sim, entries=(("foo", "amd64", "1.0"), ("foo", "i386", "1.0")))
     assert len(parsed) == 2
     identities = {(item.package_name, item.architecture) for item in parsed}
     assert identities == {("foo", "amd64"), ("foo", "i386")}
 
 
-def test_architecture_only_difference_changes_the_fingerprint() -> None:
-    # Multiarch regression D: same name/installed/candidate, different
-    # architecture, must be a different material plan/fingerprint.
-    amd64 = parse_apt_simulation(
+def test_native_bare_name_resolves_unambiguously_beside_a_foreign_sibling() -> None:
+    # Multiarch regression E: a bare (unqualified) Inst name must resolve to
+    # the NATIVE-architecture installed row even when a foreign sibling of
+    # the same name is also independently installed.
+    sim = (
         "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
         "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
     )
-    i386 = parse_apt_simulation(
+    parsed = _sim(sim, entries=(("foo", "amd64", "1.0"), ("foo", "i386", "1.0")))
+    assert parsed == (
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))[0],
+    )
+    assert parsed[0].architecture == "amd64"
+
+
+def test_architecture_only_difference_changes_the_fingerprint() -> None:
+    # Multiarch regression D: same name/installed/candidate, different
+    # architecture, must be a different material plan/fingerprint.
+    amd64 = _sim(
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=(("foo", "amd64", "1.0"),),
+    )
+    i386 = _sim(
         "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
-        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=(("foo", "i386", "1.0"),),
     )
     assert amd64 != i386
     assert package_plan_fingerprint(amd64) != package_plan_fingerprint(i386)
@@ -258,15 +319,18 @@ def test_architecture_only_difference_changes_the_fingerprint() -> None:
 def test_package_row_order_does_not_change_the_fingerprint() -> None:
     # Multiarch regression I: canonical ordering is deterministic, so
     # equality/fingerprinting never depends on host-reported row order.
-    forward = parse_apt_simulation(
+    entries = (("apt", "amd64", "2.6.1"), ("foo", "i386", "1.0"))
+    forward = _sim(
         "Inst apt [2.6.1] (2.6.2 Debian:12/stable [amd64])\n"
         "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
-        "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=entries,
     )
-    reversed_order = parse_apt_simulation(
+    reversed_order = _sim(
         "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
         "Inst apt [2.6.1] (2.6.2 Debian:12/stable [amd64])\n"
-        "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=entries,
     )
     assert forward == reversed_order
     assert package_plan_fingerprint(forward) == package_plan_fingerprint(reversed_order)
@@ -274,20 +338,262 @@ def test_package_row_order_does_not_change_the_fingerprint() -> None:
 
 def test_installed_or_candidate_version_difference_changes_the_fingerprint() -> None:
     # Multiarch regression K/L.
-    base = parse_apt_simulation(
+    base = _sim(
         "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
-        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=(("foo", "amd64", "1.0"),),
     )
-    installed_changed = parse_apt_simulation(
+    installed_changed = _sim(
         "Inst foo [1.0.1] (1.1 Debian:stable [amd64])\n"
-        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=(("foo", "amd64", "1.0.1"),),
     )
-    candidate_changed = parse_apt_simulation(
+    candidate_changed = _sim(
         "Inst foo [1.0] (1.2 Debian:stable [amd64])\n"
-        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=(("foo", "amd64", "1.0"),),
     )
     assert package_plan_fingerprint(base) != package_plan_fingerprint(installed_changed)
     assert package_plan_fingerprint(base) != package_plan_fingerprint(candidate_changed)
+
+
+# ---------------------------------------------------------------------------
+# P2-1: installed binary-package identity is independently PROVEN, never
+# inferred from APT's own candidate architecture bracket alone.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_native_architecture_accepts_one_real_triplet() -> None:
+    assert parse_native_architecture("amd64\n") == "amd64"
+    assert parse_native_architecture("arm64") == "arm64"
+
+
+@pytest.mark.parametrize("text", ("all\n", "\n", "amd64\ni386\n", "AMD64\n", "amd 64\n", ""))
+def test_parse_native_architecture_fails_closed_on_malformed_or_ambiguous(text: str) -> None:
+    with pytest.raises(PackageScanParseError):
+        parse_native_architecture(text)
+
+
+def test_parse_installed_inventory_keeps_only_installed_status_rows() -> None:
+    text = (
+        "foo\tamd64\t1.0\tinstalled\n"
+        "bar\tamd64\t2.0\tconfig-files\n"
+        "baz\ti386\t3.0\thalf-configured\n"
+    )
+    assert parse_installed_inventory(text) == {("foo", "amd64"): "1.0"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "foo\tamd64\t1.0\n",  # missing status field
+        "foo\tamd64\t1.0\tunknown-status\n",  # unrecognized status word
+        "foo\tAMD64\t1.0\tinstalled\n",  # malformed architecture
+        "\tamd64\t1.0\tinstalled\n",  # empty name
+        "foo\tamd64\t1.0\tinstalled\nfoo\tamd64\t2.0\tinstalled\n",  # duplicate identity
+    ),
+)
+def test_parse_installed_inventory_fails_closed_on_malformed_rows(text: str) -> None:
+    with pytest.raises(PackageScanParseError):
+        parse_installed_inventory(text)
+
+
+def test_installed_architecture_all_from_dpkg_beside_native_apt_bracket_fails_closed() -> None:
+    # Regression F/G: installed amd64 -> candidate all (a cross-architecture
+    # transition) is out of scope and must fail closed, never silently
+    # relabeled from the candidate's own architecture bracket.
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [all])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_installed_architecture_native_from_dpkg_beside_all_apt_bracket_fails_closed() -> None:
+    # Regression G/reverse: installed all -> candidate amd64 also fails closed.
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "all", "1.0"),))
+
+
+def test_apt_qualified_name_contradicting_dpkg_architecture_fails_closed() -> None:
+    # Regression H: APT says foo:i386 but dpkg's own installed evidence only
+    # knows about foo/amd64.
+    sim = (
+        "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_apt_installed_version_disagreeing_with_dpkg_fails_closed() -> None:
+    # Regression I / race sanity: APT's own displayed installed version must
+    # match dpkg's independently observed installed version exactly.
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "0.9"),))
+
+
+def test_missing_installed_identity_fails_closed() -> None:
+    # Regression J: dpkg has no record at all of this package.
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=())
+
+
+def test_ambiguous_bare_name_installed_at_both_native_and_all_fails_closed() -> None:
+    # A bare Inst name resolving to BOTH the native architecture and "all"
+    # in dpkg's own evidence is a genuine ambiguity, not a case to guess.
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"), ("foo", "all", "1.0")))
+
+
+# ---------------------------------------------------------------------------
+# P2-2: every `Conf` (configure) action must be exactly bound to an approved
+# `Inst` row, and pre-existing unfinished dpkg state fails closed.
+# ---------------------------------------------------------------------------
+
+
+def test_ordinary_conf_bound_to_its_own_inst_is_accepted() -> None:
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Conf foo (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    parsed = _sim(sim, entries=(("foo", "amd64", "1.0"),))
+    assert tuple(p.package_name for p in parsed) == ("foo",)
+
+
+def test_two_upgraded_packages_each_configured_is_accepted() -> None:
+    sim = (
+        "Inst apt [2.6.1] (2.6.2 Debian:12/oldstable [amd64])\n"
+        "Inst openssl [3.0.11-1] (3.0.11-1~deb12u3 Debian-Security:12/oldstable-security [amd64])\n"
+        "Conf apt (2.6.2 Debian:12/oldstable [amd64])\n"
+        "Conf openssl (3.0.11-1~deb12u3 Debian-Security:12/oldstable-security [amd64])\n"
+        "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    parsed = _sim(sim, entries=DEBIAN_INVENTORY)
+    assert len(parsed) == 2
+
+
+def test_standalone_conf_with_no_approved_inst_fails_closed() -> None:
+    # Regression: a package configured but never approved as an Inst change
+    # must never silently disappear from the material plan.
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Conf bar (2.0 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_conf_candidate_version_mismatch_fails_closed() -> None:
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Conf foo (1.2 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_conf_architecture_mismatch_fails_closed() -> None:
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Conf foo:i386 (1.1 Debian:stable [i386])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_duplicate_conf_for_the_same_action_fails_closed() -> None:
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Conf foo (1.1 Debian:stable [amd64])\n"
+        "Conf foo (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_conf_broken_shape_fails_closed() -> None:
+    # pkgSimulate::RealConfigure's distinct "Conf <name> broken" shape (and
+    # the dependency-listing line that follows it) never matches the normal
+    # Conf grammar and must fail closed exactly like any other unparseable
+    # line, independent of whatever APT's own returncode does.
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Conf foo:amd64 broken\n"
+        " Depends:bar\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_zero_change_plan_with_a_standalone_conf_never_becomes_an_empty_match() -> None:
+    sim = (
+        "Conf bar (2.0 Debian:stable [amd64])\n"
+        "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim)
+
+
+def test_frozen_inst_rows_plus_fresh_extra_standalone_conf_never_matches() -> None:
+    # The exact scenario the execution gate cares about: a job's frozen
+    # material is one Inst row, but a fresh simulation additionally
+    # configures a package the job never approved.
+    frozen = _sim(
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        entries=(("foo", "amd64", "1.0"),),
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(
+            "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+            "Conf bar (2.0 Debian:stable [amd64])\n"
+            "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+            entries=(("foo", "amd64", "1.0"),),
+        )
+    assert frozen  # the frozen plan itself parses fine on its own
+
+
+def test_not_fully_installed_or_removed_fails_closed() -> None:
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "1 not fully installed or removed.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_zero_change_plan_with_unfinished_dpkg_state_fails_closed() -> None:
+    sim = (
+        "0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        "2 not fully installed or removed.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim)
 
 
 @pytest.mark.parametrize(
@@ -317,7 +623,7 @@ def test_installed_or_candidate_version_difference_changes_the_fingerprint() -> 
 )
 def test_malformed_or_inexact_simulation_fails_scan(text: str) -> None:
     with pytest.raises(PackageScanParseError):
-        parse_apt_simulation(text)
+        _sim(text, entries=(("foo", "amd64", "1.0"), ("apt", "amd64", "2.6.1")))
 
 
 def test_package_manager_busy_has_distinct_classification() -> None:
@@ -359,9 +665,12 @@ class FakeHelperRunner:
         os_release: str = 'ID=debian\nVERSION_ID="12"\n',
         apt_version: str = "apt 2.6.1 (amd64)\n",
         apt_version_returncode: int = 0,
+        native_architecture: str = "amd64\n",
+        installed_inventory: str = "",
         update_returncode: int = 0,
         update_stderr: str = "",
         simulation_returncode: int = 0,
+        simulation_stdout: str = ZERO_SIMULATION,
         simulation_stderr: str = "",
         remote_returncode: int | None = None,
         remote_stderr: str = "",
@@ -378,9 +687,12 @@ class FakeHelperRunner:
         self.os_release = os_release
         self.apt_version = apt_version
         self.apt_version_returncode = apt_version_returncode
+        self.native_architecture = native_architecture
+        self.installed_inventory = installed_inventory
         self.update_returncode = update_returncode
         self.update_stderr = update_stderr
         self.simulation_returncode = simulation_returncode
+        self.simulation_stdout = simulation_stdout
         self.simulation_stderr = simulation_stderr
         self.remote_returncode = remote_returncode
         self.remote_stderr = remote_stderr
@@ -447,9 +759,13 @@ class FakeHelperRunner:
         if "upgrade" in rendered:
             return helper.CommandResult(
                 self.simulation_returncode,
-                ZERO_SIMULATION.encode(),
+                self.simulation_stdout.encode(),
                 self.simulation_stderr.encode(),
             )
+        if "--print-architecture" in rendered:
+            return helper.CommandResult(0, self.native_architecture.encode(), b"")
+        if "dpkg-query" in rendered:
+            return helper.CommandResult(0, self.installed_inventory.encode(), b"")
         if "/var/run/reboot-required" in rendered:
             return helper.CommandResult(1, b"", b"")
         raise AssertionError(f"unexpected command shape: {argv!r}")
@@ -472,6 +788,8 @@ def test_helper_success_uses_only_fixed_pvesh_and_pct_shapes() -> None:
     response = helper.handle_request(_request(), runner=runner)
     assert response["ok"] is True
     assert response["reboot_required"] is None
+    assert response["native_architecture"] == "amd64\n"
+    assert response["installed_inventory"] == ""
     assert all(call[0] in {"pvesh", "pct"} for call in runner.calls)
     assert any(call[-2:] == ("apt-get", "--version") for call in runner.calls)
     assert any(
@@ -479,6 +797,8 @@ def test_helper_success_uses_only_fixed_pvesh_and_pct_shapes() -> None:
         for call in runner.calls
     )
     assert any(call[-3:] == ("apt-get", "-s", "upgrade") for call in runner.calls)
+    assert any(call[-2:] == ("dpkg", "--print-architecture") for call in runner.calls)
+    assert any(call[-3] == "dpkg-query" for call in runner.calls)
     assert not any("eval" in argument for call in runner.calls for argument in call)
 
 
@@ -624,7 +944,9 @@ def test_helper_routes_remote_node_lxc_execution_over_cluster_ssh() -> None:
     assert response["ok"] is True
     assert not any(call[0] == "pct" for call in runner.calls)
     ssh_calls = [call for call in runner.calls if call[0] == "ssh"]
-    assert len(ssh_calls) == 5
+    # os-release, apt-version, apt-get update, apt-get -s upgrade,
+    # dpkg --print-architecture, dpkg-query, reboot-required.
+    assert len(ssh_calls) == 7
     for call in ssh_calls:
         assert call[-2] == "root@pve-b"
         assert "BatchMode=yes" in call
@@ -634,6 +956,8 @@ def test_helper_routes_remote_node_lxc_execution_over_cluster_ssh() -> None:
         assert "eval" not in remote_command
     assert any("apt-get update -qq" in call[-1] for call in ssh_calls)
     assert any("apt-get -s upgrade" in call[-1] for call in ssh_calls)
+    assert any("dpkg --print-architecture" in call[-1] for call in ssh_calls)
+    assert any("dpkg-query -W" in call[-1] for call in ssh_calls)
 
 
 def test_helper_migration_between_validations_fails_closed_never_success() -> None:
@@ -738,6 +1062,8 @@ def test_ssh_host_control_pins_key_and_host_key_and_sends_json_on_stdin(tmp_path
             "ok": True,
             "context": request["context"],
             "os_release": 'ID=debian\nVERSION_ID="12"\n',
+            "native_architecture": "amd64\n",
+            "installed_inventory": "",
             "simulation": {"returncode": 0, "stdout": ZERO_SIMULATION},
             "reboot_required": None,
         }
@@ -755,6 +1081,8 @@ def test_ssh_host_control_pins_key_and_host_key_and_sends_json_on_stdin(tmp_path
     )
     result = client.scan_packages(run)
     assert result.simulation_stdout == ZERO_SIMULATION
+    assert result.native_architecture == "amd64\n"
+    assert result.installed_inventory == ""
     argv = captured["argv"]
     assert "StrictHostKeyChecking=yes" in argv
     assert any(str(item).startswith("UserKnownHostsFile=") for item in argv)

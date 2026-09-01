@@ -443,11 +443,46 @@ def handle_request(payload: Any, *, runner: Runner = _run_bounded) -> dict[str, 
         if simulation.returncode != 0:
             raise _package_failure("simulation", simulation_stderr)
 
+        # Independent, read-only proof of the guest's currently installed
+        # binary packages -- never inferred from APT's own candidate
+        # description, and read as close as possible to the simulation
+        # above to minimize the ordinary concurrent-package-manager race
+        # window between the two. See ARCHITECTURE.md, "Binary package
+        # identity".
+        _current_target(runner, vmid, expected_node)
+        native_arch_result = _run_guest_command(
+            runner, vmid, expected_node, local_node,
+            ("env", "LC_ALL=C", "dpkg", "--print-architecture"),
+            max_output=4096,
+        )
+        native_architecture, _ = _decode_output(native_arch_result)
+        if native_arch_result.returncode != 0:
+            raise ExecutionError(
+                "execution_failed", "could not determine guest native architecture"
+            )
+
+        _current_target(runner, vmid, expected_node)
+        inventory_result = _run_guest_command(
+            runner, vmid, expected_node, local_node,
+            (
+                "env", "LC_ALL=C", "dpkg-query", "-W",
+                "-f=${Package}\\t${Architecture}\\t${Version}\\t${db:Status-Status}\\n",
+            ),
+            max_output=32 * 1024 * 1024,
+        )
+        installed_inventory, _ = _decode_output(inventory_result)
+        if inventory_result.returncode != 0:
+            raise ExecutionError(
+                "execution_failed", "could not read guest installed package inventory"
+            )
+
         return {
             "response_version": 1,
             "ok": True,
             "context": context,
             "os_release": os_release,
+            "native_architecture": native_architecture,
+            "installed_inventory": installed_inventory,
             "simulation": {"returncode": 0, "stdout": simulation_stdout},
         }
     except ExecutionError as exc:
