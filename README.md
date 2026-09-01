@@ -49,7 +49,7 @@ key, or PVE mutation privilege is deployed. Healthchecks and rollback execution
 are not built yet — see `STATUS.md`.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v12 and has no migration from v11 or earlier. An existing
+schema is v13 and has no migration from v12 or earlier. An existing
 pre-release deployment uses
 `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
 authority schema, backs it up, and resets only the authority database (with

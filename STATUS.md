@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v12):
+  SQLite authority database (schema v13):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -17,10 +17,15 @@
   write-ahead uncertainty checkpoint, the observed PVE task identity, and
   SQL-level state-machine invariants over all of them. Schema v11 added the
   explicit, material `architecture` column to package rows (see
-  "Execution-time plan equality" below). Schema v12 adds the job-owned
+  "Execution-time plan equality" below). Schema v12 added the job-owned
   package mutation operation identity and SQL-level invariants tying both
-  mutation checkpoints to their durable facts in both directions (see
-  "Crash-safe package mutation" below).
+  mutation checkpoints to their durable facts in both directions. Schema v13
+  adds `accepted_prepared_evidence_digest` — the exact preparation evidence
+  the arming transaction accepted — written by the same single compare-and-set
+  statement as the checkpoint, the operation identity, and the timestamp, so
+  the mutation-arm facts are one indivisible write-ahead authority fact and
+  only the invocation carrying that digest can submit (see "Crash-safe
+  package mutation" below).
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus exactly
   one authority-only mutation,
   `PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
@@ -280,6 +285,43 @@ unimplemented future stage.
   authority while holding the authority store's writer lock -- a bounded
   round trip that never waits for the package command. A stale context there
   refuses before the host is ever called and is routed to the durable seal.
+- **Only the accepted evidence may submit.** The arming transaction also
+  commits `accepted_prepared_evidence_digest` in that same statement, and
+  reports `ARMED_NOW` only to the invocation that committed it; everyone
+  else gets `ALREADY_ARMED` and becomes recovery-only. The submission
+  critical section re-proves that digest before invoking the host callback,
+  refusing a mismatch with a narrow type that is deliberately not
+  seal-eligible. On the host side a PREPARE that finds an `intent` already
+  journaled refuses rather than overwriting its digest, so a concurrent
+  PREPARE can never replace the material authority bound itself to. An
+  orphaned intent — one whose backend died before arming — is therefore
+  never permission to execute: no later invocation can obtain its digest,
+  and the job, never having crossed the write-ahead boundary, is resolved by
+  the existing startup contract that interrupts `snapshot_confirmed` jobs
+  and frees the global slot.
+- **A pre-dpkg action gate binds the REAL invocation to the approved plan.**
+  The one real command installs a fixed, code-owned `DPkg::Pre-Install-Pkgs`
+  hook at protocol Version 3, so APT's own resolved action stream must
+  exactly equal the authority-accepted material before dpkg receives any
+  package operation. This closes the window in which APT metadata,
+  candidates, holds, pins, or sources change between preparation and
+  execution while installed versions still match. Verified against real APT
+  in an isolated APT root with a fake dpkg: a refusing hook leaves the dpkg
+  package-operation count at zero, a protocol below Version 3 is rejected,
+  and an ordinary guest `apt.conf.d` snippet can neither clear the hook nor
+  downgrade it. The gate is `/bin/sh` plus `sort`/`tail` -- `dash` and
+  `coreutils` are `Essential: yes`, so no new guest prerequisite -- staged
+  with the approved material as stdin payload bytes into the guest's own
+  tmpfs, never as command text. The independent dpkg post-state completion
+  proof is unchanged and still required: the gate prevents, the proof proves.
+- **Every guest command revalidates its own live target.** The invariant
+  lives in the helper's single fixed guest-command dispatcher rather than
+  with its callers, so no caller can amortize one check across two commands,
+  and the detached runner revalidates immediately before the real package
+  command. A VMID freed and reused after `submitted` is durable therefore
+  never receives the mutation; the operation journals a truthful terminal
+  failure, keeps ownership, and is never sealed as never-submitted or
+  retried.
 - **The one real command** is fixed argv with no package name, version,
   option, or command text from any caller: a non-interactive `-y` APT
   *upgrade* under `DEBIAN_FRONTEND=noninteractive` with
@@ -328,10 +370,22 @@ unimplemented future stage.
   updater path can reach any of this. The mutation helper is a separate dark
   file that is **not deployed**, with no key, no `authorized_keys` entry, and
   no PVE privilege, and the scan, snapshot, and execution-plan helpers gained
-  no mutation capability whatsoever. Healthcheck execution, rollback
-  submission, snapshot retention, and production activation remain later
-  stages. No real package mutation has been performed against any live guest;
-  operator Human0 validation of this stage has not been done.
+  no mutation capability whatsoever. The Version 3 action gate is likewise
+  never installed by bootstrap or the updater: it is generated per operation
+  and written into one guest's tmpfs only while that operation runs.
+  Healthcheck execution, rollback submission, snapshot retention, and
+  production activation remain later stages. No real package mutation has
+  been performed against any live guest; operator Human0 validation of this
+  stage has not been done.
+- **Correction completed internally (schema v13).** Three confirmed blockers
+  in this stage were closed: the real APT invocation is now bound to the
+  accepted plan by its own pre-dpkg Version 3 action gate; the accepted
+  preparation evidence is a durable authority fact that exactly one
+  invocation can commit and only that invocation can submit with; and every
+  guest command, including the detached runner's real package command,
+  revalidates its own live PVE target. The stage remains dark, no Human0
+  mutation has been performed, and healthcheck and rollback execution remain
+  future work.
 
 ## Next
 
@@ -352,9 +406,9 @@ unimplemented future stage.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v12 is incompatible with v11, v10, and v9, and there is
-  no in-place migration path. An existing installation now uses `deploy/update-proxmox-0.5.sh`
-  for this: it detects the incompatible authority schema, backs it up, and
+- Pre-release: schema v13 is incompatible with v12, v11, v10, and v9, and
+  there is no in-place migration path. An existing installation now uses
+  `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible authority schema, backs it up, and
   resets only the authority database (see "In-place product updates" below)
   while preserving the LXC, its VMID/network, PVE identity/token, and every
   other credential/config file. Home Assistant re-enrollment is required only

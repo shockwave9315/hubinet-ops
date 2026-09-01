@@ -114,6 +114,8 @@ package and cannot remove one -- that is a property of the package manager's
 own upgrade resolver, not a flag Hubinet sets. No package name, version,
 option, or command text supplied by anything else ever reaches it; the
 approved plan is used only to *refuse* the operation, never to build it.
+That stays true of the plan check described below: the approved plan reaches
+the guest as data in a file, never as part of any command.
 
 **Operator configuration is preserved.** A configuration file the operator
 edited is never silently overwritten by a package's version of it. The
@@ -126,10 +128,25 @@ the approved plan exactly. A changed plan fails closed (hard rule 2). A
 package that someone else changed in the meantime fails closed. Unfinished
 package-manager state on the guest fails closed.
 
-**Finishing is proven, not assumed.** A zero exit code is never treated as
-proof. Completion requires the guest's own package database to show every
-approved package at exactly its approved new version, nothing else changed at
-all, and no package left half-installed. Anything less is not "complete".
+**The operation cannot exceed its approved plan, even if the package
+manager's own view moves.** Package-manager locking does not span two
+separate invocations, so between the plan being re-proved and the upgrade
+running, an ordinary actor on the guest can refresh metadata, release a
+hold, add a source, or change a pin -- and the upgrade could then
+legitimately choose a different package or a different version while every
+installed version still matched the approved plan. So the real invocation's
+OWN resolved list of package operations is checked against the approved plan
+before the package manager is allowed to touch a single package. Anything
+extra, missing, changed, downgraded, removed, newly installed, or built for
+the wrong architecture aborts the operation with nothing changed. Detecting
+this afterwards would be too late; it is prevented.
+
+**Finishing is still proven, not assumed.** A zero exit code is never treated
+as proof, and neither is the check above -- that one prevents unapproved
+work from starting, it does not show the approved work finished. Completion
+requires the guest's own package database to show every approved package at
+exactly its approved new version, nothing else changed at all, and no
+package left half-installed. Anything less is not "complete".
 
 **A failed, partial, or unknown update never abandons the guest.** If the
 operation fails, times out, is interrupted, or cannot be proven, the job
