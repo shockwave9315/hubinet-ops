@@ -76,7 +76,17 @@ class PackageScanParseError(ValueError):
     """Exact material plan or OS/dpkg evidence was malformed."""
 
 
-@dataclass(frozen=True, slots=True)
+# Deliberately NOT `frozen=True`. This is an *exception*, and Python itself
+# assigns `__traceback__` to a live exception object while it propagates --
+# notably `contextlib._GeneratorContextManager.__exit__`, which every
+# `@contextmanager` (including the authority store's own transaction) goes
+# through. A frozen dataclass's generated `__setattr__` refuses that
+# assignment, and combined with `slots=True` it does not even fail cleanly:
+# the slots rewrite leaves `super(cls, self)` bound to the pre-slots class,
+# so the refusal surfaces as an unrelated `TypeError` that replaces the real
+# typed failure. A typed host failure must survive propagation through a
+# context manager unchanged, so this stays an ordinary slotted dataclass.
+@dataclass(slots=True)
 class HostScanFailure(Exception):
     failure_class: PackageScanFailure
     message: str
@@ -154,16 +164,69 @@ def parse_native_architecture(text: str) -> str:
     return value
 
 
-def parse_installed_inventory(text: str) -> dict[tuple[str, str], str]:
+#: dpkg's own status words, as ``db:Status-Status`` reports them (see
+#: ``dpkg-query(1)``). ``installed`` is the only one that means "this exact
+#: version is currently installed and configured"; ``not-installed`` and
+#: ``config-files`` are stable not-installed states. The remaining five are
+#: dpkg's genuinely *unfinished* states -- an interrupted unpack, configure,
+#: or trigger cycle -- and are never treated as evidence of an installed
+#: package.
+DPKG_STATUS_WORDS = frozenset(
+    {
+        "installed",
+        "not-installed",
+        "config-files",
+        "half-installed",
+        "unpacked",
+        "half-configured",
+        "triggers-awaited",
+        "triggers-pending",
+    }
+)
+
+#: The states that mean dpkg's own database is mid-transaction for a package.
+#: Their presence makes any statement about "the package state is now exactly
+#: X" ambiguous, so both the plan parser and the package-mutation completion
+#: proof fail closed on them rather than reasoning around them.
+DPKG_UNFINISHED_STATUS_WORDS = frozenset(
+    {
+        "half-installed",
+        "unpacked",
+        "half-configured",
+        "triggers-awaited",
+        "triggers-pending",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledInventoryState:
+    """The guest's complete, independently observed dpkg package state.
+
+    ``installed`` is every ``(package_name, architecture) -> version`` dpkg
+    itself reports as status ``installed``. ``unfinished`` is every
+    ``(package_name, architecture, status)`` dpkg reports in one of its
+    mid-transaction states -- separated rather than dropped, because "no
+    package is in an unfinished dpkg state" is itself a required
+    postcondition of a completed package mutation, and silently discarding
+    those rows would make an ambiguous guest look clean.
+    """
+
+    installed: dict[tuple[str, str], str]
+    unfinished: tuple[tuple[str, str, str], ...]
+
+
+def parse_installed_inventory_state(text: str) -> InstalledInventoryState:
     """Parse the guest's fixed, argument-less ``dpkg-query -W`` inventory.
 
     Independent, read-only proof of every currently *installed* binary
-    package's exact ``(name, architecture) -> version``, sourced from
-    dpkg's own status database rather than inferred from APT's candidate
-    description (see ARCHITECTURE.md, "Binary package identity"). Only rows
-    dpkg itself reports as status ``installed`` are kept; every other
-    status word (``config-files``, ``half-configured``, ...) is dropped,
-    never treated as evidence of a currently installed package.
+    package's exact ``(name, architecture) -> version``, sourced from dpkg's
+    own status database rather than inferred from APT's candidate
+    description (see ARCHITECTURE.md, "Binary package identity"), plus the
+    exact set of packages dpkg reports as mid-transaction.
+
+    This is the single implementation; :func:`parse_installed_inventory` is
+    the installed-only view every pre-existing caller keeps using unchanged.
     """
 
     if not isinstance(text, str) or len(text.encode("utf-8")) > 16 * 1024 * 1024:
@@ -171,6 +234,8 @@ def parse_installed_inventory(text: str) -> dict[tuple[str, str], str]:
             "installed package inventory evidence is missing or oversized"
         )
     inventory: dict[tuple[str, str], str] = {}
+    unfinished: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for raw_line in text.splitlines():
         if not raw_line:
             continue
@@ -180,24 +245,14 @@ def parse_installed_inventory(text: str) -> dict[tuple[str, str], str]:
                 "installed package inventory contains a malformed row"
             )
         name, architecture, version, status = fields
-        if status not in {
-            "installed",
-            "not-installed",
-            "config-files",
-            "half-installed",
-            "unpacked",
-            "half-configured",
-            "triggers-awaited",
-            "triggers-pending",
-        }:
+        if status not in DPKG_STATUS_WORDS:
             raise PackageScanParseError(
                 "installed package inventory contains an unknown status"
             )
-        if status != "installed":
+        if status == "not-installed":
             continue
         if (
             not name
-            or not version
             or len(name) > 300
             or len(version) > 500
             or not _ARCHITECTURE_RE.fullmatch(architecture)
@@ -206,12 +261,37 @@ def parse_installed_inventory(text: str) -> dict[tuple[str, str], str]:
                 "installed package inventory contains a malformed row"
             )
         identity = (name, architecture)
-        if identity in inventory:
+        if identity in seen:
             raise PackageScanParseError(
                 "installed package inventory contains a duplicate (name, architecture)"
             )
+        seen.add(identity)
+        if status in DPKG_UNFINISHED_STATUS_WORDS:
+            unfinished.append((name, architecture, status))
+            continue
+        if status != "installed":
+            # `config-files`: removed but not purged. Not installed, and not
+            # unfinished either.
+            continue
+        if not version:
+            raise PackageScanParseError(
+                "installed package inventory contains a malformed row"
+            )
         inventory[identity] = version
-    return inventory
+    return InstalledInventoryState(
+        installed=inventory, unfinished=tuple(sorted(unfinished))
+    )
+
+
+def parse_installed_inventory(text: str) -> dict[tuple[str, str], str]:
+    """The installed-only view of :func:`parse_installed_inventory_state`.
+
+    Only rows dpkg itself reports as status ``installed`` are kept; every
+    other status word (``config-files``, ``half-configured``, ...) is
+    dropped, never treated as evidence of a currently installed package.
+    """
+
+    return parse_installed_inventory_state(text).installed
 
 
 def _split_qualified_name(raw_name: str) -> tuple[str, str | None]:

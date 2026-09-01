@@ -1137,3 +1137,34 @@ def test_ssh_host_control_classifies_transport_bounds(
     )
     with pytest.raises(expected):
         client.scan_packages(_scan_run())
+
+
+def test_a_typed_host_failure_survives_context_manager_propagation() -> None:
+    """`HostScanFailure` must reach its handler unchanged, as itself.
+
+    Python assigns `__traceback__` to a live exception while it propagates,
+    and every `@contextmanager` -- including the authority store's own
+    transaction, which the package-mutation submission critical section
+    raises through -- does exactly that in `__exit__`. A frozen dataclass
+    exception refuses that assignment and, with `slots=True`, does not even
+    fail cleanly: it surfaces an unrelated `TypeError` in place of the real
+    typed failure, so a caller classifying host failures silently loses the
+    classification it needs to fail closed on.
+    """
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _transaction():
+        try:
+            yield
+        except BaseException:
+            raise
+
+    with pytest.raises(HostScanFailure) as raised:
+        with _transaction():
+            raise HostScanFailure(
+                PackageScanFailure.PACKAGE_MANAGER_BUSY, "APT or dpkg is busy"
+            )
+    assert raised.value.failure_class is PackageScanFailure.PACKAGE_MANAGER_BUSY
+    assert str(raised.value) == "APT or dpkg is busy"
