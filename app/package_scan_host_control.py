@@ -13,7 +13,7 @@ import subprocess
 import time
 from typing import Any
 
-from app.inventory import PackageScanFailure, PackageScanRun
+from app.inventory import BOUNDED_PROCESS_CLEANUP_SECONDS, PackageScanFailure, PackageScanRun
 from app.package_scan import HostScanFailure, HostScanResult, expected_host_context
 
 
@@ -77,7 +77,12 @@ def _bounded_process_runner(
                 break
     finally:
         selector.close()
-        process.wait(timeout=5)
+        # This is the reap allowance `app.inventory.contention_policy`
+        # attributes to a snapshot host critical section that actually times
+        # out -- it happens after `timeout` has elapsed but before this
+        # runner (and the caller's writer transaction, when this runner is
+        # reused by the snapshot host-control transport) returns.
+        process.wait(timeout=BOUNDED_PROCESS_CLEANUP_SECONDS)
     return BoundedProcessResult(
         process.returncode,
         bytes(output["stdout"][: max_output + 1]),

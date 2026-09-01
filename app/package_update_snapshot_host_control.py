@@ -20,7 +20,11 @@ from pathlib import Path
 import re
 from typing import Any
 
-from app.inventory import ObservedSnapshot, SnapshotOwnership
+from app.inventory import (
+    MAX_SNAPSHOT_HOST_TIMEOUT_SECONDS,
+    ObservedSnapshot,
+    SnapshotOwnership,
+)
 from app.package_scan_host_control import (
     BoundedProcessResult,
     ProcessRunner,
@@ -98,8 +102,20 @@ class SshPackageUpdateSnapshotHostControl:
             raise ValueError("host-control user is invalid")
         if type(port) is not int or not 1 <= port <= 65535:
             raise ValueError("host-control port is invalid")
-        if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 3600:
-            raise ValueError("host-control timeout is invalid")
+        if (
+            type(timeout_seconds) is not int
+            or not 1 <= timeout_seconds <= MAX_SNAPSHOT_HOST_TIMEOUT_SECONDS
+        ):
+            # This bound is deliberate, not the historical 3600s ceiling: a
+            # snapshot host critical section holds the authority store's
+            # writer lock for its whole duration (see
+            # `app.inventory.contention_policy`), so an uncapped timeout here
+            # would make ordinary concurrent writer contention effectively
+            # uncapped too, whatever the store's own wait budget says.
+            raise ValueError(
+                "host-control timeout must be between 1 and "
+                f"{MAX_SNAPSHOT_HOST_TIMEOUT_SECONDS} seconds"
+            )
         if (
             type(max_result_bytes) is not int
             or not 1024 <= max_result_bytes <= 16 * 1024 * 1024

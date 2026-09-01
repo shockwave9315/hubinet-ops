@@ -22,10 +22,16 @@ Scope is deliberately minimal:
 `ensure_pre_update_snapshot_submitted` is submission-only: it never polls a
 PVE task to completion. It journals the submission, invokes `pvesh create`
 at most once, records the task identity the instant PVE returns one, and
-returns immediately. The backend is expected to hold no lock of its own
-across this call (see `app/package_update_snapshot.py`), and it must not hold
-one across task completion either, so the helper never blocks here for PVE's
-own async task to finish. `inspect_job_snapshot_state` reads the journaled
+returns immediately. The backend DOES hold a lock of its own across this
+call -- its own authority store's short SQLite writer transaction, so a
+concurrent Hubinet writer cannot invalidate this job's authority in the gap
+between proving it and submitting (see
+`InventoryAuthority.execute_snapshot_submission_if_current` in
+`app/inventory/authority.py`, and the sized wait policy in
+`app/inventory/contention_policy.py`). What the backend must never do is hold
+that lock, or any lock, across PVE's own asynchronous task completion: this
+call itself never blocks for that, and neither does any caller-side
+transaction wrapping it. `inspect_job_snapshot_state` reads the journaled
 task's status exactly once, synchronously, alongside a fresh canonical
 listing -- fast, bounded, and repeatable from the caller's own bounded retry
 loop -- so completion is observed by the caller polling this cheap read
