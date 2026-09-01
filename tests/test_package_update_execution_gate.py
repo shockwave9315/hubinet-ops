@@ -548,11 +548,134 @@ def test_revalidate_or_release_never_terminalizes_a_job_off_this_checkpoint(
     # authority released" terminal write.
     clock, store, authority, resource, scan, approval = _approved_system(tmp_path)
     job = _issue(authority, resource, approval)
+    events_before = store.list_package_update_job_events(job.job_id)
     with pytest.raises(AuthorityConflict, match="not awaiting"):
         authority.revalidate_or_release_stale_package_update_execution(job.job_id)
     unchanged = store.package_update_job(job.job_id)
     assert unchanged.status is PackageUpdateJobStatus.ACTIVE
     assert unchanged.terminalized_at is None
+    events_after = store.list_package_update_job_events(job.job_id)
+    assert len(events_after) == len(events_before)
+    assert not any(
+        e.event_type is PackageUpdateEventType.EXECUTION_AUTHORITY_STALE_RELEASED
+        for e in events_after
+    )
+
+
+def test_revalidate_or_release_never_terminalizes_an_already_terminal_job(
+    tmp_path: Path,
+) -> None:
+    # Negative control (section 10.B): a job already terminal for an
+    # unrelated reason is preserved exactly, never overwritten with a
+    # stale-authority reason.
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    authority.recover_interrupted_package_update_jobs()
+    interrupted = store.package_update_job(job.job_id)
+    assert interrupted.status is PackageUpdateJobStatus.INTERRUPTED
+
+    with pytest.raises(AuthorityConflict, match="terminal"):
+        authority.revalidate_or_release_stale_package_update_execution(job.job_id)
+    still = store.package_update_job(job.job_id)
+    assert still.status is PackageUpdateJobStatus.INTERRUPTED
+    assert still.terminal_reason == interrupted.terminal_reason
+
+
+# ---------------------------------------------------------------------------
+# Witnesses: every ORDINARY way current authority can become obsolete for a
+# frozen job at this checkpoint releases the global slot -- not just a moved
+# resource/source context, but the world simply moving on from the approved
+# plan (a newer scan attempt, successful or not).
+# ---------------------------------------------------------------------------
+
+
+def test_a_newer_materially_different_successful_scan_releases_the_job(
+    tmp_path: Path,
+) -> None:
+    # Witness 1 (correction section 7): the latest successful exact plan for
+    # this resource changed after the job froze its own copy. Before this
+    # fix, `_package_update_job_authority_is_current` *raised* for this case
+    # instead of returning False, so the execution gate's stale-release path
+    # never ran and the job was stuck ACTIVE forever.
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    changed = tuple(
+        PackageScanPackage(
+            p.package_name, p.architecture, p.installed_version, "9.9.9",
+            p.origin, p.description, p.security,
+        )
+        for p in scan.packages
+    )
+    new_run = authority.issue_package_scan(resource.resource_id)
+    authority.finalize_successful_package_scan(
+        new_run.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=changed,
+        reboot_required=None,
+    )
+
+    current, decided = authority.revalidate_or_release_stale_package_update_execution(
+        job.job_id
+    )
+    assert current is False
+    assert decided.status is PackageUpdateJobStatus.BLOCKED
+    assert decided.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert decided.mutation_may_have_started_at is None
+    events = store.list_package_update_job_events(job.job_id)
+    assert events[-1].event_type is PackageUpdateEventType.EXECUTION_AUTHORITY_STALE_RELEASED
+
+    other_resource, other_scan, other_approval = _add_approved_resource(store, authority)
+    other_job = _issue(authority, other_resource, other_approval)
+    assert other_job.status is PackageUpdateJobStatus.ACTIVE
+
+
+def test_a_newer_failed_scan_releases_the_job_never_leaves_it_active(
+    tmp_path: Path,
+) -> None:
+    # Witness 2 (correction section 8): the latest scan attempt for this
+    # resource is now FAILED (current package state is UNKNOWN, per
+    # PRODUCT.md). The old frozen job can no longer be current execution
+    # authority for it -- this must release the job, not merely leave it
+    # ACTIVE waiting on an unknown current plan, and it must never be
+    # confused with treating the failure as an empty/zero plan.
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    failing_run = authority.issue_package_scan(resource.resource_id)
+    authority.finalize_failed_package_scan(
+        failing_run.scan_run_id,
+        failure_class=PackageScanFailure.GUEST_UNAVAILABLE,
+        error_message="guest unreachable",
+    )
+
+    current, decided = authority.revalidate_or_release_stale_package_update_execution(
+        job.job_id
+    )
+    assert current is False
+    assert decided.status is PackageUpdateJobStatus.BLOCKED
+    assert decided.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert decided.mutation_may_have_started_at is None
+
+    # A successor job is issuable once a fresh successful scan is approved.
+    other_resource, other_scan, other_approval = _add_approved_resource(store, authority)
+    other_job = _issue(authority, other_resource, other_approval)
+    assert other_job.status is PackageUpdateJobStatus.ACTIVE
+
+
+def test_evaluate_execution_plan_also_releases_on_a_newer_failed_scan(
+    tmp_path: Path,
+) -> None:
+    # The post-host equality transition must classify this exactly the same
+    # way as the pre-host check -- one shared definition of staleness.
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    failing_run = authority.issue_package_scan(resource.resource_id)
+    authority.finalize_failed_package_scan(
+        failing_run.scan_run_id,
+        failure_class=PackageScanFailure.GUEST_UNAVAILABLE,
+        error_message="guest unreachable",
+    )
+    outcome, decided = authority.evaluate_package_update_execution_plan(
+        job.job_id, scan.packages
+    )
+    assert outcome is PackageUpdateExecutionOutcome.AUTHORITY_STALE
+    assert decided.status is PackageUpdateJobStatus.BLOCKED
 
 
 def test_revalidate_or_release_is_idempotent_after_release(tmp_path: Path) -> None:

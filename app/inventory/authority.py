@@ -1279,9 +1279,9 @@ class InventoryAuthority:
             )
         return self._store.package_update_job(canonical_job_id)
 
-    def _package_update_job_authority_is_current(
+    def _package_update_job_current_authority_detail(
         self, connection: sqlite3.Connection, job: sqlite3.Row
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         """Re-prove every current-authority predicate inside ONE transaction.
 
         This is the whole "current authority still permits this job to
@@ -1294,9 +1294,23 @@ class InventoryAuthority:
         verify live PVE VMID/type/node facts, never a backend resource
         incarnation) would catch it.
 
-        Returns ``False`` for a stale resource/source context so the caller
-        can commit any freshness expiry materialized here before refusing.
-        Hard incoherences still raise.
+        Returns ``(True, None)`` when current, or ``(False, reason)`` for
+        every ORDINARY way current authority can no longer support this
+        frozen job -- a moved/changed resource or source context, or the
+        current world simply moving on from the approved plan (the latest
+        scan is no longer a successful exact plan, its context no longer
+        matches the job, its fingerprint changed, or its exact material
+        changed). None of these are invariant corruption: a background scan
+        can legitimately produce a different result at any time after this
+        job froze its own copy. ``reason`` is non-``None`` only for the
+        latter, plan-drift group, so :meth:`_package_update_job_authority_is_current`
+        can keep raising :class:`AuthorityConflict` for exactly the cases it
+        always has, unchanged, while callers that need to tell "not current"
+        apart from "hard failure" -- the execution-time plan gate -- can use
+        this method directly instead and treat every ``(False, ...)`` result
+        the same way. Hard incoherences (the job is terminal, an unsupported
+        frozen resource type, or a stored fingerprint that no longer matches
+        its own recomputation) still raise in both cases.
         """
 
         if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
@@ -1317,28 +1331,25 @@ class InventoryAuthority:
             self._package_scan_context_is_current(connection, job)
             and self._package_scan_source_context_is_current(connection, job)
         ):
-            return False
+            return False, None
 
         current = self._latest_package_scan_row(connection, str(job["resource_id"]))
         if current is None or (
             str(current["lifecycle"]) != PackageScanLifecycle.COMPLETED.value
             or str(current["outcome"]) != PackageScanOutcome.SUCCESS.value
         ):
-            raise AuthorityConflict(
-                "latest package scan attempt is not a successful exact plan"
-            )
+            return False, "latest package scan attempt is not a successful exact plan"
         if not (
             self._package_scan_is_current_and_approvable(connection, current)
             and self._package_scan_context_matches_job(current, job)
         ):
-            raise AuthorityConflict(
-                "latest package scan authority context does not match the job"
-            )
+            return False, "latest package scan authority context does not match the job"
+        # A stored fingerprint that no longer matches a recomputation from
+        # its own exact rows is corruption, not staleness; raised, not
+        # returned, by _successful_package_scan_fingerprint itself.
         fingerprint = self._successful_package_scan_fingerprint(connection, current)
         if fingerprint != str(job["approved_plan_fingerprint"]):
-            raise AuthorityConflict(
-                "latest package plan fingerprint does not match the job"
-            )
+            return False, "latest package plan fingerprint does not match the job"
         current_material = self._package_material_rows(
             connection,
             table="package_scan_packages",
@@ -1352,10 +1363,34 @@ class InventoryAuthority:
             owner_id=job_id,
         )
         if not current_material or current_material != job_material:
-            raise AuthorityConflict(
-                "current exact package material does not match the job"
-            )
-        return True
+            return False, "current exact package material does not match the job"
+        return True, None
+
+    def _package_update_job_authority_is_current(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> bool:
+        """Bool-returning current-authority proof, unchanged for existing callers.
+
+        A thin, behavior-preserving wrapper over
+        :meth:`_package_update_job_current_authority_detail`: every caller
+        predating the execution-time plan gate (preflight, snapshot intent,
+        snapshot submission, snapshot confirmation, the generic job
+        revalidation) keeps exactly its existing contract -- ``False`` for a
+        stale resource/source context, :class:`AuthorityConflict` raised for
+        the current world having moved on from the approved plan. See
+        ``evaluate_package_update_execution_plan`` /
+        ``revalidate_or_release_stale_package_update_execution`` for the
+        gate that instead needs to tell those two apart.
+        """
+
+        current, reason = self._package_update_job_current_authority_detail(
+            connection, job
+        )
+        if current:
+            return True
+        if reason is not None:
+            raise AuthorityConflict(reason)
+        return False
 
     def _snapshot_identity_in_transaction(
         self, connection: sqlite3.Connection, job: sqlite3.Row
@@ -2303,22 +2338,42 @@ class InventoryAuthority:
         restart -- which must never be the ordinary release mechanism (see
         ARCHITECTURE.md, "Execution-time plan equality").
 
+        Uses :meth:`_package_update_job_current_authority_detail` directly,
+        not the bool-returning :meth:`_package_update_job_authority_is_current`
+        wrapper: both of that method's "not current" cases -- a moved/
+        changed resource or source context, and the current world having
+        moved on from the approved plan entirely (the latest scan is no
+        longer a successful exact plan, its context no longer matches this
+        job, its fingerprint changed, or its exact material changed) -- are
+        equally ordinary staleness at THIS pre-mutation checkpoint and must
+        equally release the job, never leave it dangling ACTIVE merely
+        because the bool wrapper would have raised for one of them. A hard
+        incoherence (the job already terminal, an unsupported frozen
+        resource type, or a stored fingerprint that no longer matches its
+        own recomputation) still propagates as an uncaught exception here,
+        exactly as it always has -- never mislabeled as staleness, and never
+        turned into a stale-release write.
+
         Returns ``True`` (and has terminalized the job) when authority was
         proven stale here; ``False`` (job unchanged) when it is current.
         """
 
-        current_authority_holds = self._package_update_job_authority_is_current(
-            connection, job
+        current_authority_holds, stale_reason = (
+            self._package_update_job_current_authority_detail(connection, job)
         )
         job_id = str(job["job_id"])
         self._after_package_update_authority_proof(connection, job_id=job_id)
         if current_authority_holds:
             return False
         reason = (
-            "package update job's current resource/source/approval authority "
-            "became stale before package mutation; retained but released for "
-            "a fresh plan and job"
-        )
+            f"package update job's current resource/source/approval authority "
+            f"became stale before package mutation ({stale_reason})"
+            if stale_reason is not None
+            else (
+                "package update job's current resource/source/approval "
+                "authority became stale before package mutation"
+            )
+        ) + "; retained but released for a fresh plan and job"
         updated = connection.execute(
             "UPDATE package_update_jobs SET status='blocked', "
             "terminalized_at=?, terminal_reason=? "

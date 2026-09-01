@@ -990,6 +990,30 @@ this path: the checkpoint/status guard both entry points share raises an
 ordinary `AuthorityConflict` instead, and the job's actual terminal reason
 is never overwritten.
 
+**"Stale" means every ordinary way current authority can move past a frozen
+job, not only a moved resource or source.** The shared underlying proof
+(`_package_update_job_current_authority_detail`) classifies three ways, not
+two: **current** (everything still matches); **stale** -- the resource or
+source context drifted (a rotated transport trust revision, a replaced
+resource, ...), *or* the current world has simply moved past the approved
+plan itself (the latest scan for this resource is no longer a successful
+exact plan -- including a plain scan *failure*, which per `PRODUCT.md` means
+the current package state is unknown, not zero -- its context no longer
+matches this job, its fingerprint changed, or its exact material changed);
+and **hard failure** -- the job already terminal, an unsupported frozen
+resource type, or a stored fingerprint that no longer matches its own
+recomputation (structurally unreachable under the schema's own immutability
+triggers, but never silently reclassified if it ever were). Every "stale"
+case releases the job identically; only "hard failure" propagates as an
+exception instead, exactly as it always has. This one predicate backs two
+call sites with different needs: `_package_update_job_authority_is_current`
+(the pre-existing bool-returning form every other package-update transition
+still uses, completely unchanged -- `False` for context drift, an
+`AuthorityConflict` raise for plan drift, preserving each of their exact
+prior contracts) and `_terminalize_execution_gate_job_if_authority_stale`
+(which this gate uses instead, treating every stale case the same way:
+release, never raise past this checkpoint).
+
 A `MATCHED` result is deliberately not a durable mutation permit: it changes
 nothing about the job besides an append-only diagnostic event, and a future
 package-mutation stage MUST re-run this exact gate immediately before it
