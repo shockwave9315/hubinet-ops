@@ -96,9 +96,13 @@ development fallback, not a supported installation method.
 ## Development
 
 ```bash
-python -m pip install -r requirements.txt -r requirements-dev.txt
-pytest -q
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest -q
 ```
+
+On the established Linux devbox, reuse the existing `.venv` and `.venv-ha`
+described in `AGENTS.md`; do not recreate or reinstall them.
 
 Tests use a fake provider transport, fake clocks, and temporary SQLite
 databases. They never contact Proxmox, Home Assistant, or any private-network
@@ -108,21 +112,22 @@ Full validation, mirroring CI — run before publishing or merging a runtime
 change:
 
 ```bash
-python -m compileall -q app custom_components tests scripts
-pytest -q
+.venv/bin/python -m compileall -q app custom_components tests scripts
+.venv/bin/python -m pytest -q
 bash -n deploy/install-0.5.0-fresh.sh
 for f in deploy/bootstrap-proxmox-0.5.sh deploy/update-proxmox-0.5.sh deploy/lib/*.sh; do bash -n "$f"; done
-for f in deploy/bootstrap-proxmox-0.5.sh deploy/update-proxmox-0.5.sh deploy/lib/*.sh; do python scripts/validate_hermetic_shell_boundary.py "$f"; done
-python scripts/validate_yaml.py
-python scripts/check_tracked_files.py
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/update-proxmox-0.5.sh deploy/lib/*.sh; do .venv/bin/python scripts/validate_hermetic_shell_boundary.py "$f"; done
+.venv/bin/python scripts/validate_yaml.py
+.venv/bin/python scripts/check_tracked_files.py
 ```
 
 The Home Assistant integration suite is a separate, pinned dependency set and
 needs Python ≥ 3.14.2 on Linux:
 
 ```bash
-python -m pip install -r requirements-ha-test.txt
-python -m pytest -q --tb=short -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
+python3.14 -m venv .venv-ha
+.venv-ha/bin/python -m pip install -r requirements-ha-test.txt
+.venv-ha/bin/python -m pytest -q --tb=short -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
 ```
 
 `tests/test_bootstrap_proxmox_0_5_smoke.py` executes the real bootstrap script

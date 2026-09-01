@@ -68,13 +68,13 @@ authority is held stable through the submission boundary, and the host
 independently re-validates the live PVE target immediately before it ever
 submits.
 
-The one exception is not an inference but a proof: the host's durable
-operation journal can show that a failure happened while the operation was
-still at `intent`, which means the submission subprocess was never launched
-for it. Only that proof releases the job (terminalized `blocked`), so an
-ordinary pre-flight refusal on the host does not fence the single global
-destructive slot forever. Everything else -- a canonical absence, a lock, a
-timeout, a lost SSH answer, an unreadable journal -- stays uncertain.
+Transient `absent`/`intent` journal observations can route a job into the
+release path, but never release it: an already-launched helper may not have
+reached its host lease yet. The release path instead durably writes
+`sealed_not_submitted` through a third typed host operation, under the same
+per-VMID lease as submission, while the backend still holds its SQLite writer
+transaction. Only that seal releases the job. A delayed helper must obey it;
+every failed or unsupported seal stays uncertain and fenced.
 
 ## Verified PVE task semantics
 
@@ -110,6 +110,7 @@ from typing import Any, Protocol
 
 from app.inventory import (
     AuthorityConflict,
+    HostSubmissionState,
     InventoryAuthority,
     ObservedSnapshot,
     PackageUpdateCheckpoint,
@@ -148,32 +149,6 @@ class SnapshotOperationOutcome(StrEnum):
     #: write-ahead uncertainty checkpoint, and it is never inferred from a
     #: canonical absence, an error name, a timeout, or a transport failure.
     NOT_SUBMITTED = "not_submitted"
-
-
-class HostSubmissionState(StrEnum):
-    """The host's own durable journal phase for one snapshot operation.
-
-    Read directly off the host's journal, never inferred from canonical PVE
-    state or an error string. Only :attr:`ABSENT` and :attr:`INTENT` prove
-    that a NEW submission is still permitted; every other value means a
-    submission attempt may already have crossed PVE's door, and this exact
-    operation identity may never be submitted again.
-    """
-
-    #: No durable journal record exists at all for this operation identity.
-    ABSENT = "absent"
-    #: A journal record exists, but the submission subprocess was never
-    #: launched for it.
-    INTENT = "intent"
-    #: A submission attempt has begun. No task identity is known yet -- the
-    #: genuinely uncertain window. Never resubmit; recovery is one bounded
-    #: canonical read, not a retry loop.
-    SUBMITTED = "submitted"
-    #: PVE returned a task identity for this operation. The task itself may
-    #: still be running; poll it via ``inspect_job_snapshot_state``.
-    TASK_KNOWN = "task_known"
-    #: A final outcome was recorded for this operation identity.
-    TERMINAL = "terminal"
 
 
 class SnapshotTaskState(StrEnum):
@@ -266,6 +241,17 @@ class PackageUpdateSnapshotHostControl(Protocol):
         ownership: SnapshotOwnership,
     ) -> HostSnapshotResult:
         """Read current canonical state without submitting anything."""
+
+    def seal_operation_never_submitted(
+        self,
+        *,
+        snapshot_operation_id: str,
+        snapshot_name: str,
+        vmid: int,
+        expected_node: str,
+        ownership: SnapshotOwnership,
+    ) -> HostSnapshotResult:
+        """Durably forbid this exact operation from ever being submitted."""
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +399,11 @@ DEFAULT_TASK_POLL_INTERVAL_SECONDS = 2.0
 #: attempt may already have crossed PVE's door.
 _SUBMISSION_PERMITTED_STATES = (HostSubmissionState.ABSENT, HostSubmissionState.INTENT)
 
+#: A release proof is deliberately distinct from permission to submit. A
+#: transient absent/intent observation can be invalidated by a delayed helper;
+#: only the durable host seal may release the backend's global slot.
+_RELEASE_PROVED_STATES = (HostSubmissionState.SEALED_NOT_SUBMITTED,)
+
 
 class PackageUpdateSnapshotOrchestrator:
     """Coordinate authority and one dark host boundary for one snapshot.
@@ -496,6 +487,18 @@ class PackageUpdateSnapshotOrchestrator:
         # merely to recover evidence").
         result = self._read_inspection(job, identity, ownership)
 
+        if result.submission_state in _RELEASE_PROVED_STATES:
+            # A prior attempt may have durably sealed the host and then died
+            # before committing the backend block. Re-enter the idempotent
+            # seal under the backend writer lock to finish that transition.
+            return self._resolve_pre_submission_block(job, identity, ownership)
+
+        if result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED:
+            # A journal-backed transient pre-submit observation is routing
+            # evidence only. Seal before deciding whether the backend slot can
+            # be released; do not retry the PVE read through submission.
+            return self._resolve_pre_submission_block(job, identity, ownership)
+
         if result.submission_state in _SUBMISSION_PERMITTED_STATES:
             # E2. The host PROVED, from its own durable journal, that no
             # submission has ever crossed the door for this exact operation
@@ -541,13 +544,21 @@ class PackageUpdateSnapshotOrchestrator:
         identity: PackageUpdateSnapshotIdentity,
         ownership: SnapshotOwnership,
         result: HostSnapshotResult,
+        *,
+        allow_pre_submission_seal: bool = True,
     ) -> SnapshotStageResult:
         # F. Task polling and canonical recovery happen entirely outside the
         # authority critical section: every iteration here is a bounded,
         # read-only host inspection, never a resubmission and never a held
         # database writer lock.
         result = self._poll_until_resolved(job, identity, ownership, result)
-        return self._apply_host_result(job, identity, ownership, result)
+        return self._apply_host_result(
+            job,
+            identity,
+            ownership,
+            result,
+            allow_pre_submission_seal=allow_pre_submission_seal,
+        )
 
     def _resolve_pre_submission_block(
         self,
@@ -557,63 +568,63 @@ class PackageUpdateSnapshotOrchestrator:
     ) -> SnapshotStageResult:
         """Decide, and durably apply, a pre-submission release.
 
-        Reached whenever something claims this exact operation identity was
-        never submitted: a refused NEW-submission attempt (authority went
-        stale before the submission-only host callback ever ran, so the host
-        was never asked to submit anything), or a submission attempt whose
-        own host call proved ``not_submitted`` during its pre-submission
-        window. Neither of those facts alone may terminalize the job: that
-        must not fence this job's single global destructive slot forever
-        purely because Hubinet's own authority context moved on, but it also
-        must not race a concurrent, authorized submission that crosses the
-        door in the gap before the block is durably applied.
+        Reached when transient journal evidence says submission may still be
+        preventable, or when a prior attempt already reports the durable seal.
+        Neither ``absent`` nor ``intent`` may terminalize the job: a helper
+        launched by a dead backend may still be waiting to take its host
+        lease and submit afterward.
 
         Both are closed the same way, inside
         :meth:`InventoryAuthority.resolve_pre_submission_block`: a FRESH host
-        read -- never any read or claim this call started with -- taken
-        while that method's own transaction still owns the authority store's
-        writer lock, with the block committed in that SAME transaction when,
-        and only when, the fresh read still proves ``absent``/``intent``.
-        Trusting an earlier read, or the caller's own claim, would itself be
-        a race: another invocation can enter its own submission critical
-        section and actually submit in the gap between any earlier read and
-        this decision. `execute_snapshot_submission_if_current` only
-        serializes Hubinet's own writers against each other -- reconciliation
-        cannot invalidate authority while a submission critical section is
-        open -- so by the time this call's fresh read runs under the SAME
-        writer lock, any concurrent submission attempt that was authorized
-        has already crossed whatever durable host journal phase it reached
-        and released the lock, or has not yet been able to acquire it at
-        all; either way the two critical sections cannot interleave.
+        seal -- never an earlier observation -- is written while that method's
+        transaction still owns the authority-store writer lock. The seal and
+        every submitter use the same per-VMID host lease. If seal wins, the
+        delayed submitter must refuse; if submit wins, seal observes a
+        post-submission phase and refuses to release the job.
 
-        Anything the fresh read shows other than ``absent``/``intent`` -- a
-        submission already in flight, a terminal outcome, or the read itself
-        failing to prove anything -- is recovered through the ordinary
+        Anything the seal shows other than ``sealed_not_submitted`` -- a
+        submission already in flight, a terminal outcome, or the seal itself
+        failing -- is recovered through the ordinary
         evidence pipeline exactly as if this call had never happened: never
         released as unsubmitted, and never resubmitted.
         """
 
-        def _inspect() -> tuple[bool, str, HostSnapshotResult]:
-            fresh = self._read_inspection(job, identity, ownership)
-            proved_not_submitted = (
-                fresh.submission_state in _SUBMISSION_PERMITTED_STATES
-            )
-            reason = fresh.reason or (
-                "a fresh host read proves this operation was never submitted"
+        def _seal() -> tuple[HostSubmissionState | None, str, HostSnapshotResult]:
+            try:
+                fresh = self._host_control.seal_operation_never_submitted(
+                    snapshot_operation_id=identity.snapshot_operation_id,
+                    snapshot_name=identity.snapshot_name,
+                    vmid=job.expected_vmid,
+                    expected_node=job.expected_node_name,
+                    ownership=ownership,
+                )
+            except Exception as exc:  # noqa: BLE001 - an unreturned seal is unknown
+                fresh = HostSnapshotResult(
+                    outcome=SnapshotOperationOutcome.UNCERTAIN,
+                    snapshot_operation_id=identity.snapshot_operation_id,
+                    reason=(
+                        "snapshot host seal did not return an outcome: "
+                        f"{type(exc).__name__}"
+                    ),
+                )
+            fresh = self._validated(fresh, identity.snapshot_operation_id)
+            proved_not_submitted = fresh.submission_state in _RELEASE_PROVED_STATES
+            reason = (
+                "host durably sealed this snapshot operation before submission"
                 if proved_not_submitted
-                else "a fresh host read does not prove this operation was "
-                "never submitted"
+                else "host did not durably seal this snapshot operation before "
+                "submission"
             )
-            return proved_not_submitted, reason, fresh
+            return fresh.submission_state, reason, fresh
 
         try:
             blocked, fresh = self._authority.resolve_pre_submission_block(
-                job.job_id, _inspect
+                job.job_id, _seal
             )
         except Exception:  # noqa: BLE001 - a contradicted proof stays fenced
             return self._uncertain(
                 job.job_id,
-                "a fresh host read proved this operation was never submitted, "
+                "a durable host seal proved this operation was never submitted, "
                 "but durable job state contradicts it",
             )
 
@@ -623,7 +634,12 @@ class PackageUpdateSnapshotOrchestrator:
                 job=self._authority.package_update_job(job.job_id),
                 reason=fresh.reason,
             )
-        return self._finish(job, identity, ownership, fresh)
+        # The seal decision is attempted exactly once per orchestration path.
+        # If it did not prove the durable phase, ordinary evidence handling
+        # may fence/recover the job but must not recurse into another seal.
+        return self._finish(
+            job, identity, ownership, fresh, allow_pre_submission_seal=False
+        )
 
     def _read_inspection(
         self,
@@ -708,6 +724,8 @@ class PackageUpdateSnapshotOrchestrator:
         identity: PackageUpdateSnapshotIdentity,
         ownership: SnapshotOwnership,
         result: HostSnapshotResult,
+        *,
+        allow_pre_submission_seal: bool = True,
     ) -> SnapshotStageResult:
         job_id = job.job_id
         if (
@@ -732,12 +750,15 @@ class PackageUpdateSnapshotOrchestrator:
                 )
 
         if result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED:
-            # The host's classification here is never enough on its own to
-            # terminalize: the actual proof of non-submission must be
-            # re-derived fresh and applied atomically with the block, exactly
-            # like a refused NEW-submission attempt -- see
-            # _resolve_pre_submission_block.
-            return self._resolve_pre_submission_block(job, identity, ownership)
+            if allow_pre_submission_seal:
+                # A transient absent/intent observation only routes into the
+                # seal attempt. It is never itself a release proof.
+                return self._resolve_pre_submission_block(job, identity, ownership)
+            return self._uncertain(
+                job_id,
+                result.reason
+                or "snapshot operation was not durably sealed before submission",
+            )
 
         if result.outcome is SnapshotOperationOutcome.UNCERTAIN:
             return self._uncertain(
@@ -792,6 +813,44 @@ class PackageUpdateSnapshotOrchestrator:
             job_after = self._authority.confirm_package_update_snapshot(
                 job_id, result.snapshots
             )
+        except AuthorityConflict:
+            # Confirmation deliberately retains its current-authority bar:
+            # that is what grants rollback authority. If exact canonical
+            # success is independently re-proved while current authority is
+            # stale, retain the snapshot but terminalize without confirming.
+            try:
+                blocked, job_after = (
+                    self._authority.block_package_update_after_snapshot_success_with_stale_authority(
+                        job_id, result.snapshots
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - ambiguity stays fenced
+                return self._uncertain(
+                    job_id,
+                    "canonical snapshot confirmation failed closed: "
+                    f"{type(exc).__name__}",
+                )
+            if blocked:
+                return SnapshotStageResult(
+                    outcome=SnapshotOperationOutcome.COMPLETED,
+                    job=job_after,
+                    reason=(
+                        "snapshot exists but current package authority became "
+                        "stale; retained but not authorized for rollback"
+                    ),
+                )
+            # Authority became current again before the independent resolver
+            # ran. Retry normal confirmation once; never recurse.
+            try:
+                job_after = self._authority.confirm_package_update_snapshot(
+                    job_id, result.snapshots
+                )
+            except Exception as exc:  # noqa: BLE001 - bounded retry only
+                return self._uncertain(
+                    job_id,
+                    "canonical snapshot confirmation failed closed after "
+                    f"authority became current: {type(exc).__name__}",
+                )
         except Exception as exc:  # noqa: BLE001 - never confirm on ambiguity
             return self._uncertain(
                 job_id,

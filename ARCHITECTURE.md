@@ -108,19 +108,18 @@ confirmed snapshot simply retained — but leaves a
 slot, with its evidence fenced. It never replays a snapshot operation and
 never guesses an outcome.
 
-**Proved non-submission is not an inference.** Because that checkpoint is
-committed before the host is ever called, an ordinary pre-flight refusal on
-the host — a guest that moved off the job's frozen node, a guest that is
-gone, a failed PVE read — would otherwise fence the single global
-destructive slot forever, with no PVE mutation having been attempted at all.
-The host therefore answers every failure with a typed submission proof drawn
-from its durable operation journal. `not_submitted` is emitted only while
-that journal is still at `intent`, which — because the `intent -> submitted`
-transition is an fsynced atomic rename performed strictly before the
-submission subprocess is launched — proves the mutation was never launched
-for that operation identity. Only that proof terminalizes the job (as
-`blocked`, evidence retained), and authority additionally refuses it for any
-job that ever recorded a PVE task, since such a job provably *was* submitted.
+**Transient observation versus durable release proof.** Because that
+checkpoint is committed before the host is ever called, an ordinary
+pre-flight refusal — a moved or gone guest, or a failed PVE read — would
+otherwise fence the global destructive slot forever. The host journal has
+three evidence classes. `absent`/`intent` are transient pre-submission
+observations: they permit a NEW submission and may route the backend into its
+release path, but they may not release a job. A helper launched by a backend
+that then died may not have acquired its host lease yet.
+`sealed_not_submitted` is the durable no-future-submit fence and the only
+pre-submission release proof. `submitted`/`task_known`/`terminal` are
+post-submission evidence and remain fenced or recover through the ordinary
+evidence path.
 
 Everything else stays uncertain and fenced: a canonical absence, an
 in-flight guest lock, ambiguous ownership, a polling timeout, a lost SSH
@@ -176,25 +175,26 @@ canonical evidence, rather than fabricating a task identity it never saw.
 
 **Host-side durable journal.** `deploy/hubinet-package-snapshot-helper.py` is
 a separate file and a separate logical privilege boundary from the scan
-helper, which stays scan-only. It exposes two typed operations
-(`inspect_job_snapshot_state`, `ensure_pre_update_snapshot_submitted`), no
-delete, no rollback submission, no arbitrary shell or argv, and it re-derives
+helper, which stays scan-only. It exposes three typed operations
+(`inspect_job_snapshot_state`, `ensure_pre_update_snapshot_submitted`, and
+`seal_operation_never_submitted`), no delete, no rollback submission, no
+arbitrary shell or argv, and it re-derives
 the snapshot identity from the request's own ownership facts rather than
 trusting the name it was handed. `ensure_pre_update_snapshot_submitted` is
 submission-only: it never polls a PVE task to completion, so it returns the
 instant the operation has crossed (or is already past) its submission
-boundary. Each mutation is journaled on the PVE host under an `flock` held
-per VMID, keyed by the operation identity:
-`intent -> submitted -> task_known -> terminal`, each transition an fsynced
-atomic rename. A journal still reading `intent` proves submission was never
-attempted; `submitted` is the genuinely uncertain window and is **never**
-resubmitted — it may only be recovered as success on strict evidence (the
-exact snapshot, exact ownership metadata, complete, and the guest carrying no
-in-flight config lock), otherwise the answer is `uncertain`. An identical
-retry reattaches; the same operation identity with a different request is
-refused. Every response from either operation carries this exact phase as a
-typed `submission_state` field, so the backend never infers it from canonical
-PVE state or an error string.
+boundary. Each operation is journaled by operation identity on the PVE host,
+with submission and sealing serialized by an `flock` held per VMID. From
+`intent`, either seal wins and writes `sealed_not_submitted`, or submission
+wins and advances through
+`submitted -> task_known -> terminal`; every transition is an fsynced atomic
+rename. `sealed_not_submitted` can never transition to submission.
+`submitted` is the genuinely uncertain window and is **never** resubmitted.
+Taskless success uses one strict bar in both ensure and inspect recovery: the
+exact complete snapshot plus no relevant in-flight container lock. An
+identical retry reattaches; a mismatched request is refused. Every response
+carries the exact typed `submission_state`, so the backend never infers it
+from canonical PVE state or an error string.
 
 **The submission critical section.** The write-ahead checkpoint alone leaves
 a second, narrower race open: another Hubinet writer (discovery
@@ -215,8 +215,9 @@ orchestrator first reads the host's durable `submission_state` — a pure read
 that never requires current authority, because recovering evidence about an
 operation that may already have been submitted must never be discarded
 merely because authority has gone stale. Only `absent` and `intent` states
-permit a NEW submission; every other state skips the critical section
-entirely and goes straight to read-only recovery. Task polling and canonical
+permit a NEW submission; every other state skips the submission critical
+section. A seal is routed to the durable release path, while post-submission
+states go to read-only recovery. Task polling and canonical
 confirmation both happen strictly *after* the critical section releases its
 writer lock, through the same read-only `inspect_job_snapshot_state`
 operation, bounded by `PackageUpdateSnapshotOrchestrator`'s own retry loop —
@@ -242,74 +243,39 @@ between such a read and a later, separately-committed block.
 So a job is only ever released as unsubmitted from inside
 `InventoryAuthority.resolve_pre_submission_block` — the mirror image of
 `execute_snapshot_submission_if_current`, serialized against it through the
-SAME authority-store writer lock. It takes ONE fresh, bounded, read-only
-host inspection *while its own transaction still owns that lock*, and
-terminalizes the job in that SAME transaction if, and only if, the read
-still proves `absent`/`intent`. `PackageUpdateSnapshotOrchestrator` calls it
-whenever something claims this exact operation was never submitted — a
-refused NEW-submission attempt, or a submission attempt whose own host call
-proved `not_submitted` during its pre-submission window — and never trusts
-any earlier read or claim for the decision itself. Current package-update
-authority is deliberately NOT required to release a job this way: what is
-still enforced is that the job's own durable record is consistent with
-never having been submitted (no observed task, no confirmed snapshot).
-Anything the fresh read shows other than `absent`/`intent` (a submission
-already in flight, a terminal outcome, or the read itself failing to prove
-anything) is recovered through the ordinary evidence pipeline exactly as if
-the call had never happened — never released as unsubmitted, and never
-resubmitted.
+SAME authority-store writer lock. It invokes ONE bounded host seal while its
+transaction owns that lock and terminalizes in the SAME transaction only when
+the host durably returns `sealed_not_submitted`. Current package-update
+authority is deliberately not required; the job must still be active at
+`snapshot_may_have_started`, with no observed task and no confirmation.
+Anything other than the seal — post-submission state, lease contention, an
+older helper, or a lost/malformed response — remains fenced and follows the
+ordinary evidence path. The seal performs no PVE reads, so a moved or deleted
+guest does not need to exist on the frozen node for liveness.
 
-This closes both interleavings symmetrically. If a submission critical
-section begins first, it owns the writer lock, the block operation waits,
-the submission-only helper durably advances the host journal to at least
-`submitted` before `pvesh create`, and only once that section ends and
-releases the lock does the block's own fresh inspection run — and it then
-correctly sees the submission and refuses to terminalize. If the block
-critical section begins first, it owns the writer lock, its fresh
-inspection proves `absent`/`intent`, it terminalizes the job in that same
-transaction, and only once it ends and releases the lock can a later
-submission attempt acquire it — where it now finds a terminal job and
-refuses before its own submission-only callback ever runs. Either way the
-two critical sections cannot interleave, because both hold the same one
-writer lock the authority store's `BEGIN IMMEDIATE` provides — regardless of
-whether Hubinet's authority state happens to be monotonic: authority can
-legitimately go stale and become current again (a package scan that stops,
-then resumes, matching a job's frozen plan, say), and neither critical
-section's safety depends on it staying in either state.
+**Two serialization layers, not one.** The SQLite writer lock serializes
+Hubinet's submission and release transactions. The host's SAME non-blocking
+per-VMID `VmidMutationLock` serializes submission, inspection, and sealing
+across independent helper processes. If submit takes the host lease first, it
+durably reaches at least `submitted` before `pvesh create`, and the later seal
+refuses. If seal takes the lease first, it durably writes
+`sealed_not_submitted`; a helper launched earlier but delayed before its own
+lease acquisition reads that phase when it finally starts and must never
+submit. `operation_in_progress` stays UNCERTAIN. Each inspection releases the
+host lease before returning, and task polling holds neither the host lease nor
+the SQLite writer lock across a wait. This serialization claims no historical
+LXC incarnation identity; the backend retains `resource_id`/continuity
+authority while the helper validates only current PVE facts.
 
-Neither critical section ever holds that writer lock for anything beyond
-one bounded round trip: the submission-only host call never polls a PVE
-task to completion, and the block's own inspection is the same single
-bounded read `inspect_job_snapshot_state` always performs. Task polling and
-canonical confirmation happen strictly outside both, through the
-orchestrator's own read-only retry loop.
-
-**Two serialization layers, not one.** The backend's SQLite writer lock
-serializes Hubinet's own two critical sections against each other, but a
-backend that lost that lock -- crashed, restarted, or is simply a separate
-later attempt -- cannot infer that a submission-only mutator it once invoked
-on the PVE host is also gone: that mutator is a separate process there, and
-SSH dropping or the backend dying does not kill it. It may still be alive,
-still holding its per-VMID mutation lease (`VmidMutationLock`), still
-between its own durable journal phases -- lease held, journal not yet
-advanced past `intent` -- exactly while a fresh inspection reads that same
-journal. So `inspect_job_snapshot_state` joins that SAME lease, acquired
-non-blocking and released before it returns: if the lease is already held it
-reports `operation_in_progress`, which resolves to UNCERTAIN and can never
-be parsed as `not_submitted`/`absent`/`intent` proof, so
-`resolve_pre_submission_block` never terminalizes a job whose remote
-mutator may still be mid-flight. This does not make inspection a mutating
-operation -- no journal write, no `pvesh create`, still one bounded host
-read -- and each individual `inspect_job_snapshot_state` call acquires and
-releases the lease on its own, so the orchestrator's polling loop never
-holds it (or the SQLite writer lock) across a wait. Once the mutator
-genuinely finishes, either by failing before `submitted` (a later fresh
-inspection then safely proves `intent`) or by crossing the door (a later
-fresh inspection then correctly sees `submitted`/`task_known` and refuses
-to release the job), a later attempt observes the truth because the lease
-serializes the two exactly as SQLite's writer lock serializes the backend's
-own critical sections against each other -- one on the backend, one on the
-host, each closing the seam the other cannot see.
+**Successful snapshot with stale authority.** Confirmation still requires
+current authority because confirmation grants rollback authority. If a fresh
+canonical listing independently proves the exact complete same-job snapshot
+but current package/resource/source authority is stale, a separate authority
+transaction retains all snapshot/task evidence and terminalizes the job as
+`blocked` without setting `snapshot_confirmed_at` or advancing the checkpoint.
+The global slot is released, but rollback selection refuses the terminal,
+unconfirmed job. If authority is current again when that resolver runs, it
+does not terminalize and normal confirmation may proceed.
 
 **Same-job rollback.** A job may roll back only to the snapshot that exact job
 created and confirmed. `select_package_update_rollback_target` re-proves the

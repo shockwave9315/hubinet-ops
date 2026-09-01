@@ -43,6 +43,17 @@ class PackageUpdateJobStatus(StrEnum):
     MANUAL_INTERVENTION = "manual_intervention"
 
 
+class HostSubmissionState(StrEnum):
+    """Durable host journal phase for one snapshot operation."""
+
+    ABSENT = "absent"
+    INTENT = "intent"
+    SEALED_NOT_SUBMITTED = "sealed_not_submitted"
+    SUBMITTED = "submitted"
+    TASK_KNOWN = "task_known"
+    TERMINAL = "terminal"
+
+
 class PackageUpdateCheckpoint(StrEnum):
     ISSUED = "issued"
     PREFLIGHT_PASSED = "preflight_passed"
@@ -104,6 +115,7 @@ class PackageUpdateEventType(StrEnum):
     SNAPSHOT_OUTCOME_UNCERTAIN = "snapshot_outcome_uncertain"
     SNAPSHOT_FAILED = "snapshot_failed"
     SNAPSHOT_BLOCKED_BEFORE_SUBMISSION = "snapshot_blocked_before_submission"
+    SNAPSHOT_RETAINED_AUTHORITY_STALE = "snapshot_retained_authority_stale"
 
 
 class PackageScanFailure(StrEnum):

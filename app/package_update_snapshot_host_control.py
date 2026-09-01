@@ -59,6 +59,7 @@ _OUTCOMES = {
     "failed": SnapshotOperationOutcome.FAILED,
     "uncertain": SnapshotOperationOutcome.UNCERTAIN,
     "absent": SnapshotOperationOutcome.UNCERTAIN,
+    "not_submitted": SnapshotOperationOutcome.NOT_SUBMITTED,
 }
 
 #: The one token that may downgrade a host failure from "unknown" to "proved
@@ -155,6 +156,24 @@ class SshPackageUpdateSnapshotHostControl:
             ownership=ownership,
         )
 
+    def seal_operation_never_submitted(
+        self,
+        *,
+        snapshot_operation_id: str,
+        snapshot_name: str,
+        vmid: int,
+        expected_node: str,
+        ownership: SnapshotOwnership,
+    ) -> HostSnapshotResult:
+        return self._request(
+            "seal_operation_never_submitted",
+            snapshot_operation_id=snapshot_operation_id,
+            snapshot_name=snapshot_name,
+            vmid=vmid,
+            expected_node=expected_node,
+            ownership=ownership,
+        )
+
     # -- transport -------------------------------------------------------
 
     def _request(
@@ -170,6 +189,7 @@ class SshPackageUpdateSnapshotHostControl:
         if operation not in (
             "ensure_pre_update_snapshot_submitted",
             "inspect_job_snapshot_state",
+            "seal_operation_never_submitted",
         ):
             raise ValueError("unsupported snapshot host-control operation")
         if type(vmid) is not int or not 100 <= vmid <= 999_999_999:
@@ -237,6 +257,12 @@ class SshPackageUpdateSnapshotHostControl:
             "ForwardAgent=no",
             "-o",
             "ClearAllForwardings=yes",
+            "-o",
+            f"ConnectTimeout={min(30, self._timeout_seconds)}",
+            "-o",
+            f"ServerAliveInterval={min(15, max(1, self._timeout_seconds // 3))}",
+            "-o",
+            "ServerAliveCountMax=2",
             f"{self._user}@{self._host}",
         )
 
@@ -289,16 +315,16 @@ class SshPackageUpdateSnapshotHostControl:
                 ]
                 submission = error.get("submission")
             if submission == _HELPER_NOT_SUBMITTED:
-                # The host proved from its durable journal that this exact
-                # operation never crossed its submission boundary. Note this
-                # is keyed off that explicit proof, never off `classification`
-                # -- the same classification raised after submission stays
-                # uncertain.
+                # The helper read a pre-submission journal phase. This is
+                # routing evidence for the durable seal attempt, never itself
+                # a backend release proof. It is keyed off the exact token,
+                # never `classification`; the same classification after
+                # submission stays uncertain.
                 return HostSnapshotResult(
                     outcome=SnapshotOperationOutcome.NOT_SUBMITTED,
                     snapshot_operation_id=snapshot_operation_id,
                     reason=(
-                        "host proved no snapshot mutation was submitted "
+                        "host journal was pre-submission "
                         f"({classification})"
                     ),
                 )
@@ -349,6 +375,17 @@ class SshPackageUpdateSnapshotHostControl:
                     snapshot_operation_id,
                     "host-control returned an unknown submission state",
                 )
+        if not self._response_fields_are_consistent(
+            outcome=outcome,
+            submission_state=submission_state,
+            task_upid=task_upid,
+            task=task,
+            snapshots=snapshots,
+        ):
+            return self._uncertain(
+                snapshot_operation_id,
+                "host-control returned contradictory snapshot operation fields",
+            )
         return HostSnapshotResult(
             outcome=outcome,
             snapshot_operation_id=snapshot_operation_id,
@@ -358,6 +395,61 @@ class SshPackageUpdateSnapshotHostControl:
             reason=str(reason)[:500] if isinstance(reason, str) else None,
             submission_state=submission_state,
         )
+
+    @staticmethod
+    def _response_fields_are_consistent(
+        *,
+        outcome: SnapshotOperationOutcome,
+        submission_state: HostSubmissionState | None,
+        task_upid: str | None,
+        task: Any,
+        snapshots: tuple[ObservedSnapshot, ...] | None,
+    ) -> bool:
+        if task is not None and (task_upid is None or task.upid != task_upid):
+            return False
+        if submission_state is None:
+            return task is None or task_upid is not None
+        if submission_state in (
+            HostSubmissionState.ABSENT,
+            HostSubmissionState.INTENT,
+        ):
+            return (
+                task_upid is None
+                and task is None
+                and outcome
+                in (
+                    SnapshotOperationOutcome.UNCERTAIN,
+                    SnapshotOperationOutcome.NOT_SUBMITTED,
+                )
+            )
+        if submission_state is HostSubmissionState.SEALED_NOT_SUBMITTED:
+            return (
+                outcome is SnapshotOperationOutcome.NOT_SUBMITTED
+                and task_upid is None
+                and task is None
+                and snapshots is None
+            )
+        if submission_state is HostSubmissionState.SUBMITTED:
+            return (
+                task_upid is None
+                and task is None
+                and outcome
+                in (
+                    SnapshotOperationOutcome.UNCERTAIN,
+                    SnapshotOperationOutcome.COMPLETED,
+                )
+            )
+        if submission_state is HostSubmissionState.TASK_KNOWN:
+            return (
+                task_upid is not None
+                and outcome is not SnapshotOperationOutcome.NOT_SUBMITTED
+            )
+        if submission_state is HostSubmissionState.TERMINAL:
+            return (
+                outcome is not SnapshotOperationOutcome.NOT_SUBMITTED
+                and (task is None or task.terminal)
+            )
+        return False
 
     @staticmethod
     def _uncertain(snapshot_operation_id: str, reason: str) -> HostSnapshotResult:

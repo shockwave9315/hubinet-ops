@@ -22,6 +22,7 @@ from .models import (
     AuthorityNotFound,
     DiscoveryRun,
     DiscoveryRunLifecycle,
+    HostSubmissionState,
     InventorySourceState,
     ObservedSnapshot,
     PackageScanFailure,
@@ -1791,6 +1792,90 @@ class InventoryAuthority:
             )
         return self._store.package_update_job(canonical_job_id)
 
+    def block_package_update_after_snapshot_success_with_stale_authority(
+        self, job_id: str, observed: Sequence[ObservedSnapshot]
+    ) -> tuple[bool, PackageUpdateJob]:
+        """Retain a proven snapshot but release a job whose authority is stale.
+
+        Confirmation grants rollback authority and therefore keeps its current
+        package/resource/source-authority requirement. This resolver instead
+        re-proves exact canonical same-job success and stale current authority
+        inside one transaction, then terminalizes without confirming. If
+        authority is current again, it leaves the job active for confirmation.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        snapshots = _require_observed_snapshots(observed)
+        blocked = False
+        reason = (
+            "snapshot exists but current package authority became stale; "
+            "retained but not authorized for rollback"
+        )
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            if job["snapshot_confirmed_at"] is not None:
+                raise AuthorityInvariantError(
+                    "package update job snapshot confirmation is inconsistent"
+                )
+
+            # Never inherit success from a caught exception or host outcome:
+            # prove the exact canonical snapshot again in this transaction.
+            self._require_exactly_one_job_owned_snapshot(
+                job_id=canonical_job_id,
+                expected_name=str(job["snapshot_name"]),
+                observed=snapshots,
+                expected=self._snapshot_ownership_in_transaction(connection, job),
+            )
+            try:
+                current_authority_holds = (
+                    self._package_update_job_authority_is_current(connection, job)
+                )
+            except AuthorityConflict:
+                # Job lifecycle and canonical success were independently
+                # established above. Remaining conflicts are failures of the
+                # current package/source/resource authority predicate.
+                current_authority_holds = False
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if not current_authority_holds:
+                terminalized_at = _timestamp(self._now())
+                updated = connection.execute(
+                    "UPDATE package_update_jobs SET status='blocked', "
+                    "terminalized_at=?, terminal_reason=? "
+                    "WHERE job_id=? AND status='active' "
+                    "AND checkpoint='snapshot_may_have_started' "
+                    "AND snapshot_confirmed_at IS NULL",
+                    (terminalized_at, reason, canonical_job_id),
+                )
+                if updated.rowcount != 1:
+                    raise AuthorityConflict(
+                        "stale-authority snapshot retention lost durable ownership"
+                    )
+                self._append_package_update_job_event(
+                    connection,
+                    job_id=canonical_job_id,
+                    created_at=terminalized_at,
+                    level=PackageUpdateEventLevel.WARNING,
+                    stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+                    event_type=(
+                        PackageUpdateEventType.SNAPSHOT_RETAINED_AUTHORITY_STALE
+                    ),
+                    message=reason,
+                    details={"snapshot_name": str(job["snapshot_name"])},
+                )
+                blocked = True
+        return blocked, self._store.package_update_job(canonical_job_id)
+
     def record_package_update_snapshot_uncertain(
         self, job_id: str, reason: str
     ) -> PackageUpdateJob:
@@ -1894,7 +1979,9 @@ class InventoryAuthority:
         return self._store.package_update_job(canonical_job_id)
 
     def resolve_pre_submission_block(
-        self, job_id: str, inspect: Callable[[], tuple[bool, str, _T]]
+        self,
+        job_id: str,
+        seal: Callable[[], tuple[HostSubmissionState | None, str, _T]],
     ) -> tuple[bool, _T]:
         """Atomically decide, and durably apply, a pre-submission block.
 
@@ -1907,16 +1994,15 @@ class InventoryAuthority:
         commit race just like the one that method itself closes, mirrored
         onto the release path instead of the submission path.
 
-        ``inspect`` performs exactly ONE bounded, read-only host inspection
-        -- never a resubmission, never a poll loop, never task polling -- and
-        returns ``(host_proves_not_submitted, reason, evidence)``. It is
+        ``seal`` performs exactly ONE bounded typed host seal operation --
+        never a PVE read, resubmission, or poll loop -- and returns
+        ``(host_submission_state, reason, evidence)``. It is
         invoked at most once, while this transaction still owns the writer
         lock, so no concurrent :meth:`execute_snapshot_submission_if_current`
         critical section can interleave between the proof and the block:
         whichever critical section acquires the store's one writer lock first
-        is the one that observes truthful host state, and the other observes
-        whatever the first left behind (a submitted/task_known/terminal
-        journal, or a still-durable block).
+        reaches the host boundary first. The host's own per-VMID lease then
+        orders the durable seal against every delayed submitter.
 
         This is the ONLY way a job past ``snapshot_may_have_started`` may be
         terminalized without canonical PVE evidence, and it exists because the
@@ -1935,9 +2021,9 @@ class InventoryAuthority:
         still at the write-ahead checkpoint, no observed PVE task, and no
         confirmed snapshot. A job that ever recorded a task identity provably
         *was* submitted and can never be released down this path, whatever
-        ``inspect`` reports.
+        ``seal`` reports.
 
-        Returns whether the job was blocked, plus whatever ``inspect``
+        Returns whether the job was blocked, plus whatever ``seal``
         returned as evidence either way, so the caller can recover through
         the ordinary pipeline when it was not.
         """
@@ -1965,14 +2051,14 @@ class InventoryAuthority:
                 raise AuthorityInvariantError(
                     "package update job snapshot confirmation is inconsistent"
                 )
-            # The fresh host proof happens HERE, while this transaction still
+            # The durable host seal happens HERE, while this transaction still
             # owns the writer lock -- never before BEGIN IMMEDIATE, and never
             # trusted if merely supplied by the caller as a precomputed value.
-            proved_not_submitted, reason, evidence = inspect()
+            submission_state, reason, evidence = seal()
             self._after_pre_submission_block_proof(
                 connection, job_id=canonical_job_id
             )
-            if proved_not_submitted:
+            if submission_state is HostSubmissionState.SEALED_NOT_SUBMITTED:
                 self._commit_pre_submission_block(
                     connection,
                     job_id=canonical_job_id,
@@ -2345,7 +2431,7 @@ class InventoryAuthority:
         self, connection: sqlite3.Connection, *, job_id: str
     ) -> None:
         """Test seam inside :meth:`resolve_pre_submission_block`'s transaction,
-        after the fresh host proof and before the durable block it may
+        after the durable host seal and before the backend block it may
         authorize. Both are in one transaction, so this is exactly the point
         where an interleaving submission critical section would otherwise be
         able to race the block.

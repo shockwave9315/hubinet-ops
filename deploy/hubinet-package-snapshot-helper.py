@@ -11,8 +11,9 @@ and is never extended into a mutation helper.
 Scope is deliberately minimal:
 
 - LXC only.
-- Exactly two typed operations: `inspect_job_snapshot_state` and
-  `ensure_pre_update_snapshot_submitted`.
+- Exactly three typed operations: `inspect_job_snapshot_state`,
+  `ensure_pre_update_snapshot_submitted`, and the narrow
+  `seal_operation_never_submitted` fence.
 - No arbitrary shell, no command string, no caller-supplied argv, no generic
   action dispatcher. Every `pvesh` argv is built from this file's own fixed
   constants plus validated typed fields.
@@ -37,12 +38,11 @@ uses, acquired non-blocking and released before it returns. A backend that
 lost its own lock (crashed, restarted, or is simply a later attempt) cannot
 otherwise tell that a mutating call it once invoked is still alive on this
 host, still between its own durable phases; without joining that lease, a
-concurrent inspection could read a stale `intent` while a live mutator was
-about to advance past it, and hand a caller false proof that nothing was
-ever submitted. If the lease is already held, this reports
+    concurrent inspection could read `intent` while a live mutator was about
+    to advance past it, and hand a caller stale routing evidence. If the lease is already held, this reports
 `operation_in_progress`, exactly as the mutating operation does for the
-identical reason -- never inferred as `not_submitted`, `absent`, or
-`intent` proof, and never worth retrying inside this same call: a later,
+    identical reason -- never inferred as `not_submitted`, `absent`, or
+    `intent` evidence, and never worth retrying inside this same call: a later,
 separate inspection may join the lease once it is free.
 
 ## Durable operation journal
@@ -55,6 +55,7 @@ from immutable job identity.
 
 ```text
 intent      request recorded; submission NOT yet attempted   -> may submit
+sealed_not_submitted  durable no-future-submit fence          -> NEVER submit
 submitted   submission attempt has begun                     -> NEVER resubmit
 task_known  PVE returned a UPID                              -> caller polls that task
 terminal    outcome recorded                                 -> replay answer
@@ -62,16 +63,16 @@ terminal    outcome recorded                                 -> replay answer
 
 Every response -- from either operation -- reports this exact phase as a
 typed `submission_state` field, read straight from the journal rather than
-inferred from canonical PVE state or an error string. The caller uses it, not
-canonical evidence, to decide whether a NEW submission is still permitted:
-`absent` (no journal record at all) and `intent` are the only phases that
-permit one; everything else means some submission attempt may already have
-crossed PVE's door, and no second one may ever be issued for this operation
-identity.
+inferred from canonical PVE state or an error string. `absent` (no journal
+record) and `intent` permit a NEW submission but never release a backend job.
+Only `sealed_not_submitted` is a durable release proof: it is written under
+the same per-VMID lease as submission, and every delayed helper must obey it.
 
 `intent -> submitted` is an atomic rename that is fsynced before the
-subprocess is launched, so a journal still reading `intent` proves submission
-was never reached. `submitted` without a UPID is the genuinely uncertain
+subprocess is launched, so an observation of `intent` under the lease is
+transient pre-submission routing evidence. It is not a no-future-submit proof:
+the backend must write the durable seal before releasing its job. `submitted`
+without a UPID is the genuinely uncertain
 window: this helper then inspects canonical state and may recover a success
 only on strict evidence (the exact snapshot, the exact ownership metadata,
 complete, and the container not locked by an in-flight operation). Otherwise
@@ -81,12 +82,11 @@ caller restarted.
 **This journal is the host-side record of record for submission.** Every
 failure answer therefore carries a typed `error.submission`:
 
-- `not_submitted` — the journal was at `intent` for this exact operation
-  identity when the failure happened, which proves the submission subprocess
-  was never launched for it. Only this lets the backend safely terminalize a
-  job that is already past its write-ahead uncertainty checkpoint, so it is
-  emitted from that durable phase alone, never inferred from an error name, a
-  canonical absence, a lock, a timeout, or a transport failure.
+- `not_submitted` — transient routing evidence when a journal read under the
+  lease is still `absent`/`intent`, or the final durable answer when it is
+  `sealed_not_submitted`. The backend distinguishes those states and releases
+  only on the seal, never on an error name, canonical absence, timeout, or
+  transport failure.
 - `may_have_been_submitted` — the default for everything else, including an
   unreadable or corrupt journal, a lease held by another invocation, and every
   failure at or after the `submitted` transition.
@@ -163,7 +163,11 @@ _OPERATION_DOMAIN = b"hubinet-ops/package-update/snapshot-operation-id/v1"
 #: Container config locks that prove some PVE operation is still in flight.
 _IN_FLIGHT_LOCKS = frozenset({"snapshot", "snapshot-delete", "rollback"})
 
-OPERATIONS = ("inspect_job_snapshot_state", "ensure_pre_update_snapshot_submitted")
+OPERATIONS = (
+    "inspect_job_snapshot_state",
+    "ensure_pre_update_snapshot_submitted",
+    "seal_operation_never_submitted",
+)
 
 _OWNERSHIP_FIELDS = (
     "job_id",
@@ -505,7 +509,13 @@ def request_fingerprint(request: Mapping[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-JOURNAL_PHASES = ("intent", "submitted", "task_known", "terminal")
+JOURNAL_PHASES = (
+    "intent",
+    "sealed_not_submitted",
+    "submitted",
+    "task_known",
+    "terminal",
+)
 
 
 class OperationJournal:
@@ -554,6 +564,18 @@ class OperationJournal:
         # A phase is only usable with the facts that phase promises. A
         # 'task_known' record without a decodable task identity must never
         # degrade into a record that looks safe to submit from.
+        if record["phase"] in (
+            "intent",
+            "sealed_not_submitted",
+            "submitted",
+        ) and (
+            record.get("task_upid") is not None
+            or record.get("outcome") is not None
+        ):
+            raise SnapshotError(
+                "journal_corrupt",
+                "snapshot operation journal phase carries incompatible evidence",
+            )
         if record["phase"] == "task_known" and not (
             isinstance(record.get("task_upid"), str)
             and UPID_RE.fullmatch(record["task_upid"])
@@ -889,18 +911,19 @@ def _inspect(
 
     It is, however, serialized against the SAME per-VMID mutation lease
     `_ensure_submitted` uses, acquired non-blocking and released before this
-    returns. That is what makes an `absent`/`intent` result here trustworthy
-    as proof of non-submission: without it, a submission helper that outlived
+    returns. That makes an `absent`/`intent` result trustworthy as transient
+    routing evidence: without it, a submission helper that outlived
     its own backend caller (SSH dropped, backend crashed or timed out) could
     still be holding the lease and be between its own durable phases --
     journal not yet advanced past `intent` -- exactly while this read runs,
     and a caller could then terminalize a job whose snapshot mutation is
-    genuinely still in flight. This does not make inspection a mutating
+    genuinely still in flight. It is still not a release proof; only the
+    durable seal is. This does not make inspection a mutating
     operation: no journal write, no `pvesh create`, still one bounded host
     read. If the lease is already held, this raises the SAME
     `operation_in_progress` error `_ensure_submitted` raises for the
     identical reason, which resolves to UNCERTAIN and can never be mistaken
-    for `not_submitted`/absent/intent proof.
+    for pre-submission routing evidence.
     """
 
     with VmidMutationLock(request["vmid"], journal.directory):
@@ -912,36 +935,153 @@ def _inspect(
                 "operation_request_mismatch",
                 "this operation identity was journaled with a different request",
             )
-        listing = list_snapshots(runner, request["vmid"], request["expected_node"])
+        submission_state = record["phase"] if record is not None else "absent"
+        if submission_state == "sealed_not_submitted":
+            # The journal is the record of record. No PVE target or canonical
+            # read is needed to report this durable no-future-submit fence.
+            return _response(
+                request,
+                "not_submitted",
+                reason=(
+                    "host durably sealed this snapshot operation before submission"
+                ),
+                submission_state="sealed_not_submitted",
+            )
+
         task_upid = record.get("task_upid") if record else None
         task = None
-        if isinstance(task_upid, str):
-            task = read_task_status(runner, request["expected_node"], task_upid)
-        evidence = _owned_snapshot_evidence(listing, request)
-        if task is not None and task["status"] == "stopped" and _task_is_error(task):
-            # The task PVE ran for this operation terminated in a failure
-            # state. This is reported regardless of canonical evidence -- the
-            # backend independently re-proves canonical absence before it may
-            # ever terminalize a job on this outcome, exactly as it always
-            # has.
-            outcome = "failed"
-        else:
-            outcome = {
-                "present": "completed",
-                "absent": "absent",
-                "incomplete": "uncertain",
-                "ambiguous": "uncertain",
-            }[evidence]
-        submission_state = record["phase"] if record is not None else "absent"
+        try:
+            if submission_state == "submitted" and task_upid is None:
+                # Taskless completion uses the same strict bar as submission
+                # recovery: exact complete canonical evidence and no relevant
+                # in-flight PVE container lock.
+                lock = read_container_lock(
+                    runner, request["vmid"], request["expected_node"]
+                )
+                listing = list_snapshots(
+                    runner, request["vmid"], request["expected_node"]
+                )
+                evidence = _owned_snapshot_evidence(listing, request)
+                if lock in _IN_FLIGHT_LOCKS:
+                    outcome = "uncertain"
+                    reason = (
+                        "taskless submitted recovery is blocked by an in-flight "
+                        f"PVE operation ({lock})"
+                    )
+                else:
+                    outcome = {
+                        "present": "completed",
+                        "absent": "absent",
+                        "incomplete": "uncertain",
+                        "ambiguous": "uncertain",
+                    }[evidence]
+                    reason = f"canonical job-owned snapshot evidence: {evidence}"
+            else:
+                listing = list_snapshots(
+                    runner, request["vmid"], request["expected_node"]
+                )
+                if isinstance(task_upid, str):
+                    task = read_task_status(
+                        runner, request["expected_node"], task_upid
+                    )
+                evidence = _owned_snapshot_evidence(listing, request)
+                if (
+                    task is not None
+                    and task["status"] == "stopped"
+                    and _task_is_error(task)
+                ):
+                    outcome = "failed"
+                elif submission_state in ("absent", "intent") and evidence == "present":
+                    # A transient pre-submit journal phase cannot itself claim
+                    # completion. The submission operation will re-check the
+                    # same evidence under the lease and journal terminal state.
+                    outcome = "uncertain"
+                else:
+                    outcome = {
+                        "present": "completed",
+                        "absent": "absent",
+                        "incomplete": "uncertain",
+                        "ambiguous": "uncertain",
+                    }[evidence]
+                reason = f"canonical job-owned snapshot evidence: {evidence}"
+        except SnapshotError as exc:
+            if submission_state in ("absent", "intent"):
+                # This is trustworthy transient routing evidence because the
+                # journal was read while the same per-VMID lease was held.
+                # It is NOT a release proof; the backend must durably seal.
+                return _response(
+                    request,
+                    "not_submitted",
+                    reason=(
+                        "host journal was still pre-submission while a PVE read "
+                        f"failed ({exc.classification})"
+                    ),
+                    submission_state=submission_state,
+                )
+            raise
     return _response(
         request,
         outcome,
         task_upid=task_upid if isinstance(task_upid, str) else None,
         task=task,
         snapshots=listing,
-        reason=f"canonical job-owned snapshot evidence: {evidence}",
+        reason=reason,
         submission_state=submission_state,
     )
+
+
+def _seal_never_submitted(
+    request: Mapping[str, Any], journal: OperationJournal
+) -> dict[str, Any]:
+    """Durably forbid this exact operation from crossing submission.
+
+    This narrow operation performs no PVE reads or mutations. It serializes
+    against submission through the same non-blocking per-VMID lease and uses
+    the journal's existing fsynced atomic write path.
+    """
+
+    fingerprint = request_fingerprint(request)
+    with VmidMutationLock(request["vmid"], journal.directory):
+        record = journal.read(request["snapshot_operation_id"])
+        if record is not None and record["request_fingerprint"] != fingerprint:
+            raise SnapshotError(
+                "operation_request_mismatch",
+                "this operation identity was journaled with a different request",
+            )
+        if record is None:
+            record = {
+                "journal_version": 1,
+                "snapshot_operation_id": request["snapshot_operation_id"],
+                "request_fingerprint": fingerprint,
+                "vmid": request["vmid"],
+                "expected_node": request["expected_node"],
+                "snapshot_name": request["snapshot_name"],
+                "phase": "sealed_not_submitted",
+            }
+            journal.write(record)
+        elif record["phase"] == "intent":
+            record = {**record, "phase": "sealed_not_submitted"}
+            journal.write(record)
+        elif record["phase"] != "sealed_not_submitted":
+            # Submission won. Refuse the seal while returning the exact
+            # durable phase so the backend remains fenced/recoverable.
+            return _response(
+                request,
+                "uncertain",
+                task_upid=(
+                    str(record["task_upid"])
+                    if isinstance(record.get("task_upid"), str)
+                    else None
+                ),
+                reason="snapshot operation crossed submission before it could be sealed",
+                submission_state=str(record["phase"]),
+            )
+        return _response(
+            request,
+            "not_submitted",
+            reason="host durably sealed this snapshot operation before submission",
+            submission_state="sealed_not_submitted",
+        )
 
 
 def _finalize(
@@ -1014,6 +1154,18 @@ def _ensure_submitted(
                 return _recover_submitted_without_task(
                     runner, request, journal, record
                 )
+            if phase == "sealed_not_submitted":
+                # The durable seal is terminal with respect to submission.
+                # It is obeyed before any live-target or canonical PVE read.
+                return _response(
+                    request,
+                    "not_submitted",
+                    submission_state="sealed_not_submitted",
+                    reason=(
+                        "host durably sealed this snapshot operation before "
+                        "submission"
+                    ),
+                )
             if phase != "intent":
                 # Exhaustive by construction: a phase this build does not
                 # understand must never fall through into a submission.
@@ -1041,15 +1193,12 @@ def _ensure_submitted(
         # The durable journal for this operation is at `intent`, and the
         # `intent -> submitted` transition below is an fsynced atomic rename
         # performed strictly BEFORE the submission subprocess is launched.
-        # So for the whole of this window this host can prove that no
-        # snapshot mutation has ever been submitted for this operation
-        # identity, and any failure raised here is reported as such rather
-        # than as unresolvable uncertainty.
-        #
-        # That proof is what lets the backend safely terminalize a job which
-        # is already past its write-ahead uncertainty checkpoint. Without it
-        # an ordinary pre-flight refusal (a guest that moved node, say) would
-        # fence the single global destructive slot forever.
+        # So for the whole of this window the journal supplies transient
+        # routing evidence that no submission has crossed this helper's door.
+        # It does NOT authorize backend release: a different helper may have
+        # been launched already and still be waiting to acquire this lease.
+        # The backend must win a later seal operation, which replaces this
+        # phase with `sealed_not_submitted`, before terminalizing the job.
         # ---------------------------------------------------------------
         if record["phase"] != "intent":
             raise SnapshotError(
@@ -1247,6 +1396,8 @@ def handle_request(
     try:
         if request["operation"] == "inspect_job_snapshot_state":
             return _inspect(runner, request, operation_journal)
+        if request["operation"] == "seal_operation_never_submitted":
+            return _seal_never_submitted(request, operation_journal)
         return _ensure_submitted(runner, request, operation_journal)
     except SnapshotError as exc:
         return {

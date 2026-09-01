@@ -146,10 +146,21 @@ class FakePve:
                     }
                 )
             return self._json(rows)
-        if argv[:2] == ("pvesh", "get") and argv[2].endswith("/config"):
-            return self._json({"lock": self.lock} if self.lock else {})
-        if argv[:2] == ("pvesh", "get") and argv[2].endswith("/snapshot"):
-            return self._json(self.snapshots)
+        if argv[:2] == ("pvesh", "get"):
+            lxc_read = re.fullmatch(
+                r"/nodes/([^/]+)/lxc/(\d+)/(config|snapshot)", argv[2]
+            )
+            if lxc_read is not None:
+                requested_node, requested_vmid, kind = lxc_read.groups()
+                if (
+                    requested_node != self.node
+                    or int(requested_vmid) != self.vmid
+                    or not self.present
+                ):
+                    return 2, b"", b"guest is not available on requested node"
+                if kind == "config":
+                    return self._json({"lock": self.lock} if self.lock else {})
+                return self._json(self.snapshots)
         if argv[:2] == ("pvesh", "get") and "/tasks/" in argv[2]:
             payload = (
                 self.task_sequence.pop(0)
@@ -158,6 +169,16 @@ class FakePve:
             )
             return self._json(payload)
         if argv[:2] == ("pvesh", "create"):
+            match = re.fullmatch(
+                r"/nodes/([^/]+)/lxc/(\d+)/snapshot", argv[2]
+            )
+            if (
+                match is None
+                or match.group(1) != self.node
+                or int(match.group(2)) != self.vmid
+                or not self.present
+            ):
+                return 2, b"", b"guest is not available on requested node"
             self.submissions += 1
             if self.on_submit is not None:
                 self.on_submit(self)
@@ -191,10 +212,11 @@ def _handle(request, pve, journal):
 # ---------------------------------------------------------------------------
 
 
-def test_only_the_two_typed_operations_exist() -> None:
+def test_only_the_three_typed_operations_exist() -> None:
     assert helper.OPERATIONS == (
         "inspect_job_snapshot_state",
         "ensure_pre_update_snapshot_submitted",
+        "seal_operation_never_submitted",
     )
 
 
@@ -551,6 +573,7 @@ def test_a_running_task_is_reported_without_polling(tmp_path: Path) -> None:
     assert submitted["outcome"] == "uncertain"
     assert submitted["submission_state"] == "task_known"
     assert pve.submissions == 1
+
     assert not any("/tasks/" in argv[2] for argv in pve.argvs if argv[1] == "get")
 
     inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
@@ -1174,8 +1197,7 @@ def test_not_submitted_is_emitted_from_exactly_one_pre_submission_site() -> None
 # that the remote mutator is gone with it: the mutator is a separate process
 # on the PVE host and may still be alive, still holding its lease, still
 # between its own durable journal phases. A concurrent inspection must not be
-# able to read a stale `intent` as proof of non-submission while that lease
-# is held.
+# able to consume `intent` as current routing evidence while that lease is held.
 # ---------------------------------------------------------------------------
 
 
@@ -1189,7 +1211,7 @@ def test_inspect_reports_operation_in_progress_while_the_mutator_holds_the_lease
     SSH connection, timed out, or crashed would leave it: still alive, still
     holding the lease, journal not yet advanced past `intent`. A concurrent
     inspection reaching the SAME journal directory must not be able to read
-    that `intent` as proof of non-submission while the lease is held.
+    that `intent` as current routing evidence while the lease is held.
     """
 
     import threading
@@ -1375,3 +1397,138 @@ def test_the_lease_release_after_submission_lets_inspect_see_task_known(
     assert inspected_second["outcome"] == "completed"
     # Never a second submission, however many times it is inspected.
     assert pve.submissions == 1
+
+
+# ---------------------------------------------------------------------------
+# Durable prove-and-seal state machine
+# ---------------------------------------------------------------------------
+
+
+def test_seal_is_durable_idempotent_and_submit_must_obey_it(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    pve = FakePve()
+    operation_id, _ = _identity(_ownership())
+
+    first = _handle(_request("seal_operation_never_submitted"), pve, journal)
+    second = _handle(_request("seal_operation_never_submitted"), pve, journal)
+    delayed_submit = _handle(_request(), pve, journal)
+
+    assert first == second
+    assert first["outcome"] == "not_submitted"
+    assert first["submission_state"] == "sealed_not_submitted"
+    assert delayed_submit["outcome"] == "not_submitted"
+    assert delayed_submit["submission_state"] == "sealed_not_submitted"
+    assert journal.read(operation_id)["phase"] == "sealed_not_submitted"
+    assert pve.argvs == []
+    assert pve.submissions == 0
+
+
+def test_seal_advances_intent_without_any_pve_read(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    request = helper.validate_request(_request())
+    operation_id = request["snapshot_operation_id"]
+    journal.write(
+        {
+            "journal_version": 1,
+            "snapshot_operation_id": operation_id,
+            "request_fingerprint": helper.request_fingerprint(request),
+            "vmid": VMID,
+            "expected_node": NODE,
+            "snapshot_name": request["snapshot_name"],
+            "phase": "intent",
+        }
+    )
+    pve = FakePve(present=False, node="pve-moved")
+
+    sealed = _handle(_request("seal_operation_never_submitted"), pve, journal)
+
+    assert sealed["submission_state"] == "sealed_not_submitted"
+    assert journal.read(operation_id)["phase"] == "sealed_not_submitted"
+    assert pve.argvs == []
+    assert pve.submissions == 0
+
+
+def test_submit_wins_before_seal_and_is_never_resubmitted(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    pve = FakePve()
+
+    submitted = _handle(_request(), pve, journal)
+    refused = _handle(_request("seal_operation_never_submitted"), pve, journal)
+    retried = _handle(_request(), pve, journal)
+
+    assert submitted["submission_state"] == "task_known"
+    assert refused["outcome"] == "uncertain"
+    assert refused["submission_state"] == "task_known"
+    assert refused["task_upid"] == UPID
+    assert retried["submission_state"] == "task_known"
+    assert pve.submissions == 1
+
+
+@pytest.mark.parametrize("kind", ["corrupt", "mismatch"])
+def test_seal_refuses_corrupt_or_mismatched_journal(
+    tmp_path: Path, kind: str
+) -> None:
+    journal = _journal(tmp_path)
+    journal.ensure_directory()
+    operation_id, snapshot_name = _identity(_ownership())
+    if kind == "corrupt":
+        (journal.directory / f"op-{operation_id}.json").write_text("{bad json")
+    else:
+        journal.write(
+            {
+                "journal_version": 1,
+                "snapshot_operation_id": operation_id,
+                "request_fingerprint": "0" * 64,
+                "vmid": VMID,
+                "expected_node": NODE,
+                "snapshot_name": snapshot_name,
+                "phase": "intent",
+            }
+        )
+    pve = FakePve()
+
+    response = _handle(_request("seal_operation_never_submitted"), pve, journal)
+
+    assert response["ok"] is False
+    assert response["error"]["classification"] in (
+        "journal_corrupt",
+        "operation_request_mismatch",
+    )
+    assert pve.argvs == []
+    assert pve.submissions == 0
+
+
+def test_taskless_inspect_uses_the_same_no_in_flight_lock_bar(
+    tmp_path: Path,
+) -> None:
+    ownership = _ownership()
+    operation_id, snapshot_name = _identity(ownership)
+    journal = _journal(tmp_path)
+    journal.write(
+        {
+            "journal_version": 1,
+            "snapshot_operation_id": operation_id,
+            "request_fingerprint": helper.request_fingerprint(
+                helper.validate_request(_request())
+            ),
+            "vmid": VMID,
+            "expected_node": NODE,
+            "snapshot_name": snapshot_name,
+            "phase": "submitted",
+        }
+    )
+    pve = FakePve(
+        lock="snapshot",
+        snapshots=[_completed_snapshot(ownership, snapshot_name)],
+    )
+
+    locked = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert locked["outcome"] == "uncertain"
+    assert locked["submission_state"] == "submitted"
+    assert pve.submissions == 0
+
+    pve.lock = None
+    completed = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert completed["outcome"] == "completed"
+    assert completed["submission_state"] == "submitted"
+    assert pve.submissions == 0

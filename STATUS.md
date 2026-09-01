@@ -160,12 +160,15 @@ unimplemented future stage.
   observed PVE task identity; verified PVE async-task semantics with mandatory
   fresh canonical snapshot re-read before confirmation; a durable per-operation
   host journal under a per-VMID `flock` that reattaches instead of resubmitting;
-  a typed host-proved `not_submitted` answer that releases a job blocked
-  before its snapshot was ever submitted, so an ordinary pre-flight refusal
-  cannot fence the global slot forever; fail-closed handling of every other
-  ambiguity; startup recovery that fences an uncertain snapshot operation and
-  keeps it owning the global slot; and the same-job rollback authorization
-  contract.
+  transient host `absent`/`intent` routing evidence plus a durable
+  `sealed_not_submitted` no-future-submit fence, serialized against delayed
+  helpers by the same per-VMID lease and required before a pre-submission job
+  may release the global slot; moved/gone-guest liveness without a successful
+  PVE target read; terminal retention of canonically proven snapshots when
+  current authority becomes stale, without granting rollback authority;
+  fail-closed handling of every other ambiguity; startup recovery that fences
+  an uncertain snapshot operation and keeps it owning the global slot; and the
+  same-job rollback authorization contract.
 - **Not activated:** no production HTTP, Home Assistant, scheduler, bootstrap,
   or updater path can create a PVE snapshot. The snapshot helper is a separate
   dark file that is **not deployed**, no key or `authorized_keys` entry exists
