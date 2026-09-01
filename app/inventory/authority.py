@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+import re
 import sqlite3
+from typing import TypeVar
 import uuid
 
 from .canonicalization import (
@@ -20,7 +22,9 @@ from .models import (
     AuthorityNotFound,
     DiscoveryRun,
     DiscoveryRunLifecycle,
+    HostSubmissionState,
     InventorySourceState,
+    ObservedSnapshot,
     PackageScanFailure,
     PackageScanLifecycle,
     PackageScanOutcome,
@@ -32,6 +36,15 @@ from .models import (
     PackageUpdateEventType,
     PackageUpdateJob,
     PackageUpdateJobStatus,
+    PackageUpdateRollbackTarget,
+    PackageUpdateSnapshotIdentity,
+    SnapshotOwnership,
+    SnapshotSubmissionRefusedBeforeCallback,
+    checkpoint_rank as _checkpoint_rank,
+)
+from .snapshot_identity import (
+    build_snapshot_ownership,
+    derive_pre_update_snapshot_identity,
 )
 from .discovery import (
     BaselineCompleteness,
@@ -41,6 +54,9 @@ from .discovery import (
 from .provider import PROVIDER_CONTRACT_VERSION
 from .reconciliation import InventoryReconciler, ReconciliationSummary
 from .store import InventoryAuthorityStore
+
+
+_T = TypeVar("_T")
 
 
 class InventoryAuthority:
@@ -1245,99 +1261,1032 @@ class InventoryAuthority:
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        rejected_current_authority = False
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
-            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
-                raise AuthorityConflict("package update job is terminal")
-            if str(job["expected_resource_type"]) != "lxc":
-                raise AuthorityInvariantError(
-                    "package update job has an unsupported frozen resource type"
-                )
-
-            decision_time = self._authority_decision_time()
-            self._materialize_due_expiry_in_transaction(
-                connection,
-                str(job["inventory_source_id"]),
-                now=decision_time,
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
             )
-            if not (
-                self._package_scan_context_is_current(connection, job)
-                and self._package_scan_source_context_is_current(connection, job)
-            ):
-                rejected_current_authority = True
-            else:
-                current = self._latest_package_scan_row(
-                    connection, str(job["resource_id"])
-                )
-                if current is None or (
-                    str(current["lifecycle"])
-                    != PackageScanLifecycle.COMPLETED.value
-                    or str(current["outcome"])
-                    != PackageScanOutcome.SUCCESS.value
-                ):
-                    raise AuthorityConflict(
-                        "latest package scan attempt is not a successful exact plan"
-                    )
-                if not (
-                    self._package_scan_is_current_and_approvable(
-                        connection, current
-                    )
-                    and self._package_scan_context_matches_job(current, job)
-                ):
-                    raise AuthorityConflict(
-                        "latest package scan authority context does not match the job"
-                    )
-                fingerprint = self._successful_package_scan_fingerprint(
-                    connection, current
-                )
-                if fingerprint != str(job["approved_plan_fingerprint"]):
-                    raise AuthorityConflict(
-                        "latest package plan fingerprint does not match the job"
-                    )
-                current_triplets = self._package_material_triplets(
-                    connection,
-                    table="package_scan_packages",
-                    owner_column="scan_run_id",
-                    owner_id=str(current["scan_run_id"]),
-                )
-                job_triplets = self._package_material_triplets(
-                    connection,
-                    table="package_update_job_packages",
-                    owner_column="job_id",
-                    owner_id=canonical_job_id,
-                )
-                if not current_triplets or current_triplets != job_triplets:
-                    raise AuthorityConflict(
-                        "current exact package material does not match the job"
-                    )
 
-        if rejected_current_authority:
+        # Deliberately raised after the transaction commits: the predicate
+        # may have materialized due source-freshness expiry, and that
+        # bookkeeping is kept even when the job itself is refused.
+        if not current_authority_holds:
             raise AuthorityConflict(
                 "package update job resource or source authority context is stale"
             )
         return self._store.package_update_job(canonical_job_id)
 
-    def recover_interrupted_package_update_jobs(self) -> tuple[str, ...]:
-        """Interrupt pre-mutation jobs; preserve unknown later states intact.
+    def _package_update_job_authority_is_current(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> bool:
+        """Re-prove every current-authority predicate inside ONE transaction.
 
-        No legitimate NEXT-A method can reach a mutation checkpoint. If a
-        future/reserved row is nevertheless present at or beyond
-        ``mutation_may_have_started``, this recovery pass leaves it active and
-        leaves the global slot owned. It never replays work, guesses success,
-        or silently frees destructive ownership.
+        This is the whole "current authority still permits this job to
+        advance" proof, factored so that a transition can prove it in the
+        *same* transaction that commits the transition. Splitting the proof
+        and the commit across two transactions is a check-then-commit race:
+        discovery reconciliation can replace the guest occupying the same
+        VMID on the same node in between, and neither a checkpoint CAS (which
+        only sees job status/checkpoint) nor the host helper (which can only
+        verify live PVE VMID/type/node facts, never a backend resource
+        incarnation) would catch it.
+
+        Returns ``False`` for a stale resource/source context so the caller
+        can commit any freshness expiry materialized here before refusing.
+        Hard incoherences still raise.
+        """
+
+        if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+            raise AuthorityConflict("package update job is terminal")
+        if str(job["expected_resource_type"]) != "lxc":
+            raise AuthorityInvariantError(
+                "package update job has an unsupported frozen resource type"
+            )
+
+        job_id = str(job["job_id"])
+        decision_time = self._authority_decision_time()
+        self._materialize_due_expiry_in_transaction(
+            connection,
+            str(job["inventory_source_id"]),
+            now=decision_time,
+        )
+        if not (
+            self._package_scan_context_is_current(connection, job)
+            and self._package_scan_source_context_is_current(connection, job)
+        ):
+            return False
+
+        current = self._latest_package_scan_row(connection, str(job["resource_id"]))
+        if current is None or (
+            str(current["lifecycle"]) != PackageScanLifecycle.COMPLETED.value
+            or str(current["outcome"]) != PackageScanOutcome.SUCCESS.value
+        ):
+            raise AuthorityConflict(
+                "latest package scan attempt is not a successful exact plan"
+            )
+        if not (
+            self._package_scan_is_current_and_approvable(connection, current)
+            and self._package_scan_context_matches_job(current, job)
+        ):
+            raise AuthorityConflict(
+                "latest package scan authority context does not match the job"
+            )
+        fingerprint = self._successful_package_scan_fingerprint(connection, current)
+        if fingerprint != str(job["approved_plan_fingerprint"]):
+            raise AuthorityConflict(
+                "latest package plan fingerprint does not match the job"
+            )
+        current_triplets = self._package_material_triplets(
+            connection,
+            table="package_scan_packages",
+            owner_column="scan_run_id",
+            owner_id=str(current["scan_run_id"]),
+        )
+        job_triplets = self._package_material_triplets(
+            connection,
+            table="package_update_job_packages",
+            owner_column="job_id",
+            owner_id=job_id,
+        )
+        if not current_triplets or current_triplets != job_triplets:
+            raise AuthorityConflict(
+                "current exact package material does not match the job"
+            )
+        return True
+
+    def _snapshot_identity_in_transaction(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> PackageUpdateSnapshotIdentity:
+        """Derive one job's deterministic snapshot identity, in-transaction."""
+
+        job_id = str(job["job_id"])
+        backend_instance_id = str(
+            connection.execute(
+                "SELECT backend_instance_id FROM backend_instance"
+            ).fetchone()["backend_instance_id"]
+        )
+        identity = derive_pre_update_snapshot_identity(
+            backend_instance_id=backend_instance_id,
+            job_id=job_id,
+            resource_id=str(job["resource_id"]),
+            resource_continuity_revision=int(
+                job["expected_resource_continuity_revision"]
+            ),
+        )
+        persisted_name = job["snapshot_name"]
+        persisted_operation = job["snapshot_operation_id"]
+        if (
+            persisted_name is not None
+            and str(persisted_name) != identity.snapshot_name
+        ) or (
+            persisted_operation is not None
+            and str(persisted_operation) != identity.snapshot_operation_id
+        ):
+            raise AuthorityInvariantError(
+                "persisted snapshot identity does not match the job's "
+                "deterministic derivation"
+            )
+        return identity
+
+    def _snapshot_ownership_in_transaction(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> SnapshotOwnership:
+        """Build one job's strict snapshot ownership metadata, in-transaction."""
+
+        backend_instance_id = str(
+            connection.execute(
+                "SELECT backend_instance_id FROM backend_instance"
+            ).fetchone()["backend_instance_id"]
+        )
+        return build_snapshot_ownership(
+            job_id=str(job["job_id"]),
+            resource_id=str(job["resource_id"]),
+            resource_continuity_revision=int(
+                job["expected_resource_continuity_revision"]
+            ),
+            inventory_source_id=str(job["inventory_source_id"]),
+            backend_instance_id=backend_instance_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Job-owned snapshot safety
+    #
+    # These are internal authority transitions. Production has no route,
+    # scheduler, or worker that reaches them, and none of them performs a
+    # PVE, snapshot, or workload mutation of its own: they record durable
+    # authority facts about a snapshot operation another component may
+    # perform.
+    # ------------------------------------------------------------------
+
+    def package_update_job(self, job_id: str) -> PackageUpdateJob:
+        """Read one durable package update job through the authority."""
+
+        return self._store.package_update_job(_require_uuid(job_id, "job_id"))
+
+    def record_package_update_preflight_passed(
+        self, job_id: str
+    ) -> PackageUpdateJob:
+        """Record that one active job's authority preflight currently holds.
+
+        Revalidates the full current-authority context first, so a stale job
+        can never advance. Idempotent: a job already at ``preflight_passed``
+        revalidates and returns unchanged.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            # The authority proof and the transition it authorizes commit
+            # together, so nothing can invalidate the job in between.
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
+            )
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+                if checkpoint is PackageUpdateCheckpoint.ISSUED:
+                    updated = connection.execute(
+                        "UPDATE package_update_jobs SET checkpoint='preflight_passed' "
+                        "WHERE job_id=? AND status='active' AND checkpoint='issued'",
+                        (canonical_job_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise AuthorityConflict(
+                            "package update job preflight lost durable ownership"
+                        )
+                    self._append_package_update_job_event(
+                        connection,
+                        job_id=canonical_job_id,
+                        created_at=recorded_at,
+                        level=PackageUpdateEventLevel.INFO,
+                        stage=PackageUpdateCheckpoint.PREFLIGHT_PASSED,
+                        event_type=PackageUpdateEventType.PREFLIGHT_PASSED,
+                        message="package update job preflight authority revalidated",
+                        details={},
+                    )
+                elif checkpoint is not PackageUpdateCheckpoint.PREFLIGHT_PASSED:
+                    raise AuthorityConflict(
+                        "package update job has already advanced past preflight"
+                    )
+
+        if not current_authority_holds:
+            raise AuthorityConflict(
+                "package update job resource or source authority context is stale"
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def package_update_snapshot_identity(
+        self, job_id: str
+    ) -> PackageUpdateSnapshotIdentity:
+        """Derive one job's deterministic pre-update snapshot identity.
+
+        Pure and restart-stable: it reads only immutable job facts plus this
+        backend instance's identity, so the same job always derives the same
+        snapshot name and operation id.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            return self._snapshot_identity_in_transaction(connection, job)
+
+    def package_update_snapshot_ownership(self, job_id: str) -> SnapshotOwnership:
+        """Build the strict ownership metadata one job's snapshot must carry."""
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            return self._snapshot_ownership_in_transaction(connection, job)
+
+    def record_package_update_snapshot_intent(
+        self, job_id: str
+    ) -> PackageUpdateJob:
+        """Durably commit the write-ahead snapshot-operation intent.
+
+        This is the uncertainty boundary. It MUST be committed before any
+        snapshot mutation request can be sent, because once a job is at
+        ``snapshot_may_have_started`` nothing may ever conclude that no PVE
+        mutation happened. Idempotent: re-recording the same derived identity
+        returns the existing durable intent instead of creating a second one.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            # The write-ahead intent is the point of no return, so its
+            # authority proof commits in the same transaction. A guest
+            # replaced at the same VMID on the same node between proof and
+            # commit would otherwise let a stale job submit a snapshot
+            # against the replacement and tag it with the old incarnation's
+            # ownership metadata.
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
+            )
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                identity = self._snapshot_identity_in_transaction(connection, job)
+                checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+                if checkpoint is PackageUpdateCheckpoint.PREFLIGHT_PASSED:
+                    self._commit_snapshot_intent(
+                        connection,
+                        job_id=canonical_job_id,
+                        identity=identity,
+                        recorded_at=recorded_at,
+                    )
+                elif (
+                    checkpoint
+                    is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+                ):
+                    # Already at the intent checkpoint is idempotent; anything
+                    # else has advanced past this transition.
+                    raise AuthorityConflict(
+                        "package update job snapshot intent requires a passed "
+                        "preflight"
+                    )
+
+        if not current_authority_holds:
+            raise AuthorityConflict(
+                "package update job resource or source authority context is stale"
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def _commit_snapshot_intent(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        identity: PackageUpdateSnapshotIdentity,
+        recorded_at: str,
+    ) -> None:
+        updated = connection.execute(
+            "UPDATE package_update_jobs "
+            "SET checkpoint='snapshot_may_have_started', "
+            "snapshot_operation_id=?, snapshot_name=?, "
+            "snapshot_intent_recorded_at=? "
+            "WHERE job_id=? AND status='active' "
+            "AND checkpoint='preflight_passed' "
+            "AND snapshot_operation_id IS NULL",
+            (
+                identity.snapshot_operation_id,
+                identity.snapshot_name,
+                recorded_at,
+                job_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job snapshot intent lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=recorded_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+            event_type=PackageUpdateEventType.SNAPSHOT_INTENT_RECORDED,
+            message="pre-update snapshot operation may be submitted from here on",
+            details={
+                "snapshot_operation_id": identity.snapshot_operation_id,
+                "snapshot_name": identity.snapshot_name,
+            },
+        )
+
+    def execute_snapshot_submission_if_current(
+        self, job_id: str, submit: Callable[[], _T]
+    ) -> _T:
+        """Run one bounded host submission callback while authority holds.
+
+        This is the short submission critical section a NEW PVE snapshot
+        submission must run inside. It closes the race the write-ahead
+        checkpoint alone does not: discovery reconciliation or a package scan
+        could otherwise invalidate this job's authority *after* it was proved
+        and *before* the host actually submits, in the gap between two
+        separate transactions. Re-proving authority and calling the host
+        happen here in the SAME transaction instead, so nothing else may
+        write to this authority store while ``submit`` runs -- the BEGIN
+        IMMEDIATE below holds this store's one writer lock across it.
+
+        ``submit`` MUST be the host's submission-only operation and nothing
+        else: no PVE task polling, no package mutation, no rollback, and no
+        recursive authority mutation. It is invoked at most once, only when
+        current authority still holds, and only while this transaction still
+        owns the writer lock. A stale authority context refuses BEFORE
+        ``submit`` is ever called, so the host is never asked to submit
+        anything for a job whose authority context has already moved on --
+        that specific refusal raises :class:`SnapshotSubmissionRefusedBeforeCallback`
+        (a distinct, narrow subclass of :class:`AuthorityConflict`), never
+        the bare base type, because a caller must be able to tell "current
+        authority itself proved false before any host call" apart from a
+        terminal job or a wrong checkpoint -- both of which remain ordinary
+        :class:`AuthorityConflict` and say nothing about whether ``submit``
+        ran. Nothing this method itself does ever recasts an exception
+        ``submit`` raises after it begins executing into that narrow type.
+
+        This is not a claim that SQLite and PVE are proved atomic, and it is
+        not a claim that a snapshot is proved to belong to the same LXC PVE
+        showed several minutes ago. It is the narrower claim
+        `app/package_update_snapshot.py` documents: Hubinet's own current
+        authority is held stable through the submission boundary, and the
+        host independently re-validates the live PVE target immediately
+        before it ever submits.
+
+        Recovering evidence about an operation that may already have been
+        submitted -- reading the host's durable journal state, and polling a
+        known task to completion -- never calls this method: that evidence
+        must never be discarded merely because authority has gone stale.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        host_result: _T | None = None
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            # The authority proof and the bounded submission callback share
+            # this one transaction, so nothing can invalidate the job between
+            # the proof just taken and the submission it authorizes.
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
+            )
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                host_result = submit()
+
+        if not current_authority_holds:
+            # This is the one specific, structurally guaranteed case: the
+            # current-authority predicate itself proved false, so `submit`
+            # was never called (see the `if current_authority_holds:` guard
+            # above, inside the same transaction). A distinct typed
+            # exception marks this exactly, so a caller may route it into the
+            # durable seal/liveness path without conflating it with the
+            # terminal-job or wrong-checkpoint conflicts raised earlier in
+            # this same method, which say nothing about whether a host call
+            # occurred.
+            raise SnapshotSubmissionRefusedBeforeCallback(
+                "package update job resource or source authority context is stale"
+            )
+        return host_result  # type: ignore[return-value]
+
+    def record_package_update_snapshot_task(
+        self, job_id: str, task_upid: str
+    ) -> PackageUpdateJob:
+        """Persist the exact PVE task identity observed for this operation.
+
+        Write-once: the same UPID may be recorded again, a different one is a
+        conflict. Recording a task never confirms the snapshot.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_upid = _require_pve_upid(task_upid)
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            existing = job["snapshot_task_upid"]
+            if existing is not None:
+                if str(existing) != canonical_upid:
+                    raise AuthorityConflict(
+                        "package update job already observed a different PVE "
+                        "snapshot task"
+                    )
+                return self._store.package_update_job(canonical_job_id)
+            observed_at = _timestamp(self._now())
+            updated = connection.execute(
+                "UPDATE package_update_jobs SET snapshot_task_upid=? "
+                "WHERE job_id=? AND status='active' "
+                "AND checkpoint='snapshot_may_have_started' "
+                "AND snapshot_task_upid IS NULL",
+                (canonical_upid, canonical_job_id),
+            )
+            if updated.rowcount != 1:
+                raise AuthorityConflict(
+                    "package update job snapshot task record lost durable ownership"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=observed_at,
+                level=PackageUpdateEventLevel.INFO,
+                stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.SNAPSHOT_TASK_OBSERVED,
+                message="observed the PVE task for this snapshot operation",
+                details={"snapshot_task_upid": canonical_upid},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def confirm_package_update_snapshot(
+        self, job_id: str, observed: Sequence[ObservedSnapshot]
+    ) -> PackageUpdateJob:
+        """Confirm the job-owned snapshot from a fresh canonical PVE listing.
+
+        ``observed`` must be a complete, freshly re-read canonical snapshot
+        listing for the job's target. A successful PVE task alone is never
+        enough: exactly one real, complete snapshot carrying this exact job's
+        exact structured ownership metadata under this exact name must be
+        present, and the job's current authority context must still hold.
+        Every ambiguity fails closed.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        snapshots = _require_observed_snapshots(observed)
+        confirmed_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            # Confirmation is what makes the snapshot usable as a rollback
+            # source, so its authority proof, its ownership derivation, the
+            # strict canonical match, and the commit are all one transaction.
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
+            )
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+                if checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED:
+                    snapshot_name = str(job["snapshot_name"])
+                    self._require_exactly_one_job_owned_snapshot(
+                        job_id=canonical_job_id,
+                        expected_name=snapshot_name,
+                        observed=snapshots,
+                        expected=self._snapshot_ownership_in_transaction(
+                            connection, job
+                        ),
+                    )
+                    updated = connection.execute(
+                        "UPDATE package_update_jobs "
+                        "SET checkpoint='snapshot_confirmed', "
+                        "snapshot_confirmed_at=? "
+                        "WHERE job_id=? AND status='active' "
+                        "AND checkpoint='snapshot_may_have_started' "
+                        "AND snapshot_confirmed_at IS NULL AND snapshot_name=?",
+                        (confirmed_at, canonical_job_id, snapshot_name),
+                    )
+                    if updated.rowcount != 1:
+                        raise AuthorityConflict(
+                            "package update job snapshot confirmation lost "
+                            "durable ownership"
+                        )
+                    self._append_package_update_job_event(
+                        connection,
+                        job_id=canonical_job_id,
+                        created_at=confirmed_at,
+                        level=PackageUpdateEventLevel.INFO,
+                        stage=PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+                        event_type=PackageUpdateEventType.SNAPSHOT_CONFIRMED,
+                        message="job-owned pre-update snapshot confirmed canonically",
+                        details={"snapshot_name": snapshot_name},
+                    )
+                elif checkpoint is not PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED:
+                    raise AuthorityConflict(
+                        "package update job is not inside a snapshot operation"
+                    )
+
+        if not current_authority_holds:
+            raise AuthorityConflict(
+                "package update job resource or source authority context is stale"
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def block_package_update_after_snapshot_success_with_stale_authority(
+        self, job_id: str, observed: Sequence[ObservedSnapshot]
+    ) -> tuple[bool, PackageUpdateJob]:
+        """Retain a proven snapshot but release a job whose authority is stale.
+
+        Confirmation grants rollback authority and therefore keeps its current
+        package/resource/source-authority requirement. This resolver instead
+        re-proves exact canonical same-job success and stale current authority
+        inside one transaction, then terminalizes without confirming. If
+        authority is current again, it leaves the job active for confirmation.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        snapshots = _require_observed_snapshots(observed)
+        blocked = False
+        reason = (
+            "snapshot exists but current package authority became stale; "
+            "retained but not authorized for rollback"
+        )
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            if job["snapshot_confirmed_at"] is not None:
+                raise AuthorityInvariantError(
+                    "package update job snapshot confirmation is inconsistent"
+                )
+
+            # Never inherit success from a caught exception or host outcome:
+            # prove the exact canonical snapshot again in this transaction.
+            self._require_exactly_one_job_owned_snapshot(
+                job_id=canonical_job_id,
+                expected_name=str(job["snapshot_name"]),
+                observed=snapshots,
+                expected=self._snapshot_ownership_in_transaction(connection, job),
+            )
+            try:
+                current_authority_holds = (
+                    self._package_update_job_authority_is_current(connection, job)
+                )
+            except AuthorityConflict:
+                # Job lifecycle and canonical success were independently
+                # established above. Remaining conflicts are failures of the
+                # current package/source/resource authority predicate.
+                current_authority_holds = False
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if not current_authority_holds:
+                terminalized_at = _timestamp(self._now())
+                updated = connection.execute(
+                    "UPDATE package_update_jobs SET status='blocked', "
+                    "terminalized_at=?, terminal_reason=? "
+                    "WHERE job_id=? AND status='active' "
+                    "AND checkpoint='snapshot_may_have_started' "
+                    "AND snapshot_confirmed_at IS NULL",
+                    (terminalized_at, reason, canonical_job_id),
+                )
+                if updated.rowcount != 1:
+                    raise AuthorityConflict(
+                        "stale-authority snapshot retention lost durable ownership"
+                    )
+                self._append_package_update_job_event(
+                    connection,
+                    job_id=canonical_job_id,
+                    created_at=terminalized_at,
+                    level=PackageUpdateEventLevel.WARNING,
+                    stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+                    event_type=(
+                        PackageUpdateEventType.SNAPSHOT_RETAINED_AUTHORITY_STALE
+                    ),
+                    message=reason,
+                    details={"snapshot_name": str(job["snapshot_name"])},
+                )
+                blocked = True
+        return blocked, self._store.package_update_job(canonical_job_id)
+
+    def record_package_update_snapshot_uncertain(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Record that a snapshot operation's outcome could not be established.
+
+        Deliberately non-terminal. The job stays active, keeps owning the
+        global destructive slot, and keeps its durable evidence, because a
+        snapshot operation that may have run is not the same as one that did
+        not. Nothing here permits a retry of the mutation.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.ERROR,
+                stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.SNAPSHOT_OUTCOME_UNCERTAIN,
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def fail_package_update_snapshot(
+        self, job_id: str, reason: str, observed: Sequence[ObservedSnapshot]
+    ) -> PackageUpdateJob:
+        """Terminalize a job whose snapshot provably did not come into being.
+
+        Only legal when the caller supplies a fresh canonical listing that
+        contains no trace of this job's snapshot -- not even an incomplete or
+        wrongly-owned entry under its name. Anything else is uncertainty, and
+        uncertainty must not be terminalized.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job_row = self._require_package_update_job_row(
+                connection, canonical_job_id
+            )
+            if str(job_row["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            checkpoint = PackageUpdateCheckpoint(str(job_row["checkpoint"]))
+            if checkpoint is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED:
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            expected_name = str(job_row["snapshot_name"])
+            for snapshot in _require_observed_snapshots(observed):
+                if snapshot.is_current_pseudo_entry:
+                    continue
+                if snapshot.name == expected_name:
+                    raise AuthorityConflict(
+                        "canonical PVE state still shows this job's snapshot name; "
+                        "the snapshot operation outcome is uncertain, not failed"
+                    )
+                if (
+                    snapshot.ownership is not None
+                    and snapshot.ownership.job_id == canonical_job_id
+                ) or snapshot.ownership_malformed:
+                    raise AuthorityConflict(
+                        "canonical PVE state is ambiguous about this job's "
+                        "snapshot; the outcome is uncertain, not failed"
+                    )
+            updated = connection.execute(
+                "UPDATE package_update_jobs SET status='blocked', "
+                "terminalized_at=?, terminal_reason=? "
+                "WHERE job_id=? AND status='active' "
+                "AND checkpoint='snapshot_may_have_started'",
+                (recorded_at, canonical_reason, canonical_job_id),
+            )
+            if updated.rowcount != 1:
+                raise AuthorityConflict(
+                    "package update job snapshot failure lost durable ownership"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.ERROR,
+                stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.SNAPSHOT_FAILED,
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def resolve_pre_submission_block(
+        self,
+        job_id: str,
+        seal: Callable[[], tuple[HostSubmissionState | None, str, _T]],
+    ) -> tuple[bool, _T]:
+        """Atomically decide, and durably apply, a pre-submission block.
+
+        This is the mirror image of
+        :meth:`execute_snapshot_submission_if_current`. That method never
+        lets a NEW submission proceed once authority has gone stale; this one
+        never lets a "never submitted" proof terminalize a job once a
+        concurrent, authorized submission may have crossed the door in the
+        gap between the proof and the durable transition -- a check-then-
+        commit race just like the one that method itself closes, mirrored
+        onto the release path instead of the submission path.
+
+        ``seal`` performs exactly ONE bounded typed host seal operation --
+        never a PVE read, resubmission, or poll loop -- and returns
+        ``(host_submission_state, reason, evidence)``. It is
+        invoked at most once, while this transaction still owns the writer
+        lock, so no concurrent :meth:`execute_snapshot_submission_if_current`
+        critical section can interleave between the proof and the block:
+        whichever critical section acquires the store's one writer lock first
+        reaches the host boundary first. The host's own per-VMID lease then
+        orders the durable seal against every delayed submitter.
+
+        This is the ONLY way a job past ``snapshot_may_have_started`` may be
+        terminalized without canonical PVE evidence, and it exists because the
+        write-ahead checkpoint is deliberately committed before the host is
+        ever called: an ordinary pre-flight refusal on the host (a guest that
+        moved node, say) would otherwise fence the single global destructive
+        slot forever, with no PVE mutation having been attempted at all.
+
+        Current package-update authority is deliberately NOT required here:
+        this path exists specifically for operations whose authority may
+        already be stale, or may never have been proved for this exact call
+        at all -- recovering evidence, and releasing a job the host proves it
+        never touched, must never depend on a context that may never become
+        current again. What IS still enforced is that the job's own durable
+        record is consistent with never having been submitted -- active,
+        still at the write-ahead checkpoint, no observed PVE task, and no
+        confirmed snapshot. A job that ever recorded a task identity provably
+        *was* submitted and can never be released down this path, whatever
+        ``seal`` reports.
+
+        Returns whether the job was blocked, plus whatever ``seal``
+        returned as evidence either way, so the caller can recover through
+        the ordinary pipeline when it was not.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        evidence: _T | None = None
+        blocked = False
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            if job["snapshot_task_upid"] is not None:
+                raise AuthorityConflict(
+                    "package update job observed a PVE snapshot task, so its "
+                    "operation was submitted and cannot be released as unsubmitted"
+                )
+            if job["snapshot_confirmed_at"] is not None:
+                raise AuthorityInvariantError(
+                    "package update job snapshot confirmation is inconsistent"
+                )
+            # The durable host seal happens HERE, while this transaction still
+            # owns the writer lock -- never before BEGIN IMMEDIATE, and never
+            # trusted if merely supplied by the caller as a precomputed value.
+            submission_state, reason, evidence = seal()
+            self._after_pre_submission_block_proof(
+                connection, job_id=canonical_job_id
+            )
+            if submission_state is HostSubmissionState.SEALED_NOT_SUBMITTED:
+                self._commit_pre_submission_block(
+                    connection,
+                    job_id=canonical_job_id,
+                    reason=_require_text(reason, "reason", max_length=500),
+                )
+                blocked = True
+        return blocked, evidence  # type: ignore[return-value]
+
+    def _commit_pre_submission_block(
+        self, connection: sqlite3.Connection, *, job_id: str, reason: str
+    ) -> None:
+        """Durably terminalize one job as blocked, inside the caller's own
+        transaction. Only ever called while that transaction still owns the
+        authority store's writer lock -- see
+        :meth:`resolve_pre_submission_block`.
+        """
+
+        recorded_at = _timestamp(self._now())
+        updated = connection.execute(
+            "UPDATE package_update_jobs SET status='blocked', "
+            "terminalized_at=?, terminal_reason=? "
+            "WHERE job_id=? AND status='active' "
+            "AND checkpoint='snapshot_may_have_started' "
+            "AND snapshot_task_upid IS NULL AND snapshot_confirmed_at IS NULL",
+            (recorded_at, reason, job_id),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job pre-submission block lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=recorded_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+            event_type=(
+                PackageUpdateEventType.SNAPSHOT_BLOCKED_BEFORE_SUBMISSION
+            ),
+            message=reason,
+            details={},
+        )
+
+    def select_package_update_rollback_target(
+        self, job_id: str, observed: Sequence[ObservedSnapshot]
+    ) -> PackageUpdateRollbackTarget:
+        """Return the ONLY snapshot this exact job may ever roll back to.
+
+        There is no caller-supplied snapshot name, no "latest Hubinet
+        snapshot", no "newest pre-update snapshot", and no fallback to another
+        job's snapshot. The target is the snapshot this job itself created and
+        confirmed, re-proved against a fresh canonical listing every time.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        snapshots = _require_observed_snapshots(observed)
+        # One read transaction, so the job row and the ownership derived from
+        # it are a consistent view of authority.
+        with self._store._transaction() as connection:
+            job_row = self._require_package_update_job_row(
+                connection, canonical_job_id
+            )
+            expected_ownership = self._snapshot_ownership_in_transaction(
+                connection, job_row
+            )
+        job = self._store.package_update_job(canonical_job_id)
+        if job.status is not PackageUpdateJobStatus.ACTIVE:
+            # A terminal job never rolls anything back. Its snapshot is
+            # retained, but retention is not authorization.
+            raise AuthorityConflict(
+                "package update job is terminal and cannot roll back"
+            )
+        if job.snapshot_confirmed_at is None or job.snapshot_name is None:
+            raise AuthorityConflict(
+                "package update job has no confirmed job-owned snapshot"
+            )
+        if (
+            _checkpoint_rank(job.checkpoint)
+            < _checkpoint_rank(PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED)
+        ):
+            raise AuthorityInvariantError(
+                "package update job snapshot confirmation is inconsistent"
+            )
+        self._require_exactly_one_job_owned_snapshot(
+            job_id=canonical_job_id,
+            expected_name=job.snapshot_name,
+            observed=snapshots,
+            expected=expected_ownership,
+        )
+        return PackageUpdateRollbackTarget(
+            job_id=canonical_job_id,
+            resource_id=job.resource_id,
+            expected_vmid=job.expected_vmid,
+            expected_node_name=job.expected_node_name,
+            snapshot_name=job.snapshot_name,
+            snapshot_operation_id=str(job.snapshot_operation_id),
+            snapshot_confirmed_at=job.snapshot_confirmed_at,
+        )
+
+    @staticmethod
+    def _require_exactly_one_job_owned_snapshot(
+        *,
+        job_id: str,
+        expected_name: str | None,
+        observed: Sequence[ObservedSnapshot],
+        expected: SnapshotOwnership,
+    ) -> ObservedSnapshot:
+        """Fail closed unless the canonical listing proves exactly one owner.
+
+        Ambiguity is never resolved in the job's favour: a duplicate, an
+        incomplete entry, a name collision with foreign metadata, or a
+        Hubinet-looking snapshot whose metadata did not parse all refuse.
+        """
+
+        if expected_name is None:
+            raise AuthorityInvariantError(
+                "package update job has no persisted snapshot identity"
+            )
+        matches: list[ObservedSnapshot] = []
+        for snapshot in _require_observed_snapshots(observed):
+            if snapshot.is_current_pseudo_entry:
+                if snapshot.name == expected_name:
+                    raise AuthorityConflict(
+                        "canonical PVE state reports the job snapshot name as the "
+                        "current pseudo-entry"
+                    )
+                continue
+            claims_this_job = (
+                snapshot.ownership is not None
+                and snapshot.ownership.job_id == job_id
+            )
+            if snapshot.name != expected_name and not claims_this_job:
+                if snapshot.ownership_malformed:
+                    # A malformed Hubinet-looking snapshot elsewhere on this
+                    # guest cannot be attributed, so it cannot be ruled out as
+                    # a second claim on this job either.
+                    raise AuthorityConflict(
+                        "canonical PVE state contains malformed Hubinet snapshot "
+                        "metadata; job-owned snapshot ownership is ambiguous"
+                    )
+                continue
+            if snapshot.ownership_malformed:
+                raise AuthorityConflict(
+                    "job-owned snapshot name carries malformed Hubinet metadata"
+                )
+            if snapshot.name != expected_name:
+                raise AuthorityConflict(
+                    "another snapshot claims this job under a different name"
+                )
+            if snapshot.incomplete:
+                raise AuthorityConflict(
+                    "canonical PVE state reports the job-owned snapshot as "
+                    "incomplete"
+                )
+            if snapshot.ownership != expected:
+                raise AuthorityConflict(
+                    "job-owned snapshot name does not carry this job's exact "
+                    "ownership metadata"
+                )
+            matches.append(snapshot)
+        if not matches:
+            raise AuthorityConflict(
+                "canonical PVE state does not contain this job's snapshot"
+            )
+        if len(matches) != 1:
+            raise AuthorityConflict(
+                "canonical PVE state contains duplicate job-owned snapshots"
+            )
+        return matches[0]
+
+    #: Checkpoints from which ordinary startup may safely terminalize an
+    #: active job. Every one of them is provably before any PVE snapshot
+    #: submission *and* before any package mutation:
+    #:
+    #: - ``issued``/``preflight_passed`` -- nothing was ever submitted.
+    #: - ``snapshot_confirmed`` -- a snapshot exists and is retained, but no
+    #:   package mutation has begun, so interrupting is safe.
+    #:
+    #: ``snapshot_may_have_started`` is deliberately absent: a snapshot
+    #: operation may already be in flight, so the job stays active and fenced.
+    _STARTUP_INTERRUPTIBLE_CHECKPOINTS = (
+        PackageUpdateCheckpoint.ISSUED,
+        PackageUpdateCheckpoint.PREFLIGHT_PASSED,
+        PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+    )
+
+    def recover_interrupted_package_update_jobs(self) -> tuple[str, ...]:
+        """Interrupt provably-safe jobs; preserve every uncertain state intact.
+
+        Ordinary production startup terminalizes only the checkpoints in
+        ``_STARTUP_INTERRUPTIBLE_CHECKPOINTS``. A job at
+        ``snapshot_may_have_started`` may already have submitted a PVE
+        snapshot mutation, and a job at or beyond ``mutation_may_have_started``
+        may already have mutated packages; both are left active, keep owning
+        the global destructive slot, and keep their durable evidence. This
+        pass never replays a snapshot operation, never guesses an outcome, and
+        never silently frees destructive ownership. Repeating it is
+        idempotent: an already-terminal job is not selected again.
         """
 
         recovered_at = _timestamp(self._now())
-        pre_mutation = (
-            PackageUpdateCheckpoint.ISSUED.value,
-            PackageUpdateCheckpoint.PREFLIGHT_PASSED.value,
-            PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED.value,
+        pre_mutation = tuple(
+            checkpoint.value
+            for checkpoint in self._STARTUP_INTERRUPTIBLE_CHECKPOINTS
         )
         with self._store._transaction() as connection:
             rows = connection.execute(
                 "SELECT job_id, checkpoint FROM package_update_jobs "
-                "WHERE status='active' AND checkpoint IN (?, ?, ?) "
+                "WHERE status='active' AND checkpoint IN "
+                f"({', '.join('?' * len(pre_mutation))}) "
                 "ORDER BY issued_at, job_id",
                 pre_mutation,
             ).fetchall()
@@ -1481,10 +2430,30 @@ class InventoryAuthority:
             ),
         )
 
+    def _after_package_update_authority_proof(
+        self, connection: sqlite3.Connection, *, job_id: str
+    ) -> None:
+        """Test seam inside a transition transaction, after the authority proof.
+
+        Fires between proving current authority and committing the transition
+        it authorizes. Both are in one transaction, so this is exactly the
+        point where a check-then-commit race would have been possible.
+        """
+
     def _after_package_update_job_issuance(
         self, connection: sqlite3.Connection, *, job_id: str
     ) -> None:
         """Test seam after all issuance writes, inside the transaction."""
+
+    def _after_pre_submission_block_proof(
+        self, connection: sqlite3.Connection, *, job_id: str
+    ) -> None:
+        """Test seam inside :meth:`resolve_pre_submission_block`'s transaction,
+        after the durable host seal and before the backend block it may
+        authorize. Both are in one transaction, so this is exactly the point
+        where an interleaving submission critical section would otherwise be
+        able to race the block.
+        """
 
     @staticmethod
     def _require_package_scan_target(
@@ -2206,6 +3175,41 @@ def _require_uuid(value: str, field_name: str) -> str:
             f"{field_name} must be a canonical lowercase hyphenated non-NIL UUID"
         )
     return value
+
+
+_PVE_UPID_RE = re.compile(
+    r"UPID:(?P<node>[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?)"
+    r":[0-9A-Fa-f]{8}:[0-9A-Fa-f]{8,9}:[0-9A-Fa-f]{8}"
+    r":[^:\s/]+:[^:\s/]*:[^:\s/]+:"
+)
+
+
+def _require_pve_upid(value: str) -> str:
+    """Validate a PVE task identity against PVE's own UPID grammar.
+
+    Mirrors ``PVE::UPID::decode`` (``pve-common``): the trailing colon is part
+    of the format, and a value that does not decode is never a task identity
+    we may later poll.
+    """
+
+    if (
+        not isinstance(value, str)
+        or len(value) > 300
+        or not _PVE_UPID_RE.fullmatch(value)
+    ):
+        raise ValueError("task_upid must be a canonical PVE UPID")
+    return value
+
+
+def _require_observed_snapshots(
+    observed: Sequence[ObservedSnapshot],
+) -> tuple[ObservedSnapshot, ...]:
+    if isinstance(observed, (str, bytes)) or not isinstance(observed, Sequence):
+        raise ValueError("observed snapshots must be a sequence")
+    snapshots = tuple(observed)
+    if not all(isinstance(item, ObservedSnapshot) for item in snapshots):
+        raise ValueError("observed snapshots must be ObservedSnapshot values")
+    return snapshots
 
 
 def _require_package_plan_fingerprint(value: str) -> str:

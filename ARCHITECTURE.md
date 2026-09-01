@@ -22,10 +22,11 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v9). Schema v9 retains the
-immutable scan/approval authority and adds internal, purpose-specific durable
-package-update jobs, copied exact package rows, global active-job ownership,
-and append-only job events. There is no migration from v8; pre-release installs
+database (marker `hubinet_ops_0_5_authority`, schema v10). Schema v10 retains
+the immutable scan/approval authority and internal durable package-update jobs,
+and adds the job-owned snapshot operation identity, its write-ahead uncertainty
+checkpoint, the observed PVE task identity, and SQL-level state-machine
+invariants over all of them. There is no migration from v9; pre-release installs
 use the product updater's explicit backed-up authority reset and require Home
 Assistant re-enrollment.
 
@@ -77,12 +78,258 @@ Hubinet credential. QEMU is published as unsupported.
 Package-update job authority is persistence-only in this stage. A directly
 instantiated `InventoryAuthority` can issue and revalidate one globally
 single-flight job from a current exact approval, and startup interrupts any
-pre-mutation active job so it cannot auto-run after restart. The production
-HTTP and Home Assistant surfaces cannot issue a job, and there is no job
-consumer, PVE snapshot mutation, workload package mutation, healthcheck, or
-rollback implementation. Authority revalidation is necessary but not
-sufficient permission for future mutation: the activation stage must also
-prove exact APT simulation/equality immediately before execution.
+pre-package-mutation active job so it cannot auto-run after restart. The
+production HTTP and Home Assistant surfaces cannot issue a job, and there is
+no job consumer, workload package mutation, healthcheck, or rollback
+execution. Authority revalidation is necessary but not sufficient permission
+for future mutation: the activation stage must also prove exact APT
+simulation/equality immediately before execution.
+
+## Job-owned snapshot safety
+
+The safety primitives for one update job's single pre-update PVE snapshot
+exist internally and are **not production-reachable**. Nothing on the HTTP,
+Home Assistant, scheduler, bootstrap, or updater path can create a PVE
+snapshot, and no snapshot helper, key, or PVE mutation privilege is deployed.
+There is still no workload package mutation anywhere.
+
+```text
+issued -> preflight_passed -> snapshot_may_have_started
+       -> snapshot_confirmed -> (mutation, still unimplemented)
+```
+
+**The uncertainty boundary.** `snapshot_may_have_started` is a write-ahead
+checkpoint committed durably *before* any snapshot mutation request can be
+sent. Once a job reaches it, nothing may *infer* that no PVE mutation
+happened. Startup recovery therefore interrupts `issued`, `preflight_passed`,
+and `snapshot_confirmed` jobs — all provably before package mutation, with a
+confirmed snapshot simply retained — but leaves a
+`snapshot_may_have_started` job active, still owning the global destructive
+slot, with its evidence fenced. It never replays a snapshot operation and
+never guesses an outcome.
+
+**Transient observation versus durable release proof.** Because that
+checkpoint is committed before the host is ever called, an ordinary
+pre-flight refusal — a moved or gone guest, or a failed PVE read — would
+otherwise fence the global destructive slot forever. The host journal has
+three evidence classes. `absent`/`intent` are transient pre-submission
+observations: they permit a NEW submission and may route the backend into its
+release path, but they may not release a job. A helper launched by a backend
+that then died may not have acquired its host lease yet.
+`sealed_not_submitted` is the durable no-future-submit fence and the only
+pre-submission release proof. `submitted`/`task_known`/`terminal` are
+post-submission evidence and remain fenced or recover through the ordinary
+evidence path.
+
+Everything else stays uncertain and fenced: a canonical absence, an
+in-flight guest lock, ambiguous ownership, a polling timeout, a lost SSH
+answer, an unreadable or corrupt journal, a lease held by another
+invocation, and every failure at or after the `submitted` transition. The
+releasing token is matched exactly, so a helper that reports no proof at all
+can never release a job.
+
+**One transaction per authorized transition.** Every transition whose safety
+depends on current authority — preflight, the write-ahead snapshot intent,
+and snapshot confirmation — re-proves the *complete* current-authority
+predicate inside the same SQLite transaction that commits it (`BEGIN
+IMMEDIATE`, so no other writer can interleave). Proving in one transaction and
+committing in another is a check-then-commit race: discovery reconciliation
+can invalidate the job's resource incarnation in between while the VMID, node,
+resource type, and running status all stay identical, so neither the
+checkpoint CAS (which sees only job status and checkpoint) nor the host helper
+(which can verify only live PVE facts, never a backend incarnation) would
+catch it. Transitions that merely preserve evidence about a possible PVE
+mutation — recording the observed task, recording uncertainty, startup
+fencing — deliberately do **not** require current authority, because
+staleness must never discard evidence.
+
+**Identity.** `app/inventory/snapshot_identity.py` derives one job's snapshot
+name and snapshot operation id purely from immutable identity (backend
+instance, job, resource incarnation, continuity revision), so the same job
+derives the same identity after any restart and two jobs never collide. The
+name satisfies PVE's verified `pve-snapshot-name` contract (`pve-configid`,
+maxLength 40, `current`/`vzdump` reserved). **The name is only the physical
+PVE key and is never ownership proof.** Ownership is a strict structured
+metadata record carried in the snapshot's PVE description; malformed,
+incomplete, duplicate, or mismatching metadata fails closed, and a
+Hubinet-looking snapshot that will not parse is reported as ambiguous rather
+than silently skipped.
+
+**Verified PVE semantics.** Read from current Proxmox VE sources rather than
+inherited from Hubinet 0.4: snapshot create is asynchronous and returns a UPID
+immediately, so a returned POST proves nothing; task status is
+`running`/`stopped` plus an optional `exitstatus`, and PVE's own rule treats
+only `OK` and `WARNINGS: <n>` as non-errors, so `stopped` alone is never
+success; the snapshot listing includes PVE's synthetic `current` pseudo-entry
+and carries `snapstate` for unfinished snapshots; and an LXC snapshot
+description does not round-trip byte-identically, because the config parser
+appends a newline to every line it reads back.
+
+Strict fresh canonical evidence is therefore mandatory in every case before
+`snapshot_confirmed`, and a terminal successful task is never sufficient on
+its own. Task evidence is not, however, universally *necessary*: the normal
+path observes a PVE task and requires it to have reached a terminal non-error
+state, while the submitted-without-recorded-UPID recovery path establishes
+completion from its durable operation-journal state plus that same strict
+canonical evidence, rather than fabricating a task identity it never saw.
+
+**Host-side durable journal.** `deploy/hubinet-package-snapshot-helper.py` is
+a separate file and a separate logical privilege boundary from the scan
+helper, which stays scan-only. It exposes three typed operations
+(`inspect_job_snapshot_state`, `ensure_pre_update_snapshot_submitted`, and
+`seal_operation_never_submitted`), no delete, no rollback submission, no
+arbitrary shell or argv, and it re-derives
+the snapshot identity from the request's own ownership facts rather than
+trusting the name it was handed. `ensure_pre_update_snapshot_submitted` is
+submission-only: it never polls a PVE task to completion, so it returns the
+instant the operation has crossed (or is already past) its submission
+boundary. Each operation is journaled by operation identity on the PVE host,
+with submission and sealing serialized by an `flock` held per VMID. From
+`intent`, either seal wins and writes `sealed_not_submitted`, or submission
+wins and advances through
+`submitted -> task_known -> terminal`; every transition is an fsynced atomic
+rename. `sealed_not_submitted` can never transition to submission.
+`submitted` is the genuinely uncertain window and is **never** resubmitted.
+Taskless success uses one strict bar in both ensure and inspect recovery: the
+exact complete snapshot plus no relevant in-flight container lock. An
+identical retry reattaches; a mismatched request is refused. Successful
+operation-state responses carry the exact typed `submission_state`. Error
+responses use the separate typed `error.submission` field instead, to state
+whether the helper still has transient pre-submission evidence
+(`not_submitted`) or whether submission must be treated as unknown
+(`may_have_been_submitted`); a malformed request or a main-level failure may
+carry neither. Neither channel lets the backend infer release from an error
+string or canonical absence: only `submission_state=sealed_not_submitted` is
+a durable release proof.
+
+**The submission critical section.** The write-ahead checkpoint alone leaves
+a second, narrower race open: another Hubinet writer (discovery
+reconciliation, a package scan) can invalidate this job's authority *after*
+it was proved and *before* a NEW PVE submission is actually sent, in the gap
+between the intent transaction and the host-control call. Proving authority
+and calling the host in two separate transactions is a check-then-commit race
+exactly like the one the write-ahead checkpoint itself was built to close. So
+a NEW submission runs only inside
+`InventoryAuthority.execute_snapshot_submission_if_current`, which re-proves
+the job's whole current-authority context and calls
+`ensure_pre_update_snapshot_submitted` while it still holds the authority
+store's one writer lock — nothing else may write to that store for the
+whole of it. Because the host call it invokes never polls a PVE task to
+completion, the writer lock is held only for one bounded round trip, never
+for PVE's own asynchronous task. Before attempting any of this, the
+orchestrator first reads the host's durable `submission_state` — a pure read
+that never requires current authority, because recovering evidence about an
+operation that may already have been submitted must never be discarded
+merely because authority has gone stale. Only `absent` and `intent` states
+permit a NEW submission; every other state skips the submission critical
+section. A seal is routed to the durable release path, while post-submission
+states go to read-only recovery. Task polling and canonical
+confirmation both happen strictly *after* the critical section releases its
+writer lock, through the same read-only `inspect_job_snapshot_state`
+operation, bounded by `PackageUpdateSnapshotOrchestrator`'s own retry loop —
+never by holding a database transaction open across it. This is not a claim
+that SQLite and PVE are proved atomic, and not a claim that a snapshot is
+proved to belong to the same LXC PVE showed several minutes ago (see
+"Identity" below): the claim is that Hubinet's own current authority is held
+stable through the submission boundary, and the host independently
+re-validates the live PVE target immediately before it ever submits.
+
+**Activation gate: SQLite writer-contention policy.** `execute_snapshot_submission_if_current`
+and `resolve_pre_submission_block` deliberately hold the authority store's
+`BEGIN IMMEDIATE` writer lock across one bounded SSH host round trip each —
+that serialization is load-bearing (see above and "the pre-submission block
+critical section" below) and must remain. `InventoryAuthorityStore` currently
+sizes `PRAGMA busy_timeout`/connection `timeout` from one fixed
+`BUSY_TIMEOUT_MS = 5000` constant shared by every writer, including ordinary
+discovery/package-scan authority writes that have no reason to wait on a host
+round trip at all. Once snapshot execution is production-reachable, a
+legitimate concurrent writer (discovery, a package scan, approval) could then
+observe `database is locked` purely because a valid snapshot host round trip
+inside one of these two critical sections legitimately took longer than that
+generic timeout, even though the snapshot critical section itself was
+operating correctly. Before snapshot execution becomes production-reachable,
+SQLite writer contention/wait policy must be sized or configured consistently
+with the maximum bounded snapshot host critical-section duration, so normal
+concurrent authority writers do not fail merely because a valid snapshot host
+round trip exceeds the generic DB busy timeout. This is deliberately not
+solved in this dark stage: today there is no production caller of either
+critical section, so no concurrent writer can actually contend with one, and
+a per-critical-section busy-timeout override or similar mechanism is new
+runtime/configuration surface this PR does not introduce. This is NOT
+permission to lengthen or hold any polling transaction open — task polling
+and canonical confirmation stay strictly outside both writer critical
+sections (see above), and this gate does not change that.
+
+**Liveness after a refusal, and the pre-submission block critical section.**
+A stale authority context always refuses a NEW submission —
+`execute_snapshot_submission_if_current` never authorizes one on stale
+authority, full stop. But if the underlying resource or source is gone or
+replaced for good, every future retry would repeat that identical refusal
+forever, permanently occupying the one global destructive slot with a job
+that can never advance. The refusal alone therefore does not decide the
+job's fate, and neither does a single fresh read taken outside any lock:
+that would only narrow the very race it exists to close, since another
+invocation's authorized submission could still cross the door in the gap
+between such a read and a later, separately-committed block.
+
+So a job is only ever released as unsubmitted from inside
+`InventoryAuthority.resolve_pre_submission_block` — the mirror image of
+`execute_snapshot_submission_if_current`, serialized against it through the
+SAME authority-store writer lock. It invokes ONE bounded host seal while its
+transaction owns that lock and terminalizes in the SAME transaction only when
+the host durably returns `sealed_not_submitted`. Current package-update
+authority is deliberately not required; the job must still be active at
+`snapshot_may_have_started`, with no observed task and no confirmation.
+Anything other than the seal — post-submission state, lease contention, an
+older helper, or a lost/malformed response — remains fenced and follows the
+ordinary evidence path. The seal performs no PVE reads, so a moved or deleted
+guest does not need to exist on the frozen node for liveness.
+
+**Two serialization layers, not one.** The SQLite writer lock serializes
+Hubinet's submission and release transactions. The host's SAME non-blocking
+per-VMID `VmidMutationLock` serializes submission, inspection, and sealing
+across independent helper processes. If submit takes the host lease first, it
+durably reaches at least `submitted` before `pvesh create`, and the later seal
+refuses. If seal takes the lease first, it durably writes
+`sealed_not_submitted`; a helper launched earlier but delayed before its own
+lease acquisition reads that phase when it finally starts and must never
+submit. `operation_in_progress` stays UNCERTAIN. Each inspection releases the
+host lease before returning, and task polling holds neither the host lease nor
+the SQLite writer lock across a wait. This serialization claims no historical
+LXC incarnation identity; the backend retains `resource_id`/continuity
+authority while the helper validates only current PVE facts.
+
+**Successful snapshot with stale authority.** Confirmation still requires
+current authority because confirmation grants rollback authority. If a fresh
+canonical listing independently proves the exact complete same-job snapshot
+but current package/resource/source authority is stale, a separate authority
+transaction retains all snapshot/task evidence and terminalizes the job as
+`blocked` without setting `snapshot_confirmed_at` or advancing the checkpoint.
+The global slot is released, but rollback selection refuses the terminal,
+unconfirmed job. If authority is current again when that resolver runs, it
+does not terminalize and normal confirmation may proceed.
+
+**Same-job rollback.** A job may roll back only to the snapshot that exact job
+created and confirmed. `select_package_update_rollback_target` re-proves the
+name, the full structured ownership metadata, `resource_id`, the continuity
+revision, that the entry is a real snapshot rather than the `current`
+pseudo-entry, and that canonical state is unambiguous. There is no
+caller-supplied snapshot name, no "latest Hubinet snapshot", and no fallback
+to another job's snapshot; a reused VMID never transfers rollback authority to
+a different incarnation. **Rollback submission is deliberately not
+implemented**: only the authorization/selection contract exists, and execution
+is left to the later activation stage rather than being shipped to a lower
+safety bar.
+
+**No deletion.** This stage deletes nothing — not foreign snapshots, not
+manual PVE snapshots, not old, failed, or interrupted-job Hubinet snapshots.
+Retention is separate future work.
+
+`app/package_update_snapshot.py` (orchestration) and
+`app/package_update_snapshot_host_control.py` (a purpose-specific pinned-key
+SSH client, not a revival of the removed generic `app/host_control.py`) are
+instantiated only by hermetic tests. `tests/test_r0_architecture_regression.py`
+proves production reachability did not increase.
 
 ## Identity
 
@@ -197,7 +444,7 @@ lock.
   -> start, prove systemd active + local HTTP health within the existing
      service timeout, then accept (reused bootstrap discovery contract,
      extended with an optional minimum-committed-sequence floor to prove a
-     genuine post-restart cycle -- a committed source that is otherwise
+     genuine post-restart cycle — a committed source that is otherwise
      fully coherent but has not yet published a run past that floor is a
      TRANSIENT condition and keeps polling within the existing discovery
      timeout, never an immediate failure; every other incoherence is still
@@ -505,9 +752,10 @@ Properties that channel must have:
   binding/generation/continuity/VMID/node context, and the same fresh healthy
   committed source context captured when the scan was issued.
 
-Job-owned snapshot mutation, update execution, healthchecks, rollback,
-lifecycle mutation, and QEMU package execution remain future work. Exact APT
-execution must also resolve multiarch package identity rather than guessing it.
+Update execution, healthchecks, rollback execution, lifecycle mutation, and
+QEMU package execution remain future work; job-owned snapshot safety exists
+internally but cannot be invoked by production. Exact APT execution must also
+resolve multiarch package identity rather than guessing it.
 
 ## Ordinary safety rules (all layers, now and later)
 

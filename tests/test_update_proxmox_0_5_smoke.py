@@ -173,7 +173,7 @@ def _assert_recovery_pushed_nothing(env, before_recovery):
 
 @pytest.fixture
 def target_checkout(tmp_path):
-    return build_update_target_checkout(tmp_path / "target", REPO_ROOT, schema_version=9)
+    return build_update_target_checkout(tmp_path / "target", REPO_ROOT, schema_version=10)
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +184,7 @@ def target_checkout(tmp_path):
 class TestCodeOnlyUpdate:
     def test_boring_update_preserves_everything(self, tmp_path):
         env = seed_installed_environment(
-            tmp_path, schema_version=9, installed_source_sha="1" * 40
+            tmp_path, schema_version=10, installed_source_sha="1" * 40
         )
         pre_state = env.state()
         pre_authorized_keys = (
@@ -194,7 +194,7 @@ class TestCodeOnlyUpdate:
         pre_agent_env = env.ct_file_text(FAKE_VMID, "/etc/hubinet-ops/agent.env")
         pre_nft = env.ct_file_text(FAKE_VMID, "/etc/nftables.conf")
 
-        target = build_update_target_checkout(tmp_path / "target-boring", REPO_ROOT, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-boring", REPO_ROOT, schema_version=10)
         result = _run(env.env, _base_args(target))
         assert result.returncode == 0, result.stderr
 
@@ -222,7 +222,7 @@ class TestCodeOnlyUpdate:
         # Authority DB preserved (same backend_instance_id, schema unchanged).
         db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
         assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
-        assert db["schema_version"] == 9
+        assert db["schema_version"] == 10
         # Installed-source marker recorded.
         marker = env.ct_file_text(FAKE_VMID, "/opt/hubinet-ops/.hubinet-source-commit").strip()
         assert marker == git_head_sha(target)
@@ -349,10 +349,10 @@ class TestAuthoritySchemaReset:
         # assumed; the updater itself must then prove the two differ.
         new_backend_instance_id = "11111111-1111-4111-8111-111111111111"
         env = seed_installed_environment(
-            tmp_path, schema_version=8,
+            tmp_path, schema_version=9,
             scenario_overrides={"discovery_backend_instance_id": new_backend_instance_id},
         )
-        target = build_update_target_checkout(tmp_path / "target-v9", REPO_ROOT, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-v10", REPO_ROOT, schema_version=10)
         result = _run(
             env.env,
             _base_args(target, extra=["--allow-authority-reset"]),
@@ -372,16 +372,16 @@ class TestAuthoritySchemaReset:
         assert backup_files, "expected a retained authority DB backup"
         backup_data = json.loads(backup_files[0].read_text(encoding="utf-8"))
         assert backup_data["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
-        assert backup_data["schema_version"] == 8
+        assert backup_data["schema_version"] == 9
 
     def test_reset_refused_without_allow_flag_makes_zero_mutation(self, tmp_path):
-        env = seed_installed_environment(tmp_path, schema_version=8)
-        target = build_update_target_checkout(tmp_path / "target-v9-refused", REPO_ROOT, schema_version=9)
+        env = seed_installed_environment(tmp_path, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-v10-refused", REPO_ROOT, schema_version=10)
         result = _run(env.env, _base_args(target))
         assert result.returncode != 0
         assert "--allow-authority-reset" in result.stderr
         db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-        assert db["schema_version"] == 8
+        assert db["schema_version"] == 9
         assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
         assert not any(
@@ -399,15 +399,15 @@ class TestRollbackAfterDestructiveResetFailure:
     def test_full_rollback_restores_old_code_and_old_db(self, tmp_path):
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             scenario_overrides={"discovery_result": "backend_unreachable"},
         )
-        target = build_update_target_checkout(tmp_path / "target-v9-fail", REPO_ROOT, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-v10-fail", REPO_ROOT, schema_version=10)
         result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
         assert result.returncode != 0
 
         db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-        assert db["schema_version"] == 8, "the OLD authority database must be restored, not a new schema-9 one"
+        assert db["schema_version"] == 9, "the OLD authority database must be restored, not a new schema-10 one"
         assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
         # The original (pre-update) app payload has no app/inventory/
@@ -877,13 +877,13 @@ class TestAuthorityRemoveFailClosedRollback:
         # rollback itself) is the one that fails here.
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             scenario_overrides={
                 "discovery_result": "backend_unreachable",
                 "fail_nth_authority_remove": 2,
             },
         )
-        target = build_update_target_checkout(tmp_path / "target-v9-remove-fail", REPO_ROOT, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-v10-remove-fail", REPO_ROOT, schema_version=10)
         result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
         assert result.returncode != 0
         assert "ROLLBACK COULD NOT BE COMPLETED" in result.stderr
@@ -892,7 +892,7 @@ class TestAuthorityRemoveFailClosedRollback:
         backup_files = list(backups_root.rglob("authority.db"))
         assert backup_files, "expected the retained authority DB backup to survive"
         backup_data = json.loads(backup_files[0].read_text(encoding="utf-8"))
-        assert backup_data["schema_version"] == 8
+        assert backup_data["schema_version"] == 9
         assert backup_data["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
         # Never copied over an uncertain live database state.
         assert not env.ct_file(FAKE_VMID, "/var/lib/hubinet-ops/authority.db").exists()
@@ -922,15 +922,15 @@ class TestAuthorityResetAttemptedBeforeDestructiveRemoveP1A:
         # outright, leaving old code paired with a missing database.
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             scenario_overrides={"fail_nth_authority_remove_partial": 1},
         )
-        target = build_update_target_checkout(tmp_path / "target-v9-partial-remove", REPO_ROOT, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-v10-partial-remove", REPO_ROOT, schema_version=10)
         result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
         assert result.returncode != 0
 
         db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-        assert db["schema_version"] == 8, (
+        assert db["schema_version"] == 9, (
             "the OLD authority database must be restored even when the forward reset's own "
             "`remove` call failed partway through (one path already unlinked)"
         )
@@ -1069,12 +1069,12 @@ class TestPreserveSchemaObjectsP2C:
     def test_preserve_fails_closed_before_service_stop_on_structural_drift(self, tmp_path):
         env = seed_installed_environment(
             tmp_path,
-            schema_version=9,
+            schema_version=10,
             # Missing "one_active_endpoint_per_source" relative to the
             # target's default required set (FAKE_REQUIRED_SCHEMA_OBJECTS).
             schema_objects=["authority_schema", "backend_instance"],
         )
-        target = build_update_target_checkout(tmp_path / "target-schema-drift", REPO_ROOT, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-schema-drift", REPO_ROOT, schema_version=10)
         result = _run(env.env, _base_args(target))
         assert result.returncode != 0
         assert "structurally drifted" in result.stderr
@@ -1349,14 +1349,14 @@ class TestRollbackLoadBearingStepsCorrectionPass3:
     ):
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             scenario_overrides={
                 "discovery_result": "backend_unreachable",
                 "fail": [failure_key],
             },
         )
         target = build_update_target_checkout(
-            tmp_path / failure_key, REPO_ROOT, schema_version=9
+            tmp_path / failure_key, REPO_ROOT, schema_version=10
         )
         result = _run(
             env.env,
@@ -1371,7 +1371,7 @@ class TestRollbackLoadBearingStepsCorrectionPass3:
         restored = json.loads(
             env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db")
         )
-        assert restored["schema_version"] == 8
+        assert restored["schema_version"] == 9
         assert list(env.ct_file(FAKE_VMID, "/opt/hubinet-ops").glob("app.rollback-*"))
 
 
@@ -1821,7 +1821,7 @@ class TestRebootTmpLossRecoveryP1:
         new_backend_instance_id = "22222222-2222-4222-8222-222222222222"
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             installed_source_sha="4" * 40,
             scenario_overrides={
                 "discovery_backend_instance_id": new_backend_instance_id,
@@ -1829,7 +1829,7 @@ class TestRebootTmpLossRecoveryP1:
             },
         )
         target = build_update_target_checkout(
-            tmp_path / "target-reset-tmp-loss", REPO_ROOT, schema_version=9
+            tmp_path / "target-reset-tmp-loss", REPO_ROOT, schema_version=10
         )
 
         interrupted = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
@@ -1862,7 +1862,7 @@ class TestRebootTmpLossRecoveryP1:
         _assert_recovery_repushed_only_the_authority_tool(env, before_recovery, run_id)
 
         restored = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-        assert restored["schema_version"] == 8, (
+        assert restored["schema_version"] == 9, (
             "the re-pushed helper must have driven the fail-closed remove + "
             "validated-backup restore, not been silently skipped"
         )
@@ -2229,7 +2229,7 @@ class TestMarkerPreconditionUnknownP2B:
         new_backend_instance_id = "33333333-3333-4333-8333-333333333333"
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             installed_source_sha="b" * 40,
             installed_requirements="fastapi==0.100.0\n",
             installed_unit_text=OLD_UNIT_TEXT,
@@ -2244,7 +2244,7 @@ class TestMarkerPreconditionUnknownP2B:
         target = build_update_target_checkout(
             tmp_path / "target-marker-unknown",
             REPO_ROOT,
-            schema_version=9,
+            schema_version=10,
             requirements_text="fastapi==0.116.1\n",
             unit_text=NEW_UNIT_TEXT,
             helper_text=NEW_HELPER_TEXT,
@@ -2273,7 +2273,7 @@ class TestMarkerPreconditionUnknownP2B:
         assert env.ct_file_text(FAKE_VMID, "/etc/systemd/system/hubinet-ops.service") == OLD_UNIT_TEXT
         assert _helper_host_path(env).read_text(encoding="utf-8") == OLD_HELPER_TEXT
         restored = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-        assert restored["schema_version"] == 8
+        assert restored["schema_version"] == 9
         assert restored["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
         # And the pre-update installation is coherently back in service.
         post = env.state()["vmids"][FAKE_VMID]
@@ -2867,7 +2867,7 @@ def _interrupt_after_authority_rollback_restart(tmp_path, name):
     terminal state."""
     env = seed_installed_environment(
         tmp_path,
-        schema_version=8,
+        schema_version=9,
         scenario_overrides={
             "discovery_result": "backend_unreachable",
             # Start #1 is the target's; start #2 is the ROLLBACK's own
@@ -2875,7 +2875,7 @@ def _interrupt_after_authority_rollback_restart(tmp_path, name):
             "kill_updater_after_service_start_call": 2,
         },
     )
-    target = build_update_target_checkout(tmp_path / name, REPO_ROOT, schema_version=9)
+    target = build_update_target_checkout(tmp_path / name, REPO_ROOT, schema_version=10)
     interrupted = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
     assert interrupted.returncode == -9
 
@@ -2887,7 +2887,7 @@ def _interrupt_after_authority_rollback_restart(tmp_path, name):
         "the restore checkpoint must be durable BEFORE the old service can start"
     )
     restored = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-    assert restored["schema_version"] == 8
+    assert restored["schema_version"] == 9
     assert restored["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
     assert len(_authority_backup_restores(env)) == 1
 
@@ -2921,7 +2921,7 @@ class TestAuthorityRestoredCheckpointP2:
             "a replayed rollback must never re-apply the original backup over "
             "writes the restored old service made after the first rollback"
         )
-        assert final["schema_version"] == 8
+        assert final["schema_version"] == 9
         assert final["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
         # Exactly one backup restore across BOTH invocations.
         assert len(_authority_backup_restores(env)) == 1
@@ -2995,18 +2995,18 @@ class TestAuthorityRestoredCheckpointP2:
         """Positive control: the ordinary, uninterrupted path is unchanged."""
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             scenario_overrides={"discovery_result": "backend_unreachable"},
         )
         target = build_update_target_checkout(
-            tmp_path / "target-authority-once", REPO_ROOT, schema_version=9
+            tmp_path / "target-authority-once", REPO_ROOT, schema_version=10
         )
         result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
         assert result.returncode != 0
         assert "rollback complete" in result.stderr
         assert len(_authority_backup_restores(env)) == 1
         db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-        assert db["schema_version"] == 8
+        assert db["schema_version"] == 9
         assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
         assert env.state()["vmids"][FAKE_VMID]["service"] == "active"
         assert not _update_state_path(env, FAKE_VMID, "journal").exists()
@@ -3229,14 +3229,14 @@ class TestForwardDurabilityBarrierFailureSeams:
     def test_authority_restore_barrier_failure_hard_stops(self, tmp_path):
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             scenario_overrides={
                 "discovery_result": "backend_unreachable",
                 "fail": ["ct_sync_authority_restore"],
             },
         )
         target = build_update_target_checkout(
-            tmp_path / "target-barrier-authority-restore-fail", REPO_ROOT, schema_version=9
+            tmp_path / "target-barrier-authority-restore-fail", REPO_ROOT, schema_version=10
         )
         result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
         assert result.returncode != 0
@@ -3246,7 +3246,7 @@ class TestForwardDurabilityBarrierFailureSeams:
         # The namespace-level restore already happened -- only the
         # durability proof failed.
         restored = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-        assert restored["schema_version"] == 8
+        assert restored["schema_version"] == 9
         assert env.state()["vmids"][FAKE_VMID]["service"] == "inactive"
 
 
@@ -3460,10 +3460,10 @@ class TestAuthorityBackupAncestryDurabilityBarrier:
     def test_backup_dir_barrier_crosses_after_creation_before_boot_reenable(self, tmp_path):
         new_backend_instance_id = "33333333-3333-4333-8333-333333333333"
         env = seed_installed_environment(
-            tmp_path, schema_version=8,
+            tmp_path, schema_version=9,
             scenario_overrides={"discovery_backend_instance_id": new_backend_instance_id},
         )
-        target = build_update_target_checkout(tmp_path / "target-backup-ancestry-order", REPO_ROOT, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-backup-ancestry-order", REPO_ROOT, schema_version=10)
         result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
         assert result.returncode == 0, result.stderr
         stderr = result.stderr
@@ -3476,13 +3476,13 @@ class TestAuthorityBackupAncestryDurabilityBarrier:
         new_backend_instance_id = "44444444-4444-4444-8444-444444444444"
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             scenario_overrides={
                 "discovery_backend_instance_id": new_backend_instance_id,
                 "fail": ["ct_sync_authority_backup_dir"],
             },
         )
-        target = build_update_target_checkout(tmp_path / "target-backup-ancestry-fail", REPO_ROOT, schema_version=9)
+        target = build_update_target_checkout(tmp_path / "target-backup-ancestry-fail", REPO_ROOT, schema_version=10)
         result = _run(env.env, _base_args(target, extra=["--allow-authority-reset"]))
         assert result.returncode != 0
         assert "rollback complete" in result.stderr
@@ -3491,7 +3491,7 @@ class TestAuthorityBackupAncestryDurabilityBarrier:
         # marker (which gates the destructive `remove`) is only journaled
         # AFTER this barrier passes.
         db = json.loads(env.ct_file_text(FAKE_VMID, "/var/lib/hubinet-ops/authority.db"))
-        assert db["schema_version"] == 8
+        assert db["schema_version"] == 9
         assert db["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
         # The coherent backup file itself was created (namespace-visible)
         # before the barrier failed -- retained for manual diagnosis, but
@@ -3650,14 +3650,14 @@ class TestImmediatelyBeforeMutationFence:
     def test_reset_required_does_not_require_old_schema_objects_to_match_target(self, tmp_path):
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             schema_objects=["legacy_authority_table"],
             scenario_overrides={
                 "discovery_backend_instance_id": "22222222-2222-4222-8222-222222222222",
             },
         )
         target = build_update_target_checkout(
-            tmp_path / "target-fence-reset-schema-control", REPO_ROOT, schema_version=9
+            tmp_path / "target-fence-reset-schema-control", REPO_ROOT, schema_version=10
         )
         result = _run(
             env.env,
@@ -3747,12 +3747,12 @@ class TestTerminalCheckpointNeverRollsBack:
         new_backend_instance_id = "44444444-4444-4444-8444-444444444444"
         env = seed_installed_environment(
             tmp_path,
-            schema_version=8,
+            schema_version=9,
             scenario_overrides={"discovery_backend_instance_id": new_backend_instance_id},
         )
         env_with_term = dict(env.env, HUBINET_OPS_TEST_TERM_AT="after_completed_partial_cleanup")
         target = build_update_target_checkout(
-            tmp_path / "target-term-schema-reset", REPO_ROOT, schema_version=9
+            tmp_path / "target-term-schema-reset", REPO_ROOT, schema_version=10
         )
         result = _run(env_with_term, _base_args(target, extra=["--allow-authority-reset"]))
 
@@ -3770,7 +3770,7 @@ class TestTerminalCheckpointNeverRollsBack:
         backup_files = list(backups_root.rglob("authority.db"))
         assert backup_files, "expected the retained authority DB backup"
         backup_data = json.loads(backup_files[0].read_text(encoding="utf-8"))
-        assert backup_data["schema_version"] == 8
+        assert backup_data["schema_version"] == 9
         assert backup_data["backend_instance_id"] == FAKE_BACKEND_INSTANCE_ID
 
     def test_journal_clear_failure_after_completed_is_resolved_by_next_invocation(self, tmp_path):

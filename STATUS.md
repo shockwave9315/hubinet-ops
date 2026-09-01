@@ -5,15 +5,17 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v9):
+  SQLite authority database (schema v10):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
   source context, durable exact-plan approval facts, and internal durable
   package-update job authority. Jobs copy immutable approval/context provenance
   and exact package rows, use UUID request idempotency, own one global active
-  slot, record append-only events, and are interrupted before mutation on
-  restart.
+  slot, record append-only events, and are interrupted before package mutation
+  on restart. Schema v10 adds the job-owned snapshot operation identity, its
+  write-ahead uncertainty checkpoint, the observed PVE task identity, and
+  SQL-level state-machine invariants over all of them.
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus exactly
   one authority-only mutation,
   `PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
@@ -63,11 +65,12 @@
 
 The PVE API inventory surface remains read-only. The backend's sole mutation
 route records Hubinet approval authority state only. Internal update-job
-issuance is not production-reachable: there is no HTTP/HA creation control and
-no worker or scheduler consuming jobs. Package scanning may write APT
-index/cache metadata but never changes workload packages. There is no PVE
-job-owned snapshot mutation, workload package mutation, healthcheck execution,
-rollback execution, lifecycle mutation, policy, or endpoint failover.
+issuance and job-owned snapshot safety are not production-reachable: there is
+no HTTP/HA creation control and no worker or scheduler consuming jobs, and no
+snapshot helper, key, or PVE mutation privilege is deployed. Package scanning
+may write APT index/cache metadata but never changes workload packages. There
+is no workload package mutation, healthcheck execution, rollback execution,
+snapshot deletion, lifecycle mutation, policy, or endpoint failover.
 
 ## Human0 validation
 
@@ -145,19 +148,59 @@ unimplemented future stage.
   immutable copied package rows, request-id retry semantics, global durable
   single-flight, current-authority revalidation, append-only events, and
   pre-mutation restart interruption.
-- **Not activated:** no HTTP or Home Assistant job control, executor, PVE
-  snapshot operation, package mutation, healthcheck, or rollback path exists.
-  Reserved later checkpoint vocabulary is inert.
+- **Not activated:** no HTTP or Home Assistant job control, executor, package
+  mutation, healthcheck, or rollback execution path exists.
+
+## Job-owned snapshot safety
+
+- **Implemented internally:** a deterministic, restart-stable per-job snapshot
+  identity; strict structured ownership metadata in the snapshot description as
+  the authority proof (never the name); a `snapshot_may_have_started`
+  write-ahead checkpoint committed before any mutation request can be sent;
+  observed PVE task identity; verified PVE async-task semantics with mandatory
+  fresh canonical snapshot re-read before confirmation; a durable per-operation
+  host journal under a per-VMID `flock` that reattaches instead of resubmitting;
+  transient host `absent`/`intent` routing evidence plus a durable
+  `sealed_not_submitted` no-future-submit fence, serialized against delayed
+  helpers by the same per-VMID lease and required before a pre-submission job
+  may release the global slot; moved/gone-guest liveness without a successful
+  PVE target read; terminal retention of canonically proven snapshots when
+  current authority becomes stale, without granting rollback authority;
+  fail-closed handling of every other ambiguity; startup recovery that fences
+  an uncertain snapshot operation and keeps it owning the global slot; and the
+  same-job rollback authorization contract.
+- **Not activated:** no production HTTP, Home Assistant, scheduler, bootstrap,
+  or updater path can create a PVE snapshot. The snapshot helper is a separate
+  dark file that is **not deployed**, no key or `authorized_keys` entry exists
+  for it, and no extra PVE privilege (`VM.Snapshot`) is provisioned. The
+  package-scan helper remains scan-only.
+- **Deliberately deferred:** rollback *submission*. Only the authorization and
+  selection contract exists; executing a rollback is left to the activation
+  stage rather than shipped to a lower safety bar. There is also no snapshot
+  deletion or retention in this stage, and no workload package mutation.
+- **Activation requirement:** the two snapshot critical sections
+  (`execute_snapshot_submission_if_current`, `resolve_pre_submission_block`)
+  correctly hold the authority store's writer lock across one bounded host
+  round trip each; that serialization stays unchanged and correct in this
+  dark stage because nothing production-reachable can invoke it yet. Before
+  production activation, SQLite writer contention/wait policy must be sized
+  or configured consistently with the maximum bounded snapshot host
+  critical-section duration, so an ordinary concurrent authority writer
+  (discovery, package scan, approval) does not fail merely because a valid
+  snapshot host round trip legitimately exceeds today's one fixed
+  `BUSY_TIMEOUT_MS` shared by every writer. See `ARCHITECTURE.md`, "Activation
+  gate: SQLite writer-contention policy". This is not a defect of the current
+  dark stage and is not permission to hold a polling transaction open.
 
 ## Next
 
-- Job-owned snapshot safety, including a recoverable identity for the actual
-  PVE snapshot operation/task.
 - Exact APT execution simulation/equality, including a proven multiarch package
   identity contract.
 - Package execution with post-mutation crash recovery, then healthcheck and
-  same-job rollback.
-- Lifecycle controls (start/stop/reboot) and manual snapshot operations.
+  same-job rollback execution.
+- Production activation of the update lifecycle.
+- Snapshot retention, then lifecycle controls (start/stop/reboot) and manual
+  snapshot operations.
 
 ## Known limitations
 
@@ -171,7 +214,7 @@ unimplemented future stage.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v9 is incompatible with v8, and there is no v8-to-v9
+- Pre-release: schema v10 is incompatible with v9, and there is no v9-to-v10
   migration path. An existing installation now uses `deploy/update-proxmox-0.5.sh`
   for this: it detects the incompatible authority schema, backs it up, and
   resets only the authority database (see "In-place product updates" below)

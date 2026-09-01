@@ -112,6 +112,32 @@ PVE guest must never require a repository or config change.
 
 ## Tests
 
+### Development environment entry points
+
+Agents must resolve the repository root with
+`ROOT="$(git rev-parse --show-toplevel)"` and reuse the repository-local
+environments. Ordinary Python and tests use `$ROOT/.venv/bin/python`; invoke
+tests as `$ROOT/.venv/bin/python -m pytest ...`, not by probing with bare
+`pytest`. The pinned Home Assistant environment is separate and existing at
+`$ROOT/.venv-ha/bin/python`; its canonical invocation is:
+
+```bash
+$ROOT/.venv-ha/bin/python -m pytest -q --tb=short \
+  -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
+```
+
+Do not create or reinstall another environment merely because bare
+`pytest`, `python`, or `pip` is absent from `PATH`. The GitHub-only wrapper
+`tests/shell/run_bootstrap_smoke_sandbox.sh` must not be bypassed locally.
+Local Docker CI uses the existing `tests/shell/Dockerfile.bootstrap-smoke`
+and `tests/shell/bootstrap_smoke_sandbox_entrypoint.sh` through the
+established devbox Docker setup.
+
+Compact path map: `.venv/` is ordinary repository Python; `.venv-ha/` is the
+pinned HA suite; `tests/` holds tests and the smoke sandbox; `scripts/` holds
+validators; `deploy/` holds deployment code; `app/` is the backend; and
+`custom_components/hubinet_ops/` is the Home Assistant integration.
+
 Tests must enforce behavior, not restate it. Exercise failure, race, restart,
 fencing, idempotency, and fail-closed paths, not only happy paths. Never weaken
 a test or a fail-closed invariant to make a change pass.

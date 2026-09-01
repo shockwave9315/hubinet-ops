@@ -40,12 +40,14 @@ a guest in Proxmox never requires touching this repository or its config.
   many times, preserving identity/config/credentials.
 
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
-installs packages. Internal durable package-update job authority is built, but
-it is not production-reachable. Job-owned PVE snapshot mutation, workload
-package execution, healthchecks, and rollback are not built yet — see
+installs packages. Internal durable package-update job authority and job-owned
+snapshot safety are built, but neither is production-reachable: no HTTP, Home
+Assistant, scheduler, bootstrap, or updater path can create a PVE snapshot, and
+no snapshot helper, key, or PVE mutation privilege is deployed. Workload package
+execution, healthchecks, and rollback execution are not built yet — see
 `STATUS.md`.
 
-Schema v9 has no v8 migration. An existing pre-release deployment uses
+Schema v10 has no v9 migration. An existing pre-release deployment uses
 `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
 authority schema, backs it up, and resets only the authority database (with
 explicit operator authorization) while preserving the LXC, its VMID/network,
@@ -94,9 +96,13 @@ development fallback, not a supported installation method.
 ## Development
 
 ```bash
-python -m pip install -r requirements.txt -r requirements-dev.txt
-pytest -q
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest -q
 ```
+
+On the established Linux devbox, reuse the existing `.venv` and `.venv-ha`
+described in `AGENTS.md`; do not recreate or reinstall them.
 
 Tests use a fake provider transport, fake clocks, and temporary SQLite
 databases. They never contact Proxmox, Home Assistant, or any private-network
@@ -106,21 +112,22 @@ Full validation, mirroring CI — run before publishing or merging a runtime
 change:
 
 ```bash
-python -m compileall -q app custom_components tests scripts
-pytest -q
+.venv/bin/python -m compileall -q app custom_components tests scripts
+.venv/bin/python -m pytest -q
 bash -n deploy/install-0.5.0-fresh.sh
 for f in deploy/bootstrap-proxmox-0.5.sh deploy/update-proxmox-0.5.sh deploy/lib/*.sh; do bash -n "$f"; done
-for f in deploy/bootstrap-proxmox-0.5.sh deploy/update-proxmox-0.5.sh deploy/lib/*.sh; do python scripts/validate_hermetic_shell_boundary.py "$f"; done
-python scripts/validate_yaml.py
-python scripts/check_tracked_files.py
+for f in deploy/bootstrap-proxmox-0.5.sh deploy/update-proxmox-0.5.sh deploy/lib/*.sh; do .venv/bin/python scripts/validate_hermetic_shell_boundary.py "$f"; done
+.venv/bin/python scripts/validate_yaml.py
+.venv/bin/python scripts/check_tracked_files.py
 ```
 
 The Home Assistant integration suite is a separate, pinned dependency set and
 needs Python ≥ 3.14.2 on Linux:
 
 ```bash
-python -m pip install -r requirements-ha-test.txt
-python -m pytest -q --tb=short -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
+python3.14 -m venv .venv-ha
+.venv-ha/bin/python -m pip install -r requirements-ha-test.txt
+.venv-ha/bin/python -m pytest -q --tb=short -o asyncio_mode=auto tests/test_hubinet_ops_integration.py
 ```
 
 `tests/test_bootstrap_proxmox_0_5_smoke.py` executes the real bootstrap script
@@ -130,7 +137,7 @@ ephemeral-CI Docker sandbox; it skips everywhere else by design.
 Run the backend locally with:
 
 ```bash
-uvicorn app.inventory_runtime:create_app_from_env --factory --host 127.0.0.1 --port 8787
+.venv/bin/python -m uvicorn app.inventory_runtime:create_app_from_env --factory --host 127.0.0.1 --port 8787
 ```
 
 `create_app_from_env` builds the app from a runtime config file — selected via

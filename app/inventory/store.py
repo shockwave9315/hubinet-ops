@@ -46,7 +46,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 9
+AUTHORITY_SCHEMA_VERSION = 10
 BUSY_TIMEOUT_MS = 5_000
 
 _REQUIRED_TABLES = frozenset(
@@ -103,9 +103,37 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "package_update_job_package_delete_immutable",
         "package_update_job_event_update_immutable",
         "package_update_job_event_delete_immutable",
+        "package_update_job_snapshot_identity_immutable",
+        "package_update_job_snapshot_task_immutable",
+        "package_update_job_snapshot_confirmation_immutable",
+        "package_update_job_checkpoint_never_regresses",
+        "one_package_update_job_snapshot_operation",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
+
+# SQL form of models.CHECKPOINT_ORDER. Defined once and interpolated into
+# every constraint that needs it, so the schema's notion of checkpoint order
+# can never drift between copies. Rank 3 is snapshot_may_have_started (the
+# write-ahead uncertainty boundary) and rank 4 snapshot_confirmed.
+_CHECKPOINT_RANK_SQL = """(CASE {column}
+        WHEN 'issued' THEN 1
+        WHEN 'preflight_passed' THEN 2
+        WHEN 'snapshot_may_have_started' THEN 3
+        WHEN 'snapshot_confirmed' THEN 4
+        WHEN 'mutation_may_have_started' THEN 5
+        WHEN 'mutation_completed' THEN 6
+        WHEN 'health_started' THEN 7
+        WHEN 'rollback_may_have_started' THEN 8
+        WHEN 'rollback_completed' THEN 9
+    END
+    )"""
+
+
+def _checkpoint_rank_sql(column: str) -> str:
+    return _CHECKPOINT_RANK_SQL.format(column=column)
+
+
 
 
 class InventoryAuthorityStore:
@@ -989,7 +1017,10 @@ def _package_update_job(
         package_count=int(row["package_count"]),
         status=PackageUpdateJobStatus(str(row["status"])),
         checkpoint=PackageUpdateCheckpoint(str(row["checkpoint"])),
+        snapshot_operation_id=row["snapshot_operation_id"],
         snapshot_name=row["snapshot_name"],
+        snapshot_intent_recorded_at=row["snapshot_intent_recorded_at"],
+        snapshot_task_upid=row["snapshot_task_upid"],
         snapshot_confirmed_at=row["snapshot_confirmed_at"],
         mutation_may_have_started_at=row["mutation_may_have_started_at"],
         mutation_completed_at=row["mutation_completed_at"],
@@ -1023,7 +1054,7 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 9)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 10)
     )
     """,
     """
@@ -1474,7 +1505,7 @@ _SCHEMA_STATEMENTS = (
         FOREIGN KEY(reviewed_scan_run_id) REFERENCES package_scan_runs(scan_run_id)
     )
     """,
-    """
+    f"""
     CREATE TABLE package_update_jobs (
         job_id TEXT PRIMARY KEY,
         request_id TEXT NOT NULL UNIQUE,
@@ -1519,11 +1550,28 @@ _SCHEMA_STATEMENTS = (
             'active', 'succeeded', 'blocked', 'failed', 'rolled_back',
             'interrupted', 'manual_intervention')),
         checkpoint TEXT NOT NULL CHECK(checkpoint IN (
-            'issued', 'preflight_passed', 'snapshot_confirmed',
+            'issued', 'preflight_passed', 'snapshot_may_have_started',
+            'snapshot_confirmed',
             'mutation_may_have_started', 'mutation_completed', 'health_started',
             'rollback_may_have_started', 'rollback_completed')),
+        -- One job owns exactly one pre-update snapshot operation. The
+        -- identity is derived from immutable job facts, so it is stable
+        -- across restarts, and the triggers below make it write-once.
+        snapshot_operation_id TEXT
+            CHECK(snapshot_operation_id IS NULL OR
+                  length(snapshot_operation_id) = 36),
+        -- Bounded to PVE's own pve-snapshot-name contract: pve-configid
+        -- (leading letter, then letters/digits/underscore/hyphen) with
+        -- maxLength 40. 'current'/'vzdump' are PVE-reserved.
         snapshot_name TEXT CHECK(snapshot_name IS NULL OR
-            (length(trim(snapshot_name)) > 0 AND length(snapshot_name) <= 200)),
+            (length(snapshot_name) BETWEEN 2 AND 40 AND
+             snapshot_name GLOB '[A-Za-z]*' AND
+             NOT snapshot_name GLOB '*[^A-Za-z0-9_-]*' AND
+             lower(snapshot_name) NOT IN ('current', 'vzdump'))),
+        snapshot_intent_recorded_at TEXT,
+        snapshot_task_upid TEXT CHECK(snapshot_task_upid IS NULL OR
+            (length(snapshot_task_upid) BETWEEN 20 AND 300 AND
+             snapshot_task_upid GLOB 'UPID:?*:?*:?*:?*:?*:*:?*:')),
         snapshot_confirmed_at TEXT,
         mutation_may_have_started_at TEXT,
         mutation_completed_at TEXT,
@@ -1542,12 +1590,34 @@ _SCHEMA_STATEMENTS = (
             REFERENCES inventory_nodes(inventory_source_id, node_id),
         CHECK((status = 'active' AND terminalized_at IS NULL AND terminal_reason IS NULL) OR
               (status != 'active' AND terminalized_at IS NOT NULL AND
-               terminal_reason IS NOT NULL))
+               terminal_reason IS NOT NULL)),
+        -- A snapshot operation identity is all-or-nothing.
+        CHECK((snapshot_operation_id IS NULL) = (snapshot_intent_recorded_at IS NULL)),
+        CHECK(snapshot_operation_id IS NULL OR snapshot_name IS NOT NULL),
+        -- A PVE task may only be recorded for an operation that exists.
+        CHECK(snapshot_task_upid IS NULL OR snapshot_operation_id IS NOT NULL),
+        -- snapshot_confirmed requires the snapshot identity and its timestamp.
+        CHECK(snapshot_confirmed_at IS NULL OR
+              (snapshot_name IS NOT NULL AND snapshot_operation_id IS NOT NULL)),
+        -- The checkpoint and the durable snapshot facts must agree in BOTH
+        -- directions, so neither can be forged independently of the other.
+        -- Rank 3 is snapshot_may_have_started, rank 4 snapshot_confirmed;
+        -- mutation_may_have_started (rank 5) can therefore never precede a
+        -- confirmed snapshot.
+        CHECK({_checkpoint_rank_sql('checkpoint')} < 3 OR snapshot_operation_id IS NOT NULL),
+        CHECK({_checkpoint_rank_sql('checkpoint')} >= 3 OR snapshot_operation_id IS NULL),
+        CHECK({_checkpoint_rank_sql('checkpoint')} < 4 OR snapshot_confirmed_at IS NOT NULL),
+        CHECK({_checkpoint_rank_sql('checkpoint')} >= 4 OR snapshot_confirmed_at IS NULL)
     )
     """,
     """
     CREATE UNIQUE INDEX one_active_package_update_job_globally
     ON package_update_jobs((1)) WHERE status = 'active'
+    """,
+    """
+    CREATE UNIQUE INDEX one_package_update_job_snapshot_operation
+    ON package_update_jobs(snapshot_operation_id)
+    WHERE snapshot_operation_id IS NOT NULL
     """,
     """
     CREATE TABLE package_update_job_packages (
@@ -1577,7 +1647,8 @@ _SCHEMA_STATEMENTS = (
         created_at TEXT NOT NULL,
         level TEXT NOT NULL CHECK(level IN ('info', 'warning', 'error')),
         stage TEXT NOT NULL CHECK(stage IN (
-            'issued', 'preflight_passed', 'snapshot_confirmed',
+            'issued', 'preflight_passed', 'snapshot_may_have_started',
+            'snapshot_confirmed',
             'mutation_may_have_started', 'mutation_completed', 'health_started',
             'rollback_may_have_started', 'rollback_completed')),
         event_type TEXT NOT NULL CHECK(length(trim(event_type)) > 0 AND
@@ -1782,5 +1853,45 @@ _SCHEMA_STATEMENTS = (
     CREATE TRIGGER package_update_job_event_delete_immutable
     BEFORE DELETE ON package_update_job_events
     BEGIN SELECT RAISE(ABORT, 'package update job events are append-only'); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_snapshot_identity_immutable
+    BEFORE UPDATE OF snapshot_operation_id, snapshot_name,
+                     snapshot_intent_recorded_at
+    ON package_update_jobs
+    WHEN (OLD.snapshot_operation_id IS NOT NULL OR OLD.snapshot_name IS NOT NULL)
+     AND (NEW.snapshot_operation_id IS NOT OLD.snapshot_operation_id
+          OR NEW.snapshot_name IS NOT OLD.snapshot_name
+          OR NEW.snapshot_intent_recorded_at IS NOT OLD.snapshot_intent_recorded_at)
+    BEGIN SELECT RAISE(ABORT,
+        'package update job snapshot operation identity is write-once'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_snapshot_task_immutable
+    BEFORE UPDATE OF snapshot_task_upid ON package_update_jobs
+    WHEN OLD.snapshot_task_upid IS NOT NULL
+     AND NEW.snapshot_task_upid IS NOT OLD.snapshot_task_upid
+    BEGIN SELECT RAISE(ABORT,
+        'package update job snapshot task identity is write-once'
+    ); END
+    """,
+    """
+    CREATE TRIGGER package_update_job_snapshot_confirmation_immutable
+    BEFORE UPDATE OF snapshot_confirmed_at ON package_update_jobs
+    WHEN OLD.snapshot_confirmed_at IS NOT NULL
+     AND NEW.snapshot_confirmed_at IS NOT OLD.snapshot_confirmed_at
+    BEGIN SELECT RAISE(ABORT,
+        'package update job snapshot confirmation is write-once'
+    ); END
+    """,
+    f"""
+    CREATE TRIGGER package_update_job_checkpoint_never_regresses
+    BEFORE UPDATE OF checkpoint ON package_update_jobs
+    WHEN {_checkpoint_rank_sql('NEW.checkpoint')}
+       < {_checkpoint_rank_sql('OLD.checkpoint')}
+    BEGIN SELECT RAISE(ABORT,
+        'package update job checkpoint may never move backwards'
+    ); END
     """,
 )
