@@ -23,6 +23,7 @@ from .models import (
     AuthorityNotFound,
     DiscoveryRun,
     DiscoveryRunLifecycle,
+    HostMutationState,
     HostSubmissionState,
     InventorySourceState,
     ObservedSnapshot,
@@ -38,12 +39,20 @@ from .models import (
     PackageUpdateExecutionOutcome,
     PackageUpdateJob,
     PackageUpdateJobStatus,
+    MutationSubmissionRefusedBeforeCallback,
+    PackageUpdateMutationIdentity,
+    PackageUpdateMutationRequest,
     PackageUpdateRollbackTarget,
     PackageUpdateSnapshotIdentity,
     SnapshotOwnership,
     SnapshotSubmissionRefusedBeforeCallback,
     checkpoint_rank as _checkpoint_rank,
 )
+from .mutation_completion import (
+    PackageMutationPostState,
+    prove_package_mutation_completion,
+)
+from .mutation_identity import derive_package_mutation_identity
 from .snapshot_identity import (
     build_snapshot_ownership,
     derive_pre_update_snapshot_identity,
@@ -2610,6 +2619,648 @@ class InventoryAuthority:
                 "execution-time plan comparison was not captured"
             )
         return outcome, self._store.package_update_job(canonical_job_id)
+
+    # ------------------------------------------------------------------
+    # Crash-safe real package mutation
+    #
+    # The write-ahead uncertainty boundary for the one real workload
+    # package mutation a job may cause, its bounded submission critical
+    # section, its durable release proof, and its completion proof. None of
+    # these performs guest or package-manager I/O of its own: they record
+    # durable authority facts about an operation the dark host boundary
+    # performs. Production has no route, scheduler, or worker that reaches
+    # any of them.
+    # ------------------------------------------------------------------
+
+    def package_update_mutation_identity(
+        self, job_id: str
+    ) -> PackageUpdateMutationIdentity:
+        """Derive one job's deterministic package mutation operation identity.
+
+        Pure and restart-stable: it reads only immutable job facts plus this
+        backend instance's identity, so the same job always derives the same
+        operation id, and a job that already armed its mutation is proved to
+        agree with its own derivation rather than trusted.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            return self._mutation_identity_in_transaction(connection, job)
+
+    def _mutation_identity_in_transaction(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> PackageUpdateMutationIdentity:
+        backend_instance_id = str(
+            connection.execute(
+                "SELECT backend_instance_id FROM backend_instance"
+            ).fetchone()["backend_instance_id"]
+        )
+        identity = derive_package_mutation_identity(
+            backend_instance_id=backend_instance_id,
+            job_id=str(job["job_id"]),
+            resource_id=str(job["resource_id"]),
+            resource_continuity_revision=int(
+                job["expected_resource_continuity_revision"]
+            ),
+        )
+        persisted = job["mutation_operation_id"]
+        if persisted is not None and str(persisted) != identity.mutation_operation_id:
+            raise AuthorityInvariantError(
+                "persisted package mutation operation identity does not match "
+                "the job's deterministic derivation"
+            )
+        return identity
+
+    def package_update_mutation_request(
+        self, job_id: str
+    ) -> PackageUpdateMutationRequest:
+        """Assemble the exact fenced host request for one job's mutation.
+
+        One read transaction, so the derived operation identity, the frozen
+        locator context, and the immutable approved material are guaranteed
+        to describe the same durable job. Every field is an authority fact or
+        derived purely from one; nothing here is caller-supplied.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            identity = self._mutation_identity_in_transaction(connection, job)
+            backend_instance_id = str(
+                connection.execute(
+                    "SELECT backend_instance_id FROM backend_instance"
+                ).fetchone()["backend_instance_id"]
+            )
+            packages = tuple(
+                sorted(
+                    self._package_material_rows(
+                        connection,
+                        table="package_update_job_packages",
+                        owner_column="job_id",
+                        owner_id=canonical_job_id,
+                    )
+                )
+            )
+            if not packages:
+                raise AuthorityInvariantError(
+                    "package update job has no immutable approved material"
+                )
+            return PackageUpdateMutationRequest(
+                mutation_operation_id=identity.mutation_operation_id,
+                plan_fingerprint=str(job["approved_plan_fingerprint"]),
+                backend_instance_id=backend_instance_id,
+                job_id=canonical_job_id,
+                resource_id=str(job["resource_id"]),
+                binding_id=str(job["expected_binding_id"]),
+                locator_generation=int(job["expected_locator_generation"]),
+                resource_continuity_revision=int(
+                    job["expected_resource_continuity_revision"]
+                ),
+                vmid=int(job["expected_vmid"]),
+                expected_node=str(job["expected_node_name"]),
+                packages=packages,
+            )
+
+    def arm_package_update_mutation(
+        self,
+        job_id: str,
+        fresh_packages: tuple[PackageScanPackage, ...],
+    ) -> tuple[PackageUpdateExecutionOutcome, PackageUpdateJob]:
+        """Durably commit the write-ahead package-mutation uncertainty boundary.
+
+        This is the package equivalent of
+        :meth:`record_package_update_snapshot_intent`, and it is the ONLY
+        transition that may put a job at ``mutation_may_have_started``. It
+        MUST be committed before any real package command can possibly be
+        submitted, because once a job is at that checkpoint nothing may ever
+        conclude that no workload package mutation happened.
+
+        It is deliberately not "mark safe, mutate later". Every proof this
+        gate makes and the checkpoint it authorizes share ONE ``BEGIN
+        IMMEDIATE`` transaction, in this order:
+
+        - the job is ACTIVE at exactly ``snapshot_confirmed`` (so its own
+          fresh pre-update snapshot exists and no mutation has begun);
+        - current job/source/resource/approval authority still holds --
+          proven stale terminalizes the job ``blocked`` in this same
+          transaction, exactly as the execution-time plan gate does, so a
+          provably stale job can never starve the one global destructive
+          slot; a newest RUNNING package scan instead raises the narrow
+          retryable
+          :class:`PackageUpdateExecutionAuthorityTemporarilyUnavailable`
+          with no durable write at all;
+        - ``fresh_packages`` -- which MUST already be the canonical parse of
+          a metadata-refreshed, freshly re-simulated APT upgrade read from
+          the live guest moments ago -- exactly equals the job's IMMUTABLE
+          copied package rows, complete-set equality only, never
+          subset/superset/name-only matching. A mismatch terminalizes the
+          job ``blocked``, retaining its confirmed snapshot and releasing
+          the global slot without granting rollback authority, exactly as
+          the execution-time plan gate does.
+
+        This method performs no host I/O, so it never holds the writer lock
+        across one: the caller performs its fresh host round trip first,
+        outside any transaction. That the exact equality proof and the
+        write-ahead checkpoint commit together is the whole point -- proving
+        in one transaction and committing in another is the check-then-commit
+        race the rest of this stage exists to close.
+
+        A ``MATCHED`` outcome means, and only means, "a real package
+        mutation may be attempted from here on, exactly once". It grants no
+        further permission: the caller must still cross the bounded
+        submission critical section
+        (:meth:`execute_package_mutation_submission_if_current`) before a
+        package command is sent. Re-arming an already-armed job is
+        idempotent: the same derived identity is re-proved and the existing
+        durable boundary is returned, never a second one.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        fresh_material = frozenset(
+            (
+                package.package_name,
+                package.architecture,
+                package.installed_version,
+                package.candidate_version,
+            )
+            for package in _validate_package_plan(fresh_packages)
+        )
+        decided_at = _timestamp(self._now())
+        outcome: PackageUpdateExecutionOutcome | None = None
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+            if checkpoint is PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED:
+                # Already past the boundary. Re-prove the derived identity
+                # against the persisted one and return the existing durable
+                # fact; never re-decide equality for a job whose packages may
+                # already be changing.
+                self._mutation_identity_in_transaction(connection, job)
+                outcome = PackageUpdateExecutionOutcome.MATCHED
+            elif checkpoint is not PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED:
+                raise AuthorityConflict(
+                    "package update job is not awaiting the package mutation gate"
+                )
+            elif self._terminalize_execution_gate_job_if_authority_stale(
+                connection, job, decided_at
+            ):
+                outcome = PackageUpdateExecutionOutcome.AUTHORITY_STALE
+            else:
+                job_material = self._package_material_rows(
+                    connection,
+                    table="package_update_job_packages",
+                    owner_column="job_id",
+                    owner_id=canonical_job_id,
+                )
+                if job_material and job_material == fresh_material:
+                    outcome = PackageUpdateExecutionOutcome.MATCHED
+                    identity = self._mutation_identity_in_transaction(
+                        connection, job
+                    )
+                    self._commit_package_mutation_intent(
+                        connection,
+                        job_id=canonical_job_id,
+                        identity=identity,
+                        recorded_at=decided_at,
+                        package_count=len(job_material),
+                    )
+                else:
+                    outcome = PackageUpdateExecutionOutcome.MISMATCHED
+                    reason = (
+                        "fresh execution-time APT simulation no longer exactly "
+                        "matches this job's frozen approved material"
+                    )
+                    updated = connection.execute(
+                        "UPDATE package_update_jobs SET status='blocked', "
+                        "terminalized_at=?, terminal_reason=? "
+                        "WHERE job_id=? AND status='active' "
+                        "AND checkpoint='snapshot_confirmed'",
+                        (decided_at, reason, canonical_job_id),
+                    )
+                    if updated.rowcount != 1:
+                        raise AuthorityConflict(
+                            "package update job mutation-arming mismatch lost "
+                            "durable ownership"
+                        )
+                    self._append_package_update_job_event(
+                        connection,
+                        job_id=canonical_job_id,
+                        created_at=decided_at,
+                        level=PackageUpdateEventLevel.ERROR,
+                        stage=PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+                        event_type=PackageUpdateEventType.EXECUTION_PLAN_MISMATCH,
+                        message=reason,
+                        details={
+                            "job_package_count": len(job_material),
+                            "fresh_package_count": len(fresh_material),
+                        },
+                    )
+
+        if outcome is None:
+            raise AuthorityInvariantError(
+                "package mutation arming decision was not captured"
+            )
+        return outcome, self._store.package_update_job(canonical_job_id)
+
+    def _commit_package_mutation_intent(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        identity: PackageUpdateMutationIdentity,
+        recorded_at: str,
+        package_count: int,
+    ) -> None:
+        updated = connection.execute(
+            "UPDATE package_update_jobs "
+            "SET checkpoint='mutation_may_have_started', "
+            "mutation_operation_id=?, mutation_may_have_started_at=? "
+            "WHERE job_id=? AND status='active' "
+            "AND checkpoint='snapshot_confirmed' "
+            "AND mutation_operation_id IS NULL "
+            "AND mutation_may_have_started_at IS NULL",
+            (identity.mutation_operation_id, recorded_at, job_id),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job mutation intent lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=recorded_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+            event_type=PackageUpdateEventType.MUTATION_MAY_HAVE_STARTED,
+            message=(
+                "real workload package mutation may be submitted from here on"
+            ),
+            details={
+                "mutation_operation_id": identity.mutation_operation_id,
+                "package_count": package_count,
+            },
+        )
+
+    def execute_package_mutation_submission_if_current(
+        self, job_id: str, submit: Callable[[], _T]
+    ) -> _T:
+        """Run one bounded host mutation submission while authority holds.
+
+        The package-mutation mirror of
+        :meth:`execute_snapshot_submission_if_current`, and load-bearing for
+        exactly the same reason: the write-ahead checkpoint alone leaves a
+        second, narrower race open. Discovery reconciliation can replace the
+        guest occupying this job's VMID on this job's node *after* current
+        authority was proved and *before* the host is actually asked to
+        mutate, and neither a checkpoint CAS (which sees only job status and
+        checkpoint) nor the host helper (which can verify live PVE facts but
+        never a backend resource incarnation) would catch it. So the proof
+        and the submission it authorizes share ONE transaction, holding this
+        store's single writer lock across the whole of it.
+
+        ``submit`` MUST be the host's submission-only mutation operation and
+        nothing else: it journals ``submitted`` durably and hands the real
+        package command to a detached host runner, so it returns as soon as
+        the operation has crossed its submission boundary and NEVER waits for
+        ``apt-get`` itself. That bound is machine-enforced by
+        ``app/inventory/contention_policy.py`` and the mutation transport's
+        own submission-timeout ceiling; see ARCHITECTURE.md, "SQLite
+        writer-contention policy". Polling the operation, and proving its
+        completion, happen strictly outside this transaction.
+
+        A stale authority context refuses BEFORE ``submit`` is ever called,
+        raising :class:`MutationSubmissionRefusedBeforeCallback` -- a
+        distinct, narrow subclass of :class:`AuthorityConflict` that
+        structurally means the host was never asked to mutate anything, so a
+        caller may route it into the durable seal path. A terminal job or a
+        wrong checkpoint stays an ordinary :class:`AuthorityConflict` and
+        says nothing about whether ``submit`` ran.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        host_result: _T | None = None
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_package_mutation_job(job)
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
+            )
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                host_result = submit()
+
+        if not current_authority_holds:
+            raise MutationSubmissionRefusedBeforeCallback(
+                "package update job resource or source authority context is stale"
+            )
+        return host_result  # type: ignore[return-value]
+
+    @staticmethod
+    def _require_armed_package_mutation_job(job: sqlite3.Row) -> None:
+        """Shared guard for every transition inside the mutation window."""
+
+        if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+            raise AuthorityConflict("package update job is terminal")
+        if (
+            PackageUpdateCheckpoint(str(job["checkpoint"]))
+            is not PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED
+        ):
+            raise AuthorityConflict(
+                "package update job is not inside a package mutation operation"
+            )
+
+    def record_package_update_mutation_uncertain(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Record that a package mutation's outcome could not be established.
+
+        Deliberately non-terminal, and deliberately unconditional on current
+        authority. The job stays ACTIVE at ``mutation_may_have_started``,
+        keeps owning the one global destructive slot, keeps its confirmed
+        job-owned snapshot, and keeps its rollback authority, because a
+        package mutation that may have run -- or may have run partway -- is
+        nothing like one that provably did not. Nothing here permits a retry
+        of the mutation: the host's durable journal, not this record, decides
+        what may still be submitted, and it never re-permits a submitted
+        operation.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_package_mutation_job(job)
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.ERROR,
+                stage=PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.MUTATION_OUTCOME_UNCERTAIN,
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def record_package_update_mutation_submitted(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Append the truthful "the real package command was launched" event.
+
+        Pure evidence: it advances no checkpoint and grants no permission,
+        because ``mutation_may_have_started`` already means exactly "a real
+        package mutation may be in progress". It exists so an operator can
+        tell, from the append-only event log alone, that the host durably
+        crossed its submission boundary rather than merely being asked to.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_package_mutation_job(job)
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.WARNING,
+                stage=PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.MUTATION_SUBMITTED,
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def record_package_update_mutation_terminal_failure(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Record that the real package command reached a failed terminal result.
+
+        Deliberately NOT terminalization of the job. ``apt-get`` exiting
+        non-zero, being killed, or timing out says the command failed; it
+        says nothing about how much of the workload it already changed
+        first. So the job stays ACTIVE at ``mutation_may_have_started``,
+        retains its global destructive ownership, its snapshot, and its
+        rollback authority, and the later healthcheck/rollback stage decides
+        what to do with it. Releasing the slot here would strand a possibly
+        half-upgraded guest with no owner.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_package_mutation_job(job)
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.ERROR,
+                stage=PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.MUTATION_TERMINAL_FAILURE,
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def resolve_pre_mutation_block(
+        self,
+        job_id: str,
+        seal: Callable[[], tuple[HostMutationState | None, str, _T]],
+    ) -> tuple[bool, _T]:
+        """Atomically decide, and durably apply, a pre-mutation block.
+
+        The mirror image of
+        :meth:`execute_package_mutation_submission_if_current`, serialized
+        against it through the SAME authority-store writer lock, and the
+        ONLY way a job past ``mutation_may_have_started`` may ever be
+        released. It exists because the write-ahead checkpoint is
+        deliberately committed before the host is called at all: without a
+        durable release proof, an ordinary pre-flight refusal (a guest that
+        moved node, a backend that died between arming and submitting) would
+        fence the one global destructive slot forever with no package
+        mutation having been attempted.
+
+        ``seal`` performs exactly ONE bounded typed host seal -- never a
+        package command, never a poll loop -- and returns
+        ``(host_mutation_state, reason, evidence)``. It is invoked at most
+        once, while this transaction still owns the writer lock, so no
+        concurrent submission critical section can interleave between the
+        proof and the block: whichever acquires the writer lock first
+        reaches the host boundary first, and the host's own per-VMID lease
+        then orders the durable seal against every delayed submitter.
+
+        Only ``sealed_not_submitted`` -- the host's durable no-future-submit
+        fence -- releases the job, and it releases it as ``blocked``, never
+        as succeeded and never with rollback authority: the whole content of
+        that proof is that no package mutation occurred and none ever can
+        for this operation identity, so fabricating rollback authority for it
+        would be untruthful. A transient ``absent``/``intent`` observation,
+        any post-submission state, a lease held by another invocation, and
+        every failed or malformed seal all leave the job exactly as it was.
+
+        Current package-update authority is deliberately NOT required: a job
+        whose authority context may never become current again is precisely
+        the one that most needs this release path.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        evidence: _T | None = None
+        blocked = False
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_package_mutation_job(job)
+            if job["mutation_completed_at"] is not None:
+                raise AuthorityInvariantError(
+                    "package update job mutation completion is inconsistent"
+                )
+            # The durable host seal happens HERE, while this transaction
+            # still owns the writer lock -- never before BEGIN IMMEDIATE,
+            # and never trusted as a value the caller precomputed.
+            mutation_state, reason, evidence = seal()
+            self._after_pre_submission_block_proof(
+                connection, job_id=canonical_job_id
+            )
+            if mutation_state is HostMutationState.SEALED_NOT_SUBMITTED:
+                self._commit_pre_mutation_block(
+                    connection,
+                    job_id=canonical_job_id,
+                    reason=_require_text(reason, "reason", max_length=500),
+                )
+                blocked = True
+        return blocked, evidence  # type: ignore[return-value]
+
+    def _commit_pre_mutation_block(
+        self, connection: sqlite3.Connection, *, job_id: str, reason: str
+    ) -> None:
+        """Durably terminalize one armed job as blocked, inside the caller's
+        own transaction. Only ever called while that transaction still owns
+        the authority store's writer lock -- see
+        :meth:`resolve_pre_mutation_block`.
+        """
+
+        recorded_at = _timestamp(self._now())
+        updated = connection.execute(
+            "UPDATE package_update_jobs SET status='blocked', "
+            "terminalized_at=?, terminal_reason=? "
+            "WHERE job_id=? AND status='active' "
+            "AND checkpoint='mutation_may_have_started' "
+            "AND mutation_completed_at IS NULL",
+            (recorded_at, reason, job_id),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job pre-mutation block lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=recorded_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+            event_type=(
+                PackageUpdateEventType.MUTATION_BLOCKED_BEFORE_SUBMISSION
+            ),
+            message=reason,
+            details={},
+        )
+
+    def complete_package_update_mutation(
+        self, job_id: str, post_state: PackageMutationPostState
+    ) -> PackageUpdateJob:
+        """Advance an armed job to ``mutation_completed``, proof first.
+
+        ``post_state`` is *parsed evidence*, never a verdict: the caller
+        supplies the guest's own independently read dpkg inventory from both
+        sides of the mutation, and the verdict is computed HERE, by
+        :func:`prove_package_mutation_completion`, inside the same
+        transaction that would commit the checkpoint and against the job's
+        own IMMUTABLE frozen rows read in that transaction. There is
+        deliberately no way to complete a job by asserting success: an
+        ``apt-get`` exit code is never sufficient (see PRODUCT.md and
+        ARCHITECTURE.md, "Package mutation completion proof").
+
+        Current job/source/resource/approval authority is deliberately NOT
+        required. Packages have already changed; recording that truthfully
+        is evidence preservation, exactly like recording a snapshot task or
+        an uncertain outcome, and must never be discarded merely because
+        this backend's own inventory context moved on.
+
+        Completion is deliberately not job success. The job stays ACTIVE,
+        still owns the one global destructive slot, and still owns its
+        confirmed snapshot and rollback authority, because the healthcheck
+        that decides whether this update was good has not happened yet.
+
+        Idempotent: a job already at ``mutation_completed`` re-proves the
+        same material and returns unchanged. A proof that does not hold
+        raises :class:`AuthorityConflict` and writes nothing, so the job
+        stays fenced at ``mutation_may_have_started``.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+            if checkpoint not in (
+                PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+                PackageUpdateCheckpoint.MUTATION_COMPLETED,
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a package mutation operation"
+                )
+            job_material = self._package_material_rows(
+                connection,
+                table="package_update_job_packages",
+                owner_column="job_id",
+                owner_id=canonical_job_id,
+            )
+            proof = prove_package_mutation_completion(
+                frozen_material=job_material, post_state=post_state
+            )
+            if not proof.proven:
+                raise AuthorityConflict(
+                    "package mutation completion proof did not hold: "
+                    f"{proof.reason or 'unproven'}"
+                )
+            if checkpoint is PackageUpdateCheckpoint.MUTATION_COMPLETED:
+                return self._store.package_update_job(canonical_job_id)
+            updated = connection.execute(
+                "UPDATE package_update_jobs SET checkpoint='mutation_completed', "
+                "mutation_completed_at=? "
+                "WHERE job_id=? AND status='active' "
+                "AND checkpoint='mutation_may_have_started' "
+                "AND mutation_completed_at IS NULL",
+                (recorded_at, canonical_job_id),
+            )
+            if updated.rowcount != 1:
+                raise AuthorityConflict(
+                    "package update job mutation completion lost durable ownership"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.INFO,
+                stage=PackageUpdateCheckpoint.MUTATION_COMPLETED,
+                event_type=PackageUpdateEventType.MUTATION_COMPLETED,
+                message=(
+                    "independent dpkg post-state proves the exact approved "
+                    "package mutation is complete"
+                ),
+                details={"package_count": len(job_material)},
+            )
+        return self._store.package_update_job(canonical_job_id)
 
     #: Checkpoints from which ordinary startup may safely terminalize an
     #: active job. Every one of them is provably before any PVE snapshot
