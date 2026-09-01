@@ -129,6 +129,21 @@ invocation, and every failure at or after the `submitted` transition. The
 releasing token is matched exactly, so a helper that reports no proof at all
 can never release a job.
 
+**One transaction per authorized transition.** Every transition whose safety
+depends on current authority — preflight, the write-ahead snapshot intent,
+and snapshot confirmation — re-proves the *complete* current-authority
+predicate inside the same SQLite transaction that commits it (`BEGIN
+IMMEDIATE`, so no other writer can interleave). Proving in one transaction and
+committing in another is a check-then-commit race: discovery reconciliation
+can invalidate the job's resource incarnation in between while the VMID, node,
+resource type, and running status all stay identical, so neither the
+checkpoint CAS (which sees only job status and checkpoint) nor the host helper
+(which can verify only live PVE facts, never a backend incarnation) would
+catch it. Transitions that merely preserve evidence about a possible PVE
+mutation — recording the observed task, recording uncertainty, startup
+fencing — deliberately do **not** require current authority, because
+staleness must never discard evidence.
+
 **Identity.** `app/inventory/snapshot_identity.py` derives one job's snapshot
 name and snapshot operation id purely from immutable identity (backend
 instance, job, resource incarnation, continuity revision), so the same job

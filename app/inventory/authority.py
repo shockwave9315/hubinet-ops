@@ -1255,78 +1255,152 @@ class InventoryAuthority:
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        rejected_current_authority = False
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
-            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
-                raise AuthorityConflict("package update job is terminal")
-            if str(job["expected_resource_type"]) != "lxc":
-                raise AuthorityInvariantError(
-                    "package update job has an unsupported frozen resource type"
-                )
-
-            decision_time = self._authority_decision_time()
-            self._materialize_due_expiry_in_transaction(
-                connection,
-                str(job["inventory_source_id"]),
-                now=decision_time,
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
             )
-            if not (
-                self._package_scan_context_is_current(connection, job)
-                and self._package_scan_source_context_is_current(connection, job)
-            ):
-                rejected_current_authority = True
-            else:
-                current = self._latest_package_scan_row(
-                    connection, str(job["resource_id"])
-                )
-                if current is None or (
-                    str(current["lifecycle"])
-                    != PackageScanLifecycle.COMPLETED.value
-                    or str(current["outcome"])
-                    != PackageScanOutcome.SUCCESS.value
-                ):
-                    raise AuthorityConflict(
-                        "latest package scan attempt is not a successful exact plan"
-                    )
-                if not (
-                    self._package_scan_is_current_and_approvable(
-                        connection, current
-                    )
-                    and self._package_scan_context_matches_job(current, job)
-                ):
-                    raise AuthorityConflict(
-                        "latest package scan authority context does not match the job"
-                    )
-                fingerprint = self._successful_package_scan_fingerprint(
-                    connection, current
-                )
-                if fingerprint != str(job["approved_plan_fingerprint"]):
-                    raise AuthorityConflict(
-                        "latest package plan fingerprint does not match the job"
-                    )
-                current_triplets = self._package_material_triplets(
-                    connection,
-                    table="package_scan_packages",
-                    owner_column="scan_run_id",
-                    owner_id=str(current["scan_run_id"]),
-                )
-                job_triplets = self._package_material_triplets(
-                    connection,
-                    table="package_update_job_packages",
-                    owner_column="job_id",
-                    owner_id=canonical_job_id,
-                )
-                if not current_triplets or current_triplets != job_triplets:
-                    raise AuthorityConflict(
-                        "current exact package material does not match the job"
-                    )
 
-        if rejected_current_authority:
+        # Deliberately raised after the transaction commits: the predicate
+        # may have materialized due source-freshness expiry, and that
+        # bookkeeping is kept even when the job itself is refused.
+        if not current_authority_holds:
             raise AuthorityConflict(
                 "package update job resource or source authority context is stale"
             )
         return self._store.package_update_job(canonical_job_id)
+
+    def _package_update_job_authority_is_current(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> bool:
+        """Re-prove every current-authority predicate inside ONE transaction.
+
+        This is the whole "current authority still permits this job to
+        advance" proof, factored so that a transition can prove it in the
+        *same* transaction that commits the transition. Splitting the proof
+        and the commit across two transactions is a check-then-commit race:
+        discovery reconciliation can replace the guest occupying the same
+        VMID on the same node in between, and neither a checkpoint CAS (which
+        only sees job status/checkpoint) nor the host helper (which can only
+        verify live PVE VMID/type/node facts, never a backend resource
+        incarnation) would catch it.
+
+        Returns ``False`` for a stale resource/source context so the caller
+        can commit any freshness expiry materialized here before refusing.
+        Hard incoherences still raise.
+        """
+
+        if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+            raise AuthorityConflict("package update job is terminal")
+        if str(job["expected_resource_type"]) != "lxc":
+            raise AuthorityInvariantError(
+                "package update job has an unsupported frozen resource type"
+            )
+
+        job_id = str(job["job_id"])
+        decision_time = self._authority_decision_time()
+        self._materialize_due_expiry_in_transaction(
+            connection,
+            str(job["inventory_source_id"]),
+            now=decision_time,
+        )
+        if not (
+            self._package_scan_context_is_current(connection, job)
+            and self._package_scan_source_context_is_current(connection, job)
+        ):
+            return False
+
+        current = self._latest_package_scan_row(connection, str(job["resource_id"]))
+        if current is None or (
+            str(current["lifecycle"]) != PackageScanLifecycle.COMPLETED.value
+            or str(current["outcome"]) != PackageScanOutcome.SUCCESS.value
+        ):
+            raise AuthorityConflict(
+                "latest package scan attempt is not a successful exact plan"
+            )
+        if not (
+            self._package_scan_is_current_and_approvable(connection, current)
+            and self._package_scan_context_matches_job(current, job)
+        ):
+            raise AuthorityConflict(
+                "latest package scan authority context does not match the job"
+            )
+        fingerprint = self._successful_package_scan_fingerprint(connection, current)
+        if fingerprint != str(job["approved_plan_fingerprint"]):
+            raise AuthorityConflict(
+                "latest package plan fingerprint does not match the job"
+            )
+        current_triplets = self._package_material_triplets(
+            connection,
+            table="package_scan_packages",
+            owner_column="scan_run_id",
+            owner_id=str(current["scan_run_id"]),
+        )
+        job_triplets = self._package_material_triplets(
+            connection,
+            table="package_update_job_packages",
+            owner_column="job_id",
+            owner_id=job_id,
+        )
+        if not current_triplets or current_triplets != job_triplets:
+            raise AuthorityConflict(
+                "current exact package material does not match the job"
+            )
+        return True
+
+    def _snapshot_identity_in_transaction(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> PackageUpdateSnapshotIdentity:
+        """Derive one job's deterministic snapshot identity, in-transaction."""
+
+        job_id = str(job["job_id"])
+        backend_instance_id = str(
+            connection.execute(
+                "SELECT backend_instance_id FROM backend_instance"
+            ).fetchone()["backend_instance_id"]
+        )
+        identity = derive_pre_update_snapshot_identity(
+            backend_instance_id=backend_instance_id,
+            job_id=job_id,
+            resource_id=str(job["resource_id"]),
+            resource_continuity_revision=int(
+                job["expected_resource_continuity_revision"]
+            ),
+        )
+        persisted_name = job["snapshot_name"]
+        persisted_operation = job["snapshot_operation_id"]
+        if (
+            persisted_name is not None
+            and str(persisted_name) != identity.snapshot_name
+        ) or (
+            persisted_operation is not None
+            and str(persisted_operation) != identity.snapshot_operation_id
+        ):
+            raise AuthorityInvariantError(
+                "persisted snapshot identity does not match the job's "
+                "deterministic derivation"
+            )
+        return identity
+
+    def _snapshot_ownership_in_transaction(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> SnapshotOwnership:
+        """Build one job's strict snapshot ownership metadata, in-transaction."""
+
+        backend_instance_id = str(
+            connection.execute(
+                "SELECT backend_instance_id FROM backend_instance"
+            ).fetchone()["backend_instance_id"]
+        )
+        return build_snapshot_ownership(
+            job_id=str(job["job_id"]),
+            resource_id=str(job["resource_id"]),
+            resource_continuity_revision=int(
+                job["expected_resource_continuity_revision"]
+            ),
+            inventory_source_id=str(job["inventory_source_id"]),
+            backend_instance_id=backend_instance_id,
+        )
 
     # ------------------------------------------------------------------
     # Job-owned snapshot safety
@@ -1354,33 +1428,47 @@ class InventoryAuthority:
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        job = self.revalidate_package_update_job(canonical_job_id)
-        if job.checkpoint is PackageUpdateCheckpoint.PREFLIGHT_PASSED:
-            return job
-        if job.checkpoint is not PackageUpdateCheckpoint.ISSUED:
-            raise AuthorityConflict(
-                "package update job has already advanced past preflight"
-            )
         recorded_at = _timestamp(self._now())
         with self._store._transaction() as connection:
-            updated = connection.execute(
-                "UPDATE package_update_jobs SET checkpoint='preflight_passed' "
-                "WHERE job_id=? AND status='active' AND checkpoint='issued'",
-                (canonical_job_id,),
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            # The authority proof and the transition it authorizes commit
+            # together, so nothing can invalidate the job in between.
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
             )
-            if updated.rowcount != 1:
-                raise AuthorityConflict(
-                    "package update job preflight lost durable ownership"
-                )
-            self._append_package_update_job_event(
-                connection,
-                job_id=canonical_job_id,
-                created_at=recorded_at,
-                level=PackageUpdateEventLevel.INFO,
-                stage=PackageUpdateCheckpoint.PREFLIGHT_PASSED,
-                event_type=PackageUpdateEventType.PREFLIGHT_PASSED,
-                message="package update job preflight authority revalidated",
-                details={},
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+                if checkpoint is PackageUpdateCheckpoint.ISSUED:
+                    updated = connection.execute(
+                        "UPDATE package_update_jobs SET checkpoint='preflight_passed' "
+                        "WHERE job_id=? AND status='active' AND checkpoint='issued'",
+                        (canonical_job_id,),
+                    )
+                    if updated.rowcount != 1:
+                        raise AuthorityConflict(
+                            "package update job preflight lost durable ownership"
+                        )
+                    self._append_package_update_job_event(
+                        connection,
+                        job_id=canonical_job_id,
+                        created_at=recorded_at,
+                        level=PackageUpdateEventLevel.INFO,
+                        stage=PackageUpdateCheckpoint.PREFLIGHT_PASSED,
+                        event_type=PackageUpdateEventType.PREFLIGHT_PASSED,
+                        message="package update job preflight authority revalidated",
+                        details={},
+                    )
+                elif checkpoint is not PackageUpdateCheckpoint.PREFLIGHT_PASSED:
+                    raise AuthorityConflict(
+                        "package update job has already advanced past preflight"
+                    )
+
+        if not current_authority_holds:
+            raise AuthorityConflict(
+                "package update job resource or source authority context is stale"
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -1397,33 +1485,7 @@ class InventoryAuthority:
         canonical_job_id = _require_uuid(job_id, "job_id")
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
-            backend_instance_id = str(
-                connection.execute(
-                    "SELECT backend_instance_id FROM backend_instance"
-                ).fetchone()["backend_instance_id"]
-            )
-            identity = derive_pre_update_snapshot_identity(
-                backend_instance_id=backend_instance_id,
-                job_id=canonical_job_id,
-                resource_id=str(job["resource_id"]),
-                resource_continuity_revision=int(
-                    job["expected_resource_continuity_revision"]
-                ),
-            )
-            persisted_name = job["snapshot_name"]
-            persisted_operation = job["snapshot_operation_id"]
-            if (
-                persisted_name is not None
-                and str(persisted_name) != identity.snapshot_name
-            ) or (
-                persisted_operation is not None
-                and str(persisted_operation) != identity.snapshot_operation_id
-            ):
-                raise AuthorityInvariantError(
-                    "persisted snapshot identity does not match the job's "
-                    "deterministic derivation"
-                )
-        return identity
+            return self._snapshot_identity_in_transaction(connection, job)
 
     def package_update_snapshot_ownership(self, job_id: str) -> SnapshotOwnership:
         """Build the strict ownership metadata one job's snapshot must carry."""
@@ -1431,20 +1493,7 @@ class InventoryAuthority:
         canonical_job_id = _require_uuid(job_id, "job_id")
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
-            backend_instance_id = str(
-                connection.execute(
-                    "SELECT backend_instance_id FROM backend_instance"
-                ).fetchone()["backend_instance_id"]
-            )
-            return build_snapshot_ownership(
-                job_id=canonical_job_id,
-                resource_id=str(job["resource_id"]),
-                resource_continuity_revision=int(
-                    job["expected_resource_continuity_revision"]
-                ),
-                inventory_source_id=str(job["inventory_source_id"]),
-                backend_instance_id=backend_instance_id,
-            )
+            return self._snapshot_ownership_in_transaction(connection, job)
 
     def record_package_update_snapshot_intent(
         self, job_id: str
@@ -1459,51 +1508,88 @@ class InventoryAuthority:
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        job = self.revalidate_package_update_job(canonical_job_id)
-        identity = self.package_update_snapshot_identity(canonical_job_id)
-        if job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED:
-            return job
-        if job.checkpoint is not PackageUpdateCheckpoint.PREFLIGHT_PASSED:
-            raise AuthorityConflict(
-                "package update job snapshot intent requires a passed preflight"
-            )
         recorded_at = _timestamp(self._now())
         with self._store._transaction() as connection:
-            updated = connection.execute(
-                "UPDATE package_update_jobs "
-                "SET checkpoint='snapshot_may_have_started', "
-                "snapshot_operation_id=?, snapshot_name=?, "
-                "snapshot_intent_recorded_at=? "
-                "WHERE job_id=? AND status='active' "
-                "AND checkpoint='preflight_passed' "
-                "AND snapshot_operation_id IS NULL",
-                (
-                    identity.snapshot_operation_id,
-                    identity.snapshot_name,
-                    recorded_at,
-                    canonical_job_id,
-                ),
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            # The write-ahead intent is the point of no return, so its
+            # authority proof commits in the same transaction. A guest
+            # replaced at the same VMID on the same node between proof and
+            # commit would otherwise let a stale job submit a snapshot
+            # against the replacement and tag it with the old incarnation's
+            # ownership metadata.
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
             )
-            if updated.rowcount != 1:
-                raise AuthorityConflict(
-                    "package update job snapshot intent lost durable ownership"
-                )
-            self._append_package_update_job_event(
-                connection,
-                job_id=canonical_job_id,
-                created_at=recorded_at,
-                level=PackageUpdateEventLevel.WARNING,
-                stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
-                event_type=PackageUpdateEventType.SNAPSHOT_INTENT_RECORDED,
-                message=(
-                    "pre-update snapshot operation may be submitted from here on"
-                ),
-                details={
-                    "snapshot_operation_id": identity.snapshot_operation_id,
-                    "snapshot_name": identity.snapshot_name,
-                },
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                identity = self._snapshot_identity_in_transaction(connection, job)
+                checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+                if checkpoint is PackageUpdateCheckpoint.PREFLIGHT_PASSED:
+                    self._commit_snapshot_intent(
+                        connection,
+                        job_id=canonical_job_id,
+                        identity=identity,
+                        recorded_at=recorded_at,
+                    )
+                elif (
+                    checkpoint
+                    is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+                ):
+                    # Already at the intent checkpoint is idempotent; anything
+                    # else has advanced past this transition.
+                    raise AuthorityConflict(
+                        "package update job snapshot intent requires a passed "
+                        "preflight"
+                    )
+
+        if not current_authority_holds:
+            raise AuthorityConflict(
+                "package update job resource or source authority context is stale"
             )
         return self._store.package_update_job(canonical_job_id)
+
+    def _commit_snapshot_intent(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        identity: PackageUpdateSnapshotIdentity,
+        recorded_at: str,
+    ) -> None:
+        updated = connection.execute(
+            "UPDATE package_update_jobs "
+            "SET checkpoint='snapshot_may_have_started', "
+            "snapshot_operation_id=?, snapshot_name=?, "
+            "snapshot_intent_recorded_at=? "
+            "WHERE job_id=? AND status='active' "
+            "AND checkpoint='preflight_passed' "
+            "AND snapshot_operation_id IS NULL",
+            (
+                identity.snapshot_operation_id,
+                identity.snapshot_name,
+                recorded_at,
+                job_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job snapshot intent lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=recorded_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+            event_type=PackageUpdateEventType.SNAPSHOT_INTENT_RECORDED,
+            message="pre-update snapshot operation may be submitted from here on",
+            details={
+                "snapshot_operation_id": identity.snapshot_operation_id,
+                "snapshot_name": identity.snapshot_name,
+            },
+        )
 
     def record_package_update_snapshot_task(
         self, job_id: str, task_upid: str
@@ -1573,38 +1659,63 @@ class InventoryAuthority:
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        job = self.revalidate_package_update_job(canonical_job_id)
-        if job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED:
-            return job
-        if job.checkpoint is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED:
-            raise AuthorityConflict(
-                "package update job is not inside a snapshot operation"
-            )
-        expected = self.package_update_snapshot_ownership(canonical_job_id)
-        self._require_exactly_one_job_owned_snapshot(job, observed, expected)
+        snapshots = _require_observed_snapshots(observed)
         confirmed_at = _timestamp(self._now())
         with self._store._transaction() as connection:
-            updated = connection.execute(
-                "UPDATE package_update_jobs SET checkpoint='snapshot_confirmed', "
-                "snapshot_confirmed_at=? "
-                "WHERE job_id=? AND status='active' "
-                "AND checkpoint='snapshot_may_have_started' "
-                "AND snapshot_confirmed_at IS NULL AND snapshot_name=?",
-                (confirmed_at, canonical_job_id, job.snapshot_name),
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            # Confirmation is what makes the snapshot usable as a rollback
+            # source, so its authority proof, its ownership derivation, the
+            # strict canonical match, and the commit are all one transaction.
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
             )
-            if updated.rowcount != 1:
-                raise AuthorityConflict(
-                    "package update job snapshot confirmation lost durable ownership"
-                )
-            self._append_package_update_job_event(
-                connection,
-                job_id=canonical_job_id,
-                created_at=confirmed_at,
-                level=PackageUpdateEventLevel.INFO,
-                stage=PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
-                event_type=PackageUpdateEventType.SNAPSHOT_CONFIRMED,
-                message="job-owned pre-update snapshot confirmed canonically",
-                details={"snapshot_name": str(job.snapshot_name)},
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+                if checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED:
+                    snapshot_name = str(job["snapshot_name"])
+                    self._require_exactly_one_job_owned_snapshot(
+                        job_id=canonical_job_id,
+                        expected_name=snapshot_name,
+                        observed=snapshots,
+                        expected=self._snapshot_ownership_in_transaction(
+                            connection, job
+                        ),
+                    )
+                    updated = connection.execute(
+                        "UPDATE package_update_jobs "
+                        "SET checkpoint='snapshot_confirmed', "
+                        "snapshot_confirmed_at=? "
+                        "WHERE job_id=? AND status='active' "
+                        "AND checkpoint='snapshot_may_have_started' "
+                        "AND snapshot_confirmed_at IS NULL AND snapshot_name=?",
+                        (confirmed_at, canonical_job_id, snapshot_name),
+                    )
+                    if updated.rowcount != 1:
+                        raise AuthorityConflict(
+                            "package update job snapshot confirmation lost "
+                            "durable ownership"
+                        )
+                    self._append_package_update_job_event(
+                        connection,
+                        job_id=canonical_job_id,
+                        created_at=confirmed_at,
+                        level=PackageUpdateEventLevel.INFO,
+                        stage=PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED,
+                        event_type=PackageUpdateEventType.SNAPSHOT_CONFIRMED,
+                        message="job-owned pre-update snapshot confirmed canonically",
+                        details={"snapshot_name": snapshot_name},
+                    )
+                elif checkpoint is not PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED:
+                    raise AuthorityConflict(
+                        "package update job is not inside a snapshot operation"
+                    )
+
+        if not current_authority_holds:
+            raise AuthorityConflict(
+                "package update job resource or source authority context is stale"
             )
         return self._store.package_update_job(canonical_job_id)
 
@@ -1794,6 +1905,16 @@ class InventoryAuthority:
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
+        snapshots = _require_observed_snapshots(observed)
+        # One read transaction, so the job row and the ownership derived from
+        # it are a consistent view of authority.
+        with self._store._transaction() as connection:
+            job_row = self._require_package_update_job_row(
+                connection, canonical_job_id
+            )
+            expected_ownership = self._snapshot_ownership_in_transaction(
+                connection, job_row
+            )
         job = self._store.package_update_job(canonical_job_id)
         if job.status is not PackageUpdateJobStatus.ACTIVE:
             # A terminal job never rolls anything back. Its snapshot is
@@ -1812,8 +1933,12 @@ class InventoryAuthority:
             raise AuthorityInvariantError(
                 "package update job snapshot confirmation is inconsistent"
             )
-        expected = self.package_update_snapshot_ownership(canonical_job_id)
-        self._require_exactly_one_job_owned_snapshot(job, observed, expected)
+        self._require_exactly_one_job_owned_snapshot(
+            job_id=canonical_job_id,
+            expected_name=job.snapshot_name,
+            observed=snapshots,
+            expected=expected_ownership,
+        )
         return PackageUpdateRollbackTarget(
             job_id=canonical_job_id,
             resource_id=job.resource_id,
@@ -1826,7 +1951,9 @@ class InventoryAuthority:
 
     @staticmethod
     def _require_exactly_one_job_owned_snapshot(
-        job: PackageUpdateJob,
+        *,
+        job_id: str,
+        expected_name: str | None,
         observed: Sequence[ObservedSnapshot],
         expected: SnapshotOwnership,
     ) -> ObservedSnapshot:
@@ -1837,7 +1964,6 @@ class InventoryAuthority:
         Hubinet-looking snapshot whose metadata did not parse all refuse.
         """
 
-        expected_name = job.snapshot_name
         if expected_name is None:
             raise AuthorityInvariantError(
                 "package update job has no persisted snapshot identity"
@@ -1853,7 +1979,7 @@ class InventoryAuthority:
                 continue
             claims_this_job = (
                 snapshot.ownership is not None
-                and snapshot.ownership.job_id == job.job_id
+                and snapshot.ownership.job_id == job_id
             )
             if snapshot.name != expected_name and not claims_this_job:
                 if snapshot.ownership_malformed:
@@ -2076,6 +2202,16 @@ class InventoryAuthority:
                 details_json,
             ),
         )
+
+    def _after_package_update_authority_proof(
+        self, connection: sqlite3.Connection, *, job_id: str
+    ) -> None:
+        """Test seam inside a transition transaction, after the authority proof.
+
+        Fires between proving current authority and committing the transition
+        it authorizes. Both are in one transaction, so this is exactly the
+        point where a check-then-commit race would have been possible.
+        """
 
     def _after_package_update_job_issuance(
         self, connection: sqlite3.Connection, *, job_id: str

@@ -43,12 +43,21 @@ _SNAPSHOT_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{1,39}")
 _MAX_REQUEST_BYTES = 8192
 
 #: Outcomes the dark helper may report, mapped onto the orchestrator's typed
-#: vocabulary. ``absent`` is only produced by the read-only inspect operation.
+#: vocabulary.
+#:
+#: ``absent`` is only produced by the read-only ``inspect_job_snapshot_state``
+#: operation, and it maps to UNCERTAIN, never FAILED. A canonical absence is
+#: an *observation*, not proof that an already-submitted asynchronous PVE
+#: snapshot operation terminated: the task may still be queued or running and
+#: about to create the snapshot. Only a terminal failed PVE task (which the
+#: helper reports as ``failed``, with its own canonical evidence attached) may
+#: reach the FAILED branch, and only the explicit durable ``not_submitted``
+#: proof may release a job that was never submitted at all.
 _OUTCOMES = {
     "completed": SnapshotOperationOutcome.COMPLETED,
     "failed": SnapshotOperationOutcome.FAILED,
     "uncertain": SnapshotOperationOutcome.UNCERTAIN,
-    "absent": SnapshotOperationOutcome.FAILED,
+    "absent": SnapshotOperationOutcome.UNCERTAIN,
 }
 
 #: The one token that may downgrade a host failure from "unknown" to "proved

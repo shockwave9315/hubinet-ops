@@ -49,6 +49,7 @@ from app.package_update_snapshot import (
     classify_task_status,
     parse_canonical_snapshot_listing,
 )
+from tests.test_package_scan_authority import _reconcile
 from tests.test_package_update_job_authority import (
     _add_approved_resource,
     _approved_system,
@@ -1923,3 +1924,505 @@ def test_an_unknown_or_absent_submission_token_stays_uncertain() -> None:
         operation_id,
     )
     assert proved.outcome is SnapshotOperationOutcome.NOT_SUBMITTED
+
+
+# ===========================================================================
+# Authority transition atomicity (check-then-commit race)
+#
+# Every transition whose safety depends on CURRENT authority must re-prove it
+# inside the SAME SQLite transaction that commits the transition. Proving in
+# one transaction and committing in another let discovery reconciliation
+# replace the guest occupying the same VMID on the same node in between: the
+# checkpoint CAS only sees job status/checkpoint, and the host helper can only
+# verify live PVE VMID/type/node facts, never a backend resource incarnation.
+# ===========================================================================
+
+
+def _break_incarnation_continuity_at_the_same_locator(store, authority) -> None:
+    """Invalidate the job's incarnation while every live PVE fact stays equal.
+
+    Driven through real reconciliation: the guest disappears from one complete
+    baseline and returns in the next. Afterwards the VMID, node, resource
+    type, and running status are all byte-for-byte what the job froze, so the
+    host helper's independent live checks cannot possibly catch it -- but the
+    backend's incarnation lifecycle and continuity revision have moved, so the
+    job's authority is stale. This is precisely the case a check-then-commit
+    race would let through.
+    """
+
+    source_id = store.list_resources()[0].inventory_source_id
+    before = store.list_resources()[0]
+    _reconcile(authority, source_id, resource_present=False)
+    _reconcile(authority, source_id)
+    after = store.list_resources()[0]
+    # Guard the fixture itself: it must change only backend-known facts.
+    assert after.resource_id == before.resource_id
+    assert (after.vmid, after.current_node_id, after.resource_type) == (
+        before.vmid,
+        before.current_node_id,
+        before.resource_type,
+    )
+    assert after.lifecycle != "active"
+    assert after.resource_continuity_revision != before.resource_continuity_revision
+
+
+def _authority_transitions(authority):
+    """The three transitions that claim current authority permits advancing."""
+
+    return (
+        (
+            "preflight",
+            PackageUpdateCheckpoint.ISSUED,
+            lambda job_id: authority.record_package_update_preflight_passed(job_id),
+        ),
+        (
+            "snapshot intent",
+            PackageUpdateCheckpoint.PREFLIGHT_PASSED,
+            lambda job_id: authority.record_package_update_snapshot_intent(job_id),
+        ),
+        (
+            "snapshot confirmation",
+            PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+            lambda job_id: authority.confirm_package_update_snapshot(job_id, ()),
+        ),
+    )
+
+
+def _advance_to(authority, job_id, checkpoint) -> None:
+    if checkpoint is PackageUpdateCheckpoint.ISSUED:
+        return
+    authority.record_package_update_preflight_passed(job_id)
+    if checkpoint is PackageUpdateCheckpoint.PREFLIGHT_PASSED:
+        return
+    authority.record_package_update_snapshot_intent(job_id)
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_broken_incarnation_continuity_refuses_every_authority_transition(
+    tmp_path: Path, index: int
+) -> None:
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    name, checkpoint, transition = _authority_transitions(authority)[index]
+    _advance_to(authority, job.job_id, checkpoint)
+
+    before = store.package_update_job(job.job_id)
+    before_events = store.list_package_update_job_events(job.job_id)
+    assert before.checkpoint is checkpoint
+
+    # Same VMID, same node, different backend incarnation.
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    with pytest.raises(AuthorityConflict, match="authority context is stale"):
+        transition(job.job_id)
+
+    # Refusal is atomic: nothing about the job moved, and no event was left
+    # behind by a partially applied transition.
+    after = store.package_update_job(job.job_id)
+    assert after == before, name
+    assert store.list_package_update_job_events(job.job_id) == before_events, name
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_the_authority_proof_and_its_transition_share_one_transaction(
+    tmp_path: Path, index: int
+) -> None:
+    """The actual race proof, not just that the predicate exists.
+
+    A seam fires inside the transition transaction, immediately after the
+    authority proof -- exactly where an interleaving writer used to be able to
+    invalidate the job between the proof and the commit. From a second
+    connection, that write must be impossible: the transition holds the
+    database write lock across both.
+    """
+
+    import sqlite3 as _sqlite3
+
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    _, checkpoint, transition = _authority_transitions(authority)[index]
+    _advance_to(authority, job.job_id, checkpoint)
+
+    attempted: list[str] = []
+
+    def seam(connection, *, job_id):
+        # A genuinely separate connection, with a short busy timeout so the
+        # attempt fails fast instead of waiting out the store's own.
+        other = _sqlite3.connect(store.path, timeout=0.1, isolation_level=None)
+        try:
+            # No other writer can begin -- so nothing can invalidate this job
+            # between the authority proof just taken and the commit below.
+            with pytest.raises(_sqlite3.OperationalError, match="locked"):
+                other.execute("BEGIN IMMEDIATE")
+            attempted.append(job_id)
+        finally:
+            other.close()
+
+    authority._after_package_update_authority_proof = seam
+    # The confirmation transition needs real canonical evidence to commit.
+    if checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED:
+        identity = authority.package_update_snapshot_identity(job.job_id)
+        ownership = authority.package_update_snapshot_ownership(job.job_id)
+        authority.confirm_package_update_snapshot(
+            job.job_id, _canonical(ownership, identity)
+        )
+    else:
+        transition(job.job_id)
+
+    assert attempted == [job.job_id]
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_a_transition_interrupted_after_its_proof_commits_nothing(
+    tmp_path: Path, index: int
+) -> None:
+    """Proof, transition, and event are one atomic unit."""
+
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    _, checkpoint, transition = _authority_transitions(authority)[index]
+    _advance_to(authority, job.job_id, checkpoint)
+
+    before = store.package_update_job(job.job_id)
+    before_events = store.list_package_update_job_events(job.job_id)
+
+    def die(connection, *, job_id):
+        raise KeyboardInterrupt("process died between the proof and the commit")
+
+    authority._after_package_update_authority_proof = die
+    with pytest.raises(KeyboardInterrupt):
+        transition(job.job_id)
+
+    assert store.package_update_job(job.job_id) == before
+    assert store.list_package_update_job_events(job.job_id) == before_events
+
+
+def test_broken_incarnation_continuity_never_reaches_host_submission(
+    tmp_path: Path,
+) -> None:
+    """The critical original witness, end to end through the real boundary.
+
+    The guest is replaced at the same VMID on the same node after the job was
+    issued. The host helper independently verifies only live PVE VMID, type,
+    node, and status -- all of which still match -- so nothing downstream could
+    catch this. It must be refused in the backend, before any submission.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
+        tmp_path
+    )
+    # Live PVE still shows the same VMID, type, node and status.
+    assert pve.vmid == job.expected_vmid
+    assert pve.node == job.expected_node_name
+
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _dark_channel(pve, journal)
+    )
+    with pytest.raises(AuthorityConflict, match="authority context is stale"):
+        orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert pve.submissions == 0
+    assert pve.argvs == []
+    stalled = store.package_update_job(job.job_id)
+    assert stalled.checkpoint is PackageUpdateCheckpoint.ISSUED
+    assert stalled.snapshot_operation_id is None
+    assert stalled.snapshot_name is None
+
+
+def test_broken_continuity_after_preflight_cannot_record_snapshot_intent(
+    tmp_path: Path,
+) -> None:
+    """The window that matters most: the last step before submission."""
+
+    store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _dark_channel(pve, journal)
+    )
+    with pytest.raises(AuthorityConflict, match="authority context is stale"):
+        orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert pve.submissions == 0
+    stalled = store.package_update_job(job.job_id)
+    assert stalled.checkpoint is PackageUpdateCheckpoint.PREFLIGHT_PASSED
+    assert stalled.snapshot_operation_id is None
+
+
+def test_post_submission_transitions_do_not_require_current_authority(
+    tmp_path: Path,
+) -> None:
+    """Staleness must not discard evidence about a possible PVE mutation.
+
+    Once a snapshot may already have been submitted, recording the task,
+    recording uncertainty, and startup fencing are all about preserving
+    evidence -- they are not claims that authority permits advancing, so a
+    replaced incarnation must not stop them.
+    """
+
+    _, store, authority, _, job, identity, _ = _prepared(tmp_path)
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    assert (
+        authority.record_package_update_snapshot_task(job.job_id, UPID).snapshot_task_upid
+        == UPID
+    )
+    assert authority.record_package_update_snapshot_uncertain(
+        job.job_id, "outcome unknown"
+    ).status is PackageUpdateJobStatus.ACTIVE
+    assert authority.recover_interrupted_package_update_jobs() == ()
+    assert store.package_update_job(job.job_id).status is (
+        PackageUpdateJobStatus.ACTIVE
+    )
+
+    # ...but advancing to confirmation still refuses.
+    with pytest.raises(AuthorityConflict, match="authority context is stale"):
+        authority.confirm_package_update_snapshot(job.job_id, ())
+
+
+# ===========================================================================
+# An inspected canonical absence is an observation, not a failure
+#
+# `inspect_job_snapshot_state` is read-only. Absence does not prove that an
+# already-submitted asynchronous PVE snapshot operation terminated: its task
+# may still be queued or running and about to create the snapshot. So it must
+# never reach the FAILED branch, which is what terminalizes a job.
+# ===========================================================================
+
+
+def _channel(runner):
+    from app.package_update_snapshot_host_control import (
+        SshPackageUpdateSnapshotHostControl,
+    )
+
+    return SshPackageUpdateSnapshotHostControl(
+        host="pve.example.internal",
+        port=22,
+        user="hubinet-snapshot",
+        private_key_path=Path("/etc/hubinet-ops/snapshot-key"),
+        known_hosts_path=Path("/etc/hubinet-ops/known_hosts"),
+        timeout_seconds=60,
+        max_result_bytes=1024 * 1024,
+        runner=runner,
+    )
+
+
+def test_an_inspected_absence_maps_to_uncertain_never_failed() -> None:
+    channel = _channel(None)
+    operation_id = str(uuid.uuid4())
+    absent = channel._parse_payload(
+        {
+            "response_version": 1,
+            "ok": True,
+            "snapshot_operation_id": operation_id,
+            "outcome": "absent",
+            "snapshots": [{"name": "current", "description": "You are here!"}],
+        },
+        operation_id,
+    )
+    assert absent.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert absent.outcome is not SnapshotOperationOutcome.FAILED
+    # And absence is never the durable non-submission proof either.
+    assert absent.outcome is not SnapshotOperationOutcome.NOT_SUBMITTED
+
+
+def test_inspecting_a_submitted_operation_that_shows_nothing_stays_fenced(
+    tmp_path: Path,
+) -> None:
+    """The real chain: journal says submitted, canonical state shows nothing.
+
+    The task may still be about to run. The job must stay active and fenced,
+    and nothing may terminalize it.
+    """
+
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    authority.record_package_update_snapshot_intent(job.job_id)
+
+    # A submission was made; its task identity was never durably captured.
+    # The fingerprint must be the real one, or the helper would short-circuit
+    # on a request mismatch and never compute canonical absence at all.
+    fingerprint = snapshot_helper.request_fingerprint(
+        snapshot_helper.validate_request(
+            {
+                "request_version": 1,
+                "operation": "inspect_job_snapshot_state",
+                "target": {
+                    "vmid": job.expected_vmid,
+                    "expected_node": job.expected_node_name,
+                },
+                "operation_identity": {
+                    "snapshot_operation_id": identity.snapshot_operation_id,
+                    "snapshot_name": identity.snapshot_name,
+                },
+                "ownership": {
+                    "job_id": ownership.job_id,
+                    "resource_id": ownership.resource_id,
+                    "resource_continuity_revision": (
+                        ownership.resource_continuity_revision
+                    ),
+                    "inventory_source_id": ownership.inventory_source_id,
+                    "backend_instance_id": ownership.backend_instance_id,
+                },
+            }
+        )
+    )
+    journal.write(
+        {
+            "journal_version": 1,
+            "snapshot_operation_id": identity.snapshot_operation_id,
+            "request_fingerprint": fingerprint,
+            "vmid": job.expected_vmid,
+            "expected_node": job.expected_node_name,
+            "snapshot_name": identity.snapshot_name,
+            "phase": "submitted",
+        }
+    )
+
+    channel = _dark_channel(pve, journal)
+    result = channel.inspect_job_snapshot_state(
+        snapshot_operation_id=identity.snapshot_operation_id,
+        snapshot_name=identity.snapshot_name,
+        vmid=job.expected_vmid,
+        expected_node=job.expected_node_name,
+        ownership=ownership,
+    )
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert pve.submissions == 0
+    # ...and specifically because `absent` maps to UNCERTAIN, not because the
+    # helper refused for some other reason.
+    raw = snapshot_helper.handle_request(
+        {
+            "request_version": 1,
+            "operation": "inspect_job_snapshot_state",
+            "target": {
+                "vmid": job.expected_vmid,
+                "expected_node": job.expected_node_name,
+            },
+            "operation_identity": {
+                "snapshot_operation_id": identity.snapshot_operation_id,
+                "snapshot_name": identity.snapshot_name,
+            },
+            "ownership": {
+                "job_id": ownership.job_id,
+                "resource_id": ownership.resource_id,
+                "resource_continuity_revision": (
+                    ownership.resource_continuity_revision
+                ),
+                "inventory_source_id": ownership.inventory_source_id,
+                "backend_instance_id": ownership.backend_instance_id,
+            },
+        },
+        runner=pve,
+        journal=journal,
+    )
+    assert raw["ok"] is True and raw["outcome"] == "absent"
+
+    # Handing that observation to the orchestrator must not terminalize.
+    orchestrator = PackageUpdateSnapshotOrchestrator(authority, channel)
+    staged = orchestrator._apply_host_result(
+        job.job_id, identity.snapshot_operation_id, result
+    )
+    assert staged.outcome is SnapshotOperationOutcome.UNCERTAIN
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert fenced.terminalized_at is None
+    assert authority.recover_interrupted_package_update_jobs() == ()
+
+
+def test_a_genuinely_failed_task_still_terminalizes(tmp_path: Path) -> None:
+    """Positive control: the FAILED path keeps its real task-failure evidence."""
+
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    identity = authority.package_update_snapshot_identity(job.job_id)
+    host = FakeHostControl(
+        HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.FAILED,
+            snapshot_operation_id=identity.snapshot_operation_id,
+            task_upid=UPID,
+            task=classify_task_status(
+                {"upid": UPID, "status": "stopped", "exitstatus": "boom"}
+            ),
+            snapshots=(_current_entry(), _foreign_entry()),
+            reason="PVE snapshot task terminated in a failure state",
+        )
+    )
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, host
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.FAILED
+    assert store.package_update_job(job.job_id).status is (
+        PackageUpdateJobStatus.BLOCKED
+    )
+
+
+def test_a_failed_task_whose_snapshot_might_exist_still_stays_uncertain(
+    tmp_path: Path,
+) -> None:
+    """Positive control: FAILED still needs canonical proof of absence."""
+
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    identity = authority.package_update_snapshot_identity(job.job_id)
+    ownership = authority.package_update_snapshot_ownership(job.job_id)
+    host = FakeHostControl(
+        HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.FAILED,
+            snapshot_operation_id=identity.snapshot_operation_id,
+            task_upid=UPID,
+            task=classify_task_status(
+                {"upid": UPID, "status": "stopped", "exitstatus": "boom"}
+            ),
+            snapshots=_canonical(ownership, identity),
+            reason="PVE snapshot task terminated in a failure state",
+        )
+    )
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, host
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert store.package_update_job(job.job_id).status is (
+        PackageUpdateJobStatus.ACTIVE
+    )
+
+
+def test_only_the_durable_proof_releases_a_never_submitted_job(
+    tmp_path: Path,
+) -> None:
+    """Positive control alongside the absence rule.
+
+    Absence stays uncertain; the explicit host proof still releases.
+    """
+
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    identity = authority.package_update_snapshot_identity(job.job_id)
+    host = FakeHostControl(
+        HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.NOT_SUBMITTED,
+            snapshot_operation_id=identity.snapshot_operation_id,
+            reason="host proved no snapshot mutation was submitted (stale_target)",
+        )
+    )
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, host
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED
+    assert store.package_update_job(job.job_id).status is (
+        PackageUpdateJobStatus.BLOCKED
+    )
