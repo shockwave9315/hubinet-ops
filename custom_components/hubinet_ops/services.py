@@ -151,6 +151,7 @@ async def _view_update_plan(
         "packages": [
             {
                 "name": package.name,
+                "architecture": package.architecture,
                 "installed_version": package.installed_version,
                 "candidate_version": package.candidate_version,
                 "origin": package.origin,

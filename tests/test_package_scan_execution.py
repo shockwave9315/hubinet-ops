@@ -99,8 +99,11 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
     assert debian[1].candidate_version == "3.0.11-1~deb12u3"
     assert debian[1].security is True
     assert debian[0].security is None
+    assert debian[0].architecture == "amd64"
+    assert debian[1].architecture == "amd64"
     ubuntu = parse_apt_simulation(UBUNTU_SIMULATION)
-    assert ubuntu[0].origin == "Ubuntu:24.04/noble-updates [amd64]"
+    assert ubuntu[0].origin == "Ubuntu:24.04/noble-updates"
+    assert ubuntu[0].architecture == "amd64"
     assert ubuntu[0].security is None
 
 
@@ -108,6 +111,7 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
     (
         "change",
         "expected_name",
+        "expected_architecture",
         "expected_installed",
         "expected_candidate",
         "expected_origin",
@@ -117,17 +121,19 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
         (
             "Inst foo [1.0] (1.1 Debian:stable [amd64])",
             "foo",
+            "amd64",
             "1.0",
             "1.1",
-            "Debian:stable [amd64]",
+            "Debian:stable",
             None,
         ),
         (
             "Inst foo [1.0] (1.1 Debian:stable [amd64]) []",
             "foo",
+            "amd64",
             "1.0",
             "1.1",
-            "Debian:stable [amd64]",
+            "Debian:stable",
             None,
         ),
         (
@@ -135,34 +141,61 @@ def test_zero_and_multiple_exact_apt_updates() -> None:
             "(2.41.5-0+deb13u1 Debian-Security:13/stable-security [amd64]) "
             "[util-linux:amd64 on liblastlog2-2:amd64] [util-linux:amd64 ]",
             "liblastlog2-2",
+            "amd64",
             "2.41-5",
             "2.41.5-0+deb13u1",
-            "Debian-Security:13/stable-security [amd64]",
+            "Debian-Security:13/stable-security",
             True,
         ),
         (
             "Inst foo [1.0] (1.1 Debian:stable [amd64]) "
             "[util-linux:amd64 on foo:amd64]",
             "foo",
+            "amd64",
             "1.0",
             "1.1",
-            "Debian:stable [amd64]",
+            "Debian:stable",
             None,
         ),
         (
             "Inst bind9-host [1:9.20.23-1~deb13u1] "
             "(1:9.20.26-1~deb13u1 Debian-Security:13/stable-security [amd64]) []",
             "bind9-host",
+            "amd64",
             "1:9.20.23-1~deb13u1",
             "1:9.20.26-1~deb13u1",
-            "Debian-Security:13/stable-security [amd64]",
+            "Debian-Security:13/stable-security",
             True,
+        ),
+        (
+            # Architecture: all -- no name qualifier, "all" in the bracket.
+            "Inst linux-libc-dev [6.12.101-1] "
+            "(6.12.107-1 Debian-Security:13/stable-security [all])",
+            "linux-libc-dev",
+            "all",
+            "6.12.101-1",
+            "6.12.107-1",
+            "Debian-Security:13/stable-security",
+            True,
+        ),
+        (
+            # Foreign architecture -- APT qualifies the name with ':i386'
+            # (see ARCHITECTURE.md, "Binary package identity"); the bracket
+            # inside the parens still carries the same architecture.
+            "Inst libc6:i386 [2.31-13] (2.31-13+deb11u7 Debian:11/stable [i386])",
+            "libc6",
+            "i386",
+            "2.31-13",
+            "2.31-13+deb11u7",
+            "Debian:11/stable",
+            None,
         ),
     ),
 )
 def test_realistic_apt_shortbreaks_suffix_is_not_material_plan_data(
     change: str,
     expected_name: str,
+    expected_architecture: str,
     expected_installed: str,
     expected_candidate: str,
     expected_origin: str,
@@ -172,6 +205,7 @@ def test_realistic_apt_shortbreaks_suffix_is_not_material_plan_data(
         f"{change}\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
     )
     assert parsed[0].package_name == expected_name
+    assert parsed[0].architecture == expected_architecture
     assert parsed[0].installed_version == expected_installed
     assert parsed[0].candidate_version == expected_candidate
     assert parsed[0].origin == expected_origin
@@ -192,6 +226,70 @@ def test_shortbreaks_suffix_does_not_change_material_fingerprint() -> None:
     assert package_plan_fingerprint(plain) == package_plan_fingerprint(shortbreaks)
 
 
+def test_same_package_name_two_architectures_remain_distinct() -> None:
+    # Multiarch regression C/E: foo/amd64 and foo/i386 are two different
+    # binary packages, not one row that collapses or overwrites the other.
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
+        "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    parsed = parse_apt_simulation(sim)
+    assert len(parsed) == 2
+    identities = {(item.package_name, item.architecture) for item in parsed}
+    assert identities == {("foo", "amd64"), ("foo", "i386")}
+
+
+def test_architecture_only_difference_changes_the_fingerprint() -> None:
+    # Multiarch regression D: same name/installed/candidate, different
+    # architecture, must be a different material plan/fingerprint.
+    amd64 = parse_apt_simulation(
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    i386 = parse_apt_simulation(
+        "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    assert amd64 != i386
+    assert package_plan_fingerprint(amd64) != package_plan_fingerprint(i386)
+
+
+def test_package_row_order_does_not_change_the_fingerprint() -> None:
+    # Multiarch regression I: canonical ordering is deterministic, so
+    # equality/fingerprinting never depends on host-reported row order.
+    forward = parse_apt_simulation(
+        "Inst apt [2.6.1] (2.6.2 Debian:12/stable [amd64])\n"
+        "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
+        "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    reversed_order = parse_apt_simulation(
+        "Inst foo:i386 [1.0] (1.1 Debian:stable [i386])\n"
+        "Inst apt [2.6.1] (2.6.2 Debian:12/stable [amd64])\n"
+        "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    assert forward == reversed_order
+    assert package_plan_fingerprint(forward) == package_plan_fingerprint(reversed_order)
+
+
+def test_installed_or_candidate_version_difference_changes_the_fingerprint() -> None:
+    # Multiarch regression K/L.
+    base = parse_apt_simulation(
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    installed_changed = parse_apt_simulation(
+        "Inst foo [1.0.1] (1.1 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    candidate_changed = parse_apt_simulation(
+        "Inst foo [1.0] (1.2 Debian:stable [amd64])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    assert package_plan_fingerprint(base) != package_plan_fingerprint(installed_changed)
+    assert package_plan_fingerprint(base) != package_plan_fingerprint(candidate_changed)
+
+
 @pytest.mark.parametrize(
     "text",
     (
@@ -202,6 +300,19 @@ def test_shortbreaks_suffix_does_not_change_material_fingerprint() -> None:
         "Inst apt [2.6.1] (2.6.2 Debian:12/stable [amd64])\n0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
         "Remv obsolete [1.0]\n0 upgraded, 0 newly installed, 1 to remove and 0 not upgraded.\n",
         "Reading package lists...\n",
+        # Multiarch regression G: no architecture bracket at all.
+        "Inst foo [1.0] (1.1 Debian:stable)\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        # Multiarch regression G: an empty architecture bracket.
+        "Inst foo [1.0] (1.1 Debian:stable [])\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        # Multiarch regression F: the name's ':arch' qualifier contradicts
+        # the candidate description's own architecture bracket.
+        "Inst foo:i386 [1.0] (1.1 Debian:stable [amd64])\n1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n",
+        # Multiarch regression H: duplicate (package, architecture).
+        (
+            "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+            "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+            "2 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+        ),
     ),
 )
 def test_malformed_or_inexact_simulation_fails_scan(text: str) -> None:

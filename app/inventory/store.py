@@ -47,7 +47,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 10
+AUTHORITY_SCHEMA_VERSION = 11
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -888,6 +888,7 @@ def _package_scan_run(
     packages = tuple(
         PackageScanPackage(
             package_name=str(package["package_name"]),
+            architecture=str(package["architecture"]),
             installed_version=str(package["installed_version"]),
             candidate_version=str(package["candidate_version"]),
             origin=package["origin"],
@@ -978,6 +979,7 @@ def _package_update_job(
         PackageUpdateJobPackage(
             package_index=int(package["package_index"]),
             package_name=str(package["package_name"]),
+            architecture=str(package["architecture"]),
             installed_version=str(package["installed_version"]),
             candidate_version=str(package["candidate_version"]),
             origin=package["origin"],
@@ -1064,7 +1066,7 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE authority_schema (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         marker TEXT NOT NULL CHECK(marker = 'hubinet_ops_0_5_authority'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 10)
+        schema_version INTEGER NOT NULL CHECK(schema_version = 11)
     )
     """,
     """
@@ -1493,13 +1495,23 @@ _SCHEMA_STATEMENTS = (
         package_index INTEGER NOT NULL
             CHECK(typeof(package_index) = 'integer' AND package_index >= 0),
         package_name TEXT NOT NULL CHECK(length(trim(package_name)) > 0),
+        -- Durable binary-package identity is (package_name, architecture),
+        -- never package_name alone: dpkg/APT multiarch installs foo:amd64
+        -- and foo:i386 as fully independent packages. 'all' marks an
+        -- Architecture: all package; every other value is a real dpkg
+        -- architecture string. See ARCHITECTURE.md, "Binary package
+        -- identity".
+        architecture TEXT NOT NULL CHECK(
+            architecture GLOB '[a-z]*' AND
+            NOT architecture GLOB '*[^a-z0-9-]*' AND
+            length(architecture) BETWEEN 2 AND 32),
         installed_version TEXT NOT NULL CHECK(length(trim(installed_version)) > 0),
         candidate_version TEXT NOT NULL CHECK(length(trim(candidate_version)) > 0),
         origin TEXT CHECK(origin IS NULL OR length(origin) <= 500),
         description TEXT CHECK(description IS NULL OR length(description) <= 500),
         security INTEGER CHECK(security IS NULL OR security = 1),
         PRIMARY KEY(scan_run_id, package_index),
-        UNIQUE(scan_run_id, package_name),
+        UNIQUE(scan_run_id, package_name, architecture),
         FOREIGN KEY(scan_run_id) REFERENCES package_scan_runs(scan_run_id)
     )
     """,
@@ -1636,6 +1648,11 @@ _SCHEMA_STATEMENTS = (
             CHECK(typeof(package_index) = 'integer' AND package_index >= 0),
         package_name TEXT NOT NULL
             CHECK(length(trim(package_name)) > 0 AND length(package_name) <= 300),
+        -- Same durable identity contract as package_scan_packages.architecture.
+        architecture TEXT NOT NULL CHECK(
+            architecture GLOB '[a-z]*' AND
+            NOT architecture GLOB '*[^a-z0-9-]*' AND
+            length(architecture) BETWEEN 2 AND 32),
         installed_version TEXT NOT NULL
             CHECK(length(trim(installed_version)) > 0 AND length(installed_version) <= 500),
         candidate_version TEXT NOT NULL
@@ -1644,7 +1661,7 @@ _SCHEMA_STATEMENTS = (
         description TEXT CHECK(description IS NULL OR length(description) <= 500),
         security INTEGER CHECK(security IS NULL OR security = 1),
         PRIMARY KEY(job_id, package_index),
-        UNIQUE(job_id, package_name),
+        UNIQUE(job_id, package_name, architecture),
         FOREIGN KEY(job_id) REFERENCES package_update_jobs(job_id)
             DEFERRABLE INITIALLY DEFERRED
     )

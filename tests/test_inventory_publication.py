@@ -244,7 +244,7 @@ def successful_package_scan(authority, resource_id):
         run.scan_run_id,
         os_id="debian",
         os_version="12",
-        packages=(AuthorityPackageScanPackage("apt", "2.6.1", "2.6.2"),),
+        packages=(AuthorityPackageScanPackage("apt", "amd64", "2.6.1", "2.6.2"),),
         reboot_required=True,
     )
     return run, completed

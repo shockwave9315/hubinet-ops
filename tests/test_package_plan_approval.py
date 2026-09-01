@@ -133,7 +133,7 @@ def test_changed_plan_is_stale_but_same_plan_with_same_context_stays_approved(
     changed = _successful_plan(
         authority,
         resource.resource_id,
-        (PackageScanPackage("apt", "2.6.1", "2.6.3"),),
+        (PackageScanPackage("apt", "amd64", "2.6.1", "2.6.3"),),
     )
     changed_view = _approval_view(store, authority, resource.resource_id)
     assert changed.plan_fingerprint != reviewed.plan_fingerprint
@@ -329,7 +329,7 @@ def test_newer_scan_race_and_approval_transaction_failure_are_fail_closed(
     plan_b = _successful_plan(
         authority,
         resource.resource_id,
-        (PackageScanPackage("apt", "2.6.1", "2.6.9"),),
+        (PackageScanPackage("apt", "amd64", "2.6.1", "2.6.9"),),
     )
     assert viewed_a.plan_fingerprint != plan_b.plan_fingerprint
     with pytest.raises(AuthorityConflict, match="latest attempt"):
@@ -442,7 +442,7 @@ def test_approval_response_reflects_its_own_transaction_not_a_later_replacement(
     reviewed = _successful_plan(
         authority,
         resource.resource_id,
-        (PackageScanPackage("apt", "2.6.1", "2.6.9"),),
+        (PackageScanPackage("apt", "amd64", "2.6.1", "2.6.9"),),
     )
     assert reviewed.plan_fingerprint != superseded.plan_fingerprint
 

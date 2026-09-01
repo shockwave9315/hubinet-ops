@@ -19,9 +19,23 @@ from app.inventory import (
 
 _INST_RE = re.compile(
     r"^Inst (?P<name>\S+) \[(?P<installed>[^\]\s]+)\] "
-    r"\((?P<candidate>\S+)(?: (?P<origin>.*?))?\)"
+    r"\((?P<candidate>\S+) (?P<relstr>[^)]*)\)"
     r"(?: \[[^\[\]\r\n]*\])*$"
 )
+#: ``apt-get -s upgrade``'s candidate description is always
+#: ``"<label list> [<architecture>]"`` or, when there is no label list,
+#: ``" [<architecture>]"`` -- ``pkgCache::VerIterator::RelStr()``
+#: unconditionally appends `` [<Arch()>]`` after any release-label text (see
+#: ARCHITECTURE.md, "Binary package identity", and the PR body's cited
+#: research). The architecture bracket is therefore always the last bracket
+#: group in the candidate description, never absent, and never optional
+#: metadata; a non-greedy origin group anchored by ``fullmatch`` finds it
+#: even if release-label text itself happened to contain other brackets.
+_RELSTR_RE = re.compile(r"(?:(?P<origin>.*?) )?\[(?P<architecture>[^\[\]]*)\]")
+#: A dpkg/APT architecture string as ``VerIterator::Arch()`` ever actually
+#: produces: ``all`` for an ``Architecture: all`` version, otherwise a real
+#: dpkg architecture triplet such as ``amd64``/``i386``/``arm64``.
+_ARCHITECTURE_RE = re.compile(r"[a-z][a-z0-9]*(-[a-z0-9]+)*")
 _SUMMARY_RE = re.compile(
     r"^(?P<upgraded>\d+) upgraded, (?P<new>\d+) newly installed, "
     r"(?P<removed>\d+) to remove and (?P<held>\d+) not upgraded\.$"
@@ -103,7 +117,7 @@ def parse_apt_simulation(text: str) -> tuple[PackageScanPackage, ...]:
     if not isinstance(text, str) or len(text.encode("utf-8")) > 8 * 1024 * 1024:
         raise PackageScanParseError("APT simulation output is missing or oversized")
     packages: list[PackageScanPackage] = []
-    names: set[str] = set()
+    identities: set[tuple[str, str]] = set()
     summary: tuple[int, int, int] | None = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -115,16 +129,49 @@ def parse_apt_simulation(text: str) -> tuple[PackageScanPackage, ...]:
             match = _INST_RE.fullmatch(line)
             if match is None:
                 raise PackageScanParseError("APT simulation contains an unparseable change")
-            name = match.group("name")
-            if name in names:
-                raise PackageScanParseError("APT simulation contains a duplicate package")
-            names.add(name)
-            origin = (match.group("origin") or "").strip() or None
+            raw_name = match.group("name")
+            # A colon in the "Inst" name position is exclusively dpkg/APT's
+            # architecture-qualifier separator (Debian Policy 5.6.7 forbids
+            # ':' in an actual package name), and APT only ever prints it for
+            # a foreign-architecture package (never for the native
+            # architecture or "all") -- see ARCHITECTURE.md, "Binary package
+            # identity". When present it must agree with the architecture
+            # this line's candidate description carries; it is never trusted
+            # alone, because it is silently absent for the common native case.
+            if ":" in raw_name:
+                name, _, name_architecture = raw_name.partition(":")
+            else:
+                name, name_architecture = raw_name, None
+
+            relstr_match = _RELSTR_RE.fullmatch(match.group("relstr"))
+            if relstr_match is None:
+                raise PackageScanParseError(
+                    "APT simulation candidate description has no architecture"
+                )
+            architecture = relstr_match.group("architecture")
+            if not _ARCHITECTURE_RE.fullmatch(architecture or ""):
+                raise PackageScanParseError(
+                    "APT simulation candidate architecture is malformed"
+                )
+            if name_architecture is not None and name_architecture != architecture:
+                raise PackageScanParseError(
+                    "APT simulation package name architecture contradicts "
+                    "its candidate architecture"
+                )
+
+            identity = (name, architecture)
+            if identity in identities:
+                raise PackageScanParseError(
+                    "APT simulation contains a duplicate (package, architecture)"
+                )
+            identities.add(identity)
+            origin = (relstr_match.group("origin") or "").strip() or None
             if origin is not None and len(origin) > 500:
                 origin = None
             packages.append(
                 PackageScanPackage(
                     package_name=name,
+                    architecture=architecture,
                     installed_version=match.group("installed"),
                     candidate_version=match.group("candidate"),
                     origin=origin,
@@ -157,7 +204,9 @@ def parse_apt_simulation(text: str) -> tuple[PackageScanPackage, ...]:
         raise PackageScanParseError(
             "APT simulation summary does not match parsed package changes"
         )
-    return tuple(sorted(packages, key=lambda package: package.package_name))
+    return tuple(
+        sorted(packages, key=lambda package: (package.package_name, package.architecture))
+    )
 
 
 def classify_command_failure(

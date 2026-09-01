@@ -490,3 +490,105 @@ def test_r0_bearer_token_never_appears_in_server_logs(tmp_path: Path, caplog) ->
     assert "wrong-token-value" not in rendered
     assert config.api_bearer_token not in rendered
     assert config.pve_api_token not in rendered
+
+
+# ---------------------------------------------------------------------------
+# NEXT-C: the execution-time APT plan equality gate stays dark.
+# ---------------------------------------------------------------------------
+
+
+def test_execution_plan_gate_is_not_production_reachable() -> None:
+    """The execution-time plan equality gate exists internally and stays dark.
+
+    Nothing on the production HTTP, Home Assistant, scheduler, bootstrap, or
+    updater paths may construct or call the execution-gate orchestrator, its
+    host control, or the authority's execution-plan comparison transition.
+    """
+
+    execution_symbols = (
+        "package_update_execution",
+        "PackageUpdateExecutionHostControl",
+        "SshPackageUpdateExecutionHostControl",
+        "run_package_update_execution_gate",
+        "evaluate_package_update_execution_plan",
+        "simulate_exact_update_plan",
+        "hubinet-package-update-helper",
+    )
+    for rel_path in (
+        "app/inventory_runtime.py",
+        "app/inventory_scheduler.py",
+        "app/package_scan_scheduler.py",
+        "app/package_scan.py",
+        "app/package_scan_host_control.py",
+        "app/package_update_snapshot.py",
+        "app/package_update_snapshot_host_control.py",
+        "app/inventory_runtime_config.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/transport_http.py",
+        "custom_components/hubinet_ops/coordinator.py",
+        "deploy/bootstrap-proxmox-0.5.sh",
+        "deploy/update-proxmox-0.5.sh",
+        "deploy/install-0.5.0-fresh.sh",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for symbol in execution_symbols:
+            assert symbol not in text, (rel_path, symbol)
+
+
+def test_bootstrap_and_updater_deploy_no_execution_helper_or_key() -> None:
+    """No update-execution helper, forced-command line, or key ships.
+
+    ``hubinet-package-update`` (not the bare, ambiguous ``update-helper`` --
+    that substring legitimately appears in the *existing* scan-helper
+    in-place update machinery, e.g. ``UPDATE_HELPER_STAGED_HOST_PATH``) is
+    this new dark helper's exact, unambiguous name prefix.
+    """
+
+    for rel_path in ("deploy", "deploy/lib"):
+        directory = REPO_ROOT / rel_path
+        for path in sorted(directory.glob("*.sh")):
+            text = path.read_text(encoding="utf-8")
+            assert "hubinet-package-update" not in text, path
+
+
+def test_the_execution_helper_is_a_separate_file_from_the_scan_and_snapshot_helpers() -> None:
+    scan = REPO_ROOT / "deploy/hubinet-package-scan-helper.py"
+    snapshot = REPO_ROOT / "deploy/hubinet-package-snapshot-helper.py"
+    execution = REPO_ROOT / "deploy/hubinet-package-update-helper.py"
+    assert scan.exists() and snapshot.exists() and execution.exists()
+    for other, text in (
+        (scan, scan.read_text(encoding="utf-8")),
+        (snapshot, snapshot.read_text(encoding="utf-8")),
+    ):
+        assert "simulate_exact_update_plan" not in text, other
+
+
+def test_the_execution_helper_exposes_exactly_one_non_mutating_operation() -> None:
+    text = (REPO_ROOT / "deploy/hubinet-package-update-helper.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'payload["operation"] != "simulate_exact_update_plan"' in text
+    for forbidden in (
+        "execute_packages",
+        "install_packages",
+        "pct snapshot",
+        "pct rollback",
+        "snapshot",
+        '"apt-get", "install"',
+        '"apt-get", "upgrade"',
+        '"apt-get", "dist-upgrade"',
+        "apt-get install",
+        "apt-get upgrade",
+        "apt-get dist-upgrade",
+        "apt-get remove",
+        "apt-get autoremove",
+        "apt full-upgrade",
+        "dpkg -i",
+        "dpkg --configure",
+        "VM.Snapshot",
+    ):
+        assert forbidden not in text, forbidden
+    # The only two allowed APT invocations: a metadata refresh and a
+    # simulated (never real) upgrade.
+    assert '"apt-get", "update", "-qq"' in text
+    assert '"apt-get", "-s", "upgrade"' in text
