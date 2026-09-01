@@ -522,6 +522,10 @@ def test_execution_plan_gate_is_not_production_reachable() -> None:
         "app/package_scan_host_control.py",
         "app/package_update_snapshot.py",
         "app/package_update_snapshot_host_control.py",
+        # The mutation stage re-proves exact plan equality through the
+        # authority, never by reaching into the gate's own dark boundary.
+        "app/package_update_mutation.py",
+        "app/package_update_mutation_host_control.py",
         "app/inventory_runtime_config.py",
         "custom_components/hubinet_ops/services.py",
         "custom_components/hubinet_ops/transport_http.py",
@@ -592,3 +596,138 @@ def test_the_execution_helper_exposes_exactly_one_non_mutating_operation() -> No
     # simulated (never real) upgrade.
     assert '"apt-get", "update", "-qq"' in text
     assert '"apt-get", "-s", "upgrade"' in text
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe real package mutation stays dark.
+# ---------------------------------------------------------------------------
+
+
+def test_package_mutation_is_not_production_reachable() -> None:
+    """The only real package command in the product stays unreachable.
+
+    Nothing on the production HTTP, Home Assistant, scheduler, bootstrap, or
+    updater paths -- nor any other dark stage -- may construct or call the
+    mutation orchestrator, its host control, or the authority's mutation
+    transitions.
+    """
+
+    mutation_symbols = (
+        "package_update_mutation",
+        "PackageUpdateMutationHostControl",
+        "SshPackageUpdateMutationHostControl",
+        "PackageUpdateMutationOrchestrator",
+        "execute_job_owned_mutation",
+        "arm_package_update_mutation",
+        "execute_package_mutation_submission_if_current",
+        "resolve_pre_mutation_block",
+        "complete_package_update_mutation",
+        "execute_exact_package_mutation",
+        "hubinet-package-mutation-helper",
+    )
+    for rel_path in (
+        "app/inventory_runtime.py",
+        "app/inventory_scheduler.py",
+        "app/package_scan_scheduler.py",
+        "app/package_scan.py",
+        "app/package_scan_host_control.py",
+        "app/package_update_snapshot.py",
+        "app/package_update_snapshot_host_control.py",
+        "app/package_update_execution.py",
+        "app/package_update_execution_host_control.py",
+        "app/inventory_runtime_config.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/transport_http.py",
+        "custom_components/hubinet_ops/coordinator.py",
+        "deploy/bootstrap-proxmox-0.5.sh",
+        "deploy/update-proxmox-0.5.sh",
+        "deploy/install-0.5.0-fresh.sh",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for symbol in mutation_symbols:
+            assert symbol not in text, (rel_path, symbol)
+
+
+def test_bootstrap_and_updater_deploy_no_mutation_helper_or_key() -> None:
+    """No package-mutation helper, forced-command line, or key ships."""
+
+    for rel_path in ("deploy", "deploy/lib"):
+        directory = REPO_ROOT / rel_path
+        for path in sorted(directory.glob("*.sh")):
+            text = path.read_text(encoding="utf-8")
+            assert "hubinet-package-mutation" not in text, path
+            assert "package-mutation-operations" not in text, path
+
+
+def test_the_mutation_helper_is_the_only_file_that_can_change_a_package() -> None:
+    """Every other helper keeps its own, weaker, non-mutating promise."""
+
+    mutation = REPO_ROOT / "deploy/hubinet-package-mutation-helper.py"
+    assert mutation.exists()
+    for other in (
+        "deploy/hubinet-package-scan-helper.py",
+        "deploy/hubinet-package-snapshot-helper.py",
+        "deploy/hubinet-package-update-helper.py",
+    ):
+        text = (REPO_ROOT / other).read_text(encoding="utf-8")
+        for forbidden in (
+            "execute_exact_package_mutation",
+            "prepare_exact_package_mutation",
+            '"apt-get", "install"',
+            '"apt-get", "dist-upgrade"',
+            "apt-get install",
+            "apt-get dist-upgrade",
+            "apt-get remove",
+            "apt-get autoremove",
+            "dpkg -i",
+            "dpkg --configure",
+        ):
+            assert forbidden not in text, (other, forbidden)
+
+
+def test_the_mutation_helper_runs_exactly_one_fixed_bounded_package_command() -> None:
+    text = (REPO_ROOT / "deploy/hubinet-package-mutation-helper.py").read_text(
+        encoding="utf-8"
+    )
+    # Exactly four typed operations, no generic dispatcher, no shell.
+    for operation in (
+        "prepare_exact_package_mutation",
+        "execute_exact_package_mutation",
+        "seal_mutation_never_submitted",
+        "inspect_package_mutation_state",
+    ):
+        assert f'"{operation}"' in text, operation
+    for forbidden in (
+        "shell=True",
+        "os.system",
+        "sh -c",
+        "pct snapshot",
+        "pct rollback",
+        "pct destroy",
+        "VM.Snapshot",
+        "apt-get install",
+        "apt-get dist-upgrade",
+        "apt-get remove",
+        "apt-get purge",
+        "apt-get autoremove",
+        "full-upgrade",
+        "dpkg -i",
+        "--force-yes",
+    ):
+        assert forbidden not in text, forbidden
+
+    # The one real package command is a fixed module-level tuple built from
+    # literals only, never from request data.
+    module = ast.parse(text, filename="hubinet-package-mutation-helper.py")
+    argv = None
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "MUTATION_ARGV"
+        ):
+            argv = ast.literal_eval(node.value)
+    assert isinstance(argv, tuple) and argv, "MUTATION_ARGV must be a literal tuple"
+    assert all(isinstance(item, str) for item in argv)
+    assert argv[-1] == "upgrade"
+    assert "Dpkg::Options::=--force-confold" in argv
