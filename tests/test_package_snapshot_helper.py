@@ -856,3 +856,211 @@ def test_only_the_intent_phase_can_ever_reach_a_submission() -> None:
     assert guard < submission
     for phase in ("terminal", "task_known", "submitted"):
         assert body.index(f'phase == "{phase}"') < submission
+
+
+# ---------------------------------------------------------------------------
+# Submission proof: "not submitted" comes from the durable journal phase,
+# never from an error name, an absence, a lock, or a transport failure.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "classification"),
+    [
+        ({"present": False}, "guest_unavailable"),
+        ({"resource_type": "qemu"}, "unsupported_resource_type"),
+        ({"node": "pve-b"}, "stale_target"),
+        ({"status": "migrating"}, "guest_unavailable"),
+    ],
+)
+def test_pre_submission_failures_are_reported_as_provably_not_submitted(
+    tmp_path: Path, kwargs, classification
+) -> None:
+    """Every failure raised while the journal is still at `intent`.
+
+    The submission subprocess is launched strictly after the fsynced
+    `intent -> submitted` rename, so none of these can have submitted
+    anything, whatever their classification happens to be called.
+    """
+
+    journal = _journal(tmp_path)
+    pve = FakePve(**kwargs)
+    operation_id, _ = _identity(_ownership())
+
+    response = _handle(_request(), pve, journal)
+
+    assert response["ok"] is False
+    assert response["error"]["classification"] == classification
+    assert response["error"]["submission"] == helper.SUBMISSION_NOT_SUBMITTED
+    assert pve.submissions == 0
+    assert journal.read(operation_id)["phase"] == "intent"
+
+
+def test_a_failed_pre_submission_pve_read_is_still_not_submitted(
+    tmp_path: Path,
+) -> None:
+    """Classification is irrelevant; the journal phase is what proves it."""
+
+    class BrokenReads(FakePve):
+        def _dispatch(self, argv):
+            if argv[2].endswith("/config"):
+                return 1, b"", b"permission denied"
+            return super()._dispatch(argv)
+
+    pve = BrokenReads()
+    response = _handle(_request(), pve, _journal(tmp_path))
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "execution_failed"
+    assert response["error"]["submission"] == helper.SUBMISSION_NOT_SUBMITTED
+    assert pve.submissions == 0
+
+
+def test_a_lock_or_ambiguous_state_before_submission_stays_uncertain(
+    tmp_path: Path,
+) -> None:
+    """Not submitted by us is not the same as nothing happening.
+
+    A guest locked by an in-flight PVE operation, or canonical state that is
+    not a clean absence, must not be reported as a clean non-submission.
+    """
+
+    ownership = _ownership()
+    _, snapshot_name = _identity(ownership)
+
+    locked = _handle(_request(), FakePve(lock="snapshot"), _journal(tmp_path / "a"))
+    assert locked["ok"] is True and locked["outcome"] == "uncertain"
+
+    ambiguous = _handle(
+        _request(),
+        FakePve(
+            snapshots=[
+                _completed_snapshot(_ownership(job_id=str(uuid.uuid4())), snapshot_name)
+            ]
+        ),
+        _journal(tmp_path / "b"),
+    )
+    assert ambiguous["ok"] is True and ambiguous["outcome"] == "uncertain"
+
+
+@pytest.mark.parametrize("phase", ["submitted", "task_known"])
+def test_failures_at_or_after_the_submission_boundary_are_never_not_submitted(
+    tmp_path: Path, phase: str
+) -> None:
+    journal = _journal(tmp_path)
+    operation_id, snapshot_name = _identity(_ownership())
+    record = {
+        "journal_version": 1,
+        "snapshot_operation_id": operation_id,
+        "request_fingerprint": helper.request_fingerprint(
+            helper.validate_request(_request())
+        ),
+        "vmid": VMID,
+        "expected_node": NODE,
+        "snapshot_name": snapshot_name,
+        "phase": phase,
+    }
+    if phase == "task_known":
+        record["task_upid"] = UPID
+
+    class BrokenReads(FakePve):
+        def _dispatch(self, argv):
+            if argv[1] == "get":
+                return 1, b"", b"pve read failed"
+            return super()._dispatch(argv)
+
+    journal.write(record)
+    pve = BrokenReads()
+    response = _handle(_request(), pve, journal)
+
+    assert response["ok"] is False
+    assert response["error"].get("submission") == helper.SUBMISSION_UNKNOWN
+    assert pve.submissions == 0
+
+
+def test_an_unreadable_journal_is_never_reported_as_not_submitted(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    journal.ensure_directory()
+    operation_id, _ = _identity(_ownership())
+    (journal.directory / f"op-{operation_id}.json").write_text("{not json")
+    pve = FakePve()
+
+    response = _handle(_request(), pve, journal)
+
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "journal_corrupt"
+    assert response["error"]["submission"] == helper.SUBMISSION_UNKNOWN
+    assert pve.submissions == 0
+
+
+def test_a_lease_held_by_another_invocation_is_never_not_submitted(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    journal.ensure_directory()
+    with helper.VmidMutationLock(VMID, journal.directory):
+        pve = FakePve()
+        response = _handle(_request(), pve, journal)
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "operation_in_progress"
+    assert response["error"]["submission"] == helper.SUBMISSION_UNKNOWN
+    assert pve.submissions == 0
+
+
+def test_an_operation_request_mismatch_is_never_not_submitted(
+    tmp_path: Path,
+) -> None:
+    journal = _journal(tmp_path)
+    operation_id, snapshot_name = _identity(_ownership())
+    journal.write(
+        {
+            "journal_version": 1,
+            "snapshot_operation_id": operation_id,
+            "request_fingerprint": "0" * 64,
+            "vmid": VMID,
+            "expected_node": NODE,
+            "snapshot_name": snapshot_name,
+            "phase": "intent",
+        }
+    )
+    pve = FakePve()
+    response = _handle(_request(), pve, journal)
+    assert response["error"]["classification"] == "operation_request_mismatch"
+    assert response["error"]["submission"] == helper.SUBMISSION_UNKNOWN
+    assert pve.submissions == 0
+
+
+def test_the_submission_proof_defaults_to_unknown() -> None:
+    """Fail-closed by construction: the default is never the releasing value."""
+
+    import inspect as _inspect
+
+    default = _inspect.signature(helper.SnapshotError).parameters["submission"].default
+    assert default == helper.SUBMISSION_UNKNOWN
+    assert helper.SnapshotError("x", "y").submission == helper.SUBMISSION_UNKNOWN
+
+
+def test_not_submitted_is_emitted_from_exactly_one_pre_submission_site() -> None:
+    """Structural guard on the only value that may release a fenced job.
+
+    It must be produced in exactly one place, and that place must lie before
+    the journal's `intent -> submitted` transition -- otherwise a failure
+    after submission could inherit it.
+    """
+
+    source = HELPER_PATH.read_text(encoding="utf-8")
+    body = source[source.index("def _create_pre_update_snapshot"):]
+    body = body[: body.index("def _extract_upid")]
+
+    # One emission, in the create flow only.
+    assert source.count("submission=SUBMISSION_NOT_SUBMITTED") == 1
+    assert body.count("submission=SUBMISSION_NOT_SUBMITTED") == 1
+
+    emission = body.index("submission=SUBMISSION_NOT_SUBMITTED")
+    boundary = body.index('"phase": "submitted"')
+    submission = body.index('"pvesh", "create"')
+    assert emission < boundary < submission
+
+    # And the default is the fail-closed value, so nothing inherits it.
+    assert 'submission: str = SUBMISSION_UNKNOWN' in source

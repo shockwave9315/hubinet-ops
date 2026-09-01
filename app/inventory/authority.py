@@ -1710,6 +1710,78 @@ class InventoryAuthority:
             )
         return self._store.package_update_job(canonical_job_id)
 
+    def block_package_update_before_snapshot_submission(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Terminalize a job whose snapshot operation was never submitted.
+
+        This is the ONLY way a job past ``snapshot_may_have_started`` may be
+        terminalized without canonical PVE evidence, and it exists because the
+        write-ahead checkpoint is deliberately committed before the host is
+        ever called: an ordinary pre-flight refusal on the host (a guest that
+        moved node, say) would otherwise fence the single global destructive
+        slot forever, with no PVE mutation having been attempted at all.
+
+        The caller must be relaying the host's own durable proof that this
+        exact operation never crossed its submission boundary. Authority
+        cannot re-derive a host fact, exactly as it cannot re-derive the
+        canonical listing that
+        :meth:`confirm_package_update_snapshot` is handed; what it does
+        enforce is that the job's own durable record is consistent with never
+        having been submitted -- no observed PVE task, and no confirmed
+        snapshot. A job that ever recorded a task identity provably *was*
+        submitted and can never be released down this path.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            if job["snapshot_task_upid"] is not None:
+                raise AuthorityConflict(
+                    "package update job observed a PVE snapshot task, so its "
+                    "operation was submitted and cannot be released as unsubmitted"
+                )
+            if job["snapshot_confirmed_at"] is not None:
+                raise AuthorityInvariantError(
+                    "package update job snapshot confirmation is inconsistent"
+                )
+            updated = connection.execute(
+                "UPDATE package_update_jobs SET status='blocked', "
+                "terminalized_at=?, terminal_reason=? "
+                "WHERE job_id=? AND status='active' "
+                "AND checkpoint='snapshot_may_have_started' "
+                "AND snapshot_task_upid IS NULL AND snapshot_confirmed_at IS NULL",
+                (recorded_at, canonical_reason, canonical_job_id),
+            )
+            if updated.rowcount != 1:
+                raise AuthorityConflict(
+                    "package update job pre-submission block lost durable ownership"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.WARNING,
+                stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+                event_type=(
+                    PackageUpdateEventType.SNAPSHOT_BLOCKED_BEFORE_SUBMISSION
+                ),
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
     def select_package_update_rollback_target(
         self, job_id: str, observed: Sequence[ObservedSnapshot]
     ) -> PackageUpdateRollbackTarget:

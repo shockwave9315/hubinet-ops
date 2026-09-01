@@ -28,6 +28,14 @@ crash anywhere after it leaves a durable "a snapshot operation may already
 have been submitted" fact. That state is never treated as "definitely no
 mutation happened", never replayed, and never silently released.
 
+The one exception is not an inference but a proof: the host's durable
+operation journal can show that a failure happened while the operation was
+still at `intent`, which means the submission subprocess was never launched
+for it. Only that proof releases the job (terminalized `blocked`), so an
+ordinary pre-flight refusal on the host does not fence the single global
+destructive slot forever. Everything else -- a canonical absence, a lock, a
+timeout, a lost SSH answer, an unreadable journal -- stays uncertain.
+
 ## Verified PVE task semantics
 
 Established from current Proxmox VE sources, not from Hubinet 0.4 behaviour:
@@ -44,8 +52,12 @@ Established from current Proxmox VE sources, not from Hubinet 0.4 behaviour:
   `current` pseudo-entry, and carries `snapstate` for snapshots whose
   operation has not finished, even though its declared schema omits it.
 
-A terminal successful task is therefore necessary but never sufficient: the
-canonical listing is re-read afterwards in every case.
+Strict fresh canonical evidence is therefore mandatory in every case, and a
+terminal successful task is never sufficient on its own. It is not
+universally necessary either: when a task was observed it must have reached a
+terminal non-error state, but the submitted-without-recorded-UPID recovery
+path establishes completion from the host's durable operation-journal state
+plus that same canonical evidence, without fabricating a task identity.
 """
 
 from __future__ import annotations
@@ -81,12 +93,18 @@ MAX_SNAPSHOT_DESCRIPTION_BYTES = 8192
 class SnapshotOperationOutcome(StrEnum):
     """How a dark host snapshot operation ended, from the caller's side."""
 
-    #: A terminal successful PVE task plus a canonical listing were obtained.
+    #: Strict canonical evidence of this job's snapshot was obtained.
     COMPLETED = "completed"
     #: The PVE task terminated in a failure state.
     FAILED = "failed"
     #: The outcome could not be established. Never a licence to resubmit.
     UNCERTAIN = "uncertain"
+    #: The host PROVED, from its durable operation journal, that no snapshot
+    #: mutation was ever submitted for this operation identity. This is the
+    #: only outcome that may release a job which is already past its
+    #: write-ahead uncertainty checkpoint, and it is never inferred from a
+    #: canonical absence, an error name, a timeout, or a transport failure.
+    NOT_SUBMITTED = "not_submitted"
 
 
 class SnapshotTaskState(StrEnum):
@@ -405,6 +423,29 @@ class PackageUpdateSnapshotOrchestrator:
                 return self._uncertain(
                     job_id, "observed PVE snapshot task conflicts with the durable one"
                 )
+
+        if result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED:
+            # The host proved nothing was submitted for this operation, so the
+            # job can be released rather than fencing the global destructive
+            # slot forever. If the durable job record contradicts that proof
+            # (a task was observed, so it *was* submitted), authority refuses
+            # and the job stays fenced.
+            reason = result.reason or "snapshot operation was blocked before submission"
+            try:
+                job = self._authority.block_package_update_before_snapshot_submission(
+                    job_id, reason[:500]
+                )
+            except Exception:  # noqa: BLE001 - a contradicted proof stays fenced
+                return self._uncertain(
+                    job_id,
+                    "host reported no submission but durable job state "
+                    "contradicts it",
+                )
+            return SnapshotStageResult(
+                outcome=SnapshotOperationOutcome.NOT_SUBMITTED,
+                job=job,
+                reason=reason,
+            )
 
         if result.outcome is SnapshotOperationOutcome.UNCERTAIN:
             return self._uncertain(

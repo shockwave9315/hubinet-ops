@@ -1658,3 +1658,268 @@ def test_a_crash_leaving_no_snapshot_stays_uncertain_and_fenced(
     assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
     assert fenced.snapshot_confirmed_at is None
     assert authority.recover_interrupted_package_update_jobs() == ()
+
+
+# ===========================================================================
+# The P2 witness: a pre-flight refusal must not fence the global slot forever
+# ===========================================================================
+
+
+class _ResourceRef:
+    """Minimal stand-in for the `_issue` helper's resource argument."""
+
+    def __init__(self, resource_id: str) -> None:
+        self.resource_id = resource_id
+
+
+def test_a_guest_that_moved_node_blocks_the_job_without_submitting_anything(
+    tmp_path: Path,
+) -> None:
+    """The original witness, end to end through the real dark boundary.
+
+    The job is already past its write-ahead uncertainty checkpoint when the
+    host refuses on live target revalidation. Because the host's durable
+    journal proves the submission subprocess was never launched, the job is
+    terminalized instead of holding the one global destructive slot forever.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
+        tmp_path
+    )
+    # The guest is no longer on the node this job froze at issuance.
+    pve.node = "pve-moved"
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _dark_channel(pve, journal)
+    )
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    # 1. Nothing was ever submitted.
+    assert pve.submissions == 0
+    assert not any(argv[1] == "create" for argv in pve.argvs)
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    assert (
+        snapshot_helper.OperationJournal(journal.directory)
+        .read(identity.snapshot_operation_id)["phase"]
+        == "intent"
+    )
+
+    # 2. The typed outcome is the proof, not unresolvable uncertainty.
+    assert result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED
+
+    # 3. The job is terminal and its evidence stays honest.
+    blocked = store.package_update_job(job.job_id)
+    assert blocked.status is PackageUpdateJobStatus.BLOCKED
+    assert blocked.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert blocked.snapshot_name == identity.snapshot_name
+    assert blocked.snapshot_operation_id == identity.snapshot_operation_id
+    assert blocked.snapshot_task_upid is None
+    assert blocked.snapshot_confirmed_at is None
+    assert blocked.terminal_reason
+    events = store.list_package_update_job_events(job.job_id)
+    assert (
+        events[-1].event_type
+        is PackageUpdateEventType.SNAPSHOT_BLOCKED_BEFORE_SUBMISSION
+    )
+
+    # 4. Startup recovery leaves the terminal job exactly as it is.
+    before = store.list_package_update_job_events(job.job_id)
+    assert authority.recover_interrupted_package_update_jobs() == ()
+    assert store.package_update_job(job.job_id) == blocked
+    assert store.list_package_update_job_events(job.job_id) == before
+
+    # 5. The global destructive slot is free again.
+    approval = store.package_plan_approval(blocked.resource_id)
+    successor = _issue(authority, _ResourceRef(blocked.resource_id), approval)
+    assert successor.status is PackageUpdateJobStatus.ACTIVE
+    assert successor.job_id != job.job_id
+
+
+def test_a_job_that_observed_a_task_can_never_be_released_as_unsubmitted(
+    tmp_path: Path,
+) -> None:
+    """The durable job record outranks a host claim of non-submission.
+
+    A recorded task identity proves the operation WAS submitted, so authority
+    refuses the release outright and the orchestrator keeps the job fenced.
+    """
+
+    _, store, authority, _, job, identity, _ = _prepared(tmp_path)
+    authority.record_package_update_snapshot_task(job.job_id, UPID)
+
+    with pytest.raises(AuthorityConflict, match="cannot be released as unsubmitted"):
+        authority.block_package_update_before_snapshot_submission(
+            job.job_id, "host claims nothing was submitted"
+        )
+
+    host = FakeHostControl(
+        HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.NOT_SUBMITTED,
+            snapshot_operation_id=identity.snapshot_operation_id,
+            reason="host proved no snapshot mutation was submitted",
+        )
+    )
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, host
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.snapshot_task_upid == UPID
+
+
+def test_the_pre_submission_release_cannot_reach_other_checkpoints(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+
+    # Before the write-ahead intent there is nothing to release this way.
+    with pytest.raises(AuthorityConflict, match="not inside a snapshot operation"):
+        authority.block_package_update_before_snapshot_submission(
+            job.job_id, "too early"
+        )
+    authority.record_package_update_preflight_passed(job.job_id)
+    with pytest.raises(AuthorityConflict, match="not inside a snapshot operation"):
+        authority.block_package_update_before_snapshot_submission(
+            job.job_id, "still too early"
+        )
+
+    # And once terminal it cannot be reused.
+    authority.record_package_update_snapshot_intent(job.job_id)
+    authority.block_package_update_before_snapshot_submission(job.job_id, "blocked")
+    assert store.package_update_job(job.job_id).status is (
+        PackageUpdateJobStatus.BLOCKED
+    )
+    with pytest.raises(AuthorityConflict, match="terminal"):
+        authority.block_package_update_before_snapshot_submission(
+            job.job_id, "again"
+        )
+
+
+def test_a_confirmed_snapshot_can_never_be_released_as_unsubmitted(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, _, job, identity, ownership = _prepared(tmp_path)
+    authority.confirm_package_update_snapshot(
+        job.job_id, _canonical(ownership, identity)
+    )
+    with pytest.raises(AuthorityConflict, match="not inside a snapshot operation"):
+        authority.block_package_update_before_snapshot_submission(
+            job.job_id, "host claims nothing was submitted"
+        )
+
+
+def test_uncertain_host_outcomes_never_release_the_global_slot(
+    tmp_path: Path,
+) -> None:
+    """Positive control for the fencing this correction must not weaken."""
+
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    other_resource, _, other_approval = _add_approved_resource(store, authority)
+    job = _issue(authority, resource, approval)
+    identity = authority.package_update_snapshot_identity(job.job_id)
+
+    host = FakeHostControl(
+        HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.UNCERTAIN,
+            snapshot_operation_id=identity.snapshot_operation_id,
+            task_upid=UPID,
+            reason="task still running at the polling bound",
+        )
+    )
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, host
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert store.package_update_job(job.job_id).status is (
+        PackageUpdateJobStatus.ACTIVE
+    )
+    with pytest.raises(AuthorityConflict, match="global slot"):
+        _issue(authority, other_resource, other_approval)
+
+
+def test_a_lost_ssh_answer_never_releases_the_global_slot(tmp_path: Path) -> None:
+    """A transport failure says nothing about whether PVE ran the mutation."""
+
+    from app.package_scan_host_control import BoundedProcessResult
+    from app.package_update_snapshot_host_control import (
+        SshPackageUpdateSnapshotHostControl,
+    )
+
+    store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
+        tmp_path
+    )
+
+    def lost(argv, input_bytes, timeout, max_output):
+        return BoundedProcessResult(255, b"", b"", timed_out=True)
+
+    channel = SshPackageUpdateSnapshotHostControl(
+        host="pve.example.internal",
+        port=22,
+        user="hubinet-snapshot",
+        private_key_path=Path("/etc/hubinet-ops/snapshot-key"),
+        known_hosts_path=Path("/etc/hubinet-ops/known_hosts"),
+        timeout_seconds=60,
+        max_result_bytes=1024 * 1024,
+        runner=lost,
+    )
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, channel
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert authority.recover_interrupted_package_update_jobs() == ()
+
+
+def test_an_unknown_or_absent_submission_token_stays_uncertain() -> None:
+    """An older helper that reports no proof can never release a job."""
+
+    from app.package_update_snapshot_host_control import (
+        SshPackageUpdateSnapshotHostControl,
+    )
+
+    channel = SshPackageUpdateSnapshotHostControl(
+        host="pve.example.internal",
+        port=22,
+        user="hubinet-snapshot",
+        private_key_path=Path("/etc/hubinet-ops/snapshot-key"),
+        known_hosts_path=Path("/etc/hubinet-ops/known_hosts"),
+        timeout_seconds=60,
+        max_result_bytes=1024 * 1024,
+    )
+    operation_id = str(uuid.uuid4())
+    for error in (
+        {"classification": "stale_target"},
+        {"classification": "stale_target", "submission": "maybe"},
+        {"classification": "stale_target", "submission": None},
+        {"classification": "stale_target", "submission": "NOT_SUBMITTED"},
+        {"classification": "stale_target", "submission": ["not_submitted"]},
+    ):
+        parsed = channel._parse_payload(
+            {
+                "response_version": 1,
+                "ok": False,
+                "snapshot_operation_id": operation_id,
+                "error": error,
+            },
+            operation_id,
+        )
+        assert parsed.outcome is SnapshotOperationOutcome.UNCERTAIN, error
+
+    proved = channel._parse_payload(
+        {
+            "response_version": 1,
+            "ok": False,
+            "snapshot_operation_id": operation_id,
+            "error": {"classification": "stale_target", "submission": "not_submitted"},
+        },
+        operation_id,
+    )
+    assert proved.outcome is SnapshotOperationOutcome.NOT_SUBMITTED

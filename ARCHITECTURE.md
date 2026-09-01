@@ -100,13 +100,34 @@ issued -> preflight_passed -> snapshot_may_have_started
 
 **The uncertainty boundary.** `snapshot_may_have_started` is a write-ahead
 checkpoint committed durably *before* any snapshot mutation request can be
-sent. Once a job reaches it, nothing may conclude that no PVE mutation
+sent. Once a job reaches it, nothing may *infer* that no PVE mutation
 happened. Startup recovery therefore interrupts `issued`, `preflight_passed`,
 and `snapshot_confirmed` jobs — all provably before package mutation, with a
 confirmed snapshot simply retained — but leaves a
 `snapshot_may_have_started` job active, still owning the global destructive
 slot, with its evidence fenced. It never replays a snapshot operation and
 never guesses an outcome.
+
+**Proved non-submission is not an inference.** Because that checkpoint is
+committed before the host is ever called, an ordinary pre-flight refusal on
+the host — a guest that moved off the job's frozen node, a guest that is
+gone, a failed PVE read — would otherwise fence the single global
+destructive slot forever, with no PVE mutation having been attempted at all.
+The host therefore answers every failure with a typed submission proof drawn
+from its durable operation journal. `not_submitted` is emitted only while
+that journal is still at `intent`, which — because the `intent -> submitted`
+transition is an fsynced atomic rename performed strictly before the
+submission subprocess is launched — proves the mutation was never launched
+for that operation identity. Only that proof terminalizes the job (as
+`blocked`, evidence retained), and authority additionally refuses it for any
+job that ever recorded a PVE task, since such a job provably *was* submitted.
+
+Everything else stays uncertain and fenced: a canonical absence, an
+in-flight guest lock, ambiguous ownership, a polling timeout, a lost SSH
+answer, an unreadable or corrupt journal, a lease held by another
+invocation, and every failure at or after the `submitted` transition. The
+releasing token is matched exactly, so a helper that reports no proof at all
+can never release a job.
 
 **Identity.** `app/inventory/snapshot_identity.py` derives one job's snapshot
 name and snapshot operation id purely from immutable identity (backend
@@ -128,9 +149,15 @@ only `OK` and `WARNINGS: <n>` as non-errors, so `stopped` alone is never
 success; the snapshot listing includes PVE's synthetic `current` pseudo-entry
 and carries `snapstate` for unfinished snapshots; and an LXC snapshot
 description does not round-trip byte-identically, because the config parser
-appends a newline to every line it reads back. A terminal successful task is
-therefore necessary but never sufficient — a fresh canonical listing is
-re-read and strictly matched in every case before `snapshot_confirmed`.
+appends a newline to every line it reads back.
+
+Strict fresh canonical evidence is therefore mandatory in every case before
+`snapshot_confirmed`, and a terminal successful task is never sufficient on
+its own. Task evidence is not, however, universally *necessary*: the normal
+path observes a PVE task and requires it to have reached a terminal non-error
+state, while the submitted-without-recorded-UPID recovery path establishes
+completion from its durable operation-journal state plus that same strict
+canonical evidence, rather than fabricating a task identity it never saw.
 
 **Host-side durable journal.** `deploy/hubinet-package-snapshot-helper.py` is
 a separate file and a separate logical privilege boundary from the scan

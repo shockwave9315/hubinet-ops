@@ -42,6 +42,23 @@ complete, and the container not locked by an in-flight operation). Otherwise
 it answers `uncertain`. It never submits a second snapshot request because a
 caller restarted.
 
+**This journal is the host-side record of record for submission.** Every
+failure answer therefore carries a typed `error.submission`:
+
+- `not_submitted` — the journal was at `intent` for this exact operation
+  identity when the failure happened, which proves the submission subprocess
+  was never launched for it. Only this lets the backend safely terminalize a
+  job that is already past its write-ahead uncertainty checkpoint, so it is
+  emitted from that durable phase alone, never inferred from an error name, a
+  canonical absence, a lock, a timeout, or a transport failure.
+- `may_have_been_submitted` — the default for everything else, including an
+  unreadable or corrupt journal, a lease held by another invocation, and every
+  failure at or after the `submitted` transition.
+
+Destruction of this journal by something outside Hubinet is out of the
+product's threat model (see `AGENTS.md`); it is ordinary durable state on the
+PVE host, not a defence against an administrator deleting it.
+
 Mutations are serialized per VMID with a kernel `flock`.
 
 ## Verified PVE semantics this file depends on
@@ -141,11 +158,34 @@ class RequestError(ValueError):
     """The request did not have the exact expected typed shape."""
 
 
+#: What this host can PROVE about whether a snapshot mutation was submitted
+#: for one operation identity. This is the only thing that may ever let the
+#: backend terminalize a job that is already past its write-ahead uncertainty
+#: checkpoint, so it is derived from the durable journal, never from an error
+#: name, a canonical absence, a timeout, or a transport failure.
+SUBMISSION_NOT_SUBMITTED = "not_submitted"
+SUBMISSION_UNKNOWN = "may_have_been_submitted"
+
+
 class SnapshotError(RuntimeError):
-    def __init__(self, classification: str, message: str) -> None:
+    """A snapshot operation failed.
+
+    ``submission`` defaults to ``may_have_been_submitted``: unless a caller
+    positively proves otherwise from the durable journal, every failure must
+    be treated as one that may have left a PVE mutation in flight.
+    """
+
+    def __init__(
+        self,
+        classification: str,
+        message: str,
+        *,
+        submission: str = SUBMISSION_UNKNOWN,
+    ) -> None:
         super().__init__(message)
         self.classification = classification
         self.message = message
+        self.submission = submission
 
 
 def _run_bounded(
@@ -906,8 +946,11 @@ def _await_task(
             runner, request, journal, record, "failed",
             "PVE snapshot task terminated in a failure state", status,
         )
-    # A successful task is necessary, never sufficient: the canonical listing
-    # decides, and it is re-read below even though the task says success.
+    # A successful task is never sufficient: the canonical listing decides,
+    # and it is re-read below even though the task says success. (Task
+    # evidence is not universally necessary either -- see
+    # _recover_submitted_without_task, which reaches the same canonical bar
+    # without a task identity it never observed.)
     listing = list_snapshots(runner, request["vmid"], request["expected_node"])
     evidence = _owned_snapshot_evidence(listing, request)
     if evidence != "present":
@@ -985,22 +1028,61 @@ def _create_pre_update_snapshot(
             }
             journal.write(record)
 
-        # Live target revalidation immediately before the mutation.
-        revalidate_live_target(runner, request["vmid"], request["expected_node"])
-        lock = read_container_lock(runner, request["vmid"], request["expected_node"])
+        # ---------------------------------------------------------------
+        # PRE-SUBMISSION WINDOW
+        #
+        # The durable journal for this operation is at `intent`, and the
+        # `intent -> submitted` transition below is an fsynced atomic rename
+        # performed strictly BEFORE the submission subprocess is launched.
+        # So for the whole of this window this host can prove that no
+        # snapshot mutation has ever been submitted for this operation
+        # identity, and any failure raised here is reported as such rather
+        # than as unresolvable uncertainty.
+        #
+        # That proof is what lets the backend safely terminalize a job which
+        # is already past its write-ahead uncertainty checkpoint. Without it
+        # an ordinary pre-flight refusal (a guest that moved node, say) would
+        # fence the single global destructive slot forever.
+        # ---------------------------------------------------------------
+        if record["phase"] != "intent":
+            raise SnapshotError(
+                "journal_corrupt",
+                "snapshot operation left its pre-submission phase unexpectedly",
+            )
+        try:
+            # Live target revalidation immediately before the mutation.
+            revalidate_live_target(runner, request["vmid"], request["expected_node"])
+            lock = read_container_lock(
+                runner, request["vmid"], request["expected_node"]
+            )
+            # Canonical pre-submission read. Defence in depth on top of the
+            # journal: it lets an operation whose result already exists be
+            # recognised without issuing any mutation request at all.
+            listing = (
+                None
+                if lock in _IN_FLIGHT_LOCKS
+                else list_snapshots(
+                    runner, request["vmid"], request["expected_node"]
+                )
+            )
+        except SnapshotError as exc:
+            raise SnapshotError(
+                exc.classification,
+                exc.message,
+                submission=SUBMISSION_NOT_SUBMITTED,
+            ) from exc
+
         if lock in _IN_FLIGHT_LOCKS:
+            # This operation has not been submitted, but *something* is
+            # mutating this guest right now. Refusing is not the same as
+            # proving nothing happened, so this stays uncertain.
             return _response(
                 request,
                 "uncertain",
                 reason=f"guest is locked by an in-flight PVE operation ({lock})",
             )
 
-        # Canonical pre-submission check. The journal alone is not the only
-        # possible evidence: if this operation's exact snapshot is already
-        # present (a previous run whose journal was lost, say), no mutation
-        # request is issued at all, and any ambiguity refuses rather than
-        # submitting into an unclear state.
-        listing = list_snapshots(runner, request["vmid"], request["expected_node"])
+        assert listing is not None
         evidence = _owned_snapshot_evidence(listing, request)
         if evidence == "present":
             journal.write(
@@ -1150,6 +1232,7 @@ def handle_request(
             "error": {
                 "classification": exc.classification,
                 "message": exc.message[:500],
+                "submission": exc.submission,
             },
         }
 

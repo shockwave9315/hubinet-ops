@@ -103,6 +103,7 @@ class PackageUpdateEventType(StrEnum):
     SNAPSHOT_CONFIRMED = "snapshot_confirmed"
     SNAPSHOT_OUTCOME_UNCERTAIN = "snapshot_outcome_uncertain"
     SNAPSHOT_FAILED = "snapshot_failed"
+    SNAPSHOT_BLOCKED_BEFORE_SUBMISSION = "snapshot_blocked_before_submission"
 
 
 class PackageScanFailure(StrEnum):

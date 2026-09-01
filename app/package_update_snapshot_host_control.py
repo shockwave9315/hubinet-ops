@@ -51,6 +51,12 @@ _OUTCOMES = {
     "absent": SnapshotOperationOutcome.FAILED,
 }
 
+#: The one token that may downgrade a host failure from "unknown" to "proved
+#: nothing was submitted". Matched exactly: an absent, unknown, or malformed
+#: value stays uncertain, so an older helper that does not report submission
+#: proof can never accidentally release a fenced job.
+_HELPER_NOT_SUBMITTED = "not_submitted"
+
 
 class SshPackageUpdateSnapshotHostControl:
     """One bounded typed request per snapshot operation, over pinned-key SSH."""
@@ -266,10 +272,26 @@ class SshPackageUpdateSnapshotHostControl:
         if payload.get("ok") is not True:
             error = payload.get("error")
             classification = "unclassified"
+            submission = None
             if isinstance(error, Mapping):
                 classification = str(error.get("classification") or "unclassified")[
                     :100
                 ]
+                submission = error.get("submission")
+            if submission == _HELPER_NOT_SUBMITTED:
+                # The host proved from its durable journal that this exact
+                # operation never crossed its submission boundary. Note this
+                # is keyed off that explicit proof, never off `classification`
+                # -- the same classification raised after submission stays
+                # uncertain.
+                return HostSnapshotResult(
+                    outcome=SnapshotOperationOutcome.NOT_SUBMITTED,
+                    snapshot_operation_id=snapshot_operation_id,
+                    reason=(
+                        "host proved no snapshot mutation was submitted "
+                        f"({classification})"
+                    ),
+                )
             return self._uncertain(
                 snapshot_operation_id,
                 f"host-control reported a failure ({classification})",
