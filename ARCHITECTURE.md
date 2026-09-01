@@ -869,7 +869,8 @@ below -- never two independent implementations -- and fails closed
 (`PackageScanParseError`) on a missing, malformed, or contradictory
 architecture, a missing or ambiguous installed identity, an APT/dpkg
 installed-version disagreement, a duplicate `(name, architecture)` row, or
-any removal/new-install line -- the scanner's existing scope stays an
+any removal/new-install line (including explicit `Remv` and `Purg` actions) --
+the scanner's existing scope stays an
 ordinary upgrade plan only (see "Package scanning for LXC" above); it is not
 broadened to dist-upgrade, autoremove, install, or remove semantics by this.
 
@@ -881,8 +882,10 @@ authoritatively, not guessed from one fixture). A standalone `Conf` -- one
 whose exact `(name, candidate_version)` label does not match an approved
 `Inst` row in the very same simulation -- means a real future upgrade would
 configure a package this plan never approved, which would silently violate
-`PRODUCT.md` rule 2; it fails closed, as does a `Conf` that contradicts an
-`Inst` row's version or architecture, a duplicate `Conf` for the same
+`PRODUCT.md` rule 2; final binding requires the same raw package identity,
+candidate version, and candidate/proven architecture. A `Conf` that
+contradicts an `Inst` row's version or architecture fails closed, as does a
+duplicate `Conf` for the same
 action, and the distinct `"Conf <name> broken"` shape APT prints for an
 already-broken configure (which also registers an internal APT error).
 Separately, APT's summary printer (`apt-private/private-output.cc::Stats()`)
@@ -925,6 +928,8 @@ snapshot_confirmed
          subset/superset/name-only matching
   -> MATCHED: typed result only; the job is untouched (still ACTIVE at
        snapshot_confirmed; no checkpoint advance; no new persisted flag)
+  -> TEMPORARILY_UNAVAILABLE: a latest scan is RUNNING, so authority is
+       undecided; job and snapshot untouched, no host call when seen pre-host
   -> MISMATCHED: the job is terminalized `blocked` in the same transaction --
        snapshot retained, global slot released, no rollback authority
 ```
@@ -936,7 +941,8 @@ is its purpose-specific pinned-key SSH transport, and
 PVE boundary exposing exactly one typed, non-mutating operation
 (`simulate_exact_update_plan`): a fixed metadata refresh
 (`apt-get update -qq --error-on=any`), a fixed simulation
-(`apt-get -s upgrade`), and the two fixed, read-only dpkg identity commands
+(`apt-get -s upgrade`), fixed OS/APT inspection (`cat /etc/os-release`,
+`apt-get --version`), and the two fixed, read-only dpkg identity commands
 described above (`dpkg --print-architecture`, `dpkg-query -W -f='...'`),
 against the job's own frozen expected VMID/node, re-validated live before
 each guest command -- the same non-mutating contract `PRODUCT.md`, "What
@@ -990,17 +996,17 @@ this path: the checkpoint/status guard both entry points share raises an
 ordinary `AuthorityConflict` instead, and the job's actual terminal reason
 is never overwritten.
 
-**"Stale" means every ordinary way current authority can move past a frozen
+**"Stale" means every decided way current authority can move past a frozen
 job, not only a moved resource or source.** The shared underlying proof
-(`_package_update_job_current_authority_detail`) classifies three ways, not
-two: **current** (everything still matches); **stale** -- the resource or
-source context drifted (a rotated transport trust revision, a replaced
-resource, ...), *or* the current world has simply moved past the approved
-plan itself (the latest scan for this resource is no longer a successful
-exact plan -- including a plain scan *failure*, which per `PRODUCT.md` means
-the current package state is unknown, not zero -- its context no longer
-matches this job, its fingerprint changed, or its exact material changed);
-and **hard failure** -- the job already terminal, an unsupported frozen
+(`_package_update_job_current_authority_detail`) classifies four ways:
+**current** (everything still matches); **temporarily unavailable** (the
+newest scan is RUNNING, so no new exact plan or failure exists yet and the
+job remains ACTIVE for retry); **stale** -- the resource or source context
+drifted (a rotated transport trust revision, a replaced resource, ...), *or*
+the current world has decisively moved past the approved plan itself (the
+latest scan completed unsuccessfully, which per `PRODUCT.md` means unknown,
+not zero; or it completed successfully but its context, fingerprint, or exact
+material changed); and **hard failure** -- the job already terminal, an unsupported frozen
 resource type, or a stored fingerprint that no longer matches its own
 recomputation (structurally unreachable under the schema's own immutability
 triggers, but never silently reclassified if it ever were). Every "stale"
@@ -1011,8 +1017,9 @@ call sites with different needs: `_package_update_job_authority_is_current`
 still uses, completely unchanged -- `False` for context drift, an
 `AuthorityConflict` raise for plan drift, preserving each of their exact
 prior contracts) and `_terminalize_execution_gate_job_if_authority_stale`
-(which this gate uses instead, treating every stale case the same way:
-release, never raise past this checkpoint).
+(which this gate uses instead, releasing every stale case while returning a
+narrow retryable result for temporary unavailability). Generic callers retain
+their prior bool/`AuthorityConflict` behavior.
 
 A `MATCHED` result is deliberately not a durable mutation permit: it changes
 nothing about the job besides an append-only diagnostic event, and a future

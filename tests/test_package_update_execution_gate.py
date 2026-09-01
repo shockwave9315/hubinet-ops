@@ -521,6 +521,119 @@ def test_revalidate_or_release_direct_current_authority_leaves_job_unchanged(
     assert unchanged.terminalized_at is None
 
 
+def test_running_newest_scan_is_retryable_and_preserves_snapshot_confirmed_job(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    authority.issue_package_scan(resource.resource_id)
+    events_before = store.list_package_update_job_events(job.job_id)
+    host_control = FakeExecutionHostControl(
+        simulation_stdout=_simulation_for(scan.packages),
+        installed_inventory=_inventory_for(scan.packages),
+    )
+
+    result = run_package_update_execution_gate(authority, job.job_id, host_control)
+
+    assert result.status is ExecutionGateStatus.AUTHORITY_TEMPORARILY_UNAVAILABLE
+    assert host_control.calls == 0
+    preserved = store.package_update_job(job.job_id)
+    assert preserved.status is PackageUpdateJobStatus.ACTIVE
+    assert preserved.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert preserved.snapshot_name == job.snapshot_name
+    assert preserved.mutation_may_have_started_at is None
+    assert preserved.terminalized_at is None
+    assert preserved.terminal_reason is None
+    events_after = store.list_package_update_job_events(job.job_id)
+    assert events_after == events_before
+    assert not any(
+        event.event_type
+        is PackageUpdateEventType.EXECUTION_AUTHORITY_STALE_RELEASED
+        for event in events_after
+    )
+
+
+def test_running_scan_preserves_generic_authority_callers_prior_refusal_contract(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    authority.issue_package_scan(resource.resource_id)
+
+    with pytest.raises(AuthorityConflict, match="still running"):
+        authority.revalidate_package_update_job(job.job_id)
+
+    preserved = store.package_update_job(job.job_id)
+    assert preserved.status is PackageUpdateJobStatus.ACTIVE
+    assert preserved.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert preserved.terminalized_at is None
+
+
+def test_running_scan_that_completes_failed_then_releases_the_old_job(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    running = authority.issue_package_scan(resource.resource_id)
+    host_control = FakeExecutionHostControl(
+        simulation_stdout=_simulation_for(scan.packages),
+        installed_inventory=_inventory_for(scan.packages),
+    )
+    first = run_package_update_execution_gate(authority, job.job_id, host_control)
+    assert first.status is ExecutionGateStatus.AUTHORITY_TEMPORARILY_UNAVAILABLE
+    assert store.package_update_job(job.job_id).status is PackageUpdateJobStatus.ACTIVE
+
+    authority.finalize_failed_package_scan(
+        running.scan_run_id,
+        failure_class=PackageScanFailure.GUEST_UNAVAILABLE,
+        error_message="guest unreachable",
+    )
+    second = run_package_update_execution_gate(authority, job.job_id, host_control)
+
+    assert second.status is ExecutionGateStatus.AUTHORITY_STALE
+    assert host_control.calls == 0
+    released = store.package_update_job(job.job_id)
+    assert released.status is PackageUpdateJobStatus.BLOCKED
+    assert released.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert released.snapshot_name == job.snapshot_name
+    assert released.mutation_may_have_started_at is None
+    assert "stale" in (released.terminal_reason or "").lower()
+    assert (
+        store.list_package_update_job_events(job.job_id)[-1].event_type
+        is PackageUpdateEventType.EXECUTION_AUTHORITY_STALE_RELEASED
+    )
+
+    other_resource, other_scan, other_approval = _add_approved_resource(store, authority)
+    successor = _issue(authority, other_resource, other_approval)
+    assert successor.status is PackageUpdateJobStatus.ACTIVE
+
+
+def test_scan_started_during_host_round_trip_is_retryable_and_preserves_job(
+    tmp_path: Path,
+) -> None:
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+
+    def _start_scan(_job) -> None:
+        authority.issue_package_scan(resource.resource_id)
+
+    host_control = FakeExecutionHostControl(
+        simulation_stdout=_simulation_for(scan.packages),
+        installed_inventory=_inventory_for(scan.packages),
+        side_effect=_start_scan,
+    )
+    result = run_package_update_execution_gate(authority, job.job_id, host_control)
+
+    assert result.status is ExecutionGateStatus.AUTHORITY_TEMPORARILY_UNAVAILABLE
+    assert host_control.calls == 1
+    preserved = store.package_update_job(job.job_id)
+    assert preserved.status is PackageUpdateJobStatus.ACTIVE
+    assert preserved.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert preserved.mutation_may_have_started_at is None
+    assert preserved.terminalized_at is None
+    assert not any(
+        event.event_type
+        is PackageUpdateEventType.EXECUTION_AUTHORITY_STALE_RELEASED
+        for event in store.list_package_update_job_events(job.job_id)
+    )
+
+
 def test_revalidate_or_release_direct_stale_authority_blocks_atomically(
     tmp_path: Path,
 ) -> None:

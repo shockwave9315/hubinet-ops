@@ -469,7 +469,7 @@ def test_ambiguous_bare_name_installed_at_both_native_and_all_fails_closed() -> 
 # ---------------------------------------------------------------------------
 
 
-def test_ordinary_conf_bound_to_its_own_inst_is_accepted() -> None:
+def test_bare_conf_with_matching_inst_architecture_is_accepted() -> None:
     sim = (
         "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
         "Conf foo (1.1 Debian:stable [amd64])\n"
@@ -513,10 +513,20 @@ def test_conf_candidate_version_mismatch_fails_closed() -> None:
         _sim(sim, entries=(("foo", "amd64", "1.0"),))
 
 
-def test_conf_architecture_mismatch_fails_closed() -> None:
+def test_qualified_conf_name_architecture_contradiction_fails_closed() -> None:
     sim = (
         "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
         "Conf foo:i386 (1.1 Debian:stable [i386])\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
+
+
+def test_bare_conf_architecture_differing_from_bound_inst_fails_closed() -> None:
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Conf foo (1.1 Debian:stable [i386])\n"
         "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
     )
     with pytest.raises(PackageScanParseError):
@@ -594,6 +604,16 @@ def test_zero_change_plan_with_unfinished_dpkg_state_fails_closed() -> None:
     )
     with pytest.raises(PackageScanParseError):
         _sim(sim)
+
+
+def test_purge_action_fails_closed_even_when_summary_claims_no_removals() -> None:
+    sim = (
+        "Inst foo [1.0] (1.1 Debian:stable [amd64])\n"
+        "Purg bar [2.0]\n"
+        "1 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n"
+    )
+    with pytest.raises(PackageScanParseError, match="planned a removal"):
+        _sim(sim, entries=(("foo", "amd64", "1.0"),))
 
 
 @pytest.mark.parametrize(

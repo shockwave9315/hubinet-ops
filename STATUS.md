@@ -239,7 +239,12 @@ unimplemented future stage.
   moment staleness is proven, so the one global destructive slot can never
   be starved by an obsolete job with only a backend restart as a way out --
   a job that goes terminal for an unrelated reason while a host round trip
-  is in flight is never mistaken for this and never overwritten.
+  is in flight is never mistaken for this and never overwritten. A newest
+  RUNNING package scan is transient rather than stale: the gate returns a
+  retryable result, preserves the ACTIVE snapshot-confirmed job and retained
+  snapshot, and avoids the host round trip when the scan is already visible
+  at the pre-host check. Once that scan completes failed/unknown, the old job
+  is stale and releases normally.
 - **Not activated:** no HTTP, Home Assistant, scheduler, bootstrap, or updater
   path can invoke this gate; the execution helper is a separate dark file
   that is **not deployed**, with no key or `authorized_keys` entry and no

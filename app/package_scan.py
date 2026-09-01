@@ -309,14 +309,15 @@ def parse_apt_simulation(
     changes: list[tuple[str, str, str | None, str, str, str, str | None, bool | None]] = []
     # Each tuple: (raw_name, name, name_architecture, candidate_architecture,
     #              installed_version, candidate_version, origin, security)
-    pending_conf: list[tuple[str, str]] = []  # (raw_name, candidate_version)
+    pending_conf: list[tuple[str, str, str]] = []
+    # Each tuple: (raw_name, candidate_version, candidate_architecture)
     summary: tuple[int, int, int] | None = None
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("Remv "):
+        if line.startswith(("Remv ", "Purg ")):
             raise PackageScanParseError("APT simulation unexpectedly planned a removal")
         if line.startswith("Inst "):
             match = _INST_RE.fullmatch(line)
@@ -379,7 +380,9 @@ def parse_apt_simulation(
                     "APT simulation contains a duplicate configure action"
                 )
             raw_conf_names.add(raw_name)
-            pending_conf.append((raw_name, match.group("candidate")))
+            pending_conf.append(
+                (raw_name, match.group("candidate"), conf_architecture)
+            )
             continue
         if _BAD_COUNT_RE.fullmatch(line) is not None:
             raise PackageScanParseError(
@@ -408,7 +411,7 @@ def parse_apt_simulation(
 
     packages: list[PackageScanPackage] = []
     identities: set[tuple[str, str]] = set()
-    approved_raw: set[tuple[str, str]] = set()
+    approved_raw: dict[tuple[str, str], str] = {}
     for (
         raw_name,
         name,
@@ -438,7 +441,7 @@ def parse_apt_simulation(
                 "APT simulation contains a duplicate (package, architecture)"
             )
         identities.add(identity)
-        approved_raw.add((raw_name, candidate_version))
+        approved_raw[(raw_name, candidate_version)] = architecture
         packages.append(
             PackageScanPackage(
                 package_name=name,
@@ -451,10 +454,16 @@ def parse_apt_simulation(
             )
         )
 
-    for raw_name, candidate_version in pending_conf:
-        if (raw_name, candidate_version) not in approved_raw:
+    for raw_name, candidate_version, conf_architecture in pending_conf:
+        approved_architecture = approved_raw.get((raw_name, candidate_version))
+        if approved_architecture is None:
             raise PackageScanParseError(
                 "APT simulation configures a package outside the approved plan"
+            )
+        if conf_architecture != approved_architecture:
+            raise PackageScanParseError(
+                "APT simulation configure action architecture does not match "
+                "its approved package change"
             )
 
     return tuple(

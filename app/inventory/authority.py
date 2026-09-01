@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 import hashlib
 import json
 import re
@@ -58,6 +59,16 @@ from .store import InventoryAuthorityStore
 
 
 _T = TypeVar("_T")
+
+
+class PackageUpdateExecutionAuthorityTemporarilyUnavailable(AuthorityConflict):
+    """Current execution authority cannot be decided while a scan is running."""
+
+
+class _PackageUpdateJobAuthorityState(StrEnum):
+    CURRENT = "current"
+    STALE = "stale"
+    TEMPORARILY_UNAVAILABLE = "temporarily_unavailable"
 
 
 class InventoryAuthority:
@@ -1281,7 +1292,7 @@ class InventoryAuthority:
 
     def _package_update_job_current_authority_detail(
         self, connection: sqlite3.Connection, job: sqlite3.Row
-    ) -> tuple[bool, str | None]:
+    ) -> tuple[_PackageUpdateJobAuthorityState, str | None]:
         """Re-prove every current-authority predicate inside ONE transaction.
 
         This is the whole "current authority still permits this job to
@@ -1294,23 +1305,18 @@ class InventoryAuthority:
         verify live PVE VMID/type/node facts, never a backend resource
         incarnation) would catch it.
 
-        Returns ``(True, None)`` when current, or ``(False, reason)`` for
+        Returns ``(CURRENT, None)`` when current, ``(STALE, reason)`` for
         every ORDINARY way current authority can no longer support this
         frozen job -- a moved/changed resource or source context, or the
         current world simply moving on from the approved plan (the latest
-        scan is no longer a successful exact plan, its context no longer
-        matches the job, its fingerprint changed, or its exact material
-        changed). None of these are invariant corruption: a background scan
-        can legitimately produce a different result at any time after this
-        job froze its own copy. ``reason`` is non-``None`` only for the
-        latter, plan-drift group, so :meth:`_package_update_job_authority_is_current`
-        can keep raising :class:`AuthorityConflict` for exactly the cases it
-        always has, unchanged, while callers that need to tell "not current"
-        apart from "hard failure" -- the execution-time plan gate -- can use
-        this method directly instead and treat every ``(False, ...)`` result
-        the same way. Hard incoherences (the job is terminal, an unsupported
-        frozen resource type, or a stored fingerprint that no longer matches
-        its own recomputation) still raise in both cases.
+        completed scan is no longer a successful exact plan, its context no
+        longer matches the job, its fingerprint changed, or its exact
+        material changed). A newest RUNNING scan instead returns
+        ``(TEMPORARILY_UNAVAILABLE, reason)``: it has not produced a new plan
+        or failure yet, so the execution gate must remain fail closed without
+        destroying the job. ``reason`` is non-``None`` for plan drift and
+        temporary unavailability, preserving the generic wrapper's prior
+        :class:`AuthorityConflict` behavior. Hard incoherences still raise.
         """
 
         if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
@@ -1331,25 +1337,44 @@ class InventoryAuthority:
             self._package_scan_context_is_current(connection, job)
             and self._package_scan_source_context_is_current(connection, job)
         ):
-            return False, None
+            return _PackageUpdateJobAuthorityState.STALE, None
 
         current = self._latest_package_scan_row(connection, str(job["resource_id"]))
-        if current is None or (
+        if current is None:
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "latest package scan attempt is not a successful exact plan",
+            )
+        if str(current["lifecycle"]) == PackageScanLifecycle.RUNNING.value:
+            return (
+                _PackageUpdateJobAuthorityState.TEMPORARILY_UNAVAILABLE,
+                "latest package scan attempt is still running",
+            )
+        if (
             str(current["lifecycle"]) != PackageScanLifecycle.COMPLETED.value
             or str(current["outcome"]) != PackageScanOutcome.SUCCESS.value
         ):
-            return False, "latest package scan attempt is not a successful exact plan"
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "latest package scan attempt is not a successful exact plan",
+            )
         if not (
             self._package_scan_is_current_and_approvable(connection, current)
             and self._package_scan_context_matches_job(current, job)
         ):
-            return False, "latest package scan authority context does not match the job"
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "latest package scan authority context does not match the job",
+            )
         # A stored fingerprint that no longer matches a recomputation from
         # its own exact rows is corruption, not staleness; raised, not
         # returned, by _successful_package_scan_fingerprint itself.
         fingerprint = self._successful_package_scan_fingerprint(connection, current)
         if fingerprint != str(job["approved_plan_fingerprint"]):
-            return False, "latest package plan fingerprint does not match the job"
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "latest package plan fingerprint does not match the job",
+            )
         current_material = self._package_material_rows(
             connection,
             table="package_scan_packages",
@@ -1363,8 +1388,11 @@ class InventoryAuthority:
             owner_id=job_id,
         )
         if not current_material or current_material != job_material:
-            return False, "current exact package material does not match the job"
-        return True, None
+            return (
+                _PackageUpdateJobAuthorityState.STALE,
+                "current exact package material does not match the job",
+            )
+        return _PackageUpdateJobAuthorityState.CURRENT, None
 
     def _package_update_job_authority_is_current(
         self, connection: sqlite3.Connection, job: sqlite3.Row
@@ -1383,10 +1411,10 @@ class InventoryAuthority:
         gate that instead needs to tell those two apart.
         """
 
-        current, reason = self._package_update_job_current_authority_detail(
+        state, reason = self._package_update_job_current_authority_detail(
             connection, job
         )
-        if current:
+        if state is _PackageUpdateJobAuthorityState.CURRENT:
             return True
         if reason is not None:
             raise AuthorityConflict(reason)
@@ -2342,29 +2370,33 @@ class InventoryAuthority:
         not the bool-returning :meth:`_package_update_job_authority_is_current`
         wrapper: both of that method's "not current" cases -- a moved/
         changed resource or source context, and the current world having
-        moved on from the approved plan entirely (the latest scan is no
-        longer a successful exact plan, its context no longer matches this
-        job, its fingerprint changed, or its exact material changed) -- are
-        equally ordinary staleness at THIS pre-mutation checkpoint and must
-        equally release the job, never leave it dangling ACTIVE merely
-        because the bool wrapper would have raised for one of them. A hard
-        incoherence (the job already terminal, an unsupported frozen
-        resource type, or a stored fingerprint that no longer matches its
-        own recomputation) still propagates as an uncaught exception here,
-        exactly as it always has -- never mislabeled as staleness, and never
-        turned into a stale-release write.
+        moved on from the approved plan entirely (a completed failed scan,
+        or a completed success whose context, fingerprint, or exact material
+        changed) -- are equally ordinary staleness at THIS pre-mutation
+        checkpoint and must equally release the job. A latest RUNNING scan is
+        distinct: it raises the narrow retryable transient refusal without a
+        write. A hard incoherence still propagates as an uncaught exception
+        here, exactly as it always has -- never mislabeled as staleness, and
+        never turned into a stale-release write.
 
         Returns ``True`` (and has terminalized the job) when authority was
-        proven stale here; ``False`` (job unchanged) when it is current.
+        proven stale here; ``False`` (job unchanged) when it is current; and
+        raises :class:`PackageUpdateExecutionAuthorityTemporarilyUnavailable`
+        with the job untouched when the newest scan is still RUNNING.
         """
 
-        current_authority_holds, stale_reason = (
+        authority_state, stale_reason = (
             self._package_update_job_current_authority_detail(connection, job)
         )
         job_id = str(job["job_id"])
         self._after_package_update_authority_proof(connection, job_id=job_id)
-        if current_authority_holds:
+        if authority_state is _PackageUpdateJobAuthorityState.CURRENT:
             return False
+        if authority_state is _PackageUpdateJobAuthorityState.TEMPORARILY_UNAVAILABLE:
+            raise PackageUpdateExecutionAuthorityTemporarilyUnavailable(
+                stale_reason
+                or "package update execution authority is temporarily unavailable"
+            )
         reason = (
             f"package update job's current resource/source/approval authority "
             f"became stale before package mutation ({stale_reason})"
@@ -2415,7 +2447,10 @@ class InventoryAuthority:
         "is authority still current" read usable at any checkpoint).
 
         Returns ``(True, job)`` when authority is current (job unchanged) or
-        ``(False, job)`` when it was just proven stale and released.
+        ``(False, job)`` when it was just proven stale and released. If the
+        newest package scan is still RUNNING, raises the narrow
+        :class:`PackageUpdateExecutionAuthorityTemporarilyUnavailable` and
+        leaves the job unchanged for a retry after the scan completes.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
@@ -2467,6 +2502,10 @@ class InventoryAuthority:
         a backend restart as the only way out -- which must never be the
         ordinary release mechanism. This returns
         :attr:`PackageUpdateExecutionOutcome.AUTHORITY_STALE` for that case.
+        A newest RUNNING package scan is not stale: it raises the narrow
+        retryable
+        :class:`PackageUpdateExecutionAuthorityTemporarilyUnavailable` with
+        no durable write, because no new exact plan or failure exists yet.
 
         An exact material match -- the complete frozen job material set
         equals the complete fresh material set, never subset/superset/

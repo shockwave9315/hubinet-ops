@@ -37,6 +37,9 @@ from app.inventory import (
     PackageUpdateJob,
     PackageUpdateJobStatus,
 )
+from app.inventory.authority import (
+    PackageUpdateExecutionAuthorityTemporarilyUnavailable,
+)
 from app.package_scan import (
     HostScanFailure,
     PackageScanParseError,
@@ -85,6 +88,10 @@ class ExecutionGateStatus(StrEnum):
     #: proved the staleness, releasing the one global destructive slot --
     #: it never leaks. See ARCHITECTURE.md, "Execution-time plan equality".
     AUTHORITY_STALE = "authority_stale"
+    #: A newer package scan is still running, so current execution authority
+    #: cannot yet be proved or disproved. The job and retained snapshot stay
+    #: untouched; retry after the scan completes.
+    AUTHORITY_TEMPORARILY_UNAVAILABLE = "authority_temporarily_unavailable"
     #: The host round trip itself failed (busy, timeout, transport failure,
     #: unsupported OS/resource, or a malformed/ambiguous simulation). Never
     #: treated as an empty plan and never as a match.
@@ -122,6 +129,11 @@ def run_package_update_execution_gate(
     :meth:`InventoryAuthority.evaluate_package_update_execution_plan`'s own
     single short writer transaction, which never wraps host I/O -- see
     ``ARCHITECTURE.md``, "SQLite writer-contention policy".
+
+    A newest RUNNING package scan makes current execution authority
+    temporarily undecidable. It returns a retryable typed outcome and leaves
+    the snapshot-confirmed job untouched; when visible at the pre-check, no
+    host round trip is attempted.
     """
 
     try:
@@ -158,6 +170,12 @@ def run_package_update_execution_gate(
         return ExecutionGateOutcome(
             status=ExecutionGateStatus.JOB_NOT_READY,
             message="package update job does not exist",
+        )
+    except PackageUpdateExecutionAuthorityTemporarilyUnavailable as exc:
+        return ExecutionGateOutcome(
+            status=ExecutionGateStatus.AUTHORITY_TEMPORARILY_UNAVAILABLE,
+            job=job,
+            message=str(exc),
         )
     except AuthorityConflict as exc:
         return ExecutionGateOutcome(
@@ -219,6 +237,12 @@ def run_package_update_execution_gate(
         return ExecutionGateOutcome(
             status=ExecutionGateStatus.JOB_NOT_READY,
             message="package update job does not exist",
+        )
+    except PackageUpdateExecutionAuthorityTemporarilyUnavailable as exc:
+        return ExecutionGateOutcome(
+            status=ExecutionGateStatus.AUTHORITY_TEMPORARILY_UNAVAILABLE,
+            job=job,
+            message=str(exc),
         )
     except AuthorityConflict as exc:
         # The pre-host-call checks above already proved the job was ACTIVE
