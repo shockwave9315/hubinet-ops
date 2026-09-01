@@ -1973,6 +1973,52 @@ def test_an_unknown_or_absent_submission_token_stays_uncertain() -> None:
     assert proved.outcome is SnapshotOperationOutcome.NOT_SUBMITTED
 
 
+def test_operation_in_progress_never_parses_as_a_non_submission_proof() -> None:
+    """A held per-VMID lease is UNCERTAIN, never absent/intent/not_submitted.
+
+    `operation_in_progress` is raised by both the mutating operation and the
+    read-only inspection when the host's per-VMID mutation lease is already
+    held -- exactly the case where a remote submission-only helper may still
+    be alive and between its own durable phases. It must never be parsed as
+    proof of anything: not NOT_SUBMITTED, and no `submission_state` value a
+    pre-submission block could ever act on.
+    """
+
+    from app.package_update_snapshot import HostSubmissionState
+    from app.package_update_snapshot_host_control import (
+        SshPackageUpdateSnapshotHostControl,
+    )
+
+    channel = SshPackageUpdateSnapshotHostControl(
+        host="pve.example.internal",
+        port=22,
+        user="hubinet-snapshot",
+        private_key_path=Path("/etc/hubinet-ops/snapshot-key"),
+        known_hosts_path=Path("/etc/hubinet-ops/known_hosts"),
+        timeout_seconds=60,
+        max_result_bytes=1024 * 1024,
+    )
+    operation_id = str(uuid.uuid4())
+    parsed = channel._parse_payload(
+        {
+            "response_version": 1,
+            "ok": False,
+            "snapshot_operation_id": operation_id,
+            "error": {
+                "classification": "operation_in_progress",
+                "message": "another snapshot operation holds this guest's lease",
+            },
+        },
+        operation_id,
+    )
+    assert parsed.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert parsed.submission_state is None
+    assert parsed.submission_state not in (
+        HostSubmissionState.ABSENT,
+        HostSubmissionState.INTENT,
+    )
+
+
 # ===========================================================================
 # Authority transition atomicity (check-then-commit race)
 #
@@ -3020,7 +3066,10 @@ def test_task_polling_never_holds_the_authority_writer_lock(tmp_path: Path) -> N
     BEGIN IMMEDIATE transaction WHILE this orchestrator is bounded-polling a
     known task -- proving the submission critical section's writer lock was
     already released before polling ever starts, and stays released for the
-    whole of it.
+    whole of it. The SAME window also proves each individual
+    `inspect_job_snapshot_state` call releases the host's own per-VMID
+    mutation lease before returning: it is acquired and released once per
+    bounded read, never held across the orchestrator's polling loop.
     """
 
     import sqlite3 as _sqlite3
@@ -3043,6 +3092,7 @@ def test_task_polling_never_holds_the_authority_writer_lock(tmp_path: Path) -> N
     ]
 
     acquired: list[bool] = []
+    lease_acquired: list[bool] = []
 
     def sleep_and_probe(_seconds: float) -> None:
         other = _sqlite3.connect(store.path, timeout=0.1, isolation_level=None)
@@ -3052,6 +3102,11 @@ def test_task_polling_never_holds_the_authority_writer_lock(tmp_path: Path) -> N
             other.commit()
         finally:
             other.close()
+        # The prior inspect call's own VmidMutationLock must already be
+        # released: a fresh acquisition here must not raise
+        # `operation_in_progress`.
+        with snapshot_helper.VmidMutationLock(job.expected_vmid, journal.directory):
+            lease_acquired.append(True)
         pve.snapshots.append(
             {
                 "name": identity.snapshot_name,
@@ -3082,6 +3137,7 @@ def test_task_polling_never_holds_the_authority_writer_lock(tmp_path: Path) -> N
     result = orchestrator.ensure_job_owned_snapshot(job.job_id)
 
     assert acquired == [True]
+    assert lease_acquired == [True]
     assert result.outcome is SnapshotOperationOutcome.COMPLETED
     assert pve.submissions == 1
 
@@ -3366,3 +3422,165 @@ def test_inspect_return_value_alone_decides_never_a_caller_supplied_flag(
     assert blocked is False
     assert evidence == "unchanged"
     assert store.package_update_job(job.job_id).status is PackageUpdateJobStatus.ACTIVE
+
+
+# ===========================================================================
+# Host-side serialization: the backend's fresh-proof lock is not enough on
+# its own. A backend that lost its SQLite writer lock (crash, restart, a
+# separate later attempt) cannot infer that a remote submission-only mutator
+# it once invoked is also gone: that mutator is a separate process on the PVE
+# host and may still be alive, holding the SAME per-VMID lease
+# `_ensure_submitted`/`_inspect` both join. The backend critical sections
+# alone do not see that -- only the host's own VmidMutationLock does.
+# ===========================================================================
+
+
+def test_resolve_pre_submission_block_never_terminalizes_while_the_remote_mutator_is_alive(
+    tmp_path: Path,
+) -> None:
+    """The most important regression: backend loses its lock, host does not.
+
+    A remote submission-only mutator is paused mid-flight through the real
+    dark boundary -- real per-VMID lease held, real on-disk journal at
+    `intent` -- exactly where a caller that lost its SSH connection or
+    crashed would leave it. resolve_pre_submission_block's own fresh host
+    inspection, run inside its own SQLite writer lock, must join that SAME
+    host lease and refuse to terminalize while the mutator might still be
+    about to submit. Once the mutator genuinely finishes -- here, by
+    actually submitting -- a later recovery attempt correctly sees that,
+    never resubmits, and never releases the job as unsubmitted.
+    """
+
+    import threading
+
+    from tests.test_package_snapshot_helper import FakePve, helper as snapshot_helper
+
+    store, authority, job, identity, ownership, _, journal, upid = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+
+    entered_live_check = threading.Event()
+    resume_mutator = threading.Event()
+
+    class PausingPve(FakePve):
+        def _dispatch(self, argv):
+            if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+                entered_live_check.set()
+                assert resume_mutator.wait(timeout=10)
+            return super()._dispatch(argv)
+
+    def _owned_snapshot_entry() -> dict:
+        return {
+            "name": identity.snapshot_name,
+            "description": snapshot_helper.build_snapshot_description(
+                {
+                    "job_id": ownership.job_id,
+                    "resource_id": ownership.resource_id,
+                    "resource_continuity_revision": (
+                        ownership.resource_continuity_revision
+                    ),
+                    "inventory_source_id": ownership.inventory_source_id,
+                    "backend_instance_id": ownership.backend_instance_id,
+                }
+            )
+            + "\n",
+            "snaptime": 1_700_000_000,
+        }
+
+    paused_pve = PausingPve(
+        vmid=job.expected_vmid,
+        node=job.expected_node_name,
+        task_sequence=[{"upid": upid, "status": "stopped", "exitstatus": "OK"}],
+        submit_upid=upid,
+    )
+    paused_pve.on_submit = lambda p: p.snapshots.append(_owned_snapshot_entry())
+
+    mutator_channel = _dark_channel(paused_pve, journal)
+    mutator_result: dict = {}
+
+    def run_mutator() -> None:
+        mutator_result["value"] = (
+            mutator_channel.ensure_pre_update_snapshot_submitted(
+                snapshot_operation_id=identity.snapshot_operation_id,
+                snapshot_name=identity.snapshot_name,
+                vmid=job.expected_vmid,
+                expected_node=job.expected_node_name,
+                ownership=ownership,
+            )
+        )
+
+    mutator_thread = threading.Thread(target=run_mutator)
+    mutator_thread.start()
+    try:
+        assert entered_live_check.wait(timeout=10)
+
+        # The remote mutator is paused right here: the real per-VMID lease
+        # is held, and the real on-disk journal is at `intent`.
+        assert (
+            snapshot_helper.OperationJournal(journal.directory)
+            .read(identity.snapshot_operation_id)["phase"]
+            == "intent"
+        )
+
+        # Backend B: a fresh host inspection through the real dark boundary,
+        # run inside resolve_pre_submission_block's own writer lock.
+        read_only_pve = FakePve(vmid=job.expected_vmid, node=job.expected_node_name)
+        read_channel = _dark_channel(read_only_pve, journal)
+
+        def inspect() -> tuple[bool, str, HostSnapshotResult]:
+            fresh = read_channel.inspect_job_snapshot_state(
+                snapshot_operation_id=identity.snapshot_operation_id,
+                snapshot_name=identity.snapshot_name,
+                vmid=job.expected_vmid,
+                expected_node=job.expected_node_name,
+                ownership=ownership,
+            )
+            proved = fresh.submission_state in (
+                HostSubmissionState.ABSENT,
+                HostSubmissionState.INTENT,
+            )
+            return proved, fresh.reason or "fresh host read", fresh
+
+        blocked, evidence = authority.resolve_pre_submission_block(
+            job.job_id, inspect
+        )
+
+        assert blocked is False
+        assert evidence.outcome is SnapshotOperationOutcome.UNCERTAIN
+        # The read-only inspection made zero PVE calls: the lease attempt
+        # failed before ever touching PVE.
+        assert read_only_pve.argvs == []
+        assert read_only_pve.submissions == 0
+        fenced = store.package_update_job(job.job_id)
+        assert fenced.status is PackageUpdateJobStatus.ACTIVE
+        assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+        assert paused_pve.submissions == 0
+    finally:
+        resume_mutator.set()
+        mutator_thread.join(timeout=10)
+    assert not mutator_thread.is_alive()
+
+    # The mutator crossed the door for real, exactly once.
+    result = mutator_result["value"]
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert result.submission_state is HostSubmissionState.TASK_KNOWN
+    assert paused_pve.submissions == 1
+
+    # Next backend recovery must not resubmit, and must not release the job
+    # as unsubmitted -- it must recover to a confirmed snapshot instead.
+    final_pve = FakePve(
+        vmid=job.expected_vmid,
+        node=job.expected_node_name,
+        snapshots=list(paused_pve.snapshots),
+        task_sequence=list(paused_pve.task_sequence),
+    )
+    recovery_channel = _dark_channel(final_pve, journal)
+    recovered = PackageUpdateSnapshotOrchestrator(
+        authority, recovery_channel
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert final_pve.submissions == 0
+    assert recovered.outcome is SnapshotOperationOutcome.COMPLETED
+    assert recovered.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED

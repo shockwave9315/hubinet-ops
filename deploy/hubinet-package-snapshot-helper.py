@@ -30,6 +30,21 @@ listing -- fast, bounded, and repeatable from the caller's own bounded retry
 loop -- so completion is observed by the caller polling this cheap read
 operation, never by the mutating one blocking internally.
 
+`inspect_job_snapshot_state` is read-only with respect to PVE and the
+journal -- no write, no `pvesh create` -- but it is serialized against the
+SAME per-VMID mutation lease (`VmidMutationLock`) the mutating operation
+uses, acquired non-blocking and released before it returns. A backend that
+lost its own lock (crashed, restarted, or is simply a later attempt) cannot
+otherwise tell that a mutating call it once invoked is still alive on this
+host, still between its own durable phases; without joining that lease, a
+concurrent inspection could read a stale `intent` while a live mutator was
+about to advance past it, and hand a caller false proof that nothing was
+ever submitted. If the lease is already held, this reports
+`operation_in_progress`, exactly as the mutating operation does for the
+identical reason -- never inferred as `not_submitted`, `absent`, or
+`intent` proof, and never worth retrying inside this same call: a later,
+separate inspection may join the lease once it is free.
+
 ## Durable operation journal
 
 The backend receiving a UPID is not something this helper may rely on: the
@@ -871,36 +886,53 @@ def _inspect(
     whole of it -- there is no poll-to-completion loop here, so a caller may
     call this as often as it likes, including as its own bounded retry loop,
     without ever holding anything open on either side.
+
+    It is, however, serialized against the SAME per-VMID mutation lease
+    `_ensure_submitted` uses, acquired non-blocking and released before this
+    returns. That is what makes an `absent`/`intent` result here trustworthy
+    as proof of non-submission: without it, a submission helper that outlived
+    its own backend caller (SSH dropped, backend crashed or timed out) could
+    still be holding the lease and be between its own durable phases --
+    journal not yet advanced past `intent` -- exactly while this read runs,
+    and a caller could then terminalize a job whose snapshot mutation is
+    genuinely still in flight. This does not make inspection a mutating
+    operation: no journal write, no `pvesh create`, still one bounded host
+    read. If the lease is already held, this raises the SAME
+    `operation_in_progress` error `_ensure_submitted` raises for the
+    identical reason, which resolves to UNCERTAIN and can never be mistaken
+    for `not_submitted`/absent/intent proof.
     """
 
-    record = journal.read(request["snapshot_operation_id"])
-    if record is not None and record["request_fingerprint"] != request_fingerprint(
-        request
-    ):
-        raise SnapshotError(
-            "operation_request_mismatch",
-            "this operation identity was journaled with a different request",
-        )
-    listing = list_snapshots(runner, request["vmid"], request["expected_node"])
-    task_upid = record.get("task_upid") if record else None
-    task = None
-    if isinstance(task_upid, str):
-        task = read_task_status(runner, request["expected_node"], task_upid)
-    evidence = _owned_snapshot_evidence(listing, request)
-    if task is not None and task["status"] == "stopped" and _task_is_error(task):
-        # The task PVE ran for this operation terminated in a failure state.
-        # This is reported regardless of canonical evidence -- the backend
-        # independently re-proves canonical absence before it may ever
-        # terminalize a job on this outcome, exactly as it always has.
-        outcome = "failed"
-    else:
-        outcome = {
-            "present": "completed",
-            "absent": "absent",
-            "incomplete": "uncertain",
-            "ambiguous": "uncertain",
-        }[evidence]
-    submission_state = record["phase"] if record is not None else "absent"
+    with VmidMutationLock(request["vmid"], journal.directory):
+        record = journal.read(request["snapshot_operation_id"])
+        if record is not None and record[
+            "request_fingerprint"
+        ] != request_fingerprint(request):
+            raise SnapshotError(
+                "operation_request_mismatch",
+                "this operation identity was journaled with a different request",
+            )
+        listing = list_snapshots(runner, request["vmid"], request["expected_node"])
+        task_upid = record.get("task_upid") if record else None
+        task = None
+        if isinstance(task_upid, str):
+            task = read_task_status(runner, request["expected_node"], task_upid)
+        evidence = _owned_snapshot_evidence(listing, request)
+        if task is not None and task["status"] == "stopped" and _task_is_error(task):
+            # The task PVE ran for this operation terminated in a failure
+            # state. This is reported regardless of canonical evidence -- the
+            # backend independently re-proves canonical absence before it may
+            # ever terminalize a job on this outcome, exactly as it always
+            # has.
+            outcome = "failed"
+        else:
+            outcome = {
+                "present": "completed",
+                "absent": "absent",
+                "incomplete": "uncertain",
+                "ambiguous": "uncertain",
+            }[evidence]
+        submission_state = record["phase"] if record is not None else "absent"
     return _response(
         request,
         outcome,

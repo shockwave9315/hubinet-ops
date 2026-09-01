@@ -284,6 +284,33 @@ bounded read `inspect_job_snapshot_state` always performs. Task polling and
 canonical confirmation happen strictly outside both, through the
 orchestrator's own read-only retry loop.
 
+**Two serialization layers, not one.** The backend's SQLite writer lock
+serializes Hubinet's own two critical sections against each other, but a
+backend that lost that lock -- crashed, restarted, or is simply a separate
+later attempt -- cannot infer that a submission-only mutator it once invoked
+on the PVE host is also gone: that mutator is a separate process there, and
+SSH dropping or the backend dying does not kill it. It may still be alive,
+still holding its per-VMID mutation lease (`VmidMutationLock`), still
+between its own durable journal phases -- lease held, journal not yet
+advanced past `intent` -- exactly while a fresh inspection reads that same
+journal. So `inspect_job_snapshot_state` joins that SAME lease, acquired
+non-blocking and released before it returns: if the lease is already held it
+reports `operation_in_progress`, which resolves to UNCERTAIN and can never
+be parsed as `not_submitted`/`absent`/`intent` proof, so
+`resolve_pre_submission_block` never terminalizes a job whose remote
+mutator may still be mid-flight. This does not make inspection a mutating
+operation -- no journal write, no `pvesh create`, still one bounded host
+read -- and each individual `inspect_job_snapshot_state` call acquires and
+releases the lease on its own, so the orchestrator's polling loop never
+holds it (or the SQLite writer lock) across a wait. Once the mutator
+genuinely finishes, either by failing before `submitted` (a later fresh
+inspection then safely proves `intent`) or by crossing the door (a later
+fresh inspection then correctly sees `submitted`/`task_known` and refuses
+to release the job), a later attempt observes the truth because the lease
+serializes the two exactly as SQLite's writer lock serializes the backend's
+own critical sections against each other -- one on the backend, one on the
+host, each closing the seam the other cannot see.
+
 **Same-job rollback.** A job may roll back only to the snapshot that exact job
 created and confirmed. `select_package_update_rollback_target` re-proves the
 name, the full structured ownership metadata, `resource_id`, the continuity

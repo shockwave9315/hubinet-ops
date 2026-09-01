@@ -1165,3 +1165,213 @@ def test_not_submitted_is_emitted_from_exactly_one_pre_submission_site() -> None
 
     # And the default is the fail-closed value, so nothing inherits it.
     assert 'submission: str = SUBMISSION_UNKNOWN' in source
+
+
+# ---------------------------------------------------------------------------
+# Host-side serialization: inspection must join the per-VMID mutation lease
+#
+# A backend that lost its SSH connection, timed out, or crashed cannot infer
+# that the remote mutator is gone with it: the mutator is a separate process
+# on the PVE host and may still be alive, still holding its lease, still
+# between its own durable journal phases. A concurrent inspection must not be
+# able to read a stale `intent` as proof of non-submission while that lease
+# is held.
+# ---------------------------------------------------------------------------
+
+
+def test_inspect_reports_operation_in_progress_while_the_mutator_holds_the_lease(
+    tmp_path: Path,
+) -> None:
+    """The exact backend-died-but-remote-helper-still-alive witness.
+
+    The submission-only mutator acquires its per-VMID lease and journals
+    `intent`, then pauses mid-flight -- exactly where a caller that lost its
+    SSH connection, timed out, or crashed would leave it: still alive, still
+    holding the lease, journal not yet advanced past `intent`. A concurrent
+    inspection reaching the SAME journal directory must not be able to read
+    that `intent` as proof of non-submission while the lease is held.
+    """
+
+    import threading
+
+    journal = _journal(tmp_path)
+    request = _request()
+    operation_id = request["operation_identity"]["snapshot_operation_id"]
+
+    entered_live_check = threading.Event()
+    resume_mutator = threading.Event()
+
+    class PausingPve(FakePve):
+        def _dispatch(self, argv):
+            if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+                entered_live_check.set()
+                assert resume_mutator.wait(timeout=10)
+            return super()._dispatch(argv)
+
+    pve = PausingPve()
+    mutator_response: dict = {}
+
+    def run_mutator() -> None:
+        mutator_response["value"] = helper.handle_request(
+            request, runner=pve, journal=journal
+        )
+
+    mutator_thread = threading.Thread(target=run_mutator)
+    mutator_thread.start()
+    try:
+        assert entered_live_check.wait(timeout=10)
+
+        # The mutator is paused right here: lease held, journal at intent,
+        # first live PVE read in flight -- nothing below resumes it.
+        assert journal.read(operation_id)["phase"] == "intent"
+
+        inspect_pve = FakePve()
+        inspected = helper.handle_request(
+            _request("inspect_job_snapshot_state"),
+            runner=inspect_pve,
+            journal=journal,
+        )
+
+        assert inspected["ok"] is False
+        assert inspected["error"]["classification"] == "operation_in_progress"
+        assert inspected["error"]["submission"] == helper.SUBMISSION_UNKNOWN
+        # Inspection never mutated the journal or touched PVE at all.
+        assert journal.read(operation_id)["phase"] == "intent"
+        assert inspect_pve.argvs == []
+        assert inspect_pve.submissions == 0
+    finally:
+        resume_mutator.set()
+        mutator_thread.join(timeout=10)
+    assert not mutator_thread.is_alive()
+
+
+def test_the_lease_release_after_failure_still_lets_inspect_prove_intent(
+    tmp_path: Path,
+) -> None:
+    """Failure-before-submit liveness positive control.
+
+    The mutator fails before `submitted` and releases the lease. Once it is
+    genuinely gone, a fresh inspection may safely observe the still-`intent`
+    journal and prove non-submission -- the fix must not fence the job
+    forever just because a mutator was once, briefly, in the way.
+    """
+
+    import threading
+
+    journal = _journal(tmp_path)
+    request = _request()
+    operation_id = request["operation_identity"]["snapshot_operation_id"]
+
+    entered_live_check = threading.Event()
+    resume_mutator = threading.Event()
+
+    class FailingPausingPve(FakePve):
+        def _dispatch(self, argv):
+            if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+                entered_live_check.set()
+                assert resume_mutator.wait(timeout=10)
+                # The guest is gone by the time this resumes: live-target
+                # revalidation fails, proving non-submission.
+                self.present = False
+            return super()._dispatch(argv)
+
+    pve = FailingPausingPve()
+    mutator_response: dict = {}
+
+    def run_mutator() -> None:
+        mutator_response["value"] = helper.handle_request(
+            request, runner=pve, journal=journal
+        )
+
+    mutator_thread = threading.Thread(target=run_mutator)
+    mutator_thread.start()
+    assert entered_live_check.wait(timeout=10)
+    resume_mutator.set()
+    mutator_thread.join(timeout=10)
+    assert not mutator_thread.is_alive()
+
+    failed = mutator_response["value"]
+    assert failed["ok"] is False
+    assert failed["error"]["submission"] == helper.SUBMISSION_NOT_SUBMITTED
+    assert journal.read(operation_id)["phase"] == "intent"
+    assert pve.submissions == 0
+
+    # The lease is free now: a fresh inspection safely proves non-submission.
+    inspected = helper.handle_request(
+        _request("inspect_job_snapshot_state"), runner=pve, journal=journal
+    )
+    assert inspected["ok"] is True
+    assert inspected["submission_state"] == "intent"
+    assert pve.submissions == 0
+
+
+def test_the_lease_release_after_submission_lets_inspect_see_task_known(
+    tmp_path: Path,
+) -> None:
+    """Submitted/task_known crash-recovery positive control.
+
+    The mutator crosses the door and releases the lease. A fresh inspection
+    then correctly sees the submission -- never absent, never intent -- and
+    exactly one PVE submission ever happens, however many times it is
+    inspected afterward.
+    """
+
+    import threading
+
+    journal = _journal(tmp_path)
+    ownership = _ownership()
+    _, snapshot_name = _identity(ownership)
+    request = _request(ownership=ownership)
+
+    entered_live_check = threading.Event()
+    resume_mutator = threading.Event()
+
+    class PausingPve(FakePve):
+        def _dispatch(self, argv):
+            if argv[:3] == ("pvesh", "get", "/cluster/resources"):
+                entered_live_check.set()
+                assert resume_mutator.wait(timeout=10)
+            return super()._dispatch(argv)
+
+    pve = PausingPve(
+        task_sequence=[{"upid": UPID, "status": "stopped", "exitstatus": "OK"}]
+    )
+    pve.on_submit = lambda p: p.snapshots.append(
+        _completed_snapshot(ownership, snapshot_name)
+    )
+    mutator_response: dict = {}
+
+    def run_mutator() -> None:
+        mutator_response["value"] = helper.handle_request(
+            request, runner=pve, journal=journal
+        )
+
+    mutator_thread = threading.Thread(target=run_mutator)
+    mutator_thread.start()
+    assert entered_live_check.wait(timeout=10)
+    resume_mutator.set()
+    mutator_thread.join(timeout=10)
+    assert not mutator_thread.is_alive()
+
+    submitted = mutator_response["value"]
+    assert submitted["ok"] is True
+    assert submitted["outcome"] == "uncertain"
+    assert submitted["submission_state"] == "task_known"
+    assert pve.submissions == 1
+
+    inspected_first = helper.handle_request(
+        _request("inspect_job_snapshot_state", ownership=ownership),
+        runner=pve,
+        journal=journal,
+    )
+    inspected_second = helper.handle_request(
+        _request("inspect_job_snapshot_state", ownership=ownership),
+        runner=pve,
+        journal=journal,
+    )
+    assert inspected_first["ok"] is True
+    assert inspected_first["submission_state"] == "task_known"
+    assert inspected_first["outcome"] == "completed"
+    assert inspected_second["outcome"] == "completed"
+    # Never a second submission, however many times it is inspected.
+    assert pve.submissions == 1
