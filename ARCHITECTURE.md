@@ -227,6 +227,29 @@ proved to belong to the same LXC PVE showed several minutes ago (see
 stable through the submission boundary, and the host independently
 re-validates the live PVE target immediately before it ever submits.
 
+**Liveness after a refusal.** A stale authority context always refuses a NEW
+submission — `execute_snapshot_submission_if_current` never authorizes one on
+stale authority, full stop. But if the underlying resource or source is gone
+or replaced for good, every future retry would repeat that identical refusal
+forever, permanently occupying the one global destructive slot with a job
+that can never advance. The refusal alone therefore does not decide the
+job's fate: `PackageUpdateSnapshotOrchestrator` takes one FRESH host read —
+never the read this attempt started with, since another invocation could
+have been authorized and actually submitted in the gap between this
+attempt's first read and its own refusal — and only THAT fresh read decides.
+If it still proves `absent`/`intent`, the job is safely terminalized via
+`block_package_update_before_snapshot_submission` and the slot is released;
+anything else it shows (a submission already in flight, a terminal outcome,
+or the read itself failing to prove anything) is recovered through the
+ordinary evidence pipeline exactly as if this attempt had never tried to
+submit — never released as unsubmitted, and never resubmitted. This is safe
+because `execute_snapshot_submission_if_current` only serializes Hubinet's
+own writers against each other: by the time one invocation observes a
+refusal, any concurrent submission attempt that WAS authorized has already
+crossed whatever durable host journal phase it reached and released the
+writer lock, so a fresh read can see it even though the stale first read
+could not.
+
 **Same-job rollback.** A job may roll back only to the snapshot that exact job
 created and confirmed. `select_package_update_rollback_target` re-proves the
 name, the full structured ownership metadata, `resource_id`, the continuity

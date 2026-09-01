@@ -519,8 +519,14 @@ class PackageUpdateSnapshotOrchestrator:
                 )
             except AuthorityConflict:
                 # Authority refused BEFORE the callback ever ran: the host
-                # was never asked to submit anything.
-                raise
+                # was never asked to submit anything. That alone must never
+                # authorize a submission, but it must also never be allowed
+                # to fence this job's global slot forever purely because
+                # Hubinet's own authority context moved on -- see
+                # _resolve_after_stale_authority_refusal.
+                return self._resolve_after_stale_authority_refusal(
+                    job, identity, ownership
+                )
             except Exception as exc:  # noqa: BLE001 - any failure here is uncertain
                 return self._uncertain(
                     job.job_id,
@@ -529,13 +535,89 @@ class PackageUpdateSnapshotOrchestrator:
                 )
             result = self._validated(result, identity.snapshot_operation_id)
 
+        return self._finish(job, identity, ownership, result)
+
+    def _finish(
+        self,
+        job: PackageUpdateJob,
+        identity: PackageUpdateSnapshotIdentity,
+        ownership: SnapshotOwnership,
+        result: HostSnapshotResult,
+    ) -> SnapshotStageResult:
         # F. Task polling and canonical recovery happen entirely outside the
         # authority critical section: every iteration here is a bounded,
         # read-only host inspection, never a resubmission and never a held
         # database writer lock.
         result = self._poll_until_resolved(job, identity, ownership, result)
-
         return self._apply_host_result(job.job_id, identity.snapshot_operation_id, result)
+
+    def _resolve_after_stale_authority_refusal(
+        self,
+        job: PackageUpdateJob,
+        identity: PackageUpdateSnapshotIdentity,
+        ownership: SnapshotOwnership,
+    ) -> SnapshotStageResult:
+        """Decide liveness after a refused NEW-submission attempt.
+
+        ``execute_snapshot_submission_if_current`` refused BEFORE the
+        submission-only host callback ever ran: the host was never asked to
+        submit anything for this attempt, and stale authority can never
+        authorize one. But that refusal must not fence this job's single
+        global destructive slot forever purely because Hubinet's own
+        authority context moved on -- the resource/source may be gone or
+        replaced for good, so every future retry would repeat the identical
+        refusal.
+
+        Liveness is restored with a FRESH host read, never the one this
+        attempt started with. Trusting the earlier read would itself be a
+        race: another invocation can enter its own submission critical
+        section and actually submit in the gap between this attempt's first
+        read and its own authority refusal.
+        ``execute_snapshot_submission_if_current`` only serializes Hubinet's
+        own writers against each other -- reconciliation cannot invalidate
+        authority while a submission critical section is open -- so by the
+        time THIS attempt observes a refusal, any concurrent submission
+        attempt that was authorized has already crossed whatever durable
+        host journal phase it reached and released the writer lock. A fresh
+        read can see that; the stale first read cannot.
+
+        If the fresh read still proves this exact operation identity has
+        never crossed its submission boundary (``absent``/``intent``), the
+        job is safely terminalized as `blocked` and the slot is released --
+        that is the ONLY thing an unsubmitted proof after the fact may do.
+        Anything else the fresh read shows -- a submission already in
+        flight, a terminal outcome, or the read itself failing to prove
+        anything -- is recovered through the ordinary evidence pipeline
+        exactly as if this attempt had never tried to submit: never
+        released as unsubmitted, and never resubmitted.
+        """
+
+        fresh = self._read_inspection(job, identity, ownership)
+
+        if fresh.submission_state in _SUBMISSION_PERMITTED_STATES:
+            reason = (
+                "package update job authority is stale and a fresh host "
+                "read still proves this operation was never submitted"
+            )
+            try:
+                blocked_job = (
+                    self._authority.block_package_update_before_snapshot_submission(
+                        job.job_id, reason
+                    )
+                )
+            except Exception:  # noqa: BLE001 - a contradicted proof stays fenced
+                return self._uncertain(
+                    job.job_id,
+                    "stale authority proved unsubmitted by a fresh host read, "
+                    "but durable job state contradicts it",
+                )
+            return SnapshotStageResult(
+                outcome=SnapshotOperationOutcome.NOT_SUBMITTED,
+                job=blocked_job,
+                reason=reason,
+            )
+
+        return self._finish(job, identity, ownership, fresh)
 
     def _read_inspection(
         self,

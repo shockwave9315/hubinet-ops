@@ -2469,35 +2469,70 @@ def test_only_the_durable_proof_releases_a_never_submitted_job(
 # ===========================================================================
 
 
-def test_replacement_after_intent_commit_refuses_a_new_submission(
+def test_replacement_after_intent_commit_releases_the_slot_via_a_fresh_read(
     tmp_path: Path,
 ) -> None:
     """A. The exact remaining race, at the Python boundary.
 
     Discovery reconciliation invalidates current Hubinet authority strictly
     AFTER the write-ahead intent commits and BEFORE the submission critical
-    section runs. The host is never even asked whether it could submit.
+    section runs. The host is never even asked whether it could submit -- a
+    stale authority context always refuses a NEW submission. But because this
+    resource/source is gone or replaced for good, every future retry would
+    repeat that identical refusal, so a permanently stale authority context
+    must not fence the job's global slot forever: a FRESH host read, taken
+    strictly AFTER the refusal, that still proves nothing was ever submitted
+    is what safely releases it.
     """
 
     _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+    # Break THIS job's own resource before a second, unrelated resource
+    # exists -- otherwise `_break_incarnation_continuity_at_the_same_locator`
+    # (which always targets `store.list_resources()[0]`) could break the
+    # wrong one.
     _break_incarnation_continuity_at_the_same_locator(store, authority)
+    other_resource, _, other_approval = _add_approved_resource(store, authority)
 
     host = FakeHostControl()
     orchestrator = PackageUpdateSnapshotOrchestrator(authority, host)
 
-    with pytest.raises(AuthorityConflict, match="authority context is stale"):
-        orchestrator.ensure_job_owned_snapshot(job.job_id)
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
 
-    # The host was read for durable evidence (which never requires current
-    # authority), but it was never asked to submit anything.
-    assert len(host.inspect_calls) == 1
+    # Read for durable evidence TWICE: the initial read that permitted
+    # attempting a submission, and the fresh post-refusal read that actually
+    # decides liveness. Never asked to submit anything either time.
+    assert len(host.inspect_calls) == 2
     assert host.create_calls == []
-    stalled = store.package_update_job(job.job_id)
-    assert stalled.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
-    assert stalled.snapshot_task_upid is None
+
+    assert result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED
+    blocked = store.package_update_job(job.job_id)
+    assert blocked.status is PackageUpdateJobStatus.BLOCKED
+    assert blocked.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert blocked.snapshot_task_upid is None
+    assert blocked.snapshot_confirmed_at is None
+    assert blocked.terminal_reason
+    events = store.list_package_update_job_events(job.job_id)
+    assert (
+        events[-1].event_type
+        is PackageUpdateEventType.SNAPSHOT_BLOCKED_BEFORE_SUBMISSION
+    )
+
+    # Startup recovery leaves the terminal job exactly as it is.
+    before_events = store.list_package_update_job_events(job.job_id)
+    assert authority.recover_interrupted_package_update_jobs() == ()
+    assert store.package_update_job(job.job_id) == blocked
+    assert store.list_package_update_job_events(job.job_id) == before_events
+
+    # The global destructive slot is free again -- proved on a different
+    # resource, since this test's own staleness mechanism (reconciliation
+    # cycling the resource away and back) leaves THIS resource transitionally
+    # non-active in its own right, which is not what is being proved here.
+    successor = _issue(authority, other_resource, other_approval)
+    assert successor.status is PackageUpdateJobStatus.ACTIVE
+    assert successor.job_id != job.job_id
 
 
-def test_replacement_after_intent_commit_never_reaches_pvesh_create(
+def test_replacement_after_intent_commit_releases_the_slot_through_the_real_dark_boundary(
     tmp_path: Path,
 ) -> None:
     """A. The same witness through the real dark boundary.
@@ -2506,7 +2541,8 @@ def test_replacement_after_intent_commit_never_reaches_pvesh_create(
     host helper could independently verify stays exactly what the job froze
     at issuance. This is precisely the case a check-then-commit race would
     let through, and precisely why VMID/node/type/status are not treated as
-    incarnation proof anywhere in this stage.
+    incarnation proof anywhere in this stage. Zero PVE submissions happen at
+    any point, yet the job still reaches a safe terminal state.
     """
 
     store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
@@ -2521,19 +2557,32 @@ def test_replacement_after_intent_commit_never_reaches_pvesh_create(
     assert pve.resource_type == "lxc"
     assert pve.status == "running"
 
+    # Break THIS job's own resource before a second, unrelated resource
+    # exists -- otherwise `_break_incarnation_continuity_at_the_same_locator`
+    # (which always targets `store.list_resources()[0]`) could break the
+    # wrong one.
     _break_incarnation_continuity_at_the_same_locator(store, authority)
+    other_resource, _, other_approval = _add_approved_resource(store, authority)
 
     orchestrator = PackageUpdateSnapshotOrchestrator(
         authority, _dark_channel(pve, journal)
     )
-    with pytest.raises(AuthorityConflict, match="authority context is stale"):
-        orchestrator.ensure_job_owned_snapshot(job.job_id)
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
 
     assert pve.submissions == 0
     assert not any(argv[1] == "create" for argv in pve.argvs)
-    stalled = store.package_update_job(job.job_id)
-    assert stalled.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
-    assert stalled.snapshot_task_upid is None
+    assert result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED
+    blocked = store.package_update_job(job.job_id)
+    assert blocked.status is PackageUpdateJobStatus.BLOCKED
+    assert blocked.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert blocked.snapshot_task_upid is None
+    assert blocked.snapshot_confirmed_at is None
+
+    # The global destructive slot is free again -- proved on a different
+    # resource; see the sibling Python-boundary test for why.
+    successor = _issue(authority, other_resource, other_approval)
+    assert successor.status is PackageUpdateJobStatus.ACTIVE
+    assert successor.job_id != job.job_id
 
 
 def test_writer_cannot_interleave_inside_the_submission_critical_section(
@@ -2575,7 +2624,7 @@ def test_writer_cannot_interleave_inside_the_submission_critical_section(
     assert attempted == [job.job_id]
 
 
-def test_reentry_with_intent_only_and_stale_authority_refuses_without_fabricating_identity(
+def test_reentry_with_intent_only_and_stale_authority_terminalizes_via_a_fresh_read(
     tmp_path: Path,
 ) -> None:
     """C. Re-entry: the host journal proves no submission was ever attempted.
@@ -2583,9 +2632,11 @@ def test_reentry_with_intent_only_and_stale_authority_refuses_without_fabricatin
     One prior attempt reaches the host and durably records intent, but a
     concurrent PVE operation blocks it before it ever submits -- the journal
     never advances past `intent`. On retry, current authority has since gone
-    stale. A NEW submission is still permitted in principle (nothing was ever
-    sent), but it must still be refused before the host is asked to submit,
-    and never by trying to prove this is "the same LXC" from live PVE facts.
+    stale, so a NEW submission is refused, never by trying to prove this is
+    "the same LXC" from live PVE facts. Because the durable host journal
+    independently still proves nothing was ever submitted, the job is safely
+    terminalized rather than fenced forever by an authority context that will
+    never become current again.
     """
 
     store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
@@ -2610,15 +2661,217 @@ def test_reentry_with_intent_only_and_stale_authority_refuses_without_fabricatin
     )
 
     pve.lock = None
+    # Break THIS job's own resource before a second, unrelated resource
+    # exists -- otherwise `_break_incarnation_continuity_at_the_same_locator`
+    # (which always targets `store.list_resources()[0]`) could break the
+    # wrong one.
     _break_incarnation_continuity_at_the_same_locator(store, authority)
+    other_resource, _, other_approval = _add_approved_resource(store, authority)
 
-    with pytest.raises(AuthorityConflict, match="authority context is stale"):
-        orchestrator.ensure_job_owned_snapshot(job.job_id)
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
 
     assert pve.submissions == 0
     assert not any(argv[1] == "create" for argv in pve.argvs)
-    stalled = store.package_update_job(job.job_id)
-    assert stalled.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED
+    blocked = store.package_update_job(job.job_id)
+    assert blocked.status is PackageUpdateJobStatus.BLOCKED
+    assert blocked.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert blocked.snapshot_task_upid is None
+
+    # The global destructive slot is free again -- proved on a different
+    # resource; see the sibling Python-boundary test for why.
+    successor = _issue(authority, other_resource, other_approval)
+    assert successor.status is PackageUpdateJobStatus.ACTIVE
+    assert successor.job_id != job.job_id
+
+
+def test_the_initial_pre_refusal_inspection_is_never_trusted_after_refusal(
+    tmp_path: Path,
+) -> None:
+    """The mandatory race witness for the post-refusal liveness fix.
+
+    Invocation B reads `absent`/`intent` -- a NEW submission looks possible.
+    Before B's own submission critical section runs, invocation A gets
+    there first, is authorized, and actually submits: the host's durable
+    journal moves on to `task_known`. THEN B's authority is invalidated and
+    its critical section refuses. If B trusted the FIRST read it started
+    with, it would wrongly terminalize a job whose snapshot may already be
+    in flight. It must instead take a fresh read after the refusal and see
+    what invocation A left behind.
+    """
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+    # Break THIS job's own resource before a second, unrelated resource
+    # exists -- otherwise `_break_incarnation_continuity_at_the_same_locator`
+    # (which always targets `store.list_resources()[0]`) could break the
+    # wrong one.
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+    other_resource, _, other_approval = _add_approved_resource(store, authority)
+
+    before = HostSnapshotResult(
+        outcome=SnapshotOperationOutcome.UNCERTAIN,
+        snapshot_operation_id=identity.snapshot_operation_id,
+        submission_state=HostSubmissionState.ABSENT,
+    )
+    after = HostSnapshotResult(
+        outcome=SnapshotOperationOutcome.UNCERTAIN,
+        snapshot_operation_id=identity.snapshot_operation_id,
+        task_upid=UPID,
+        submission_state=HostSubmissionState.TASK_KNOWN,
+        reason="another invocation's authorized submission is already in flight",
+    )
+
+    class _RacingHostControl:
+        """Simulates a concurrent, already-authorized submission by another
+        invocation landing between this invocation's two reads."""
+
+        def __init__(self) -> None:
+            self.inspect_calls = 0
+            self.create_calls = 0
+
+        def inspect_job_snapshot_state(self, **kwargs) -> HostSnapshotResult:
+            self.inspect_calls += 1
+            return before if self.inspect_calls == 1 else after
+
+        def ensure_pre_update_snapshot_submitted(self, **kwargs) -> HostSnapshotResult:
+            self.create_calls += 1
+            raise AssertionError(
+                "authority was stale: the host must never be asked to submit"
+            )
+
+    host = _RacingHostControl()
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, host, task_poll_timeout_seconds=0.0
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    # The bounded read-only poll loop takes one more look (already timed
+    # out) after the fresh post-refusal read finds a known task; it never
+    # sleeps for real here because the poll bound is already exhausted.
+    assert host.inspect_calls == 3
+    assert host.create_calls == 0
+
+    # The OLD `absent` read never releases the job: it must recover the task
+    # the fresh read actually found, not fabricate a "never submitted" proof
+    # from stale evidence.
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert fenced.snapshot_task_upid == UPID
+    with pytest.raises(AuthorityConflict, match="global slot"):
+        _issue(authority, other_resource, other_approval)
+
+
+def test_the_race_is_closed_through_the_real_dark_boundary(tmp_path: Path) -> None:
+    """The same race witness, but invocation A's submission is real.
+
+    A concurrent invocation is simulated by submitting through the SAME real
+    dark channel (the same PVE fake and the same on-disk journal) directly,
+    in between this invocation's own pre- and post-refusal reads -- proving
+    the fresh re-read observes genuinely durable host state, not a value
+    contrived at the Python level.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    real_channel = _dark_channel(pve, journal)
+
+    class _RaceThroughRealHelper:
+        def __init__(self) -> None:
+            self.inspect_calls = 0
+
+        def inspect_job_snapshot_state(self, **kwargs) -> HostSnapshotResult:
+            self.inspect_calls += 1
+            if self.inspect_calls == 2:
+                # Invocation A: already authorized (bypassing authority here
+                # only to stand in for a DIFFERENT, still-current invocation)
+                # submits for real through the same host and journal.
+                real_channel.ensure_pre_update_snapshot_submitted(
+                    snapshot_operation_id=identity.snapshot_operation_id,
+                    snapshot_name=identity.snapshot_name,
+                    vmid=job.expected_vmid,
+                    expected_node=job.expected_node_name,
+                    ownership=ownership,
+                )
+            return real_channel.inspect_job_snapshot_state(**kwargs)
+
+        def ensure_pre_update_snapshot_submitted(self, **kwargs) -> HostSnapshotResult:
+            raise AssertionError(
+                "authority was stale: the host must never be asked to submit"
+            )
+
+    host = _RaceThroughRealHelper()
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, host, task_poll_timeout_seconds=0.0
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert host.inspect_calls == 3
+    assert pve.submissions == 1
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert fenced.snapshot_task_upid == upid
+
+
+def test_an_unreadable_post_refusal_inspection_stays_fenced(tmp_path: Path) -> None:
+    """D + unknown-evidence guard: the fresh re-read itself can fail closed.
+
+    If the post-refusal read cannot prove anything -- a transport failure,
+    a malformed/unknown submission_state, a corrupt journal -- that must
+    never be treated as proof of non-submission. The job stays active and
+    fenced, never blocked and never resubmitted.
+    """
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+    # Break THIS job's own resource before a second, unrelated resource
+    # exists -- otherwise `_break_incarnation_continuity_at_the_same_locator`
+    # (which always targets `store.list_resources()[0]`) could break the
+    # wrong one.
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+    other_resource, _, other_approval = _add_approved_resource(store, authority)
+
+    before = HostSnapshotResult(
+        outcome=SnapshotOperationOutcome.UNCERTAIN,
+        snapshot_operation_id=identity.snapshot_operation_id,
+        submission_state=HostSubmissionState.ABSENT,
+    )
+
+    class _FailingSecondInspect:
+        def __init__(self) -> None:
+            self.inspect_calls = 0
+            self.create_calls = 0
+
+        def inspect_job_snapshot_state(self, **kwargs) -> HostSnapshotResult:
+            self.inspect_calls += 1
+            if self.inspect_calls == 1:
+                return before
+            raise RuntimeError("transport lost the second inspection")
+
+        def ensure_pre_update_snapshot_submitted(self, **kwargs) -> HostSnapshotResult:
+            self.create_calls += 1
+            raise AssertionError(
+                "authority was stale: the host must never be asked to submit"
+            )
+
+    host = _FailingSecondInspect()
+    result = PackageUpdateSnapshotOrchestrator(
+        authority, host
+    ).ensure_job_owned_snapshot(job.job_id)
+
+    assert host.inspect_calls == 2
+    assert host.create_calls == 0
+    assert result.outcome is SnapshotOperationOutcome.UNCERTAIN
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    with pytest.raises(AuthorityConflict, match="global slot"):
+        _issue(authority, other_resource, other_approval)
 
 
 def test_reentry_after_submission_recovers_despite_stale_authority(
