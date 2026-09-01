@@ -234,31 +234,60 @@ proved to belong to the same LXC PVE showed several minutes ago (see
 stable through the submission boundary, and the host independently
 re-validates the live PVE target immediately before it ever submits.
 
-**Activation gate: SQLite writer-contention policy.** `execute_snapshot_submission_if_current`
+**SQLite writer-contention policy.** `execute_snapshot_submission_if_current`
 and `resolve_pre_submission_block` deliberately hold the authority store's
 `BEGIN IMMEDIATE` writer lock across one bounded SSH host round trip each —
 that serialization is load-bearing (see above and "the pre-submission block
-critical section" below) and must remain. `InventoryAuthorityStore` currently
-sizes `PRAGMA busy_timeout`/connection `timeout` from one fixed
-`BUSY_TIMEOUT_MS = 5000` constant shared by every writer, including ordinary
-discovery/package-scan authority writes that have no reason to wait on a host
-round trip at all. Once snapshot execution is production-reachable, a
-legitimate concurrent writer (discovery, a package scan, approval) could then
-observe `database is locked` purely because a valid snapshot host round trip
-inside one of these two critical sections legitimately took longer than that
-generic timeout, even though the snapshot critical section itself was
-operating correctly. Before snapshot execution becomes production-reachable,
-SQLite writer contention/wait policy must be sized or configured consistently
-with the maximum bounded snapshot host critical-section duration, so normal
-concurrent authority writers do not fail merely because a valid snapshot host
-round trip exceeds the generic DB busy timeout. This is deliberately not
-solved in this dark stage: today there is no production caller of either
-critical section, so no concurrent writer can actually contend with one, and
-a per-critical-section busy-timeout override or similar mechanism is new
-runtime/configuration surface this PR does not introduce. This is NOT
-permission to lengthen or hold any polling transaction open — task polling
-and canonical confirmation stay strictly outside both writer critical
-sections (see above), and this gate does not change that.
+critical section" below) and must remain. Holding that lock across a host
+round trip means any other writer (discovery, a package scan, approval)
+waiting on the same lock must be willing to wait at least as long as that
+round trip can legitimately run, or it fails with `database is locked` for no
+reason of its own. `app/inventory/contention_policy.py` is the single source
+of truth for that relationship instead of an unrelated fixed timeout:
+
+- `MAX_SNAPSHOT_HOST_TIMEOUT_SECONDS = 90` is the deliberate upper bound
+  `SshPackageUpdateSnapshotHostControl` accepts for `timeout_seconds`,
+  enforced in its constructor before any SSH or subprocess execution. It
+  replaces the historical, unrelated 3600s ceiling: both snapshot mutations
+  are submission/seal-only and never poll a PVE task to completion (see
+  above and `deploy/hubinet-package-snapshot-helper.py`), so this bounds one
+  `pvesh` trigger plus a durable journal write, not PVE's own asynchronous
+  task. The canonical 60s test timeout is ordinary evidence of a healthy
+  round trip, not this ceiling.
+- `BOUNDED_PROCESS_CLEANUP_SECONDS = 5` is the bounded process runner's own
+  `Popen.wait` reap allowance after it kills a timed-out subprocess
+  (`app.package_scan_host_control._bounded_process_runner`, reused by the
+  snapshot transport) — real wall-clock time the critical section spends
+  before returning, not free slack.
+- `MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS = 95` is their sum: the
+  worst-case duration one snapshot critical section may hold the writer
+  lock.
+- `WRITER_SCHEDULING_MARGIN_SECONDS = 10` is an explicit margin on top of
+  that worst case for scheduling jitter and SQLite's own lock handoff.
+- `AUTHORITY_WRITER_WAIT_BUDGET_SECONDS = 105` (`_MS = 105_000`) is what
+  `InventoryAuthorityStore` now sizes both `PRAGMA busy_timeout` and
+  `sqlite3.connect(timeout=...)` from, for every connection, replacing the
+  previous fixed `BUSY_TIMEOUT_MS = 5000`.
+
+A module-level assertion in `contention_policy.py` enforces
+`AUTHORITY_WRITER_WAIT_BUDGET_SECONDS > MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS`
+at import time, and the host-control constructor's timeout ceiling makes a
+legal critical section longer than that impossible to construct — so it is
+no longer possible to configure a snapshot host round trip long enough to
+legitimately exhaust the store's writer wait budget. This guarantees exactly
+one thing: one healthy bounded snapshot critical section cannot, by itself,
+cause an ordinary concurrent writer to fail merely because it waited less
+than a valid snapshot host round trip could legitimately take. It does not
+guarantee fairness across arbitrarily many queued writers, freedom from
+starvation under continuous write load, or recovery from a permanently
+wedged transaction; a writer still blocked past the budget still fails with
+`database is locked`, deliberately — this is bounded waiting, not infinite
+retry. This is NOT permission to lengthen or hold any polling transaction
+open — task polling and canonical confirmation stay strictly outside both
+writer critical sections (see above), and this policy does not change that.
+Production snapshot execution is still not reachable (see below), so no
+production writer can yet actually contend with either critical section;
+this closes the policy gap regardless, before that activation.
 
 **Liveness after a refusal, and the pre-submission block critical section.**
 A stale authority context always refuses a NEW submission —

@@ -178,19 +178,24 @@ unimplemented future stage.
   selection contract exists; executing a rollback is left to the activation
   stage rather than shipped to a lower safety bar. There is also no snapshot
   deletion or retention in this stage, and no workload package mutation.
-- **Activation requirement:** the two snapshot critical sections
-  (`execute_snapshot_submission_if_current`, `resolve_pre_submission_block`)
-  correctly hold the authority store's writer lock across one bounded host
-  round trip each; that serialization stays unchanged and correct in this
-  dark stage because nothing production-reachable can invoke it yet. Before
-  production activation, SQLite writer contention/wait policy must be sized
-  or configured consistently with the maximum bounded snapshot host
-  critical-section duration, so an ordinary concurrent authority writer
-  (discovery, package scan, approval) does not fail merely because a valid
-  snapshot host round trip legitimately exceeds today's one fixed
-  `BUSY_TIMEOUT_MS` shared by every writer. See `ARCHITECTURE.md`, "Activation
-  gate: SQLite writer-contention policy". This is not a defect of the current
-  dark stage and is not permission to hold a polling transaction open.
+- **Implemented internal safety/liveness infrastructure:** the two snapshot
+  critical sections (`execute_snapshot_submission_if_current`,
+  `resolve_pre_submission_block`) correctly hold the authority store's writer
+  lock across one bounded host round trip each; that serialization is
+  unchanged. `app/inventory/contention_policy.py` now sizes the authority
+  store's SQLite writer wait budget (`AUTHORITY_WRITER_WAIT_BUDGET_MS`,
+  105s) from an explicit, machine-enforced relationship to the maximum
+  bounded snapshot host critical-section duration
+  (`MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS`, 95s) plus a scheduling
+  margin, replacing the previous one fixed `BUSY_TIMEOUT_MS = 5000` shared by
+  every writer. `SshPackageUpdateSnapshotHostControl` now rejects a
+  `timeout_seconds` above `MAX_SNAPSHOT_HOST_TIMEOUT_SECONDS` (90s) before
+  any SSH or process execution, so a snapshot host round trip long enough to
+  legitimately exhaust that writer budget can no longer be configured. See
+  `ARCHITECTURE.md`, "SQLite writer-contention policy" for the exact values
+  and what this does and does not guarantee. This is not permission to hold a
+  polling transaction open; task polling and canonical confirmation still run
+  strictly outside both writer critical sections.
 
 ## Next
 

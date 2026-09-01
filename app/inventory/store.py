@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import uuid
 
+from .contention_policy import AUTHORITY_WRITER_WAIT_BUDGET_MS
 from .models import (
     AuthorityDatabaseRejected,
     AuthorityInvariantError,
@@ -47,7 +48,16 @@ from .models import (
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
 AUTHORITY_SCHEMA_VERSION = 10
-BUSY_TIMEOUT_MS = 5_000
+
+#: Every authority connection's writer wait policy -- both `PRAGMA
+#: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
+#: value, so they cannot silently diverge. It is derived, not chosen here:
+#: see `app.inventory.contention_policy` for the enforced relationship
+#: between this budget and the maximum bounded snapshot host critical
+#: section that may legitimately hold this store's one writer lock across a
+#: host round trip (`InventoryAuthority.execute_snapshot_submission_if_current`,
+#: `InventoryAuthority.resolve_pre_submission_block`).
+BUSY_TIMEOUT_MS = AUTHORITY_WRITER_WAIT_BUDGET_MS
 
 _REQUIRED_TABLES = frozenset(
     {
