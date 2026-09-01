@@ -3126,7 +3126,7 @@ class InventoryAuthority:
             # still owns the writer lock -- never before BEGIN IMMEDIATE,
             # and never trusted as a value the caller precomputed.
             mutation_state, reason, evidence = seal()
-            self._after_pre_submission_block_proof(
+            self._after_pre_mutation_block_proof(
                 connection, job_id=canonical_job_id
             )
             if mutation_state is HostMutationState.SEALED_NOT_SUBMITTED:
@@ -3482,6 +3482,16 @@ class InventoryAuthority:
         authorize. Both are in one transaction, so this is exactly the point
         where an interleaving submission critical section would otherwise be
         able to race the block.
+        """
+
+    def _after_pre_mutation_block_proof(
+        self, connection: sqlite3.Connection, *, job_id: str
+    ) -> None:
+        """The same seam for :meth:`resolve_pre_mutation_block`.
+
+        Deliberately its own seam rather than a reuse of the snapshot one:
+        the two release paths are independent families, and a test that
+        overrides one must not silently fire inside the other.
         """
 
     @staticmethod

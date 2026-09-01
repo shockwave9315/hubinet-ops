@@ -1598,6 +1598,56 @@ def test_an_unreadable_host_is_never_a_release(tmp_path: Path) -> None:
     assert guest.mutations == []
 
 
+def test_a_submission_that_wins_the_writer_lock_defeats_a_racing_seal(
+    tmp_path: Path,
+) -> None:
+    """The release path and the submission path share one writer lock.
+
+    Both critical sections take the authority store's single writer lock, so
+    they can never interleave: whichever gets it first reaches the host
+    first. This drives the seal transaction's own in-transaction seam to
+    prove the block cannot be committed once the host has already crossed
+    submission -- the check-then-commit race, mirrored onto the release path.
+    """
+
+    _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
+        tmp_path
+    )
+    request = authority.package_update_mutation_request(job.job_id)
+    prepared = host.prepare_exact_package_mutation(request)
+    authority.arm_package_update_mutation(job.job_id, job_packages(job))
+
+    def _submit_inside_the_seal(connection, *, job_id):
+        # A concurrent, authorized submission crossing the host boundary
+        # after the seal was attempted. It can only win if it took the host
+        # lease first, so the seal must observe the post-submission phase.
+        host.execute_exact_package_mutation(
+            request,
+            prepared_evidence_digest=prepared.prepared_evidence_digest,
+        )
+
+    seals: list[str] = []
+
+    def _seal_then_submit():
+        # Model the seal LOSING the host lease race: submission already
+        # journaled `submitted` before the seal read the journal.
+        _submit_inside_the_seal(None, job_id=job.job_id)
+        fresh = host.seal_mutation_never_submitted(request)
+        seals.append(fresh.state.value)
+        return fresh.state, "seal attempted", fresh
+
+    blocked, fresh = authority.resolve_pre_mutation_block(
+        job.job_id, _seal_then_submit
+    )
+
+    assert blocked is False
+    assert seals == ["terminal_success"]
+    assert guest.mutations == [1]
+    still_owned = store.package_update_job(job.job_id)
+    assert still_owned.status is PackageUpdateJobStatus.ACTIVE
+    assert still_owned.checkpoint is PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED
+
+
 def test_a_failed_seal_never_releases_the_job(tmp_path: Path) -> None:
     _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
         tmp_path
