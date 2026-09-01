@@ -69,7 +69,7 @@ def _identity(ownership: dict) -> tuple[str, str]:
     )
 
 
-def _request(operation="create_pre_update_snapshot", **overrides) -> dict:
+def _request(operation="ensure_pre_update_snapshot_submitted", **overrides) -> dict:
     ownership = overrides.pop("ownership", _ownership())
     operation_id, snapshot_name = _identity(ownership)
     request = {
@@ -194,13 +194,13 @@ def _handle(request, pve, journal):
 def test_only_the_two_typed_operations_exist() -> None:
     assert helper.OPERATIONS == (
         "inspect_job_snapshot_state",
-        "create_pre_update_snapshot",
+        "ensure_pre_update_snapshot_submitted",
     )
 
 
 def test_exact_request_shape_is_required() -> None:
     assert helper.validate_request(_request())["operation"] == (
-        "create_pre_update_snapshot"
+        "ensure_pre_update_snapshot_submitted"
     )
     for mutate in (
         lambda r: r.pop("ownership"),
@@ -461,7 +461,16 @@ def test_a_submitted_operation_recovers_only_on_strict_canonical_evidence(
     assert pve.submissions == 0
 
 
-def test_a_known_task_is_polled_and_never_resubmitted(tmp_path: Path) -> None:
+def test_a_known_task_is_never_polled_or_resubmitted_by_the_submission_operation(
+    tmp_path: Path,
+) -> None:
+    """The mutating operation returns the instant a task is journaled.
+
+    It must never poll PVE's own asynchronous task to completion: that is
+    the read-only operation's job, exercised below. Zero PVE calls at all
+    proves this returns promptly rather than blocking internally.
+    """
+
     ownership = _ownership()
     operation_id, snapshot_name = _identity(ownership)
     journal = _journal(tmp_path)
@@ -488,12 +497,73 @@ def test_a_known_task_is_polled_and_never_resubmitted(tmp_path: Path) -> None:
     response = _handle(_request(), pve, journal)
 
     assert pve.submissions == 0
+    assert response["outcome"] == "uncertain"
+    assert response["submission_state"] == "task_known"
+    assert response["task_upid"] == UPID
+    assert pve.argvs == []
+
+
+def test_inspecting_a_known_task_reads_it_exactly_once_and_never_submits(
+    tmp_path: Path,
+) -> None:
+    """Task completion is observed by the read-only operation, one read at a
+    time -- never a poll-to-completion loop, and never a resubmission."""
+
+    ownership = _ownership()
+    operation_id, snapshot_name = _identity(ownership)
+    journal = _journal(tmp_path)
+    journal.write(
+        {
+            "journal_version": 1,
+            "snapshot_operation_id": operation_id,
+            "request_fingerprint": helper.request_fingerprint(
+                helper.validate_request(_request())
+            ),
+            "vmid": VMID,
+            "expected_node": NODE,
+            "snapshot_name": snapshot_name,
+            "phase": "task_known",
+            "task_upid": UPID,
+        }
+    )
+    pve = FakePve(
+        snapshots=[
+            {"name": "current", "description": "You are here!"},
+            _completed_snapshot(ownership, snapshot_name),
+        ]
+    )
+    response = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+
+    assert pve.submissions == 0
     assert response["outcome"] == "completed"
     assert response["task_upid"] == UPID
-    assert any("/tasks/" in argv[2] for argv in pve.argvs if argv[1] == "get")
+    assert response["submission_state"] == "task_known"
+    assert len([argv for argv in pve.argvs if "/tasks/" in argv[2]]) == 1
 
 
-def test_an_identical_retry_replays_the_terminal_answer(tmp_path: Path) -> None:
+def test_a_running_task_is_reported_without_polling(tmp_path: Path) -> None:
+    """The helper never blocks on PVE's own asynchronous task."""
+
+    journal = _journal(tmp_path)
+    pve = FakePve(task_sequence=[{"upid": UPID, "status": "running"}])
+
+    submitted = _handle(_request(), pve, journal)
+    assert submitted["outcome"] == "uncertain"
+    assert submitted["submission_state"] == "task_known"
+    assert pve.submissions == 1
+    assert not any("/tasks/" in argv[2] for argv in pve.argvs if argv[1] == "get")
+
+    inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert inspected["outcome"] == "absent"
+    assert inspected["submission_state"] == "task_known"
+    assert pve.submissions == 1
+    # Exactly one task-status read: never an internal poll loop.
+    assert len([argv for argv in pve.argvs if "/tasks/" in argv[2]]) == 1
+
+
+def test_an_identical_retry_never_resubmits_and_inspect_replays_the_outcome(
+    tmp_path: Path,
+) -> None:
     ownership = _ownership()
     operation_id, snapshot_name = _identity(ownership)
     journal = _journal(tmp_path)
@@ -509,9 +579,19 @@ def test_an_identical_retry_replays_the_terminal_answer(tmp_path: Path) -> None:
     first = _handle(_request(), pve, journal)
     second = _handle(_request(), pve, journal)
 
-    assert first["outcome"] == second["outcome"] == "completed"
+    # The second attempt reattaches to the identical journaled operation
+    # instead of submitting again.
+    assert first["outcome"] == second["outcome"] == "uncertain"
+    assert first["submission_state"] == second["submission_state"] == "task_known"
     assert pve.submissions == 1
-    assert journal.read(operation_id)["phase"] == "terminal"
+    assert journal.read(operation_id)["phase"] == "task_known"
+
+    # The read-only operation observes the same completed outcome, however
+    # many times it is asked, and still never resubmits.
+    inspected_first = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    inspected_second = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert inspected_first["outcome"] == inspected_second["outcome"] == "completed"
+    assert pve.submissions == 1
 
 
 def test_the_same_operation_identity_with_a_different_request_is_refused(
@@ -563,7 +643,9 @@ def test_journal_writes_are_atomic_and_leave_no_temporary_file(
     _handle(_request(), pve, journal)
     assert not list(journal.directory.glob("*.tmp"))
     record = json.loads((journal.directory / f"op-{operation_id}.json").read_text())
-    assert record["phase"] == "terminal"
+    # The submission-only operation returns promptly once the task is
+    # journaled; it does not itself finalize the operation.
+    assert record["phase"] == "task_known"
     assert record["snapshot_operation_id"] == operation_id
 
 
@@ -573,33 +655,33 @@ def test_journal_writes_are_atomic_and_leave_no_temporary_file(
 
 
 def test_a_task_failure_is_terminal_and_never_confirms(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
     pve = FakePve(
         task_sequence=[{"upid": UPID, "status": "stopped", "exitstatus": "boom"}]
     )
-    response = _handle(_request(), pve, _journal(tmp_path))
-    assert response["outcome"] == "failed"
+    submitted = _handle(_request(), pve, journal)
+    assert submitted["outcome"] == "uncertain"
+    assert submitted["submission_state"] == "task_known"
+    assert pve.submissions == 1
+
+    inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert inspected["outcome"] == "failed"
     assert pve.submissions == 1
 
 
-def test_a_successful_task_without_the_canonical_snapshot_is_uncertain(
+def test_a_successful_task_without_the_canonical_snapshot_never_confirms(
     tmp_path: Path,
 ) -> None:
     # Task says OK but the canonical listing never gains our snapshot.
+    journal = _journal(tmp_path)
     pve = FakePve()
-    response = _handle(_request(), pve, _journal(tmp_path))
-    assert response["outcome"] == "uncertain"
-    assert "canonical state does not show" in response["reason"]
+    submitted = _handle(_request(), pve, journal)
+    assert submitted["outcome"] == "uncertain"
+    assert submitted["submission_state"] == "task_known"
 
-
-def test_a_task_still_running_at_the_bound_is_uncertain(
-    tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.setattr(helper, "TASK_POLL_TIMEOUT_SECONDS", 0.0)
-    pve = FakePve(task_sequence=[{"upid": UPID, "status": "running"}])
-    response = _handle(_request(), pve, _journal(tmp_path))
-    assert response["outcome"] == "uncertain"
-    assert "still running" in response["reason"]
-    assert pve.submissions == 1
+    inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert inspected["outcome"] != "completed"
+    assert inspected["outcome"] == "absent"
 
 
 def test_a_submission_that_returns_no_usable_task_identity_is_uncertain(
@@ -610,6 +692,7 @@ def test_a_submission_that_returns_no_usable_task_identity_is_uncertain(
         response = _handle(_request(), pve, _journal(tmp_path / str(returncode)))
         assert response["outcome"] == "uncertain"
         assert "task identity" in response["reason"]
+        assert response["submission_state"] == "submitted"
 
 
 @pytest.mark.parametrize("exitstatus", ["OK", "WARNINGS: 2"])
@@ -618,13 +701,15 @@ def test_pve_non_error_exit_statuses_are_accepted(
 ) -> None:
     ownership = _ownership()
     _, snapshot_name = _identity(ownership)
+    journal = _journal(tmp_path / exitstatus[:2])
     pve = FakePve(
         task_sequence=[{"upid": UPID, "status": "stopped", "exitstatus": exitstatus}]
     )
     pve.on_submit = lambda p: p.snapshots.append(
         _completed_snapshot(ownership, snapshot_name)
     )
-    response = _handle(_request(), pve, _journal(tmp_path / exitstatus[:2]))
+    _handle(_request(), pve, journal)
+    response = _handle(_request("inspect_job_snapshot_state"), pve, journal)
     assert response["outcome"] == "completed"
 
 
@@ -641,11 +726,13 @@ def test_a_terminal_task_without_a_non_error_status_never_confirms(
 ) -> None:
     ownership = _ownership()
     _, snapshot_name = _identity(ownership)
+    journal = _journal(tmp_path)
     pve = FakePve(task_sequence=[status])
     pve.on_submit = lambda p: p.snapshots.append(
         _completed_snapshot(ownership, snapshot_name)
     )
-    response = _handle(_request(), pve, _journal(tmp_path))
+    _handle(_request(), pve, journal)
+    response = _handle(_request("inspect_job_snapshot_state"), pve, journal)
     # 'stopped' alone is never success: this is a failure, not a confirmation.
     assert response["outcome"] == "failed"
 
@@ -714,7 +801,11 @@ def test_snapshot_mutation_is_serialized_per_vmid_with_a_kernel_flock(
     pve.on_submit = lambda p: p.snapshots.append(
         _completed_snapshot(ownership, snapshot_name)
     )
-    assert _handle(_request(), pve, journal)["outcome"] == "completed"
+    submitted = _handle(_request(), pve, journal)
+    assert submitted["outcome"] == "uncertain"
+    assert submitted["submission_state"] == "task_known"
+    inspected = _handle(_request("inspect_job_snapshot_state"), pve, journal)
+    assert inspected["outcome"] == "completed"
 
 
 def test_different_vmids_use_different_locks(tmp_path: Path) -> None:
@@ -848,7 +939,7 @@ def test_only_the_intent_phase_can_ever_reach_a_submission() -> None:
     # Structural: the submission call site is guarded so that every phase
     # other than 'intent' returns or raises before reaching it.
     source = HELPER_PATH.read_text(encoding="utf-8")
-    body = source[source.index("def _create_pre_update_snapshot"):]
+    body = source[source.index("def _ensure_submitted"):]
     body = body[: body.index("def _extract_upid")]
     assert body.count('"pvesh", "create"') == 1
     guard = body.index('if phase != "intent":')
@@ -970,7 +1061,17 @@ def test_failures_at_or_after_the_submission_boundary_are_never_not_submitted(
 
     journal.write(record)
     pve = BrokenReads()
-    response = _handle(_request(), pve, journal)
+    # A journaled "submitted" is recovered by the mutating operation itself
+    # (it must never resubmit). A journaled "task_known" is only ever
+    # observed read-only from here on: the mutating operation returns its
+    # cached facts immediately without touching PVE at all, so this failure
+    # can only manifest through the read-only inspection.
+    operation = (
+        "inspect_job_snapshot_state"
+        if phase == "task_known"
+        else "ensure_pre_update_snapshot_submitted"
+    )
+    response = _handle(_request(operation), pve, journal)
 
     assert response["ok"] is False
     assert response["error"].get("submission") == helper.SUBMISSION_UNKNOWN
@@ -1050,7 +1151,7 @@ def test_not_submitted_is_emitted_from_exactly_one_pre_submission_site() -> None
     """
 
     source = HELPER_PATH.read_text(encoding="utf-8")
-    body = source[source.index("def _create_pre_update_snapshot"):]
+    body = source[source.index("def _ensure_submitted"):]
     body = body[: body.index("def _extract_upid")]
 
     # One emission, in the create flow only.

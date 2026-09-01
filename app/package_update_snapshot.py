@@ -16,7 +16,10 @@ revalidate authority
   -> preflight_passed
   -> derive deterministic job-owned snapshot identity
   -> DURABLY COMMIT snapshot_may_have_started   (write-ahead, before any call)
-  -> dark typed host operation (submit or reattach; never a blind resubmit)
+  -> read the durable host operation state (never requires current authority)
+  -> if, and only if, that state proves no submission has crossed the door:
+       hold current authority through a SHORT critical section and submit
+  -> read-only task/canonical polling (current authority not required)
   -> terminal PVE task evidence
   -> fresh canonical PVE snapshot listing
   -> strict same-job ownership match
@@ -27,6 +30,43 @@ The write-ahead checkpoint is committed *before* the host-control call so a
 crash anywhere after it leaves a durable "a snapshot operation may already
 have been submitted" fact. That state is never treated as "definitely no
 mutation happened", never replayed, and never silently released.
+
+## The submission critical section
+
+Between the write-ahead commit and an actual new PVE submission there is a
+second, narrower race: another Hubinet writer (discovery reconciliation, a
+package scan) can invalidate this job's authority *after* it was proved and
+*before* the host is asked to submit. Re-proving authority in a separate
+transaction from the submission request is a check-then-commit race exactly
+like the one the write-ahead checkpoint itself was built to close.
+
+So a NEW submission is only ever attempted from inside
+:meth:`InventoryAuthority.execute_snapshot_submission_if_current`, which
+re-proves the job's whole current-authority context and calls the host's
+submission-only operation *while it still holds the database's writer lock*.
+Nothing else may write to this authority store while that section runs, so
+nothing can invalidate the job between the final proof and the submission
+request it authorizes. That transaction is kept as short as the submission
+request itself: the host operation it calls
+(`ensure_pre_update_snapshot_submitted`) never polls a PVE task to
+completion, so the writer lock is held only for one bounded round trip, never
+for PVE's own asynchronous task.
+
+Recovering evidence about an operation that may already have been submitted
+is a different thing entirely, and never requires current authority: reading
+the durable host operation state (`inspect_job_snapshot_state`) and polling a
+known task to completion both happen strictly *outside* this critical
+section, after it has already committed and released its writer lock. A
+stale incarnation must never cause that evidence to be discarded -- see
+`AGENTS.md` and `PRODUCT.md`.
+
+This is deliberately not a claim that PVE and this backend's authority are
+proved atomic, and it is deliberately not a claim that a snapshot is proved
+to belong to "the same LXC" PVE showed several minutes ago -- see
+`ARCHITECTURE.md`. The claim is narrower and exact: Hubinet's own current
+authority is held stable through the submission boundary, and the host
+independently re-validates the live PVE target immediately before it ever
+submits.
 
 The one exception is not an inference but a proof: the host's durable
 operation journal can show that a failure happened while the operation was
@@ -62,18 +102,21 @@ plus that same canonical evidence, without fabricating a task identity.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+import time
 from typing import Any, Protocol
 
 from app.inventory import (
+    AuthorityConflict,
     InventoryAuthority,
     ObservedSnapshot,
     PackageUpdateCheckpoint,
     PackageUpdateJob,
     PackageUpdateJobStatus,
     PackageUpdateRollbackTarget,
+    PackageUpdateSnapshotIdentity,
     SnapshotIdentityError,
     SnapshotOwnership,
     checkpoint_rank,
@@ -105,6 +148,32 @@ class SnapshotOperationOutcome(StrEnum):
     #: write-ahead uncertainty checkpoint, and it is never inferred from a
     #: canonical absence, an error name, a timeout, or a transport failure.
     NOT_SUBMITTED = "not_submitted"
+
+
+class HostSubmissionState(StrEnum):
+    """The host's own durable journal phase for one snapshot operation.
+
+    Read directly off the host's journal, never inferred from canonical PVE
+    state or an error string. Only :attr:`ABSENT` and :attr:`INTENT` prove
+    that a NEW submission is still permitted; every other value means a
+    submission attempt may already have crossed PVE's door, and this exact
+    operation identity may never be submitted again.
+    """
+
+    #: No durable journal record exists at all for this operation identity.
+    ABSENT = "absent"
+    #: A journal record exists, but the submission subprocess was never
+    #: launched for it.
+    INTENT = "intent"
+    #: A submission attempt has begun. No task identity is known yet -- the
+    #: genuinely uncertain window. Never resubmit; recovery is one bounded
+    #: canonical read, not a retry loop.
+    SUBMITTED = "submitted"
+    #: PVE returned a task identity for this operation. The task itself may
+    #: still be running; poll it via ``inspect_job_snapshot_state``.
+    TASK_KNOWN = "task_known"
+    #: A final outcome was recorded for this operation identity.
+    TERMINAL = "terminal"
 
 
 class SnapshotTaskState(StrEnum):
@@ -156,6 +225,11 @@ class HostSnapshotResult:
     snapshots: tuple[ObservedSnapshot, ...] | None = None
     #: Bounded classification/reason text. Never raw PVE logs or command text.
     reason: str | None = None
+    #: The host's own durable journal phase for this operation, read
+    #: directly off it. ``None`` only for an older host that predates this
+    #: field, which the caller must treat exactly like ``SUBMITTED`` --
+    #: never a licence to submit, and never something to poll.
+    submission_state: HostSubmissionState | None = None
 
 
 class PackageUpdateSnapshotHostControl(Protocol):
@@ -165,7 +239,7 @@ class PackageUpdateSnapshotHostControl(Protocol):
     no generic action dispatcher, and no place to pass a command string.
     """
 
-    def create_pre_update_snapshot(
+    def ensure_pre_update_snapshot_submitted(
         self,
         *,
         snapshot_operation_id: str,
@@ -174,7 +248,13 @@ class PackageUpdateSnapshotHostControl(Protocol):
         expected_node: str,
         ownership: SnapshotOwnership,
     ) -> HostSnapshotResult:
-        """Submit, or reattach to, this exact job's snapshot operation."""
+        """Submit, or reattach to, this exact job's snapshot operation.
+
+        Submission-only: this call never polls a PVE task to completion. It
+        returns promptly once the operation has crossed (or is already past)
+        its submission boundary, so it is safe to call while this backend
+        holds its own authority write lock across it.
+        """
 
     def inspect_job_snapshot_state(
         self,
@@ -322,20 +402,50 @@ class SnapshotStageResult:
     reason: str | None = None
 
 
+#: Bounded polling of one journaled PVE task. A task still running when this
+#: elapses stays UNCERTAIN -- never failed, and never a licence to resubmit.
+DEFAULT_TASK_POLL_TIMEOUT_SECONDS = 900.0
+DEFAULT_TASK_POLL_INTERVAL_SECONDS = 2.0
+
+#: Journal phases that still permit a NEW submission for this exact operation
+#: identity. Everything else -- including ``None``, which only an older host
+#: that predates this field would ever report -- means some submission
+#: attempt may already have crossed PVE's door.
+_SUBMISSION_PERMITTED_STATES = (HostSubmissionState.ABSENT, HostSubmissionState.INTENT)
+
+
 class PackageUpdateSnapshotOrchestrator:
     """Coordinate authority and one dark host boundary for one snapshot.
 
     Instantiated only by hermetic tests in this stage. It performs no package
     mutation, no snapshot deletion, and no rollback submission.
+
+    A NEW PVE submission is only ever attempted from inside
+    :meth:`InventoryAuthority.execute_snapshot_submission_if_current`, which
+    holds this backend's own authority write lock across exactly one bounded
+    submission-only host call. Recovering evidence about an operation that may
+    already have been submitted -- reading the host's durable journal state,
+    and polling a known task to completion -- never requires that lock, and
+    happens entirely outside it: see the module docstring's "submission
+    critical section" section.
     """
 
     def __init__(
         self,
         authority: InventoryAuthority,
         host_control: PackageUpdateSnapshotHostControl,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        task_poll_timeout_seconds: float = DEFAULT_TASK_POLL_TIMEOUT_SECONDS,
+        task_poll_interval_seconds: float = DEFAULT_TASK_POLL_INTERVAL_SECONDS,
     ) -> None:
         self._authority = authority
         self._host_control = host_control
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._task_poll_timeout_seconds = task_poll_timeout_seconds
+        self._task_poll_interval_seconds = task_poll_interval_seconds
 
     def ensure_job_owned_snapshot(self, job_id: str) -> SnapshotStageResult:
         """Drive one job from ``issued`` to a confirmed job-owned snapshot.
@@ -379,23 +489,130 @@ class PackageUpdateSnapshotOrchestrator:
         identity = self._authority.package_update_snapshot_identity(job.job_id)
         ownership = self._authority.package_update_snapshot_ownership(job.job_id)
 
-        # E. The dark host operation. It either submits exactly once or
-        # reattaches to the operation this same identity already started.
+        # E1. READ the durable host operation state first. This is a pure
+        # read of evidence that may already exist, so it never requires
+        # current authority -- a stale incarnation must never cause it to be
+        # discarded (see AGENTS.md, "current authority is not required
+        # merely to recover evidence").
+        result = self._read_inspection(job, identity, ownership)
+
+        if result.submission_state in _SUBMISSION_PERMITTED_STATES:
+            # E2. The host PROVED, from its own durable journal, that no
+            # submission has ever crossed the door for this exact operation
+            # identity, so a NEW one is still possible. This is the only
+            # branch that may mutate PVE, and the whole of it runs inside the
+            # short authority critical section: current authority is
+            # re-proved and held stable through the submission boundary, and
+            # the submission-only host call it invokes never polls a PVE task
+            # to completion, so the write lock is held only for one bounded
+            # round trip.
+            try:
+                result = self._authority.execute_snapshot_submission_if_current(
+                    job.job_id,
+                    lambda: self._host_control.ensure_pre_update_snapshot_submitted(
+                        snapshot_operation_id=identity.snapshot_operation_id,
+                        snapshot_name=identity.snapshot_name,
+                        vmid=job.expected_vmid,
+                        expected_node=job.expected_node_name,
+                        ownership=ownership,
+                    ),
+                )
+            except AuthorityConflict:
+                # Authority refused BEFORE the callback ever ran: the host
+                # was never asked to submit anything.
+                raise
+            except Exception as exc:  # noqa: BLE001 - any failure here is uncertain
+                return self._uncertain(
+                    job.job_id,
+                    f"snapshot host submission did not return an outcome: "
+                    f"{type(exc).__name__}",
+                )
+            result = self._validated(result, identity.snapshot_operation_id)
+
+        # F. Task polling and canonical recovery happen entirely outside the
+        # authority critical section: every iteration here is a bounded,
+        # read-only host inspection, never a resubmission and never a held
+        # database writer lock.
+        result = self._poll_until_resolved(job, identity, ownership, result)
+
+        return self._apply_host_result(job.job_id, identity.snapshot_operation_id, result)
+
+    def _read_inspection(
+        self,
+        job: PackageUpdateJob,
+        identity: PackageUpdateSnapshotIdentity,
+        ownership: SnapshotOwnership,
+    ) -> HostSnapshotResult:
+        """One bounded, read-only look at the host's durable operation state."""
+
         try:
-            result = self._host_control.create_pre_update_snapshot(
+            inspected = self._host_control.inspect_job_snapshot_state(
                 snapshot_operation_id=identity.snapshot_operation_id,
                 snapshot_name=identity.snapshot_name,
                 vmid=job.expected_vmid,
                 expected_node=job.expected_node_name,
                 ownership=ownership,
             )
-        except Exception as exc:  # noqa: BLE001 - any failure here is uncertain
-            return self._uncertain(
-                job.job_id,
-                f"snapshot host operation did not return an outcome: "
-                f"{type(exc).__name__}",
+        except Exception as exc:  # noqa: BLE001 - a failed read is uncertain
+            return HostSnapshotResult(
+                outcome=SnapshotOperationOutcome.UNCERTAIN,
+                snapshot_operation_id=identity.snapshot_operation_id,
+                reason=(
+                    "snapshot host inspection did not return an outcome: "
+                    f"{type(exc).__name__}"
+                ),
             )
-        return self._apply_host_result(job.job_id, identity.snapshot_operation_id, result)
+        return self._validated(inspected, identity.snapshot_operation_id)
+
+    @staticmethod
+    def _validated(
+        result: HostSnapshotResult, snapshot_operation_id: str
+    ) -> HostSnapshotResult:
+        if (
+            not isinstance(result, HostSnapshotResult)
+            or result.snapshot_operation_id != snapshot_operation_id
+        ):
+            return HostSnapshotResult(
+                outcome=SnapshotOperationOutcome.UNCERTAIN,
+                snapshot_operation_id=snapshot_operation_id,
+                reason="snapshot host operation answered a different operation",
+            )
+        return result
+
+    def _poll_until_resolved(
+        self,
+        job: PackageUpdateJob,
+        identity: PackageUpdateSnapshotIdentity,
+        ownership: SnapshotOwnership,
+        result: HostSnapshotResult,
+    ) -> HostSnapshotResult:
+        """Bounded-poll a known PVE task purely through read-only inspection.
+
+        Never opens a database transaction and never resubmits anything: it
+        only re-reads the host's durable state until the task the submission
+        boundary already crossed for reaches a terminal outcome or this
+        bound elapses. A ``submitted``-without-a-task-identity operation is
+        deliberately never looped on here: that window resolves, if at all,
+        from one bounded canonical read, not from repeating an identical read
+        that cannot change on its own.
+        """
+
+        def _pending(candidate: HostSnapshotResult) -> bool:
+            return (
+                candidate.submission_state is HostSubmissionState.TASK_KNOWN
+                and candidate.outcome is SnapshotOperationOutcome.UNCERTAIN
+            )
+
+        if not _pending(result):
+            return result
+        deadline = self._monotonic() + self._task_poll_timeout_seconds
+        while True:
+            result = self._read_inspection(job, identity, ownership)
+            if not _pending(result):
+                return result
+            if self._monotonic() >= deadline:
+                return result
+            self._sleep(self._task_poll_interval_seconds)
 
     def _apply_host_result(
         self,

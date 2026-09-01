@@ -276,7 +276,8 @@ def test_job_owned_snapshot_safety_is_not_production_reachable() -> None:
         "confirm_package_update_snapshot",
         "select_package_update_rollback_target",
         "record_package_update_preflight_passed",
-        "create_pre_update_snapshot",
+        "ensure_pre_update_snapshot_submitted",
+        "execute_snapshot_submission_if_current",
         "hubinet-package-snapshot-helper",
     )
     for rel_path in (
@@ -349,7 +350,7 @@ def test_the_snapshot_helper_exposes_no_delete_or_rollback_operation() -> None:
             operations = ast.literal_eval(node.value)
     assert operations == (
         "inspect_job_snapshot_state",
-        "create_pre_update_snapshot",
+        "ensure_pre_update_snapshot_submitted",
     )
     # `pvesh` is only ever invoked with a read or a create verb.
     verbs = set()

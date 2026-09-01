@@ -9,6 +9,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from typing import TypeVar
 import uuid
 
 from .canonicalization import (
@@ -51,6 +52,9 @@ from .discovery import (
 from .provider import PROVIDER_CONTRACT_VERSION
 from .reconciliation import InventoryReconciler, ReconciliationSummary
 from .store import InventoryAuthorityStore
+
+
+_T = TypeVar("_T")
 
 
 class InventoryAuthority:
@@ -1590,6 +1594,74 @@ class InventoryAuthority:
                 "snapshot_name": identity.snapshot_name,
             },
         )
+
+    def execute_snapshot_submission_if_current(
+        self, job_id: str, submit: Callable[[], _T]
+    ) -> _T:
+        """Run one bounded host submission callback while authority holds.
+
+        This is the short submission critical section a NEW PVE snapshot
+        submission must run inside. It closes the race the write-ahead
+        checkpoint alone does not: discovery reconciliation or a package scan
+        could otherwise invalidate this job's authority *after* it was proved
+        and *before* the host actually submits, in the gap between two
+        separate transactions. Re-proving authority and calling the host
+        happen here in the SAME transaction instead, so nothing else may
+        write to this authority store while ``submit`` runs -- the BEGIN
+        IMMEDIATE below holds this store's one writer lock across it.
+
+        ``submit`` MUST be the host's submission-only operation and nothing
+        else: no PVE task polling, no package mutation, no rollback, and no
+        recursive authority mutation. It is invoked at most once, only when
+        current authority still holds, and only while this transaction still
+        owns the writer lock. A stale authority context refuses BEFORE
+        ``submit`` is ever called, so the host is never asked to submit
+        anything for a job whose authority context has already moved on.
+
+        This is not a claim that SQLite and PVE are proved atomic, and it is
+        not a claim that a snapshot is proved to belong to the same LXC PVE
+        showed several minutes ago. It is the narrower claim
+        `app/package_update_snapshot.py` documents: Hubinet's own current
+        authority is held stable through the submission boundary, and the
+        host independently re-validates the live PVE target immediately
+        before it ever submits.
+
+        Recovering evidence about an operation that may already have been
+        submitted -- reading the host's durable journal state, and polling a
+        known task to completion -- never calls this method: that evidence
+        must never be discarded merely because authority has gone stale.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        host_result: _T | None = None
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            if (
+                PackageUpdateCheckpoint(str(job["checkpoint"]))
+                is not PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+            ):
+                raise AuthorityConflict(
+                    "package update job is not inside a snapshot operation"
+                )
+            # The authority proof and the bounded submission callback share
+            # this one transaction, so nothing can invalidate the job between
+            # the proof just taken and the submission it authorizes.
+            current_authority_holds = self._package_update_job_authority_is_current(
+                connection, job
+            )
+            self._after_package_update_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if current_authority_holds:
+                host_result = submit()
+
+        if not current_authority_holds:
+            raise AuthorityConflict(
+                "package update job resource or source authority context is stale"
+            )
+        return host_result  # type: ignore[return-value]
 
     def record_package_update_snapshot_task(
         self, job_id: str, task_upid: str

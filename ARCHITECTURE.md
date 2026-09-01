@@ -177,11 +177,14 @@ canonical evidence, rather than fabricating a task identity it never saw.
 **Host-side durable journal.** `deploy/hubinet-package-snapshot-helper.py` is
 a separate file and a separate logical privilege boundary from the scan
 helper, which stays scan-only. It exposes two typed operations
-(`inspect_job_snapshot_state`, `create_pre_update_snapshot`), no delete, no
-rollback submission, no arbitrary shell or argv, and it re-derives the
-snapshot identity from the request's own ownership facts rather than trusting
-the name it was handed. Each mutation is journaled on the PVE host under an
-`flock` held per VMID, keyed by the operation identity:
+(`inspect_job_snapshot_state`, `ensure_pre_update_snapshot_submitted`), no
+delete, no rollback submission, no arbitrary shell or argv, and it re-derives
+the snapshot identity from the request's own ownership facts rather than
+trusting the name it was handed. `ensure_pre_update_snapshot_submitted` is
+submission-only: it never polls a PVE task to completion, so it returns the
+instant the operation has crossed (or is already past) its submission
+boundary. Each mutation is journaled on the PVE host under an `flock` held
+per VMID, keyed by the operation identity:
 `intent -> submitted -> task_known -> terminal`, each transition an fsynced
 atomic rename. A journal still reading `intent` proves submission was never
 attempted; `submitted` is the genuinely uncertain window and is **never**
@@ -189,7 +192,40 @@ resubmitted — it may only be recovered as success on strict evidence (the
 exact snapshot, exact ownership metadata, complete, and the guest carrying no
 in-flight config lock), otherwise the answer is `uncertain`. An identical
 retry reattaches; the same operation identity with a different request is
-refused.
+refused. Every response from either operation carries this exact phase as a
+typed `submission_state` field, so the backend never infers it from canonical
+PVE state or an error string.
+
+**The submission critical section.** The write-ahead checkpoint alone leaves
+a second, narrower race open: another Hubinet writer (discovery
+reconciliation, a package scan) can invalidate this job's authority *after*
+it was proved and *before* a NEW PVE submission is actually sent, in the gap
+between the intent transaction and the host-control call. Proving authority
+and calling the host in two separate transactions is a check-then-commit race
+exactly like the one the write-ahead checkpoint itself was built to close. So
+a NEW submission runs only inside
+`InventoryAuthority.execute_snapshot_submission_if_current`, which re-proves
+the job's whole current-authority context and calls
+`ensure_pre_update_snapshot_submitted` while it still holds the authority
+store's one writer lock — nothing else may write to that store for the
+whole of it. Because the host call it invokes never polls a PVE task to
+completion, the writer lock is held only for one bounded round trip, never
+for PVE's own asynchronous task. Before attempting any of this, the
+orchestrator first reads the host's durable `submission_state` — a pure read
+that never requires current authority, because recovering evidence about an
+operation that may already have been submitted must never be discarded
+merely because authority has gone stale. Only `absent` and `intent` states
+permit a NEW submission; every other state skips the critical section
+entirely and goes straight to read-only recovery. Task polling and canonical
+confirmation both happen strictly *after* the critical section releases its
+writer lock, through the same read-only `inspect_job_snapshot_state`
+operation, bounded by `PackageUpdateSnapshotOrchestrator`'s own retry loop —
+never by holding a database transaction open across it. This is not a claim
+that SQLite and PVE are proved atomic, and not a claim that a snapshot is
+proved to belong to the same LXC PVE showed several minutes ago (see
+"Identity" below): the claim is that Hubinet's own current authority is held
+stable through the submission boundary, and the host independently
+re-validates the live PVE target immediately before it ever submits.
 
 **Same-job rollback.** A job may roll back only to the snapshot that exact job
 created and confirmed. `select_package_update_rollback_target` re-proves the

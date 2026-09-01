@@ -28,6 +28,7 @@ from app.package_scan_host_control import (
 )
 from app.package_update_snapshot import (
     HostSnapshotResult,
+    HostSubmissionState,
     PackageUpdateSnapshotError,
     SnapshotEvidenceError,
     SnapshotOperationOutcome,
@@ -118,7 +119,7 @@ class SshPackageUpdateSnapshotHostControl:
 
     # -- typed operations ------------------------------------------------
 
-    def create_pre_update_snapshot(
+    def ensure_pre_update_snapshot_submitted(
         self,
         *,
         snapshot_operation_id: str,
@@ -128,7 +129,7 @@ class SshPackageUpdateSnapshotHostControl:
         ownership: SnapshotOwnership,
     ) -> HostSnapshotResult:
         return self._request(
-            "create_pre_update_snapshot",
+            "ensure_pre_update_snapshot_submitted",
             snapshot_operation_id=snapshot_operation_id,
             snapshot_name=snapshot_name,
             vmid=vmid,
@@ -167,7 +168,7 @@ class SshPackageUpdateSnapshotHostControl:
         ownership: SnapshotOwnership,
     ) -> HostSnapshotResult:
         if operation not in (
-            "create_pre_update_snapshot",
+            "ensure_pre_update_snapshot_submitted",
             "inspect_job_snapshot_state",
         ):
             raise ValueError("unsupported snapshot host-control operation")
@@ -338,6 +339,16 @@ class SshPackageUpdateSnapshotHostControl:
                     "host-control returned a malformed snapshot listing",
                 )
         reason = payload.get("reason")
+        raw_submission_state = payload.get("submission_state")
+        submission_state: HostSubmissionState | None = None
+        if raw_submission_state is not None:
+            try:
+                submission_state = HostSubmissionState(str(raw_submission_state))
+            except ValueError:
+                return self._uncertain(
+                    snapshot_operation_id,
+                    "host-control returned an unknown submission state",
+                )
         return HostSnapshotResult(
             outcome=outcome,
             snapshot_operation_id=snapshot_operation_id,
@@ -345,6 +356,7 @@ class SshPackageUpdateSnapshotHostControl:
             task=task,
             snapshots=snapshots,
             reason=str(reason)[:500] if isinstance(reason, str) else None,
+            submission_state=submission_state,
         )
 
     @staticmethod

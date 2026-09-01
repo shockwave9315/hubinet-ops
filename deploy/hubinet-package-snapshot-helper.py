@@ -12,11 +12,23 @@ Scope is deliberately minimal:
 
 - LXC only.
 - Exactly two typed operations: `inspect_job_snapshot_state` and
-  `create_pre_update_snapshot`.
+  `ensure_pre_update_snapshot_submitted`.
 - No arbitrary shell, no command string, no caller-supplied argv, no generic
   action dispatcher. Every `pvesh` argv is built from this file's own fixed
   constants plus validated typed fields.
 - **No snapshot delete operation, and no rollback submission.**
+
+`ensure_pre_update_snapshot_submitted` is submission-only: it never polls a
+PVE task to completion. It journals the submission, invokes `pvesh create`
+at most once, records the task identity the instant PVE returns one, and
+returns immediately. The backend is expected to hold no lock of its own
+across this call (see `app/package_update_snapshot.py`), and it must not hold
+one across task completion either, so the helper never blocks here for PVE's
+own async task to finish. `inspect_job_snapshot_state` reads the journaled
+task's status exactly once, synchronously, alongside a fresh canonical
+listing -- fast, bounded, and repeatable from the caller's own bounded retry
+loop -- so completion is observed by the caller polling this cheap read
+operation, never by the mutating one blocking internally.
 
 ## Durable operation journal
 
@@ -29,9 +41,18 @@ from immutable job identity.
 ```text
 intent      request recorded; submission NOT yet attempted   -> may submit
 submitted   submission attempt has begun                     -> NEVER resubmit
-task_known  PVE returned a UPID                              -> poll that task
+task_known  PVE returned a UPID                              -> caller polls that task
 terminal    outcome recorded                                 -> replay answer
 ```
+
+Every response -- from either operation -- reports this exact phase as a
+typed `submission_state` field, read straight from the journal rather than
+inferred from canonical PVE state or an error string. The caller uses it, not
+canonical evidence, to decide whether a NEW submission is still permitted:
+`absent` (no journal record at all) and `intent` are the only phases that
+permit one; everything else means some submission attempt may already have
+crossed PVE's door, and no second one may ever be issued for this operation
+identity.
 
 `intent -> submitted` is an atomic rename that is fsynced before the
 subprocess is launched, so a journal still reading `intent` proves submission
@@ -101,10 +122,6 @@ from typing import Any
 MAX_REQUEST_BYTES = 8192
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024 * 1024
 COMMAND_TIMEOUT_SECONDS = 120.0
-#: Bounded polling of one PVE snapshot task. A task still running when this
-#: elapses is UNCERTAIN, never failed and never a licence to resubmit.
-TASK_POLL_TIMEOUT_SECONDS = 900.0
-TASK_POLL_INTERVAL_SECONDS = 2.0
 
 JOURNAL_DIRECTORY = Path("/var/lib/hubinet-ops/snapshot-operations")
 
@@ -131,7 +148,7 @@ _OPERATION_DOMAIN = b"hubinet-ops/package-update/snapshot-operation-id/v1"
 #: Container config locks that prove some PVE operation is still in flight.
 _IN_FLIGHT_LOCKS = frozenset({"snapshot", "snapshot-delete", "rollback"})
 
-OPERATIONS = ("inspect_job_snapshot_state", "create_pre_update_snapshot")
+OPERATIONS = ("inspect_job_snapshot_state", "ensure_pre_update_snapshot_submitted")
 
 _OWNERSHIP_FIELDS = (
     "job_id",
@@ -762,26 +779,6 @@ def _task_is_error(status: Mapping[str, Any]) -> bool:
     )
 
 
-def poll_task(
-    runner: Runner,
-    expected_node: str,
-    upid: str,
-    *,
-    monotonic: Callable[[], float] = time.monotonic,
-    sleep: Callable[[float], None] = time.sleep,
-) -> dict[str, Any] | None:
-    """Bounded-poll one PVE task. ``None`` means still running at the bound."""
-
-    deadline = monotonic() + TASK_POLL_TIMEOUT_SECONDS
-    while True:
-        status = read_task_status(runner, expected_node, upid)
-        if status["status"] == "stopped":
-            return status
-        if monotonic() >= deadline:
-            return None
-        sleep(TASK_POLL_INTERVAL_SECONDS)
-
-
 # ---------------------------------------------------------------------------
 # Owned-snapshot evidence
 # ---------------------------------------------------------------------------
@@ -842,6 +839,7 @@ def _response(
     task: Mapping[str, Any] | None = None,
     snapshots: list[dict[str, Any]] | None = None,
     reason: str | None = None,
+    submission_state: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "response_version": 1,
@@ -858,13 +856,22 @@ def _response(
         payload["snapshots"] = snapshots
     if reason is not None:
         payload["reason"] = reason[:500]
+    if submission_state is not None:
+        payload["submission_state"] = submission_state
     return payload
 
 
 def _inspect(
     runner: Runner, request: Mapping[str, Any], journal: OperationJournal
 ) -> dict[str, Any]:
-    """Read-only: current canonical state plus any journaled task identity."""
+    """Read-only: current canonical state plus the journaled submission phase.
+
+    Never mutates the journal and never submits anything. A single bounded
+    read of the journaled task (if any) plus a fresh canonical listing is the
+    whole of it -- there is no poll-to-completion loop here, so a caller may
+    call this as often as it likes, including as its own bounded retry loop,
+    without ever holding anything open on either side.
+    """
 
     record = journal.read(request["snapshot_operation_id"])
     if record is not None and record["request_fingerprint"] != request_fingerprint(
@@ -880,12 +887,20 @@ def _inspect(
     if isinstance(task_upid, str):
         task = read_task_status(runner, request["expected_node"], task_upid)
     evidence = _owned_snapshot_evidence(listing, request)
-    outcome = {
-        "present": "completed",
-        "absent": "absent",
-        "incomplete": "uncertain",
-        "ambiguous": "uncertain",
-    }[evidence]
+    if task is not None and task["status"] == "stopped" and _task_is_error(task):
+        # The task PVE ran for this operation terminated in a failure state.
+        # This is reported regardless of canonical evidence -- the backend
+        # independently re-proves canonical absence before it may ever
+        # terminalize a job on this outcome, exactly as it always has.
+        outcome = "failed"
+    else:
+        outcome = {
+            "present": "completed",
+            "absent": "absent",
+            "incomplete": "uncertain",
+            "ambiguous": "uncertain",
+        }[evidence]
+    submission_state = record["phase"] if record is not None else "absent"
     return _response(
         request,
         outcome,
@@ -893,6 +908,7 @@ def _inspect(
         task=task,
         snapshots=listing,
         reason=f"canonical job-owned snapshot evidence: {evidence}",
+        submission_state=submission_state,
     )
 
 
@@ -921,63 +937,11 @@ def _finalize(
         task=task,
         snapshots=listing,
         reason=reason,
+        submission_state="terminal",
     )
 
 
-def _await_task(
-    runner: Runner,
-    request: Mapping[str, Any],
-    journal: OperationJournal,
-    record: dict[str, Any],
-    upid: str,
-) -> dict[str, Any]:
-    """Poll exactly the journaled task; never submit anything here."""
-
-    status = poll_task(runner, request["expected_node"], upid)
-    if status is None:
-        return _response(
-            request,
-            "uncertain",
-            task_upid=upid,
-            reason="PVE snapshot task was still running at the polling bound",
-        )
-    if _task_is_error(status):
-        return _finalize(
-            runner, request, journal, record, "failed",
-            "PVE snapshot task terminated in a failure state", status,
-        )
-    # A successful task is never sufficient: the canonical listing decides,
-    # and it is re-read below even though the task says success. (Task
-    # evidence is not universally necessary either -- see
-    # _recover_submitted_without_task, which reaches the same canonical bar
-    # without a task identity it never observed.)
-    listing = list_snapshots(runner, request["vmid"], request["expected_node"])
-    evidence = _owned_snapshot_evidence(listing, request)
-    if evidence != "present":
-        return _response(
-            request,
-            "uncertain",
-            task_upid=upid,
-            task=status,
-            snapshots=listing,
-            reason=(
-                "PVE snapshot task succeeded but canonical state does not show "
-                f"exactly this job's snapshot ({evidence})"
-            ),
-        )
-    journal.write({**record, "phase": "terminal", "outcome": "completed",
-                   "reason": "canonical job-owned snapshot present"})
-    return _response(
-        request,
-        "completed",
-        task_upid=upid,
-        task=status,
-        snapshots=listing,
-        reason="canonical job-owned snapshot present",
-    )
-
-
-def _create_pre_update_snapshot(
+def _ensure_submitted(
     runner: Runner, request: Mapping[str, Any], journal: OperationJournal
 ) -> dict[str, Any]:
     fingerprint = request_fingerprint(request)
@@ -999,8 +963,19 @@ def _create_pre_update_snapshot(
                     None,
                 )
             if phase == "task_known":
-                return _await_task(
-                    runner, request, journal, record, str(record["task_upid"])
+                # NEVER submit and NEVER poll here: the task is already
+                # journaled, so the caller observes its completion through
+                # the read-only inspect operation's own bounded retries,
+                # never by this mutating one blocking internally.
+                return _response(
+                    request,
+                    "uncertain",
+                    task_upid=str(record["task_upid"]),
+                    submission_state="task_known",
+                    reason=(
+                        "snapshot submission already recorded; inspect the "
+                        "operation to observe task completion"
+                    ),
                 )
             if phase == "submitted":
                 # The genuinely uncertain window. NEVER resubmit here.
@@ -1080,6 +1055,7 @@ def _create_pre_update_snapshot(
                 request,
                 "uncertain",
                 reason=f"guest is locked by an in-flight PVE operation ({lock})",
+                submission_state="intent",
             )
 
         assert listing is not None
@@ -1098,6 +1074,7 @@ def _create_pre_update_snapshot(
                 "completed",
                 snapshots=listing,
                 reason="canonical job-owned snapshot already present",
+                submission_state="terminal",
             )
         if evidence != "absent":
             return _response(
@@ -1108,6 +1085,7 @@ def _create_pre_update_snapshot(
                     "canonical state is not a clean absence for this operation "
                     f"({evidence}); refusing to submit"
                 ),
+                submission_state="intent",
             )
 
         record = {**record, "phase": "submitted"}
@@ -1134,10 +1112,22 @@ def _create_pre_update_snapshot(
                     "PVE snapshot submission returned no usable task identity; "
                     "the operation may or may not have started"
                 ),
+                submission_state="submitted",
             )
+        # The task is now durably journaled. Return immediately: polling it
+        # to completion is the read-only operation's job, never this one's.
         record = {**record, "phase": "task_known", "task_upid": upid}
         journal.write(record)
-        return _await_task(runner, request, journal, record, upid)
+        return _response(
+            request,
+            "uncertain",
+            task_upid=upid,
+            submission_state="task_known",
+            reason=(
+                "snapshot submission recorded; inspect the operation to "
+                "observe task completion"
+            ),
+        )
 
 
 def _extract_upid(result: CommandResult) -> str | None:
@@ -1184,6 +1174,7 @@ def _recover_submitted_without_task(
                 "a snapshot request was submitted for this operation and the "
                 f"guest is still locked ({lock})"
             ),
+            submission_state="submitted",
         )
     if evidence == "present":
         journal.write(
@@ -1199,6 +1190,7 @@ def _recover_submitted_without_task(
             "completed",
             snapshots=listing,
             reason="recovered: canonical job-owned snapshot present",
+            submission_state="terminal",
         )
     return _response(
         request,
@@ -1208,6 +1200,7 @@ def _recover_submitted_without_task(
             "a snapshot request was submitted for this operation but its task "
             f"identity was never recorded (canonical evidence: {evidence})"
         ),
+        submission_state="submitted",
     )
 
 
@@ -1222,7 +1215,7 @@ def handle_request(
     try:
         if request["operation"] == "inspect_job_snapshot_state":
             return _inspect(runner, request, operation_journal)
-        return _create_pre_update_snapshot(runner, request, operation_journal)
+        return _ensure_submitted(runner, request, operation_journal)
     except SnapshotError as exc:
         return {
             "response_version": 1,

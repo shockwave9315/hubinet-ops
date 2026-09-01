@@ -42,6 +42,7 @@ from app.inventory.snapshot_identity import (
 )
 from app.package_update_snapshot import (
     HostSnapshotResult,
+    HostSubmissionState,
     PackageUpdateSnapshotOrchestrator,
     SnapshotEvidenceError,
     SnapshotOperationOutcome,
@@ -277,14 +278,21 @@ def test_snapshot_intent_is_committed_before_any_host_mutation_callback(
     observed: list[PackageUpdateCheckpoint] = []
 
     class RecordingHostControl:
-        def create_pre_update_snapshot(self, **kwargs):
+        def ensure_pre_update_snapshot_submitted(self, **kwargs):
             # By the time the host boundary is reached at all, the durable
             # write-ahead checkpoint must already be committed and visible.
             observed.append(store.package_update_job(job.job_id).checkpoint)
             raise RuntimeError("host process died mid-submission")
 
-        def inspect_job_snapshot_state(self, **kwargs):  # pragma: no cover
-            raise AssertionError("not used")
+        def inspect_job_snapshot_state(self, **kwargs) -> HostSnapshotResult:
+            # Nothing has been journaled for this operation yet, so a NEW
+            # submission is still permitted and the orchestrator proceeds to
+            # the submission critical section above.
+            return HostSnapshotResult(
+                outcome=SnapshotOperationOutcome.UNCERTAIN,
+                snapshot_operation_id=kwargs["snapshot_operation_id"],
+                submission_state=HostSubmissionState.ABSENT,
+            )
 
     result = PackageUpdateSnapshotOrchestrator(
         authority, RecordingHostControl()
@@ -607,20 +615,38 @@ def test_confirmation_is_idempotent_and_write_once(tmp_path: Path) -> None:
 
 
 class FakeHostControl:
-    """A dark host boundary that records every call it receives."""
+    """A dark host boundary that records every call it receives.
+
+    Mimics just enough of the real host's journal-driven ``submission_state``
+    for the orchestrator's split read-then-submit contract to exercise
+    correctly: before any submission call it reports ``absent`` (a NEW
+    submission is permitted); after one, it reports back whatever the queued
+    submission result itself carried, exactly as the real host's own
+    ``inspect_job_snapshot_state`` would keep reporting the same durable
+    journal phase until something changes it.
+    """
 
     def __init__(self, *results: HostSnapshotResult) -> None:
         self._results = list(results)
         self.create_calls: list[dict] = []
         self.inspect_calls: list[dict] = []
+        self._last_submission_result: HostSnapshotResult | None = None
 
-    def create_pre_update_snapshot(self, **kwargs) -> HostSnapshotResult:
+    def ensure_pre_update_snapshot_submitted(self, **kwargs) -> HostSnapshotResult:
         self.create_calls.append(kwargs)
-        return self._results.pop(0)
+        result = self._results.pop(0)
+        self._last_submission_result = result
+        return result
 
     def inspect_job_snapshot_state(self, **kwargs) -> HostSnapshotResult:
         self.inspect_calls.append(kwargs)
-        return self._results.pop(0)
+        if self._last_submission_result is not None:
+            return self._last_submission_result
+        return HostSnapshotResult(
+            outcome=SnapshotOperationOutcome.UNCERTAIN,
+            snapshot_operation_id=kwargs["snapshot_operation_id"],
+            submission_state=HostSubmissionState.ABSENT,
+        )
 
 
 def test_retry_after_uncertainty_reattaches_and_never_confirms_blindly(
@@ -2426,3 +2452,363 @@ def test_only_the_durable_proof_releases_a_never_submitted_job(
     assert store.package_update_job(job.job_id).status is (
         PackageUpdateJobStatus.BLOCKED
     )
+
+
+# ===========================================================================
+# The submission critical section: authority -> commit -> PVE-submit race
+#
+# The write-ahead checkpoint alone does not close the whole seam: another
+# Hubinet writer can invalidate this job's authority AFTER it was proved and
+# BEFORE a NEW PVE submission is actually sent, in the gap between the intent
+# transaction and the host-control call. execute_snapshot_submission_if_current
+# closes it by re-proving authority and calling the submission-only host
+# operation inside the SAME transaction. These tests prove the actual race is
+# closed, not merely that the predicate exists -- and that recovering
+# evidence about an operation that may already have been submitted never
+# needs, and never waits on, that same lock.
+# ===========================================================================
+
+
+def test_replacement_after_intent_commit_refuses_a_new_submission(
+    tmp_path: Path,
+) -> None:
+    """A. The exact remaining race, at the Python boundary.
+
+    Discovery reconciliation invalidates current Hubinet authority strictly
+    AFTER the write-ahead intent commits and BEFORE the submission critical
+    section runs. The host is never even asked whether it could submit.
+    """
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    host = FakeHostControl()
+    orchestrator = PackageUpdateSnapshotOrchestrator(authority, host)
+
+    with pytest.raises(AuthorityConflict, match="authority context is stale"):
+        orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    # The host was read for durable evidence (which never requires current
+    # authority), but it was never asked to submit anything.
+    assert len(host.inspect_calls) == 1
+    assert host.create_calls == []
+    stalled = store.package_update_job(job.job_id)
+    assert stalled.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert stalled.snapshot_task_upid is None
+
+
+def test_replacement_after_intent_commit_never_reaches_pvesh_create(
+    tmp_path: Path,
+) -> None:
+    """A. The same witness through the real dark boundary.
+
+    Same VMID, same node, same LXC, still running -- every live PVE fact a
+    host helper could independently verify stays exactly what the job froze
+    at issuance. This is precisely the case a check-then-commit race would
+    let through, and precisely why VMID/node/type/status are not treated as
+    incarnation proof anywhere in this stage.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+    assert job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+
+    assert pve.vmid == job.expected_vmid
+    assert pve.node == job.expected_node_name
+    assert pve.resource_type == "lxc"
+    assert pve.status == "running"
+
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _dark_channel(pve, journal)
+    )
+    with pytest.raises(AuthorityConflict, match="authority context is stale"):
+        orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert pve.submissions == 0
+    assert not any(argv[1] == "create" for argv in pve.argvs)
+    stalled = store.package_update_job(job.job_id)
+    assert stalled.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert stalled.snapshot_task_upid is None
+
+
+def test_writer_cannot_interleave_inside_the_submission_critical_section(
+    tmp_path: Path,
+) -> None:
+    """B. The actual race proof for the NEW submission critical section.
+
+    A seam fires inside execute_snapshot_submission_if_current's own
+    transaction, immediately after the authority proof and before the
+    submission callback runs -- exactly where an interleaving writer could
+    invalidate the job between them. From a second, genuinely separate
+    connection, writing to this store must be impossible for the whole of
+    that window: the critical section holds the database's one writer lock
+    across both the proof and the submission it authorizes.
+    """
+
+    import sqlite3 as _sqlite3
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+
+    attempted: list[str] = []
+
+    def seam(connection, *, job_id):
+        other = _sqlite3.connect(store.path, timeout=0.1, isolation_level=None)
+        try:
+            with pytest.raises(_sqlite3.OperationalError, match="locked"):
+                other.execute("BEGIN IMMEDIATE")
+            attempted.append(job_id)
+        finally:
+            other.close()
+
+    authority._after_package_update_authority_proof = seam
+
+    result = authority.execute_snapshot_submission_if_current(
+        job.job_id, lambda: "submitted-under-lock"
+    )
+
+    assert result == "submitted-under-lock"
+    assert attempted == [job.job_id]
+
+
+def test_reentry_with_intent_only_and_stale_authority_refuses_without_fabricating_identity(
+    tmp_path: Path,
+) -> None:
+    """C. Re-entry: the host journal proves no submission was ever attempted.
+
+    One prior attempt reaches the host and durably records intent, but a
+    concurrent PVE operation blocks it before it ever submits -- the journal
+    never advances past `intent`. On retry, current authority has since gone
+    stale. A NEW submission is still permitted in principle (nothing was ever
+    sent), but it must still be refused before the host is asked to submit,
+    and never by trying to prove this is "the same LXC" from live PVE facts.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+
+    pve.lock = "snapshot"
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _dark_channel(pve, journal)
+    )
+    first = orchestrator.ensure_job_owned_snapshot(job.job_id)
+    assert first.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert pve.submissions == 0
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    assert (
+        snapshot_helper.OperationJournal(journal.directory)
+        .read(identity.snapshot_operation_id)["phase"]
+        == "intent"
+    )
+
+    pve.lock = None
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    with pytest.raises(AuthorityConflict, match="authority context is stale"):
+        orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert pve.submissions == 0
+    assert not any(argv[1] == "create" for argv in pve.argvs)
+    stalled = store.package_update_job(job.job_id)
+    assert stalled.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+
+
+def test_reentry_after_submission_recovers_despite_stale_authority(
+    tmp_path: Path,
+) -> None:
+    """D. Re-entry: the host journal proves a submission may already exist.
+
+    Once the host's durable journal is past `intent`, staleness must never
+    cause that evidence to be discarded: the retry must recover/observe,
+    never resubmit, and keep the job fenced rather than releasing it on a
+    stale authority context it never even had to consult.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+
+    pve.task_sequence = [{"upid": upid, "status": "running"}]
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _dark_channel(pve, journal), task_poll_timeout_seconds=0.0
+    )
+    first = orchestrator.ensure_job_owned_snapshot(job.job_id)
+    assert first.outcome is SnapshotOperationOutcome.UNCERTAIN
+    assert pve.submissions == 1
+    assert store.package_update_job(job.job_id).snapshot_task_upid == upid
+
+    _break_incarnation_continuity_at_the_same_locator(store, authority)
+
+    second = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert pve.submissions == 1
+    assert second.outcome is SnapshotOperationOutcome.UNCERTAIN
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert fenced.snapshot_task_upid == upid
+
+
+def test_crash_after_task_known_is_journaled_never_resubmits_and_recovers(
+    tmp_path: Path,
+) -> None:
+    """E + F. Crash inside the submission critical section, past task_known.
+
+    The host durably crosses its own `submitted -> task_known` boundary and
+    answers successfully; the caller then crashes before it ever applies that
+    answer or the authority transaction cleanly returns. After restart, the
+    host's durable journal -- not backend memory -- proves a task is already
+    known, so retry must reattach and poll/recover, never resubmit.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    pve.on_submit = lambda p: p.snapshots.append(
+        {
+            "name": identity.snapshot_name,
+            "description": snapshot_helper.build_snapshot_description(
+                {
+                    "job_id": ownership.job_id,
+                    "resource_id": ownership.resource_id,
+                    "resource_continuity_revision": (
+                        ownership.resource_continuity_revision
+                    ),
+                    "inventory_source_id": ownership.inventory_source_id,
+                    "backend_instance_id": ownership.backend_instance_id,
+                }
+            )
+            + "\n",
+            "snaptime": 1_700_000_000,
+        }
+    )
+
+    real_channel = _dark_channel(pve, journal)
+
+    class _CrashAfterHostAnswers:
+        """Simulates the caller dying after the host crossed task_known."""
+
+        def ensure_pre_update_snapshot_submitted(self, **kwargs):
+            real_channel.ensure_pre_update_snapshot_submitted(**kwargs)
+            raise KeyboardInterrupt("caller died after task_known was journaled")
+
+        def inspect_job_snapshot_state(self, **kwargs):
+            return real_channel.inspect_job_snapshot_state(**kwargs)
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, _CrashAfterHostAnswers(), task_poll_timeout_seconds=0.0
+    )
+    with pytest.raises(KeyboardInterrupt):
+        orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert pve.submissions == 1
+    crashed = store.package_update_job(job.job_id)
+    assert crashed.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    # The caller crashed before the authority transaction ever applied the
+    # host's answer, so nothing about the task was recorded here yet.
+    assert crashed.snapshot_task_upid is None
+    assert (
+        snapshot_helper.OperationJournal(journal.directory)
+        .read(identity.snapshot_operation_id)["phase"]
+        == "task_known"
+    )
+
+    # Retry with a healthy channel: the durable host journal proves a task is
+    # already known, so this must reattach and recover, never resubmit.
+    recovered_orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority, real_channel, task_poll_timeout_seconds=0.0
+    )
+    recovered = recovered_orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert pve.submissions == 1
+    assert recovered.outcome is SnapshotOperationOutcome.COMPLETED
+    assert recovered.job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert recovered.job.snapshot_task_upid == upid
+
+
+def test_task_polling_never_holds_the_authority_writer_lock(tmp_path: Path) -> None:
+    """G. The guard against "fixed the race by locking the whole database".
+
+    A second, genuinely separate writer must be able to acquire its own
+    BEGIN IMMEDIATE transaction WHILE this orchestrator is bounded-polling a
+    known task -- proving the submission critical section's writer lock was
+    already released before polling ever starts, and stays released for the
+    whole of it.
+    """
+
+    import sqlite3 as _sqlite3
+
+    store, authority, job, identity, ownership, pve, journal, upid = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+
+    from tests.test_package_snapshot_helper import helper as snapshot_helper
+
+    # The task is still running for the first read, so the poll loop must
+    # genuinely iterate (and therefore genuinely call `sleep`) at least once
+    # before the canonical evidence -- added below, from inside that sleep --
+    # resolves it.
+    pve.task_sequence = [
+        {"upid": upid, "status": "running"},
+        {"upid": upid, "status": "stopped", "exitstatus": "OK"},
+    ]
+
+    acquired: list[bool] = []
+
+    def sleep_and_probe(_seconds: float) -> None:
+        other = _sqlite3.connect(store.path, timeout=0.1, isolation_level=None)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            acquired.append(True)
+            other.commit()
+        finally:
+            other.close()
+        pve.snapshots.append(
+            {
+                "name": identity.snapshot_name,
+                "description": snapshot_helper.build_snapshot_description(
+                    {
+                        "job_id": ownership.job_id,
+                        "resource_id": ownership.resource_id,
+                        "resource_continuity_revision": (
+                            ownership.resource_continuity_revision
+                        ),
+                        "inventory_source_id": ownership.inventory_source_id,
+                        "backend_instance_id": ownership.backend_instance_id,
+                    }
+                )
+                + "\n",
+                "snaptime": 1_700_000_000,
+            }
+        )
+
+    orchestrator = PackageUpdateSnapshotOrchestrator(
+        authority,
+        _dark_channel(pve, journal),
+        sleep=sleep_and_probe,
+        monotonic=lambda: 0.0,
+        task_poll_interval_seconds=0.0,
+    )
+
+    result = orchestrator.ensure_job_owned_snapshot(job.job_id)
+
+    assert acquired == [True]
+    assert result.outcome is SnapshotOperationOutcome.COMPLETED
+    assert pve.submissions == 1
