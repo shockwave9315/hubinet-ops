@@ -523,10 +523,8 @@ class PackageUpdateSnapshotOrchestrator:
                 # authorize a submission, but it must also never be allowed
                 # to fence this job's global slot forever purely because
                 # Hubinet's own authority context moved on -- see
-                # _resolve_after_stale_authority_refusal.
-                return self._resolve_after_stale_authority_refusal(
-                    job, identity, ownership
-                )
+                # _resolve_pre_submission_block.
+                return self._resolve_pre_submission_block(job, identity, ownership)
             except Exception as exc:  # noqa: BLE001 - any failure here is uncertain
                 return self._uncertain(
                     job.job_id,
@@ -549,74 +547,82 @@ class PackageUpdateSnapshotOrchestrator:
         # read-only host inspection, never a resubmission and never a held
         # database writer lock.
         result = self._poll_until_resolved(job, identity, ownership, result)
-        return self._apply_host_result(job.job_id, identity.snapshot_operation_id, result)
+        return self._apply_host_result(job, identity, ownership, result)
 
-    def _resolve_after_stale_authority_refusal(
+    def _resolve_pre_submission_block(
         self,
         job: PackageUpdateJob,
         identity: PackageUpdateSnapshotIdentity,
         ownership: SnapshotOwnership,
     ) -> SnapshotStageResult:
-        """Decide liveness after a refused NEW-submission attempt.
+        """Decide, and durably apply, a pre-submission release.
 
-        ``execute_snapshot_submission_if_current`` refused BEFORE the
-        submission-only host callback ever ran: the host was never asked to
-        submit anything for this attempt, and stale authority can never
-        authorize one. But that refusal must not fence this job's single
-        global destructive slot forever purely because Hubinet's own
-        authority context moved on -- the resource/source may be gone or
-        replaced for good, so every future retry would repeat the identical
-        refusal.
+        Reached whenever something claims this exact operation identity was
+        never submitted: a refused NEW-submission attempt (authority went
+        stale before the submission-only host callback ever ran, so the host
+        was never asked to submit anything), or a submission attempt whose
+        own host call proved ``not_submitted`` during its pre-submission
+        window. Neither of those facts alone may terminalize the job: that
+        must not fence this job's single global destructive slot forever
+        purely because Hubinet's own authority context moved on, but it also
+        must not race a concurrent, authorized submission that crosses the
+        door in the gap before the block is durably applied.
 
-        Liveness is restored with a FRESH host read, never the one this
-        attempt started with. Trusting the earlier read would itself be a
-        race: another invocation can enter its own submission critical
-        section and actually submit in the gap between this attempt's first
-        read and its own authority refusal.
-        ``execute_snapshot_submission_if_current`` only serializes Hubinet's
-        own writers against each other -- reconciliation cannot invalidate
-        authority while a submission critical section is open -- so by the
-        time THIS attempt observes a refusal, any concurrent submission
-        attempt that was authorized has already crossed whatever durable
-        host journal phase it reached and released the writer lock. A fresh
-        read can see that; the stale first read cannot.
+        Both are closed the same way, inside
+        :meth:`InventoryAuthority.resolve_pre_submission_block`: a FRESH host
+        read -- never any read or claim this call started with -- taken
+        while that method's own transaction still owns the authority store's
+        writer lock, with the block committed in that SAME transaction when,
+        and only when, the fresh read still proves ``absent``/``intent``.
+        Trusting an earlier read, or the caller's own claim, would itself be
+        a race: another invocation can enter its own submission critical
+        section and actually submit in the gap between any earlier read and
+        this decision. `execute_snapshot_submission_if_current` only
+        serializes Hubinet's own writers against each other -- reconciliation
+        cannot invalidate authority while a submission critical section is
+        open -- so by the time this call's fresh read runs under the SAME
+        writer lock, any concurrent submission attempt that was authorized
+        has already crossed whatever durable host journal phase it reached
+        and released the lock, or has not yet been able to acquire it at
+        all; either way the two critical sections cannot interleave.
 
-        If the fresh read still proves this exact operation identity has
-        never crossed its submission boundary (``absent``/``intent``), the
-        job is safely terminalized as `blocked` and the slot is released --
-        that is the ONLY thing an unsubmitted proof after the fact may do.
-        Anything else the fresh read shows -- a submission already in
-        flight, a terminal outcome, or the read itself failing to prove
-        anything -- is recovered through the ordinary evidence pipeline
-        exactly as if this attempt had never tried to submit: never
+        Anything the fresh read shows other than ``absent``/``intent`` -- a
+        submission already in flight, a terminal outcome, or the read itself
+        failing to prove anything -- is recovered through the ordinary
+        evidence pipeline exactly as if this call had never happened: never
         released as unsubmitted, and never resubmitted.
         """
 
-        fresh = self._read_inspection(job, identity, ownership)
-
-        if fresh.submission_state in _SUBMISSION_PERMITTED_STATES:
-            reason = (
-                "package update job authority is stale and a fresh host "
-                "read still proves this operation was never submitted"
+        def _inspect() -> tuple[bool, str, HostSnapshotResult]:
+            fresh = self._read_inspection(job, identity, ownership)
+            proved_not_submitted = (
+                fresh.submission_state in _SUBMISSION_PERMITTED_STATES
             )
-            try:
-                blocked_job = (
-                    self._authority.block_package_update_before_snapshot_submission(
-                        job.job_id, reason
-                    )
-                )
-            except Exception:  # noqa: BLE001 - a contradicted proof stays fenced
-                return self._uncertain(
-                    job.job_id,
-                    "stale authority proved unsubmitted by a fresh host read, "
-                    "but durable job state contradicts it",
-                )
+            reason = fresh.reason or (
+                "a fresh host read proves this operation was never submitted"
+                if proved_not_submitted
+                else "a fresh host read does not prove this operation was "
+                "never submitted"
+            )
+            return proved_not_submitted, reason, fresh
+
+        try:
+            blocked, fresh = self._authority.resolve_pre_submission_block(
+                job.job_id, _inspect
+            )
+        except Exception:  # noqa: BLE001 - a contradicted proof stays fenced
+            return self._uncertain(
+                job.job_id,
+                "a fresh host read proved this operation was never submitted, "
+                "but durable job state contradicts it",
+            )
+
+        if blocked:
             return SnapshotStageResult(
                 outcome=SnapshotOperationOutcome.NOT_SUBMITTED,
-                job=blocked_job,
-                reason=reason,
+                job=self._authority.package_update_job(job.job_id),
+                reason=fresh.reason,
             )
-
         return self._finish(job, identity, ownership, fresh)
 
     def _read_inspection(
@@ -698,13 +704,15 @@ class PackageUpdateSnapshotOrchestrator:
 
     def _apply_host_result(
         self,
-        job_id: str,
-        snapshot_operation_id: str,
+        job: PackageUpdateJob,
+        identity: PackageUpdateSnapshotIdentity,
+        ownership: SnapshotOwnership,
         result: HostSnapshotResult,
     ) -> SnapshotStageResult:
+        job_id = job.job_id
         if (
             not isinstance(result, HostSnapshotResult)
-            or result.snapshot_operation_id != snapshot_operation_id
+            or result.snapshot_operation_id != identity.snapshot_operation_id
         ):
             return self._uncertain(
                 job_id, "snapshot host operation answered a different operation"
@@ -724,27 +732,12 @@ class PackageUpdateSnapshotOrchestrator:
                 )
 
         if result.outcome is SnapshotOperationOutcome.NOT_SUBMITTED:
-            # The host proved nothing was submitted for this operation, so the
-            # job can be released rather than fencing the global destructive
-            # slot forever. If the durable job record contradicts that proof
-            # (a task was observed, so it *was* submitted), authority refuses
-            # and the job stays fenced.
-            reason = result.reason or "snapshot operation was blocked before submission"
-            try:
-                job = self._authority.block_package_update_before_snapshot_submission(
-                    job_id, reason[:500]
-                )
-            except Exception:  # noqa: BLE001 - a contradicted proof stays fenced
-                return self._uncertain(
-                    job_id,
-                    "host reported no submission but durable job state "
-                    "contradicts it",
-                )
-            return SnapshotStageResult(
-                outcome=SnapshotOperationOutcome.NOT_SUBMITTED,
-                job=job,
-                reason=reason,
-            )
+            # The host's classification here is never enough on its own to
+            # terminalize: the actual proof of non-submission must be
+            # re-derived fresh and applied atomically with the block, exactly
+            # like a refused NEW-submission attempt -- see
+            # _resolve_pre_submission_block.
+            return self._resolve_pre_submission_block(job, identity, ownership)
 
         if result.outcome is SnapshotOperationOutcome.UNCERTAIN:
             return self._uncertain(
@@ -758,7 +751,7 @@ class PackageUpdateSnapshotOrchestrator:
                     "snapshot task failed without canonical evidence of absence",
                 )
             try:
-                job = self._authority.fail_package_update_snapshot(
+                job_after = self._authority.fail_package_update_snapshot(
                     job_id,
                     result.reason or "PVE snapshot task failed",
                     result.snapshots,
@@ -770,7 +763,7 @@ class PackageUpdateSnapshotOrchestrator:
                 )
             return SnapshotStageResult(
                 outcome=SnapshotOperationOutcome.FAILED,
-                job=job,
+                job=job_after,
                 reason=result.reason,
             )
 
@@ -796,7 +789,7 @@ class PackageUpdateSnapshotOrchestrator:
         # G. Strict same-job confirmation, which revalidates current authority
         # once more before the job may reach snapshot_confirmed.
         try:
-            job = self._authority.confirm_package_update_snapshot(
+            job_after = self._authority.confirm_package_update_snapshot(
                 job_id, result.snapshots
             )
         except Exception as exc:  # noqa: BLE001 - never confirm on ambiguity
@@ -805,7 +798,7 @@ class PackageUpdateSnapshotOrchestrator:
                 f"canonical snapshot confirmation failed closed: {type(exc).__name__}",
             )
         return SnapshotStageResult(
-            outcome=SnapshotOperationOutcome.COMPLETED, job=job
+            outcome=SnapshotOperationOutcome.COMPLETED, job=job_after
         )
 
     def _uncertain(self, job_id: str, reason: str) -> SnapshotStageResult:

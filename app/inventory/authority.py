@@ -1893,10 +1893,30 @@ class InventoryAuthority:
             )
         return self._store.package_update_job(canonical_job_id)
 
-    def block_package_update_before_snapshot_submission(
-        self, job_id: str, reason: str
-    ) -> PackageUpdateJob:
-        """Terminalize a job whose snapshot operation was never submitted.
+    def resolve_pre_submission_block(
+        self, job_id: str, inspect: Callable[[], tuple[bool, str, _T]]
+    ) -> tuple[bool, _T]:
+        """Atomically decide, and durably apply, a pre-submission block.
+
+        This is the mirror image of
+        :meth:`execute_snapshot_submission_if_current`. That method never
+        lets a NEW submission proceed once authority has gone stale; this one
+        never lets a "never submitted" proof terminalize a job once a
+        concurrent, authorized submission may have crossed the door in the
+        gap between the proof and the durable transition -- a check-then-
+        commit race just like the one that method itself closes, mirrored
+        onto the release path instead of the submission path.
+
+        ``inspect`` performs exactly ONE bounded, read-only host inspection
+        -- never a resubmission, never a poll loop, never task polling -- and
+        returns ``(host_proves_not_submitted, reason, evidence)``. It is
+        invoked at most once, while this transaction still owns the writer
+        lock, so no concurrent :meth:`execute_snapshot_submission_if_current`
+        critical section can interleave between the proof and the block:
+        whichever critical section acquires the store's one writer lock first
+        is the one that observes truthful host state, and the other observes
+        whatever the first left behind (a submitted/task_known/terminal
+        journal, or a still-durable block).
 
         This is the ONLY way a job past ``snapshot_may_have_started`` may be
         terminalized without canonical PVE evidence, and it exists because the
@@ -1905,20 +1925,26 @@ class InventoryAuthority:
         moved node, say) would otherwise fence the single global destructive
         slot forever, with no PVE mutation having been attempted at all.
 
-        The caller must be relaying the host's own durable proof that this
-        exact operation never crossed its submission boundary. Authority
-        cannot re-derive a host fact, exactly as it cannot re-derive the
-        canonical listing that
-        :meth:`confirm_package_update_snapshot` is handed; what it does
-        enforce is that the job's own durable record is consistent with never
-        having been submitted -- no observed PVE task, and no confirmed
-        snapshot. A job that ever recorded a task identity provably *was*
-        submitted and can never be released down this path.
+        Current package-update authority is deliberately NOT required here:
+        this path exists specifically for operations whose authority may
+        already be stale, or may never have been proved for this exact call
+        at all -- recovering evidence, and releasing a job the host proves it
+        never touched, must never depend on a context that may never become
+        current again. What IS still enforced is that the job's own durable
+        record is consistent with never having been submitted -- active,
+        still at the write-ahead checkpoint, no observed PVE task, and no
+        confirmed snapshot. A job that ever recorded a task identity provably
+        *was* submitted and can never be released down this path, whatever
+        ``inspect`` reports.
+
+        Returns whether the job was blocked, plus whatever ``inspect``
+        returned as evidence either way, so the caller can recover through
+        the ordinary pipeline when it was not.
         """
 
         canonical_job_id = _require_uuid(job_id, "job_id")
-        canonical_reason = _require_text(reason, "reason", max_length=500)
-        recorded_at = _timestamp(self._now())
+        evidence: _T | None = None
+        blocked = False
         with self._store._transaction() as connection:
             job = self._require_package_update_job_row(connection, canonical_job_id)
             if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
@@ -1939,31 +1965,56 @@ class InventoryAuthority:
                 raise AuthorityInvariantError(
                     "package update job snapshot confirmation is inconsistent"
                 )
-            updated = connection.execute(
-                "UPDATE package_update_jobs SET status='blocked', "
-                "terminalized_at=?, terminal_reason=? "
-                "WHERE job_id=? AND status='active' "
-                "AND checkpoint='snapshot_may_have_started' "
-                "AND snapshot_task_upid IS NULL AND snapshot_confirmed_at IS NULL",
-                (recorded_at, canonical_reason, canonical_job_id),
+            # The fresh host proof happens HERE, while this transaction still
+            # owns the writer lock -- never before BEGIN IMMEDIATE, and never
+            # trusted if merely supplied by the caller as a precomputed value.
+            proved_not_submitted, reason, evidence = inspect()
+            self._after_pre_submission_block_proof(
+                connection, job_id=canonical_job_id
             )
-            if updated.rowcount != 1:
-                raise AuthorityConflict(
-                    "package update job pre-submission block lost durable ownership"
+            if proved_not_submitted:
+                self._commit_pre_submission_block(
+                    connection,
+                    job_id=canonical_job_id,
+                    reason=_require_text(reason, "reason", max_length=500),
                 )
-            self._append_package_update_job_event(
-                connection,
-                job_id=canonical_job_id,
-                created_at=recorded_at,
-                level=PackageUpdateEventLevel.WARNING,
-                stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
-                event_type=(
-                    PackageUpdateEventType.SNAPSHOT_BLOCKED_BEFORE_SUBMISSION
-                ),
-                message=canonical_reason,
-                details={},
+                blocked = True
+        return blocked, evidence  # type: ignore[return-value]
+
+    def _commit_pre_submission_block(
+        self, connection: sqlite3.Connection, *, job_id: str, reason: str
+    ) -> None:
+        """Durably terminalize one job as blocked, inside the caller's own
+        transaction. Only ever called while that transaction still owns the
+        authority store's writer lock -- see
+        :meth:`resolve_pre_submission_block`.
+        """
+
+        recorded_at = _timestamp(self._now())
+        updated = connection.execute(
+            "UPDATE package_update_jobs SET status='blocked', "
+            "terminalized_at=?, terminal_reason=? "
+            "WHERE job_id=? AND status='active' "
+            "AND checkpoint='snapshot_may_have_started' "
+            "AND snapshot_task_upid IS NULL AND snapshot_confirmed_at IS NULL",
+            (recorded_at, reason, job_id),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job pre-submission block lost durable ownership"
             )
-        return self._store.package_update_job(canonical_job_id)
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=recorded_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED,
+            event_type=(
+                PackageUpdateEventType.SNAPSHOT_BLOCKED_BEFORE_SUBMISSION
+            ),
+            message=reason,
+            details={},
+        )
 
     def select_package_update_rollback_target(
         self, job_id: str, observed: Sequence[ObservedSnapshot]
@@ -2289,6 +2340,16 @@ class InventoryAuthority:
         self, connection: sqlite3.Connection, *, job_id: str
     ) -> None:
         """Test seam after all issuance writes, inside the transaction."""
+
+    def _after_pre_submission_block_proof(
+        self, connection: sqlite3.Connection, *, job_id: str
+    ) -> None:
+        """Test seam inside :meth:`resolve_pre_submission_block`'s transaction,
+        after the fresh host proof and before the durable block it may
+        authorize. Both are in one transaction, so this is exactly the point
+        where an interleaving submission critical section would otherwise be
+        able to race the block.
+        """
 
     @staticmethod
     def _require_package_scan_target(

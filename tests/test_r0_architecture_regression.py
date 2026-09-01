@@ -278,6 +278,7 @@ def test_job_owned_snapshot_safety_is_not_production_reachable() -> None:
         "record_package_update_preflight_passed",
         "ensure_pre_update_snapshot_submitted",
         "execute_snapshot_submission_if_current",
+        "resolve_pre_submission_block",
         "hubinet-package-snapshot-helper",
     )
     for rel_path in (

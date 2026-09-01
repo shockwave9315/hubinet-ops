@@ -227,28 +227,62 @@ proved to belong to the same LXC PVE showed several minutes ago (see
 stable through the submission boundary, and the host independently
 re-validates the live PVE target immediately before it ever submits.
 
-**Liveness after a refusal.** A stale authority context always refuses a NEW
-submission — `execute_snapshot_submission_if_current` never authorizes one on
-stale authority, full stop. But if the underlying resource or source is gone
-or replaced for good, every future retry would repeat that identical refusal
+**Liveness after a refusal, and the pre-submission block critical section.**
+A stale authority context always refuses a NEW submission —
+`execute_snapshot_submission_if_current` never authorizes one on stale
+authority, full stop. But if the underlying resource or source is gone or
+replaced for good, every future retry would repeat that identical refusal
 forever, permanently occupying the one global destructive slot with a job
 that can never advance. The refusal alone therefore does not decide the
-job's fate: `PackageUpdateSnapshotOrchestrator` takes one FRESH host read —
-never the read this attempt started with, since another invocation could
-have been authorized and actually submitted in the gap between this
-attempt's first read and its own refusal — and only THAT fresh read decides.
-If it still proves `absent`/`intent`, the job is safely terminalized via
-`block_package_update_before_snapshot_submission` and the slot is released;
-anything else it shows (a submission already in flight, a terminal outcome,
-or the read itself failing to prove anything) is recovered through the
-ordinary evidence pipeline exactly as if this attempt had never tried to
-submit — never released as unsubmitted, and never resubmitted. This is safe
-because `execute_snapshot_submission_if_current` only serializes Hubinet's
-own writers against each other: by the time one invocation observes a
-refusal, any concurrent submission attempt that WAS authorized has already
-crossed whatever durable host journal phase it reached and released the
-writer lock, so a fresh read can see it even though the stale first read
-could not.
+job's fate, and neither does a single fresh read taken outside any lock:
+that would only narrow the very race it exists to close, since another
+invocation's authorized submission could still cross the door in the gap
+between such a read and a later, separately-committed block.
+
+So a job is only ever released as unsubmitted from inside
+`InventoryAuthority.resolve_pre_submission_block` — the mirror image of
+`execute_snapshot_submission_if_current`, serialized against it through the
+SAME authority-store writer lock. It takes ONE fresh, bounded, read-only
+host inspection *while its own transaction still owns that lock*, and
+terminalizes the job in that SAME transaction if, and only if, the read
+still proves `absent`/`intent`. `PackageUpdateSnapshotOrchestrator` calls it
+whenever something claims this exact operation was never submitted — a
+refused NEW-submission attempt, or a submission attempt whose own host call
+proved `not_submitted` during its pre-submission window — and never trusts
+any earlier read or claim for the decision itself. Current package-update
+authority is deliberately NOT required to release a job this way: what is
+still enforced is that the job's own durable record is consistent with
+never having been submitted (no observed task, no confirmed snapshot).
+Anything the fresh read shows other than `absent`/`intent` (a submission
+already in flight, a terminal outcome, or the read itself failing to prove
+anything) is recovered through the ordinary evidence pipeline exactly as if
+the call had never happened — never released as unsubmitted, and never
+resubmitted.
+
+This closes both interleavings symmetrically. If a submission critical
+section begins first, it owns the writer lock, the block operation waits,
+the submission-only helper durably advances the host journal to at least
+`submitted` before `pvesh create`, and only once that section ends and
+releases the lock does the block's own fresh inspection run — and it then
+correctly sees the submission and refuses to terminalize. If the block
+critical section begins first, it owns the writer lock, its fresh
+inspection proves `absent`/`intent`, it terminalizes the job in that same
+transaction, and only once it ends and releases the lock can a later
+submission attempt acquire it — where it now finds a terminal job and
+refuses before its own submission-only callback ever runs. Either way the
+two critical sections cannot interleave, because both hold the same one
+writer lock the authority store's `BEGIN IMMEDIATE` provides — regardless of
+whether Hubinet's authority state happens to be monotonic: authority can
+legitimately go stale and become current again (a package scan that stops,
+then resumes, matching a job's frozen plan, say), and neither critical
+section's safety depends on it staying in either state.
+
+Neither critical section ever holds that writer lock for anything beyond
+one bounded round trip: the submission-only host call never polls a PVE
+task to completion, and the block's own inspection is the same single
+bounded read `inspect_job_snapshot_state` always performs. Task polling and
+canonical confirmation happen strictly outside both, through the
+orchestrator's own read-only retry loop.
 
 **Same-job rollback.** A job may roll back only to the snapshot that exact job
 created and confirmed. `select_package_update_rollback_target` re-proves the

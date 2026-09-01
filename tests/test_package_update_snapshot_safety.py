@@ -641,6 +641,22 @@ class FakeHostControl:
     def inspect_job_snapshot_state(self, **kwargs) -> HostSnapshotResult:
         self.inspect_calls.append(kwargs)
         if self._last_submission_result is not None:
+            if (
+                self._last_submission_result.outcome
+                is SnapshotOperationOutcome.NOT_SUBMITTED
+            ):
+                # NOT_SUBMITTED is only ever produced by the mutating
+                # operation's own pre-submission-window error path; the
+                # journal never advances past `intent` for it, so a
+                # subsequent read-only inspection sees exactly that -- never
+                # a NOT_SUBMITTED outcome of its own, which no real inspect
+                # response ever carries.
+                return HostSnapshotResult(
+                    outcome=SnapshotOperationOutcome.UNCERTAIN,
+                    snapshot_operation_id=kwargs["snapshot_operation_id"],
+                    submission_state=HostSubmissionState.INTENT,
+                    reason=self._last_submission_result.reason,
+                )
             return self._last_submission_result
         return HostSnapshotResult(
             outcome=SnapshotOperationOutcome.UNCERTAIN,
@@ -1776,8 +1792,9 @@ def test_a_job_that_observed_a_task_can_never_be_released_as_unsubmitted(
     authority.record_package_update_snapshot_task(job.job_id, UPID)
 
     with pytest.raises(AuthorityConflict, match="cannot be released as unsubmitted"):
-        authority.block_package_update_before_snapshot_submission(
-            job.job_id, "host claims nothing was submitted"
+        authority.resolve_pre_submission_block(
+            job.job_id,
+            lambda: (True, "host claims nothing was submitted", None),
         )
 
     host = FakeHostControl(
@@ -1805,24 +1822,27 @@ def test_the_pre_submission_release_cannot_reach_other_checkpoints(
 
     # Before the write-ahead intent there is nothing to release this way.
     with pytest.raises(AuthorityConflict, match="not inside a snapshot operation"):
-        authority.block_package_update_before_snapshot_submission(
-            job.job_id, "too early"
+        authority.resolve_pre_submission_block(
+            job.job_id, lambda: (True, "too early", None)
         )
     authority.record_package_update_preflight_passed(job.job_id)
     with pytest.raises(AuthorityConflict, match="not inside a snapshot operation"):
-        authority.block_package_update_before_snapshot_submission(
-            job.job_id, "still too early"
+        authority.resolve_pre_submission_block(
+            job.job_id, lambda: (True, "still too early", None)
         )
 
     # And once terminal it cannot be reused.
     authority.record_package_update_snapshot_intent(job.job_id)
-    authority.block_package_update_before_snapshot_submission(job.job_id, "blocked")
+    blocked, _ = authority.resolve_pre_submission_block(
+        job.job_id, lambda: (True, "blocked", None)
+    )
+    assert blocked is True
     assert store.package_update_job(job.job_id).status is (
         PackageUpdateJobStatus.BLOCKED
     )
     with pytest.raises(AuthorityConflict, match="terminal"):
-        authority.block_package_update_before_snapshot_submission(
-            job.job_id, "again"
+        authority.resolve_pre_submission_block(
+            job.job_id, lambda: (True, "again", None)
         )
 
 
@@ -1834,8 +1854,9 @@ def test_a_confirmed_snapshot_can_never_be_released_as_unsubmitted(
         job.job_id, _canonical(ownership, identity)
     )
     with pytest.raises(AuthorityConflict, match="not inside a snapshot operation"):
-        authority.block_package_update_before_snapshot_submission(
-            job.job_id, "host claims nothing was submitted"
+        authority.resolve_pre_submission_block(
+            job.job_id,
+            lambda: (True, "host claims nothing was submitted", None),
         )
 
 
@@ -2356,9 +2377,7 @@ def test_inspecting_a_submitted_operation_that_shows_nothing_stays_fenced(
 
     # Handing that observation to the orchestrator must not terminalize.
     orchestrator = PackageUpdateSnapshotOrchestrator(authority, channel)
-    staged = orchestrator._apply_host_result(
-        job.job_id, identity.snapshot_operation_id, result
-    )
+    staged = orchestrator._apply_host_result(job, identity, ownership, result)
     assert staged.outcome is SnapshotOperationOutcome.UNCERTAIN
     fenced = store.package_update_job(job.job_id)
     assert fenced.status is PackageUpdateJobStatus.ACTIVE
@@ -3065,3 +3084,285 @@ def test_task_polling_never_holds_the_authority_writer_lock(tmp_path: Path) -> N
     assert acquired == [True]
     assert result.outcome is SnapshotOperationOutcome.COMPLETED
     assert pve.submissions == 1
+
+
+# ===========================================================================
+# The pre-submission block critical section: fresh no-submit proof -> block
+#
+# A fresh host read alone is not enough: reading it and terminalizing the job
+# on it must happen atomically with respect to Hubinet's own submission
+# writers, or a concurrent, authorized submission can cross the door in the
+# gap between the read and the durable block. resolve_pre_submission_block is
+# the mirror image of execute_snapshot_submission_if_current, serialized
+# against it through the SAME authority-store writer lock.
+# ===========================================================================
+
+
+def test_block_wins_first_against_an_interleaving_submission_writer(
+    tmp_path: Path,
+) -> None:
+    """A. The direct race proof for the NEW pre-submission block section.
+
+    A seam fires inside resolve_pre_submission_block's own transaction,
+    immediately after the fresh host proof and before the durable block --
+    exactly where an interleaving submission critical section could
+    otherwise race it. From a second, genuinely separate connection, a
+    competing writer must be unable to acquire the writer lock for the whole
+    of that window.
+    """
+
+    import sqlite3 as _sqlite3
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+
+    attempted: list[str] = []
+    inspect_calls: list[str] = []
+
+    def seam(connection, *, job_id):
+        other = _sqlite3.connect(store.path, timeout=0.1, isolation_level=None)
+        try:
+            with pytest.raises(_sqlite3.OperationalError, match="locked"):
+                other.execute("BEGIN IMMEDIATE")
+            attempted.append(job_id)
+        finally:
+            other.close()
+
+    authority._after_pre_submission_block_proof = seam
+
+    def inspect() -> tuple[bool, str, str]:
+        inspect_calls.append(job.job_id)
+        return True, "host proves absent", "evidence"
+
+    blocked, evidence = authority.resolve_pre_submission_block(job.job_id, inspect)
+
+    assert blocked is True
+    assert evidence == "evidence"
+    assert attempted == [job.job_id]
+    # Exactly one bounded host inspection -- never a poll loop.
+    assert inspect_calls == [job.job_id]
+    blocked_job = store.package_update_job(job.job_id)
+    assert blocked_job.status is PackageUpdateJobStatus.BLOCKED
+    assert blocked_job.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+    assert blocked_job.snapshot_task_upid is None
+    assert blocked_job.snapshot_confirmed_at is None
+    events = store.list_package_update_job_events(job.job_id)
+    assert (
+        events[-1].event_type
+        is PackageUpdateEventType.SNAPSHOT_BLOCKED_BEFORE_SUBMISSION
+    )
+
+    # Afterwards, a competitor's submission attempt correctly refuses: the
+    # job is already terminal, and its callback is never invoked.
+    competitor_calls: list[str] = []
+    with pytest.raises(AuthorityConflict, match="terminal"):
+        authority.execute_snapshot_submission_if_current(
+            job.job_id, lambda: competitor_calls.append("submitted")
+        )
+    assert competitor_calls == []
+
+    # Startup recovery leaves the terminal job exactly as it is.
+    before_events = store.list_package_update_job_events(job.job_id)
+    assert authority.recover_interrupted_package_update_jobs() == ()
+    assert store.package_update_job(job.job_id) == blocked_job
+    assert store.list_package_update_job_events(job.job_id) == before_events
+
+    # And the global destructive slot is free again.
+    other_resource, _, other_approval = _add_approved_resource(store, authority)
+    successor = _issue(authority, other_resource, other_approval)
+    assert successor.status is PackageUpdateJobStatus.ACTIVE
+
+
+def test_block_wins_first_through_the_real_dark_boundary(tmp_path: Path) -> None:
+    """A. The same witness, through the real dark boundary.
+
+    The host journal genuinely stays at `intent`. Once the block commits,
+    a competitor's submission attempt must never reach a real `pvesh
+    create` -- it is refused before the host is ever asked.
+    """
+
+    store, authority, job, identity, ownership, pve, journal, _ = _dark_system(
+        tmp_path
+    )
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+
+    channel = _dark_channel(pve, journal)
+
+    def inspect() -> tuple[bool, str, HostSnapshotResult]:
+        result = channel.inspect_job_snapshot_state(
+            snapshot_operation_id=identity.snapshot_operation_id,
+            snapshot_name=identity.snapshot_name,
+            vmid=job.expected_vmid,
+            expected_node=job.expected_node_name,
+            ownership=ownership,
+        )
+        proved = result.submission_state in (
+            HostSubmissionState.ABSENT,
+            HostSubmissionState.INTENT,
+        )
+        return proved, result.reason or "fresh host read", result
+
+    blocked, evidence = authority.resolve_pre_submission_block(job.job_id, inspect)
+
+    assert blocked is True
+    assert pve.submissions == 0
+    assert not any(argv[1] == "create" for argv in pve.argvs)
+    blocked_job = store.package_update_job(job.job_id)
+    assert blocked_job.status is PackageUpdateJobStatus.BLOCKED
+
+    # A competitor's submission attempt correctly refuses: the job is
+    # already terminal, so the real host is never even asked.
+    create_calls: list[dict] = []
+
+    def tracking_submit() -> HostSnapshotResult:
+        create_calls.append({})
+        return channel.ensure_pre_update_snapshot_submitted(
+            snapshot_operation_id=identity.snapshot_operation_id,
+            snapshot_name=identity.snapshot_name,
+            vmid=job.expected_vmid,
+            expected_node=job.expected_node_name,
+            ownership=ownership,
+        )
+
+    with pytest.raises(AuthorityConflict, match="terminal"):
+        authority.execute_snapshot_submission_if_current(
+            job.job_id, tracking_submit
+        )
+    assert create_calls == []
+    assert pve.submissions == 0
+
+
+def test_submission_wins_first_against_the_pre_submission_block(
+    tmp_path: Path,
+) -> None:
+    """B. A submission that already crossed the door always wins.
+
+    An authorized submission commits first, under its own writer lock. The
+    block's OWN fresh inspection -- taken later, under its own writer lock
+    -- must see whatever that submission left behind and refuse to
+    terminalize; the durable task evidence remains recoverable regardless.
+    """
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+
+    submitted = authority.execute_snapshot_submission_if_current(
+        job.job_id, lambda: "submitted-for-real"
+    )
+    assert submitted == "submitted-for-real"
+    # The backend has NOT yet persisted the task identity -- that only
+    # happens in a later, separate transaction (see
+    # PackageUpdateSnapshotOrchestrator._apply_host_result). This is exactly
+    # the gap the block must not race: its own fresh host inspection, not
+    # this durable field, is what has to prove a submission is in flight.
+    assert store.package_update_job(job.job_id).snapshot_task_upid is None
+
+    inspect_calls: list[str] = []
+
+    def inspect() -> tuple[bool, str, str]:
+        inspect_calls.append(job.job_id)
+        return False, "host now shows a submission in flight", "post-submit-evidence"
+
+    blocked, evidence = authority.resolve_pre_submission_block(job.job_id, inspect)
+
+    assert blocked is False
+    assert evidence == "post-submit-evidence"
+    assert inspect_calls == [job.job_id]
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_MAY_HAVE_STARTED
+
+    # The task evidence remains recoverable outside the block's lock, exactly
+    # as the ordinary orchestrator pipeline would do it afterward.
+    authority.record_package_update_snapshot_task(job.job_id, UPID)
+    assert store.package_update_job(job.job_id).snapshot_task_upid == UPID
+
+
+def test_the_block_path_stays_safe_even_though_authority_is_not_monotonic(
+    tmp_path: Path,
+) -> None:
+    """C. "Once stale, always stale" is not a valid safety assumption.
+
+    Authority can legitimately go stale and then become current again -- a
+    package scan that no longer matches the job's frozen plan, followed by a
+    new successful scan that reproduces the exact same material, is a real,
+    ordinary way for that to happen; it is not this stage's job to change
+    that. Demonstrate the round trip, then prove the pre-submission block
+    stays safe regardless: even though authority is current again by the
+    time the block's fresh read runs, a competing, already-authorized
+    submission that crossed the door earlier -- while authority was briefly
+    stale for THIS job's own attempt -- must still win. The block decision
+    depends only on the fresh host proof taken under its own writer lock,
+    never on Hubinet's authority state at any particular moment.
+    """
+
+    from dataclasses import replace as _replace
+
+    from tests.test_package_plan_approval import _successful_plan
+    from tests.test_package_scan_authority import _packages
+
+    _, store, authority, resource, scan, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    authority.record_package_update_preflight_passed(job.job_id)
+    job = authority.record_package_update_snapshot_intent(job.job_id)
+
+    # Authority goes stale: a new scan finds different package material, so
+    # the job's frozen plan fingerprint no longer matches the latest scan.
+    drifted_packages = tuple(
+        _replace(package, candidate_version=package.candidate_version + "+rebuild1")
+        for package in _packages()
+    )
+    _successful_plan(authority, resource.resource_id, drifted_packages)
+    with pytest.raises(AuthorityConflict, match="package plan fingerprint"):
+        authority.execute_snapshot_submission_if_current(
+            job.job_id, lambda: "must never run while stale"
+        )
+
+    # It legitimately becomes current again: a further scan reproduces the
+    # job's exact original material and fingerprint.
+    _successful_plan(authority, resource.resource_id)
+    restored = authority.execute_snapshot_submission_if_current(
+        job.job_id, lambda: "a-real-submission-while-current"
+    )
+    assert restored == "a-real-submission-while-current"
+    # The backend has not yet persisted the task identity from that
+    # submission -- the same gap test B exercises -- so only a fresh host
+    # proof, never this durable field, may decide the block below.
+    assert store.package_update_job(job.job_id).snapshot_task_upid is None
+
+    # A DIFFERENT, later invocation's fresh block inspection -- run after
+    # authority is current again -- must still see that submission and
+    # refuse to terminalize the job as unsubmitted. It never looks at
+    # authority state at all.
+    blocked, _ = authority.resolve_pre_submission_block(
+        job.job_id,
+        lambda: (False, "host shows the submission that already crossed", None),
+    )
+
+    assert blocked is False
+    authority.record_package_update_snapshot_task(job.job_id, UPID)
+    fenced = store.package_update_job(job.job_id)
+    assert fenced.status is PackageUpdateJobStatus.ACTIVE
+    assert fenced.snapshot_task_upid == UPID
+
+
+def test_inspect_return_value_alone_decides_never_a_caller_supplied_flag(
+    tmp_path: Path,
+) -> None:
+    """Typed-result guard: only what ``inspect`` reports under the lock can
+    ever terminalize the job -- there is no separate boolean parameter a
+    caller could pass to short-circuit the read."""
+
+    import inspect as _pyinspect
+
+    signature = _pyinspect.signature(
+        InventoryAuthority.resolve_pre_submission_block
+    )
+    assert list(signature.parameters) == ["self", "job_id", "inspect"]
+
+    _, store, authority, resource, job, identity, ownership = _prepared(tmp_path)
+    blocked, evidence = authority.resolve_pre_submission_block(
+        job.job_id, lambda: (False, "not proved", "unchanged")
+    )
+    assert blocked is False
+    assert evidence == "unchanged"
+    assert store.package_update_job(job.job_id).status is PackageUpdateJobStatus.ACTIVE
