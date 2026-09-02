@@ -2104,8 +2104,24 @@ job's workload is healthy. So the existing layered model applies:
 Every argv is fixed, and every one was **verified against the real tools**
 (systemd 257, Docker 26.1.5), not assumed. A probe target is data: it becomes
 one argv element and never command text, never a format string, never a
-template, never a shell fragment. Shell quoting is not used as a security
-mechanism anywhere — there is no shell.
+template, never a shell fragment.
+
+For a guest on the local node there is no shell at all — it is `pct exec`
+argv, straight through. The one place a command *line* exists is routing to
+another cluster member, because that is what `ssh` hands the remote login
+shell, and the scan, execution, and mutation helpers all route the same way
+over the passwordless inter-node trust Proxmox itself provisions.
+
+Health execution is the first helper to route an element that came from
+outside the file, and **shell quoting is deliberately not the mechanism that
+makes it safe.** The kind-specific validation below already restricts a target
+to characters a shell reads as nothing at all; the guest-command dispatcher
+names the request-derived element explicitly and refuses to route it if it
+would need a single quote adding, reporting the probe unevaluable instead. So
+the property is checked rather than claimed. The constants around it — notably
+the Docker `--format` template, whose braces this file owns — are quoted
+normally: their content is fixed and reviewed, the caller's is not, and only
+the caller's is subject to that rule.
 
 **`systemd_unit_active`**
 
