@@ -174,6 +174,15 @@ MAX_EXPECTED_PACKAGES = 5000
 
 JOURNAL_DIRECTORY = Path("/var/lib/hubinet-ops/package-mutation-operations")
 
+#: The deepest directory this module assumes already exists, and is already
+#: durably linked in its own parent, on any host it runs on: a standard FHS
+#: location created by the base OS install. This module never creates,
+#: removes, or otherwise races to create `/var/lib` itself, so no
+#: concurrent-first-use durability barrier is needed for it -- only for the
+#: Hubinet-owned levels strictly below it (`JOURNAL_DIRECTORY` and its
+#: parent). See `_ensure_durable_directory`.
+JOURNAL_DURABILITY_ANCHOR = JOURNAL_DIRECTORY.parent.parent
+
 NODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}")
 FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 ARCHITECTURE_RE = re.compile(r"[a-z][a-z0-9]*(-[a-z0-9]+)*")
@@ -955,8 +964,11 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         offset += written
 
 
-def _ensure_durable_directory(path: Path, *, mode: int) -> None:
-    """Create `path`, and any missing parents, as a crash-durable link.
+def _ensure_durable_directory(
+    path: Path, *, mode: int, anchor: Path = JOURNAL_DURABILITY_ANCHOR
+) -> None:
+    """Create `path`, and any missing parents down to `anchor`, as a
+    crash-durable link, proving every level's own barrier on EVERY call.
 
     `Path.mkdir(parents=True, exist_ok=True)` alone is not enough on this
     host's very first package-mutation operation, when `JOURNAL_DIRECTORY`
@@ -969,17 +981,25 @@ def _ensure_durable_directory(path: Path, *, mode: int) -> None:
     recovery sees the journal directory as absent and seals an operation
     that may already have mutated packages as never submitted.
 
-    Only the components that do not already exist are created and
-    fsynced; a pre-existing system directory such as `/var` or
-    `/var/lib` is never opened or written to by this call, and once
-    `path` exists this is a single `is_dir()` check with no `mkdir` or
-    `fsync` at all -- so it is not a cost paid on every journal write,
-    only on the first one.
+    `is_dir()` being true is NOT proof a level is durable: it is equally
+    true the instant after a CONCURRENT first-use caller (a different VMID
+    racing this same host's very first two package-mutation operations)
+    creates it and before that caller has performed its own parent-fsync
+    barrier. A caller that trusted "already exists" as "already durable"
+    could then journal `submitted` and launch `apt` while that entry's own
+    link is still only in page cache -- a power loss before the concurrent
+    creator resumes drops it, and recovery observes the journal directory
+    as absent for an operation that may already have mutated packages.
 
-    Safe under a race between two processes creating the same path: a
-    `FileExistsError` from losing the race is not an error here, and the
-    loser still fsyncs the parent, so neither caller can return before the
-    entry it just observed is durable.
+    So every level strictly below `anchor` gets its own `mkdir` attempt
+    (tolerating `FileExistsError` -- from this call's own knowledge, an
+    ordinary race, not an error) followed by an unconditional fsync of
+    ITS parent, on every call, regardless of whether that level already
+    existed when this call started. `anchor` itself is never opened,
+    created, or fsynced: it is the caller's assertion of the smallest
+    directory that is known-durable independent of any concurrent Hubinet
+    activity (in production, `JOURNAL_DURABILITY_ANCHOR` = `/var/lib`, a
+    standard FHS location from the base OS install -- see that constant).
 
     `path` is always one of this module's own code-owned absolute
     literals (`JOURNAL_DIRECTORY`, or a lease path directly under it),
@@ -987,23 +1007,22 @@ def _ensure_durable_directory(path: Path, *, mode: int) -> None:
     traversal surface to defend against here.
     """
 
-    missing: list[Path] = []
+    if path != anchor and anchor not in path.parents:
+        raise ValueError(f"{path} is not below the trusted anchor {anchor}")
+
+    levels: list[Path] = []
     probe = path
-    while not probe.is_dir():
-        missing.append(probe)
-        parent = probe.parent
-        if parent == probe:
-            # Reached the filesystem root without finding an existing
-            # directory. Unreachable for a real absolute path under an
-            # existing filesystem; stop rather than loop forever.
-            break
-        probe = parent
-    for directory in reversed(missing):
+    while probe != anchor:
+        levels.append(probe)
+        probe = probe.parent
+    for directory in reversed(levels):
         try:
             os.mkdir(directory, mode)
         except FileExistsError:
-            # Another process won the race to create this exact level;
-            # its entry still gets the same durability barrier below.
+            # Already present -- either genuinely pre-existing, or a
+            # concurrent first-use caller (our own race partner, or a
+            # different VMID's first operation) just created it. Either
+            # way its own durability barrier below is not skipped.
             pass
         parent_descriptor = os.open(directory.parent, os.O_RDONLY)
         try:
@@ -1015,12 +1034,22 @@ def _ensure_durable_directory(path: Path, *, mode: int) -> None:
 class OperationJournal:
     """Atomic, fsynced, per-operation package-mutation journal on the host."""
 
-    def __init__(self, directory: Path = JOURNAL_DIRECTORY) -> None:
+    def __init__(
+        self,
+        directory: Path = JOURNAL_DIRECTORY,
+        *,
+        anchor: Path = JOURNAL_DURABILITY_ANCHOR,
+    ) -> None:
         self._directory = Path(directory)
+        self._anchor = Path(anchor)
 
     @property
     def directory(self) -> Path:
         return self._directory
+
+    @property
+    def anchor(self) -> Path:
+        return self._anchor
 
     def _path(self, mutation_operation_id: str) -> Path:
         # The id is a validated canonical UUID, so this never escapes.
@@ -1032,11 +1061,12 @@ class OperationJournal:
         Shares its primitive with `VmidMutationLease.__enter__`, which may
         create this same directory first (a lease is typically acquired
         before any journal record for an operation is written): whichever
-        of the two runs first pays for the durability barrier, and the
-        other observes an already-existing, already-durable directory.
+        of the two runs first still pays for its OWN durability barrier,
+        because an already-existing directory is not proof the other
+        caller's barrier has completed yet.
         """
 
-        _ensure_durable_directory(self._directory, mode=0o700)
+        _ensure_durable_directory(self._directory, mode=0o700, anchor=self._anchor)
 
     def read(self, mutation_operation_id: str) -> dict[str, Any] | None:
         path = self._path(mutation_operation_id)
@@ -1163,8 +1193,15 @@ class VmidMutationLease:
     never unlocks -- unlocking would release the lock for the runner too.
     """
 
-    def __init__(self, vmid: int, directory: Path = JOURNAL_DIRECTORY) -> None:
+    def __init__(
+        self,
+        vmid: int,
+        directory: Path = JOURNAL_DIRECTORY,
+        *,
+        anchor: Path = JOURNAL_DURABILITY_ANCHOR,
+    ) -> None:
         self._path = Path(directory) / f"vmid-{int(vmid)}.lock"
+        self._anchor = Path(anchor)
         self._descriptor: int | None = None
 
     @property
@@ -1175,8 +1212,10 @@ class VmidMutationLease:
         # Same durable-directory primitive as `OperationJournal.ensure_directory`
         # -- this lease is often acquired before that operation's first
         # journal record exists, so this call may be the one that first
-        # creates `JOURNAL_DIRECTORY`, and it must be exactly as durable.
-        _ensure_durable_directory(self._path.parent, mode=0o700)
+        # creates `JOURNAL_DIRECTORY`, and a DIFFERENT VMID's lease may be
+        # racing this same first-use directory concurrently; either way
+        # this call proves its own barrier rather than trusting the other.
+        _ensure_durable_directory(self._path.parent, mode=0o700, anchor=self._anchor)
         self._descriptor = os.open(
             self._path, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC, 0o600
         )
@@ -1207,11 +1246,13 @@ class VmidMutationLease:
             self._descriptor = None
 
 
-def lease_is_held(vmid: int, directory: Path) -> bool:
+def lease_is_held(
+    vmid: int, directory: Path, *, anchor: Path = JOURNAL_DURABILITY_ANCHOR
+) -> bool:
     """Probe whether some invocation currently holds this guest's lease."""
 
     try:
-        with VmidMutationLease(vmid, directory):
+        with VmidMutationLease(vmid, directory, anchor=anchor):
             return False
     except MutationError as exc:
         if exc.classification == "operation_in_progress":
@@ -1666,7 +1707,7 @@ def _inspect(
     )
     state = _phase_state(record)
     running = state == "submitted" and lease_is_held(
-        request["vmid"], journal.directory
+        request["vmid"], journal.directory, anchor=journal.anchor
     )
     evidence = None
     if record is not None and state in TERMINAL_PHASES:
@@ -1706,7 +1747,7 @@ def _seal_never_submitted(
     """
 
     fingerprint = request_fingerprint(request)
-    with VmidMutationLease(request["vmid"], journal.directory):
+    with VmidMutationLease(request["vmid"], journal.directory, anchor=journal.anchor):
         record = _require_matching_request(
             journal.read(request["mutation_operation_id"]), fingerprint
         )
@@ -1788,7 +1829,7 @@ def _prepare(
     fingerprint = request_fingerprint(request)
     vmid = request["vmid"]
     expected_node = request["expected_node"]
-    with VmidMutationLease(vmid, journal.directory):
+    with VmidMutationLease(vmid, journal.directory, anchor=journal.anchor):
         record = _require_matching_request(
             journal.read(request["mutation_operation_id"]), fingerprint
         )
@@ -1919,7 +1960,7 @@ def _execute(
     fingerprint = request_fingerprint(request)
     vmid = request["vmid"]
     expected_node = request["expected_node"]
-    lease = VmidMutationLease(vmid, journal.directory)
+    lease = VmidMutationLease(vmid, journal.directory, anchor=journal.anchor)
     with lease:
         record = _require_matching_request(
             journal.read(request["mutation_operation_id"]), fingerprint

@@ -235,7 +235,11 @@ class FakeHost:
 
 @pytest.fixture()
 def journal(tmp_path: Path):
-    return helper.OperationJournal(tmp_path / "operations")
+    # `anchor=tmp_path` stands in for `JOURNAL_DURABILITY_ANCHOR` (`/var/lib`
+    # in production): pytest already guarantees `tmp_path` durably exists,
+    # so it is exactly as trustworthy a pre-existing boundary for these
+    # tests as the real anchor is in production.
+    return helper.OperationJournal(tmp_path / "operations", anchor=tmp_path)
 
 
 @pytest.fixture()
@@ -697,7 +701,7 @@ def test_inspection_performs_no_pve_or_guest_reads(host, journal) -> None:
 
 
 def test_a_held_lease_refuses_every_mutating_operation(host, journal) -> None:
-    with helper.VmidMutationLease(VMID, journal.directory):
+    with helper.VmidMutationLease(VMID, journal.directory, anchor=journal.anchor):
         for operation in (
             "prepare_exact_package_mutation",
             "execute_exact_package_mutation",
@@ -728,7 +732,7 @@ def test_a_held_lease_is_the_running_signal_for_a_submitted_operation(
     assert idle["operation_state"] == "submitted"
     assert idle["running"] is False
 
-    with helper.VmidMutationLease(VMID, journal.directory):
+    with helper.VmidMutationLease(VMID, journal.directory, anchor=journal.anchor):
         busy = _handle(
             _request("inspect_package_mutation_state"),
             host,
@@ -789,10 +793,10 @@ def test_the_real_detached_runner_holds_the_lease_and_journals_its_result(
     # wait, not an instantaneous assertion.
     deadline = time.monotonic() + 15.0
     while time.monotonic() < deadline:
-        if not helper.lease_is_held(VMID, journal.directory):
+        if not helper.lease_is_held(VMID, journal.directory, anchor=journal.anchor):
             break
         time.sleep(0.05)
-    assert not helper.lease_is_held(VMID, journal.directory)
+    assert not helper.lease_is_held(VMID, journal.directory, anchor=journal.anchor)
 
 
 # ===========================================================================
@@ -1919,7 +1923,7 @@ def test_first_directory_creation_fsyncs_every_newly_created_parent(
     assert not root.parent.exists()
     fsynced = _spy_fd_paths(monkeypatch)
 
-    helper._ensure_durable_directory(root, mode=0o700)
+    helper._ensure_durable_directory(root, mode=0o700, anchor=tmp_path)
 
     assert root.is_dir()
     assert oct(root.stat().st_mode & 0o777) == oct(0o700)
@@ -1930,29 +1934,67 @@ def test_first_directory_creation_fsyncs_every_newly_created_parent(
     assert fsynced == [tmp_path, root.parent]
 
 
-def test_an_already_existing_journal_directory_needs_no_new_work(
+def test_an_already_existing_directory_still_gets_its_parent_barrier(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """B. No correctness regression once the directory already exists."""
+    """B. `is_dir()` already being true is not proof of durability.
 
-    root = tmp_path / "package-mutation-operations"
-    root.mkdir(mode=0o700)
+    It is equally true a long time after this directory was durably
+    created, AND the instant after a concurrent first-use caller (a
+    different VMID racing this same host's very first two package-mutation
+    operations) created it and before THAT caller reached its own
+    parent-fsync barrier. This call cannot tell those two situations
+    apart, so it must not skip the barrier in either one: it still
+    attempts `mkdir` (tolerating `FileExistsError`, an ordinary race, not
+    an error) and still fsyncs the parent, exactly as if it had created
+    the directory itself.
+    """
 
-    def _unexpected(*_args, **_kwargs):
-        raise AssertionError("must not touch an already-durable directory")
+    root = tmp_path / "var-lib-hubinet-ops" / "package-mutation-operations"
+    root.mkdir(parents=True, mode=0o700)
+    fsynced = _spy_fd_paths(monkeypatch)
 
-    monkeypatch.setattr(os, "mkdir", _unexpected)
-    monkeypatch.setattr(os, "fsync", _unexpected)
-
-    helper._ensure_durable_directory(root, mode=0o700)  # must not raise
+    helper._ensure_durable_directory(root, mode=0o700, anchor=tmp_path)  # must not raise
 
     assert root.is_dir()
+    assert fsynced == [tmp_path, root.parent]
+
+
+def test_a_concurrently_created_intermediate_level_still_gets_barriered(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C. Two-level race: only the intermediate Hubinet-owned level was
+    concurrently created; the leaf still needs creating by this call.
+
+    A concurrent first-use caller for a different VMID may have created
+    `hubinet-ops` (this product's one intermediate controlled level) and
+    not yet fsynced ITS parent, while the leaf journal directory is still
+    genuinely absent for this call to create. Both levels' own parent
+    links must be proven before this call returns -- not just the leaf's,
+    which the old "stop climbing at the first existing ancestor" discovery
+    would have wrongly trusted as already durable.
+    """
+
+    anchor = tmp_path
+    intermediate = tmp_path / "hubinet-ops"
+    leaf = intermediate / "package-mutation-operations"
+    intermediate.mkdir(mode=0o700)  # the concurrent creator got here first
+    assert not leaf.exists()
+    fsynced = _spy_fd_paths(monkeypatch)
+
+    helper._ensure_durable_directory(leaf, mode=0o700, anchor=anchor)
+
+    assert leaf.is_dir()
+    # `intermediate`'s own barrier (proving ITS link into `anchor`) still
+    # happens, even though this call did not create it, followed by
+    # `leaf`'s barrier (proving its link into `intermediate`).
+    assert fsynced == [anchor, intermediate]
 
 
 def test_first_journal_write_orders_directory_before_record_before_rename(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """C. durable directory -> durable record -> rename -> submitted -> apt.
+    """D. durable directory -> durable record -> rename -> submitted -> apt.
 
     Exercised at the `OperationJournal.write` level, one level below the
     real "submitted, then launch apt" boundary in `handle_request`: `write`
@@ -1962,7 +2004,7 @@ def test_first_journal_write_orders_directory_before_record_before_rename(
     """
 
     directory = tmp_path / "operations"
-    journal = helper.OperationJournal(directory)
+    journal = helper.OperationJournal(directory, anchor=tmp_path)
     assert not directory.exists()
 
     events: list[str] = []
@@ -2007,14 +2049,16 @@ def test_first_journal_write_orders_directory_before_record_before_rename(
 def test_lease_first_path_creates_the_directory_just_as_durably(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """D. The lease may create the journal directory before any journal
-    record exists; it must use the identical durability barrier."""
+    """E. The lease may create the journal directory before any journal
+    record exists; it must use the identical durability barrier -- and a
+    journal that observes that already-existing directory afterwards must
+    still perform its own barrier rather than trusting the lease's."""
 
     directory = tmp_path / "operations"
     assert not directory.exists()
     fsynced = _spy_fd_paths(monkeypatch)
 
-    with helper.VmidMutationLease(VMID, directory):
+    with helper.VmidMutationLease(VMID, directory, anchor=tmp_path):
         pass
 
     assert directory.is_dir()
@@ -2023,19 +2067,18 @@ def test_lease_first_path_creates_the_directory_just_as_durably(
     # `OperationJournal.ensure_directory` would have used.
     assert directory.parent in fsynced
 
-    # A journal created afterwards observes an already-durable directory
-    # and pays no further mkdir/fsync cost to make it durable again.
-    def _unexpected_mkdir(*_args, **_kwargs):
-        raise AssertionError("directory is already durable")
-
-    monkeypatch.setattr(os, "mkdir", _unexpected_mkdir)
-    helper.OperationJournal(directory).ensure_directory()
+    # A journal created afterwards still performs its own mkdir attempt
+    # (tolerating `FileExistsError`) and its own parent fsync -- it does
+    # NOT trust the lease's prior barrier as proof of its own durability.
+    fsynced_again = _spy_fd_paths(monkeypatch)
+    helper.OperationJournal(directory, anchor=tmp_path).ensure_directory()
+    assert fsynced_again == [directory.parent]
 
 
 def test_a_losing_creator_still_fsyncs_and_never_raises(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """E. Two racing creators: the loser's `mkdir` failure is not an error,
+    """F. Two racing creators: the loser's `mkdir` failure is not an error,
     and it still fsyncs the parent before returning."""
 
     directory = tmp_path / "package-mutation-operations"
@@ -2050,14 +2093,57 @@ def test_a_losing_creator_still_fsyncs_and_never_raises(
     monkeypatch.setattr(os, "mkdir", racing_mkdir)
     fsynced = _spy_fd_paths(monkeypatch)
 
-    helper._ensure_durable_directory(directory, mode=0o700)  # must not raise
+    helper._ensure_durable_directory(
+        directory, mode=0o700, anchor=tmp_path
+    )  # must not raise
 
     assert directory.is_dir()
     assert directory.parent in fsynced
 
 
+def test_a_directory_barrier_failure_blocks_submission_and_apt(
+    host, journal, monkeypatch
+) -> None:
+    """G. A failed durability barrier fails closed, exactly like a failed
+    record write: no rename, no submitted state, no mutation launch.
+
+    The lease's directory-ensure is the very first fsync of the whole
+    execute flow (preparation itself is durable-free), so failing the
+    first `os.fsync` call reaches exactly that barrier.
+    """
+
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    assert prepared["ok"] is True
+    digest = prepared["evidence"]["prepared_evidence_digest"]
+
+    real_fsync = os.fsync
+    calls = {"n": 0}
+
+    def spy_fsync(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("simulated fsync failure for the journal directory link")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+
+    with pytest.raises(OSError):
+        _handle(
+            _request(
+                "execute_exact_package_mutation", prepared_evidence_digest=digest
+            ),
+            host,
+            journal,
+            spawn=_never_spawn,
+        )
+
+    assert calls["n"] >= 1
+    assert host.mutations == 0
+    assert journal.read(OPERATION_ID) is None
+
+
 # ===========================================================================
-# F. A SHORT `os.write()` NEVER BECOMES THE DURABLE JOURNAL RECORD
+# N. A SHORT `os.write()` NEVER BECOMES THE DURABLE JOURNAL RECORD
 #
 # `os.write(fd, payload)` is only permitted to return `len(payload)`; a
 # valid call may legally write fewer bytes than that without raising. The
@@ -2077,7 +2163,7 @@ def test_a_short_first_write_is_completed_by_a_later_write(
 ) -> None:
     """A. A truncated first `os.write` is completed by a subsequent one."""
 
-    journal = helper.OperationJournal(tmp_path / "operations")
+    journal = helper.OperationJournal(tmp_path / "operations", anchor=tmp_path)
     real_write = os.write
     calls = {"n": 0}
 
@@ -2103,7 +2189,7 @@ def test_many_tiny_short_writes_reconstruct_the_exact_payload(
 ) -> None:
     """B. The whole payload survives being written one byte at a time."""
 
-    journal = helper.OperationJournal(tmp_path / "operations")
+    journal = helper.OperationJournal(tmp_path / "operations", anchor=tmp_path)
     real_write = os.write
 
     def spy_write(fd, data):
@@ -2128,7 +2214,7 @@ def test_a_write_that_makes_no_progress_never_replaces_the_journal(
     """C. `os.write()` returning 0 fails closed: no replace, no record."""
 
     directory = tmp_path / "operations"
-    journal = helper.OperationJournal(directory)
+    journal = helper.OperationJournal(directory, anchor=tmp_path)
 
     monkeypatch.setattr(os, "write", lambda fd, data: 0)
 
@@ -2146,7 +2232,7 @@ def test_a_write_error_after_partial_progress_never_replaces_the_journal(
     """D. A write that fails partway leaves no authoritative rename."""
 
     directory = tmp_path / "operations"
-    journal = helper.OperationJournal(directory)
+    journal = helper.OperationJournal(directory, anchor=tmp_path)
     real_write = os.write
     calls = {"n": 0}
 

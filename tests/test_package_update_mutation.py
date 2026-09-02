@@ -323,7 +323,13 @@ class HelperBackedHostControl:
 
     def __init__(self, guest: FakeGuest, journal_directory: Path) -> None:
         self.guest = guest
-        self.journal = helper.OperationJournal(journal_directory)
+        # `journal_directory.parent` stands in for `JOURNAL_DURABILITY_ANCHOR`
+        # (`/var/lib` in production): the caller's `tmp_path`-rooted parent is
+        # exactly as durable a pre-existing boundary for this test as the
+        # real anchor is in production.
+        self.journal = helper.OperationJournal(
+            journal_directory, anchor=journal_directory.parent
+        )
         self.calls: list[str] = []
         #: How the detached runner behaves. "run" completes it synchronously,
         #: "hold" models one still running, "die" models a runner killed
