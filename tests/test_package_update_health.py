@@ -27,6 +27,7 @@ guest, with a JSON round trip through the real transport parser.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sqlite3
 import sys
@@ -1415,8 +1416,6 @@ def test_a_failed_health_job_can_then_be_rolled_back_normally(
 ) -> None:
     """The capability is retained; it just is not exercised automatically."""
 
-    from app.package_update_rollback import PackageUpdateRollbackOrchestrator
-
     _, store, authority, _, _, _, job = _mutated_job(tmp_path)
     identity = authority.package_update_snapshot_identity(job.job_id)
     ownership = authority.package_update_snapshot_ownership(job.job_id)
@@ -1819,3 +1818,172 @@ def test_a_job_that_moved_on_mid_attempt_still_reports_no_verdict(
     assert result.status is HealthStageStatus.UNKNOWN
     assert result.job.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
     assert result.job.health_outcome is None
+
+
+# ===========================================================================
+# 12. End to end: the orchestrator over the REAL dark helper
+# ===========================================================================
+#
+# Everything above tests one seam. These join all of them: authority ->
+# request assembly -> the real SSH transport's JSON encoding -> the real
+# helper module -> a fake guest -> the real response parser -> validation ->
+# aggregation -> the durable verdict. Nothing here runs a real `pvesh`,
+# `pct`, `ssh`, `systemctl`, or `docker`.
+
+
+def _end_to_end(tmp_path: Path, configure=None, *, probes=None):
+    from tests.test_package_health_helper import FakeGuest, helper as real_helper
+    from app.package_scan_host_control import BoundedProcessResult
+    from app.package_update_health_host_control import (
+        SshPackageUpdateHealthHostControl,
+    )
+
+    _, store, authority, resource, scan, approval, job = _mutated_job(
+        tmp_path, health_probes=probes
+    )
+    request = authority.package_update_health_request(job.job_id)
+    guest = FakeGuest()
+    guest.vmid = request.vmid
+    guest.node = guest.current_node = request.expected_node
+    if configure is not None:
+        configure(guest)
+
+    def runner(argv, stdin, timeout, max_bytes):
+        payload = json.loads(stdin.decode("utf-8"))
+        response = real_helper.handle_request(payload, runner=guest)
+        return BoundedProcessResult(
+            returncode=0 if response.get("ok") else 1,
+            stdout=json.dumps(response).encode("utf-8"),
+            stderr=b"",
+            timed_out=False,
+            output_exceeded=False,
+        )
+
+    transport = SshPackageUpdateHealthHostControl(
+        host="pve.example.internal",
+        port=22,
+        user="hubinet-health",
+        private_key_path=Path("/etc/hubinet-ops/health.key"),
+        known_hosts_path=Path("/etc/hubinet-ops/health.known_hosts"),
+        timeout_seconds=60,
+        max_result_bytes=64 * 1024,
+        runner=runner,
+    )
+    orchestrator = PackageUpdateHealthOrchestrator(authority, transport)
+    return store, authority, guest, orchestrator.evaluate_job_health(job.job_id)
+
+
+def test_end_to_end_a_healthy_workload_succeeds(tmp_path: Path) -> None:
+    store, authority, guest, result = _end_to_end(tmp_path)
+
+    assert result.status is HealthStageStatus.PASSED
+    assert result.job.status is PackageUpdateJobStatus.SUCCEEDED
+    assert result.job.health_outcome is HealthOutcome.PASSED
+    assert [r.reason for r in result.job.health_probe_results] == [
+        "container_running",
+        "unit_active",
+    ]
+
+
+def test_end_to_end_a_stopped_unit_fails_and_keeps_rollback_authority(
+    tmp_path: Path,
+) -> None:
+    def stop_the_unit(guest):
+        guest.units["nginx.service"] = ("loaded", "failed")
+
+    store, authority, guest, result = _end_to_end(tmp_path, stop_the_unit)
+
+    assert result.status is HealthStageStatus.FAILED
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.health_outcome is HealthOutcome.FAILED
+    assert [
+        (r.outcome, r.reason) for r in result.job.health_probe_results
+    ] == [
+        (HealthProbeOutcome.PASSED, "container_running"),
+        (HealthProbeOutcome.FAILED, "unit_not_active"),
+    ]
+    assert authority.package_update_rollback_identity(result.job.job_id)
+
+
+def test_end_to_end_a_guest_that_is_not_running_is_unknown(tmp_path: Path) -> None:
+    def stop_the_guest(guest):
+        guest.running = False
+
+    store, authority, guest, result = _end_to_end(tmp_path, stop_the_guest)
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.health_outcome is None
+    assert result.job.health_probe_results == ()
+
+
+def test_end_to_end_an_unavailable_docker_daemon_is_unknown(tmp_path: Path) -> None:
+    def stop_docker(guest):
+        guest.docker_daemon_up = False
+
+    store, authority, guest, result = _end_to_end(tmp_path, stop_docker)
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.health_outcome is None
+    event = store.list_package_update_job_events(result.job.job_id)[-1]
+    assert event.details["reason"] == "docker_daemon_unavailable"
+
+
+def test_end_to_end_a_missing_container_fails_because_the_daemon_answered(
+    tmp_path: Path,
+) -> None:
+    def remove_the_container(guest):
+        guest.containers.clear()
+
+    store, authority, guest, result = _end_to_end(tmp_path, remove_the_container)
+
+    assert result.status is HealthStageStatus.FAILED
+    assert result.job.health_outcome is HealthOutcome.FAILED
+    assert [r.reason for r in result.job.health_probe_results][0] == "container_absent"
+
+
+def test_end_to_end_a_glob_target_is_unknown_and_never_passes(
+    tmp_path: Path,
+) -> None:
+    """The end-to-end version of the false PASS this design exists to stop.
+
+    `nginx*` would match the active `nginx.service` through systemd's own
+    pattern expansion. It must not produce a successful update job.
+    """
+
+    store, authority, guest, result = _end_to_end(
+        tmp_path,
+        probes=(
+            ResourceHealthProbe(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx*"
+            ),
+        ),
+    )
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.health_outcome is None
+    event = store.list_package_update_job_events(result.job.job_id)[-1]
+    assert event.details["reason"] == "probe_target_not_exact"
+
+
+def test_end_to_end_docker_health_is_required_when_it_was_asked_for(
+    tmp_path: Path,
+) -> None:
+    def make_it_merely_running(guest):
+        guest.containers["web"] = (True, "unhealthy")
+
+    store, authority, guest, result = _end_to_end(
+        tmp_path,
+        make_it_merely_running,
+        probes=(
+            ResourceHealthProbe(
+                kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY, target="web"
+            ),
+        ),
+    )
+
+    assert result.status is HealthStageStatus.FAILED
+    assert [r.reason for r in result.job.health_probe_results] == [
+        "container_unhealthy"
+    ]
