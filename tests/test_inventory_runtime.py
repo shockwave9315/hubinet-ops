@@ -724,42 +724,63 @@ def test_health_contract_put_then_get_returns_the_exact_canonical_contract(
     assert config.api_bearer_token not in caplog.text
 
 
+#: Every malformed PUT is a 422, but two different layers produce them and
+#: their bodies differ. A request whose SHAPE is wrong never reaches the
+#: handler, so FastAPI/Pydantic answers with its own ``detail`` LIST of field
+#: errors. A structurally valid request whose contract MATERIAL the authority
+#: rejects gets this API's own ``detail`` OBJECT carrying
+#: ``error="invalid_contract"``. Callers must not assume the second shape for
+#: every 422.
+_STRUCTURAL = "pydantic"
+_MATERIAL = "invalid_contract"
+
+
 @pytest.mark.parametrize(
-    "body",
+    "expected_layer, body",
     (
-        {},
-        {"probes": []},
-        {"probes": _HEALTH_PROBES, "unexpected": True},
-        {"probes": [{"kind": "http_get", "target": "https://example"}]},
-        {"probes": [{"kind": "systemd_unit_active"}]},
-        {"probes": [{"kind": "systemd_unit_active", "target": ""}]},
-        {"probes": [{"kind": "systemd_unit_active", "target": "a b.service"}]},
-        {"probes": [{"kind": "systemd_unit_active", "target": "x" * 201}]},
+        (_STRUCTURAL, {}),
+        (_STRUCTURAL, {"probes": []}),
+        (_STRUCTURAL, {"probes": _HEALTH_PROBES, "unexpected": True}),
+        (_STRUCTURAL, {"probes": [{"kind": "http_get", "target": "https://example"}]}),
+        (_STRUCTURAL, {"probes": [{"kind": "systemd_unit_active"}]}),
+        (_STRUCTURAL, {"probes": [{"kind": "systemd_unit_active", "target": ""}]}),
+        (_STRUCTURAL, {"probes": [{"kind": "systemd_unit_active", "target": "x" * 201}]}),
         # No command-shaped field may ever be accepted alongside a probe.
-        {
-            "probes": [
-                {
-                    "kind": "systemd_unit_active",
-                    "target": "nginx.service",
-                    "command": "rm -rf /",
-                }
-            ]
-        },
+        (
+            _STRUCTURAL,
+            {
+                "probes": [
+                    {
+                        "kind": "systemd_unit_active",
+                        "target": "nginx.service",
+                        "command": "rm -rf /",
+                    }
+                ]
+            },
+        ),
+        # Bounded payload: 33 probes exceeds the durable maximum of 32.
+        (
+            _STRUCTURAL,
+            {
+                "probes": [
+                    {"kind": "systemd_unit_active", "target": f"unit-{index}.service"}
+                    for index in range(33)
+                ]
+            },
+        ),
+        (_STRUCTURAL, {"probes": _HEALTH_PROBES, "expected_revision": -1}),
+        # Structurally valid, materially wrong: these reach the authority.
+        (
+            _MATERIAL,
+            {"probes": [{"kind": "systemd_unit_active", "target": "a b.service"}]},
+        ),
         # Duplicate (kind, target): an all-of contract stating the same
         # requirement twice is a mistake, not a shape to silently repair.
-        {"probes": _HEALTH_PROBES + [_HEALTH_PROBES[0]]},
-        # Bounded payload: 33 probes exceeds the durable maximum of 32.
-        {
-            "probes": [
-                {"kind": "systemd_unit_active", "target": f"unit-{index}.service"}
-                for index in range(33)
-            ]
-        },
-        {"probes": _HEALTH_PROBES, "expected_revision": -1},
+        (_MATERIAL, {"probes": _HEALTH_PROBES + [_HEALTH_PROBES[0]]}),
     ),
 )
 def test_health_contract_put_refuses_malformed_or_unbounded_declarations(
-    tmp_path: Path, monkeypatch, body
+    tmp_path: Path, monkeypatch, expected_layer: str, body
 ) -> None:
     app, config = _build_app(tmp_path)
     resource = _discover_lxc_resource(app, config, monkeypatch)
@@ -769,6 +790,12 @@ def test_health_contract_put_refuses_malformed_or_unbounded_declarations(
 
     response = client.put(path, headers=headers, json=body)
     assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    if expected_layer is _STRUCTURAL:
+        assert isinstance(detail, list), detail
+    else:
+        assert isinstance(detail, dict), detail
+        assert detail["error"] == "invalid_contract"
     assert app.state.store.resource_health_contract(resource.resource_id) is None
 
 
@@ -829,6 +856,58 @@ def test_health_contract_compare_and_set_refuses_a_stale_editor(
     # The refused writes left the original contract exactly as it was.
     assert client.get(path, headers=headers).json() == first.json()
     assert client.delete(f"{path}?expected_revision=1", headers=headers).status_code == 200
+
+
+def test_health_contract_revision_is_never_reused_over_http(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Clearing must not rewind the revision an operator compares against."""
+
+    app, config = _build_app(tmp_path)
+    resource = _discover_lxc_resource(app, config, monkeypatch)
+    path = _health_contract_path(resource.resource_id)
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+
+    first = client.put(path, headers=headers, json={"probes": _HEALTH_PROBES}).json()
+    assert first["revision"] == 1
+    # An operator opens the editor here, holding revision 1.
+
+    assert client.delete(f"{path}?expected_revision=1", headers=headers).status_code == 200
+    second = client.put(
+        path,
+        headers=headers,
+        json={
+            "probes": [{"kind": "docker_container_running", "target": "redis"}],
+            "expected_revision": 0,
+        },
+    )
+    assert second.status_code == 200
+    assert second.json()["revision"] == 2
+
+    # The stale editor's revision named a generation that no longer exists.
+    stale = client.put(
+        path,
+        headers=headers,
+        json={
+            "probes": [{"kind": "systemd_unit_active", "target": "hostile.service"}],
+            "expected_revision": 1,
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["error"] == "revision_conflict"
+    assert client.get(path, headers=headers).json() == second.json()
+
+    # Re-declaring the ORIGINAL material after a clear is a new generation:
+    # same fingerprint, different durable identity.
+    client.delete(path, headers=headers)
+    recreated = client.put(path, headers=headers, json={"probes": _HEALTH_PROBES}).json()
+    assert recreated["fingerprint"] == first["fingerprint"]
+    assert recreated["revision"] == 3
+    assert (recreated["revision"], recreated["fingerprint"]) != (
+        first["revision"],
+        first["fingerprint"],
+    )
 
 
 def test_health_contract_routes_fail_closed_on_a_non_current_resource(

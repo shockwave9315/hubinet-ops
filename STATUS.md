@@ -33,11 +33,11 @@
   partial, or unproven package mutation can reach the rollback boundary
   without fabricating a completion it never had (see "Same-job rollback
   execution" below). Schema v15 adds the operator-declared per-resource health
-  contract and its complete required probe set, with SQL-level constraints
-  that make an empty contract, an unsupported probe kind, an unbounded target,
-  a duplicate probe, an orphaned probe row, and an edited or shrunken live
-  contract all durably impossible (see "Dynamic per-resource health contracts"
-  below).
+  contract, its complete required probe set, and a durable never-reused
+  revision allocator, with SQL-level constraints rejecting an empty contract,
+  an unsupported probe kind, an unbounded target, a duplicate probe, an
+  orphaned probe row, an edited or shrunken live contract, and a reused or
+  unallocated revision (see "Dynamic per-resource health contract" below).
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus
   authority-metadata-only mutations:
   `PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
@@ -513,13 +513,25 @@ is still no healthcheck execution.
 - **Schema v15, atomic replacement.** One contract per resource, bounded to
   1-32 probes with bounded targets and no duplicate `(kind, target)`. A
   deterministic fingerprint covers only the canonical probe material, so
-  declaration order never affects it; `revision` advances by one per durable
-  change, and re-declaring identical material is not a change. Replacement and
-  clearing are single transactions, four triggers forbid every unsafe write
-  order, and no partial probe set is ever readable.
+  declaration order never affects it. Replacement and clearing are single
+  transactions and the triggers reject every unsafe write order, so no partial
+  probe set is reachable through the authority; reads independently verify
+  probe count and fingerprint and fail closed, which is what catches a
+  direct-SQL repair that reconstructed an inconsistent row set.
+- **Revisions are never reused.** `revision` advances by one per durable
+  change (re-declaring identical material while the contract exists is not a
+  change), and comes from a durable per-resource allocator that survives
+  clearing. A contract cleared at revision 3 and re-declared becomes revision
+  4 even if the material is identical — a new generation, not a continuation.
+  That is what makes `expected_revision` a real compare-and-set: a stale
+  positive revision can never become valid again, and `expected_revision=0`
+  keeps meaning "currently unconfigured" rather than "never configured".
 - **Operator surface.** `GET`/`PUT`/`DELETE
-  /r0/v1/resources/{resource_id}/health-contract` with bearer auth and a
-  machine-distinguishable error taxonomy, plus the native Home Assistant
+  /r0/v1/resources/{resource_id}/health-contract` with bearer auth. Failures
+  this API raises itself carry `{"detail": {"error", "message"}}`; a
+  structurally invalid request is still rejected by FastAPI/Pydantic first,
+  with its ordinary list-shaped validation body (see `ARCHITECTURE.md`). Plus
+  the native Home Assistant
   `view_health_contract` / `set_health_contract` / `clear_health_contract`
   actions on the existing resource-device selector. The published snapshot
   carries a concise `unsupported | unconfigured | configured` summary and its

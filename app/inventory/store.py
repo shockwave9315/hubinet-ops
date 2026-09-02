@@ -88,6 +88,7 @@ _REQUIRED_TABLES = frozenset(
         "package_update_job_events",
         "resource_health_contracts",
         "resource_health_contract_probes",
+        "resource_health_contract_revision_state",
         "canonicalization_migrations",
     }
 )
@@ -137,6 +138,9 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "one_package_update_job_mutation_operation",
         "one_package_update_job_rollback_operation",
         "resource_health_contract_update_immutable",
+        "resource_health_contract_revision_never_regresses",
+        "resource_health_contract_revision_state_no_delete",
+        "resource_health_contract_revision_is_the_allocated_one",
         "resource_health_contract_probe_belongs_to_declared_contract",
         "resource_health_contract_probe_update_immutable",
         "resource_health_contract_probe_delete_needs_no_live_contract",
@@ -1649,6 +1653,34 @@ _SCHEMA_STATEMENTS = (
         FOREIGN KEY(reviewed_scan_run_id) REFERENCES package_scan_runs(scan_run_id)
     )
     """,
+    """
+    -- The durable revision allocator for one resource's health contracts.
+    --
+    -- It is a SEPARATE row from the contract itself precisely so that
+    -- clearing a contract can remove the contract material -- absence of a
+    -- `resource_health_contracts` row is what "unconfigured" means, and that
+    -- must stay true -- without erasing the fact that revisions 1..N have
+    -- already been handed out.
+    --
+    -- Without this, a revision could be reused after a clear, and
+    -- `expected_revision` would stop being a compare-and-set: an operator
+    -- editing from a view of revision 1 could have their write accepted
+    -- against a completely different contract that also happened to be
+    -- revision 1. A revision has to name one generation of one resource's
+    -- contract, for that operator today and for the health-execution stage
+    -- that will later record which contract generation it evaluated.
+    --
+    -- The FK is to the exact incarnation, so a VMID-reused replacement is a
+    -- different resource_id with no counter and no contract, while a rename
+    -- or node move keeps both.
+    CREATE TABLE resource_health_contract_revision_state (
+        resource_id TEXT PRIMARY KEY,
+        last_revision INTEGER NOT NULL
+            CHECK(typeof(last_revision) = 'integer' AND last_revision > 0),
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id)
+    )
+    """,
     f"""
     -- One operator-declared workload health contract for ONE exact resource
     -- incarnation. The FK is to `resource_incarnations`, never to a VMID, a
@@ -2322,9 +2354,13 @@ _SCHEMA_STATEMENTS = (
     """
     -- Probes may only ever fill the contract row that declared them, in
     -- contiguous canonical order starting at 0, and never beyond the declared
-    -- probe_count. This is what makes "more probes than the contract says" and
-    -- "a probe belonging to no contract" durably impossible rather than merely
-    -- unlikely.
+    -- probe_count, so "more probes than the contract says" and "a probe
+    -- belonging to no contract" are rejected rather than merely unlikely.
+    --
+    -- This constrains what a statement can express; it does not pretend a
+    -- trusted administrator with direct SQL cannot rebuild an inconsistent
+    -- header/probe pair some other way. That is why _resource_health_contract
+    -- re-verifies probe_count and the fingerprint on every read.
     CREATE TRIGGER resource_health_contract_probe_belongs_to_declared_contract
     BEFORE INSERT ON resource_health_contract_probes
     WHEN NOT EXISTS (
@@ -2337,6 +2373,41 @@ _SCHEMA_STATEMENTS = (
     )
     BEGIN SELECT RAISE(ABORT,
         'health contract probes must fill exactly the declared contract'
+    ); END
+    """,
+    """
+    -- A handed-out revision is never handed out again.
+    CREATE TRIGGER resource_health_contract_revision_never_regresses
+    BEFORE UPDATE ON resource_health_contract_revision_state
+    WHEN NEW.last_revision <= OLD.last_revision
+    BEGIN SELECT RAISE(ABORT,
+        'a resource health contract revision may never be reused'
+    ); END
+    """,
+    """
+    -- Clearing a contract removes the contract, not the history of what has
+    -- already been allocated. Dropping this row would make the next contract
+    -- start again at 1 and silently revalidate an editor holding a stale
+    -- revision from the previous generation.
+    CREATE TRIGGER resource_health_contract_revision_state_no_delete
+    BEFORE DELETE ON resource_health_contract_revision_state
+    BEGIN SELECT RAISE(ABORT,
+        'resource health contract revision history is never deleted'
+    ); END
+    """,
+    """
+    -- A contract row may only carry the revision the allocator just handed
+    -- out, so the allocator cannot be bypassed by writing a contract row
+    -- directly.
+    CREATE TRIGGER resource_health_contract_revision_is_the_allocated_one
+    BEFORE INSERT ON resource_health_contracts
+    WHEN NEW.revision IS NOT (
+        SELECT state.last_revision
+        FROM resource_health_contract_revision_state state
+        WHERE state.resource_id = NEW.resource_id
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'a health contract must carry its allocated revision'
     ); END
     """,
     """

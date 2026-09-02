@@ -1102,10 +1102,17 @@ class InventoryAuthority:
         "no probes" must never be able to masquerade as a satisfied contract.
 
         ``expected_revision`` is an optional compare-and-set: ``0`` asserts
-        there is currently no contract, a positive value asserts exactly that
+        the resource is *currently* unconfigured -- not that it never had a
+        contract -- and a positive value asserts exactly that current
         revision. It exists so an operator editing a contract from a stale
         view cannot silently discard a newer one. Omitting it keeps the
         ordinary single-editor path unconditional.
+
+        Revisions are allocated from a durable per-resource counter that
+        survives clearing, so a revision is never reused. A contract cleared
+        at revision 3 and re-declared becomes revision 4 even if the material
+        is identical, because it is a new generation of the contract rather
+        than a continuation of the deleted one.
         """
 
         canonical_resource_id = _require_uuid(resource_id, "resource_id")
@@ -1131,7 +1138,14 @@ class InventoryAuthority:
                 # revision has to mean the contract actually became different.
                 return existing
 
-            revision = 1 if existing is None else existing.revision + 1
+            # Allocated from the durable per-resource counter, NOT from the
+            # contract row -- the contract row is gone after a clear, and
+            # restarting at 1 would let an editor holding a revision from the
+            # previous generation compare-and-set successfully against a
+            # completely different contract.
+            revision = self._allocate_health_contract_revision(
+                connection, canonical_resource_id, now=now
+            )
             created_at = now if existing is None else existing.created_at
             if existing is not None:
                 # Compare-and-set on the revision we actually read, so a
@@ -1206,6 +1220,10 @@ class InventoryAuthority:
         never a passing one. Returns whether a contract was actually removed,
         so clearing an already-unconfigured resource is a no-op rather than an
         error.
+
+        Clearing removes the contract material but never the record of which
+        revisions have already been allocated, so the next contract cannot
+        reuse one.
         """
 
         canonical_resource_id = _require_uuid(resource_id, "resource_id")
@@ -1242,6 +1260,38 @@ class InventoryAuthority:
                 connection, inventory_changed=False, published_changed=True
             )
         return True
+
+    @staticmethod
+    def _allocate_health_contract_revision(
+        connection: sqlite3.Connection, resource_id: str, *, now: str
+    ) -> int:
+        """Hand out the next never-before-used revision for this resource.
+
+        In the caller's transaction, so the allocation and the contract change
+        commit together or not at all: a rolled-back replacement consumes no
+        revision, and a committed one can never share a revision with any
+        earlier generation of this resource's contract.
+        """
+
+        row = connection.execute(
+            "SELECT last_revision FROM resource_health_contract_revision_state "
+            "WHERE resource_id=?",
+            (resource_id,),
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO resource_health_contract_revision_state("
+                "resource_id, last_revision, updated_at) VALUES(?, 1, ?)",
+                (resource_id, now),
+            )
+            return 1
+        allocated = int(row["last_revision"]) + 1
+        connection.execute(
+            "UPDATE resource_health_contract_revision_state "
+            "SET last_revision=?, updated_at=? WHERE resource_id=? AND last_revision=?",
+            (allocated, now, resource_id, int(row["last_revision"])),
+        )
+        return allocated
 
     def _require_current_health_contract_resource(
         self, connection: sqlite3.Connection, resource_id: str

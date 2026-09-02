@@ -3,8 +3,10 @@
 The product rule these tests exist to defend is narrow and absolute: a health
 contract says what "healthy" would mean for ONE exact resource incarnation,
 and the absence of one is *unconfigured*, never a pass. Everything below is
-either that rule, the bounds that keep the durable row deterministic, or the
-atomicity that stops a half-written contract from ever being readable.
+either that rule, the bounds that keep the durable row deterministic, the
+atomicity that keeps a half-written contract out of any committed state, or
+the read-time verification that catches an inconsistent row set a direct-SQL
+repair could still have reconstructed.
 
 No health EXECUTION exists in this stage, so nothing here runs, schedules, or
 interprets a probe.
@@ -159,6 +161,16 @@ def _raw_rows(store) -> tuple[list, list]:
     return contracts, probes
 
 
+def _last_allocated_revision(store, resource_id: str) -> int | None:
+    with sqlite3.connect(store.path) as connection:
+        row = connection.execute(
+            "SELECT last_revision FROM resource_health_contract_revision_state "
+            "WHERE resource_id=?",
+            (resource_id,),
+        ).fetchone()
+    return None if row is None else int(row[0])
+
+
 # ===========================================================================
 # A. SCHEMA
 # ===========================================================================
@@ -190,7 +202,11 @@ def test_fresh_database_is_schema_v15_with_the_health_contract_tables(
     assert {
         "resource_health_contracts",
         "resource_health_contract_probes",
+        "resource_health_contract_revision_state",
         "resource_health_contract_update_immutable",
+        "resource_health_contract_revision_never_regresses",
+        "resource_health_contract_revision_state_no_delete",
+        "resource_health_contract_revision_is_the_allocated_one",
         "resource_health_contract_probe_belongs_to_declared_contract",
         "resource_health_contract_probe_update_immutable",
         "resource_health_contract_probe_delete_needs_no_live_contract",
@@ -342,9 +358,11 @@ def test_a_short_probe_set_is_refused_at_read_rather_than_reported_complete(
 ) -> None:
     """A contract that no longer describes its own probes is not readable.
 
-    Hand-written SQL can still assemble this state by rebuilding the header
-    around a shortened probe set. Returning it would understate what the
-    operator required, so the read fails closed instead.
+    The triggers reject every ordinary way to reach this, but hand-written SQL
+    can still assemble it by rebuilding the header around a shortened probe
+    set -- and in a trusted-admin product it is not worth pretending
+    otherwise. What matters is that the read refuses it: returning a short
+    contract would understate what the operator required.
     """
 
     _, store, authority, resource = _system(tmp_path)
@@ -720,6 +738,306 @@ def test_the_same_resource_keeps_its_contract_across_a_node_move_and_rename(
 # ===========================================================================
 # E. CONCURRENCY AND STALE EDITORS
 # ===========================================================================
+
+
+def test_a_revision_is_never_reused_after_a_clear(tmp_path: Path) -> None:
+    """The compare-and-set witness: clearing must not rewind the counter.
+
+    If a cleared contract let the next one start again at revision 1, an
+    operator holding revision 1 of a contract that no longer exists could
+    compare-and-set successfully against a completely different contract that
+    happened to also be revision 1. That is an ABA: the value they checked
+    matched, but not the thing they were checking.
+    """
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+
+    first = authority.replace_resource_health_contract(
+        rid, _probes((SYSTEMD, "a.service"))
+    )
+    assert first.revision == 1
+    # An ordinary operator opens the editor here and holds revision 1.
+
+    assert authority.clear_resource_health_contract(rid, expected_revision=1) is True
+    assert _last_allocated_revision(store, rid) == 1
+
+    second = authority.replace_resource_health_contract(
+        rid, _probes((RUNNING, "redis")), expected_revision=0
+    )
+    assert second.revision == 2
+
+    # The stale editor's revision names a generation that is gone, and must
+    # never match again -- not now, and not after any number of later cycles.
+    for call in (
+        lambda: authority.replace_resource_health_contract(
+            rid, _probes((SYSTEMD, "hostile.service")), expected_revision=1
+        ),
+        lambda: authority.clear_resource_health_contract(rid, expected_revision=1),
+    ):
+        with pytest.raises(HealthContractRevisionConflict):
+            call()
+    assert store.resource_health_contract(rid) == second
+
+
+def test_recreating_identical_material_after_a_clear_is_a_new_generation(
+    tmp_path: Path,
+) -> None:
+    """Same probes, same fingerprint, different durable identity.
+
+    Re-declaring a contract that is still present is idempotent -- nothing
+    changed. Re-declaring one that was *deleted* is not a continuation of the
+    deleted contract, and a health-execution stage that recorded
+    `(revision, fingerprint)` must be able to tell the two generations apart.
+    """
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+
+    original = authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+    authority.clear_resource_health_contract(rid)
+    recreated = authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+
+    assert recreated.fingerprint == original.fingerprint
+    assert recreated.revision > original.revision
+    assert (recreated.revision, recreated.fingerprint) != (
+        original.revision,
+        original.fingerprint,
+    )
+    assert recreated.probes == original.probes
+    # A recreated contract is genuinely new, so its creation time is its own.
+    assert store.resource_health_contract(rid) == recreated
+
+
+def test_revisions_stay_strictly_increasing_across_many_clear_cycles(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    seen: list[int] = []
+    for index in range(4):
+        seen.append(
+            authority.replace_resource_health_contract(
+                rid, _probes((SYSTEMD, f"unit-{index}.service"))
+            ).revision
+        )
+        seen.append(
+            authority.replace_resource_health_contract(
+                rid, _probes((RUNNING, f"container-{index}"))
+            ).revision
+        )
+        authority.clear_resource_health_contract(rid)
+    assert seen == sorted(set(seen)) == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert _last_allocated_revision(store, rid) == 8
+    # And every stale revision from every cycle stays stale forever.
+    authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+    for stale in seen:
+        with pytest.raises(HealthContractRevisionConflict):
+            authority.clear_resource_health_contract(rid, expected_revision=stale)
+
+
+def test_clearing_consumes_no_revision_and_keeps_the_counter(tmp_path: Path) -> None:
+    """Clear removes the contract, not the record of what was handed out."""
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+    authority.replace_resource_health_contract(rid, _probes((RUNNING, "redis")))
+    assert _last_allocated_revision(store, rid) == 2
+
+    authority.clear_resource_health_contract(rid)
+    # No contract row and no probe rows -- absence is still what
+    # "unconfigured" means -- but the allocation history survives.
+    assert _raw_rows(store) == ([], [])
+    assert store.resource_health_contract(rid) is None
+    assert _last_allocated_revision(store, rid) == 2
+
+    # A second clear is still a no-op and still consumes nothing.
+    assert authority.clear_resource_health_contract(rid) is False
+    assert _last_allocated_revision(store, rid) == 2
+    assert authority.replace_resource_health_contract(rid, DEFAULT_PROBES).revision == 3
+
+
+def test_a_rolled_back_replacement_consumes_no_revision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A revision is allocated in the same transaction it is used by."""
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+    assert _last_allocated_revision(store, rid) == 1
+
+    def explode(self, connection, *, resource_id):
+        raise RuntimeError("simulated failure after the revision allocation")
+
+    monkeypatch.setattr(
+        InventoryAuthority, "_after_resource_health_contract_write", explode
+    )
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="simulated failure"):
+            authority.replace_resource_health_contract(
+                rid, _probes((RUNNING, "redis"))
+            )
+    assert _last_allocated_revision(store, rid) == 1
+
+    monkeypatch.undo()
+    assert (
+        authority.replace_resource_health_contract(
+            rid, _probes((RUNNING, "redis"))
+        ).revision
+        == 2
+    )
+
+
+def test_sql_refuses_reusing_or_deleting_an_allocated_revision(tmp_path: Path) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+    authority.replace_resource_health_contract(rid, _probes((RUNNING, "redis")))
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        for regressed in (2, 1, 0):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE resource_health_contract_revision_state "
+                    "SET last_revision=? WHERE resource_id=?",
+                    (regressed, rid),
+                )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM resource_health_contract_revision_state "
+                "WHERE resource_id=?",
+                (rid,),
+            )
+
+
+def test_sql_refuses_a_contract_row_that_bypasses_the_revision_allocator(
+    tmp_path: Path,
+) -> None:
+    """A contract row must carry the revision the allocator handed out.
+
+    This constrains what the schema can express, not what a trusted
+    administrator with direct SQL can reconstruct. The allocator's value and
+    the last *used* revision are the same number, so re-inserting a contract
+    at exactly the current allocator value is indistinguishable at the SQL
+    level; what makes that unreachable is the authority's allocate-then-insert
+    order, which is covered by the tests above. What the trigger does buy is
+    that no contract row can skip ahead of the allocator or exist without one,
+    so a revision can never be conjured out of nothing.
+    """
+
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+    authority.clear_resource_health_contract(rid)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        for skipped_ahead in (2, 3, 99):
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO resource_health_contracts("
+                    "resource_id, revision, fingerprint, probe_count, created_at, "
+                    "updated_at) VALUES(?, ?, ?, 1, 'x', 'x')",
+                    (rid, skipped_ahead, "a" * 64),
+                )
+
+    # A resource that has never had a contract has no allocator row at all,
+    # so a hand-written contract row cannot precede one.
+    _, other_store, _other_authority, other = _system(tmp_path / "other")
+    assert _last_allocated_revision(other_store, other.resource_id) is None
+    with sqlite3.connect(other_store.path) as connection:
+        connection.execute("PRAGMA foreign_keys=ON")
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO resource_health_contracts("
+                "resource_id, revision, fingerprint, probe_count, created_at, "
+                "updated_at) VALUES(?, 1, ?, 1, 'x', 'x')",
+                (other.resource_id, "a" * 64),
+            )
+
+
+def test_a_replacement_resource_does_not_inherit_the_revision_counter(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, original = _system(tmp_path)
+    authority.replace_resource_health_contract(original.resource_id, DEFAULT_PROBES)
+    authority.replace_resource_health_contract(
+        original.resource_id, _probes((RUNNING, "redis"))
+    )
+    assert _last_allocated_revision(store, original.resource_id) == 2
+
+    _rediscover(authority, original.inventory_source_id, resource_type="qemu")
+    _rediscover(authority, original.inventory_source_id, resource_type="lxc")
+    successor = next(
+        item
+        for item in store.list_resources()
+        if item.resource_type == "lxc" and item.resource_id != original.resource_id
+    )
+
+    # A different workload at the same VMID starts with no counter and no
+    # contract; the predecessor keeps its own history.
+    assert _last_allocated_revision(store, successor.resource_id) is None
+    assert (
+        authority.replace_resource_health_contract(
+            successor.resource_id, DEFAULT_PROBES
+        ).revision
+        == 1
+    )
+    assert _last_allocated_revision(store, original.resource_id) == 2
+
+
+def test_the_revision_counter_survives_a_rename_and_node_move(tmp_path: Path) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+    authority.clear_resource_health_contract(rid)
+
+    _rediscover(
+        authority,
+        resource.inventory_source_id,
+        name="renamed-ct",
+        node_name="pve-b",
+        node_names=("pve-a", "pve-b"),
+        observed_at="2026-08-28T13:00:00+00:00",
+    )
+    assert store.list_resources()[0].resource_id == rid
+    assert _last_allocated_revision(store, rid) == 1
+    assert authority.replace_resource_health_contract(rid, DEFAULT_PROBES).revision == 2
+    with pytest.raises(HealthContractRevisionConflict):
+        authority.clear_resource_health_contract(rid, expected_revision=1)
+
+
+def test_concurrent_clear_and_replace_never_duplicate_a_revision(
+    tmp_path: Path,
+) -> None:
+    _, store, authority, resource = _system(tmp_path)
+    rid = resource.resource_id
+    authority.replace_resource_health_contract(rid, DEFAULT_PROBES)
+
+    def clear():
+        return authority.clear_resource_health_contract(rid)
+
+    def replace(index):
+        return authority.replace_resource_health_contract(
+            rid, _probes((RUNNING, f"container-{index}"))
+        ).revision
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(replace, 0), pool.submit(clear), pool.submit(replace, 1)]
+        revisions = [
+            future.result() for future in futures if not isinstance(future.result(), bool)
+        ]
+
+    assert len(set(revisions)) == len(revisions)
+    assert min(revisions) > 1
+    last = _last_allocated_revision(store, rid)
+    assert last == max(revisions)
+    current = store.resource_health_contract(rid)
+    if current is not None:
+        assert current.revision in revisions
 
 
 def test_compare_and_set_refuses_a_stale_editor(tmp_path: Path) -> None:

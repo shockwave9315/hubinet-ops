@@ -1784,32 +1784,56 @@ constraint list is generated from the enum and the shared bounds in
 
 **Absence is the schema's first rule.** There is no row for "unconfigured" —
 absence *is* unconfigured — and `probe_count` is constrained to at least one,
-so an empty contract cannot be stored. `app/inventory/store.py` refuses to
-return a contract whose probe rows do not match its declared count or
-recomputed fingerprint: reporting a short contract as complete would understate
-what the operator required.
+so an empty contract cannot be stored.
+
+The schema constrains what ordinary writes can express; it is not a claim that
+a trusted administrator with direct SQL access cannot reconstruct an
+inconsistent row set, and per `AGENTS.md` that administrator is trusted rather
+than defended against. So there is a second, independent line:
+`app/inventory/store.py` verifies `probe_count` and recomputes the fingerprint
+on every read, and refuses to return a contract whose probe rows disagree with
+its own header. Reporting a short contract as complete would understate what
+the operator required, so the read fails closed instead.
 
 **Replacement is atomic, and a partial probe set is never readable.** The
 probes' parent foreign key is `DEFERRABLE INITIALLY DEFERRED`, which lets one
-transaction replace a contract in the only safe order: drop the live contract
-row (compare-and-set on the revision that was read), drop its now-unparented
-probes, insert the new contract row, then fill it. Four triggers make every
-other order impossible — a contract row can never be `UPDATE`d, a probe row can
-never be edited, a probe may only be inserted contiguously from index 0 and
-within the declared `probe_count`, and a live contract may not lose a probe.
-The deferred check at `COMMIT` still forbids an orphaned probe row durably.
-Clearing is the same transaction without the rebuild.
+transaction replace a contract in the only safe order: allocate the next
+revision, drop the live contract row (compare-and-set on the revision that was
+read), drop its now-unparented probes, insert the new contract row, then fill
+it. Triggers reject every other write order a statement could attempt — a
+contract row can never be `UPDATE`d, a probe row can never be edited, a probe
+may only be inserted contiguously from index 0 and within the declared
+`probe_count`, a live contract may not lose a probe, and a contract row cannot
+carry a revision the allocator has not handed out. The deferred check at
+`COMMIT` rejects an orphaned probe row. Clearing is the same transaction
+without the rebuild, and never removes the revision history.
+
+Together with the read-time verification above, that is the honest boundary:
+partial and edit-in-place contract states are unreachable through the
+authority and rejected by the schema, and anything a direct-SQL repair
+nevertheless reconstructs is caught when the contract is read.
 
 **Fingerprint and revision.** `health_contract_fingerprint` is SHA-256 over a
 domain-separated canonical JSON encoding of the `(kind, target)` set in
 `(kind, target)` order, so declaration order never affects it and two resources
 requiring the same probes share a fingerprint — exactly as two identical
-package plans do. Provenance fields are deliberately excluded. `revision`
-advances by one per durable *change*: re-declaring identical material is not a
-change and consumes no revision. A revision counts changes to the contract that
-currently exists, so clearing and re-declaring starts again at 1; the pair
-`(revision, fingerprint)` is what a later health-execution stage should record,
-because the fingerprint is what says which material was evaluated.
+package plans do. Provenance fields are deliberately excluded.
+
+`revision` advances by one per durable *change*: re-declaring identical
+material while the contract still exists is not a change and consumes no
+revision. Revisions come from `resource_health_contract_revision_state`, a
+separate durable per-resource counter, and are **never reused**. That table
+exists because the contract row is deleted on clear, and a counter living
+inside it would restart at 1 — which would quietly turn `expected_revision`
+from a compare-and-set into a coin flip, since an operator holding revision 1
+of a deleted contract would match a completely different contract that also
+happened to be revision 1. Clearing therefore removes the contract material
+and keeps the allocation history, so a contract cleared at revision 3 and
+re-declared becomes revision 4 even when the material is byte-identical: that
+is a new generation, not a continuation of the deleted one. The pair
+`(revision, fingerprint)` is consequently a stable name for one generation of
+one resource's contract, which is what a later health-execution stage needs to
+record truthfully.
 
 **Identity across replace, move, and rename.** The contract belongs to the
 exact resource incarnation. Setting, reading, and clearing all go through the
@@ -1822,21 +1846,37 @@ rename or a node move is the same durable resource and keeps its contract,
 because neither is part of contract identity.
 
 **Compare-and-set.** `expected_revision` is optional on replace and clear:
-`0` asserts there is currently no contract, a positive value asserts exactly
-that revision. It exists so an operator editing from a stale view cannot
-silently discard a newer contract. Omitting it keeps the ordinary
-single-editor path unconditional.
+`0` asserts the resource is *currently* unconfigured — not that it has never
+had a contract, so it stays valid after any number of clear/recreate cycles —
+and a positive value asserts exactly that current revision. Because revisions
+are never reused, a stale positive value can never become valid again for the
+same `resource_id`. Omitting it keeps the ordinary single-editor path
+unconditional.
 
 **HTTP.** `GET`/`PUT`/`DELETE
-/r0/v1/resources/{resource_id}/health-contract`, bearer-authenticated, with a
-machine-distinguishable error taxonomy: `resource_not_found` (404),
-`contract_unconfigured` (404), `resource_not_current` (409),
-`revision_conflict` (409, a lost compare-and-set, which is a different
-problem from a stale resource), and `invalid_contract` (422). The unconfigured case is deliberately *not* a 200
-with an empty probe list — a caller must never be able to read absence as a
-contract that nothing has to satisfy. `PUT` forbids unknown fields, so no
-`command`, `argv`, `shell`, `script`, `executable`, `working_directory`, or
-`environment` can be smuggled into caller-controlled contract material.
+/r0/v1/resources/{resource_id}/health-contract`, bearer-authenticated.
+
+Failures this API raises itself carry a machine-distinguishable body,
+`{"detail": {"error": ..., "message": ...}}`, with `error` one of
+`resource_not_found` (404), `contract_unconfigured` (404),
+`resource_not_current` (409), `revision_conflict` (409 — a lost
+compare-and-set, which is a different problem from a stale resource), or
+`invalid_contract` (422). The unconfigured case is deliberately *not* a 200
+with an empty probe list: a caller must never be able to read absence as a
+contract that nothing has to satisfy.
+
+Not every 422 has that shape, and callers must not assume it does. A request
+whose *structure* is wrong — a missing or empty `probes` list, an unknown
+probe kind, a target outside its length bounds, more than 32 probes, or any
+unknown field — is rejected by FastAPI/Pydantic before the handler runs, and
+answers with FastAPI's ordinary validation body whose `detail` is a *list* of
+field errors. `invalid_contract` is for a structurally valid request whose
+contract *material* the authority rejects: a whitespace-bearing target, a
+duplicate `(kind, target)`. No custom validation handler is installed to
+paper over the difference; the two layers are genuinely different rejections
+and the taxonomy says so. `PUT` forbids unknown fields, so no `command`,
+`argv`, `shell`, `script`, `executable`, `working_directory`, or `environment`
+can be smuggled into caller-controlled contract material.
 
 **The published snapshot carries the summary, not the material.** Each
 resource publishes `health_contract` as `status`
