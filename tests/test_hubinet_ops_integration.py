@@ -16,6 +16,8 @@ import yaml
 
 pytest.importorskip("homeassistant", reason="isolated HA test dependencies not installed")
 
+import voluptuous as vol
+
 from homeassistant.components.diagnostics import REDACTED
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
@@ -36,9 +38,14 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.hubinet_ops.api import (
     BackendInformation,
     DetailStatus,
+    HealthContractStatus,
+    HealthContractSummary,
+    HealthProbe,
+    HealthProbeKind,
     HubinetOpsApi,
     HubinetOpsCannotConnect,
     HubinetOpsConflict,
+    HubinetOpsHealthContractUnconfigured,
     HubinetOpsInvalidAuth,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
@@ -54,6 +61,7 @@ from custom_components.hubinet_ops.api import (
     PackagePlanApprovalSnapshot,
     PackagePlanApprovalStatus,
     PresenceState,
+    ResourceHealthContract,
     ResourceSnapshot,
     ResourceStateLevel,
     ResourceType,
@@ -73,6 +81,9 @@ from custom_components.hubinet_ops.const import (
     DOMAIN,
     MODEL_LXC,
     SERVICE_APPROVE_UPDATE_PLAN,
+    SERVICE_CLEAR_HEALTH_CONTRACT,
+    SERVICE_SET_HEALTH_CONTRACT,
+    SERVICE_VIEW_HEALTH_CONTRACT,
     SERVICE_VIEW_UPDATE_PLAN,
 )
 from custom_components.hubinet_ops.coordinator import (
@@ -271,6 +282,7 @@ def resource(
     successor_resource_id: str | None = None,
     package_scan: PackageScanSnapshot | None = None,
     package_plan_approval: PackagePlanApprovalSnapshot | None = None,
+    health_contract: HealthContractSummary | None = None,
 ) -> ResourceSnapshot:
     if active_binding_id is None and presence in {
         PresenceState.PRESENT,
@@ -306,6 +318,17 @@ def resource(
         package_scan=package_scan or PackageScanSnapshot(),
         package_plan_approval=(
             package_plan_approval or PackagePlanApprovalSnapshot()
+        ),
+        health_contract=(
+            health_contract
+            if health_contract is not None
+            else HealthContractSummary(
+                status=(
+                    HealthContractStatus.UNCONFIGURED
+                    if resource_type is ResourceType.LXC
+                    else HealthContractStatus.UNSUPPORTED
+                )
+            )
         ),
     )
 
@@ -392,6 +415,8 @@ class FakeTransport:
         validation_error: Exception | None = None,
         validation_backend_instance_id: str = BACKEND_ID,
         approval_error: Exception | None = None,
+        health_contracts: dict[str, ResourceHealthContract] | None = None,
+        health_contract_error: Exception | None = None,
     ) -> None:
         self._snapshots = list(snapshots)
         self._index = 0
@@ -401,6 +426,17 @@ class FakeTransport:
         self.validate_calls = 0
         self.snapshot_calls = 0
         self.approval_calls: list[tuple[str, str, str]] = []
+        # Stands in for the backend's durable authority: a resource absent
+        # from this mapping is unconfigured, which the real transport
+        # surfaces as HubinetOpsHealthContractUnconfigured, never as an
+        # empty contract.
+        self.health_contracts: dict[str, ResourceHealthContract] = dict(
+            health_contracts or {}
+        )
+        self.health_contract_error = health_contract_error
+        self.health_contract_reads: list[str] = []
+        self.health_contract_writes: list[tuple[str, tuple, int | None]] = []
+        self.health_contract_clears: list[tuple[str, int | None]] = []
 
     async def validate_connection(self) -> BackendInformation:
         self.validate_calls += 1
@@ -429,6 +465,49 @@ class FakeTransport:
         )
         if self.approval_error is not None:
             raise self.approval_error
+
+    async def fetch_health_contract(self, resource_id: str) -> ResourceHealthContract:
+        self.health_contract_reads.append(resource_id)
+        if self.health_contract_error is not None:
+            raise self.health_contract_error
+        contract = self.health_contracts.get(resource_id)
+        if contract is None:
+            raise HubinetOpsHealthContractUnconfigured(
+                "resource has no configured health contract"
+            )
+        return contract
+
+    async def replace_health_contract(
+        self,
+        resource_id: str,
+        probes: tuple[HealthProbe, ...],
+        expected_revision: int | None,
+    ) -> ResourceHealthContract:
+        self.health_contract_writes.append((resource_id, probes, expected_revision))
+        if self.health_contract_error is not None:
+            raise self.health_contract_error
+        previous = self.health_contracts.get(resource_id)
+        contract = ResourceHealthContract(
+            resource_id=resource_id,
+            status=HealthContractStatus.CONFIGURED,
+            revision=1 if previous is None else previous.revision + 1,
+            fingerprint="c" * 64,
+            created_at="2026-08-08T12:00:00+00:00",
+            updated_at="2026-08-08T12:05:00+00:00",
+            probes=tuple(
+                sorted(probes, key=lambda probe: (probe.kind.value, probe.target))
+            ),
+        )
+        self.health_contracts[resource_id] = contract
+        return contract
+
+    async def clear_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> None:
+        self.health_contract_clears.append((resource_id, expected_revision))
+        if self.health_contract_error is not None:
+            raise self.health_contract_error
+        self.health_contracts.pop(resource_id, None)
 
 
 class FakeApiFactory:
@@ -773,6 +852,7 @@ async def test_devices_and_entities_are_keyed_by_backend_resource_id(
             "security_continuity",
             "package_scan_status",
             "package_plan_approval",
+            "health_contract",
             "pending_updates",
             "last_package_scan",
             "reboot_required",
@@ -1013,6 +1093,7 @@ async def test_absent_resource_transition_retains_all_entities_unavailable(
         "security_continuity",
         "package_scan_status",
         "package_plan_approval",
+        "health_contract",
         "pending_updates",
         "last_package_scan",
         "reboot_required",
@@ -1325,7 +1406,7 @@ async def test_view_update_plan_reads_fresh_snapshot_and_returns_exact_rows(
         )
         if item.unique_id.startswith(f"{resource_key}:")
     ]
-    assert len(resource_entities) == 13
+    assert len(resource_entities) == 14
     for item in resource_entities:
         state = hass.states.get(item.entity_id)
         assert state is not None
@@ -1629,6 +1710,9 @@ def test_update_plan_action_metadata_and_polish_translations_are_structural() ->
     assert set(strings["services"]) == {
         SERVICE_VIEW_UPDATE_PLAN,
         SERVICE_APPROVE_UPDATE_PLAN,
+        SERVICE_VIEW_HEALTH_CONTRACT,
+        SERVICE_SET_HEALTH_CONTRACT,
+        SERVICE_CLEAR_HEALTH_CONTRACT,
     }
     assert polish["services"][SERVICE_VIEW_UPDATE_PLAN]["name"] == (
         "Wyświetl plan aktualizacji"
@@ -3650,3 +3734,456 @@ async def test_second_entry_failure_leaves_first_intact_then_retry_loads_cleanly
         return_response=True,
     )
     assert response["resource_id"] == RESOURCE_CT
+
+
+# ---------------------------------------------------------------------------
+# Health-contract actions.
+#
+# Three operator actions over the same dynamic resource-device selector the
+# update-plan actions use. All three are authority metadata: none of them can
+# ask the backend to run a probe, and none of them reports health.
+# ---------------------------------------------------------------------------
+
+HEALTH_PROBES = [
+    {"kind": "systemd_unit_active", "target": "nginx.service"},
+    {"kind": "docker_container_healthy", "target": "immich_server"},
+]
+
+
+def configured_contract(
+    resource_id: str = RESOURCE_CT, *, revision: int = 3
+) -> ResourceHealthContract:
+    return ResourceHealthContract(
+        resource_id=resource_id,
+        status=HealthContractStatus.CONFIGURED,
+        revision=revision,
+        fingerprint="a" * 64,
+        created_at="2026-08-08T11:00:00+00:00",
+        updated_at="2026-08-08T11:30:00+00:00",
+        probes=(
+            HealthProbe(
+                kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY, target="immich_server"
+            ),
+            HealthProbe(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_health_contract_actions_are_registered_and_removed_with_the_domain(
+    hass: HomeAssistant,
+) -> None:
+    entry = await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    for service in (
+        SERVICE_VIEW_HEALTH_CONTRACT,
+        SERVICE_SET_HEALTH_CONTRACT,
+        SERVICE_CLEAR_HEALTH_CONTRACT,
+    ):
+        assert hass.services.has_service(DOMAIN, service)
+
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
+    for service in (
+        SERVICE_VIEW_HEALTH_CONTRACT,
+        SERVICE_SET_HEALTH_CONTRACT,
+        SERVICE_CLEAR_HEALTH_CONTRACT,
+    ):
+        assert not hass.services.has_service(DOMAIN, service)
+
+
+@pytest.mark.asyncio
+async def test_view_health_contract_returns_material_as_response_data(
+    hass: HomeAssistant,
+) -> None:
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        health_contracts={RESOURCE_CT: configured_contract()},
+    )
+    entry = await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_HEALTH_CONTRACT,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+
+    assert transport.health_contract_reads == [RESOURCE_CT]
+    assert response == {
+        "resource_id": RESOURCE_CT,
+        "resource_name": "CT101 Cloudflared",
+        "status": "configured",
+        "revision": 3,
+        "fingerprint": "a" * 64,
+        "created_at": "2026-08-08T11:00:00+00:00",
+        "updated_at": "2026-08-08T11:30:00+00:00",
+        "probes": [
+            {"kind": "docker_container_healthy", "target": "immich_server"},
+            {"kind": "systemd_unit_active", "target": "nginx.service"},
+        ],
+    }
+    # Contract material is response data only -- never entity attributes.
+    key = resource_registry_key(BACKEND_ID, RESOURCE_CT)
+    for item in er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id):
+        if not item.unique_id.startswith(f"{key}:"):
+            continue
+        state = hass.states.get(item.entity_id)
+        assert state is not None
+        assert "probes" not in state.attributes
+        assert "immich_server" not in str(state.attributes)
+
+
+@pytest.mark.asyncio
+async def test_view_health_contract_reports_unconfigured_without_faking_a_contract(
+    hass: HomeAssistant,
+) -> None:
+    """An unconfigured resource is an answer, not an error -- and not an empty
+    contract either: `probes` is null, never an empty list that would read as
+    "a contract every workload satisfies"."""
+
+    await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_VIEW_HEALTH_CONTRACT,
+        {"device_id": resource_device_id(hass, RESOURCE_CT)},
+        blocking=True,
+        return_response=True,
+    )
+    assert response["status"] == "unconfigured"
+    assert response["probes"] is None
+    assert response["revision"] is None
+    assert response["fingerprint"] is None
+
+
+@pytest.mark.asyncio
+async def test_set_health_contract_serializes_the_complete_declared_set(
+    hass: HomeAssistant,
+) -> None:
+    transport = FakeTransport([snapshot(INITIAL_RESOURCES)])
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_SET_HEALTH_CONTRACT,
+        {
+            "device_id": resource_device_id(hass, RESOURCE_CT),
+            "probes": HEALTH_PROBES,
+            "expected_revision": 0,
+        },
+        blocking=True,
+        return_response=True,
+    )
+    await hass.async_block_till_done()
+
+    assert transport.health_contract_writes == [
+        (
+            RESOURCE_CT,
+            (
+                HealthProbe(
+                    kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
+                ),
+                HealthProbe(
+                    kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
+                    target="immich_server",
+                ),
+            ),
+            0,
+        )
+    ]
+    assert response["status"] == "configured"
+    assert response["revision"] == 1
+    assert response["probes"] == [
+        {"kind": "docker_container_healthy", "target": "immich_server"},
+        {"kind": "systemd_unit_active", "target": "nginx.service"},
+    ]
+
+    # Replacement is complete, never a merge with what was there before.
+    replaced = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_SET_HEALTH_CONTRACT,
+        {
+            "device_id": resource_device_id(hass, RESOURCE_CT),
+            "probes": [{"kind": "docker_container_running", "target": "redis"}],
+        },
+        blocking=True,
+        return_response=True,
+    )
+    assert replaced["probes"] == [
+        {"kind": "docker_container_running", "target": "redis"}
+    ]
+    assert replaced["revision"] == 2
+    assert transport.health_contract_writes[-1][2] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "probes",
+    (
+        [],
+        [{"kind": "http_get", "target": "https://example.invalid"}],
+        [{"kind": "systemd_unit_active"}],
+        [{"kind": "systemd_unit_active", "target": ""}],
+        [{"kind": "systemd_unit_active", "target": "a b.service"}],
+        [{"kind": "systemd_unit_active", "target": "a\nb.service"}],
+        [{"kind": "systemd_unit_active", "target": "x" * 201}],
+        [
+            {
+                "kind": "systemd_unit_active",
+                "target": "nginx.service",
+                "command": "rm -rf /",
+            }
+        ],
+        [
+            {"kind": "systemd_unit_active", "target": f"unit-{index}.service"}
+            for index in range(33)
+        ],
+    ),
+)
+async def test_set_health_contract_refuses_malformed_declarations(
+    hass: HomeAssistant, probes
+) -> None:
+    transport = FakeTransport([snapshot(INITIAL_RESOURCES)])
+    await setup_entry(hass, transport)
+
+    with pytest.raises(vol.Invalid):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_SET_HEALTH_CONTRACT,
+            {
+                "device_id": resource_device_id(hass, RESOURCE_CT),
+                "probes": probes,
+            },
+            blocking=True,
+            return_response=True,
+        )
+    assert transport.health_contract_writes == []
+
+
+@pytest.mark.asyncio
+async def test_clear_health_contract_leaves_the_resource_unconfigured(
+    hass: HomeAssistant,
+) -> None:
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        health_contracts={RESOURCE_CT: configured_contract()},
+    )
+    await setup_entry(hass, transport)
+
+    response = await hass.services.async_call(
+        DOMAIN,
+        SERVICE_CLEAR_HEALTH_CONTRACT,
+        {
+            "device_id": resource_device_id(hass, RESOURCE_CT),
+            "expected_revision": 3,
+        },
+        blocking=True,
+        return_response=True,
+    )
+    await hass.async_block_till_done()
+
+    assert transport.health_contract_clears == [(RESOURCE_CT, 3)]
+    assert response["status"] == "unconfigured"
+    assert response["probes"] is None
+    assert transport.health_contracts == {}
+
+
+@pytest.mark.asyncio
+async def test_health_contract_actions_use_the_dynamic_resource_device_selector(
+    hass: HomeAssistant,
+) -> None:
+    """Only a device that resolves to exactly one loaded resource is accepted."""
+
+    transport = FakeTransport([snapshot(INITIAL_RESOURCES)])
+    await setup_entry(hass, transport)
+    registry = dr.async_get(hass)
+    source_device = registry.async_get_device(
+        {(DOMAIN, source_registry_key(BACKEND_ID, SOURCE_ID))}
+    )
+    node_device = registry.async_get_device(
+        {(DOMAIN, node_registry_key(BACKEND_ID, NODE_A))}
+    )
+    assert source_device is not None and node_device is not None
+
+    for device_id in (source_device.id, node_device.id, "does-not-exist"):
+        for service, payload in (
+            (SERVICE_VIEW_HEALTH_CONTRACT, {}),
+            (SERVICE_SET_HEALTH_CONTRACT, {"probes": HEALTH_PROBES}),
+            (SERVICE_CLEAR_HEALTH_CONTRACT, {}),
+        ):
+            with pytest.raises(HomeAssistantError):
+                await hass.services.async_call(
+                    DOMAIN,
+                    service,
+                    {"device_id": device_id, **payload},
+                    blocking=True,
+                    return_response=True,
+                )
+    assert transport.health_contract_reads == []
+    assert transport.health_contract_writes == []
+    assert transport.health_contract_clears == []
+
+
+@pytest.mark.asyncio
+async def test_health_contract_actions_surface_a_backend_refusal_as_an_error(
+    hass: HomeAssistant,
+) -> None:
+    """A stale or non-current resource must fail loudly, never silently pass."""
+
+    transport = FakeTransport(
+        [snapshot(INITIAL_RESOURCES)],
+        health_contract_error=HubinetOpsConflict("resource is no longer current"),
+    )
+    await setup_entry(hass, transport)
+    device_id = resource_device_id(hass, RESOURCE_CT)
+
+    for service, payload in (
+        (SERVICE_VIEW_HEALTH_CONTRACT, {}),
+        (SERVICE_SET_HEALTH_CONTRACT, {"probes": HEALTH_PROBES}),
+        (SERVICE_CLEAR_HEALTH_CONTRACT, {}),
+    ):
+        with pytest.raises(HomeAssistantError):
+            await hass.services.async_call(
+                DOMAIN,
+                service,
+                {"device_id": device_id, **payload},
+                blocking=True,
+                return_response=True,
+            )
+
+
+@pytest.mark.asyncio
+async def test_health_contract_sensor_reports_configuration_never_a_result(
+    hass: HomeAssistant,
+) -> None:
+    configured = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        health_contract=HealthContractSummary(
+            status=HealthContractStatus.CONFIGURED,
+            revision=2,
+            fingerprint="b" * 64,
+            probe_count=2,
+            updated_at="2026-08-08T11:30:00+00:00",
+        ),
+    )
+    entry = await setup_entry(
+        hass,
+        FakeTransport(
+            [
+                snapshot(INITIAL_RESOURCES),
+                snapshot(
+                    (INITIAL_RESOURCES[0], configured, INITIAL_RESOURCES[2]),
+                    published_state_revision=21,
+                    published_at="2026-08-08T12:01:00+00:00",
+                ),
+            ]
+        ),
+    )
+    assert resource_entity_states(hass, entry, RESOURCE_CT)["health_contract"] == (
+        "unconfigured"
+    )
+    # A QEMU guest cannot hold a workload package-update health contract.
+    assert resource_entity_states(hass, entry, RESOURCE_VM)["health_contract"] == (
+        "unsupported"
+    )
+
+    await entry.runtime_data.async_request_refresh()
+    await hass.async_block_till_done()
+    assert resource_entity_states(hass, entry, RESOURCE_CT)["health_contract"] == (
+        "configured"
+    )
+
+    entity_id = next(
+        item.entity_id
+        for item in er.async_entries_for_config_entry(
+            er.async_get(hass), entry.entry_id
+        )
+        if item.unique_id.endswith(":health_contract")
+        and resource_registry_key(BACKEND_ID, RESOURCE_CT) in item.unique_id
+    )
+    options = hass.states.get(entity_id).attributes["options"]
+    # No passing/failing/healthy state exists to publish: there is no health
+    # execution in this stage, and configuration is not a verdict.
+    assert set(options) == {"unsupported", "unconfigured", "configured"}
+
+
+@pytest.mark.asyncio
+async def test_health_contract_action_metadata_and_translations_are_structural(
+    hass: HomeAssistant,
+) -> None:
+    await setup_entry(hass, FakeTransport([snapshot(INITIAL_RESOURCES)]))
+    descriptions = await service_helper.async_get_all_descriptions(hass)
+    device_field = {
+        "required": True,
+        "selector": {"device": {"integration": DOMAIN, "multiple": False}},
+    }
+    assert descriptions[DOMAIN][SERVICE_VIEW_HEALTH_CONTRACT]["fields"] == {
+        "device_id": device_field
+    }
+    assert set(descriptions[DOMAIN][SERVICE_SET_HEALTH_CONTRACT]["fields"]) == {
+        "device_id",
+        "probes",
+        "expected_revision",
+    }
+    assert set(descriptions[DOMAIN][SERVICE_CLEAR_HEALTH_CONTRACT]["fields"]) == {
+        "device_id",
+        "expected_revision",
+    }
+
+    polish = await async_get_translations(
+        hass, "pl", "services", integrations={DOMAIN}
+    )
+    for service in (
+        SERVICE_VIEW_HEALTH_CONTRACT,
+        SERVICE_SET_HEALTH_CONTRACT,
+        SERVICE_CLEAR_HEALTH_CONTRACT,
+    ):
+        assert polish[f"component.{DOMAIN}.services.{service}.name"]
+
+    english = await async_get_translations(hass, "en", "entity", integrations={DOMAIN})
+    assert english[
+        f"component.{DOMAIN}.entity.sensor.resource_health_contract.state.unconfigured"
+    ] == "Unconfigured"
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_still_redact_recursively_with_health_contracts_present(
+    hass: HomeAssistant,
+) -> None:
+    configured = resource(
+        RESOURCE_CT,
+        ResourceType.LXC,
+        101,
+        "Cloudflared",
+        state={"nested": {"api_token": "super-secret-value"}},
+        health_contract=HealthContractSummary(
+            status=HealthContractStatus.CONFIGURED,
+            revision=1,
+            fingerprint="d" * 64,
+            probe_count=1,
+            updated_at="2026-08-08T11:30:00+00:00",
+        ),
+    )
+    entry = await setup_entry(
+        hass, FakeTransport([snapshot((INITIAL_RESOURCES[0], configured))])
+    )
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    rendered = json.dumps(diagnostics)
+    assert "super-secret-value" not in rendered
+    assert REDACTED in rendered
+    published = next(
+        item
+        for item in diagnostics["snapshot"]["resources"]
+        if item["resource_id"] == RESOURCE_CT
+    )
+    # Diagnostics carry inventory identity and state, not contract material --
+    # exactly as they already omit package-scan and approval detail. The new
+    # field must not quietly widen that surface.
+    assert "health_contract" not in published
+    assert "d" * 64 not in rendered

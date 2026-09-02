@@ -20,3 +20,43 @@ approve_update_plan:
       required: true
       selector:
         text:
+
+view_health_contract:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: hubinet_ops
+
+set_health_contract:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: hubinet_ops
+    probes:
+      required: true
+      selector:
+        object:
+    expected_revision:
+      required: false
+      selector:
+        number:
+          min: 0
+          mode: box
+
+clear_health_contract:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          integration: hubinet_ops
+    expected_revision:
+      required: false
+      selector:
+        number:
+          min: 0
+          mode: box

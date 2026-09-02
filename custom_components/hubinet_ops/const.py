@@ -17,6 +17,9 @@ DATA_SERVICES_REGISTERED = "services_registered"
 
 SERVICE_VIEW_UPDATE_PLAN = "view_update_plan"
 SERVICE_APPROVE_UPDATE_PLAN = "approve_update_plan"
+SERVICE_VIEW_HEALTH_CONTRACT = "view_health_contract"
+SERVICE_SET_HEALTH_CONTRACT = "set_health_contract"
+SERVICE_CLEAR_HEALTH_CONTRACT = "clear_health_contract"
 
 MANUFACTURER = "Hubinet Ops"
 MODEL_SOURCE = "Proxmox inventory source via Hubinet Ops"

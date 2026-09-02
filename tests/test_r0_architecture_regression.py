@@ -229,13 +229,26 @@ def test_r0_production_modules_import_no_forbidden_legacy_symbol() -> None:
                 ), (rel_path, name)
 
 
-def test_r0_production_modules_define_only_exact_plan_approval_mutation() -> None:
+def test_r0_production_modules_define_only_authority_metadata_mutations() -> None:
+    """Every write verb the R0 app declares changes authority metadata only.
+
+    The exact-plan approval and the three health-contract operations are the
+    complete set. `@app.post` and `@app.patch` stay absent entirely, and the
+    single `@app.delete` is the health-contract clear -- never a snapshot
+    deletion, a job cancellation, or any other destructive verb.
+    """
+
     text = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
-    for verb in ("@app.post(", "@app.patch(", "@app.delete("):
+    for verb in ("@app.post(", "@app.patch("):
         assert verb not in text
-    assert text.count("@app.put(") == 1
+    assert text.count("@app.put(") == 2
+    assert text.count("@app.delete(") == 1
     assert (
         'f"{API_PREFIX}/resources/{{resource_id}}/package-plan-approval"'
+        in text
+    )
+    assert (
+        '_HEALTH_CONTRACT_ROUTE = f"{API_PREFIX}/resources/{{resource_id}}/health-contract"'
         in text
     )
 
@@ -444,7 +457,15 @@ def test_r0_ha_transport_never_references_pve_or_imports_app_inventory() -> None
     assert "app.inventory" not in text
 
 
-def test_r0_ha_transport_defines_only_exact_plan_approval_write() -> None:
+def test_r0_ha_transport_defines_only_authority_metadata_writes() -> None:
+    """The HA transport's method set is an exact allowlist.
+
+    Its writes are the exact-plan approval and the two health-contract
+    mutations -- both authority metadata. Nothing here can ask the backend to
+    start a job, mutate a package, take or roll back a snapshot, or run a
+    health probe, and this test is what keeps that true.
+    """
+
     tree = ast.parse(
         (REPO_ROOT / "custom_components/hubinet_ops/transport_http.py").read_text(
             encoding="utf-8"
@@ -455,8 +476,11 @@ def test_r0_ha_transport_defines_only_exact_plan_approval_write() -> None:
         "fetch_backend_information",
         "fetch_resource_snapshot",
         "approve_package_plan",
+        "fetch_health_contract",
+        "replace_health_contract",
+        "clear_health_contract",
     }
-    exact_private_methods = {"_get", "_put"}
+    exact_private_methods = {"_get", "_put", "_decode", "_health_contract_request"}
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == "HttpHubinetOpsTransport":
             method_names = {
@@ -945,10 +969,10 @@ def test_no_snapshot_deletion_exists_anywhere_in_the_product() -> None:
 def test_no_health_execution_exists_anywhere() -> None:
     """Healthcheck execution is deliberately NOT part of this stage.
 
-    The product has no truthful generic workload-health definition yet (see
-    STATUS.md), so no code may claim one: nothing writes `health_started_at`,
-    advances to the `health_started` checkpoint, or terminalizes a job
-    `succeeded`.
+    Health is now DEFINED per resource (an operator-declared contract), but
+    nothing evaluates one, so no code may claim a verdict: nothing writes
+    `health_started_at`, advances to the `health_started` checkpoint, or
+    terminalizes a job `succeeded`.
     """
 
     for rel_path in (
@@ -962,3 +986,122 @@ def test_no_health_execution_exists_anywhere() -> None:
         assert "health_started_at=" not in text, rel_path
         assert "status='succeeded'" not in text, rel_path
         assert "checkpoint='health_started'" not in text, rel_path
+
+
+def _executable_source(path) -> str:
+    """Return one module's source with its docstrings and comments removed.
+
+    Negative documentation is the point of several modules in this repository
+    -- they say, in prose, exactly what they must never do. A scan that could
+    not tell that prose from code would punish writing it down.
+    """
+
+    import io
+    import tokenize
+
+    source = path.read_text(encoding="utf-8")
+    lines = source.splitlines()
+    tree = ast.parse(source, filename=str(path))
+    blanked = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", ())
+        if not body:
+            continue
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+            if isinstance(first.value.value, str):
+                blanked.update(range(first.lineno, (first.end_lineno or first.lineno) + 1))
+    kept = [
+        "" if index + 1 in blanked else line for index, line in enumerate(lines)
+    ]
+    without_docstrings = "\n".join(kept)
+    tokens = tokenize.generate_tokens(io.StringIO(without_docstrings).readline)
+    return "\n".join(
+        token.string for token in tokens if token.type != tokenize.COMMENT
+    )
+
+
+def test_health_contracts_are_configuration_and_never_execution() -> None:
+    """The contract layer declares what healthy means; it never checks it.
+
+    Declaring a contract made "healthy" definable for the first time, which
+    is exactly when an executor becomes tempting. Nothing in the contract
+    layer -- authority, HTTP surface, or Home Assistant actions -- may run a
+    probe, reach a guest, or touch update-job state.
+    """
+
+    # Executable source only. These modules legitimately DOCUMENT the fixed
+    # argv a future executor will use ("systemctl is-active <unit>"), and a
+    # raw substring scan over that prose would false-positive on the exact
+    # negative documentation that makes the boundary clear.
+    probe_execution = (
+        "is-active",
+        "systemctl",
+        "docker",
+        "pct",
+        "subprocess",
+        "Popen",
+        "healthcheck",
+    )
+    job_lifecycle = (
+        "health_started",
+        "issue_package_update_job",
+        "package_update_jobs",
+        "succeeded",
+        "rollback",
+    )
+    for rel_path in (
+        "app/inventory/health_contract.py",
+        "custom_components/hubinet_ops/contract/health_contract_validation.py",
+    ):
+        text = _executable_source(REPO_ROOT / rel_path)
+        for forbidden in probe_execution + job_lifecycle:
+            assert forbidden not in text, (rel_path, forbidden)
+
+    # The contract's own vocabulary must stay declarative: a probe carries a
+    # kind and a target, never anything a caller could turn into command text.
+    for rel_path in (
+        "app/inventory/health_contract.py",
+        "app/inventory_runtime.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/transport_http.py",
+        "custom_components/hubinet_ops/services.yaml",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for forbidden in (
+            '"command"',
+            '"argv"',
+            '"shell"',
+            '"script"',
+            '"executable"',
+            '"working_directory"',
+            '"environment"',
+            "command:",
+            "argv:",
+        ):
+            assert forbidden not in text, (rel_path, forbidden)
+
+
+def test_no_health_executor_module_or_scheduler_exists() -> None:
+    """There is no health worker, scheduler, or host-control boundary yet."""
+
+    existing = {path.name for path in (REPO_ROOT / "app").glob("*.py")}
+    for forbidden in (
+        "health_execution.py",
+        "health_scheduler.py",
+        "health_worker.py",
+        "health_host_control.py",
+        "package_update_health.py",
+    ):
+        assert forbidden not in existing, forbidden
+    for forbidden in (
+        "hubinet-health-helper.py",
+        "hubinet-package-health-helper.py",
+    ):
+        assert not (REPO_ROOT / "deploy" / forbidden).exists(), forbidden
+
+    runtime = (REPO_ROOT / "app/inventory_runtime.py").read_text(encoding="utf-8")
+    for forbidden in ("HealthScheduler", "health_scheduler", "evaluate_health"):
+        assert forbidden not in runtime, forbidden

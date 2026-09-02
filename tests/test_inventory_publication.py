@@ -35,6 +35,7 @@ for package_name, package_path in (
 
 from custom_components.hubinet_ops.contract.enums import (
     DetailStatus,
+    HealthContractStatus,
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
@@ -49,6 +50,7 @@ from custom_components.hubinet_ops.contract.enums import (
 )
 from custom_components.hubinet_ops.contract.models import (
     BackendInformation,
+    HealthContractSummary,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     NodeSnapshot,
@@ -124,6 +126,15 @@ def contract_snapshot(view) -> HubinetOpsSnapshot:
                             "plan_fingerprint"
                         ],
                         approved_at=resource["package_plan_approval"]["approved_at"],
+                    ),
+                    "health_contract": HealthContractSummary(
+                        status=HealthContractStatus(
+                            resource["health_contract"]["status"]
+                        ),
+                        revision=resource["health_contract"]["revision"],
+                        fingerprint=resource["health_contract"]["fingerprint"],
+                        probe_count=resource["health_contract"]["probe_count"],
+                        updated_at=resource["health_contract"]["updated_at"],
                     ),
                 }
             )

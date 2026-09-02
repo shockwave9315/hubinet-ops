@@ -22,7 +22,7 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v13). Schema v10 added
+database (marker `hubinet_ops_0_5_authority`, schema v15). Schema v10 added
 the job-owned snapshot operation identity, its write-ahead uncertainty
 checkpoint, the observed PVE task identity, and SQL-level state-machine
 invariants over all of them. Schema v11 added the explicit, material
@@ -34,9 +34,13 @@ directions. Schema v13 adds `accepted_prepared_evidence_digest`, the digest
 of the exact preparation evidence the arming transaction accepted, so the
 mutation-arm facts are one indivisible write-ahead authority fact and only
 the invocation carrying that digest can submit (see "Crash-safe package
-mutation" below). There is no migration from v9, v10, v11, or v12;
-pre-release installs use the product updater's explicit backed-up authority
-reset and require Home Assistant re-enrollment.
+mutation" below). Schema v14 adds the same-job rollback operation identity,
+its write-ahead uncertainty checkpoint, the observed PVE rollback task
+identity, and rollback completion (see "Same-job rollback execution" below).
+Schema v15 adds the operator-declared per-resource health contract (see
+"Dynamic per-resource health contracts" below). There is no migration from
+v9 through v14; pre-release installs use the product updater's explicit
+backed-up authority reset and require Home Assistant re-enrollment.
 
 - `store.py` — schema, transactions, CAS/fencing for discovery-run ownership,
   backend/source/global-revision bookkeeping.
@@ -55,12 +59,14 @@ reset and require Home Assistant re-enrollment.
 `create_app_from_env` factory
 (`uvicorn app.inventory_runtime:create_app_from_env --factory`). It builds the store, authority,
 publication, PVE transport, and scheduler, and serves `GET /r0/v1/health`,
-`/backend`, `/snapshot`, plus the single narrow authority mutation
-`PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
+`/backend`, `/snapshot`, plus exactly two families of authority-metadata
+mutation: `PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
+`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`. Bearer
 authentication is required on every endpoint except the deliberately
 unauthenticated minimal `/r0/v1/health` liveness probe, which exposes no
-inventory or credential data. Approval changes only the authority database and
-has no host-control path.
+inventory or credential data. Both families change only the authority
+database and have no host-control path: neither can start a job, mutate a
+package, take or roll back a snapshot, or run a healthcheck.
 
 `app/inventory_pve_transport.py` is GET-only with mandatory TLS verification
 and no mutation-verb escape hatch. `app/inventory_scheduler.py` is a thin
@@ -441,6 +447,14 @@ that caller-supplied reference unchanged to the backend and refreshes the
 coordinator after success. One concise resource sensor displays the
 backend-published `none | approved | stale` approval state. Package rows do not
 become entity attributes or package-per-entity state.
+
+`view_health_contract`, `set_health_contract`, and `clear_health_contract` use
+that same resource-device selector rather than a second selection model. All
+three return response data; contract material — the probe list — is response
+data only, never entity attributes. A second concise resource sensor displays
+the backend-published `unsupported | unconfigured | configured` contract state,
+which is a statement about configuration and never a health result: no health
+result exists to publish.
 
 The coordinator is **not** a reconciler. It never infers `missing` from a diff
 between two polls, and it never assumes revision `N -> N+1` means backend
@@ -1740,15 +1754,151 @@ seals, or completes a rollback.
 
 **No deletion, and no healthcheck.** This stage deletes nothing — retention
 stays future work — and implements no healthcheck: a rolled-back job reaches
-`ROLLED_BACK`, and `SUCCEEDED` has no transition at all in this version,
-because the product has no truthful generic workload-health definition yet
-(see `STATUS.md`).
+`ROLLED_BACK`, and `SUCCEEDED` has no transition at all. Health is now
+*defined* per resource (see "Dynamic per-resource health contracts" below),
+but nothing evaluates a contract, so no job can be shown to have succeeded.
 
 `app/package_update_rollback.py` (orchestration) and
 `app/package_update_rollback_host_control.py` (a purpose-specific pinned-key
 SSH client) are instantiated only by hermetic tests.
 `tests/test_r0_architecture_regression.py` proves production reachability did
 not increase.
+
+## Dynamic per-resource health contracts
+
+Schema v15 adds the authority that says what "healthy" means for one workload.
+It is CONFIGURATION, and this stage builds only the configuration: nothing here
+executes, schedules, or evaluates a probe. See `PRODUCT.md`, "What healthy
+means", for why the definition is operator-declared rather than inferred.
+
+**Two tables, one current contract per resource.**
+`resource_health_contracts` holds one row per `resource_id` — `revision`,
+`fingerprint`, `probe_count`, `created_at`, `updated_at` — with a foreign key
+to `resource_incarnations`. `resource_health_contract_probes` holds that
+contract's complete required set as `(resource_id, probe_index, kind, target)`,
+with `kind` constrained in SQL to the three kinds
+`app/inventory/models.py:HealthProbeKind` declares, and `target` constrained to
+one bounded, non-empty string with no NUL, whitespace, or newline. The
+constraint list is generated from the enum and the shared bounds in
+`app/inventory/health_contract.py`, so SQL and Python cannot drift.
+
+**Absence is the schema's first rule.** There is no row for "unconfigured" —
+absence *is* unconfigured — and `probe_count` is constrained to at least one,
+so an empty contract cannot be stored.
+
+The schema constrains what ordinary writes can express; it is not a claim that
+a trusted administrator with direct SQL access cannot reconstruct an
+inconsistent row set, and per `AGENTS.md` that administrator is trusted rather
+than defended against. So there is a second, independent line:
+`app/inventory/store.py` verifies `probe_count` and recomputes the fingerprint
+on every read, and refuses to return a contract whose probe rows disagree with
+its own header. Reporting a short contract as complete would understate what
+the operator required, so the read fails closed instead.
+
+**Replacement is atomic, and a partial probe set is never readable.** The
+probes' parent foreign key is `DEFERRABLE INITIALLY DEFERRED`, which lets one
+transaction replace a contract in the only safe order: allocate the next
+revision, drop the live contract row (compare-and-set on the revision that was
+read), drop its now-unparented probes, insert the new contract row, then fill
+it. Triggers reject every other write order a statement could attempt — a
+contract row can never be `UPDATE`d, a probe row can never be edited, a probe
+may only be inserted contiguously from index 0 and within the declared
+`probe_count`, a live contract may not lose a probe, and a contract row cannot
+carry a revision the allocator has not handed out. The deferred check at
+`COMMIT` rejects an orphaned probe row. Clearing is the same transaction
+without the rebuild, and never removes the revision history.
+
+Together with the read-time verification above, that is the honest boundary:
+partial and edit-in-place contract states are unreachable through the
+authority and rejected by the schema, and anything a direct-SQL repair
+nevertheless reconstructs is caught when the contract is read.
+
+**Fingerprint and revision.** `health_contract_fingerprint` is SHA-256 over a
+domain-separated canonical JSON encoding of the `(kind, target)` set in
+`(kind, target)` order, so declaration order never affects it and two resources
+requiring the same probes share a fingerprint — exactly as two identical
+package plans do. Provenance fields are deliberately excluded.
+
+`revision` advances by one per durable *change*: re-declaring identical
+material while the contract still exists is not a change and consumes no
+revision. Revisions come from `resource_health_contract_revision_state`, a
+separate durable per-resource counter, and are **never reused**. That table
+exists because the contract row is deleted on clear, and a counter living
+inside it would restart at 1 — which would quietly turn `expected_revision`
+from a compare-and-set into a coin flip, since an operator holding revision 1
+of a deleted contract would match a completely different contract that also
+happened to be revision 1. Clearing therefore removes the contract material
+and keeps the allocation history, so a contract cleared at revision 3 and
+re-declared becomes revision 4 even when the material is byte-identical: that
+is a new generation, not a continuation of the deleted one. The pair
+`(revision, fingerprint)` is consequently a stable name for one generation of
+one resource's contract, which is what a later health-execution stage needs to
+record truthfully.
+
+**Identity across replace, move, and rename.** The contract belongs to the
+exact resource incarnation. Setting, reading, and clearing all go through the
+same current-executable-binding proof the package-scan and approval paths use,
+plus an LXC check, so a missing, quarantined, retired, or replaced incarnation
+fails closed. A VMID-reused replacement is a different `resource_id` and simply
+has no contract; the predecessor keeps its own historical row as ordinary
+foreign-key provenance, which is not something the replacement can use. A
+rename or a node move is the same durable resource and keeps its contract,
+because neither is part of contract identity.
+
+**Compare-and-set.** `expected_revision` is optional on replace and clear:
+`0` asserts the resource is *currently* unconfigured — not that it has never
+had a contract, so it stays valid after any number of clear/recreate cycles —
+and a positive value asserts exactly that current revision. Because revisions
+are never reused, a stale positive value can never become valid again for the
+same `resource_id`. Omitting it keeps the ordinary single-editor path
+unconditional.
+
+**HTTP.** `GET`/`PUT`/`DELETE
+/r0/v1/resources/{resource_id}/health-contract`, bearer-authenticated.
+
+Failures this API raises itself carry a machine-distinguishable body,
+`{"detail": {"error": ..., "message": ...}}`, with `error` one of
+`resource_not_found` (404), `contract_unconfigured` (404),
+`resource_not_current` (409), `revision_conflict` (409 — a lost
+compare-and-set, which is a different problem from a stale resource), or
+`invalid_contract` (422). The unconfigured case is deliberately *not* a 200
+with an empty probe list: a caller must never be able to read absence as a
+contract that nothing has to satisfy.
+
+Not every 422 has that shape, and callers must not assume it does. A request
+whose *structure* is wrong — a missing or empty `probes` list, an unknown
+probe kind, a target outside its length bounds, more than 32 probes, or any
+unknown field — is rejected by FastAPI/Pydantic before the handler runs, and
+answers with FastAPI's ordinary validation body whose `detail` is a *list* of
+field errors. `invalid_contract` is for a structurally valid request whose
+contract *material* the authority rejects: a whitespace-bearing target, a
+duplicate `(kind, target)`. No custom validation handler is installed to
+paper over the difference; the two layers are genuinely different rejections
+and the taxonomy says so. `PUT` forbids unknown fields, so no `command`,
+`argv`, `shell`, `script`, `executable`, `working_directory`, or `environment`
+can be smuggled into caller-controlled contract material.
+
+**The published snapshot carries the summary, not the material.** Each
+resource publishes `health_contract` as `status`
+(`unsupported | unconfigured | configured`) plus `revision`, `fingerprint`,
+`probe_count`, and `updated_at`. QEMU is `unsupported` because this product
+updates packages only inside Debian/Ubuntu LXC guests. The probe list is read
+through the dedicated endpoint an operator explicitly invokes, not carried into
+entity state on every Home Assistant poll.
+
+**The non-execution boundary is explicit.** There is no probe executor, health
+scheduler, health worker, health task journal, or health host-control boundary,
+and no code here runs `systemctl`, `docker`, `pct`, or SSH. Package-update job
+semantics are untouched: a contract is not required to issue a job, is not
+copied into a job, and no job is bound to a contract revision. `health_started`
+is still unreachable, `SUCCEEDED` still has no transition, and no automatic
+health-triggered rollback or compensation policy exists — that policy is a
+separate decision from defining what healthy means, and no contract means no
+automatic health rollback could be justified anyway. Binding a job to a
+specific contract revision is health-execution work; the durable shape above
+is designed so that stage can reference one truthfully without a redesign.
+`tests/test_r0_architecture_regression.py` proves the contract layer cannot
+become the first thing to reach the dark lifecycle.
 
 ## Ordinary safety rules (all layers, now and later)
 

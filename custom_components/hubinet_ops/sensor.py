@@ -23,6 +23,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .api import (
     DetailStatus,
+    HealthContractStatus,
     InventorySourceSnapshot,
     NodeAvailability,
     NodeSnapshot,
@@ -170,6 +171,18 @@ RESOURCE_SENSORS = (
         device_class=SensorDeviceClass.ENUM,
         options=[status.value for status in PackagePlanApprovalStatus],
         value_fn=lambda resource: resource.package_plan_approval.status.value,
+    ),
+    HubinetOpsResourceSensorDescription(
+        key="health_contract",
+        translation_key="resource_health_contract",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        device_class=SensorDeviceClass.ENUM,
+        options=[status.value for status in HealthContractStatus],
+        # Whether a declared meaning of healthy EXISTS. Never a health
+        # result, and never the probe list -- contract material is read
+        # through the view_health_contract action, not carried in entity
+        # state on every poll.
+        value_fn=lambda resource: resource.health_contract.status.value,
     ),
     HubinetOpsResourceSensorDescription(
         key="pending_updates",
