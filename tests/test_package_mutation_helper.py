@@ -1872,3 +1872,185 @@ def test_a_staging_command_that_exits_early_is_a_failure_not_a_hang(
 
     assert result.returncode == 3
     assert result.timed_out is False
+
+
+# ===========================================================================
+# M. JOURNAL DIRECTORY DURABILITY
+# ===========================================================================
+#
+# `fsync` on a directory only makes ENTRIES INSIDE it durable; it says
+# nothing about that directory's own entry in its parent. On this host's
+# very first package-mutation operation the journal directory (and possibly
+# its parent) does not exist yet, so simply `mkdir`-ing it and then fsyncing
+# journal writes into it is not enough: the directory's own link into its
+# parent could still vanish on power loss, and recovery would then see the
+# journal as absent rather than durably `submitted`.
+
+
+def _spy_fd_paths(monkeypatch):
+    """Track which path each `os.open` fd names, so a later `os.fsync(fd)`
+    can be attributed to a real path instead of an opaque integer."""
+
+    opened: dict[int, Path] = {}
+    fsynced: list[Path] = []
+    real_open = os.open
+    real_fsync = os.fsync
+
+    def spy_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        opened[fd] = Path(path)
+        return fd
+
+    def spy_fsync(fd):
+        fsynced.append(opened[fd])
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    return fsynced
+
+
+def test_first_directory_creation_fsyncs_every_newly_created_parent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A. Absent journal directory: creating it durably links both new levels."""
+
+    root = tmp_path / "var-lib-hubinet-ops" / "package-mutation-operations"
+    assert not root.parent.exists()
+    fsynced = _spy_fd_paths(monkeypatch)
+
+    helper._ensure_durable_directory(root, mode=0o700)
+
+    assert root.is_dir()
+    assert oct(root.stat().st_mode & 0o777) == oct(0o700)
+    assert root.parent.stat().st_mode & 0o777 == 0o700
+    # The parent-of-the-first-missing-level is fsynced before the
+    # parent-of-the-leaf: each newly created directory entry is durable
+    # before the next level is created on top of it.
+    assert fsynced == [tmp_path, root.parent]
+
+
+def test_an_already_existing_journal_directory_needs_no_new_work(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """B. No correctness regression once the directory already exists."""
+
+    root = tmp_path / "package-mutation-operations"
+    root.mkdir(mode=0o700)
+
+    def _unexpected(*_args, **_kwargs):
+        raise AssertionError("must not touch an already-durable directory")
+
+    monkeypatch.setattr(os, "mkdir", _unexpected)
+    monkeypatch.setattr(os, "fsync", _unexpected)
+
+    helper._ensure_durable_directory(root, mode=0o700)  # must not raise
+
+    assert root.is_dir()
+
+
+def test_first_journal_write_orders_directory_before_record_before_rename(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """C. durable directory -> durable record -> rename -> submitted -> apt.
+
+    Exercised at the `OperationJournal.write` level, one level below the
+    real "submitted, then launch apt" boundary in `handle_request`: `write`
+    is exactly the call that boundary makes immediately before it launches
+    the detached runner, so this proves the record can never reach durable
+    `submitted` while its own containing directory is not itself durable.
+    """
+
+    directory = tmp_path / "operations"
+    journal = helper.OperationJournal(directory)
+    assert not directory.exists()
+
+    events: list[str] = []
+    real_mkdir = os.mkdir
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def spy_mkdir(path, *args, **kwargs):
+        events.append(f"mkdir:{path}")
+        return real_mkdir(path, *args, **kwargs)
+
+    def spy_fsync(fd):
+        events.append("fsync")
+        return real_fsync(fd)
+
+    def spy_replace(src, dst):
+        events.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "mkdir", spy_mkdir)
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+
+    journal.write(_submitted_record(_request_fingerprint()))
+
+    replace_index = events.index("replace")
+    # The directory is created and its own entry fsynced BEFORE the record
+    # file is fsynced and renamed into place.
+    assert events[0] == f"mkdir:{directory}"
+    assert events[:replace_index] == [
+        f"mkdir:{directory}",
+        "fsync",  # the new directory's own entry, durable in its parent
+        "fsync",  # the temporary record file's data
+    ]
+    # ... and the journal directory is fsynced again after the rename, so
+    # the rename itself is durable before this call returns "submitted".
+    assert events[replace_index:] == ["replace", "fsync"]
+    assert directory.is_dir()
+    assert journal.read(OPERATION_ID)["phase"] == "submitted"
+
+
+def test_lease_first_path_creates_the_directory_just_as_durably(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """D. The lease may create the journal directory before any journal
+    record exists; it must use the identical durability barrier."""
+
+    directory = tmp_path / "operations"
+    assert not directory.exists()
+    fsynced = _spy_fd_paths(monkeypatch)
+
+    with helper.VmidMutationLease(VMID, directory):
+        pass
+
+    assert directory.is_dir()
+    # `directory` itself is the newly created level, so its own entry is
+    # made durable by fsyncing its parent -- exactly the same barrier
+    # `OperationJournal.ensure_directory` would have used.
+    assert directory.parent in fsynced
+
+    # A journal created afterwards observes an already-durable directory
+    # and pays no further mkdir/fsync cost to make it durable again.
+    def _unexpected_mkdir(*_args, **_kwargs):
+        raise AssertionError("directory is already durable")
+
+    monkeypatch.setattr(os, "mkdir", _unexpected_mkdir)
+    helper.OperationJournal(directory).ensure_directory()
+
+
+def test_a_losing_creator_still_fsyncs_and_never_raises(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """E. Two racing creators: the loser's `mkdir` failure is not an error,
+    and it still fsyncs the parent before returning."""
+
+    directory = tmp_path / "package-mutation-operations"
+    real_mkdir = os.mkdir
+
+    def racing_mkdir(path, mode):
+        # Simulate another process winning the race to create this exact
+        # level between our `is_dir()` probe and our own `mkdir` call.
+        real_mkdir(path, mode)
+        raise FileExistsError()
+
+    monkeypatch.setattr(os, "mkdir", racing_mkdir)
+    fsynced = _spy_fd_paths(monkeypatch)
+
+    helper._ensure_durable_directory(directory, mode=0o700)  # must not raise
+
+    assert directory.is_dir()
+    assert directory.parent in fsynced

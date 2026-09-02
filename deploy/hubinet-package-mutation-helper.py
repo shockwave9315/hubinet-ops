@@ -922,6 +922,63 @@ def _result_is_success(result: Mapping[str, Any]) -> bool:
     )
 
 
+def _ensure_durable_directory(path: Path, *, mode: int) -> None:
+    """Create `path`, and any missing parents, as a crash-durable link.
+
+    `Path.mkdir(parents=True, exist_ok=True)` alone is not enough on this
+    host's very first package-mutation operation, when `JOURNAL_DIRECTORY`
+    (and possibly its parent `/var/lib/hubinet-ops`) does not exist yet.
+    `fsync` on a directory only makes ENTRIES INSIDE it durable; it says
+    nothing about that directory's OWN entry in ITS parent. Without this,
+    the sequence "create journal dir -> write+fsync journal record ->
+    rename -> fsync journal dir -> submitted -> apt -> host power loss"
+    can lose the newly-created directory entry itself on reboot, so
+    recovery sees the journal directory as absent and seals an operation
+    that may already have mutated packages as never submitted.
+
+    Only the components that do not already exist are created and
+    fsynced; a pre-existing system directory such as `/var` or
+    `/var/lib` is never opened or written to by this call, and once
+    `path` exists this is a single `is_dir()` check with no `mkdir` or
+    `fsync` at all -- so it is not a cost paid on every journal write,
+    only on the first one.
+
+    Safe under a race between two processes creating the same path: a
+    `FileExistsError` from losing the race is not an error here, and the
+    loser still fsyncs the parent, so neither caller can return before the
+    entry it just observed is durable.
+
+    `path` is always one of this module's own code-owned absolute
+    literals (`JOURNAL_DIRECTORY`, or a lease path directly under it),
+    never request- or caller-controlled, so there is no symlink or path
+    traversal surface to defend against here.
+    """
+
+    missing: list[Path] = []
+    probe = path
+    while not probe.is_dir():
+        missing.append(probe)
+        parent = probe.parent
+        if parent == probe:
+            # Reached the filesystem root without finding an existing
+            # directory. Unreachable for a real absolute path under an
+            # existing filesystem; stop rather than loop forever.
+            break
+        probe = parent
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory, mode)
+        except FileExistsError:
+            # Another process won the race to create this exact level;
+            # its entry still gets the same durability barrier below.
+            pass
+        parent_descriptor = os.open(directory.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+
+
 class OperationJournal:
     """Atomic, fsynced, per-operation package-mutation journal on the host."""
 
@@ -937,7 +994,16 @@ class OperationJournal:
         return self._directory / f"op-{mutation_operation_id}.json"
 
     def ensure_directory(self) -> None:
-        self._directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        """Create the journal directory durably (see `_ensure_durable_directory`).
+
+        Shares its primitive with `VmidMutationLease.__enter__`, which may
+        create this same directory first (a lease is typically acquired
+        before any journal record for an operation is written): whichever
+        of the two runs first pays for the durability barrier, and the
+        other observes an already-existing, already-durable directory.
+        """
+
+        _ensure_durable_directory(self._directory, mode=0o700)
 
     def read(self, mutation_operation_id: str) -> dict[str, Any] | None:
         path = self._path(mutation_operation_id)
@@ -1060,7 +1126,11 @@ class VmidMutationLease:
         return self._descriptor
 
     def __enter__(self) -> VmidMutationLease:
-        self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Same durable-directory primitive as `OperationJournal.ensure_directory`
+        # -- this lease is often acquired before that operation's first
+        # journal record exists, so this call may be the one that first
+        # creates `JOURNAL_DIRECTORY`, and it must be exactly as durable.
+        _ensure_durable_directory(self._path.parent, mode=0o700)
         self._descriptor = os.open(
             self._path, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC, 0o600
         )
