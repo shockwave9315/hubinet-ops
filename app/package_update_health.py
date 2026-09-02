@@ -105,6 +105,7 @@ from app.inventory import (
     HealthProbeOutcome,
     InventoryAuthority,
     PackageUpdateCheckpoint,
+    PackageUpdateHealthRequest,
     PackageUpdateJob,
     PackageUpdateJobHealthProbe,
     PackageUpdateJobStatus,
@@ -133,7 +134,7 @@ class PackageUpdateHealthError(RuntimeError):
 #: taxonomy. Anything the helper classifies differently, or does not classify
 #: at all, stays the generic rejection: a token is only used when the host
 #: actually said the thing it names.
-_HOST_REFUSAL_REASONS: dict[str, str] = {
+HOST_REFUSAL_REASONS: dict[str, str] = {
     "guest_unavailable": "guest_unavailable",
     "stale_target": "resource_context_changed",
     "unsupported_resource_type": "resource_context_changed",
@@ -292,7 +293,9 @@ class PackageUpdateHealthHostControl(Protocol):
     template, an option, or a probe the job did not freeze.
     """
 
-    def evaluate_health_contract(self, request: Any) -> HostHealthResult:
+    def evaluate_health_contract(
+        self, request: PackageUpdateHealthRequest
+    ) -> HostHealthResult:
         """Evaluate one job's complete frozen probe set inside its guest."""
 
 

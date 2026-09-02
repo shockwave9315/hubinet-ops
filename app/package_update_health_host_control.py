@@ -46,7 +46,7 @@ from app.package_scan_host_control import (
     _bounded_process_runner,
 )
 from app.package_update_health import (
-    _HOST_REFUSAL_REASONS,
+    HOST_REFUSAL_REASONS,
     HOST_PROBE_REASONS,
     HostHealthResult,
     HostProbeResult,
@@ -316,7 +316,7 @@ class SshPackageUpdateHealthHostControl:
                 ]
             raise PackageUpdateHealthError(
                 f"host-control reported a failure ({classification})",
-                reason=_HOST_REFUSAL_REASONS.get(
+                reason=HOST_REFUSAL_REASONS.get(
                     classification, "host_response_rejected"
                 ),
             )
