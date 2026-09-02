@@ -17,11 +17,19 @@ fixed `BUSY_TIMEOUT_MS = 5_000` with no relationship to that critical
 section's real duration at all.
 
 This module is the single source of truth for that relationship. It defines
-the maximum a snapshot host critical section may legitimately run, and
-derives the authority store's writer wait budget from it, so the two can
-never silently diverge again. Nothing here changes what the writer lock is
-held across (see the modules above) -- this is wait *policy*, not transaction
-shape.
+the maximum a host critical section may legitimately run, and derives the
+authority store's writer wait budget from it, so the two can never silently
+diverge again. Nothing here changes what the writer lock is held across (see
+the modules above) -- this is wait *policy*, not transaction shape.
+
+Crash-safe package mutation adds a second pair of such critical sections
+(`execute_package_mutation_submission_if_current` and
+`resolve_pre_mutation_block`), for exactly the same reason and with exactly
+the same shape: one bounded host round trip that crosses (or durably forbids)
+a mutation submission boundary, never the mutation itself. The budget below
+is therefore derived from the worst case over *every* such critical section,
+so adding one can never silently leave ordinary writers with a wait budget
+shorter than a healthy one of them.
 """
 
 from __future__ import annotations
@@ -63,6 +71,22 @@ MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS = (
     MAX_SNAPSHOT_HOST_TIMEOUT_SECONDS + BOUNDED_PROCESS_CLEANUP_SECONDS
 )
 
+#: Deliberate upper bound on `submission_timeout_seconds` for
+#: `SshPackageUpdateMutationHostControl` -- the wall-clock budget for ONE
+#: bounded SSH round trip running a typed operation that this backend calls
+#: while it still holds the authority writer lock
+#: (`execute_exact_package_mutation` or `seal_mutation_never_submitted`).
+#: Neither waits for `apt-get` itself: the mutation helper journals
+#: `submitted` and hands the real package command to a detached host runner,
+#: so what this bounds is a live PVE target read, one bounded `dpkg-query`
+#: pre-state read, two fsynced journal writes, and a fork -- never the
+#: package mutation's own duration. The helper's own read-only operations
+#: (`prepare_exact_package_mutation`, `inspect_package_mutation_state`) run
+#: strictly OUTSIDE the writer lock and are deliberately NOT bounded by this
+#: value: an APT metadata refresh plus simulation can legitimately take
+#: minutes, which is exactly why it may never happen inside the lock.
+MAX_PACKAGE_MUTATION_SUBMISSION_TIMEOUT_SECONDS = 90
+
 #: Explicit scheduling margin on top of the worst-case critical section --
 #: OS/interpreter thread scheduling jitter, SQLite's own lock-handoff
 #: bookkeeping, and clock coarseness -- so the writer budget below is not
@@ -80,8 +104,27 @@ WRITER_SCHEDULING_MARGIN_SECONDS = 10
 #: still blocked after this budget still fails with `database is locked` --
 #: this policy keeps that failure meaningful evidence of real, unbounded
 #: contention instead of routine noise, it does not remove it.
+#: The worst-case wall-clock duration ONE package-mutation host critical
+#: section (`execute_package_mutation_submission_if_current` or
+#: `resolve_pre_mutation_block`) may legitimately hold the authority store's
+#: writer lock. Same shape as the snapshot bound above, over the mutation
+#: transport's own submission ceiling.
+MAX_PACKAGE_MUTATION_CRITICAL_SECTION_SECONDS = (
+    MAX_PACKAGE_MUTATION_SUBMISSION_TIMEOUT_SECONDS + BOUNDED_PROCESS_CLEANUP_SECONDS
+)
+
+#: The worst case over EVERY critical section that may legitimately hold the
+#: authority store's writer lock across a bounded host round trip. The writer
+#: wait budget is derived from this, not from the snapshot bound alone, so
+#: adding a second such critical section can never silently leave ordinary
+#: writers with a budget shorter than a healthy one of them.
+MAX_HOST_CRITICAL_SECTION_SECONDS = max(
+    MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS,
+    MAX_PACKAGE_MUTATION_CRITICAL_SECTION_SECONDS,
+)
+
 AUTHORITY_WRITER_WAIT_BUDGET_SECONDS = (
-    MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS + WRITER_SCHEDULING_MARGIN_SECONDS
+    MAX_HOST_CRITICAL_SECTION_SECONDS + WRITER_SCHEDULING_MARGIN_SECONDS
 )
 
 AUTHORITY_WRITER_WAIT_BUDGET_MS = int(AUTHORITY_WRITER_WAIT_BUDGET_SECONDS * 1_000)
@@ -95,4 +138,12 @@ AUTHORITY_WRITER_WAIT_BUDGET_MS = int(AUTHORITY_WRITER_WAIT_BUDGET_SECONDS * 1_0
 assert AUTHORITY_WRITER_WAIT_BUDGET_SECONDS > MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS, (
     "authority writer wait budget must exceed the maximum bounded snapshot "
     "host critical-section duration plus its scheduling margin"
+)
+
+assert (
+    AUTHORITY_WRITER_WAIT_BUDGET_SECONDS
+    > MAX_PACKAGE_MUTATION_CRITICAL_SECTION_SECONDS
+), (
+    "authority writer wait budget must exceed the maximum bounded package "
+    "mutation host critical-section duration plus its scheduling margin"
 )

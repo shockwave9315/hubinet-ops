@@ -22,14 +22,21 @@ input; it is never an authority and never talks to Proxmox.**
 ## Backend
 
 `app/inventory/` is an independently instantiable subsystem with its own SQLite
-database (marker `hubinet_ops_0_5_authority`, schema v11). Schema v10 added
+database (marker `hubinet_ops_0_5_authority`, schema v13). Schema v10 added
 the job-owned snapshot operation identity, its write-ahead uncertainty
 checkpoint, the observed PVE task identity, and SQL-level state-machine
-invariants over all of them. Schema v11 adds the explicit, material
+invariants over all of them. Schema v11 added the explicit, material
 `architecture` column to `package_scan_packages` and
-`package_update_job_packages` (see "Binary package identity" below). There is
-no migration from v9 or v10; pre-release installs use the product updater's
-explicit backed-up authority reset and require Home Assistant re-enrollment.
+`package_update_job_packages` (see "Binary package identity" below). Schema
+v12 adds the job-owned package mutation operation identity and SQL-level
+invariants tying the mutation checkpoints to their durable facts in both
+directions. Schema v13 adds `accepted_prepared_evidence_digest`, the digest
+of the exact preparation evidence the arming transaction accepted, so the
+mutation-arm facts are one indivisible write-ahead authority fact and only
+the invocation carrying that digest can submit (see "Crash-safe package
+mutation" below). There is no migration from v9, v10, v11, or v12;
+pre-release installs use the product updater's explicit backed-up authority
+reset and require Home Assistant re-enrollment.
 
 - `store.py` — schema, transactions, CAS/fencing for discovery-run ownership,
   backend/source/global-revision bookkeeping.
@@ -81,13 +88,16 @@ instantiated `InventoryAuthority` can issue and revalidate one globally
 single-flight job from a current exact approval, and startup interrupts any
 pre-package-mutation active job so it cannot auto-run after restart. The
 production HTTP and Home Assistant surfaces cannot issue a job, and there is
-no job consumer, workload package mutation, healthcheck, or rollback
-execution. Authority revalidation is necessary but not sufficient permission
-for future mutation: the execution-time equality gate below proves exact
-fresh APT simulation/equality against the job's frozen material, but even a
-successful pass is not a durable mutation permit -- the future activation
-stage must re-run that exact gate again immediately before it mutates
-anything (see "Execution-time plan equality" below).
+no job consumer, healthcheck, or rollback execution. Authority revalidation
+is necessary but not sufficient permission for mutation: the execution-time
+equality gate below proves exact fresh APT simulation/equality against the
+job's frozen material, and even a successful pass is not a durable mutation
+permit -- the mutation stage re-runs that exact equality proof itself,
+immediately before it mutates, in the same transaction that commits its
+write-ahead uncertainty boundary (see "Execution-time plan equality" and
+"Crash-safe package mutation" below). Real workload package mutation exists
+internally, is at-most-once and crash-safe, and is likewise unreachable from
+production.
 
 ## Job-owned snapshot safety
 
@@ -273,9 +283,26 @@ of truth for that relationship instead of an unrelated fixed timeout:
   `sqlite3.connect(timeout=...)` from, for every connection, replacing the
   previous fixed `BUSY_TIMEOUT_MS = 5000`.
 
-A module-level assertion in `contention_policy.py` enforces
+Crash-safe package mutation adds a second pair of such critical sections
+(`execute_package_mutation_submission_if_current` and
+`resolve_pre_mutation_block`), with the same shape and the same reason, so
+the module also defines `MAX_PACKAGE_MUTATION_SUBMISSION_TIMEOUT_SECONDS`
+(90s, enforced in `SshPackageUpdateMutationHostControl`'s constructor before
+any SSH or subprocess execution) and derives
+`MAX_PACKAGE_MUTATION_CRITICAL_SECTION_SECONDS` (95s) from it. The writer
+budget is sized from `MAX_HOST_CRITICAL_SECTION_SECONDS`, the worst case
+over *every* such critical section, so adding one can never silently leave
+ordinary writers with a budget shorter than a healthy one of them. Neither
+mutation critical section ever waits for `apt-get`: the host journals
+`submitted` and hands the real package command to a detached runner, and the
+transport's own read-only operations (preparation and inspection), which may
+legitimately take minutes, run strictly outside the writer lock under a
+separate, longer timeout.
+
+Module-level assertions in `contention_policy.py` enforce
 `AUTHORITY_WRITER_WAIT_BUDGET_SECONDS > MAX_SNAPSHOT_HOST_CRITICAL_SECTION_SECONDS`
-at import time, and the host-control constructor's timeout ceiling makes a
+and the same relationship for the package-mutation critical section at
+import time, and each host-control constructor's timeout ceiling makes a
 legal critical section longer than that impossible to construct — so it is
 no longer possible to configure a snapshot host round trip long enough to
 legitimately exhaust the store's writer wait budget. This guarantees exactly
@@ -787,10 +814,10 @@ Properties that channel must have:
   binding/generation/continuity/VMID/node context, and the same fresh healthy
   committed source context captured when the scan was issued.
 
-Update execution, healthchecks, rollback execution, lifecycle mutation, and
-QEMU package execution remain future work; job-owned snapshot safety and the
-execution-time plan equality gate below exist internally but cannot be
-invoked by production.
+Healthchecks, rollback execution, lifecycle mutation, and QEMU package
+execution remain future work; job-owned snapshot safety, the execution-time
+plan equality gate, and crash-safe package mutation below all exist
+internally but cannot be invoked by production.
 
 ## Binary package identity
 
@@ -1022,10 +1049,13 @@ narrow retryable result for temporary unavailability). Generic callers retain
 their prior bool/`AuthorityConflict` behavior.
 
 A `MATCHED` result is deliberately not a durable mutation permit: it changes
-nothing about the job besides an append-only diagnostic event, and a future
-package-mutation stage MUST re-run this exact gate immediately before it
-mutates, not trust an earlier pass from possibly minutes ago -- exactly the
-TOCTOU discipline `PRODUCT.md` rule 2 requires. A crash or restart at any
+nothing about the job besides an append-only diagnostic event, and the
+package-mutation stage does NOT trust an earlier pass from possibly minutes
+ago -- it re-runs this exact equality proof itself, against material it
+obtained moments earlier, in the same transaction that commits its
+write-ahead uncertainty boundary (see "Crash-safe package mutation" below).
+That is exactly the TOCTOU discipline `PRODUCT.md` rule 2 requires. This
+read-only gate remains useful on its own for diagnostics and tests. A crash or restart at any
 point in this gate is safe by construction: because it never performs
 package mutation, "no package mutation may be assumed" (see "Job-owned
 snapshot safety" above) remains true, and ordinary startup recovery already
@@ -1036,6 +1066,457 @@ recovery does not already know how to handle).
 Nothing on the production HTTP, Home Assistant, scheduler, bootstrap, or
 updater path can reach any of this; `tests/test_r0_architecture_regression.py`
 proves it, alongside the equivalent proof for job-owned snapshot safety.
+
+## Crash-safe package mutation
+
+This is the product's one real workload package mutation, and the only place
+in the repository that can change a package inside a managed guest:
+
+```text
+ACTIVE @ snapshot_confirmed
+  -> host PREPARE (read-only: APT metadata refresh, `apt-get -s upgrade`,
+     the two fixed dpkg identity reads; returns a digest of the exact
+     evidence it produced and writes NO durable host state)
+  -> canonical material (the SAME parser package scanning uses)
+  -> ONE authority-store writer transaction:
+       re-prove ACTIVE @ snapshot_confirmed
+       re-prove current job/source/resource/approval authority
+       exact complete-set equality against the job's IMMUTABLE frozen rows
+       COMMIT checkpoint = mutation_may_have_started
+              + mutation_operation_id
+              + mutation_may_have_started_at
+              + accepted_prepared_evidence_digest     (one indivisible fact)
+       -> ARMED_NOW (may submit) | ALREADY_ARMED (recovery only)
+  -> short submission critical section: re-prove current authority AND that
+     this caller carries the accepted digest, then, while still holding the
+     writer lock, ask the host to EXECUTE
+  -> host journals `intent`, binding that accepted digest as this
+     operation's immutable evidence from its first durable byte
+  -> host stages this operation's pre-dpkg action gate into the guest
+  -> host journals `submitted` (fsynced) BEFORE launching anything, hands the
+     real package command to a detached runner, and returns
+  -> runner revalidates the live target, then runs the one real command,
+     whose own APT invocation must pass the action gate before dpkg
+  -> read-only polling, strictly outside every transaction
+  -> terminal host evidence
+  -> independent dpkg completion proof
+  -> mutation_completed  (the job stays ACTIVE; this is not job success)
+```
+
+**The one real package command.** Fixed argv, no shell, no caller-supplied
+option, package name, version, or command text:
+
+```text
+env LC_ALL=C DEBIAN_FRONTEND=noninteractive
+  apt-get -y
+    -o APT::Get::Upgrade-Allow-New=false  -o APT::Get::Remove=false
+    -o APT::Get::Force-Yes=false          -o APT::Get::allow-downgrades=false
+    -o APT::Get::allow-remove-essential=false
+    -o APT::Get::allow-change-held-packages=false
+    -o APT::Get::AllowUnauthenticated=false
+    -o APT::Ignore-Hold=false
+    -o Dpkg::Options::=--force-confdef    -o Dpkg::Options::=--force-confold
+    -o DPkg::Pre-Install-Pkgs::=/run/hubinet-ops/package-mutation/<op>/verify-action-set
+    -o DPkg::Tools::Options::/run/hubinet-ops/package-mutation/<op>/verify-action-set::Version=3
+    upgrade
+```
+
+`<op>` is the job's own canonical `mutation_operation_id` UUID and is the
+only interpolated value; everything else is a literal. The approved material
+never appears in it. It travels to the host only so the
+host can *refuse*, so there is structurally no value a package name or
+version could take that changes what runs.
+
+**Why the real command cannot exceed the approved plan.** Read from current
+upstream `apt-team/apt`, not inherited or assumed. `apt-get upgrade` is
+`DoUpgrade` -> `DoUpgradeNoNewPackages` ->
+`APT::Upgrade::Upgrade(FORBID_REMOVE_PACKAGES|FORBID_INSTALL_NEW_PACKAGES)` ->
+`pkgAllUpgradeNoNewPackages` (`apt-private/private-upgrade.cc`,
+`apt-pkg/upgrade.cc`). That resolver marks install ONLY for packages with
+`I->CurrentVer != 0 && Cache[I].InstallVer != 0`, with `AutoInst=false` so it
+never pulls in a new dependency, and resolves everything left over by *keep*
+(`ResolveByKeepInternal`). Installing a new package and removing an existing
+one are structurally impossible, not merely discouraged. `apt-get -s upgrade`
+-- the simulation the plan is proved from -- takes the identical path: `-s`
+only replaces the final package manager with `pkgSimulate` at the end of
+`InstallPackages` (`apt-private/private-install.cc`), after the resolver has
+already run, so the simulation is the real plan for the same cache inputs.
+`-y` does not change the resolver either; it replaces the confirmation prompt
+and turns an essential removal, a downgrade, or a held-package change into a
+hard pre-mutation error. The explicit `-o` options are belt-and-braces
+against a guest `apt.conf.d` snippet flipping a default in the dangerous
+direction (`Upgrade-Allow-New` would let `upgrade` install new packages;
+`Ignore-Hold` would let it change held ones); command-line `-o` wins over
+configuration files.
+
+**The pre-dpkg action gate.** Everything above bounds what the *resolver*
+may choose. It does not bound what the resolver chooses *from*. APT locking
+does not span two separate `apt-get` invocations, so between PREPARE's
+simulation and the real upgrade an ordinary actor can complete an `apt-get
+update`, release a hold, add a source, or change a pin, and the real
+resolver can then legitimately pick a DIFFERENT action set while every
+installed version still matches the approved plan. The post-state proof
+would notice afterwards -- but the unapproved package would already be
+installed. So the real invocation's own resolved action stream is made the
+thing that must equal the authority-accepted material, before dpkg is
+reached.
+
+The mechanism is a `DPkg::Pre-Install-Pkgs` hook running APT's protocol
+**Version 3**. Both properties it depends on are upstream behaviour
+(`apt-pkg/deb/dpkgpm.cc`), and both were re-verified against a real `apt`
+in an isolated APT root with a fake `dpkg`:
+
+- `RunScriptsWithPkgs("DPkg::Pre-Install-Pkgs")` runs once per
+  `pkgDPkgPM::Go()`, ahead of the loop that invokes dpkg, and `SendPkgsInfo`
+  passes the COMPLETE action list for the whole transaction -- not one batch.
+  Observed: one hook invocation covering every action, followed by two
+  separate dpkg calls (`--unpack`, then `--configure --pending`).
+- a hook exiting non-zero makes APT abort. Observed: with the hook exiting
+  1, dpkg's package-operation count was **zero**.
+
+A Version 3 action record is nine whitespace-separated fields:
+
+```text
+<name> <old ver> <old arch> <old MA> <dir> <new ver> <new arch> <new MA> <action>
+```
+
+`<dir>` is `<`, `>`, or `=`; `<action>` is `**CONFIGURE**`, `**REMOVE**`, or
+the `.deb` path being unpacked; absent versions and their architectures are
+`-`. An upgraded binary therefore contributes exactly two records, an unpack
+and a configure. The name carries **no** architecture qualifier even for a
+foreign-architecture package, so the architecture fields are the only thing
+separating `foo:amd64` from `foo:i386` -- and both are bound exactly. They
+can be bound to one value because the canonical simulation parser already
+refuses any row whose candidate architecture differs from its proven
+installed architecture, so no approved row can ever need two.
+
+Three fields are canonicalized rather than bound, for stated reasons:
+
+- the two MultiArch-type fields become `-`. APT reports the type *of the
+  version being acted on*, and it legitimately differs between a package's
+  installed and candidate versions -- observed in real APT as
+  `becomesall 2.0 amd64 none < 2.1 all foreign`. PREPARE cannot learn the
+  candidate's type from the simulation, so binding it would fail-close on
+  legal upgrades while adding no precision: the binary identity dpkg acts on
+  is already pinned by name, version, and architecture. The gate still
+  requires each field to be one of APT's four documented type words.
+- the `.deb` path becomes the class token `UNPACK`. Where APT cached the
+  archive is not part of the approved transition, and the archive's contents
+  are already pinned by name, version, and architecture. An action that is
+  neither `**CONFIGURE**`, `**REMOVE**`, nor an absolute `.deb` path is
+  refused rather than assumed to be an unpack, so a future action word
+  cannot be silently absorbed.
+
+Comparison is exact multiset equality: both sides are sorted inside the
+guest under one collation, so a different but equivalent dependency ordering
+stays legal while any extra, missing, changed, downgraded, removed, newly
+installed, or wrong-architecture action refuses.
+
+**Protocol downgrade fails closed.** APT sends its highest supported version
+when an unsupported one is requested, and a hook command it cannot key an
+option to simply gets Version 1. Both were observed. The gate therefore
+requires the literal first line `VERSION 3` and refuses anything else. This
+is also why the hook command must stay a bare path: APT keys
+`DPkg::Tools::Options::<cmd>::Version` on the exact command string, and a
+command containing a space does not resolve its own option -- observed
+falling back to Version 1.
+
+**The gate cannot be configured away.** Command-line `-o` is applied after
+every configuration file, so an ordinary guest `apt.conf`/`apt.conf.d`
+snippet can neither `#clear DPkg::Pre-Install-Pkgs` the hook out of the list
+nor pin it back to an older protocol; both were tested against real APT and
+the hook still ran at Version 3. The guest's own legitimate hooks
+(`apt-listchanges`, `dpkg-preconfigure`) are left alone and simply run
+alongside it -- ordering does not matter, because *any* hook failing aborts
+APT before dpkg.
+
+**Runtime and staging.** The gate is `/bin/sh` plus `sort`, `tail`, and
+`printf`. `dash` and `coreutils` are both `Essential: yes` under Debian
+Policy, so this adds no prerequisite to the supported guest contract and
+needs no Python, Perl, or awk inside the guest. It reads the stream from
+stdin -- APT's default `InfoFD` -- deliberately avoiding
+`<&$APT_HOOK_INFO_FD`, which is a syntax error in `dash`.
+
+The verifier and a canonical manifest of the approved action set are staged
+into `/run/hubinet-ops/package-mutation/<op>/` (tmpfs, mode `0700`, verifier
+`0500`) by fixed argv shapes whose only interpolated value is the canonical
+operation UUID. **The manifest travels as payload bytes on the command's
+stdin, never as command text, argv, or a shell fragment**, and package
+names, versions, and architectures are re-validated against a strict
+grammar first, so a value containing whitespace or a newline is refused
+before anything is staged rather than forging an extra approved action.
+Staging happens while the journal is still at `intent`, so a staging failure
+is an ordinary pre-submission refusal that remains sealable, and the staged
+bytes are read back and digest-compared before submission, which binds the
+gate to *this* operation rather than to whatever sits at the path.
+
+Stale artifacts cannot authorize anything. The whole Hubinet staging root is
+removed and recreated under the guest's per-VMID lease before every
+submission; the manifest header and the verifier's own literal each name an
+operation id and must agree; and `/run` is tmpfs, so nothing survives a guest
+reboot. There is no garbage collector, and none is needed.
+
+**Why this is not an arbitrary command string across a privileged
+boundary.** APT natively invokes a `DPkg::Pre-Install-Pkgs` command through a
+shell. The command here is one fixed, code-owned bare path containing no
+metacharacter, no argument, and no expansion, and no request-provided text
+reaches it -- there is no value a package name or version could take that
+changes what executes. The approved material is data in a staged file, used
+only to refuse.
+
+**Both protections stay.** The pre-dpkg gate and the independent dpkg
+post-state completion proof do different jobs and neither replaces the
+other: the gate PREVENTS unapproved material reaching dpkg, the post-state
+proof PROVES the exact approved transition actually completed. dpkg's own
+`--configure --pending` runs after the gate, which is precisely why an
+independent post-state reading is still required.
+
+**Why it cannot hang.** dpkg prompts about a conffile only when it was BOTH
+modified locally and changed by the package (`conffoptcells`,
+`src/main/configure.c`), and on end-of-file at that prompt it does **not**
+fall back to a default -- it calls `ohshit("end of file on <standard input>
+at conffile prompt")` and aborts mid-transaction. The helper's stdin is
+`/dev/null`, so a deterministic conffile policy is mandatory rather than
+cosmetic. `--force-confdef --force-confold` resolves every such case without
+a prompt and **keeps the operator's file**, leaving the distributor's version
+as `<file>.dpkg-dist`. The product consequence is explicit and deliberate: a
+configuration change shipped by a package is never silently applied over a
+locally modified conffile, and the operator is left to merge it. That is the
+right default for a rollback-capable updater -- the guest's behaviour stays
+as close to pre-update as the package code allows. `DEBIAN_FRONTEND=noninteractive`
+puts debconf in its non-interactive frontend, and `needrestart` reads that
+same variable to disable its own interactive service-restart prompt. Every
+command additionally runs with no controlling terminal and a bounded
+wall-clock timeout.
+
+**The simulation-to-mutation race.** A simulation and a real run are separate
+operations, and `apt-get -s` deliberately disables locking, so the window is
+real and is closed by four independent mechanisms rather than waved away:
+
+1. The proof and the command live in **one host operation pair with no
+   metadata refresh between them**. Preparation performs the last refresh;
+   the real command resolves against exactly the on-disk index state that
+   simulation was computed from.
+2. The host takes a **fresh dpkg reading immediately before launching**, under
+   the same per-VMID lease, and refuses unless every approved
+   `(package_name, architecture)` is still installed at exactly its approved
+   pre-update version and dpkg is in no unfinished state.
+3. APT's own locking: a concurrent real `apt`/`dpkg` makes the command fail
+   **before** mutating anything, never part-way into a different plan.
+4. Anything that still slips through is **detected, never silent**, by the
+   completion proof below, and the job stays fenced with its rollback
+   authority instead of being called complete.
+
+**The write-ahead uncertainty boundary.** `mutation_may_have_started` is
+committed durably *before* any real package command can be sent. Once a job
+reaches it, nothing may ever infer that no workload package changed. It is
+deliberately not "mark safe, mutate later": the exact equality proof and the
+checkpoint commit in the SAME transaction
+(`InventoryAuthority.arm_package_update_mutation`), because proving in one
+transaction and committing in another is the check-then-commit race the rest
+of this stage exists to close. A mismatch, or a provably stale current
+authority, terminalizes the job `blocked` in that same transaction --
+snapshot retained, global slot released, no rollback authority, exactly like
+the execution-time plan gate. A newest RUNNING package scan is retryable and
+writes nothing.
+
+**The submission critical section.** The checkpoint alone leaves the same
+narrower race the snapshot stage has: another writer can invalidate this
+job's resource incarnation after authority was proved and before the host is
+asked to mutate. So `execute_package_mutation_submission_if_current`
+re-proves the whole current-authority context and calls the host's
+submission-only operation while it still holds the authority store's one
+writer lock. That call never waits for `apt-get` -- the host journals
+`submitted` and detaches -- so the lock is held for one bounded round trip.
+A stale context refuses BEFORE the callback runs, raising the narrow
+`MutationSubmissionRefusedBeforeCallback`, which is routed to the durable
+seal so the global slot is released rather than fenced forever.
+
+**Only the invocation that proved it may submit.** A real package mutation is
+submitted only by the same invocation that just prepared the fresh evidence
+and armed the job with it. Every later invocation -- a retry, a restart
+recovery, a concurrent racer -- can observe, seal, or complete, never submit.
+That makes "no blind resubmission after a crash, timeout, or lost response"
+structural rather than a judgment call at each recovery branch, and it is
+enforced twice: in the orchestrator, and by the host, which refuses to
+execute unless the caller presents the exact evidence digest its own journal
+recorded.
+
+**Host-side durable journal and at-most-once execution.**
+`deploy/hubinet-package-mutation-helper.py` is a separate file and a
+deliberately stronger logical privilege boundary than the scan, snapshot, and
+execution-plan helpers, none of which gained any mutation capability. It
+exposes four typed operations (`prepare_exact_package_mutation`,
+`execute_exact_package_mutation`, `seal_mutation_never_submitted`,
+`inspect_package_mutation_state`), no delete, no rollback, no snapshot, no
+arbitrary shell or argv. Each operation is journaled by the job's
+deterministic `mutation_operation_id` on the PVE host, with fsynced atomic
+renames, and preparation, submission, and sealing are serialized by a
+non-blocking per-VMID `flock`:
+
+```text
+absent -> intent -> sealed_not_submitted        (durably never submitted)
+                 -> submitted -> terminal_success | terminal_failure
+```
+
+The journal binds a request fingerprint over the VMID, node, operation id,
+plan fingerprint, and the full backend/job/resource/binding/continuity
+context, so a request differing in any of them is a different request and is
+refused rather than allowed to reuse the operation. `submitted` is written
+and fsynced BEFORE the command is launched and is never resubmitted from --
+it is the genuinely uncertain window. `sealed_not_submitted` is the durable
+no-future-submit fence and the ONLY evidence that may release a job past the
+write-ahead checkpoint; `absent`/`intent` are transient routing evidence that
+may send the backend into the release path but may never release a job, since
+a helper launched by a dead backend may not have taken its lease yet.
+
+**Preparation writes nothing durable, and that is a safety property, not a
+shortcut.** PREPARE runs strictly BEFORE the write-ahead arming transaction,
+so a journal record written there would be mutation-operation state for an
+operation that may never be armed -- and, being immutable once written,
+would turn every ordinary pre-arm transient (a newer package scan still
+RUNNING, a lost PREPARE response, a backend that died before arming) into an
+operation identity that could not be prepared again until a backend restart
+interrupted the job. `AUTHORITY_TEMPORARILY_UNAVAILABLE` advertises "retry
+later", so retrying later has to work. The journal's first record is
+therefore written by `execute_exact_package_mutation`, the only path that may
+submit, from the digest the arming transaction accepted; `intent` means
+exactly "an already-armed operation reached the submit-capable boundary and
+has not yet crossed `submitted`", and `absent` before that point is ordinary
+rather than suspicious. Nothing about at-most-once changes: the real command
+is still launched only after `submitted` is fsynced under the per-VMID lease,
+so no package mutation can precede the write-ahead checkpoint, and an armed
+job with no host record is still resolved by durably SEALING that absence
+under the same lease -- never by inferring anything from it.
+
+**The mutation outlives SSH and backend loss.** The helper hands the real
+command to a runner it double-forks into its own session, reparented to PID
+1, with stdio detached, so neither closing the SSH channel nor the client
+timing out signals or waits on it. The runner inherits the per-VMID lease's
+open file description, so the lease stays held for exactly as long as the
+mutation runs -- which is also how "a mutation is running right now" is
+observed, with no PID bookkeeping and no PID reuse hazard. Correctness never
+depends on the runner surviving: if it is killed anyway (a host reboot, say),
+the journal simply stays at `submitted` with the lease free, which is
+durably UNCERTAIN and is never retried.
+
+**Package mutation completion proof.** An `apt-get` exit code is never
+equated with "the exact approved mutation is durably complete".
+`app/inventory/mutation_completion.py` is a pure prover the authority runs
+itself, inside the transaction that would commit `mutation_completed`, over
+the guest's own dpkg status database read independently on both sides of the
+mutation. It requires all of: every frozen `(package_name, architecture)` now
+installed at exactly its approved candidate version; every frozen row having
+started at exactly its approved installed version; the complete set of
+installed version differences between the two readings being exactly the
+approved set; no installed package appearing or disappearing; and no package
+left in any unfinished dpkg state. A caller supplies parsed evidence and
+never a verdict, so there is no way to complete a job by asserting success.
+Two legal-but-refused cases are accounted for explicitly rather than
+tolerated: a package that *disappeared* because another package overwrote all
+its files (a real dpkg outcome apt reports) is still an unapproved workload
+change and fails the proof; and a partially applied plan fails it for the
+rows that did not land.
+
+**Failure is never release, and completion is never success.** Once the
+write-ahead checkpoint exists, an `apt-get` failure, a lost response, a
+timeout, a restart, a running operation, an unreadable post-state, host
+evidence about a different operation, journal corruption, or any other
+ambiguity leaves the job ACTIVE at `mutation_may_have_started`: still owning
+the one global destructive slot, still owning its confirmed pre-update
+snapshot, still holding rollback authority, with truthful append-only
+evidence. Packages may be partly changed, and terminalizing would strand a
+half-upgraded guest with no owner. The single exception is the host's durable
+`sealed_not_submitted` proof, which releases the job as `blocked` -- no
+rollback authority is fabricated for a mutation that provably did not happen.
+A proven completion advances the checkpoint to `mutation_completed` and sets
+`mutation_completed_at`, and the job stays ACTIVE: mutation success is not
+job success, because the healthcheck has not run. Startup recovery continues
+to leave `mutation_may_have_started` and later checkpoints active and fenced.
+
+**Only the accepted evidence may submit.** Two invocations can both observe
+ACTIVE @ `snapshot_confirmed`, both prepare fresh evidence, and both derive
+the SAME deterministic `mutation_operation_id`. Identity therefore cannot be
+what decides who may cause a package command. Three independent locks decide
+it instead:
+
+- **The host intent is immutable, and only the winner creates it.** Two
+  concurrent PREPAREs are simply two read-only readings with nothing durable
+  to contend over. The host journal's first record is created by the EXECUTE
+  the arming transaction authorized, bound to the digest it accepted, and no
+  later caller may substitute another: an EXECUTE presenting a different
+  digest for an operation already at `intent` is refused. An `intent` whose
+  backend then died is never permission to execute, and never strands
+  anything either -- it belongs to an armed job, so the host's
+  `sealed_not_submitted` proof is exactly the release path for it.
+- **The arming transition names its winner.** It returns `ARMED_NOW` only to
+  the invocation that atomically committed this accepted digest, and
+  `ALREADY_ARMED` to everyone else, who become recovery-only.
+- **Submission re-proves the digest.** The bounded submission critical
+  section requires the caller's digest to equal the durable
+  `accepted_prepared_evidence_digest` before invoking the host callback. A
+  mismatch raises a narrow `PackageMutationEvidenceNotAccepted` with the
+  callback having run zero times. That type is deliberately NOT the
+  seal-eligible `MutationSubmissionRefusedBeforeCallback`: "my evidence is
+  not the accepted one" means some OTHER invocation legitimately holds the
+  right to submit and may be exercising it right now, so sealing the
+  operation "never submitted" on its behalf would be false.
+
+**Schema v13.** The mutation facts are not merely stored, they are
+constrained. Schema v12 added the write-once `mutation_operation_id` column
+with a partial UNIQUE index, and CHECK constraints in both directions tying
+the checkpoint to its durable facts: rank 5 (`mutation_may_have_started`)
+iff both the operation identity and `mutation_may_have_started_at` exist,
+rank 6 (`mutation_completed`) iff `mutation_completed_at` exists, and
+completion never without the boundary that must precede it. Schema v13 adds
+`accepted_prepared_evidence_digest` to that set: exactly 64 lowercase hex
+characters, NULL before `mutation_may_have_started` and required from it
+onward, write-once once set, and required for a completed mutation. It is
+written by the SAME single `UPDATE` as the checkpoint, the operation
+identity, and the timestamp, whose `IS NULL` guards make that statement a
+compare-and-set — so the arm facts are one indivisible write-ahead authority
+fact, exactly one of two concurrent invocations can win it, and the loser's
+evidence is never what authority accepted. Triggers make the identity, both
+timestamps, and the accepted digest write-once, on top of the existing
+checkpoint-never-regresses and terminal-once triggers. This is a DDL
+semantics change, so it is a version bump rather than new constraints bolted
+onto v12: an existing v12 database must never be structurally different from
+a fresh one at the same version. There is no in-place migration; the
+pre-release contract is the product updater's explicit, backed-up authority
+reset.
+
+**Every guest command revalidates its own target.** A VMID is an execution
+locator, never durable identity: PVE can free one and reuse it for an
+unrelated guest at any moment, including after the journal has durably
+reached `submitted` and before the detached runner reaches `apt-get`. So the
+invariant lives in the helper's single fixed guest-command dispatcher
+(`_run_guest_command`), not with its callers: every architecture read, dpkg
+inventory read, staging step, `apt-get update`, simulation, post-state read,
+and the one real package command is immediately preceded by its own fresh
+`revalidate_live_target`. Callers cannot opt out and cannot amortize one
+check across two commands, which is what let a "validate once, then run
+several commands" caller send its second command into a replacement guest.
+`revalidate_live_target` and the local-node read issue `pvesh` commands
+directly, never through the dispatcher, so the invariant cannot recurse.
+
+This is deliberately not workload-incarnation attestation, which was removed
+and stays removed. It is the same PVE-independent continuity model the rest
+of the product uses: revalidate at the last practical instant before each
+guest operation. If the runner's final check fails, `apt-get` is never
+launched and the operation journals a truthful terminal failure. It is
+NOT sealed as never-submitted -- `submitted` was already durable, so the
+pre-submission release contract no longer applies, and the operation keeps
+its ownership and its fence rather than being retried. A replacement guest
+also has no staged verifier at the hook path, so APT would fail the hook and
+abort before dpkg even if the check somehow passed.
+
+`app/package_update_mutation.py` (orchestration) and
+`app/package_update_mutation_host_control.py` (a purpose-specific pinned-key
+SSH client) are instantiated only by hermetic tests, exactly like the
+snapshot and execution-gate modules. Nothing on the production HTTP, Home
+Assistant, scheduler, bootstrap, or updater path can reach any of it; no
+helper, key, `authorized_keys` entry, or PVE privilege is deployed for it,
+and `tests/test_r0_architecture_regression.py` proves it.
 
 ## Ordinary safety rules (all layers, now and later)
 

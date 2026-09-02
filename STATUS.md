@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v11):
+  SQLite authority database (schema v13):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -15,9 +15,17 @@
   slot, record append-only events, and are interrupted before package mutation
   on restart. Schema v10 added the job-owned snapshot operation identity, its
   write-ahead uncertainty checkpoint, the observed PVE task identity, and
-  SQL-level state-machine invariants over all of them. Schema v11 adds the
+  SQL-level state-machine invariants over all of them. Schema v11 added the
   explicit, material `architecture` column to package rows (see
-  "Execution-time plan equality" below).
+  "Execution-time plan equality" below). Schema v12 added the job-owned
+  package mutation operation identity and SQL-level invariants tying both
+  mutation checkpoints to their durable facts in both directions. Schema v13
+  adds `accepted_prepared_evidence_digest` — the exact preparation evidence
+  the arming transaction accepted — written by the same single compare-and-set
+  statement as the checkpoint, the operation identity, and the timestamp, so
+  the mutation-arm facts are one indivisible write-ahead authority fact and
+  only the invocation carrying that digest can submit (see "Crash-safe
+  package mutation" below).
 - **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus exactly
   one authority-only mutation,
   `PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
@@ -67,14 +75,16 @@
 
 The PVE API inventory surface remains read-only. The backend's sole mutation
 route records Hubinet approval authority state only. Internal update-job
-issuance, job-owned snapshot safety, and the execution-time plan equality gate
-are not production-reachable: there is no HTTP/HA creation control and no
-worker or scheduler consuming jobs, and no snapshot helper, execution helper,
-key, or PVE mutation privilege is deployed. Package scanning may write APT
-index/cache metadata but never changes workload packages, and neither does
-the execution-time gate's own metadata refresh. There is no workload package
-mutation, healthcheck execution, rollback execution, snapshot deletion,
-lifecycle mutation, policy, or endpoint failover.
+issuance, job-owned snapshot safety, the execution-time plan equality gate,
+and crash-safe package mutation are not production-reachable: there is no
+HTTP/HA creation control and no worker or scheduler consuming jobs, and no
+snapshot helper, execution helper, mutation helper, key, or PVE mutation
+privilege is deployed. Package scanning may write APT index/cache metadata
+but never changes workload packages, and neither does the execution-time
+gate's or the mutation stage's own metadata refresh and simulation. There is
+no production-reachable workload package mutation, and no healthcheck
+execution, rollback execution, snapshot deletion, lifecycle mutation, policy,
+or endpoint failover anywhere.
 
 ## Human0 validation
 
@@ -109,9 +119,11 @@ sandbox.
 
 Hubinet Ops performed neither the package upgrade nor the snapshot rollback in
 the last two checks. They were manual operator actions used only to verify that
-Hubinet observes current guest state. Human0 validates only the currently
-implemented scope; update execution, job-owned snapshots, healthchecks, and
-rollback remain unimplemented future stages.
+Hubinet observes current guest state. Human0 validates only the scope that is
+actually activated in production; job-owned snapshots, the execution-time plan
+gate, and crash-safe package mutation exist internally but are dark and have
+had no operator Human0 validation, and healthchecks and rollback execution
+remain unimplemented.
 
 ## In-place product update lifecycle
 
@@ -253,10 +265,131 @@ unimplemented future stage.
   mutate" permit: the future mutation stage must re-run this exact gate again
   immediately before it mutates anything, not trust an earlier pass.
 
+## Crash-safe package mutation
+
+- **Implemented internally:** the product's one real workload package
+  mutation, at most once per job, crash-safe on both sides.
+  `app/package_update_mutation.py` drives, for one job at exactly
+  `snapshot_confirmed`: a read-only host *preparation* (APT metadata refresh,
+  `apt-get -s upgrade`, and the two fixed dpkg identity reads) whose exact
+  evidence the host journals a digest of; a canonical parse through the SAME
+  shared parser package scanning uses; then ONE authority transaction
+  (`InventoryAuthority.arm_package_update_mutation`) that re-proves the job's
+  checkpoint and complete current authority, re-proves exact complete-set
+  equality against the job's immutable frozen rows, and commits the
+  write-ahead `mutation_may_have_started` checkpoint plus a deterministic,
+  restart-stable `mutation_operation_id` derived from immutable authority
+  facts. Only after that boundary is durable may a package command be
+  submitted, and only from inside a short critical section
+  (`execute_package_mutation_submission_if_current`) that re-proves current
+  authority while holding the authority store's writer lock -- a bounded
+  round trip that never waits for the package command. A stale context there
+  refuses before the host is ever called and is routed to the durable seal.
+- **Only the accepted evidence may submit.** The arming transaction also
+  commits `accepted_prepared_evidence_digest` in that same statement, and
+  reports `ARMED_NOW` only to the invocation that committed it; everyone
+  else gets `ALREADY_ARMED` and becomes recovery-only. The submission
+  critical section re-proves that digest before invoking the host callback,
+  refusing a mismatch with a narrow type that is deliberately not
+  seal-eligible. On the host side a PREPARE that finds an `intent` already
+  journaled refuses rather than overwriting its digest, so a concurrent
+  PREPARE can never replace the material authority bound itself to. An
+  orphaned intent — one whose backend died before arming — is therefore
+  never permission to execute: no later invocation can obtain its digest,
+  and the job, never having crossed the write-ahead boundary, is resolved by
+  the existing startup contract that interrupts `snapshot_confirmed` jobs
+  and frees the global slot.
+- **A pre-dpkg action gate binds the REAL invocation to the approved plan.**
+  The one real command installs a fixed, code-owned `DPkg::Pre-Install-Pkgs`
+  hook at protocol Version 3, so APT's own resolved action stream must
+  exactly equal the authority-accepted material before dpkg receives any
+  package operation. This closes the window in which APT metadata,
+  candidates, holds, pins, or sources change between preparation and
+  execution while installed versions still match. Verified against real APT
+  in an isolated APT root with a fake dpkg: a refusing hook leaves the dpkg
+  package-operation count at zero, a protocol below Version 3 is rejected,
+  and an ordinary guest `apt.conf.d` snippet can neither clear the hook nor
+  downgrade it. The gate is `/bin/sh` plus `sort`/`tail` -- `dash` and
+  `coreutils` are `Essential: yes`, so no new guest prerequisite -- staged
+  with the approved material as stdin payload bytes into the guest's own
+  tmpfs, never as command text. The independent dpkg post-state completion
+  proof is unchanged and still required: the gate prevents, the proof proves.
+- **Every guest command revalidates its own live target.** The invariant
+  lives in the helper's single fixed guest-command dispatcher rather than
+  with its callers, so no caller can amortize one check across two commands,
+  and the detached runner revalidates immediately before the real package
+  command. A VMID freed and reused after `submitted` is durable therefore
+  never receives the mutation; the operation journals a truthful terminal
+  failure, keeps ownership, and is never sealed as never-submitted or
+  retried.
+- **The one real command** is fixed argv with no package name, version,
+  option, or command text from any caller: a non-interactive `-y` APT
+  *upgrade* under `DEBIAN_FRONTEND=noninteractive` with
+  `--force-confdef --force-confold`. Traced against current upstream apt:
+  `-s` and the real run share the identical resolver
+  (`pkgAllUpgradeNoNewPackages`), which structurally cannot install a new
+  package or remove one; `-y` changes no resolver behaviour; the explicit
+  `-o` options pin the dangerous defaults against a guest `apt.conf.d`
+  override. Traced against current upstream dpkg: a conffile prompt on
+  end-of-file is a fatal abort, not a default, so the conffile policy is
+  mandatory -- it preserves the operator's file and leaves the distributor's
+  as `.dpkg-dist`.
+- **At-most-once across crashes:** `deploy/hubinet-package-mutation-helper.py`
+  is a separate, deliberately stronger dark boundary exposing four typed
+  operations, journaling each by operation identity on the PVE host with
+  fsynced atomic renames under a non-blocking per-VMID `flock`
+  (`intent -> sealed_not_submitted | submitted -> terminal_success |
+  terminal_failure`). `submitted` is fsynced before the command is launched
+  and is never resubmitted from; `sealed_not_submitted` is the only durable
+  release proof; `absent`/`intent` are transient routing evidence only. The
+  real command runs in a runner double-forked into its own session and
+  reparented to PID 1, holding the per-VMID lease for its whole life, so an
+  SSH loss, a client timeout, or a backend crash can neither kill it nor
+  cause a second invocation -- and if it is killed anyway, the journal stays
+  at `submitted`, which is durably uncertain and never retried. Only the
+  invocation that itself prepared and armed may submit; every recovery
+  invocation can observe, seal, or complete, never submit.
+- **Completion is proven, never assumed:** `mutation_completed` requires the
+  authority's own pure proof over the guest's dpkg status database read
+  independently on both sides of the mutation -- every frozen
+  `(package_name, architecture)` at exactly its approved candidate version,
+  every one having started at exactly its approved installed version, the
+  complete set of installed version differences equal to the approved set,
+  nothing appearing or disappearing, and no unfinished dpkg state. A caller
+  supplies parsed evidence, never a verdict.
+- **Failure never releases ownership:** a package-command failure, timeout,
+  lost response, restart, running operation, unreadable post-state, corrupt
+  or contradictory journal, or host evidence about a different operation all
+  leave the job ACTIVE at `mutation_may_have_started`, still owning the one
+  global destructive slot, its confirmed snapshot, and its rollback
+  authority, with truthful append-only evidence. The single exception is the
+  host's durable `sealed_not_submitted` proof, which releases the job
+  `blocked` without fabricating rollback authority. A proven completion
+  leaves the job ACTIVE: mutation success is not job success.
+- **Not activated:** no HTTP, Home Assistant, scheduler, bootstrap, or
+  updater path can reach any of this. The mutation helper is a separate dark
+  file that is **not deployed**, with no key, no `authorized_keys` entry, and
+  no PVE privilege, and the scan, snapshot, and execution-plan helpers gained
+  no mutation capability whatsoever. The Version 3 action gate is likewise
+  never installed by bootstrap or the updater: it is generated per operation
+  and written into one guest's tmpfs only while that operation runs.
+  Healthcheck execution, rollback submission, snapshot retention, and
+  production activation remain later stages. No real package mutation has
+  been performed against any live guest; operator Human0 validation of this
+  stage has not been done.
+- **Correction completed internally (schema v13).** Three confirmed blockers
+  in this stage were closed: the real APT invocation is now bound to the
+  accepted plan by its own pre-dpkg Version 3 action gate; the accepted
+  preparation evidence is a durable authority fact that exactly one
+  invocation can commit and only that invocation can submit with; and every
+  guest command, including the detached runner's real package command,
+  revalidates its own live PVE target. The stage remains dark, no Human0
+  mutation has been performed, and healthcheck and rollback execution remain
+  future work.
+
 ## Next
 
-- Package execution with post-mutation crash recovery, then healthcheck and
-  same-job rollback execution.
+- Healthcheck execution and same-job rollback execution.
 - Production activation of the update lifecycle.
 - Snapshot retention, then lifecycle controls (start/stop/reboot) and manual
   snapshot operations.
@@ -273,9 +406,9 @@ unimplemented future stage.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v11 is incompatible with v10 and v9, and there is no
-  in-place migration path. An existing installation now uses `deploy/update-proxmox-0.5.sh`
-  for this: it detects the incompatible authority schema, backs it up, and
+- Pre-release: schema v13 is incompatible with v12, v11, v10, and v9, and
+  there is no in-place migration path. An existing installation now uses
+  `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible authority schema, backs it up, and
   resets only the authority database (see "In-place product updates" below)
   while preserving the LXC, its VMID/network, PVE identity/token, and every
   other credential/config file. Home Assistant re-enrollment is required only

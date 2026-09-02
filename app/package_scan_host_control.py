@@ -37,6 +37,16 @@ ProcessRunner = Callable[[tuple[str, ...], bytes, float, int], BoundedProcessRes
 def _bounded_process_runner(
     argv: tuple[str, ...], input_bytes: bytes, timeout: float, max_output: int
 ) -> BoundedProcessResult:
+    # The configured `timeout` is a single wall-clock budget for the WHOLE
+    # round trip -- process creation, stdin delivery, stdout/stderr
+    # collection, and completion -- not just for reading output. Delivering
+    # `input_bytes` therefore has to be bounded I/O participating in the same
+    # deadline as the read side, never a blocking `stdin.write()` performed
+    # up front: a stalled child (or a stalled ssh/network hop) that never
+    # drains stdin would otherwise block here before the clock even starts,
+    # which is exactly the unbounded critical section the callers that hold
+    # an authority writer transaction across this call must never see.
+    started = time.monotonic()
     process = subprocess.Popen(  # noqa: S603 - argv is fixed/validated and never a shell
         argv,
         stdin=subprocess.PIPE,
@@ -47,13 +57,20 @@ def _bounded_process_runner(
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
-    process.stdin.write(input_bytes)
-    process.stdin.close()
     selector = selectors.DefaultSelector()
     selector.register(process.stdout, selectors.EVENT_READ, "stdout")
     selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    stdin_pending = memoryview(input_bytes)
+    stdin_open = bool(stdin_pending)
+    if stdin_open:
+        os.set_blocking(process.stdin.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+    else:
+        # No request bytes to deliver -- close stdin immediately so the
+        # child sees EOF right away instead of waiting on input it will
+        # never receive.
+        process.stdin.close()
     output = {"stdout": bytearray(), "stderr": bytearray()}
-    started = time.monotonic()
     timed_out = False
     exceeded = False
     try:
@@ -64,6 +81,27 @@ def _bounded_process_runner(
                 process.kill()
                 break
             for key, _ in selector.select(min(remaining, 0.2)):
+                if key.data == "stdin":
+                    try:
+                        written = os.write(key.fileobj.fileno(), stdin_pending)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        # The child closed/refused stdin (BrokenPipeError is
+                        # one such OSError) -- a bounded process failure, not
+                        # an infinite loop. Stop delivering; the child's exit
+                        # status and any output already collected still
+                        # decide the result.
+                        selector.unregister(key.fileobj)
+                        process.stdin.close()
+                        stdin_open = False
+                        continue
+                    stdin_pending = stdin_pending[written:]
+                    if not stdin_pending:
+                        selector.unregister(key.fileobj)
+                        process.stdin.close()
+                        stdin_open = False
+                    continue
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -77,6 +115,11 @@ def _bounded_process_runner(
                 break
     finally:
         selector.close()
+        if stdin_open:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
         # This is the reap allowance `app.inventory.contention_policy`
         # attributes to a snapshot host critical section that actually times
         # out -- it happens after `timeout` has elapsed but before this

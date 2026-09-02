@@ -95,6 +95,70 @@ and cache metadata is a normal, expected side effect and is not a violation.
 Installing, upgrading, removing, autoremoving, or reconfiguring a workload
 package is a violation, and may only happen inside an approved update job.
 
+## What an approved update job may do
+
+Package mutation is the one thing Hubinet Ops does that changes a workload,
+and it is bounded on every side.
+
+**Exactly one operation, exactly once.** One update job may cause at most one
+real package operation, on one guest, owned by this backend, this job, and
+this exact resource incarnation. A reused VMID, a moved or replaced guest, a
+changed binding, or a second job never inherits it. A backend crash, an SSH
+loss, a timeout, a lost response, or a restart never causes it to run again:
+the operation is journaled durably on the Proxmox host before it can start,
+and a recovering backend reattaches to that record instead of guessing.
+
+**One fixed command.** The operation is a fixed, non-interactive
+`apt-get upgrade` of already-installed packages. It cannot install a new
+package and cannot remove one -- that is a property of the package manager's
+own upgrade resolver, not a flag Hubinet sets. No package name, version,
+option, or command text supplied by anything else ever reaches it; the
+approved plan is used only to *refuse* the operation, never to build it.
+That stays true of the plan check described below: the approved plan reaches
+the guest as data in a file, never as part of any command.
+
+**Operator configuration is preserved.** A configuration file the operator
+edited is never silently overwritten by a package's version of it. The
+package's version is left alongside as `<file>.dpkg-dist` for the operator to
+review. Nothing prompts, and nothing waits for input that will never come.
+
+**The plan is re-proved immediately before, not earlier.** Fresh package
+manager state is read, the exact plan is recomputed, and it must still equal
+the approved plan exactly. A changed plan fails closed (hard rule 2). A
+package that someone else changed in the meantime fails closed. Unfinished
+package-manager state on the guest fails closed.
+
+**The operation cannot exceed its approved plan, even if the package
+manager's own view moves.** Package-manager locking does not span two
+separate invocations, so between the plan being re-proved and the upgrade
+running, an ordinary actor on the guest can refresh metadata, release a
+hold, add a source, or change a pin -- and the upgrade could then
+legitimately choose a different package or a different version while every
+installed version still matched the approved plan. So the real invocation's
+OWN resolved list of package operations is checked against the approved plan
+before the package manager is allowed to touch a single package. Anything
+extra, missing, changed, downgraded, removed, newly installed, or built for
+the wrong architecture aborts the operation with nothing changed. Detecting
+this afterwards would be too late; it is prevented.
+
+**Finishing is still proven, not assumed.** A zero exit code is never treated
+as proof, and neither is the check above -- that one prevents unapproved
+work from starting, it does not show the approved work finished. Completion
+requires the guest's own package database to show every approved package at
+exactly its approved new version, nothing else changed at all, and no
+package left half-installed. Anything less is not "complete".
+
+**A failed, partial, or unknown update never abandons the guest.** If the
+operation fails, times out, is interrupted, or cannot be proven, the job
+keeps its pre-update snapshot, keeps ownership, and stays the one job in
+charge of that guest, so the healthcheck and rollback stages have something
+to act on. It is never silently retried and never reported as success. The
+only case that releases the job is a durable proof from the host that no
+package operation ever started, and could never start.
+
+**Package mutation succeeding is not the job succeeding.** The job is not
+complete until it has been health-checked.
+
 ## Not the product
 
 - Defending Hubinet against a hostile Proxmox administrator or a hostile root
