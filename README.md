@@ -19,7 +19,9 @@ a guest in Proxmox never requires touching this repository or its config.
 - PVE autodiscovery of every node, LXC, and QEMU guest.
 - A durable SQLite inventory owned by the backend.
 - An HTTP API with read-only inventory routes (`GET /r0/v1/health`, `/backend`,
-  `/snapshot`) and one authority-only exact-plan approval route. Bearer
+  `/snapshot`), one authority-only exact-plan approval route, and the
+  authority-only per-resource health-contract routes
+  (`GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`). Bearer
   authentication is required on every endpoint except the deliberately
   unauthenticated minimal `/r0/v1/health` liveness probe, which exposes no
   inventory or credential data.
@@ -30,6 +32,14 @@ a guest in Proxmox never requires touching this repository or its config.
   explicit durable approval through a second native Home Assistant action, and
   a concise backend-published approval-status sensor. Approval never executes
   an update.
+- Operator-declared per-resource health contracts: for each resource, the list
+  of typed probes (`systemd_unit_active`, `docker_container_running`,
+  `docker_container_healthy`) that must **all** hold for that workload to count
+  as up. Managed through the `view_health_contract` / `set_health_contract` /
+  `clear_health_contract` Home Assistant actions and the routes above, with a
+  concise contract-status sensor. A resource with no contract is
+  *unconfigured*, which is never "healthy" — and nothing checks a contract yet,
+  because healthcheck execution is a later stage.
 - Internal durable package-update job authority that freezes one current,
   non-empty approved exact plan with immutable approval/source/resource
   provenance, copied package rows, request-id idempotency, global single-flight,
@@ -46,12 +56,12 @@ package mutation, and same-job rollback execution are built, but none of them
 is production-reachable: no HTTP, Home Assistant, scheduler, bootstrap, or
 updater path can create a PVE snapshot, change a workload package, or roll a
 guest back, and no snapshot, execution, mutation, or rollback helper, key, or
-PVE mutation privilege is deployed. Healthchecks are not built yet, because
-the product has no truthful generic workload-health definition — see
-`STATUS.md`.
+PVE mutation privilege is deployed. Healthcheck *execution* is not built yet:
+health is now operator-declared per resource, but nothing evaluates a contract
+— see `PRODUCT.md` and `STATUS.md`.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v14 and has no migration from v13 or earlier. An existing
+schema is v15 and has no migration from v14 or earlier. An existing
 pre-release deployment uses
 `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
 authority schema, backs it up, and resets only the authority database (with

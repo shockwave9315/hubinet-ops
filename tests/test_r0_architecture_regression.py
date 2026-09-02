@@ -969,10 +969,10 @@ def test_no_snapshot_deletion_exists_anywhere_in_the_product() -> None:
 def test_no_health_execution_exists_anywhere() -> None:
     """Healthcheck execution is deliberately NOT part of this stage.
 
-    The product has no truthful generic workload-health definition yet (see
-    STATUS.md), so no code may claim one: nothing writes `health_started_at`,
-    advances to the `health_started` checkpoint, or terminalizes a job
-    `succeeded`.
+    Health is now DEFINED per resource (an operator-declared contract), but
+    nothing evaluates one, so no code may claim a verdict: nothing writes
+    `health_started_at`, advances to the `health_started` checkpoint, or
+    terminalizes a job `succeeded`.
     """
 
     for rel_path in (

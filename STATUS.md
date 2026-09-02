@@ -5,7 +5,7 @@
 - **Dynamic PVE discovery** — nodes, LXC and QEMU guests, discovered from the
   PVE API with no static VMID configuration anywhere.
 - **Persistent backend inventory, scans, approvals, and internal jobs** —
-  SQLite authority database (schema v14):
+  SQLite authority database (schema v15):
   identity, locator bindings and generations, presence/lifecycle, retained
   missing/replaced history, source health and freshness, discovery-run
   ownership with CAS/fencing and restart recovery, immutable package-scan
@@ -32,19 +32,27 @@
   `mutation_completed_at`" implication with per-fact invariants, so a failed,
   partial, or unproven package mutation can reach the rollback boundary
   without fabricating a completion it never had (see "Same-job rollback
-  execution" below).
-- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus exactly
-  one authority-only mutation,
-  `PUT /r0/v1/resources/{resource_id}/package-plan-approval`. Bearer
+  execution" below). Schema v15 adds the operator-declared per-resource health
+  contract and its complete required probe set, with SQL-level constraints
+  that make an empty contract, an unsupported probe kind, an unbounded target,
+  a duplicate probe, an orphaned probe row, and an edited or shrunken live
+  contract all durably impossible (see "Dynamic per-resource health contracts"
+  below).
+- **R0 HTTP API** — `GET /r0/v1/health`, `/backend`, `/snapshot`, plus
+  authority-metadata-only mutations:
+  `PUT /r0/v1/resources/{resource_id}/package-plan-approval` and
+  `GET`/`PUT`/`DELETE /r0/v1/resources/{resource_id}/health-contract`. Bearer
   authentication is required on every endpoint except the
   deliberately unauthenticated minimal `/r0/v1/health` liveness probe, which
   exposes no inventory or credential data.
 - **Home Assistant integration** — config flow, coordinator, structural
   contract validation, dynamic devices and entities, package-scan summary and
   concise approval-status sensors, diagnostics with recursive secret redaction,
-  and native `view_update_plan` / `approve_update_plan` actions. The view action
-  uses the native Hubinet resource-device selector and returns exact package
-  rows as response data, never as entity attributes. Distributed via HACS.
+  and native `view_update_plan` / `approve_update_plan` /
+  `view_health_contract` / `set_health_contract` / `clear_health_contract`
+  actions. Every response-capable action uses the native Hubinet
+  resource-device selector and returns exact material — package rows, contract
+  probes — as response data, never as entity attributes. Distributed via HACS.
 - **Automatic Debian/Ubuntu LXC package scanning** — configurable six-hour
   default interval, one worker, typed pinned-key SSH to a forced PVE helper,
   fixed `pct exec` operations, APT metadata refresh plus upgrade simulation,
@@ -129,8 +137,9 @@ the last two checks. They were manual operator actions used only to verify that
 Hubinet observes current guest state. Human0 validates only the scope that is
 actually activated in production; job-owned snapshots, the execution-time plan
 gate, crash-safe package mutation, and same-job rollback execution exist
-internally but are dark and have had no operator Human0 validation, and
-healthchecks remain unimplemented.
+internally but are dark and have had no operator Human0 validation. The
+per-resource health contract is implemented and production reachable, but it
+is configuration only: healthcheck execution remains unimplemented.
 
 ## In-place product update lifecycle
 
@@ -474,33 +483,65 @@ unimplemented future stage.
   compensation policy. This stage ships the internal primitive only: a caller
   must ask for one exact job to be rolled back.
 
-## The healthcheck contract is an open product decision
+## Dynamic per-resource health contract (implemented)
 
-Hubinet Ops 0.5 has **no truthful generic workload-health definition**, so no
-healthcheck is implemented and no job can reach `SUCCEEDED`. This is a recorded
-decision, not an oversight:
+The health-contract product decision that was open here is now settled and
+built. Hubinet Ops still has **no generic inferred workload-health
+definition** and will not invent one; instead the operator declares, per
+resource, what healthy means. `PRODUCT.md`, "What healthy means", is the
+durable statement; `ARCHITECTURE.md`, "Dynamic per-resource health contracts",
+is how it is built. This stage ships **configuration authority only** — there
+is still no healthcheck execution.
 
-- guest reachability, an `apt` exit code, and the package-mutation completion
-  proof are each already-meaningful facts, and none of them is a
-  workload-health contract; reusing one as if it were would be untruthful;
-- Hubinet 0.4 answered this question with an operator-declared per-guest
-  contract (required services or Docker health), and explicitly disabled
-  rollback-on-health when no contract was declared -- it never claimed a
-  generic one;
-- 0.5 removed both mechanisms 0.4 depended on (an in-guest agent, and static
-  per-VMID profiles) without replacing them, and static VMID configuration is
-  forbidden outright;
-- the supported managed-guest contract is only "an LXC whose `/etc/os-release`
-  says debian or ubuntu, reachable via `pct exec`", which says nothing about
-  what any guest is *for*.
-
-Any future health contract must therefore attach to **dynamic per-resource
-authority keyed by `resource_id`**, never to a repository or config VMID list.
-Which contract to adopt remains a product decision and is not settled here.
+- **Operator-declared, per `resource_id`.** Never a VMID, hostname, node, or a
+  list in a repository or config file. A VMID-reused replacement is a different
+  incarnation and inherits nothing; the same durable resource keeps its
+  contract across a rename or a node move. Setting, reading, and clearing all
+  go through the existing current-executable-binding proof plus an LXC check,
+  so a missing, quarantined, retired, or replaced incarnation fails closed.
+- **All configured probes are required.** Exactly three typed kinds:
+  `systemd_unit_active`, `docker_container_running`, and
+  `docker_container_healthy`. No OR trees, no scoring, no percentages, no
+  boolean expressions, and no caller-supplied command, argv, shell, script,
+  or environment material — a probe names a target, and a target is data for
+  a fixed argv operation the future executor builds itself.
+- **Absence is not health.** No contract means *unconfigured*, which is never
+  "healthy", "passed", or "nothing to check". `probe_count` is constrained to
+  at least one, so an empty contract cannot be stored, and the HTTP read
+  reports an unconfigured resource as a distinct `contract_unconfigured`
+  failure rather than a successful empty contract.
+- **Schema v15, atomic replacement.** One contract per resource, bounded to
+  1-32 probes with bounded targets and no duplicate `(kind, target)`. A
+  deterministic fingerprint covers only the canonical probe material, so
+  declaration order never affects it; `revision` advances by one per durable
+  change, and re-declaring identical material is not a change. Replacement and
+  clearing are single transactions, four triggers forbid every unsafe write
+  order, and no partial probe set is ever readable.
+- **Operator surface.** `GET`/`PUT`/`DELETE
+  /r0/v1/resources/{resource_id}/health-contract` with bearer auth and a
+  machine-distinguishable error taxonomy, plus the native Home Assistant
+  `view_health_contract` / `set_health_contract` / `clear_health_contract`
+  actions on the existing resource-device selector. The published snapshot
+  carries a concise `unsupported | unconfigured | configured` summary and its
+  identity; the probe list is response data from an explicitly invoked action,
+  never entity attributes.
+- **Out of scope here, deliberately:** every part of health *execution*. There
+  is no probe executor, scheduler, worker, task journal, or host-control
+  boundary, and nothing runs `systemctl`, `docker`, `pct`, or SSH. A contract
+  is not required to issue a package-update job, is not copied into one, and no
+  job is bound to a contract revision — job binding is health-execution work,
+  and the durable shape is designed so that stage can reference a specific
+  revision/fingerprint truthfully without a redesign. `health_started` remains
+  unreachable, `SUCCEEDED` still has no transition, and no automatic
+  health-triggered rollback, threshold, retry count, grace period, or
+  compensation policy exists or is decided here.
+- **Production reachability:** health-contract configuration is production
+  reachable, because it is authority metadata only. The update *execution*
+  lifecycle stays exactly as dark as it was.
 
 ## Next
 
-- A dynamic per-resource health contract, then healthcheck execution.
+- Healthcheck execution.
 - Production activation of the update lifecycle.
 - Snapshot retention, then lifecycle controls (start/stop/reboot) and manual
   snapshot operations.
@@ -517,7 +558,7 @@ Which contract to adopt remains a product decision and is not settled here.
   uses the guarded `tests/shell/run_bootstrap_smoke_sandbox.sh` wrapper; the
   existing Linux devbox local CI invokes the same Dockerfile and sandbox
   entrypoint directly without faking GitHub runner markers.
-- Pre-release: schema v14 is incompatible with v13, v12, v11, v10, and v9, and
+- Pre-release: schema v15 is incompatible with v14 and every earlier version, and
   there is no in-place migration path. An existing installation now uses
   `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible authority schema, backs it up, and
   resets only the authority database (see "In-place product updates" below)

@@ -55,9 +55,48 @@ that plan and approves it explicitly. Nothing installs without that approval.
 its own fresh pre-update snapshot first, then runs the update with live output
 the operator can watch.
 
-**Healthcheck and rollback.** After the update, the job health-checks the guest.
-On failure the operator may roll back, or a configured same-job compensation
-policy may roll back — always and only to the snapshot this job created.
+**Healthcheck and rollback.** After the update, the job health-checks the guest
+against that resource's health contract (below). On failure the operator may
+roll back, or a configured same-job compensation policy may roll back — always
+and only to the snapshot this job created.
+
+## What "healthy" means
+
+Hubinet Ops has no generic, inferred definition of a healthy workload, and
+will not invent one. A guest that answers, an `apt` exit code, and the
+package-mutation completion proof are each already-meaningful facts, and none
+of them says anything about what the guest is *for*.
+
+**Health is operator-declared, per resource.** For each dynamic resource the
+operator declares a health contract: the list of things that must be true for
+that workload to be considered up. It attaches to the durable `resource_id`,
+never to a VMID, a hostname, a node, or a list in a repository or config file —
+adding or removing a guest in Proxmox still never requires a code change. A
+guest that replaces another at the same VMID is a different resource
+incarnation and inherits nothing; the same resource keeps its contract when it
+is renamed or moves node.
+
+**A contract is one or more typed probes, and all of them are required.**
+There are exactly three probe kinds:
+
+- `systemd_unit_active` — the named systemd unit must be active;
+- `docker_container_running` — the named Docker container must be running;
+- `docker_container_healthy` — the named Docker container must be running and
+  report Docker `HEALTHCHECK` status healthy.
+
+Every declared probe must hold. There is no OR, no scoring, no percentage, and
+no boolean expression — a contract that needs those is a contract nobody can
+read at 3am. A probe names a target; it never carries a command, a script, or
+a shell fragment, and no caller-supplied text ever becomes command text (see
+"Arbitrary remote shell" under "Not the product").
+
+**No contract means unconfigured, and unconfigured is never success.** A
+resource with no declared contract cannot be health-checked, so its update job
+cannot be called successful and no automatic health-triggered rollback can be
+justified for it. Unconfigured is not "healthy", "passed", or "nothing to
+check" — it is the absence of a statement, and Hubinet Ops reports it as such.
+An empty contract is invalid for the same reason: a list of zero required
+things is not a definition of health.
 
 ## Hard rules
 
