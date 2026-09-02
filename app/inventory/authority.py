@@ -44,8 +44,12 @@ from .models import (
     PackageMutationEvidenceNotAccepted,
     PackageUpdateMutationIdentity,
     PackageUpdateMutationRequest,
+    PackageUpdateRollbackIdentity,
+    PackageUpdateRollbackRequest,
     PackageUpdateRollbackTarget,
     PackageUpdateSnapshotIdentity,
+    HostRollbackState,
+    RollbackSubmissionRefusedBeforeCallback,
     SnapshotOwnership,
     SnapshotSubmissionRefusedBeforeCallback,
     checkpoint_rank as _checkpoint_rank,
@@ -55,6 +59,7 @@ from .mutation_completion import (
     prove_package_mutation_completion,
 )
 from .mutation_identity import derive_package_mutation_identity
+from .rollback_identity import derive_package_rollback_identity
 from .snapshot_identity import (
     build_snapshot_ownership,
     derive_pre_update_snapshot_identity,
@@ -3335,6 +3340,769 @@ class InventoryAuthority:
             )
         return self._store.package_update_job(canonical_job_id)
 
+    # -- same-job rollback execution -------------------------------------
+
+    def _rollback_identity_in_transaction(
+        self, connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> PackageUpdateRollbackIdentity:
+        """Derive one job's deterministic rollback identity, in-transaction.
+
+        Re-derived from immutable authority on every call rather than read
+        back from the row, so a persisted identity is always checked against
+        what this job MUST derive. A stored id that does not match is
+        corruption, never a value to trust.
+        """
+
+        backend_instance_id = str(
+            connection.execute(
+                "SELECT backend_instance_id FROM backend_instance"
+            ).fetchone()["backend_instance_id"]
+        )
+        snapshot_operation_id = job["snapshot_operation_id"]
+        snapshot_name = job["snapshot_name"]
+        if job["snapshot_confirmed_at"] is None or not isinstance(
+            snapshot_operation_id, str
+        ) or not isinstance(snapshot_name, str):
+            raise AuthorityConflict(
+                "package update job has no confirmed job-owned snapshot to "
+                "roll back to"
+            )
+        identity = derive_package_rollback_identity(
+            backend_instance_id=backend_instance_id,
+            job_id=str(job["job_id"]),
+            resource_id=str(job["resource_id"]),
+            resource_continuity_revision=int(
+                job["expected_resource_continuity_revision"]
+            ),
+            snapshot_operation_id=snapshot_operation_id,
+            snapshot_name=snapshot_name,
+        )
+        persisted = job["rollback_operation_id"]
+        if persisted is not None and str(persisted) != identity.rollback_operation_id:
+            raise AuthorityInvariantError(
+                "persisted rollback operation identity does not match the "
+                "identity this job derives"
+            )
+        return identity
+
+    def package_update_rollback_identity(
+        self, job_id: str
+    ) -> PackageUpdateRollbackIdentity:
+        """Return this job's deterministic same-job rollback identity."""
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            return self._rollback_identity_in_transaction(connection, job)
+
+    def package_update_rollback_request(
+        self, job_id: str
+    ) -> PackageUpdateRollbackRequest:
+        """Assemble the exact typed rollback request for one armed job.
+
+        One read transaction, so every field is a consistent view of the same
+        durable job. The snapshot half comes from the job's OWN confirmed
+        snapshot columns -- there is deliberately no parameter through which a
+        caller could name a different snapshot.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            identity = self._rollback_identity_in_transaction(connection, job)
+            backend_instance_id = str(
+                connection.execute(
+                    "SELECT backend_instance_id FROM backend_instance"
+                ).fetchone()["backend_instance_id"]
+            )
+            return PackageUpdateRollbackRequest(
+                rollback_operation_id=identity.rollback_operation_id,
+                backend_instance_id=backend_instance_id,
+                job_id=canonical_job_id,
+                resource_id=str(job["resource_id"]),
+                binding_id=str(job["expected_binding_id"]),
+                locator_generation=int(job["expected_locator_generation"]),
+                resource_continuity_revision=int(
+                    job["expected_resource_continuity_revision"]
+                ),
+                vmid=int(job["expected_vmid"]),
+                expected_node=str(job["expected_node_name"]),
+                snapshot_name=str(job["snapshot_name"]),
+                snapshot_operation_id=str(job["snapshot_operation_id"]),
+            )
+
+    @staticmethod
+    def _rollback_resource_context_is_current(
+        connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> bool:
+        """Prove the exact resource/locator context a rollback is aimed at.
+
+        Deliberately NARROWER than
+        :meth:`_package_update_job_current_authority_detail`, in two exact
+        ways, and both narrowings are load-bearing rather than convenient:
+
+        1. **No package-plan currency.** Rollback is compensation for a
+           workload that may ALREADY have been mutated. A newer package scan,
+           an approval that went stale, or current exact material that moved
+           on are all expected AFTER an update ran -- indeed a successful
+           update guarantees them. Requiring plan currency here would let the
+           ordinary passage of time withdraw the recovery path from a
+           half-upgraded guest, which is precisely the evidence-preservation
+           rule #67 and #70 established (see `AGENTS.md`, and
+           `ARCHITECTURE.md`, "Failure is never release").
+
+        2. **No running-status requirement.** The v13 predicate requires the
+           guest to be `running`. A rollback candidate may legitimately be
+           stopped -- a failed mutation can leave it down, and PVE's rollback
+           force-stops it anyway as its own first step. Requiring `running`
+           would fence exactly the guests that most need recovery.
+
+        What it DOES prove is the identity of the thing about to be rolled
+        back: the same source, an LXC, present and active, with this job's
+        exact VMID, binding, locator generation, continuity revision, node,
+        and an available node. That is what stops a rollback landing on a
+        replaced guest at a reused VMID.
+        """
+
+        current = connection.execute(
+            "SELECT r.resource_id, r.inventory_source_id, r.vmid, "
+            "r.resource_continuity_revision, r.resource_type, r.presence, "
+            "r.lifecycle, r.current_node_id, b.binding_id, b.locator_generation, "
+            "n.external_node_name, n.available AS node_available "
+            "FROM resource_incarnations r "
+            "LEFT JOIN resource_locator_bindings b ON b.resource_id=r.resource_id "
+            "AND b.valid_to_run_sequence IS NULL "
+            "LEFT JOIN inventory_nodes n ON n.node_id=r.current_node_id "
+            "WHERE r.resource_id=?",
+            (str(job["resource_id"]),),
+        ).fetchone()
+        if current is None:
+            return False
+        if (
+            current["binding_id"] is None
+            or current["current_node_id"] is None
+            or current["node_available"] is None
+        ):
+            return False
+        return all(
+            (
+                str(current["inventory_source_id"])
+                == str(job["inventory_source_id"]),
+                str(current["resource_type"]) == "lxc",
+                str(current["presence"]) == "present",
+                str(current["lifecycle"]) == "active",
+                int(current["vmid"]) == int(job["expected_vmid"]),
+                current["binding_id"] == job["expected_binding_id"],
+                int(current["locator_generation"])
+                == int(job["expected_locator_generation"]),
+                int(current["resource_continuity_revision"])
+                == int(job["expected_resource_continuity_revision"]),
+                current["current_node_id"] == job["expected_node_id"],
+                current["external_node_name"] == job["expected_node_name"],
+                current["node_available"] == 1,
+            )
+        )
+
+    def arm_package_update_rollback(
+        self, job_id: str, observed: Sequence[ObservedSnapshot]
+    ) -> PackageUpdateJob:
+        """Durably commit the write-ahead rollback uncertainty boundary.
+
+        The ONLY transition that may put a job at
+        ``rollback_may_have_started``. It MUST be committed before any PVE
+        rollback can possibly be submitted, because once a job is at that
+        checkpoint nothing may ever conclude that no rollback happened.
+
+        Every proof and the checkpoint it authorizes share ONE ``BEGIN
+        IMMEDIATE`` transaction, in this order:
+
+        - the job is ACTIVE, and at ``mutation_may_have_started`` or
+          ``mutation_completed``. **Both** are legal entry points, and that
+          is the whole point of schema v14: a mutation that failed, was
+          partial, or could not be proven complete never reaches
+          ``mutation_completed``, and it is exactly that job which needs
+          compensating. Nothing here writes ``mutation_completed_at``;
+          nothing here even reads it as permission.
+        - the exact resource/locator context still holds
+          (:meth:`_rollback_resource_context_is_current`) -- deliberately not
+          package-plan currency;
+        - ``observed`` -- a FRESH canonical PVE snapshot listing -- proves,
+          through the existing
+          :meth:`select_package_update_rollback_target` contract, exactly one
+          complete snapshot carrying this job's own strict ownership
+          metadata. The target is derived from authority; there is no
+          parameter through which a caller may name a snapshot.
+
+        Idempotent: re-arming an already-armed job re-derives and re-proves
+        the same identity and returns the existing durable boundary, never a
+        second one.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        snapshots = _require_observed_snapshots(observed)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+                raise AuthorityConflict("package update job is terminal")
+            checkpoint = PackageUpdateCheckpoint(str(job["checkpoint"]))
+            identity = self._rollback_identity_in_transaction(connection, job)
+            if checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED:
+                # Already past the boundary. Never re-decide eligibility for
+                # a job whose guest may already be being rolled back.
+                return self._store.package_update_job(canonical_job_id)
+            if checkpoint not in (
+                PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED,
+                PackageUpdateCheckpoint.MUTATION_COMPLETED,
+            ):
+                raise AuthorityConflict(
+                    "package update job is not eligible for same-job rollback"
+                )
+            if not self._rollback_resource_context_is_current(connection, job):
+                raise RollbackSubmissionRefusedBeforeCallback(
+                    "package update job resource or locator context is stale"
+                )
+            expected_ownership = self._snapshot_ownership_in_transaction(
+                connection, job
+            )
+            # The exact same-job proof, over fresh canonical evidence. This
+            # is the identical helper `select_package_update_rollback_target`
+            # uses, so arming can never accept a snapshot that selection
+            # would refuse.
+            self._require_exactly_one_job_owned_snapshot(
+                job_id=canonical_job_id,
+                expected_name=job["snapshot_name"],
+                observed=snapshots,
+                expected=expected_ownership,
+            )
+            self._commit_rollback_intent(
+                connection,
+                job_id=canonical_job_id,
+                identity=identity,
+                recorded_at=recorded_at,
+                snapshot_name=str(job["snapshot_name"]),
+                mutation_was_proven_complete=job["mutation_completed_at"] is not None,
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def _commit_rollback_intent(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        identity: PackageUpdateRollbackIdentity,
+        recorded_at: str,
+        snapshot_name: str,
+        mutation_was_proven_complete: bool,
+    ) -> None:
+        # ONE statement, so the checkpoint, the operation identity, and the
+        # timestamp are a single coherent write-ahead fact. The `IS NULL`
+        # guards make it a compare-and-set, so exactly one of two concurrent
+        # invocations can win it. The checkpoint guard accepts BOTH legal
+        # entry points and writes no mutation fact of any kind.
+        updated = connection.execute(
+            "UPDATE package_update_jobs "
+            "SET checkpoint='rollback_may_have_started', "
+            "rollback_operation_id=?, rollback_may_have_started_at=? "
+            "WHERE job_id=? AND status='active' "
+            "AND checkpoint IN ('mutation_may_have_started', 'mutation_completed') "
+            "AND rollback_operation_id IS NULL "
+            "AND rollback_may_have_started_at IS NULL",
+            (identity.rollback_operation_id, recorded_at, job_id),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job rollback intent lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=recorded_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
+            event_type=PackageUpdateEventType.ROLLBACK_MAY_HAVE_STARTED,
+            message=(
+                "same-job PVE rollback may be submitted from here on; a "
+                "successful rollback leaves this guest stopped"
+            ),
+            details={
+                "rollback_operation_id": identity.rollback_operation_id,
+                "snapshot_name": snapshot_name,
+                # Recorded as truthful history, never as permission: a
+                # rollback is equally legal from an unproven mutation.
+                "mutation_was_proven_complete": mutation_was_proven_complete,
+            },
+        )
+
+    @staticmethod
+    def _require_armed_rollback_job(job: sqlite3.Row) -> None:
+        """Shared guard for every transition inside the rollback window."""
+
+        if str(job["status"]) != PackageUpdateJobStatus.ACTIVE.value:
+            raise AuthorityConflict("package update job is terminal")
+        if (
+            PackageUpdateCheckpoint(str(job["checkpoint"]))
+            is not PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+        ):
+            raise AuthorityConflict(
+                "package update job is not inside a rollback operation"
+            )
+
+    def execute_rollback_submission_if_current(
+        self, job_id: str, submit: Callable[[], _T]
+    ) -> _T:
+        """Run one bounded host rollback submission while authority holds.
+
+        The same-job rollback mirror of
+        :meth:`execute_snapshot_submission_if_current`, load-bearing for the
+        same structural reason: the write-ahead checkpoint alone leaves a
+        narrower race open, in which discovery reconciliation replaces the
+        guest occupying this job's VMID on this job's node *after* the
+        context was proved and *before* PVE is actually asked to roll back.
+        Neither a checkpoint CAS nor the host helper (which can verify live
+        PVE facts but never a backend resource incarnation) would catch it.
+        So the proof and the submission it authorizes share ONE transaction,
+        holding this store's single writer lock across the whole of it.
+
+        What is re-proved here is deliberately exactly the rollback
+        predicate, not the update one: ACTIVE ownership at
+        ``rollback_may_have_started``, the job's derived rollback identity
+        against its persisted one, and the exact resource/locator context.
+        Package-plan currency is NOT re-proved -- see
+        :meth:`_rollback_resource_context_is_current` for why re-approving an
+        already-run update must never gate its compensation.
+
+        ``submit`` MUST be the host's submission-only rollback operation and
+        nothing else: it journals ``submitted`` durably, invokes `pvesh
+        create` once, journals whatever UPID PVE returns, and returns. It
+        never polls the asynchronous `vzrollback` task to completion. That
+        bound is machine-enforced by ``app/inventory/contention_policy.py``
+        and the rollback transport's own timeout ceiling.
+
+        A stale context refuses BEFORE ``submit`` is ever called, raising
+        :class:`RollbackSubmissionRefusedBeforeCallback` -- structurally
+        meaning the host was never asked to roll back, so a caller may route
+        it into the durable seal path. A terminal job or a wrong checkpoint
+        stays an ordinary :class:`AuthorityConflict` and says nothing about
+        whether ``submit`` ran.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        host_result: _T | None = None
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_rollback_job(job)
+            # Re-derive and re-prove the identity against the persisted one.
+            self._rollback_identity_in_transaction(connection, job)
+            context_holds = self._rollback_resource_context_is_current(
+                connection, job
+            )
+            self._after_rollback_authority_proof(
+                connection, job_id=canonical_job_id
+            )
+            if context_holds:
+                host_result = submit()
+
+        if not context_holds:
+            raise RollbackSubmissionRefusedBeforeCallback(
+                "package update job resource or locator context is stale"
+            )
+        return host_result  # type: ignore[return-value]
+
+    def record_package_update_rollback_task(
+        self, job_id: str, task_upid: str
+    ) -> PackageUpdateJob:
+        """Persist the observed PVE task identity for this exact rollback.
+
+        Pure evidence preservation, and deliberately unconditional on the
+        resource/locator context: a task identity is the only thing that lets
+        a restarted backend reattach to an asynchronous `vzrollback` instead
+        of guessing, so a context that moved on must never discard it.
+        Write-once at the SQL layer; a conflicting identity raises.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        upid = _require_text(task_upid, "task_upid", max_length=300)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_rollback_job(job)
+            existing = job["rollback_task_upid"]
+            if existing is not None:
+                if str(existing) != upid:
+                    raise AuthorityConflict(
+                        "package update job already recorded a different "
+                        "rollback task identity"
+                    )
+                return self._store.package_update_job(canonical_job_id)
+            updated = connection.execute(
+                "UPDATE package_update_jobs SET rollback_task_upid=? "
+                "WHERE job_id=? AND status='active' "
+                "AND checkpoint='rollback_may_have_started' "
+                "AND rollback_task_upid IS NULL",
+                (upid, canonical_job_id),
+            )
+            if updated.rowcount != 1:
+                raise AuthorityConflict(
+                    "package update job rollback task record lost durable ownership"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.INFO,
+                stage=PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.ROLLBACK_TASK_OBSERVED,
+                message="observed the PVE task identity for this rollback",
+                details={"rollback_task_upid": upid},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def record_package_update_rollback_submitted(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Append the truthful "PVE was asked to roll back" event.
+
+        Pure evidence: it advances no checkpoint and grants no permission,
+        because ``rollback_may_have_started`` already means exactly "a PVE
+        rollback may be in progress".
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_rollback_job(job)
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.WARNING,
+                stage=PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.ROLLBACK_SUBMITTED,
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def record_package_update_rollback_uncertain(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Record that a rollback's outcome could not be established.
+
+        Deliberately non-terminal and deliberately unconditional on the
+        resource/locator context. The job stays ACTIVE at
+        ``rollback_may_have_started``, still owning the one global
+        destructive slot and its confirmed snapshot. A rollback whose result
+        is unknown may have replaced this guest's volumes and config, or may
+        have done nothing at all; terminalizing either way would be a guess.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_rollback_job(job)
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.WARNING,
+                stage=PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.ROLLBACK_OUTCOME_UNCERTAIN,
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def record_package_update_rollback_terminal_failure(
+        self, job_id: str, reason: str
+    ) -> PackageUpdateJob:
+        """Record that the PVE rollback task reached a failed terminal state.
+
+        Deliberately NOT terminalization of the job, and deliberately not a
+        licence to resubmit. PVE's rollback stops the container, then
+        replaces volumes and config in two config-locked phases; a failure
+        anywhere in that sequence can leave the guest stopped, partially
+        rolled back, or holding a `rollback` config lock. So the job stays
+        ACTIVE at ``rollback_may_have_started``, retains the global
+        destructive slot and its snapshot, and a human decides. Releasing
+        here would strand a guest mid-rollback with no owner.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        canonical_reason = _require_text(reason, "reason", max_length=500)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_rollback_job(job)
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.ERROR,
+                stage=PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
+                event_type=PackageUpdateEventType.ROLLBACK_TERMINAL_FAILURE,
+                message=canonical_reason,
+                details={},
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    def resolve_pre_rollback_block(
+        self,
+        job_id: str,
+        seal: Callable[[], tuple[HostRollbackState | None, str, _T]],
+    ) -> tuple[bool, _T]:
+        """Atomically decide, and durably apply, a pre-rollback block.
+
+        The mirror image of :meth:`execute_rollback_submission_if_current`,
+        serialized against it through the SAME authority-store writer lock,
+        and the ONLY way a job past ``rollback_may_have_started`` may be
+        released. It exists because the write-ahead checkpoint is committed
+        before the host is called at all: without a durable release proof, an
+        ordinary pre-flight refusal (a guest that moved node, a backend that
+        died between arming and submitting) would fence the one global
+        destructive slot forever with no rollback having been attempted.
+
+        ``seal`` performs exactly ONE bounded typed host seal -- never a
+        rollback, never a poll loop -- and returns
+        ``(host_rollback_state, reason, evidence)``. It is invoked at most
+        once, while this transaction still owns the writer lock, so no
+        concurrent submission critical section can interleave between the
+        proof and the block; the host's own per-VMID lease then orders the
+        durable seal against every delayed submitter.
+
+        Only ``sealed_not_submitted`` releases the job, and it releases it as
+        ``blocked``, never as ``rolled_back``: the whole content of that
+        proof is that no rollback occurred and none ever can for this
+        operation identity. A transient ``absent``/``intent`` observation,
+        any post-submission state, a lease held by another invocation, and
+        every failed or malformed seal all leave the job exactly as it was.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        evidence: _T | None = None
+        blocked = False
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            self._require_armed_rollback_job(job)
+            if job["rollback_completed_at"] is not None:
+                raise AuthorityInvariantError(
+                    "package update job rollback completion is inconsistent"
+                )
+            if job["rollback_task_upid"] is not None:
+                # A recorded task identity is post-submission evidence: PVE
+                # already accepted this rollback. Sealing it "never
+                # submitted" would be false, whatever a later host read says.
+                raise AuthorityConflict(
+                    "package update job already observed a PVE rollback task"
+                )
+            # The durable host seal happens HERE, while this transaction
+            # still owns the writer lock -- never before BEGIN IMMEDIATE,
+            # and never trusted as a value the caller precomputed.
+            rollback_state, reason, evidence = seal()
+            self._after_pre_rollback_block_proof(
+                connection, job_id=canonical_job_id
+            )
+            if rollback_state is HostRollbackState.SEALED_NOT_SUBMITTED:
+                self._commit_pre_rollback_block(
+                    connection,
+                    job_id=canonical_job_id,
+                    reason=_require_text(reason, "reason", max_length=500),
+                )
+                blocked = True
+        return blocked, evidence  # type: ignore[return-value]
+
+    def _commit_pre_rollback_block(
+        self, connection: sqlite3.Connection, *, job_id: str, reason: str
+    ) -> None:
+        """Durably terminalize one armed job as blocked, inside the caller's
+        own transaction. Only ever called while that transaction still owns
+        the authority store's writer lock -- see
+        :meth:`resolve_pre_rollback_block`.
+        """
+
+        recorded_at = _timestamp(self._now())
+        updated = connection.execute(
+            "UPDATE package_update_jobs SET status='blocked', "
+            "terminalized_at=?, terminal_reason=? "
+            "WHERE job_id=? AND status='active' "
+            "AND checkpoint='rollback_may_have_started' "
+            "AND rollback_completed_at IS NULL "
+            "AND rollback_task_upid IS NULL",
+            (recorded_at, reason, job_id),
+        )
+        if updated.rowcount != 1:
+            raise AuthorityConflict(
+                "package update job pre-rollback block lost durable ownership"
+            )
+        self._append_package_update_job_event(
+            connection,
+            job_id=job_id,
+            created_at=recorded_at,
+            level=PackageUpdateEventLevel.WARNING,
+            stage=PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED,
+            event_type=(
+                PackageUpdateEventType.ROLLBACK_BLOCKED_BEFORE_SUBMISSION
+            ),
+            message=reason,
+            details={},
+        )
+
+    def complete_package_update_rollback(
+        self,
+        job_id: str,
+        observed: Sequence[ObservedSnapshot],
+        *,
+        task_succeeded: bool,
+    ) -> PackageUpdateJob:
+        """Terminalize one job ``rolled_back``, proof first.
+
+        This is the ONLY transition that may set ``rollback_completed_at``,
+        and the schema makes ``status='rolled_back'`` impossible without it.
+        The proof required here is the coherent set, not any one part of it:
+
+        - the job is ACTIVE at ``rollback_may_have_started`` with its durable
+          rollback operation identity, re-derived and re-proved;
+        - ``task_succeeded`` -- the caller's classification of the PVE task
+          this job durably recorded, using PVE's own rule (``OK`` and
+          ``WARNINGS: <n>`` are the only non-errors). A rollback whose task
+          is running, failed, or unknown never completes here;
+        - ``observed`` -- a FRESH canonical listing taken AFTER the task
+          reached that terminal state -- still proves exactly one complete
+          snapshot carrying this job's own strict ownership metadata, and
+          PVE's ``current`` pseudo-entry now reports ``parent`` equal to that
+          snapshot's name.
+
+        The ``parent`` check is the post-condition upstream's own
+        ``snapshot_rollback`` establishes (`$conf->{parent} = $snapname` in
+        its second locked phase, after `__snapshot_apply_config`). It is
+        deliberately used as CORROBORATION inside this set, never alone: it
+        is not unique -- two rollbacks to the same snapshot leave the same
+        value -- so it cannot by itself identify one operation. What
+        identifies the operation is the durable host journal plus the exact
+        recorded task; what proves the rollback actually landed is the
+        terminal non-error task plus this fresh canonical post-condition.
+        The snapshot still existing is deliberately NOT treated as evidence
+        of anything: upstream rollback never removes its source snapshot, so
+        its presence is guaranteed either way.
+
+        Idempotent: a job already terminal as ``rolled_back`` with this exact
+        identity returns unchanged. Anything unproven raises and writes
+        nothing, leaving the job fenced.
+        """
+
+        canonical_job_id = _require_uuid(job_id, "job_id")
+        snapshots = _require_observed_snapshots(observed)
+        recorded_at = _timestamp(self._now())
+        with self._store._transaction() as connection:
+            job = self._require_package_update_job_row(connection, canonical_job_id)
+            if (
+                str(job["status"]) == PackageUpdateJobStatus.ROLLED_BACK.value
+                and job["rollback_completed_at"] is not None
+            ):
+                self._rollback_identity_in_transaction(connection, job)
+                return self._store.package_update_job(canonical_job_id)
+            self._require_armed_rollback_job(job)
+            self._rollback_identity_in_transaction(connection, job)
+            if task_succeeded is not True:
+                raise AuthorityConflict(
+                    "same-job rollback completion requires a terminal "
+                    "non-error PVE task"
+                )
+            if job["rollback_task_upid"] is None:
+                raise AuthorityConflict(
+                    "same-job rollback completion requires the durable PVE "
+                    "task identity this rollback recorded"
+                )
+            expected_ownership = self._snapshot_ownership_in_transaction(
+                connection, job
+            )
+            snapshot_name = str(job["snapshot_name"])
+            self._require_exactly_one_job_owned_snapshot(
+                job_id=canonical_job_id,
+                expected_name=snapshot_name,
+                observed=snapshots,
+                expected=expected_ownership,
+            )
+            self._require_current_parent_is(snapshots, snapshot_name)
+            updated = connection.execute(
+                "UPDATE package_update_jobs "
+                "SET checkpoint='rollback_completed', rollback_completed_at=?, "
+                "status='rolled_back', terminalized_at=?, terminal_reason=? "
+                "WHERE job_id=? AND status='active' "
+                "AND checkpoint='rollback_may_have_started' "
+                "AND rollback_completed_at IS NULL "
+                "AND rollback_task_upid IS NOT NULL",
+                (
+                    recorded_at,
+                    recorded_at,
+                    (
+                        "same-job rollback to this job's own confirmed "
+                        "pre-update snapshot completed; the guest is stopped"
+                    ),
+                    canonical_job_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise AuthorityConflict(
+                    "package update job rollback completion lost durable ownership"
+                )
+            self._append_package_update_job_event(
+                connection,
+                job_id=canonical_job_id,
+                created_at=recorded_at,
+                level=PackageUpdateEventLevel.WARNING,
+                stage=PackageUpdateCheckpoint.ROLLBACK_COMPLETED,
+                event_type=PackageUpdateEventType.ROLLBACK_COMPLETED,
+                message=(
+                    "terminal non-error PVE task and fresh canonical evidence "
+                    "prove this job rolled back to its own snapshot"
+                ),
+                details={
+                    "snapshot_name": snapshot_name,
+                    "rollback_task_upid": str(job["rollback_task_upid"]),
+                    # Truthful history: a rolled-back update is never a
+                    # successful update, whether or not its package mutation
+                    # had been proven complete first.
+                    "mutation_was_proven_complete": (
+                        job["mutation_completed_at"] is not None
+                    ),
+                    "guest_left_stopped": True,
+                },
+            )
+        return self._store.package_update_job(canonical_job_id)
+
+    @staticmethod
+    def _require_current_parent_is(
+        observed: tuple[ObservedSnapshot, ...], snapshot_name: str
+    ) -> None:
+        """Require PVE's ``current`` pseudo-entry to point at this snapshot.
+
+        Upstream `PVE::AbstractConfig::snapshot_rollback` sets
+        `$conf->{parent} = $snapname` in its second locked phase, so after a
+        successful rollback the listing's synthetic ``current`` row reports
+        exactly that parent. Absence of the pseudo-entry, or any other
+        parent, fails closed: this is a required member of the completion
+        evidence set, never an optional nicety.
+        """
+
+        for snapshot in observed:
+            if not snapshot.is_current_pseudo_entry:
+                continue
+            if snapshot.parent == snapshot_name:
+                return
+            raise AuthorityConflict(
+                "canonical PVE state does not report this job's snapshot as "
+                "the current parent after rollback"
+            )
+        raise AuthorityConflict(
+            "canonical PVE state contains no current pseudo-entry to prove "
+            "the rollback post-condition"
+        )
+
     #: Checkpoints from which ordinary startup may safely terminalize an
     #: active job. Every one of them is provably before any PVE snapshot
     #: submission *and* before any package mutation:
@@ -3363,6 +4131,16 @@ class InventoryAuthority:
         pass never replays a snapshot operation, never guesses an outcome, and
         never silently frees destructive ownership. Repeating it is
         idempotent: an already-terminal job is not selected again.
+
+        ``rollback_may_have_started`` is likewise deliberately absent from
+        that set, and for a strictly stronger reason than the mutation
+        boundary: a PVE rollback may be force-stopping the container and
+        replacing its volumes and config at this very moment. Such a job
+        stays ACTIVE and fenced with its durable rollback operation identity
+        and any recorded task, so a restarted backend RE-OBSERVES that exact
+        task through the read-only host inspection rather than resubmitting a
+        second destructive rollback. Nothing in this pass ever submits, seals,
+        or completes a rollback.
         """
 
         recovered_at = _timestamp(self._now())
@@ -3565,6 +4343,23 @@ class InventoryAuthority:
         Deliberately its own seam rather than a reuse of the snapshot one:
         the two release paths are independent families, and a test that
         overrides one must not silently fire inside the other.
+        """
+
+    def _after_rollback_authority_proof(
+        self, connection: sqlite3.Connection, *, job_id: str
+    ) -> None:
+        """Test seam inside
+        :meth:`execute_rollback_submission_if_current`'s transaction, between
+        proving the rollback context and the submission it authorizes.
+        """
+
+    def _after_pre_rollback_block_proof(
+        self, connection: sqlite3.Connection, *, job_id: str
+    ) -> None:
+        """The same seam for :meth:`resolve_pre_rollback_block`.
+
+        Its own seam, for the same reason the mutation release path has its
+        own: the three release paths are independent families.
         """
 
     @staticmethod
