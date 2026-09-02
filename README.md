@@ -38,8 +38,9 @@ a guest in Proxmox never requires touching this repository or its config.
   as up. Managed through the `view_health_contract` / `set_health_contract` /
   `clear_health_contract` Home Assistant actions and the routes above, with a
   concise contract-status sensor. A resource with no contract is
-  *unconfigured*, which is never "healthy" — and nothing checks a contract yet,
-  because healthcheck execution is a later stage.
+  *unconfigured*, which is never "healthy" — and it can no longer be given an
+  update job at all, because a job whose success criterion does not exist
+  could never truthfully be called successful.
 - Internal durable package-update job authority that freezes one current,
   non-empty approved exact plan with immutable approval/source/resource
   provenance, copied package rows, request-id idempotency, global single-flight,
@@ -52,16 +53,18 @@ a guest in Proxmox never requires touching this repository or its config.
 Package scanning refreshes APT metadata and runs `apt-get -s upgrade`; it never
 installs packages. Internal durable package-update job authority, job-owned
 snapshot safety, the execution-time plan equality gate, crash-safe workload
-package mutation, and same-job rollback execution are built, but none of them
-is production-reachable: no HTTP, Home Assistant, scheduler, bootstrap, or
-updater path can create a PVE snapshot, change a workload package, or roll a
-guest back, and no snapshot, execution, mutation, or rollback helper, key, or
-PVE mutation privilege is deployed. Healthcheck *execution* is not built yet:
-health is now operator-declared per resource, but nothing evaluates a contract
-— see `PRODUCT.md` and `STATUS.md`.
+package mutation, same-job rollback execution, and job-bound healthcheck
+execution are built, but none of them is production-reachable: no HTTP, Home
+Assistant, scheduler, bootstrap, or updater path can create a PVE snapshot,
+change a workload package, roll a guest back, or probe a workload, and no
+snapshot, execution, mutation, rollback, or health helper, key, or PVE
+mutation privilege is deployed. A job now freezes the exact health contract
+generation it must satisfy when it is issued, and may only be called
+successful when every one of those probes was positively proven — see
+`PRODUCT.md` and `STATUS.md`.
 
 Pre-release authority schema versions are not migrated in place: the current
-schema is v15 and has no migration from v14 or earlier. An existing
+schema is v16 and has no migration from v15 or earlier. An existing
 pre-release deployment uses
 `deploy/update-proxmox-0.5.sh` for this: it detects the incompatible
 authority schema, backs it up, and resets only the authority database (with
