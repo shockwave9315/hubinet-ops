@@ -1752,6 +1752,19 @@ _SCHEMA_STATEMENTS = (
         CHECK(rollback_completed_at IS NULL OR
               (rollback_operation_id IS NOT NULL AND
                rollback_may_have_started_at IS NOT NULL)),
+        -- ...and impossible without the exact PVE task identity this
+        -- rollback observed. Unlike snapshot create, a rollback has no
+        -- unique canonical witness of its own: the source snapshot survives
+        -- either way, and `parent == snapname` is equally true after any
+        -- earlier rollback to the same snapshot. The recorded UPID is
+        -- therefore the ONLY durable fact that ties a completion to THIS
+        -- operation, and the application proof already requires it. Without
+        -- this constraint one buggy backend UPDATE could persist a
+        -- materially false `rolled_back` -- releasing the global destructive
+        -- slot and discarding recovery ownership -- for a rollback PVE was
+        -- never durably known to have accepted.
+        CHECK(rollback_completed_at IS NULL OR
+              rollback_task_upid IS NOT NULL),
         -- Rollback needs the job's OWN confirmed snapshot to roll back to,
         -- and only ever compensates a workload that may already have been
         -- mutated, so both of those write-ahead facts must already exist.
@@ -1766,7 +1779,16 @@ _SCHEMA_STATEMENTS = (
         -- schema version deliberately ships no transition to 'succeeded' at
         -- all.
         CHECK(status != 'rolled_back' OR rollback_completed_at IS NOT NULL),
-        CHECK(status != 'succeeded' OR mutation_completed_at IS NOT NULL)
+        CHECK(status != 'succeeded' OR mutation_completed_at IS NOT NULL),
+        -- The completion checkpoint and the terminal status are one fact and
+        -- must agree in BOTH directions. The reverse implication
+        -- (rolled_back => rollback_completed) already follows transitively:
+        -- rolled_back requires rollback_completed_at, which requires rank 9.
+        -- This is the forward half, which nothing else covered -- a job left
+        -- at rank 9 while still `active` would claim a completed rollback
+        -- yet keep holding the one global destructive slot forever. The one
+        -- legal transition writes both in the same atomic statement.
+        CHECK(checkpoint != 'rollback_completed' OR status = 'rolled_back')
     )
     """,
     """

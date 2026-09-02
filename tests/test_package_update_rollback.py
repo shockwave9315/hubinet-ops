@@ -2431,3 +2431,138 @@ def test_the_helper_keeps_no_config_lock_allowlist() -> None:
     source = HELPER_PATH.read_text()
     assert "_IN_FLIGHT_LOCKS" not in source
     assert "snapshot-delete" not in source
+
+
+# ===========================================================================
+# N. THE COMPLETION/STATUS SCHEMA FAMILY
+# ===========================================================================
+#
+# The application proof in `complete_package_update_rollback` is correct and
+# already requires the durable task identity. These regressions cover the
+# SCHEMA itself: v14 is supposed to reject impossible durable states caused by
+# a buggy backend SQL statement, not merely by a well-behaved caller.
+#
+# The witness is deliberately the FULL coherent terminal write -- checkpoint,
+# completion timestamp, status, and both terminal fields together -- because
+# the weaker "status only" attempt was already rejected by other constraints
+# and therefore never exercised this one.
+
+
+def _armed_rollback_job(tmp_path: Path):
+    """One ACTIVE job at rollback_may_have_started with NO task identity."""
+
+    _, store, authority, _, job, ownership, identity, *_ = _mutating_job(tmp_path)
+    authority.arm_package_update_rollback(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+    armed = authority.package_update_job(job.job_id)
+    assert armed.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+    assert armed.rollback_task_upid is None
+    assert armed.rollback_completed_at is None
+    return store, authority, job, ownership, identity
+
+
+def test_a_coherent_rolled_back_write_without_a_task_identity_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """The exact whole-PR review witness.
+
+    A rollback has no unique canonical witness of its own -- the source
+    snapshot survives either way, and `parent == snapname` is equally true
+    after any earlier rollback to the same snapshot. The recorded UPID is the
+    only durable fact tying a completion to THIS operation, so persisting
+    `rolled_back` without it would release the global destructive slot and
+    discard recovery ownership for a rollback PVE was never durably known to
+    have accepted.
+    """
+
+    store, _, job, _, _ = _armed_rollback_job(tmp_path)
+
+    _assert_sql_rejected(
+        store,
+        "UPDATE package_update_jobs SET checkpoint='rollback_completed', "
+        "rollback_completed_at=?, status='rolled_back', terminalized_at=?, "
+        "terminal_reason='forged' WHERE job_id=?",
+        ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", job.job_id),
+    )
+    after = store.package_update_job(job.job_id)
+    assert after.status is PackageUpdateJobStatus.ACTIVE
+    assert after.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+    assert after.rollback_completed_at is None
+
+
+def test_the_completion_checkpoint_without_rolled_back_status_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Forward half of the coherence: rank 9 implies the terminal status.
+
+    A job left at `rollback_completed` while still ACTIVE would claim a
+    completed rollback and keep holding the one global destructive slot.
+    """
+
+    store, _, job, _, _ = _armed_rollback_job(tmp_path)
+
+    _assert_sql_rejected(
+        store,
+        "UPDATE package_update_jobs SET checkpoint='rollback_completed', "
+        "rollback_completed_at=?, rollback_task_upid=? WHERE job_id=?",
+        ("2026-01-01T00:00:00+00:00", UPID, job.job_id),
+    )
+    assert (
+        store.package_update_job(job.job_id).status
+        is PackageUpdateJobStatus.ACTIVE
+    )
+
+
+def test_rolled_back_without_the_completion_checkpoint_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Reverse half: it follows transitively, and is asserted explicitly."""
+
+    store, _, job, _, _ = _armed_rollback_job(tmp_path)
+
+    _assert_sql_rejected(
+        store,
+        "UPDATE package_update_jobs SET rollback_task_upid=?, "
+        "rollback_completed_at=?, status='rolled_back', terminalized_at=?, "
+        "terminal_reason='forged' WHERE job_id=?",
+        (UPID, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00", job.job_id),
+    )
+
+
+def test_a_completion_timestamp_can_never_exist_without_a_task_identity(
+    tmp_path: Path,
+) -> None:
+    """The invariant in isolation, independent of status or checkpoint."""
+
+    store, _, job, _, _ = _armed_rollback_job(tmp_path)
+
+    _assert_sql_rejected(
+        store,
+        "UPDATE package_update_jobs SET rollback_completed_at=? WHERE job_id=?",
+        ("2026-01-01T00:00:00+00:00", job.job_id),
+    )
+
+
+def test_the_legal_authority_completion_still_reaches_rolled_back(
+    tmp_path: Path,
+) -> None:
+    """Positive control: the new constraints do not block the legal path."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, orchestrator = (
+        _mutating_job(tmp_path)
+    )
+
+    result = _drive_to_successful_rollback(
+        authority, orchestrator, job, ownership, identity, pve
+    )
+
+    assert result.outcome is RollbackOperationOutcome.COMPLETED
+    assert result.job.status is PackageUpdateJobStatus.ROLLED_BACK
+    assert result.job.checkpoint is PackageUpdateCheckpoint.ROLLBACK_COMPLETED
+    assert result.job.rollback_task_upid == UPID
+    assert result.job.rollback_completed_at is not None
+    # Written as ONE atomic statement, so the checkpoint and the terminal
+    # status can never disagree even momentarily.
+    assert result.job.terminalized_at is not None
+    assert len(pve.rollbacks) == 1

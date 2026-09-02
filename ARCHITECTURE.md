@@ -1552,8 +1552,25 @@ to their own checkpoints in both directions:
 - a rollback operation requires this job's own `snapshot_confirmed_at` (there
   must be something to roll back *to*) and its `mutation_may_have_started_at`
   (there must be something to compensate);
-- `status = 'rolled_back'` is impossible without `rollback_completed_at`, and
-  `status = 'succeeded'` is impossible without `mutation_completed_at`.
+- `rollback_completed_at` requires `rollback_task_upid`. A rollback has no
+  unique canonical witness of its own — the source snapshot survives either
+  way, and `parent == snapname` is equally true after any earlier rollback to
+  the same snapshot — so the recorded UPID is the only durable fact tying a
+  completion to *this* operation. Without this, one buggy backend `UPDATE`
+  could persist a materially false `rolled_back`, releasing the global
+  destructive slot and discarding recovery ownership for a rollback PVE was
+  never durably known to have accepted;
+- `checkpoint = 'rollback_completed'` and `status = 'rolled_back'` imply each
+  other. The reverse half follows transitively (`rolled_back` requires
+  `rollback_completed_at`, which requires rank 9); the forward half is
+  explicit, so a job can never sit at rank 9 while still `active`, claiming a
+  completed rollback yet holding the one global destructive slot;
+- `status = 'succeeded'` is impossible without `mutation_completed_at`.
+
+These are constraints on the *durable state*, not merely on the well-behaved
+caller: the application proof in `complete_package_update_rollback` already
+requires every one of them, and the schema exists to reject the same
+impossible rows when a backend statement is wrong.
 
 The checkpoint order remains a monotonic no-regression fence; it is no longer
 read as a chain of implied successes. Triggers make the rollback operation
