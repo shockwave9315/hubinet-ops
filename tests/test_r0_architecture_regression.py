@@ -776,3 +776,189 @@ def test_the_mutation_helper_runs_exactly_one_fixed_bounded_package_command() ->
         assert "hubinet-package-mutation-helper" not in installed
         assert "Pre-Install-Pkgs" not in installed
         assert "/run/hubinet-ops/package-mutation" not in installed
+
+
+# ---------------------------------------------------------------------------
+# Same-job rollback execution stays dark.
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_execution_is_not_production_reachable() -> None:
+    """The product's most destructive PVE operation stays unreachable.
+
+    Nothing on the production HTTP, Home Assistant, scheduler, bootstrap, or
+    updater paths -- nor any other dark stage -- may construct or call the
+    rollback orchestrator, its host control, or the authority's rollback
+    transitions.
+    """
+
+    rollback_symbols = (
+        # Deliberately NOT the bare "package_update_rollback" prefix: the
+        # pre-existing selection contract
+        # (`select_package_update_rollback_target`, PR #67) legitimately
+        # appears in the snapshot module, and authorizing a target is not
+        # executing a rollback.
+        "app.package_update_rollback",
+        "app.package_update_rollback_host_control",
+        "PackageUpdateRollbackHostControl",
+        "SshPackageUpdateRollbackHostControl",
+        "PackageUpdateRollbackOrchestrator",
+        "roll_back_to_job_snapshot",
+        "arm_package_update_rollback",
+        "execute_rollback_submission_if_current",
+        "resolve_pre_rollback_block",
+        "complete_package_update_rollback",
+        "submit_same_job_rollback",
+        "hubinet-package-rollback-helper",
+    )
+    for rel_path in (
+        "app/inventory_runtime.py",
+        "app/inventory_scheduler.py",
+        "app/package_scan_scheduler.py",
+        "app/package_scan.py",
+        "app/package_scan_host_control.py",
+        "app/package_update_snapshot.py",
+        "app/package_update_snapshot_host_control.py",
+        "app/package_update_execution.py",
+        "app/package_update_execution_host_control.py",
+        "app/package_update_mutation.py",
+        "app/package_update_mutation_host_control.py",
+        "app/inventory_runtime_config.py",
+        "custom_components/hubinet_ops/services.py",
+        "custom_components/hubinet_ops/transport_http.py",
+        "custom_components/hubinet_ops/coordinator.py",
+        "deploy/bootstrap-proxmox-0.5.sh",
+        "deploy/update-proxmox-0.5.sh",
+        "deploy/install-0.5.0-fresh.sh",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for symbol in rollback_symbols:
+            assert symbol not in text, (rel_path, symbol)
+
+
+def test_bootstrap_and_updater_deploy_no_rollback_helper_key_or_privilege() -> None:
+    """No rollback helper, forced-command line, key, or PVE privilege ships.
+
+    `VM.Snapshot.Rollback` (and `VM.Snapshot`, which upstream also accepts for
+    the rollback endpoint) must appear nowhere in any deployment script: the
+    provisioned role stays exactly `Sys.Audit,VM.Audit`.
+    """
+
+    for rel_path in ("deploy", "deploy/lib"):
+        directory = REPO_ROOT / rel_path
+        for path in sorted(directory.glob("*.sh")):
+            text = path.read_text(encoding="utf-8")
+            assert "hubinet-package-rollback" not in text, path
+            assert "rollback-operations" not in text, path
+            assert "VM.Snapshot.Rollback" not in text, path
+            assert "VM.Snapshot" not in text, path
+
+
+def test_the_rollback_helper_is_the_only_file_that_can_roll_back() -> None:
+    """Every other helper keeps its own, weaker, non-rollback promise.
+
+    The snapshot helper in particular must never gain rollback: keeping
+    create and rollback in separate forced-command boundaries is what stops
+    one deployed key carrying both "add a recovery point" and "destroy the
+    guest's current state".
+    """
+
+    rollback = REPO_ROOT / "deploy/hubinet-package-rollback-helper.py"
+    assert rollback.exists()
+    for other in (
+        "deploy/hubinet-package-scan-helper.py",
+        "deploy/hubinet-package-snapshot-helper.py",
+        "deploy/hubinet-package-update-helper.py",
+        "deploy/hubinet-package-mutation-helper.py",
+    ):
+        text = (REPO_ROOT / other).read_text(encoding="utf-8")
+        for forbidden in (
+            "submit_same_job_rollback",
+            "seal_rollback_never_submitted",
+            "inspect_rollback_state",
+            # The pvesh rollback endpoint path fragment, as it appears in
+            # real argv rather than in prose.
+            '/rollback"',
+            "pct rollback",
+        ):
+            assert forbidden not in text, (other, forbidden)
+
+
+def test_the_rollback_helper_exposes_exactly_three_typed_operations() -> None:
+    text = (REPO_ROOT / "deploy/hubinet-package-rollback-helper.py").read_text(
+        encoding="utf-8"
+    )
+    for operation in (
+        "inspect_rollback_state",
+        "submit_same_job_rollback",
+        "seal_rollback_never_submitted",
+    ):
+        assert f'"{operation}"' in text, operation
+    for forbidden in (
+        "shell=True",
+        "os.system",
+        "sh -c",
+        "pct exec",
+        "pct destroy",
+        "pct start",
+        "pct stop",
+        "snapshot/delete",
+        "apt-get",
+        "dpkg",
+    ):
+        assert forbidden not in text, forbidden
+
+    # `start` is pinned to 0 as a module-level literal, so a successful
+    # rollback always leaves the guest stopped and nothing on the request
+    # boundary can ask for anything else.
+    module = ast.parse(text, filename="hubinet-package-rollback-helper.py")
+    start = None
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "ROLLBACK_START_AFTER"
+                for target in node.targets
+            )
+        ):
+            start = ast.literal_eval(node.value)
+    assert start == 0, "this stage must always roll back with start=0"
+
+
+def test_no_snapshot_deletion_exists_anywhere_in_the_product() -> None:
+    """Retention and deletion remain entirely unimplemented."""
+
+    for rel_path in (
+        "app/package_update_rollback.py",
+        "app/package_update_rollback_host_control.py",
+        "app/package_update_snapshot.py",
+        "app/package_update_snapshot_host_control.py",
+        "deploy/hubinet-package-rollback-helper.py",
+        "deploy/hubinet-package-snapshot-helper.py",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        for forbidden in ("pvesh\", \"delete", "snapshot/delete", "delete_snapshot"):
+            assert forbidden not in text, (rel_path, forbidden)
+
+
+def test_no_health_execution_exists_anywhere() -> None:
+    """Healthcheck execution is deliberately NOT part of this stage.
+
+    The product has no truthful generic workload-health definition yet (see
+    STATUS.md), so no code may claim one: nothing writes `health_started_at`,
+    advances to the `health_started` checkpoint, or terminalizes a job
+    `succeeded`.
+    """
+
+    for rel_path in (
+        "app/inventory/authority.py",
+        "app/package_update_rollback.py",
+        "app/package_update_mutation.py",
+        "app/package_update_snapshot.py",
+        "app/package_update_execution.py",
+    ):
+        text = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        assert "health_started_at=" not in text, rel_path
+        assert "status='succeeded'" not in text, rel_path
+        assert "checkpoint='health_started'" not in text, rel_path
