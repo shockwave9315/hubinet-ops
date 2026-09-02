@@ -1987,3 +1987,57 @@ def test_end_to_end_docker_health_is_required_when_it_was_asked_for(
     assert [r.reason for r in result.job.health_probe_results] == [
         "container_unhealthy"
     ]
+
+
+def test_contract_drift_mid_snapshot_cannot_starve_the_global_slot(
+    tmp_path: Path,
+) -> None:
+    """Drift must not wedge the one global destructive slot.
+
+    A contract edited while a snapshot operation is in flight makes the job
+    stale, and staleness must route through the SAME established resolver
+    plan drift does: the proven snapshot is retained, the job terminalizes
+    `blocked` without gaining rollback authority, and the slot is freed. An
+    obsolete job whose only way out is a backend restart is precisely what
+    that resolver exists to prevent.
+    """
+
+    from tests.test_package_update_job_authority import _add_approved_resource
+
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    job = _issue(authority, resource, approval)
+    authority.record_package_update_preflight_passed(job.job_id)
+    authority.record_package_update_snapshot_intent(job.job_id)
+    identity = authority.package_update_snapshot_identity(job.job_id)
+    ownership = authority.package_update_snapshot_ownership(job.job_id)
+
+    authority.replace_resource_health_contract(
+        resource.resource_id,
+        (
+            ResourceHealthProbe(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="new.service"
+            ),
+        ),
+    )
+
+    with pytest.raises(AuthorityConflict, match="newer generation"):
+        authority.confirm_package_update_snapshot(
+            job.job_id, _canonical(ownership, identity)
+        )
+
+    blocked, after = (
+        authority.block_package_update_after_snapshot_success_with_stale_authority(
+            job.job_id, _canonical(ownership, identity)
+        )
+    )
+    assert blocked is True
+    assert after.status is PackageUpdateJobStatus.BLOCKED
+    # The snapshot is retained, and retention is not rollback authority.
+    assert after.snapshot_name is not None
+    assert after.snapshot_confirmed_at is None
+    assert after.rollback_operation_id is None
+
+    other, _, other_approval = _add_approved_resource(store, authority)
+    assert _issue(authority, other, other_approval).status is (
+        PackageUpdateJobStatus.ACTIVE
+    )
