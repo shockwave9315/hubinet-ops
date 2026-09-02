@@ -985,3 +985,48 @@ def test_an_element_that_would_need_quoting_is_refused_rather_than_quoted(
             data_argument="a b.service",
         )
     assert guest.remote_command_lines == []
+
+
+def test_the_helper_can_only_report_reasons_the_backend_accepts() -> None:
+    """A closed taxonomy is only closed if both ends agree on it.
+
+    Every reason literal the helper's evaluators and unevaluable paths can
+    produce must be one the transport parses and the authority stores. A
+    helper token the backend rejects would silently turn a truthful probe
+    result into a rejected response -- and a backend token the helper could
+    never send would be dead vocabulary.
+    """
+
+    import ast
+
+    from app.inventory import HEALTH_PROBE_REASONS
+    from app.package_update_health import HOST_PROBE_REASONS
+
+    assert HOST_PROBE_REASONS <= HEALTH_PROBE_REASONS
+
+    source = HELPER_PATH.read_text(encoding="utf-8")
+    module = ast.parse(source, filename=str(HELPER_PATH))
+    produced: set[str] = set()
+    for node in ast.walk(module):
+        # Every unevaluable path: `raise ProbeUnknown("<token>")`.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ProbeUnknown"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            produced.add(node.args[0].value)
+        # Every definitive verdict: `return "<outcome>", "<token>"`.
+        if (
+            isinstance(node, ast.Return)
+            and isinstance(node.value, ast.Tuple)
+            and len(node.value.elts) == 2
+            and all(isinstance(part, ast.Constant) for part in node.value.elts)
+        ):
+            outcome, reason = (part.value for part in node.value.elts)
+            if outcome in ("passed", "failed"):
+                produced.add(reason)
+
+    assert produced, "no reason tokens were found in the helper"
+    assert produced <= HOST_PROBE_REASONS, produced - HOST_PROBE_REASONS
