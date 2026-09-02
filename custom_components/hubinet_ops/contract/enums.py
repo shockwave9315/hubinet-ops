@@ -112,3 +112,24 @@ class PackagePlanApprovalStatus(StrEnum):
     NONE = "none"
     APPROVED = "approved"
     STALE = "stale"
+
+
+class HealthProbeKind(StrEnum):
+    """The exact typed probes an operator may declare in a health contract."""
+
+    SYSTEMD_UNIT_ACTIVE = "systemd_unit_active"
+    DOCKER_CONTAINER_RUNNING = "docker_container_running"
+    DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
+
+
+class HealthContractStatus(StrEnum):
+    """Whether a resource has a declared meaning of healthy.
+
+    `UNCONFIGURED` is not a health verdict and never a passing one -- it says
+    the operator has not declared what healthy means for this workload. There
+    is no health-RESULT enum here, because no health execution exists.
+    """
+
+    UNSUPPORTED = "unsupported"
+    UNCONFIGURED = "unconfigured"
+    CONFIGURED = "configured"

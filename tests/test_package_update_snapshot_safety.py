@@ -1442,7 +1442,7 @@ def test_a_fresh_database_initializes_at_the_current_schema_version(
 ) -> None:
     from app.inventory.store import AUTHORITY_SCHEMA_MARKER, AUTHORITY_SCHEMA_VERSION
 
-    assert AUTHORITY_SCHEMA_VERSION == 14
+    assert AUTHORITY_SCHEMA_VERSION == 15
     store = InventoryAuthorityStore(tmp_path / "authority.db")
     with sqlite3.connect(tmp_path / "authority.db") as connection:
         marker, version = connection.execute(

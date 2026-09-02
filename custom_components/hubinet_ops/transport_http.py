@@ -26,10 +26,15 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import (
     BackendInformation,
     DetailStatus,
+    HealthContractStatus,
+    HealthContractSummary,
+    HealthProbe,
+    HealthProbeKind,
     HubinetOpsApi,
     HubinetOpsApiFactory,
     HubinetOpsCannotConnect,
     HubinetOpsConflict,
+    HubinetOpsHealthContractUnconfigured,
     HubinetOpsInvalidAuth,
     HubinetOpsInvalidResponse,
     HubinetOpsSnapshot,
@@ -46,6 +51,7 @@ from .api import (
     PackagePlanApprovalSnapshot,
     PackagePlanApprovalStatus,
     PresenceState,
+    ResourceHealthContract,
     ResourceSnapshot,
     ResourceStateLevel,
     ResourceType,
@@ -67,6 +73,7 @@ _SNAPSHOT_ROUTE = "/r0/v1/snapshot"
 _PACKAGE_PLAN_APPROVAL_ROUTE = (
     "/r0/v1/resources/{resource_id}/package-plan-approval"
 )
+_HEALTH_CONTRACT_ROUTE = "/r0/v1/resources/{resource_id}/health-contract"
 
 
 def _backend_information(payload: Mapping[str, Any]) -> BackendInformation:
@@ -188,6 +195,61 @@ def _package_plan_approval_snapshot(payload: Any) -> PackagePlanApprovalSnapshot
     )
 
 
+def _health_contract_summary(payload: Any) -> HealthContractSummary:
+    if not isinstance(payload, Mapping):
+        raise TypeError("health_contract must be an object when present")
+    return HealthContractSummary(
+        status=HealthContractStatus(payload["status"]),
+        revision=payload.get("revision"),
+        fingerprint=payload.get("fingerprint"),
+        probe_count=payload.get("probe_count"),
+        updated_at=payload.get("updated_at"),
+    )
+
+
+def _resource_health_contract(
+    resource_id: str, payload: Any
+) -> ResourceHealthContract:
+    """Parse one complete contract document from the health-contract route.
+
+    Only ``configured`` is ever built here: the unconfigured case never
+    reaches this function, because the backend reports it as a distinct 404
+    that the transport raises as
+    ``HubinetOpsHealthContractUnconfigured`` rather than as a contract with
+    nothing in it.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise HubinetOpsInvalidResponse("health contract response is not an object")
+    try:
+        if payload["resource_id"] != resource_id:
+            raise HubinetOpsInvalidResponse(
+                "health contract response names a different resource"
+            )
+        status = HealthContractStatus(payload["status"])
+        if status is not HealthContractStatus.CONFIGURED:
+            raise HubinetOpsInvalidResponse(
+                "health contract response carries material without a contract"
+            )
+        probes = tuple(
+            HealthProbe(
+                kind=HealthProbeKind(probe["kind"]), target=str(probe["target"])
+            )
+            for probe in payload["probes"]
+        )
+        return ResourceHealthContract(
+            resource_id=resource_id,
+            status=status,
+            revision=int(payload["revision"]),
+            fingerprint=str(payload["fingerprint"]),
+            created_at=str(payload["created_at"]),
+            updated_at=str(payload["updated_at"]),
+            probes=probes,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HubinetOpsInvalidResponse(f"malformed health contract: {exc}") from exc
+
+
 def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
     return ResourceSnapshot(
         resource_id=str(payload["resource_id"]),
@@ -234,8 +296,31 @@ def _resource_snapshot(payload: Mapping[str, Any]) -> ResourceSnapshot:
             if "package_plan_approval" not in payload
             else _package_plan_approval_snapshot(payload["package_plan_approval"])
         ),
+        health_contract=(
+            # Backward compatibility with a 0.5 backend predating health
+            # contracts, handled exactly like package_scan above: a genuinely
+            # MISSING key falls back to the default, while a present-but-
+            # malformed value still fails validation. The default is
+            # unconfigured for LXC and unsupported for anything else, because
+            # "we cannot tell" must never render as a declared contract.
+            _default_health_contract_summary(payload)
+            if "health_contract" not in payload
+            else _health_contract_summary(payload["health_contract"])
+        ),
         termination_reason=payload.get("termination_reason"),
         successor_resource_id=payload.get("successor_resource_id"),
+    )
+
+
+def _default_health_contract_summary(
+    payload: Mapping[str, Any],
+) -> HealthContractSummary:
+    return HealthContractSummary(
+        status=(
+            HealthContractStatus.UNCONFIGURED
+            if payload.get("resource_type") == ResourceType.LXC.value
+            else HealthContractStatus.UNSUPPORTED
+        )
     )
 
 
@@ -289,6 +374,67 @@ class HttpHubinetOpsTransport:
                     ) from exc
         except TimeoutError as exc:
             raise HubinetOpsCannotConnect("Hubinet Ops backend request timed out") from exc
+        except aiohttp.ClientConnectorError as exc:
+            raise HubinetOpsCannotConnect(
+                "cannot connect to Hubinet Ops backend"
+            ) from exc
+        except aiohttp.ClientError as exc:
+            raise HubinetOpsCannotConnect("Hubinet Ops backend request failed") from exc
+
+    @staticmethod
+    async def _decode(response: aiohttp.ClientResponse) -> Any:
+        """Map one health-contract response to the typed error taxonomy.
+
+        The 404 split is the point of this helper: an unconfigured contract
+        and a missing resource arrive with the same status code and must not
+        be collapsed, because only one of them means "the operator has not
+        said what healthy means here".
+        """
+
+        if response.status in (401, 403):
+            raise HubinetOpsInvalidAuth(
+                "Hubinet Ops backend rejected the bearer token"
+            )
+        if response.status in (404, 409, 422):
+            error = ""
+            try:
+                body = await response.json()
+            except (aiohttp.ContentTypeError, ValueError):
+                body = None
+            if isinstance(body, Mapping) and isinstance(body.get("detail"), Mapping):
+                error = str(body["detail"].get("error", ""))
+            if error == "contract_unconfigured":
+                raise HubinetOpsHealthContractUnconfigured(
+                    "resource has no configured health contract"
+                )
+            raise HubinetOpsConflict(
+                f"Hubinet Ops refused the health contract request ({error or response.status})"
+            )
+        if response.status != 200:
+            raise HubinetOpsCannotConnect(
+                f"Hubinet Ops backend returned HTTP {response.status}"
+            )
+        try:
+            return await response.json()
+        except (aiohttp.ContentTypeError, ValueError) as exc:
+            raise HubinetOpsInvalidResponse(
+                "Hubinet Ops backend returned a non-JSON body"
+            ) from exc
+
+    async def _health_contract_request(
+        self, method: str, resource_id: str, **kwargs: Any
+    ) -> Any:
+        url = f"{self._base_url}{_HEALTH_CONTRACT_ROUTE.format(resource_id=resource_id)}"
+        headers = {"Authorization": f"Bearer {self._api_token}"}
+        try:
+            async with self._session.request(
+                method, url, headers=headers, timeout=_REQUEST_TIMEOUT, **kwargs
+            ) as response:
+                return await self._decode(response)
+        except TimeoutError as exc:
+            raise HubinetOpsCannotConnect(
+                "Hubinet Ops backend request timed out"
+            ) from exc
         except aiohttp.ClientConnectorError as exc:
             raise HubinetOpsCannotConnect(
                 "cannot connect to Hubinet Ops backend"
@@ -370,6 +516,45 @@ class HttpHubinetOpsTransport:
         ):
             raise HubinetOpsInvalidResponse(
                 "approval response does not match the reviewed plan reference"
+            )
+
+    async def fetch_health_contract(self, resource_id: str) -> ResourceHealthContract:
+        payload = await self._health_contract_request("GET", resource_id)
+        return _resource_health_contract(resource_id, payload)
+
+    async def replace_health_contract(
+        self,
+        resource_id: str,
+        probes: tuple[HealthProbe, ...],
+        expected_revision: int | None,
+    ) -> ResourceHealthContract:
+        body: dict[str, Any] = {
+            "probes": [
+                {"kind": probe.kind.value, "target": probe.target}
+                for probe in probes
+            ]
+        }
+        if expected_revision is not None:
+            body["expected_revision"] = expected_revision
+        payload = await self._health_contract_request("PUT", resource_id, json=body)
+        return _resource_health_contract(resource_id, payload)
+
+    async def clear_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> None:
+        params: dict[str, Any] = {}
+        if expected_revision is not None:
+            params["expected_revision"] = expected_revision
+        payload = await self._health_contract_request(
+            "DELETE", resource_id, params=params
+        )
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("resource_id") != resource_id
+            or payload.get("status") != HealthContractStatus.UNCONFIGURED.value
+        ):
+            raise HubinetOpsInvalidResponse(
+                "clear response does not confirm an unconfigured contract"
             )
 
 

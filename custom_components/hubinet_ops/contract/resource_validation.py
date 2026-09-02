@@ -26,7 +26,11 @@ if TYPE_CHECKING:
 
 
 def validate_resource_snapshot(self: "ResourceSnapshot") -> None:
-    from .models import PackagePlanApprovalSnapshot, PackageScanSnapshot
+    from .models import (
+        HealthContractSummary,
+        PackagePlanApprovalSnapshot,
+        PackageScanSnapshot,
+    )
 
     if not isinstance(self.package_scan, PackageScanSnapshot):
         raise ValueError("package_scan must be a PackageScanSnapshot")
@@ -34,6 +38,8 @@ def validate_resource_snapshot(self: "ResourceSnapshot") -> None:
         raise ValueError(
             "package_plan_approval must be a PackagePlanApprovalSnapshot"
         )
+    if not isinstance(self.health_contract, HealthContractSummary):
+        raise ValueError("health_contract must be a HealthContractSummary")
     _require_uuid_identity(self.resource_id, "resource_id")
     _require_uuid_identity(self.inventory_source_id, "inventory_source_id")
     for value, enum_type, field_name in (

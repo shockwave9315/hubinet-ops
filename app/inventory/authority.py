@@ -49,10 +49,16 @@ from .models import (
     PackageUpdateRollbackTarget,
     PackageUpdateSnapshotIdentity,
     HostRollbackState,
+    ResourceHealthContract,
+    ResourceHealthProbe,
     RollbackSubmissionRefusedBeforeCallback,
     SnapshotOwnership,
     SnapshotSubmissionRefusedBeforeCallback,
     checkpoint_rank as _checkpoint_rank,
+)
+from .health_contract import (
+    canonical_health_probes,
+    health_contract_fingerprint,
 )
 from .mutation_completion import (
     PackageMutationPostState,
@@ -71,7 +77,11 @@ from .discovery import (
 )
 from .provider import PROVIDER_CONTRACT_VERSION
 from .reconciliation import InventoryReconciler, ReconciliationSummary
-from .store import InventoryAuthorityStore
+# `_resource_health_contract` is the store's own row assembler. It is imported
+# directly because a contract read has to happen INSIDE the caller's
+# transaction (a read that opened its own would race a concurrent replace and
+# could return probes from one revision beside another revision's header).
+from .store import InventoryAuthorityStore, _resource_health_contract
 
 
 _T = TypeVar("_T")
@@ -1046,6 +1056,231 @@ class InventoryAuthority:
         if result is None:
             raise AuthorityInvariantError("package plan approval was not captured")
         return result
+
+    # ------------------------------------------------------------------
+    # Operator-declared per-resource health contracts
+    #
+    # CONFIGURATION AUTHORITY ONLY. Nothing in this section executes,
+    # schedules, or evaluates a probe, and nothing here touches a package
+    # update job: a contract is what "healthy" would mean, not a claim that
+    # anything is healthy. See PRODUCT.md and ARCHITECTURE.md, "Dynamic
+    # per-resource health contracts".
+    # ------------------------------------------------------------------
+
+    def resource_health_contract(
+        self, resource_id: str
+    ) -> ResourceHealthContract | None:
+        """Read one exact current resource's complete health contract.
+
+        Returns ``None`` for *unconfigured*, and raises for a resource that
+        does not exist or is no longer the current authority target -- three
+        outcomes a caller must be able to tell apart, because "no contract"
+        and "no such resource" are different facts and neither is health.
+        """
+
+        canonical_resource_id = _require_uuid(resource_id, "resource_id")
+        with self._store._read_transaction() as connection:
+            self._require_current_health_contract_resource(
+                connection, canonical_resource_id
+            )
+            return _resource_health_contract(connection, canonical_resource_id)
+
+    def replace_resource_health_contract(
+        self,
+        resource_id: str,
+        probes: Sequence[ResourceHealthProbe],
+        *,
+        expected_revision: int | None = None,
+    ) -> ResourceHealthContract:
+        """Atomically install one complete health contract for one resource.
+
+        Complete replacement, never a partial probe edit: the caller states
+        the entire set of things that must be true, and either all of it
+        becomes the contract or none of it does. An empty set is refused
+        rather than stored -- clearing is a separate, explicit operation, and
+        "no probes" must never be able to masquerade as a satisfied contract.
+
+        ``expected_revision`` is an optional compare-and-set: ``0`` asserts
+        there is currently no contract, a positive value asserts exactly that
+        revision. It exists so an operator editing a contract from a stale
+        view cannot silently discard a newer one. Omitting it keeps the
+        ordinary single-editor path unconditional.
+        """
+
+        canonical_resource_id = _require_uuid(resource_id, "resource_id")
+        canonical_probes = canonical_health_probes(probes)
+        fingerprint = health_contract_fingerprint(canonical_probes)
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
+        now = _timestamp(self._now())
+        result: ResourceHealthContract | None = None
+
+        with self._store._transaction() as connection:
+            self._require_current_health_contract_resource(
+                connection, canonical_resource_id
+            )
+            existing = _resource_health_contract(connection, canonical_resource_id)
+            self._require_expected_health_contract_revision(existing, expected_revision)
+
+            if existing is not None and existing.fingerprint == fingerprint:
+                # The exact same contract material. Re-declaring it is not a
+                # change, so it must not consume a revision or republish: a
+                # revision has to mean the contract actually became different.
+                return existing
+
+            revision = 1 if existing is None else existing.revision + 1
+            created_at = now if existing is None else existing.created_at
+            if existing is not None:
+                # Compare-and-set on the revision we actually read, so a
+                # concurrent writer that slipped between the read and this
+                # statement cannot be overwritten silently.
+                deleted = connection.execute(
+                    "DELETE FROM resource_health_contracts "
+                    "WHERE resource_id=? AND revision=?",
+                    (canonical_resource_id, existing.revision),
+                ).rowcount
+                if deleted != 1:
+                    raise AuthorityConflict(
+                        "resource health contract changed during replacement"
+                    )
+            # Order matters, and the schema enforces it: the live contract row
+            # is gone before its probes are, and the new probes can only be
+            # inserted against the new contract row that declares them.
+            connection.execute(
+                "DELETE FROM resource_health_contract_probes WHERE resource_id=?",
+                (canonical_resource_id,),
+            )
+            connection.execute(
+                "INSERT INTO resource_health_contracts("
+                "resource_id, revision, fingerprint, probe_count, created_at, "
+                "updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    canonical_resource_id,
+                    revision,
+                    fingerprint,
+                    len(canonical_probes),
+                    created_at,
+                    now,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO resource_health_contract_probes("
+                "resource_id, probe_index, kind, target) VALUES(?, ?, ?, ?)",
+                [
+                    (canonical_resource_id, index, probe.kind.value, probe.target)
+                    for index, probe in enumerate(canonical_probes)
+                ],
+            )
+            self._after_resource_health_contract_write(
+                connection, resource_id=canonical_resource_id
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+            # Capture exactly what this transaction wrote rather than
+            # re-reading the mutable row after commit, which could return a
+            # later writer's contract to this caller.
+            result = ResourceHealthContract(
+                resource_id=canonical_resource_id,
+                revision=revision,
+                fingerprint=fingerprint,
+                created_at=created_at,
+                updated_at=now,
+                probes=canonical_probes,
+            )
+
+        if result is None:
+            raise AuthorityInvariantError("resource health contract was not captured")
+        return result
+
+    def clear_resource_health_contract(
+        self, resource_id: str, *, expected_revision: int | None = None
+    ) -> bool:
+        """Atomically remove one resource's health contract.
+
+        Afterwards the resource is *unconfigured*: it has no declared meaning
+        of healthy, which is the strongest statement this product makes and
+        never a passing one. Returns whether a contract was actually removed,
+        so clearing an already-unconfigured resource is a no-op rather than an
+        error.
+        """
+
+        canonical_resource_id = _require_uuid(resource_id, "resource_id")
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision < 0
+        ):
+            raise ValueError("expected_revision must be a non-negative integer")
+
+        with self._store._transaction() as connection:
+            self._require_current_health_contract_resource(
+                connection, canonical_resource_id
+            )
+            existing = _resource_health_contract(connection, canonical_resource_id)
+            self._require_expected_health_contract_revision(existing, expected_revision)
+            if existing is None:
+                return False
+            deleted = connection.execute(
+                "DELETE FROM resource_health_contracts "
+                "WHERE resource_id=? AND revision=?",
+                (canonical_resource_id, existing.revision),
+            ).rowcount
+            if deleted != 1:
+                raise AuthorityConflict(
+                    "resource health contract changed during clearing"
+                )
+            connection.execute(
+                "DELETE FROM resource_health_contract_probes WHERE resource_id=?",
+                (canonical_resource_id,),
+            )
+            self._after_resource_health_contract_write(
+                connection, resource_id=canonical_resource_id
+            )
+            self._bump_global_revisions(
+                connection, inventory_changed=False, published_changed=True
+            )
+        return True
+
+    def _require_current_health_contract_resource(
+        self, connection: sqlite3.Connection, resource_id: str
+    ) -> sqlite3.Row:
+        """Prove the caller named the exact current authority target.
+
+        Reuses the same current-executable-binding proof the package-scan and
+        approval paths use, so a stale, replaced, missing, quarantined, or
+        retired incarnation fails closed here exactly as it does there. A
+        VMID-reused replacement is a different ``resource_id`` and therefore
+        simply has no contract; nothing is ever transferred to it.
+
+        The contract describes workload package-update health, and package
+        updates are Debian/Ubuntu LXC only, so a QEMU guest is refused rather
+        than allowed to accumulate a declaration no executor could honour.
+        """
+
+        resource = self._require_package_scan_target(connection, resource_id)
+        if str(resource["resource_type"]) != "lxc":
+            raise AuthorityConflict(
+                "resource health contracts support LXC resources only"
+            )
+        return resource
+
+    @staticmethod
+    def _require_expected_health_contract_revision(
+        existing: ResourceHealthContract | None, expected_revision: int | None
+    ) -> None:
+        if expected_revision is None:
+            return
+        current = 0 if existing is None else existing.revision
+        if expected_revision != current:
+            raise AuthorityConflict(
+                "resource health contract revision does not match the expected revision"
+            )
+
+    def _after_resource_health_contract_write(
+        self, connection: sqlite3.Connection, *, resource_id: str
+    ) -> None:
+        """Test seam after the contract write, still inside its transaction."""
 
     def issue_package_update_job(
         self, resource_id: str, approval_id: str, request_id: str

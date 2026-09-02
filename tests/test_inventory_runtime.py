@@ -179,26 +179,34 @@ def test_1_static_ast_scan_finds_no_denylisted_import_in_r0_modules() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_2_only_reads_and_exact_package_plan_approval_route_exist(tmp_path: Path) -> None:
+def test_2_only_reads_and_exact_authority_metadata_writes_exist(tmp_path: Path) -> None:
+    """The R0 route table is an exact allowlist, not a shape.
+
+    Every write this API exposes changes authority metadata and nothing else:
+    the exact-plan approval, and the three per-resource health-contract
+    operations. None of them can start a job, mutate a package, take or roll
+    back a snapshot, or run a healthcheck -- and this test is what stops a
+    later route from quietly becoming the first one that can.
+    """
+
     app, _config = _build_app(tmp_path)
-    found_r0_route = False
-    mutation_routes = []
+    observed: dict[str, set[str]] = {}
     for route in app.routes:
         methods = getattr(route, "methods", None)
-        if methods is None:
+        path = str(getattr(route, "path", ""))
+        if methods is None or not path.startswith("/r0/v1"):
             continue
-        assert methods <= {"GET", "HEAD", "OPTIONS", "PUT"}, (
-            getattr(route, "path", route),
-            methods,
+        observed.setdefault(path, set()).update(
+            method for method in methods if method not in {"HEAD", "OPTIONS"}
         )
-        if "PUT" in methods:
-            mutation_routes.append(str(getattr(route, "path", "")))
-        if str(getattr(route, "path", "")).startswith("/r0/v1"):
-            found_r0_route = True
-    assert found_r0_route
-    assert mutation_routes == [
-        "/r0/v1/resources/{resource_id}/package-plan-approval"
-    ]
+
+    assert observed == {
+        "/r0/v1/health": {"GET"},
+        "/r0/v1/backend": {"GET"},
+        "/r0/v1/snapshot": {"GET"},
+        "/r0/v1/resources/{resource_id}/package-plan-approval": {"PUT"},
+        "/r0/v1/resources/{resource_id}/health-contract": {"GET", "PUT", "DELETE"},
+    }
     assert app.docs_url is None
     assert app.redoc_url is None
     assert app.openapi_url is None
@@ -588,3 +596,283 @@ def test_40_composition_root_never_touches_an_unrelated_legacy_db_on_disk(
 
     assert legacy_elsewhere.read_bytes() == before
     assert fresh_db_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Per-resource health contracts over HTTP.
+#
+# Authority metadata only: these three routes read and write what "healthy"
+# would mean for one exact resource incarnation. Nothing they do can start a
+# job, mutate a package, or run a probe -- there is no healthcheck executor to
+# reach.
+# ---------------------------------------------------------------------------
+
+_HEALTH_PROBES = [
+    {"kind": "systemd_unit_active", "target": "nginx.service"},
+    {"kind": "docker_container_healthy", "target": "immich_server"},
+]
+
+
+def _health_contract_path(resource_id: str) -> str:
+    return f"/r0/v1/resources/{resource_id}/health-contract"
+
+
+def _discover_lxc_resource(app, config, monkeypatch):
+    source_id = app.state.store.list_source_states()[0].source.inventory_source_id
+    _run_discovery(
+        monkeypatch,
+        config,
+        app.state.authority,
+        source_id,
+        guests=({"vmid": 101, "type": "lxc", "name": "ct1", "status": "running"},),
+    )
+    return app.state.store.list_resources(source_id)[0]
+
+
+def test_health_contract_routes_require_bearer_authentication(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app, config = _build_app(tmp_path)
+    resource = _discover_lxc_resource(app, config, monkeypatch)
+    path = _health_contract_path(resource.resource_id)
+    client = TestClient(app)
+
+    assert client.get(path).status_code == 401
+    assert client.put(path, json={"probes": _HEALTH_PROBES}).status_code == 401
+    assert client.delete(path).status_code == 401
+    assert client.get(path, headers={"Authorization": "Bearer wrong"}).status_code == 401
+    # Nothing was written by any unauthenticated attempt.
+    assert app.state.store.resource_health_contract(resource.resource_id) is None
+
+
+def test_health_contract_get_distinguishes_unconfigured_from_unknown_resource(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An absent contract is never a 200 with an empty probe list."""
+
+    app, config = _build_app(tmp_path)
+    resource = _discover_lxc_resource(app, config, monkeypatch)
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+
+    unconfigured = client.get(_health_contract_path(resource.resource_id), headers=headers)
+    assert unconfigured.status_code == 404
+    assert unconfigured.json()["detail"]["error"] == "contract_unconfigured"
+
+    unknown = client.get(
+        _health_contract_path("11111111-1111-1111-1111-111111111111"),
+        headers=headers,
+    )
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"]["error"] == "resource_not_found"
+
+    assert client.get("/r0/v1/resources/not-a-uuid/health-contract", headers=headers).status_code == 422
+
+
+def test_health_contract_put_then_get_returns_the_exact_canonical_contract(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    app, config = _build_app(tmp_path)
+    resource = _discover_lxc_resource(app, config, monkeypatch)
+    path = _health_contract_path(resource.resource_id)
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+
+    def forbidden_host_call(*args, **kwargs):
+        raise AssertionError("health contract route reached package host control")
+
+    monkeypatch.setattr(
+        app.state.package_scan_host_control, "scan_packages", forbidden_host_call
+    )
+
+    created = client.put(
+        path, headers=headers, json={"probes": list(reversed(_HEALTH_PROBES))}
+    )
+    assert created.status_code == 200
+    body = created.json()
+    assert body["resource_id"] == resource.resource_id
+    assert body["status"] == "configured"
+    assert body["revision"] == 1
+    # Canonical order, independent of how the operator listed them.
+    assert body["probes"] == [
+        {"kind": "docker_container_healthy", "target": "immich_server"},
+        {"kind": "systemd_unit_active", "target": "nginx.service"},
+    ]
+    assert client.get(path, headers=headers).json() == body
+
+    # Same material again is not a change, so the revision does not move.
+    assert client.put(path, headers=headers, json={"probes": _HEALTH_PROBES}).json() == body
+    replaced = client.put(
+        path,
+        headers=headers,
+        json={"probes": [{"kind": "docker_container_running", "target": "redis"}]},
+    ).json()
+    assert replaced["revision"] == 2
+    assert replaced["fingerprint"] != body["fingerprint"]
+    assert replaced["created_at"] == body["created_at"]
+
+    # The published snapshot carries the summary, never the probe list.
+    published = client.get("/r0/v1/snapshot", headers=headers).json()["resources"][0]
+    assert published["health_contract"] == {
+        "status": "configured",
+        "revision": 2,
+        "fingerprint": replaced["fingerprint"],
+        "probe_count": 1,
+        "updated_at": replaced["updated_at"],
+    }
+    assert config.api_bearer_token not in created.text
+    assert config.api_bearer_token not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        {},
+        {"probes": []},
+        {"probes": _HEALTH_PROBES, "unexpected": True},
+        {"probes": [{"kind": "http_get", "target": "https://example"}]},
+        {"probes": [{"kind": "systemd_unit_active"}]},
+        {"probes": [{"kind": "systemd_unit_active", "target": ""}]},
+        {"probes": [{"kind": "systemd_unit_active", "target": "a b.service"}]},
+        {"probes": [{"kind": "systemd_unit_active", "target": "x" * 201}]},
+        # No command-shaped field may ever be accepted alongside a probe.
+        {
+            "probes": [
+                {
+                    "kind": "systemd_unit_active",
+                    "target": "nginx.service",
+                    "command": "rm -rf /",
+                }
+            ]
+        },
+        # Duplicate (kind, target): an all-of contract stating the same
+        # requirement twice is a mistake, not a shape to silently repair.
+        {"probes": _HEALTH_PROBES + [_HEALTH_PROBES[0]]},
+        # Bounded payload: 33 probes exceeds the durable maximum of 32.
+        {
+            "probes": [
+                {"kind": "systemd_unit_active", "target": f"unit-{index}.service"}
+                for index in range(33)
+            ]
+        },
+        {"probes": _HEALTH_PROBES, "expected_revision": -1},
+    ),
+)
+def test_health_contract_put_refuses_malformed_or_unbounded_declarations(
+    tmp_path: Path, monkeypatch, body
+) -> None:
+    app, config = _build_app(tmp_path)
+    resource = _discover_lxc_resource(app, config, monkeypatch)
+    path = _health_contract_path(resource.resource_id)
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+
+    response = client.put(path, headers=headers, json=body)
+    assert response.status_code == 422, response.text
+    assert app.state.store.resource_health_contract(resource.resource_id) is None
+
+
+def test_health_contract_delete_is_idempotent_and_means_unconfigured(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app, config = _build_app(tmp_path)
+    resource = _discover_lxc_resource(app, config, monkeypatch)
+    path = _health_contract_path(resource.resource_id)
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+
+    client.put(path, headers=headers, json={"probes": _HEALTH_PROBES})
+    cleared = client.delete(path, headers=headers)
+    assert cleared.status_code == 200
+    assert cleared.json() == {
+        "resource_id": resource.resource_id,
+        "status": "unconfigured",
+        "cleared": True,
+    }
+    again = client.delete(path, headers=headers)
+    assert again.status_code == 200
+    assert again.json()["cleared"] is False
+    # And the resource is now unconfigured, not healthy and not passing.
+    assert client.get(path, headers=headers).json()["detail"]["error"] == (
+        "contract_unconfigured"
+    )
+
+
+def test_health_contract_compare_and_set_refuses_a_stale_editor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app, config = _build_app(tmp_path)
+    resource = _discover_lxc_resource(app, config, monkeypatch)
+    path = _health_contract_path(resource.resource_id)
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+
+    first = client.put(
+        path, headers=headers, json={"probes": _HEALTH_PROBES, "expected_revision": 0}
+    )
+    assert first.status_code == 200
+    stale = client.put(
+        path,
+        headers=headers,
+        json={
+            "probes": [{"kind": "docker_container_running", "target": "redis"}],
+            "expected_revision": 0,
+        },
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["error"] == "resource_not_current"
+    assert client.delete(f"{path}?expected_revision=7", headers=headers).status_code == 409
+    # The refused writes left the original contract exactly as it was.
+    assert client.get(path, headers=headers).json() == first.json()
+    assert client.delete(f"{path}?expected_revision=1", headers=headers).status_code == 200
+
+
+def test_health_contract_routes_fail_closed_on_a_non_current_resource(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A QEMU guest and a replaced incarnation are both refused, not defaulted."""
+
+    app, config = _build_app(tmp_path)
+    source_id = app.state.store.list_source_states()[0].source.inventory_source_id
+    _run_discovery(
+        monkeypatch,
+        config,
+        app.state.authority,
+        source_id,
+        guests=({"vmid": 101, "type": "lxc", "name": "ct1", "status": "running"},),
+    )
+    resource = app.state.store.list_resources(source_id)[0]
+    path = _health_contract_path(resource.resource_id)
+    headers = {"Authorization": f"Bearer {config.api_bearer_token}"}
+    client = TestClient(app)
+    assert client.put(path, headers=headers, json={"probes": _HEALTH_PROBES}).status_code == 200
+
+    # The same VMID now hosts a QEMU guest: a different resource incarnation.
+    _run_discovery(
+        monkeypatch,
+        config,
+        app.state.authority,
+        source_id,
+        guests=({"vmid": 101, "type": "qemu", "name": "vm1", "status": "running"},),
+    )
+    successor = next(
+        item
+        for item in app.state.store.list_resources(source_id)
+        if item.resource_id != resource.resource_id
+    )
+
+    for method in ("get", "put", "delete"):
+        for target in (resource.resource_id, successor.resource_id):
+            call = getattr(client, method)
+            kwargs = {"headers": headers}
+            if method == "put":
+                kwargs["json"] = {"probes": _HEALTH_PROBES}
+            response = call(_health_contract_path(target), **kwargs)
+            assert response.status_code == 409, (method, target, response.text)
+            assert response.json()["detail"]["error"] == "resource_not_current"
+
+    # The successor never inherited anything, and the predecessor's own
+    # historical row was not edited by any of those refusals.
+    assert app.state.store.resource_health_contract(successor.resource_id) is None
+    predecessor = app.state.store.resource_health_contract(resource.resource_id)
+    assert predecessor is not None and predecessor.revision == 1

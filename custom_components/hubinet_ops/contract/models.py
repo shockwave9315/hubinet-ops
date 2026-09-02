@@ -10,6 +10,8 @@ from typing import Any
 
 from .enums import (
     DetailStatus,
+    HealthContractStatus,
+    HealthProbeKind,
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
@@ -22,6 +24,11 @@ from .enums import (
     SourceFreshness,
     SourceHealth,
     SourceHealthOrigin,
+)
+from .health_contract_validation import (
+    validate_health_contract_summary,
+    validate_health_probe,
+    validate_resource_health_contract,
 )
 from .primitives import _immutable_mapping, _require_uuid_identity
 from .package_scan_validation import validate_package_scan_snapshot
@@ -229,6 +236,63 @@ class PackagePlanApprovalSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class HealthProbe:
+    """One required typed probe: `kind` selects fixed argv, `target` is data."""
+
+    kind: HealthProbeKind
+    target: str
+
+    def __post_init__(self) -> None:
+        validate_health_probe(self)
+
+
+@dataclass(frozen=True, slots=True)
+class HealthContractSummary:
+    """The per-resource health-contract fact carried in the snapshot.
+
+    Identity only -- never the probe list, which belongs to the explicit
+    health-contract action, and never a health result, which does not exist.
+    """
+
+    status: HealthContractStatus = HealthContractStatus.UNCONFIGURED
+    revision: int | None = None
+    fingerprint: str | None = None
+    probe_count: int | None = None
+    updated_at: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_health_contract_summary(self)
+
+    @property
+    def configured(self) -> bool:
+        """Whether a declared meaning of healthy exists for this resource."""
+
+        return self.status is HealthContractStatus.CONFIGURED
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceHealthContract:
+    """One resource's complete health contract material, or its absence.
+
+    ``probes`` is ``None`` when unconfigured, never an empty tuple: "no
+    contract" and "a contract that requires nothing" are different claims, and
+    only the first one is true.
+    """
+
+    resource_id: str
+    status: HealthContractStatus = HealthContractStatus.UNCONFIGURED
+    revision: int | None = None
+    fingerprint: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    probes: tuple[HealthProbe, ...] | None = None
+
+    def __post_init__(self) -> None:
+        _require_uuid_identity(self.resource_id, "resource_id")
+        validate_resource_health_contract(self)
+
+
+@dataclass(frozen=True, slots=True)
 class ResourceSnapshot:
     """One backend-owned resource incarnation and effective presentation view."""
 
@@ -263,6 +327,9 @@ class ResourceSnapshot:
     package_scan: PackageScanSnapshot = field(default_factory=PackageScanSnapshot)
     package_plan_approval: PackagePlanApprovalSnapshot = field(
         default_factory=PackagePlanApprovalSnapshot
+    )
+    health_contract: HealthContractSummary = field(
+        default_factory=HealthContractSummary
     )
     termination_reason: str | None = None
     successor_resource_id: str | None = None

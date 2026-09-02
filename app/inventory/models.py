@@ -281,6 +281,26 @@ class PackageScanFailure(StrEnum):
     EXECUTION_FAILED = "execution_failed"
 
 
+class HealthProbeKind(StrEnum):
+    """The exact typed workload-health probes an operator may declare.
+
+    Deliberately closed and deliberately small. Each member names one fixed
+    argv operation a future executor can perform truthfully against a
+    Debian/Ubuntu LXC guest; there is no member for "run this command", and
+    there never will be. `PRODUCT.md` records why this list is what it is.
+    """
+
+    #: The explicitly named systemd unit must be active.
+    SYSTEMD_UNIT_ACTIVE = "systemd_unit_active"
+    #: The explicitly named Docker container must be running.
+    DOCKER_CONTAINER_RUNNING = "docker_container_running"
+    #: The explicitly named Docker container must be running AND report
+    #: Docker HEALTHCHECK status healthy. A container with no HEALTHCHECK
+    #: therefore cannot satisfy this probe -- that is the point of choosing
+    #: it over ``docker_container_running``.
+    DOCKER_CONTAINER_HEALTHY = "docker_container_healthy"
+
+
 class PersistentSourceHealth(StrEnum):
     HEALTHY = "healthy"
     SOURCE_UNAVAILABLE = "source_unavailable"
@@ -623,6 +643,33 @@ class PackagePlanApproval:
     reviewed_scan_run_id: str
     approved_plan_fingerprint: str
     approved_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceHealthProbe:
+    """One required typed probe inside an operator-declared health contract."""
+
+    kind: HealthProbeKind
+    target: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceHealthContract:
+    """One exact resource incarnation's complete current health contract.
+
+    ``probes`` is the complete required set in canonical order: every one of
+    them must hold. ``fingerprint`` covers only that material, so a future
+    health-execution stage can record exactly which contract it evaluated.
+    There is no "empty contract" value of this type -- a resource with no
+    contract has no row at all, which is *unconfigured*, never healthy.
+    """
+
+    resource_id: str
+    revision: int
+    fingerprint: str
+    created_at: str
+    updated_at: str
+    probes: tuple[ResourceHealthProbe, ...]
 
 
 @dataclass(frozen=True, slots=True)

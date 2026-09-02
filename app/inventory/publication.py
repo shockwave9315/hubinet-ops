@@ -113,6 +113,20 @@ class InventoryPublication:
             approval_by_resource = {
                 str(row["resource_id"]): row for row in approval_rows
             }
+            # Headers only. The probe list is deliberately NOT published in
+            # the snapshot: it is contract material an operator reads and
+            # edits through the dedicated health-contract endpoint/action, not
+            # something every Home Assistant poll should carry into entity
+            # state. What the snapshot owes a viewer is the one fact that
+            # changes how they should read everything else -- whether a
+            # resource has a declared meaning of healthy at all.
+            health_contract_rows = connection.execute(
+                "SELECT resource_id, revision, fingerprint, probe_count, updated_at "
+                "FROM resource_health_contracts ORDER BY resource_id"
+            ).fetchall()
+            health_contract_by_resource = {
+                str(row["resource_id"]): row for row in health_contract_rows
+            }
             package_rows = connection.execute(
                 "SELECT package.* FROM package_scan_packages package "
                 "JOIN package_scan_runs run USING(scan_run_id) "
@@ -136,6 +150,7 @@ class InventoryPublication:
                     scan_by_resource.get(str(row["resource_id"])),
                     approval_by_resource.get(str(row["resource_id"])),
                     packages_by_run,
+                    health_contract_by_resource.get(str(row["resource_id"])),
                 )
                 for row in resource_rows
             )
@@ -211,6 +226,7 @@ class InventoryPublication:
         scan,
         approval,
         packages_by_run: Mapping[str, list[Any]],
+        health_contract,
     ) -> dict[str, Any]:
         return {
             "resource_id": str(row["resource_id"]),
@@ -242,6 +258,9 @@ class InventoryPublication:
             ),
             "package_plan_approval": self._package_plan_approval(
                 connection, row, scan, approval
+            ),
+            "health_contract": InventoryPublication._health_contract(
+                row, health_contract
             ),
             "termination_reason": row["termination_reason"],
             "successor_resource_id": row["successor_resource_id"],
@@ -332,6 +351,41 @@ class InventoryPublication:
             raise RuntimeError(
                 "successful package scan package rows do not match pending count"
             )
+        return base
+
+    @staticmethod
+    def _health_contract(resource, contract) -> dict[str, Any]:
+        """Publish whether this resource has a declared meaning of healthy.
+
+        Three states and no fourth: `unsupported` for a resource type whose
+        workload packages this product does not update, `unconfigured` when no
+        contract exists, and `configured` when one does. `unconfigured` is
+        never a passing state, and none of these is a health RESULT -- no
+        health execution exists, so no result exists to publish.
+        """
+
+        base = {
+            "status": (
+                "unsupported"
+                if resource["resource_type"] != "lxc"
+                else "unconfigured"
+            ),
+            "revision": None,
+            "fingerprint": None,
+            "probe_count": None,
+            "updated_at": None,
+        }
+        if contract is None or resource["resource_type"] != "lxc":
+            return base
+        base.update(
+            {
+                "status": "configured",
+                "revision": int(contract["revision"]),
+                "fingerprint": str(contract["fingerprint"]),
+                "probe_count": int(contract["probe_count"]),
+                "updated_at": str(contract["updated_at"]),
+            }
+        )
         return base
 
     def _package_plan_approval(

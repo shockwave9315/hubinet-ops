@@ -12,7 +12,8 @@ runtime. It constructs exactly:
 - the R0 discovery scheduler (``app.inventory_scheduler.R0Scheduler``, via
   ``bootstrap_and_start_r0_runtime`` -- recovery, then config-drift
   reconciliation, then scheduling, in that exact order);
-- the bounded HTTP route table below (read-only inventory plus exact-plan approval).
+- the bounded HTTP route table below (read-only inventory, exact-plan
+  approval, and per-resource health-contract configuration).
 
 Import denylist (never import, directly or transitively, from this
 module, ``app.inventory_scheduler``, or ``app.inventory_pve_transport``):
@@ -38,16 +39,29 @@ import os
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Path as ApiPath,
+    Query,
+    Request,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.inventory import (
     AuthorityConflict,
     AuthorityNotFound,
+    HealthProbeKind,
     InventoryAuthority,
     InventoryAuthorityStore,
     InventoryPublication,
+    MAX_HEALTH_PROBES,
+    MAX_HEALTH_PROBE_TARGET_LENGTH,
+    MIN_HEALTH_PROBES,
+    ResourceHealthContract,
+    ResourceHealthProbe,
 )
 from app.inventory_runtime_config import R0RuntimeConfig, load_r0_runtime_config
 from app.inventory_scheduler import R0Scheduler, bootstrap_and_start_r0_runtime
@@ -71,6 +85,75 @@ class PackagePlanApprovalRequest(BaseModel):
 
     scan_run_id: str = Field(pattern=_CANONICAL_UUID_PATTERN)
     plan_fingerprint: str = Field(pattern=_PLAN_FINGERPRINT_PATTERN)
+
+
+class HealthProbeRequest(BaseModel):
+    """One required typed probe in a declared health contract.
+
+    Exactly two fields, forever. There is no ``command``, ``argv``, ``shell``,
+    ``script``, ``executable``, ``working_directory``, or ``environment``
+    here, and ``extra="forbid"`` means a caller cannot smuggle one in: the
+    future executor builds fixed argv from ``kind``, and ``target`` is data
+    that only ever becomes one bounded argument.
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    # `strict=False` on this one field only: JSON carries the enum's wire
+    # value as a string, and strict mode would otherwise demand an actual
+    # enum member. The value set stays exactly `HealthProbeKind` -- anything
+    # else is still a 422.
+    kind: Annotated[HealthProbeKind, Field(strict=False)]
+    target: str = Field(min_length=1, max_length=MAX_HEALTH_PROBE_TARGET_LENGTH)
+
+
+class HealthContractRequest(BaseModel):
+    """The complete health contract an operator declares for one resource.
+
+    Complete replacement only -- there is no probe-level patch verb -- and at
+    least one probe, because an empty contract is malformed rather than
+    trivially satisfied. ``expected_revision`` is an optional compare-and-set
+    (``0`` meaning "currently unconfigured").
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    probes: list[HealthProbeRequest] = Field(
+        min_length=MIN_HEALTH_PROBES, max_length=MAX_HEALTH_PROBES
+    )
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+def _health_contract_error(status_code: int, error: str, message: str) -> HTTPException:
+    """Build one machine-distinguishable health-contract failure.
+
+    The taxonomy matters more here than anywhere else in this API: a caller
+    MUST be able to tell "this resource is not the current authority target"
+    from "this resource has no contract" from "your request was malformed".
+    Collapsing the middle one into a successful empty contract would report
+    absence as health, which is the exact thing this product refuses to do.
+    """
+
+    return HTTPException(
+        status_code=status_code, detail={"error": error, "message": message}
+    )
+
+
+def _health_contract_body(
+    resource_id: str, contract: ResourceHealthContract
+) -> dict[str, Any]:
+    return {
+        "resource_id": resource_id,
+        "status": "configured",
+        "revision": contract.revision,
+        "fingerprint": contract.fingerprint,
+        "created_at": contract.created_at,
+        "updated_at": contract.updated_at,
+        "probes": [
+            {"kind": probe.kind.value, "target": probe.target}
+            for probe in contract.probes
+        ],
+    }
 
 
 def _thaw(value: Any) -> Any:
@@ -254,6 +337,105 @@ def create_read_only_app(
             "reviewed_scan_run_id": approval.reviewed_scan_run_id,
             "plan_fingerprint": approval.approved_plan_fingerprint,
             "approved_at": approval.approved_at,
+        }
+
+    # ------------------------------------------------------------------
+    # Per-resource health contracts.
+    #
+    # Authority metadata only. These three routes read and write what
+    # "healthy" would mean for one exact resource incarnation; none of them
+    # runs a probe, issues a job, or advances any update-lifecycle state, and
+    # there is no healthcheck executor for them to reach.
+    # ------------------------------------------------------------------
+
+    _HEALTH_CONTRACT_ROUTE = f"{API_PREFIX}/resources/{{resource_id}}/health-contract"
+
+    def _health_contract_or_error(resource_id: str) -> ResourceHealthContract:
+        try:
+            contract = authority.resource_health_contract(resource_id)
+        except AuthorityNotFound as exc:
+            raise _health_contract_error(404, "resource_not_found", str(exc)) from exc
+        except AuthorityConflict as exc:
+            raise _health_contract_error(409, "resource_not_current", str(exc)) from exc
+        if contract is None:
+            raise _health_contract_error(
+                404,
+                "contract_unconfigured",
+                "resource has no configured health contract",
+            )
+        return contract
+
+    @app.get(
+        _HEALTH_CONTRACT_ROUTE, dependencies=[Depends(_require_bearer_token)]
+    )
+    def read_health_contract(
+        resource_id: Annotated[str, ApiPath(pattern=_CANONICAL_UUID_PATTERN)],
+    ) -> dict[str, Any]:
+        """Return one resource's complete current health contract.
+
+        An unconfigured resource is a 404 carrying ``contract_unconfigured``,
+        never a 200 with an empty probe list: absence of a contract is not a
+        contract that nothing has to satisfy.
+        """
+
+        return _health_contract_body(
+            resource_id, _health_contract_or_error(resource_id)
+        )
+
+    @app.put(
+        _HEALTH_CONTRACT_ROUTE, dependencies=[Depends(_require_bearer_token)]
+    )
+    def replace_health_contract(
+        body: HealthContractRequest,
+        resource_id: Annotated[str, ApiPath(pattern=_CANONICAL_UUID_PATTERN)],
+    ) -> dict[str, Any]:
+        """Install one complete health contract. Authority state only."""
+
+        try:
+            contract = authority.replace_resource_health_contract(
+                resource_id,
+                tuple(
+                    ResourceHealthProbe(kind=probe.kind, target=probe.target)
+                    for probe in body.probes
+                ),
+                expected_revision=body.expected_revision,
+            )
+        except AuthorityNotFound as exc:
+            raise _health_contract_error(404, "resource_not_found", str(exc)) from exc
+        except AuthorityConflict as exc:
+            raise _health_contract_error(409, "resource_not_current", str(exc)) from exc
+        except ValueError as exc:
+            raise _health_contract_error(422, "invalid_contract", str(exc)) from exc
+        return _health_contract_body(resource_id, contract)
+
+    @app.delete(
+        _HEALTH_CONTRACT_ROUTE, dependencies=[Depends(_require_bearer_token)]
+    )
+    def clear_health_contract(
+        resource_id: Annotated[str, ApiPath(pattern=_CANONICAL_UUID_PATTERN)],
+        expected_revision: Annotated[int | None, Query(ge=0)] = None,
+    ) -> dict[str, Any]:
+        """Clear one resource's health contract.
+
+        Afterwards the resource is unconfigured -- it has no declared meaning
+        of healthy. That is emphatically not "healthy", and no caller may read
+        it as one.
+        """
+
+        try:
+            cleared = authority.clear_resource_health_contract(
+                resource_id, expected_revision=expected_revision
+            )
+        except AuthorityNotFound as exc:
+            raise _health_contract_error(404, "resource_not_found", str(exc)) from exc
+        except AuthorityConflict as exc:
+            raise _health_contract_error(409, "resource_not_current", str(exc)) from exc
+        except ValueError as exc:
+            raise _health_contract_error(422, "invalid_contract", str(exc)) from exc
+        return {
+            "resource_id": resource_id,
+            "status": "unconfigured",
+            "cleared": cleared,
         }
 
     return app

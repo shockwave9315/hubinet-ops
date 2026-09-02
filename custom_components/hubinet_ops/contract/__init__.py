@@ -2,6 +2,8 @@
 
 from .enums import (
     DetailStatus,
+    HealthContractStatus,
+    HealthProbeKind,
     LifecycleState,
     NodeAvailability,
     ObservationalContinuity,
@@ -17,6 +19,8 @@ from .enums import (
 )
 from .models import (
     BackendInformation,
+    HealthContractSummary,
+    HealthProbe,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     NodeSnapshot,
@@ -25,6 +29,7 @@ from .models import (
     PackageScanPackage,
     PackageScanSnapshot,
     PackagePlanApprovalSnapshot,
+    ResourceHealthContract,
     ResourceSnapshot,
     SourceContext,
 )
@@ -32,6 +37,10 @@ from .models import (
 __all__ = (
     "BackendInformation",
     "DetailStatus",
+    "HealthContractStatus",
+    "HealthContractSummary",
+    "HealthProbe",
+    "HealthProbeKind",
     "HubinetOpsSnapshot",
     "InventorySourceSnapshot",
     "LifecycleState",
@@ -46,6 +55,7 @@ __all__ = (
     "PackageScanSnapshot",
     "PackagePlanApprovalSnapshot",
     "PresenceState",
+    "ResourceHealthContract",
     "ResourceSnapshot",
     "ResourceStateLevel",
     "ResourceType",

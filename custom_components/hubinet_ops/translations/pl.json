@@ -68,6 +68,14 @@
           "stale": "Nieaktualny"
         }
       },
+      "resource_health_contract": {
+        "name": "Kontrakt zdrowia",
+        "state": {
+          "unsupported": "Nieobsługiwany",
+          "unconfigured": "Nieskonfigurowany",
+          "configured": "Skonfigurowany"
+        }
+      },
       "resource_pending_updates": {"name": "Oczekujące aktualizacje"},
       "resource_last_package_scan": {"name": "Ostatnie skanowanie pakietów"},
       "resource_reboot_required": {"name": "Wymagany restart"}
@@ -99,6 +107,48 @@
         "plan_fingerprint": {
           "name": "Odcisk planu",
           "description": "Dokładny odcisk materialnego planu zwrócony przez akcję Wyświetl plan aktualizacji."
+        }
+      }
+    },
+    "view_health_contract": {
+      "name": "Wyświetl kontrakt zdrowia",
+      "description": "Odczytuje kontrakt zdrowia zadeklarowany dla wybranego zasobu Hubinet Ops. Brak kontraktu oznacza brak konfiguracji, nigdy zdrowie.",
+      "fields": {
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
+        }
+      }
+    },
+    "set_health_contract": {
+      "name": "Ustaw kontrakt zdrowia",
+      "description": "Zastępuje kompletny kontrakt zdrowia dla wybranego zasobu Hubinet Ops. Każda zadeklarowana sonda jest wymagana.",
+      "fields": {
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
+        },
+        "probes": {
+          "name": "Sondy",
+          "description": "Pełna lista wymaganych sond, każda z rodzajem (systemd_unit_active, docker_container_running lub docker_container_healthy) i nazwą celu."
+        },
+        "expected_revision": {
+          "name": "Oczekiwana rewizja",
+          "description": "Opcjonalne. Odrzuca zmianę, jeśli zapisany kontrakt nie jest już w tej rewizji; 0 wymaga braku kontraktu."
+        }
+      }
+    },
+    "clear_health_contract": {
+      "name": "Wyczyść kontrakt zdrowia",
+      "description": "Usuwa kontrakt zdrowia dla wybranego zasobu Hubinet Ops. Zasób staje się nieskonfigurowany, co nie oznacza zdrowia.",
+      "fields": {
+        "device_id": {
+          "name": "Zasób",
+          "description": "Wybierz zasób roboczy zarządzany przez Hubinet Ops."
+        },
+        "expected_revision": {
+          "name": "Oczekiwana rewizja",
+          "description": "Opcjonalne. Odrzuca zmianę, jeśli zapisany kontrakt nie jest już w tej rewizji."
         }
       }
     }

@@ -7,6 +7,10 @@ from typing import Protocol
 from .contract import (
     BackendInformation,
     DetailStatus,
+    HealthContractStatus,
+    HealthContractSummary,
+    HealthProbe,
+    HealthProbeKind,
     HubinetOpsSnapshot,
     InventorySourceSnapshot,
     LifecycleState,
@@ -21,6 +25,7 @@ from .contract import (
     PackagePlanApprovalSnapshot,
     PackagePlanApprovalStatus,
     PresenceState,
+    ResourceHealthContract,
     ResourceSnapshot,
     ResourceStateLevel,
     ResourceType,
@@ -52,6 +57,16 @@ class HubinetOpsConflict(HubinetOpsApiError):
     """The backend refused a stale or mismatched exact plan reference."""
 
 
+class HubinetOpsHealthContractUnconfigured(HubinetOpsApiError):
+    """The resource exists and is current, but declares no health contract.
+
+    A distinct exception rather than an empty result, deliberately: this is
+    the one answer a caller must never be able to mistake for "nothing needs
+    checking, so it is healthy". Callers that legitimately want to *display*
+    the unconfigured state catch this and say so explicitly.
+    """
+
+
 class HubinetOpsTransport(Protocol):
     """Typed backend transport with one exact-plan approval mutation."""
 
@@ -68,6 +83,22 @@ class HubinetOpsTransport(Protocol):
         self, resource_id: str, scan_run_id: str, plan_fingerprint: str
     ) -> None:
         """Approve the caller-supplied exact reviewed plan reference."""
+
+    async def fetch_health_contract(self, resource_id: str) -> ResourceHealthContract:
+        """Read one exact resource's complete declared health contract."""
+
+    async def replace_health_contract(
+        self,
+        resource_id: str,
+        probes: tuple[HealthProbe, ...],
+        expected_revision: int | None,
+    ) -> ResourceHealthContract:
+        """Install one complete health contract for one exact resource."""
+
+    async def clear_health_contract(
+        self, resource_id: str, expected_revision: int | None
+    ) -> None:
+        """Clear one exact resource's health contract."""
 
 
 class HubinetOpsApi:
@@ -110,6 +141,32 @@ class HubinetOpsApi:
             resource_id, scan_run_id, plan_fingerprint
         )
 
+    async def async_fetch_health_contract(
+        self, resource_id: str
+    ) -> ResourceHealthContract:
+        """Read one resource's declared health contract."""
+
+        return await self._transport.fetch_health_contract(resource_id)
+
+    async def async_replace_health_contract(
+        self,
+        resource_id: str,
+        probes: tuple[HealthProbe, ...],
+        expected_revision: int | None = None,
+    ) -> ResourceHealthContract:
+        """Forward one complete declared contract unchanged."""
+
+        return await self._transport.replace_health_contract(
+            resource_id, probes, expected_revision
+        )
+
+    async def async_clear_health_contract(
+        self, resource_id: str, expected_revision: int | None = None
+    ) -> None:
+        """Make one resource's health contract unconfigured."""
+
+        await self._transport.clear_health_contract(resource_id, expected_revision)
+
 
 class HubinetOpsApiFactory(Protocol):
     """Factory boundary used by config flow, setup and fake transports."""
@@ -140,6 +197,22 @@ class _UnconfiguredPhaseZeroTransport:
 
     async def approve_package_plan(
         self, resource_id: str, scan_run_id: str, plan_fingerprint: str
+    ) -> None:
+        raise self._error()
+
+    async def fetch_health_contract(self, resource_id: str) -> ResourceHealthContract:
+        raise self._error()
+
+    async def replace_health_contract(
+        self,
+        resource_id: str,
+        probes: tuple[HealthProbe, ...],
+        expected_revision: int | None,
+    ) -> ResourceHealthContract:
+        raise self._error()
+
+    async def clear_health_contract(
+        self, resource_id: str, expected_revision: int | None
     ) -> None:
         raise self._error()
 

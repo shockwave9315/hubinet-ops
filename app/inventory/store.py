@@ -11,6 +11,12 @@ import sqlite3
 import uuid
 
 from .contention_policy import AUTHORITY_WRITER_WAIT_BUDGET_MS
+from .health_contract import (
+    health_contract_fingerprint,
+    MAX_HEALTH_PROBES,
+    MAX_HEALTH_PROBE_TARGET_LENGTH,
+    MIN_HEALTH_PROBES,
+)
 from .models import (
     AuthorityDatabaseRejected,
     AuthorityInvariantError,
@@ -19,6 +25,7 @@ from .models import (
     DiscoveryRun,
     DiscoveryRunLifecycle,
     EndpointLifecycle,
+    HealthProbeKind,
     InventorySource,
     InventorySourceState,
     InventoryNode,
@@ -38,6 +45,8 @@ from .models import (
     PersistentSourceFreshness,
     PersistentSourceHealth,
     PersistentSourceHealthOrigin,
+    ResourceHealthContract,
+    ResourceHealthProbe,
     ResourceTermination,
     SourceEndpoint,
     SourceRuntimeHealth,
@@ -47,7 +56,7 @@ from .models import (
 
 
 AUTHORITY_SCHEMA_MARKER = "hubinet_ops_0_5_authority"
-AUTHORITY_SCHEMA_VERSION = 14
+AUTHORITY_SCHEMA_VERSION = 15
 
 #: Every authority connection's writer wait policy -- both `PRAGMA
 #: busy_timeout` and `sqlite3.connect(timeout=...)` below use this SAME
@@ -77,6 +86,8 @@ _REQUIRED_TABLES = frozenset(
         "package_update_jobs",
         "package_update_job_packages",
         "package_update_job_events",
+        "resource_health_contracts",
+        "resource_health_contract_probes",
         "canonicalization_migrations",
     }
 )
@@ -125,6 +136,10 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "one_package_update_job_snapshot_operation",
         "one_package_update_job_mutation_operation",
         "one_package_update_job_rollback_operation",
+        "resource_health_contract_update_immutable",
+        "resource_health_contract_probe_belongs_to_declared_contract",
+        "resource_health_contract_probe_update_immutable",
+        "resource_health_contract_probe_delete_needs_no_live_contract",
     }
 )
 _LEGACY_TABLES = frozenset({"plans", "jobs", "container_states", "job_events"})
@@ -159,6 +174,30 @@ _CHECKPOINT_RANK_SQL = """(CASE {column}
 
 def _checkpoint_rank_sql(column: str) -> str:
     return _CHECKPOINT_RANK_SQL.format(column=column)
+
+
+#: SQL form of models.HealthProbeKind. Generated from the enum rather than
+#: restated, so the durable CHECK and the domain model can never drift: a
+#: kind the product does not support must be impossible to store, not merely
+#: rejected by whichever validator happened to run.
+_HEALTH_PROBE_KIND_SQL = ", ".join(
+    f"'{kind.value}'" for kind in HealthProbeKind
+)
+
+#: Defense in depth under the Python validator in `health_contract.py`, not a
+#: replacement for it. SQL cannot express Unicode categories, so it enforces
+#: the part that matters durably: a target is one bounded, non-empty string
+#: with no NUL, no ASCII whitespace, and no newline -- i.e. it stays one
+#: opaque argument no matter who wrote the row.
+_HEALTH_PROBE_TARGET_CHECK_SQL = f"""typeof(target) = 'text'
+            AND length(target) BETWEEN 1 AND {MAX_HEALTH_PROBE_TARGET_LENGTH}
+            AND instr(target, char(0)) = 0
+            AND instr(target, ' ') = 0
+            AND instr(target, char(9)) = 0
+            AND instr(target, char(10)) = 0
+            AND instr(target, char(11)) = 0
+            AND instr(target, char(12)) = 0
+            AND instr(target, char(13)) = 0"""
 
 
 
@@ -335,6 +374,19 @@ class InventoryAuthorityStore:
                 (resource_id,),
             ).fetchone()
         return _package_plan_approval(row) if row is not None else None
+
+    def resource_health_contract(
+        self, resource_id: str
+    ) -> ResourceHealthContract | None:
+        """Read one resource's complete current health contract, or None.
+
+        ``None`` means *unconfigured*. It never means "healthy", "no checks
+        required", or "an empty contract" -- there is no empty contract to
+        return, and callers must not invent one.
+        """
+
+        with self._read_transaction() as connection:
+            return _resource_health_contract(connection, resource_id)
 
     def package_update_job(self, job_id: str) -> PackageUpdateJob:
         with self._read_transaction() as connection:
@@ -1066,6 +1118,51 @@ def _package_update_job(
     )
 
 
+def _resource_health_contract(
+    connection: sqlite3.Connection, resource_id: str
+) -> ResourceHealthContract | None:
+    """Assemble one complete contract, or refuse to return a partial one."""
+
+    row = connection.execute(
+        "SELECT * FROM resource_health_contracts WHERE resource_id=?",
+        (resource_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    probe_rows = connection.execute(
+        "SELECT kind, target FROM resource_health_contract_probes "
+        "WHERE resource_id=? ORDER BY probe_index",
+        (resource_id,),
+    ).fetchall()
+    if len(probe_rows) != int(row["probe_count"]):
+        # The schema forbids every ordinary path to this state; reaching it
+        # anyway means the durable row no longer describes its own probe set,
+        # and reporting a short contract as if it were complete would be a
+        # false statement about what "healthy" requires. Fail closed.
+        raise AuthorityInvariantError(
+            "resource health contract probe rows do not match its declared count"
+        )
+    probes = tuple(
+        ResourceHealthProbe(
+            kind=HealthProbeKind(str(probe["kind"])), target=str(probe["target"])
+        )
+        for probe in probe_rows
+    )
+    stored_fingerprint = str(row["fingerprint"])
+    if health_contract_fingerprint(probes) != stored_fingerprint:
+        raise AuthorityInvariantError(
+            "resource health contract fingerprint does not match its probes"
+        )
+    return ResourceHealthContract(
+        resource_id=str(row["resource_id"]),
+        revision=int(row["revision"]),
+        fingerprint=stored_fingerprint,
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+        probes=probes,
+    )
+
+
 def _package_update_job_event(row: sqlite3.Row) -> PackageUpdateJobEvent:
     details = json.loads(str(row["details_json"]))
     if not isinstance(details, dict):
@@ -1550,6 +1647,59 @@ _SCHEMA_STATEMENTS = (
         approved_at TEXT NOT NULL,
         FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id),
         FOREIGN KEY(reviewed_scan_run_id) REFERENCES package_scan_runs(scan_run_id)
+    )
+    """,
+    f"""
+    -- One operator-declared workload health contract for ONE exact resource
+    -- incarnation. The FK is to `resource_incarnations`, never to a VMID, a
+    -- name, or a node: a VMID-reused replacement is a different resource_id
+    -- and therefore starts with no contract at all (PRODUCT.md, "Health is
+    -- operator-declared per resource"). There is no row for "unconfigured" --
+    -- absence IS unconfigured, and absence is never health.
+    --
+    -- The row is replaced whole, never edited: `revision` advances by one per
+    -- durable change, and `fingerprint` covers only the canonical probe
+    -- material, so a later health-execution stage can name exactly which
+    -- contract it evaluated.
+    CREATE TABLE resource_health_contracts (
+        resource_id TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL
+            CHECK(typeof(revision) = 'integer' AND revision > 0),
+        fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+        -- An empty contract is not a contract. The lower bound is the whole
+        -- "absence is not health" rule expressed in SQL.
+        probe_count INTEGER NOT NULL
+            CHECK(typeof(probe_count) = 'integer' AND
+                  probe_count BETWEEN {MIN_HEALTH_PROBES} AND {MAX_HEALTH_PROBES}),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(resource_id) REFERENCES resource_incarnations(resource_id)
+    )
+    """,
+    f"""
+    -- The complete required probe set for the contract above: ALL of these
+    -- must hold, which is why the set needs no structure beyond a canonical
+    -- (kind, target) ordering carried as `probe_index`.
+    --
+    -- `target` is DATA. The future executor uses fixed argv operations, so
+    -- nothing here is, or may become, command text.
+    --
+    -- The parent FK is DEFERRABLE so one transaction can replace a contract
+    -- in the only order that is safe: drop the live contract row, drop its
+    -- now-unparented probes, insert the new contract row, then fill it. Every
+    -- intermediate state is invisible outside that transaction, and the
+    -- deferred check at COMMIT still forbids an orphaned probe row durably.
+    CREATE TABLE resource_health_contract_probes (
+        resource_id TEXT NOT NULL,
+        probe_index INTEGER NOT NULL
+            CHECK(typeof(probe_index) = 'integer' AND
+                  probe_index >= 0 AND probe_index < {MAX_HEALTH_PROBES}),
+        kind TEXT NOT NULL CHECK(kind IN ({_HEALTH_PROBE_KIND_SQL})),
+        target TEXT NOT NULL CHECK({_HEALTH_PROBE_TARGET_CHECK_SQL}),
+        PRIMARY KEY(resource_id, probe_index),
+        UNIQUE(resource_id, kind, target),
+        FOREIGN KEY(resource_id) REFERENCES resource_health_contracts(resource_id)
+            DEFERRABLE INITIALLY DEFERRED
     )
     """,
     f"""
@@ -2156,6 +2306,59 @@ _SCHEMA_STATEMENTS = (
        < {_checkpoint_rank_sql('OLD.checkpoint')}
     BEGIN SELECT RAISE(ABORT,
         'package update job checkpoint may never move backwards'
+    ); END
+    """,
+    """
+    -- A health contract is replaced whole or cleared, never patched. Refusing
+    -- UPDATE outright means no path -- authority, tooling, or hand-written
+    -- SQL -- can leave a row whose fingerprint, revision, or probe_count no
+    -- longer describes its own probe rows.
+    CREATE TRIGGER resource_health_contract_update_immutable
+    BEFORE UPDATE ON resource_health_contracts
+    BEGIN SELECT RAISE(ABORT,
+        'a resource health contract is replaced whole, never updated in place'
+    ); END
+    """,
+    """
+    -- Probes may only ever fill the contract row that declared them, in
+    -- contiguous canonical order starting at 0, and never beyond the declared
+    -- probe_count. This is what makes "more probes than the contract says" and
+    -- "a probe belonging to no contract" durably impossible rather than merely
+    -- unlikely.
+    CREATE TRIGGER resource_health_contract_probe_belongs_to_declared_contract
+    BEFORE INSERT ON resource_health_contract_probes
+    WHEN NOT EXISTS (
+        SELECT 1 FROM resource_health_contracts contract
+        WHERE contract.resource_id = NEW.resource_id
+          AND NEW.probe_index < contract.probe_count
+    ) OR NEW.probe_index != (
+        SELECT COUNT(*) FROM resource_health_contract_probes existing
+        WHERE existing.resource_id = NEW.resource_id
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'health contract probes must fill exactly the declared contract'
+    ); END
+    """,
+    """
+    CREATE TRIGGER resource_health_contract_probe_update_immutable
+    BEFORE UPDATE ON resource_health_contract_probes
+    BEGIN SELECT RAISE(ABORT,
+        'health contract probe rows are immutable'
+    ); END
+    """,
+    """
+    -- The mirror of the insert rule: while a contract row is live, its probe
+    -- set may not shrink. Clearing or replacing therefore has to drop the
+    -- contract row first, which is exactly the atomic order the authority
+    -- uses.
+    CREATE TRIGGER resource_health_contract_probe_delete_needs_no_live_contract
+    BEFORE DELETE ON resource_health_contract_probes
+    WHEN EXISTS (
+        SELECT 1 FROM resource_health_contracts contract
+        WHERE contract.resource_id = OLD.resource_id
+    )
+    BEGIN SELECT RAISE(ABORT,
+        'a live health contract may not lose probe rows'
     ); END
     """,
 )
