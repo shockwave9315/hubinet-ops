@@ -469,6 +469,7 @@ def _run_guest_command(
     local_node: str,
     tail: tuple[str, ...],
     *,
+    data_argument: str | None = None,
     max_output: int = MAX_COMMAND_OUTPUT_BYTES,
 ) -> CommandResult:
     """Run one fixed ``pct exec`` shape on the node that currently holds it.
@@ -484,7 +485,10 @@ def _run_guest_command(
     routed to its expected cluster member over root's existing passwordless
     inter-node SSH trust Proxmox itself provisions, exactly as the scan,
     execution, and mutation helpers do; no new Hubinet credential exists on
-    that node.
+    that node. Unlike those helpers, this one routes an element that originated
+    outside the file: ``data_argument`` names it, and it is proved shell-inert
+    before it may cross that boundary. Every other element is a constant this
+    file owns.
     """
 
     revalidate_live_target(runner, vmid, expected_node)
@@ -492,6 +496,24 @@ def _run_guest_command(
     if expected_node == local_node:
         result = _command(runner, inner, max_output=max_output)
     else:
+        # Routing to another cluster member is the ONE place a command line
+        # exists rather than an argv list, because that is what ssh hands the
+        # remote login shell.
+        #
+        # Shell quoting is deliberately NOT the mechanism that makes the
+        # caller's target safe here. The kind-specific validation already
+        # restricts a target to characters a shell reads as nothing at all,
+        # and this makes that a CHECKED property rather than a claim: if the
+        # request-derived element would need a quote adding, it is not what
+        # this file believes it is, and the probe is reported unevaluable
+        # instead of being handed to a shell that might read it.
+        #
+        # The constants around it -- notably the Docker `--format` template,
+        # whose braces this file owns -- are quoted normally. Their content is
+        # fixed and reviewed; the caller's is not, and only the caller's is
+        # subject to this rule.
+        if data_argument is not None and shlex.quote(data_argument) != data_argument:
+            raise ProbeUnknown("probe_target_not_exact")
         argv = (
             "ssh",
             "-T",
@@ -555,6 +577,7 @@ def evaluate_systemd_unit_active(
             "--",
             unit,
         ),
+        data_argument=unit,
         max_output=64 * 1024,
     )
     stdout = _decode(result)
@@ -647,6 +670,7 @@ def _inspect_container(
             "--",
             name,
         ),
+        data_argument=name,
         max_output=64 * 1024,
     )
     if result.returncode != 0:

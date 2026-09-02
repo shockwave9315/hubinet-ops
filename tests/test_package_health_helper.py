@@ -256,8 +256,8 @@ def _request(probes, *, vmid: int = VMID, node: str = NODE) -> dict:
     }
 
 
-def _evaluate(guest, probes):
-    response = helper.handle_request(_request(probes), runner=guest)
+def _evaluate(guest, probes, *, node: str = NODE):
+    response = helper.handle_request(_request(probes, node=node), runner=guest)
     assert response["ok"] is True, response
     assert response["health_contract"] == {"revision": 4, "fingerprint": "a" * 64}
     return [(probe["outcome"], probe["reason"]) for probe in response["probes"]]
@@ -906,3 +906,82 @@ def test_a_lost_or_unreadable_answer_raises_rather_than_returning(
 
     with pytest.raises(PackageUpdateHealthError):
         _transport(runner).evaluate_health_contract(request)
+
+
+# ===========================================================================
+# 7. Cross-node routing: the one place a command line exists
+# ===========================================================================
+
+
+class RemoteGuest(FakeGuest):
+    """The same guest, reachable only on another cluster member."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.node = "pve-b"
+        self.current_node = "pve-b"
+        self.remote_command_lines: list[str] = []
+
+    def __call__(self, argv, timeout, max_output):
+        if argv[0] == "ssh":
+            assert argv[-2] == "root@pve-b", argv
+            self.remote_command_lines.append(argv[-1])
+            import shlex
+
+            return super().__call__(tuple(shlex.split(argv[-1])), timeout, max_output)
+        if argv[:2] == ("pvesh", "get") and argv[2] == "/cluster/status":
+            # This helper runs on pve-a; the guest lives on pve-b.
+            return self._ok(
+                json.dumps([{"type": "node", "name": "pve-a", "local": 1}]).encode()
+            )
+        return super().__call__(argv, timeout, max_output)
+
+
+def test_a_remote_guest_is_probed_through_a_command_line_needing_no_quoting() -> None:
+    """Shell quoting is not the mechanism, and this proves it.
+
+    Routing to another cluster member is the one place an argv list becomes
+    command text, because that is what ssh hands the remote login shell. The
+    target's charset already contains nothing a shell reads, so `shlex.join`
+    must render every element as a bare word -- if it ever had to add a quote,
+    the target is not what this file thinks it is.
+    """
+
+    guest = RemoteGuest()
+    assert _evaluate(
+        guest,
+        (
+            ("systemd_unit_active", "nginx.service"),
+            ("docker_container_running", "web"),
+        ),
+        node="pve-b",
+    ) == [("passed", "unit_active"), ("passed", "container_running")]
+
+    assert guest.remote_command_lines
+    # The caller-derived elements appear as bare words. The Docker format
+    # template is a constant this file owns and is quoted normally.
+    assert any(line.endswith(" -- nginx.service") for line in guest.remote_command_lines)
+    assert any(line.endswith(" -- web") for line in guest.remote_command_lines)
+
+
+def test_an_element_that_would_need_quoting_is_refused_rather_than_quoted(
+    monkeypatch,
+) -> None:
+    """The assertion is load-bearing, not decorative.
+
+    The kind-specific validation makes such a target unreachable, so this
+    reaches past it to prove the routing boundary refuses on its own rather
+    than relying on a single upstream check.
+    """
+
+    guest = RemoteGuest()
+    with pytest.raises(helper.ProbeUnknown, match="probe_target_not_exact"):
+        helper._run_guest_command(
+            guest,
+            VMID,
+            "pve-b",
+            "pve-a",
+            ("env", "LC_ALL=C", "systemctl", "show", "--", "a b.service"),
+            data_argument="a b.service",
+        )
+    assert guest.remote_command_lines == []
