@@ -1700,3 +1700,122 @@ def test_an_unbounded_host_reason_is_rejected(tmp_path: Path) -> None:
     )
     with pytest.raises(PackageUpdateHealthError, match="bounded taxonomy"):
         validate_host_health_result(job, _host_result(job, probes=leaky))
+
+
+def test_sql_forbids_inserting_a_job_row_that_already_claims_a_verdict(
+    tmp_path: Path,
+) -> None:
+    """The last way a statement could express a success it cannot back up:
+    writing the whole row at once instead of transitioning into it."""
+
+    _, store, authority, resource, _, approval = _approved_system(tmp_path)
+    template = _issue(authority, resource, approval)
+    columns = (
+        "job_id, request_id, issued_at, resource_id, approval_id, "
+        "approval_reviewed_scan_run_id, approved_plan_fingerprint, "
+        "approval_approved_at, current_plan_scan_run_id, inventory_source_id, "
+        "committed_source_config_revision, committed_endpoint_id, "
+        "committed_canonical_transport_locator, "
+        "committed_canonicalization_contract_version, "
+        "committed_transport_trust_revision, provider_contract_version, "
+        "expected_resource_type, expected_binding_id, expected_locator_generation, "
+        "expected_resource_continuity_revision, expected_vmid, expected_node_id, "
+        "expected_node_name, package_count, health_contract_revision, "
+        "health_contract_fingerprint, health_contract_probe_count, status, "
+        "checkpoint, mutation_operation_id, mutation_may_have_started_at, "
+        "accepted_prepared_evidence_digest, mutation_completed_at, "
+        "health_started_at, health_completed_at, health_outcome, "
+        "terminalized_at, terminal_reason"
+    )
+    forged = (
+        str(uuid.uuid4()),
+        str(uuid.uuid4()),
+        template.issued_at,
+        template.resource_id,
+        template.approval_id,
+        template.approval_reviewed_scan_run_id,
+        template.approved_plan_fingerprint,
+        template.approval_approved_at,
+        template.current_plan_scan_run_id,
+        template.inventory_source_id,
+        template.committed_source_config_revision,
+        template.committed_endpoint_id,
+        template.committed_canonical_transport_locator,
+        template.committed_canonicalization_contract_version,
+        template.committed_transport_trust_revision,
+        template.provider_contract_version,
+        template.expected_resource_type,
+        template.expected_binding_id,
+        template.expected_locator_generation,
+        template.expected_resource_continuity_revision,
+        template.expected_vmid,
+        template.expected_node_id,
+        template.expected_node_name,
+        template.package_count,
+        template.health_contract_revision,
+        template.health_contract_fingerprint,
+        template.health_contract_probe_count,
+        "succeeded",
+        "health_completed",
+        str(uuid.uuid4()),
+        "2026-02-01T00:00:00+00:00",
+        "a" * 64,
+        "2026-02-01T00:01:00+00:00",
+        "2026-02-01T00:02:00+00:00",
+        "2026-02-01T00:03:00+00:00",
+        "passed",
+        "2026-02-01T00:03:00+00:00",
+        "forged",
+    )
+    _assert_sql_rejected(
+        store,
+        f"INSERT INTO package_update_jobs({columns}) "
+        f"VALUES({', '.join('?' * len(forged))})",
+        forged,
+    )
+
+
+def test_the_unknown_event_names_the_probe_that_could_not_be_evaluated(
+    tmp_path: Path,
+) -> None:
+    """"The Docker daemon did not answer" is what an operator needs to see,
+    not a generic "something went wrong"."""
+
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
+    host = FakeHealthHostControl(
+        outcomes=(HealthProbeOutcome.UNKNOWN, HealthProbeOutcome.PASSED)
+    )
+
+    result = PackageUpdateHealthOrchestrator(
+        authority, host
+    ).evaluate_job_health(job.job_id)
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    event = store.list_package_update_job_events(job.job_id)[-1]
+    assert event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
+    assert event.details["reason"] == "docker_daemon_unavailable"
+
+
+def test_a_job_that_moved_on_mid_attempt_still_reports_no_verdict(
+    tmp_path: Path,
+) -> None:
+    """An operator arming a rollback while an evaluation was in flight is not
+    an error: this attempt simply produced no verdict."""
+
+    _, _, authority, _, _, _, job = _mutated_job(tmp_path)
+    identity = authority.package_update_snapshot_identity(job.job_id)
+    ownership = authority.package_update_snapshot_ownership(job.job_id)
+
+    def arm_rollback_mid_flight(request):
+        authority.arm_package_update_rollback(
+            job.job_id, _canonical(ownership, identity)
+        )
+        raise OSError("ssh died")
+
+    result = PackageUpdateHealthOrchestrator(
+        authority, FakeHealthHostControl(side_effect=arm_rollback_mid_flight)
+    ).evaluate_job_health(job.job_id)
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+    assert result.job.health_outcome is None

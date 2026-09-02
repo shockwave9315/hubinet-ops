@@ -351,12 +351,20 @@ class PackageUpdateHealthOrchestrator:
             observation.outcome for observation in observations
         )
         if outcome is HealthOutcome.UNKNOWN:
+            # Report the FIRST unevaluable probe's own reason rather than a
+            # generic one: "the Docker daemon did not answer" is what the
+            # operator needs, and it is already a bounded token from the
+            # closed taxonomy.
+            blocking = next(
+                observation
+                for observation in observations
+                if observation.outcome is HealthProbeOutcome.UNKNOWN
+            )
             return self._unknown(
                 job.job_id,
-                "malformed_output"
-                if host_result.reason is None
-                else "command_failed",
-                "at least one frozen probe could not be evaluated truthfully",
+                blocking.reason,
+                "at least one frozen probe could not be evaluated truthfully "
+                f"({blocking.reason})",
             )
 
         # E. Re-prove the backend resource context AFTER the host answered.
@@ -383,11 +391,20 @@ class PackageUpdateHealthOrchestrator:
     def _unknown(
         self, job_id: str, reason_token: str, detail: str
     ) -> HealthStageResult:
-        """Record a truthful non-answer and leave the job exactly as it was."""
+        """Record a truthful non-answer and leave the job exactly as it was.
 
-        job = self._authority.record_package_update_health_outcome_unknown(
-            job_id, reason_token
-        )
+        If the job moved on underneath this attempt -- an operator armed a
+        rollback, say -- the event can no longer be appended, and that is not
+        an error worth raising: the outcome of THIS attempt is still "no
+        verdict", and the job's real state is read back and returned.
+        """
+
+        try:
+            job = self._authority.record_package_update_health_outcome_unknown(
+                job_id, reason_token
+            )
+        except AuthorityConflict:
+            job = self._authority.package_update_job(job_id)
         return HealthStageResult(
             status=HealthStageStatus.UNKNOWN, job=job, reason=detail
         )

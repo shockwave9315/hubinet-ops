@@ -148,6 +148,7 @@ _REQUIRED_SCHEMA_OBJECTS = _REQUIRED_TABLES | frozenset(
         "package_update_job_health_completion_immutable",
         "package_update_job_health_pass_requires_every_probe_proven",
         "package_update_job_health_failure_requires_a_proven_failure",
+        "package_update_job_health_verdict_insert_needs_evidence",
         "package_update_job_health_probe_insert_during_issuance",
         "package_update_job_health_probe_update_immutable",
         "package_update_job_health_probe_delete_immutable",
@@ -2697,6 +2698,29 @@ _SCHEMA_STATEMENTS = (
                            AND result.outcome = 'failed'))
     BEGIN SELECT RAISE(ABORT,
         'a failing health verdict requires a proven failing probe'
+    ); END
+    """,
+    """
+    -- The same two rules on INSERT. A job row is only ever inserted with a
+    -- NULL verdict by the authority, so this exists to close the last way a
+    -- statement could express a success it has no evidence for: writing the
+    -- whole row at once instead of transitioning into it.
+    CREATE TRIGGER package_update_job_health_verdict_insert_needs_evidence
+    BEFORE INSERT ON package_update_jobs
+    WHEN NEW.health_outcome IS NOT NULL
+     AND ((SELECT COUNT(*) FROM package_update_job_health_probe_results result
+           WHERE result.job_id = NEW.job_id)
+          != NEW.health_contract_probe_count
+          OR (NEW.health_outcome = 'passed'
+              AND EXISTS (SELECT 1 FROM package_update_job_health_probe_results result
+                          WHERE result.job_id = NEW.job_id
+                            AND result.outcome != 'passed'))
+          OR (NEW.health_outcome = 'failed'
+              AND NOT EXISTS (SELECT 1 FROM package_update_job_health_probe_results result
+                              WHERE result.job_id = NEW.job_id
+                                AND result.outcome = 'failed')))
+    BEGIN SELECT RAISE(ABORT,
+        'a health verdict requires its complete durable probe evidence'
     ); END
     """,
     """
