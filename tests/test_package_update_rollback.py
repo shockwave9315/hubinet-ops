@@ -114,6 +114,7 @@ class FakePve:
         self.resource_type = "lxc"
         self.current_node = NODE
         self.config_lock: str | None = None
+        self.template: object | None = None
         self.snapshot_present = True
         self.snapshot_incomplete = False
         #: PVE's `current` pseudo-entry parent. Upstream `snapshot_rollback`
@@ -211,6 +212,8 @@ class FakePve:
             config = {"hostname": "guest"}
             if self.config_lock is not None:
                 config["lock"] = self.config_lock
+            if self.template is not None:
+                config["template"] = self.template
             return self._ok(config)
         if argv[:2] == ("pvesh", "get") and argv[2].endswith("/snapshot"):
             if "snapshot" in self.fail_reads:
@@ -2719,6 +2722,99 @@ def test_the_helper_keeps_no_config_lock_allowlist() -> None:
     source = HELPER_PATH.read_text()
     assert "_IN_FLIGHT_LOCKS" not in source
     assert "snapshot-delete" not in source
+
+
+# ===========================================================================
+# M2. A TEMPLATE GUEST REFUSES BEFORE THE SUBMITTED BOUNDARY
+# ===========================================================================
+#
+# `PVE::AbstractConfig::snapshot_rollback` refuses a template unconditionally.
+# That refusal is just as observable from the current config, before
+# `submitted`, as the config lock above -- so it is checked from the SAME
+# pre-submission read rather than reaching PVE's own predictable refusal only
+# after the journal has already crossed the irreversible boundary.
+
+
+def test_a_template_guest_refuses_before_submitted(tmp_path: Path) -> None:
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.template = 1
+
+    result = host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+    assert result.outcome is RollbackOperationOutcome.NOT_SUBMITTED
+    # Nothing durable was written, so the operation is still releasable.
+    assert host.journal.read(request.rollback_operation_id) is None
+
+
+def test_a_template_guest_never_reaches_submitted_through_the_orchestrator(
+    tmp_path: Path,
+) -> None:
+    """The full orchestration path: a template guest ends NOT_SUBMITTED, the
+    job's write-ahead slot is released rather than left permanently fenced,
+    and PVE's real rollback endpoint is never called."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, orchestrator = (
+        _mutating_job(tmp_path)
+    )
+    pve.template = 1
+    observed = _canonical_before_rollback(ownership, identity)
+
+    result = orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    assert result.outcome is RollbackOperationOutcome.NOT_SUBMITTED
+    assert pve.rollbacks == []
+
+
+@pytest.mark.parametrize("malformed", [0.5, "1", True, 2, [1]])
+def test_a_malformed_template_flag_fails_closed(
+    tmp_path: Path, malformed: object
+) -> None:
+    """PVE only ever emits the literal integer `1`, or omits the key. Any
+    other shape is not a state PVE produces and must never be guessed at."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.template = malformed
+
+    host.submit_same_job_rollback(request)
+
+    assert pve.rollbacks == []
+
+
+def test_an_absent_template_key_still_submits_normally(tmp_path: Path) -> None:
+    """Positive control A: no `template` key at all is the ordinary case."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    assert pve.template is None
+
+    host.submit_same_job_rollback(request)
+
+    assert len(pve.rollbacks) == 1
+
+
+def test_an_explicit_non_template_flag_still_submits_normally(
+    tmp_path: Path,
+) -> None:
+    """Positive control B: PVE's own explicit non-template representation."""
+
+    _, _, authority, _, job, ownership, identity, pve, host, _ = _mutating_job(
+        tmp_path
+    )
+    request = _armed_request(authority, job, ownership, identity)
+    pve.template = 0
+
+    host.submit_same_job_rollback(request)
+
+    assert len(pve.rollbacks) == 1
 
 
 # ===========================================================================

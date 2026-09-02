@@ -127,6 +127,11 @@ product's threat model (see `AGENTS.md`).
   It does not accept `backup`, `migrate`, or any other lock type, so ANY
   non-empty config lock is refused here before the `submitted` boundary
   rather than after it.
+- a template guest's config carries `template` as the literal integer `1`;
+  PVE never writes `template: 0`, so the key is simply absent otherwise.
+  `snapshot_rollback` refuses a template unconditionally, and that refusal
+  is just as observable before `submitted` as the config lock is, so both
+  are checked from the SAME pre-submission config read.
 - a snapshot description carries this product's strict structured ownership
   metadata, and PVE's LXC config parser appends a newline to every
   description line it reads back, so the marker is parsed with normalised
@@ -884,16 +889,28 @@ def revalidate_live_target(runner: Runner, vmid: int, expected_node: str) -> Non
         )
 
 
-def read_config_lock(runner: Runner, vmid: int, expected_node: str) -> str | None:
-    """Return the container's current config `lock`, if any.
+def read_config_preflight(
+    runner: Runner, vmid: int, expected_node: str
+) -> tuple[str | None, bool]:
+    """Return ``(lock, is_template)`` from the container's CURRENT config.
 
-    ``None`` means the config carries no ``lock`` key at all -- the only
-    state in which upstream `check_lock` permits a rollback. Every other
-    outcome is returned or raised rather than normalised away: a non-string
-    lock is malformed and fails closed, and an empty string is returned as-is
-    so the caller refuses it too. PVE's own config parser does not emit an
-    empty lock, so treating one as "unlocked" would be inventing permissive
-    semantics for a state that should never occur.
+    One fixed pvesh read serves both PVE-refusal facts this preflight must
+    catch before `submitted`, rather than issuing two separate config reads
+    for the same instant of state.
+
+    ``lock`` is ``None`` when the config carries no ``lock`` key at all --
+    the only state in which upstream `check_lock` permits a rollback. Every
+    other outcome is returned or raised rather than normalised away: a
+    non-string lock is malformed and fails closed, and an empty string is
+    returned as-is so the caller refuses it too. PVE's own config parser
+    does not emit an empty lock, so treating one as "unlocked" would be
+    inventing permissive semantics for a state that should never occur.
+
+    ``is_template`` is ``True`` only for PVE's own literal representation --
+    the config key `template` holding the integer `1`. PVE never writes
+    `template: 0`; the key is simply absent for an ordinary guest. Any OTHER
+    representation (a string, a float, `2`, `true`) is not a shape PVE emits
+    and fails closed rather than being guessed at.
     """
 
     config = _json_command(
@@ -913,13 +930,19 @@ def read_config_lock(runner: Runner, vmid: int, expected_node: str) -> str | Non
             "execution_failed", "current container configuration was malformed"
         )
     lock = config.get("lock")
-    if lock is None:
-        return None
-    if not isinstance(lock, str):
+    if lock is not None and not isinstance(lock, str):
         raise RollbackError(
             "execution_failed", "current container configuration lock was malformed"
         )
-    return lock
+    template = config.get("template")
+    if template is not None and (
+        isinstance(template, bool) or template not in (0, 1)
+    ):
+        raise RollbackError(
+            "execution_failed",
+            "current container configuration template flag was malformed",
+        )
+    return lock, template == 1
 
 
 def read_snapshot_listing(
@@ -1341,6 +1364,10 @@ def submit_same_job_rollback(
         # refusal here leaves the operation releasable rather than
         # permanently uncertain.
         revalidate_live_target(runner, request["vmid"], request["expected_node"])
+        # Both of PVE's own deterministic, OBSERVABLE-BEFOREHAND refusals for
+        # this endpoint are checked from the same current-config read, before
+        # the journal ever reaches `submitted`:
+        #
         # ANY config lock refuses, not a curated list of "interesting" ones.
         # Upstream `PVE::AbstractConfig::check_lock` dies whenever
         # `$conf->{lock}` is truthy -- it does not accept `backup`,
@@ -1350,7 +1377,20 @@ def submit_same_job_rollback(
         # and the operation can no longer be sealed or retried: the job would
         # hold the one global destructive slot for a refusal that was
         # observable beforehand.
-        lock = read_config_lock(runner, request["vmid"], request["expected_node"])
+        #
+        # A template guest refuses unconditionally. Upstream
+        # `snapshot_rollback` rejects a template outright, so letting one
+        # reach `submitted` costs this job the same permanently-fenced
+        # outcome for a refusal PVE's own config already announced.
+        lock, is_template = read_config_preflight(
+            runner, request["vmid"], request["expected_node"]
+        )
+        if is_template:
+            raise RollbackError(
+                "unsupported_resource_type",
+                "the container is a template and PVE would refuse to roll back",
+                submission="not_submitted",
+            )
         if lock is not None:
             raise RollbackError(
                 "operation_in_progress",
