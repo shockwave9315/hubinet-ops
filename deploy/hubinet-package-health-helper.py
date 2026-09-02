@@ -630,8 +630,10 @@ def _docker_daemon_answered(
     """Fixed, argument-less proof that the guest's Docker daemon answered.
 
     `docker ps` requires the daemon, takes nothing from the request, and exits
-    0 only when the daemon responded. It is the ONLY thing that may promote a
-    failing `docker inspect` from "could not tell" to "definitely absent".
+    0 only when the daemon responded. This initial oracle proves Docker is
+    reachable before evaluation; it does not classify a later non-zero
+    `docker inspect` as absence. Definitive absence requires the separate
+    bounded exact-name proof in `_docker_exact_name_is_absent`.
     """
 
     try:
