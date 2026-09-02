@@ -46,6 +46,7 @@ from app.package_scan_host_control import (
     _bounded_process_runner,
 )
 from app.package_update_health import (
+    _HOST_REFUSAL_REASONS,
     HOST_PROBE_REASONS,
     HostHealthResult,
     HostProbeResult,
@@ -270,13 +271,18 @@ class SshPackageUpdateHealthHostControl:
         # truthful reading of "the answer never arrived": it is not a pass,
         # it is not a failure, and re-reading is safe.
         if result.timed_out:
-            raise PackageUpdateHealthError("host-control request timed out")
+            raise PackageUpdateHealthError(
+                "host-control request timed out", reason="command_timed_out"
+            )
         if result.output_exceeded:
             raise PackageUpdateHealthError(
-                "host-control result exceeded its configured bound"
+                "host-control result exceeded its configured bound",
+                reason="malformed_output",
             )
         if result.returncode != 0 and not result.stdout:
-            raise PackageUpdateHealthError("host-control SSH execution failed")
+            raise PackageUpdateHealthError(
+                "host-control SSH execution failed", reason="host_unreachable"
+            )
         try:
             payload = json.loads(result.stdout.decode("utf-8"))
         except (UnicodeDecodeError, ValueError) as exc:
@@ -297,6 +303,11 @@ class SshPackageUpdateHealthHostControl:
                 "host-control answered a different package update job"
             )
         if payload.get("ok") is not True:
+            # The host refused the WHOLE evaluation -- the guest was not
+            # running, had moved node, or could not be read at all. Recorded
+            # under the host's own classification where that maps onto a
+            # bounded token, so the durable event says what actually
+            # happened.
             error = payload.get("error")
             classification = "unclassified"
             if isinstance(error, Mapping):
@@ -304,7 +315,10 @@ class SshPackageUpdateHealthHostControl:
                     :100
                 ]
             raise PackageUpdateHealthError(
-                f"host-control reported a failure ({classification})"
+                f"host-control reported a failure ({classification})",
+                reason=_HOST_REFUSAL_REASONS.get(
+                    classification, "host_response_rejected"
+                ),
             )
         contract = payload.get("health_contract")
         if not isinstance(contract, Mapping):

@@ -113,7 +113,32 @@ from app.inventory import (
 
 
 class PackageUpdateHealthError(RuntimeError):
-    """A dark health evaluation could not be carried out safely."""
+    """A dark health evaluation could not be carried out safely.
+
+    ``reason`` is the bounded token this failure should be recorded under
+    when it becomes a durable "no verdict" event. It defaults to
+    ``host_response_rejected`` -- the honest description of a malformed,
+    contradictory, or mismatched answer -- and the host boundary sets
+    something more specific when the host told us WHY it refused, so an
+    operator reading the job's history sees "the guest was not running"
+    rather than "something went wrong".
+    """
+
+    def __init__(self, message: str, *, reason: str = "host_response_rejected") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+#: How a whole-request refusal by the host maps onto the bounded reason
+#: taxonomy. Anything the helper classifies differently, or does not classify
+#: at all, stays the generic rejection: a token is only used when the host
+#: actually said the thing it names.
+_HOST_REFUSAL_REASONS: dict[str, str] = {
+    "guest_unavailable": "guest_unavailable",
+    "stale_target": "resource_context_changed",
+    "unsupported_resource_type": "resource_context_changed",
+    "execution_failed": "command_failed",
+}
 
 
 #: Bounded reason tokens the HOST may report for a single probe. A strict
@@ -333,11 +358,17 @@ class PackageUpdateHealthOrchestrator:
         # authority transaction.
         try:
             host_result = self._host_control.evaluate_health_contract(request)
+        except PackageUpdateHealthError as exc:
+            # The boundary already classified this as truthfully as it can:
+            # the host's own refusal reason where it gave one, and the
+            # generic rejection where it did not.
+            return self._unknown(job.job_id, exc.reason, str(exc))
         except Exception as exc:  # noqa: BLE001 - any failure here is unknown
             return self._unknown(
                 job.job_id,
                 "host_unreachable",
-                f"health host evaluation did not return an answer: {type(exc).__name__}",
+                "health host evaluation did not return an answer: "
+                f"{type(exc).__name__}",
             )
 
         # D. Validate the answer against the FROZEN contract before believing
@@ -345,7 +376,7 @@ class PackageUpdateHealthOrchestrator:
         try:
             observations = validate_host_health_result(job, host_result)
         except PackageUpdateHealthError as exc:
-            return self._unknown(job.job_id, "host_response_rejected", str(exc))
+            return self._unknown(job.job_id, exc.reason, str(exc))
 
         outcome = aggregate_health_outcome(
             observation.outcome for observation in observations

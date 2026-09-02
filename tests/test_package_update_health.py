@@ -1915,6 +1915,21 @@ def test_end_to_end_a_guest_that_is_not_running_is_unknown(tmp_path: Path) -> No
     assert result.job.status is PackageUpdateJobStatus.ACTIVE
     assert result.job.health_outcome is None
     assert result.job.health_probe_results == ()
+    # The durable event says what actually happened, not "something failed".
+    event = store.list_package_update_job_events(result.job.job_id)[-1]
+    assert event.details["reason"] == "guest_unavailable"
+
+
+def test_end_to_end_a_guest_that_moved_node_is_unknown(tmp_path: Path) -> None:
+    def move_the_guest(guest):
+        guest.current_node = "pve-b"
+
+    store, authority, guest, result = _end_to_end(tmp_path, move_the_guest)
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.health_outcome is None
+    event = store.list_package_update_job_events(result.job.job_id)[-1]
+    assert event.details["reason"] == "resource_context_changed"
 
 
 def test_end_to_end_an_unavailable_docker_daemon_is_unknown(tmp_path: Path) -> None:
