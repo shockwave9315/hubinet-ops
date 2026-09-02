@@ -1075,8 +1075,8 @@ in the repository that can change a package inside a managed guest:
 ```text
 ACTIVE @ snapshot_confirmed
   -> host PREPARE (read-only: APT metadata refresh, `apt-get -s upgrade`,
-     the two fixed dpkg identity reads; journals `intent` plus a digest of
-     the exact evidence it returned)
+     the two fixed dpkg identity reads; returns a digest of the exact
+     evidence it produced and writes NO durable host state)
   -> canonical material (the SAME parser package scanning uses)
   -> ONE authority-store writer transaction:
        re-prove ACTIVE @ snapshot_confirmed
@@ -1090,6 +1090,8 @@ ACTIVE @ snapshot_confirmed
   -> short submission critical section: re-prove current authority AND that
      this caller carries the accepted digest, then, while still holding the
      writer lock, ask the host to EXECUTE
+  -> host journals `intent`, binding that accepted digest as this
+     operation's immutable evidence from its first durable byte
   -> host stages this operation's pre-dpkg action gate into the guest
   -> host journals `submitted` (fsynced) BEFORE launching anything, hands the
      real package command to a detached runner, and returns
@@ -1368,6 +1370,25 @@ write-ahead checkpoint; `absent`/`intent` are transient routing evidence that
 may send the backend into the release path but may never release a job, since
 a helper launched by a dead backend may not have taken its lease yet.
 
+**Preparation writes nothing durable, and that is a safety property, not a
+shortcut.** PREPARE runs strictly BEFORE the write-ahead arming transaction,
+so a journal record written there would be mutation-operation state for an
+operation that may never be armed -- and, being immutable once written,
+would turn every ordinary pre-arm transient (a newer package scan still
+RUNNING, a lost PREPARE response, a backend that died before arming) into an
+operation identity that could not be prepared again until a backend restart
+interrupted the job. `AUTHORITY_TEMPORARILY_UNAVAILABLE` advertises "retry
+later", so retrying later has to work. The journal's first record is
+therefore written by `execute_exact_package_mutation`, the only path that may
+submit, from the digest the arming transaction accepted; `intent` means
+exactly "an already-armed operation reached the submit-capable boundary and
+has not yet crossed `submitted`", and `absent` before that point is ordinary
+rather than suspicious. Nothing about at-most-once changes: the real command
+is still launched only after `submitted` is fsynced under the per-VMID lease,
+so no package mutation can precede the write-ahead checkpoint, and an armed
+job with no host record is still resolved by durably SEALING that absence
+under the same lease -- never by inferring anything from it.
+
 **The mutation outlives SSH and backend loss.** The helper hands the real
 command to a runner it double-forks into its own session, reparented to PID
 1, with stdio detached, so neither closing the SSH channel nor the client
@@ -1419,20 +1440,15 @@ the SAME deterministic `mutation_operation_id`. Identity therefore cannot be
 what decides who may cause a package command. Three independent locks decide
 it instead:
 
-- **The host intent is immutable.** A PREPARE that finds an `intent` already
-  journaled for this operation refuses rather than recomputing and
-  overwriting its digest, because that digest may already be the one
-  authority accepted and armed. The journal deliberately retains only the
-  digest, never the evidence, so it cannot instead re-serve "the same
-  evidence" -- a digest cannot reconstruct what it summarizes. An orphaned
-  intent, from a PREPARE whose backend then died, is therefore never
-  permission to execute: no later invocation can obtain its digest. Nor
-  does it strand anything. Such a job never crossed the write-ahead
-  boundary, so the armed-job release path does not apply to it; it is still
-  ACTIVE at `snapshot_confirmed`, which is a startup-interruptible
-  checkpoint, so restart recovery terminalizes it and frees the one global
-  destructive slot. The host's `sealed_not_submitted` proof remains the
-  release path for a job that *did* arm.
+- **The host intent is immutable, and only the winner creates it.** Two
+  concurrent PREPAREs are simply two read-only readings with nothing durable
+  to contend over. The host journal's first record is created by the EXECUTE
+  the arming transaction authorized, bound to the digest it accepted, and no
+  later caller may substitute another: an EXECUTE presenting a different
+  digest for an operation already at `intent` is refused. An `intent` whose
+  backend then died is never permission to execute, and never strands
+  anything either -- it belongs to an armed job, so the host's
+  `sealed_not_submitted` proof is exactly the release path for it.
 - **The arming transition names its winner.** It returns `ARMED_NOW` only to
   the invocation that atomically committed this accepted digest, and
   `ALREADY_ARMED` to everyone else, who become recovery-only.
