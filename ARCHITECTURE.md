@@ -88,7 +88,7 @@ instantiated `InventoryAuthority` can issue and revalidate one globally
 single-flight job from a current exact approval, and startup interrupts any
 pre-package-mutation active job so it cannot auto-run after restart. The
 production HTTP and Home Assistant surfaces cannot issue a job, and there is
-no job consumer, healthcheck, or rollback execution. Authority revalidation
+no job consumer or healthcheck execution. Authority revalidation
 is necessary but not sufficient permission for mutation: the execution-time
 equality gate below proves exact fresh APT simulation/equality against the
 job's frozen material, and even a successful pass is not a durable mutation
@@ -376,10 +376,8 @@ revision, that the entry is a real snapshot rather than the `current`
 pseudo-entry, and that canonical state is unambiguous. There is no
 caller-supplied snapshot name, no "latest Hubinet snapshot", and no fallback
 to another job's snapshot; a reused VMID never transfers rollback authority to
-a different incarnation. **Rollback submission is deliberately not
-implemented**: only the authorization/selection contract exists, and execution
-is left to the later activation stage rather than being shipped to a lower
-safety bar.
+a different incarnation. Rollback *execution* is built on exactly this
+contract — see "Same-job rollback execution" below.
 
 **No deletion.** This stage deletes nothing — not foreign snapshots, not
 manual PVE snapshots, not old, failed, or interrupted-job Hubinet snapshots.
@@ -814,9 +812,9 @@ Properties that channel must have:
   binding/generation/continuity/VMID/node context, and the same fresh healthy
   committed source context captured when the scan was issued.
 
-Healthchecks, rollback execution, lifecycle mutation, and QEMU package
-execution remain future work; job-owned snapshot safety, the execution-time
-plan equality gate, and crash-safe package mutation below all exist
+Healthchecks, lifecycle mutation, and QEMU package execution remain future
+work; job-owned snapshot safety, the execution-time plan equality gate,
+crash-safe package mutation, and same-job rollback execution below all exist
 internally but cannot be invoked by production.
 
 ## Binary package identity
@@ -1517,6 +1515,183 @@ snapshot and execution-gate modules. Nothing on the production HTTP, Home
 Assistant, scheduler, bootstrap, or updater path can reach any of it; no
 helper, key, `authorized_keys` entry, or PVE privilege is deployed for it,
 and `tests/test_r0_architecture_regression.py` proves it.
+
+## Same-job rollback execution
+
+The compensation half of the update lifecycle exists internally and is **not
+production-reachable**. Nothing on the HTTP, Home Assistant, scheduler,
+bootstrap, or updater path can roll anything back; the rollback helper is a
+separate dark file that is **not deployed**, with no key, no `authorized_keys`
+entry, and neither of the two PVE snapshot privileges upstream accepts for the
+rollback endpoint provisioned anywhere. The deployed role stays exactly
+`Sys.Audit` plus the VM audit privilege.
+
+```text
+mutation_may_have_started ---+
+                             |--> rollback_may_have_started -> rollback_completed
+mutation_completed ----------+                                  (status = rolled_back)
+```
+
+**Both mutation checkpoints are legal entry points, and that is the point.**
+A package mutation that failed, was partial, timed out, was killed, or simply
+could not be proven complete never reaches `mutation_completed` — and it is
+exactly that job which most needs compensating. Schema v13 made every
+checkpoint at or beyond rank 6 imply `mutation_completed_at IS NOT NULL`,
+which meant the only way to reach rollback from a failed mutation was to write
+a completion that never happened. `mutation_completed` means the exact
+approved package mutation was *independently proven complete*; it is never a
+routing flag. Schema v14 therefore replaces that implication with facts tied
+to their own checkpoints in both directions:
+
+- `checkpoint = 'mutation_completed'` requires `mutation_completed_at`, and
+  `mutation_completed_at` requires rank ≥ 6 — but a later rank no longer
+  implies it;
+- rank ≥ 8 (`rollback_may_have_started`) iff both `rollback_operation_id` and
+  `rollback_may_have_started_at` exist; rank ≥ 9 (`rollback_completed`) iff
+  `rollback_completed_at` exists;
+- a rollback operation requires this job's own `snapshot_confirmed_at` (there
+  must be something to roll back *to*) and its `mutation_may_have_started_at`
+  (there must be something to compensate);
+- `status = 'rolled_back'` is impossible without `rollback_completed_at`, and
+  `status = 'succeeded'` is impossible without `mutation_completed_at`.
+
+The checkpoint order remains a monotonic no-regression fence; it is no longer
+read as a chain of implied successes. Triggers make the rollback operation
+identity, the task identity, and the completion timestamp write-once, and a
+partial UNIQUE index keeps one rollback operation to one job.
+
+**Identity.** `app/inventory/rollback_identity.py` derives the operation id
+from immutable authority — backend instance, job, resource incarnation,
+continuity revision — plus the job's own confirmed snapshot identity and name,
+under its own domain separator. The snapshot half is what makes the id mean
+"roll THIS job back to THIS exact snapshot": a rollback aimed at anything else
+is structurally a different operation with a different journal. A caller can
+never supply an operation id, and the same job derives the same id after any
+restart.
+
+**Verified PVE rollback semantics.** Read from current Proxmox VE sources, not
+inherited from snapshot create:
+`POST /nodes/{node}/lxc/{vmid}/snapshot/{snapname}/rollback` is `protected`,
+`proxyto => 'node'`, takes an optional `start` boolean (default 0), and returns
+a task id from `fork_worker('vzrollback', ...)` — so a returned POST proves
+nothing. `PVE::AbstractConfig::snapshot_rollback` refuses a template, a
+missing snapshot, a snapshot still carrying `snapstate`, a config under
+another lock, and a container still running after its own forced stop. It
+holds the config lock as `rollback`, replaces the current config from the
+snapshot, moves displaced volumes to `unused`, and sets `parent` to the
+snapshot name. `PVE::LXC::Config::__snapshot_rollback_vm_stop` is
+`PVE::LXC::vm_stop($vmid, 1)` — a **forced stop** — so rollback is materially
+more destructive than create. It never deletes its source snapshot. Task
+terminal semantics are PVE's own: only `OK` and `WARNINGS: <n>` are non-errors.
+
+**The guest is left stopped.** This stage pins `start` to 0 as a code-owned
+host-side constant; it is not a field of the typed request at all. A
+successful rollback therefore always leaves the container stopped. Restarting
+it, and validating it afterwards, are deliberately separate future work rather
+than three destructive concerns fused into one operation.
+
+**Rollback authority is narrower than update authority, deliberately.** The
+predicate re-proved at the write-ahead boundary and again inside the
+submission critical section proves the *identity of the thing being rolled
+back*: same source, an LXC, present and active, with this job's exact VMID,
+binding, locator generation, continuity revision, node, and an available node.
+It deliberately does **not** re-prove package-plan currency, and does **not**
+require the guest to be `running`. A newer scan, a stale approval, or exact
+material that moved on are all expected *after* an update ran — a successful
+update guarantees them — so requiring plan currency would let the ordinary
+passage of time withdraw the recovery path from a half-upgraded guest. And a
+rollback candidate may legitimately already be stopped, which PVE's own
+forced stop would produce anyway. This is the same evidence-preservation rule
+the snapshot and mutation stages established.
+
+**The write-ahead boundary and the submission critical section.**
+`arm_package_update_rollback` commits `rollback_may_have_started` plus the
+deterministic operation identity in ONE `BEGIN IMMEDIATE` transaction, after
+proving the exact same-job target against a fresh canonical listing through
+the same helper `select_package_update_rollback_target` uses. Only after that
+boundary is durable may a rollback be submitted, and only from inside
+`execute_rollback_submission_if_current`, which re-proves the rollback
+predicate while holding the authority store's one writer lock across a single
+bounded submission-only host round trip. Task polling and canonical
+confirmation run strictly outside it.
+`app/inventory/contention_policy.py` gains
+`MAX_ROLLBACK_SUBMISSION_TIMEOUT_SECONDS` (90s, enforced in the transport's
+constructor) and derives `MAX_ROLLBACK_CRITICAL_SECTION_SECONDS` (95s); the
+writer budget is still the worst case over *every* such critical section, so
+adding this third one cannot leave ordinary writers short.
+
+**Host-side durable journal.** `deploy/hubinet-package-rollback-helper.py` is a
+separate file and a separate logical privilege boundary. Combining rollback
+into the snapshot helper was considered and rejected: snapshot create adds a
+recovery point, while rollback force-stops a container and replaces its
+volumes and config, and keeping them apart means one deployed forced-command
+entry never carries both capabilities. It exposes exactly three typed
+operations (`inspect_rollback_state`, `submit_same_job_rollback`,
+`seal_rollback_never_submitted`), no create, no delete, no lifecycle control,
+no generic dispatcher, and no caller-supplied argv or snapshot name. Each
+operation is journaled by operation identity, with fsynced atomic renames
+under a non-blocking per-VMID `flock`
+(`intent -> sealed_not_submitted | submitted -> task_known -> terminal`), the
+same crash-durable directory primitive the mutation helper uses (every caller
+proves its own parent-fsync barrier, because "already exists" is not "already
+durable"), and complete-write journal semantics. `submitted` is fsynced before
+`pvesh create` runs and is never resubmitted from; `sealed_not_submitted` is
+the only durable release proof; `absent`/`intent` are transient routing
+evidence that report `uncertain`, never `not_submitted`. Every pre-flight
+refusal — a wrong live target, an in-flight config lock, a missing or
+incomplete target snapshot — happens *before* the journal reaches `submitted`,
+so an operation PVE was always going to reject never enters the permanently
+uncertain window.
+
+**`submitted` without a UPID never recovers into success**, which is a
+deliberate difference from the snapshot helper. A snapshot's existence with
+this job's exact ownership metadata is unique canonical proof that *that*
+operation completed. Rollback has no such witness: the source snapshot
+survives either way, and `parent == snapname` is equally true after any
+earlier rollback to the same snapshot. Without the exact task identity there
+is nothing distinguishing "this rollback completed" from "some rollback
+completed once", so the answer is uncertain and the job stays fenced.
+
+**Completion proof.** `rollback_completed` requires the coherent set, never
+one part of it: the job ACTIVE at `rollback_may_have_started` with its
+re-derived operation identity; a terminal non-error PVE task classified by
+PVE's own rule; the durable `rollback_task_upid` this job itself recorded; a
+fresh canonical listing still proving exactly one complete snapshot carrying
+this job's strict ownership metadata; and PVE's `current` pseudo-entry
+reporting `parent` equal to that snapshot's name. The `parent` check is
+corroboration inside that set, never a standalone proof, and the snapshot
+still existing is treated as no evidence at all.
+
+**Failure and uncertainty never release ownership.** A terminal failed task, a
+running task, a lost SSH answer, a timeout, an unreadable task status, a
+corrupt journal, or host evidence about a different operation all leave the
+job ACTIVE at `rollback_may_have_started`, still owning the one global
+destructive slot and its confirmed snapshot, with truthful append-only
+evidence. None is ever retried: PVE's rollback stops the container and then
+replaces volumes and config in two config-locked phases, so a failure anywhere
+in that sequence can leave the guest stopped, partially rolled back, or still
+config-locked. The single exception is the host's durable
+`sealed_not_submitted` proof, which releases the job `blocked`. A recorded
+task identity permanently forbids that seal, because PVE already accepted the
+rollback.
+
+**Startup recovery** leaves `rollback_may_have_started` active and fenced with
+its operation identity and any recorded task, so a restarted backend
+re-observes that exact task through the read-only inspection rather than
+submitting a second destructive rollback. Nothing in startup ever submits,
+seals, or completes a rollback.
+
+**No deletion, and no healthcheck.** This stage deletes nothing — retention
+stays future work — and implements no healthcheck: a rolled-back job reaches
+`ROLLED_BACK`, and `SUCCEEDED` has no transition at all in this version,
+because the product has no truthful generic workload-health definition yet
+(see `STATUS.md`).
+
+`app/package_update_rollback.py` (orchestration) and
+`app/package_update_rollback_host_control.py` (a purpose-specific pinned-key
+SSH client) are instantiated only by hermetic tests.
+`tests/test_r0_architecture_regression.py` proves production reachability did
+not increase.
 
 ## Ordinary safety rules (all layers, now and later)
 
