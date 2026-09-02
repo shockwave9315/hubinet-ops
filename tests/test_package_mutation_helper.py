@@ -299,6 +299,50 @@ def _prepare_then(payload_operation, host, journal, **overrides):
     )
 
 
+def _execute_leaving_an_intent(host, journal, digest):
+    """Drive one real EXECUTE that binds `digest` and then refuses.
+
+    `intent` is now written by EXECUTE, so the only honest way to reach it
+    is to let a real submission bind its digest and then fail a pre-flight
+    fence. Installed-state drift is the cheapest such fence, and it is
+    checked strictly AFTER the journal write.
+    """
+
+    original = dict(host.installed)
+    host.installed[("bash", "amd64")] = "5.3"
+    host.installed[("apt", "amd64")] = "2.6.5"
+    response = _handle(
+        _request("execute_exact_package_mutation", prepared_evidence_digest=digest),
+        host,
+        journal,
+        spawn=_never_spawn,
+    )
+    assert response["ok"] is False
+    assert response["error"]["classification"] == "mutation_state_mismatch"
+    assert journal.read(OPERATION_ID)["phase"] == "intent"
+    assert journal.read(OPERATION_ID)["prepared_evidence_digest"] == digest
+    host.installed.clear()
+    host.installed.update(original)
+    assert host.mutations == 0
+
+
+def _submitted_record(fingerprint):
+    return {
+        "journal_version": 1,
+        "mutation_operation_id": OPERATION_ID,
+        "request_fingerprint": fingerprint,
+        "vmid": VMID,
+        "expected_node": NODE,
+        "phase": "submitted",
+    }
+
+
+def _request_fingerprint():
+    return helper.request_fingerprint(
+        helper.validate_request(_request("inspect_package_mutation_state"))
+    )
+
+
 def _inspect(host, journal):
     """Read back the durable outcome, exactly the way the backend does.
 
@@ -420,14 +464,23 @@ def test_a_prepared_mutation_runs_exactly_one_package_command(
 
 
 def test_preparation_alone_never_mutates_anything(host, journal) -> None:
+    """Read-only in both senses: no package changes, and no durable state.
+
+    Preparation runs BEFORE the backend's write-ahead arming transaction, so
+    a durable record here would be mutation-operation state for an operation
+    that may never be armed. It writes nothing, which is exactly what makes
+    an unarmed preparation repeatable.
+    """
+
     prepared = _handle(
         _request("prepare_exact_package_mutation"), host, journal, spawn=_never_spawn
     )
 
     assert prepared["ok"] is True
-    assert prepared["operation_state"] == "intent"
+    assert prepared["operation_state"] == "absent"
+    assert prepared["evidence"]["prepared_evidence_digest"]
     assert host.mutations == 0
-    assert journal.read(OPERATION_ID)["phase"] == "intent"
+    assert journal.read(OPERATION_ID) is None
 
 
 # ===========================================================================
@@ -456,15 +509,7 @@ def test_a_repeated_execute_never_runs_a_second_package_command(
 
 
 def test_execute_from_a_submitted_journal_never_resubmits(host, journal) -> None:
-    _handle(_request("prepare_exact_package_mutation"), host, journal)
-    record = journal.read(OPERATION_ID)
-    journal.write(
-        {
-            key: value
-            for key, value in {**record, "phase": "submitted"}.items()
-            if key != "prepared_evidence_digest"
-        }
-    )
+    journal.write(_submitted_record(_request_fingerprint()))
 
     response = _handle(
         _request(
@@ -488,23 +533,46 @@ def test_execute_from_a_submitted_journal_never_resubmits(host, journal) -> None
     assert host.mutations == 0
 
 
-def test_execute_without_a_prepare_refuses(host, journal) -> None:
-    response = _handle(
-        _request(
-            "execute_exact_package_mutation", prepared_evidence_digest="a" * 64
-        ),
+def test_execute_creates_the_first_durable_state_from_the_accepted_digest(
+    host, journal
+) -> None:
+    """The journal's first record is written by the submit-capable path.
+
+    The host cannot see the backend's arming transaction, so it cannot
+    demand a prior host PREPARE as evidence of authority -- and must not,
+    since requiring one is exactly what made an unarmed preparation
+    permanently poison its own operation identity. What it CAN do, and does,
+    is make the digest the armed caller presents this operation's immutable
+    binding from its very first durable byte.
+    """
+
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    digest = prepared["evidence"]["prepared_evidence_digest"]
+    assert journal.read(OPERATION_ID) is None
+
+    submitted = _handle(
+        _request("execute_exact_package_mutation", prepared_evidence_digest=digest),
         host,
         journal,
-        spawn=_never_spawn,
     )
 
-    assert response["ok"] is False
-    assert response["error"]["classification"] == "mutation_state_mismatch"
-    assert host.mutations == 0
+    assert submitted["operation_state"] == "submitted"
+    assert host.mutations == 1
+    assert _inspect(host, journal)["operation_state"] == "terminal_success"
 
 
 def test_execute_with_the_wrong_prepared_evidence_refuses(host, journal) -> None:
-    _handle(_request("prepare_exact_package_mutation"), host, journal)
+    """Once `intent` exists, its digest can never be substituted.
+
+    This is the host half of "only the accepted evidence may submit": a
+    delayed or racing caller carrying a different digest is refused, and the
+    original digest still works afterwards, so the refusal fences nothing
+    permanently.
+    """
+
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    accepted = prepared["evidence"]["prepared_evidence_digest"]
+    _execute_leaving_an_intent(host, journal, accepted)
 
     response = _handle(
         _request(
@@ -518,6 +586,16 @@ def test_execute_with_the_wrong_prepared_evidence_refuses(host, journal) -> None
     assert response["ok"] is False
     assert response["error"]["classification"] == "mutation_state_mismatch"
     assert host.mutations == 0
+    assert journal.read(OPERATION_ID)["prepared_evidence_digest"] == accepted
+
+    # The accepted digest still submits: nothing was fenced permanently.
+    resumed = _handle(
+        _request("execute_exact_package_mutation", prepared_evidence_digest=accepted),
+        host,
+        journal,
+    )
+    assert resumed["operation_state"] == "submitted"
+    assert host.mutations == 1
 
 
 # ===========================================================================
@@ -525,12 +603,25 @@ def test_execute_with_the_wrong_prepared_evidence_refuses(host, journal) -> None
 # ===========================================================================
 
 
-@pytest.mark.parametrize("prepare_first", [False, True])
+@pytest.mark.parametrize("pre_state", ["absent", "intent"])
 def test_a_seal_durably_forbids_a_future_mutation(
-    host, journal, prepare_first
+    host, journal, pre_state
 ) -> None:
-    if prepare_first:
-        _handle(_request("prepare_exact_package_mutation"), host, journal)
+    """Both pre-submission states seal identically.
+
+    `absent` is the ordinary one: the backend arms before calling the host
+    at all, so a backend that died between arming and executing leaves a
+    write-ahead checkpoint with no host record, and that absence must be
+    convertible into the durable fence rather than merely observed.
+    """
+
+    if pre_state == "intent":
+        prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+        _execute_leaving_an_intent(
+            host, journal, prepared["evidence"]["prepared_evidence_digest"]
+        )
+    else:
+        assert journal.read(OPERATION_ID) is None
     sealed = _handle(
         _request("seal_mutation_never_submitted"), host, journal, spawn=_never_spawn
     )
@@ -586,7 +677,10 @@ def test_a_seal_performs_no_pve_or_guest_reads(host, journal) -> None:
 
 
 def test_inspection_performs_no_pve_or_guest_reads(host, journal) -> None:
-    _handle(_request("prepare_exact_package_mutation"), host, journal)
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    _execute_leaving_an_intent(
+        host, journal, prepared["evidence"]["prepared_evidence_digest"]
+    )
     host.commands.clear()
 
     inspected = _handle(
@@ -626,15 +720,7 @@ def test_a_held_lease_refuses_every_mutating_operation(host, journal) -> None:
 def test_a_held_lease_is_the_running_signal_for_a_submitted_operation(
     host, journal
 ) -> None:
-    _handle(_request("prepare_exact_package_mutation"), host, journal)
-    record = journal.read(OPERATION_ID)
-    journal.write(
-        {
-            key: value
-            for key, value in {**record, "phase": "submitted"}.items()
-            if key != "prepared_evidence_digest"
-        }
-    )
+    journal.write(_submitted_record(_request_fingerprint()))
 
     idle = _handle(
         _request("inspect_package_mutation_state"), host, journal, spawn=_never_spawn
@@ -664,8 +750,8 @@ def test_the_real_detached_runner_holds_the_lease_and_journals_its_result(
     exactly one terminal record.
     """
 
-    _handle(_request("prepare_exact_package_mutation"), host, journal)
-    digest = journal.read(OPERATION_ID)["prepared_evidence_digest"]
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    digest = prepared["evidence"]["prepared_evidence_digest"]
 
     marker = tmp_path / "runner-ran"
 
@@ -938,7 +1024,10 @@ def test_malformed_journal_bytes_fail_closed(host, journal) -> None:
 def test_a_different_request_can_never_reuse_an_operation_identity(
     host, journal, override
 ) -> None:
-    _handle(_request("prepare_exact_package_mutation"), host, journal)
+    sealed = _handle(
+        _request("seal_mutation_never_submitted"), host, journal, spawn=_never_spawn
+    )
+    assert sealed["operation_state"] == "sealed_not_submitted"
 
     payload = _request("inspect_package_mutation_state", **override)
     response = _handle(payload, host, journal, spawn=_never_spawn)
@@ -1578,8 +1667,8 @@ def test_the_target_changing_between_two_evidence_reads_refuses_the_second(
 def test_the_target_changing_before_staging_stages_nothing_into_the_wrong_guest(
     host, journal
 ) -> None:
-    _handle(_request("prepare_exact_package_mutation"), host, journal)
-    digest = journal.read(OPERATION_ID)["prepared_evidence_digest"]
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    digest = prepared["evidence"]["prepared_evidence_digest"]
     swapper = _TargetSwapper(
         host,
         swap_after="dpkg-query",
@@ -1613,8 +1702,8 @@ def test_the_detached_runner_revalidates_immediately_before_the_real_command(
     no longer applies.
     """
 
-    _handle(_request("prepare_exact_package_mutation"), host, journal)
-    digest = journal.read(OPERATION_ID)["prepared_evidence_digest"]
+    prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    digest = prepared["evidence"]["prepared_evidence_digest"]
 
     swapper = _TargetSwapper(
         host,
@@ -1639,48 +1728,108 @@ def test_the_detached_runner_revalidates_immediately_before_the_real_command(
     assert "guest is not running" in record["result"]["output_tail"]
 
 
-def test_a_second_prepare_can_never_replace_the_accepted_intent(
-    host, journal
-) -> None:
-    """Finding B's host half: prepared evidence is immutable once journaled.
+def test_repeated_preparation_is_always_retryable(host, journal) -> None:
+    """The liveness contract: an unarmed preparation never poisons its id.
 
-    The digest an earlier PREPARE recorded may ALREADY be the one authority
-    accepted and armed. Recomputing evidence and overwriting it is exactly
-    how a concurrent PREPARE could replace the material the arming
-    transaction bound itself to, so the second PREPARE is refused outright
-    rather than served.
+    Preparation happens before the backend's write-ahead arming
+    transaction, and can legitimately fail to be armed for entirely
+    ordinary reasons -- a newer package scan still RUNNING, a lost response,
+    a backend that died. Every one of those must be retryable by simply
+    preparing again, against FRESH evidence, with no restart and no manual
+    recovery. Nothing durable is created here, so nothing can be stale.
     """
 
     first = _handle(_request("prepare_exact_package_mutation"), host, journal)
-    original_digest = first["evidence"]["prepared_evidence_digest"]
+    assert first["operation_state"] == "absent"
+    assert journal.read(OPERATION_ID) is None
 
-    # The guest's candidate state moves on, so a second PREPARE would
-    # legitimately compute a DIFFERENT digest if it were allowed to.
-    host.installed[("zlib1g", "amd64")] = "1.0.1"
+    # The guest's state moves on between the two attempts, so the second
+    # preparation must observe the world as it is NOW, not replay the first
+    # attempt's evidence. An unapproved package is moved deliberately: this
+    # test is about retry liveness, not about the drift fence.
+    host.installed[("bash", "amd64")] = "5.2.1"
 
     second = _handle(_request("prepare_exact_package_mutation"), host, journal)
 
-    # Reported as the durable phase with NO evidence, so the backend can seal
-    # and release rather than being stranded -- but never as evidence it
-    # could arm with.
-    assert second["operation_state"] == "intent"
-    assert "evidence" not in second
-    assert "immutable" in second["reason"]
-    assert journal.read(OPERATION_ID)["prepared_evidence_digest"] == original_digest
+    assert second["operation_state"] == "absent"
+    assert "5.2.1" in second["evidence"]["installed_inventory"]
+    assert (
+        second["evidence"]["prepared_evidence_digest"]
+        != first["evidence"]["prepared_evidence_digest"]
+    )
+    assert journal.read(OPERATION_ID) is None
     assert host.mutations == 0
 
+    # And the fresh evidence is immediately usable: retrying costs nothing.
+    submitted = _handle(
+        _request(
+            "execute_exact_package_mutation",
+            prepared_evidence_digest=second["evidence"]["prepared_evidence_digest"],
+        ),
+        host,
+        journal,
+    )
+    assert submitted["operation_state"] == "submitted"
+    assert host.mutations == 1
 
-def test_an_orphaned_intent_is_sealable_but_never_executable(
+
+def test_concurrent_preparations_create_no_durable_state_to_contend_over(
     host, journal
 ) -> None:
-    """A PREPARE whose backend died is not permission to mutate.
+    """Two live preparations, one accepted digest, at most one mutation.
 
-    It cannot be re-prepared, it cannot be executed without the exact digest
-    it recorded, and the existing pre-submission seal still resolves it.
+    With preparation durable-free there is nothing on the host for two
+    concurrent preparations to race over: they are two read-only readings.
+    The backend's arming transaction picks exactly one digest, and only the
+    digest that reaches EXECUTE ever becomes this operation's immutable
+    binding -- so the loser's evidence can never mutate anything, even if it
+    arrives later carrying its own perfectly well-formed digest.
+    """
+
+    a = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    host.installed[("bash", "amd64")] = "5.2.1"
+    b = _handle(_request("prepare_exact_package_mutation"), host, journal)
+    losing = a["evidence"]["prepared_evidence_digest"]
+    winning = b["evidence"]["prepared_evidence_digest"]
+    assert losing != winning
+    assert journal.read(OPERATION_ID) is None
+
+    # Authority accepted B. Only B reaches the host.
+    submitted = _handle(
+        _request(
+            "execute_exact_package_mutation", prepared_evidence_digest=winning
+        ),
+        host,
+        journal,
+    )
+    assert submitted["operation_state"] == "submitted"
+    assert journal.read(OPERATION_ID)["phase"] in ("submitted", "terminal_success")
+
+    # A's delayed submission arrives afterwards and can never mutate again.
+    late = _handle(
+        _request("execute_exact_package_mutation", prepared_evidence_digest=losing),
+        host,
+        journal,
+        spawn=_never_spawn,
+    )
+    assert late["operation_state"] == "terminal_success"
+    assert host.mutations == 1
+
+
+def test_an_execute_that_refused_is_sealable_but_never_re_executable(
+    host, journal
+) -> None:
+    """An armed EXECUTE that died before `submitted` is not a mutation.
+
+    It leaves a durable `intent` bound to the accepted digest. That intent
+    cannot be re-bound to another digest, and the existing pre-submission
+    seal still resolves it -- after which even the correct digest can never
+    mutate anything.
     """
 
     prepared = _handle(_request("prepare_exact_package_mutation"), host, journal)
     digest = prepared["evidence"]["prepared_evidence_digest"]
+    _execute_leaving_an_intent(host, journal, digest)
 
     wrong = _handle(
         _request("execute_exact_package_mutation", prepared_evidence_digest="0" * 64),

@@ -997,22 +997,6 @@ def test_a_stale_authority_context_releases_without_mutating(
     assert released.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
 
 
-def test_a_running_scan_is_retryable_and_never_mutates(tmp_path: Path) -> None:
-    _, store, authority, resource, _, _, job, guest, host, orchestrator = (
-        _armed_system(tmp_path)
-    )
-    authority.issue_package_scan(resource.resource_id)
-
-    result = orchestrator.execute_job_owned_mutation(job.job_id)
-
-    assert result.status is MutationStageStatus.AUTHORITY_TEMPORARILY_UNAVAILABLE
-    assert guest.mutations == []
-    preserved = store.package_update_job(job.job_id)
-    assert preserved.status is PackageUpdateJobStatus.ACTIVE
-    assert preserved.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
-    assert preserved.mutation_may_have_started_at is None
-
-
 def test_a_moved_guest_never_mutates(tmp_path: Path) -> None:
     _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
         tmp_path
@@ -2009,22 +1993,107 @@ def test_sql_refuses_a_completed_mutation_without_its_accepted_evidence(
             )
 
 
-def test_an_orphaned_prepare_refuses_without_stranding_the_global_slot(
+def test_a_running_scan_retries_to_a_real_mutation_without_a_restart(
     tmp_path: Path,
 ) -> None:
-    """Immutable intent refuses cleanly, and is not a stuck job.
+    """The pre-arm liveness contract, end to end.
 
-    A PREPARE whose backend then died leaves a durable host `intent` that a
-    later invocation may NOT re-prepare: that digest may already be the one
-    authority accepted, and a digest cannot reconstruct the evidence it
-    summarizes. So the invocation refuses with nothing armed and nothing
-    mutated.
+    `AUTHORITY_TEMPORARILY_UNAVAILABLE` advertises "retry later", so retrying
+    later must actually work. Preparation happens BEFORE the write-ahead
+    arming transaction and creates no durable host state, so an attempt that
+    cannot arm for an ordinary transient leaves the job exactly where it was
+    with nothing on the host to go stale -- and the next attempt is an
+    ordinary fresh preparation, not a recovery.
 
-    It is NOT sealed here. The job never crossed the write-ahead boundary --
-    it is still ACTIVE at `snapshot_confirmed` -- so the armed-job release
-    path does not apply, and the existing startup contract resolves it:
-    `snapshot_confirmed` is startup-interruptible, so restart recovery
-    terminalizes the job and frees the one global destructive slot.
+    A backend PROCESS RESTART must never be required to get past a scan that
+    happened to be running.
+    """
+
+    _, store, authority, resource, scan, _, job, guest, host, orchestrator = (
+        _armed_system(tmp_path)
+    )
+    request = authority.package_update_mutation_request(job.job_id)
+    running = authority.issue_package_scan(resource.resource_id)
+
+    first = orchestrator.execute_job_owned_mutation(job.job_id)
+
+    assert first.status is MutationStageStatus.AUTHORITY_TEMPORARILY_UNAVAILABLE
+    assert "prepare_exact_package_mutation" in host.calls
+    assert "execute_exact_package_mutation" not in host.calls
+    assert guest.mutations == []
+    # Nothing durable was created anywhere: not on the host, not in the job.
+    assert host.journal.read(request.mutation_operation_id) is None
+    waiting = store.package_update_job(job.job_id)
+    assert waiting.status is PackageUpdateJobStatus.ACTIVE
+    assert waiting.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert waiting.mutation_may_have_started_at is None
+    assert waiting.accepted_prepared_evidence_digest is None
+
+    # The scan completes with the same material, so the job stays current.
+    authority.finalize_successful_package_scan(
+        running.scan_run_id,
+        os_id="debian",
+        os_version="12",
+        packages=scan.packages,
+        reboot_required=None,
+    )
+
+    # The SAME orchestrator object, on the SAME process, simply tries again.
+    second = orchestrator.execute_job_owned_mutation(job.job_id)
+
+    assert second.status is MutationStageStatus.COMPLETED
+    assert guest.mutations == [1]
+    completed = store.package_update_job(job.job_id)
+    assert completed.checkpoint is PackageUpdateCheckpoint.MUTATION_COMPLETED
+    assert completed.accepted_prepared_evidence_digest is not None
+
+
+def test_a_lost_prepare_response_is_retryable_without_a_restart(
+    tmp_path: Path,
+) -> None:
+    """The host did all its read-only work; the answer never came back.
+
+    Preparation is read-only in BOTH senses -- no package changes and no
+    durable journal record -- so a lost response leaves the operation
+    identity completely untouched. The next attempt is an ordinary fresh
+    preparation against fresh evidence, never a permanent HOST_FAILURE.
+    """
+
+    _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
+        tmp_path
+    )
+    request = authority.package_update_mutation_request(job.job_id)
+    host.drop_response.add("prepare_exact_package_mutation")
+
+    lost = orchestrator.execute_job_owned_mutation(job.job_id)
+
+    assert lost.status is MutationStageStatus.HOST_FAILURE
+    assert lost.failure_class is PackageScanFailure.TIMEOUT
+    assert guest.mutations == []
+    assert host.journal.read(request.mutation_operation_id) is None
+    unchanged = store.package_update_job(job.job_id)
+    assert unchanged.status is PackageUpdateJobStatus.ACTIVE
+    assert unchanged.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert unchanged.mutation_may_have_started_at is None
+
+    host.drop_response.clear()
+
+    retried = orchestrator.execute_job_owned_mutation(job.job_id)
+
+    assert retried.status is MutationStageStatus.COMPLETED
+    assert guest.mutations == [1]
+
+
+def test_a_crash_after_preparing_before_arming_strands_nothing(
+    tmp_path: Path,
+) -> None:
+    """CASE: the backend prepared and then died before the arming transaction.
+
+    No mutation authority ever existed and no host mutation state ever
+    existed, so there is nothing to seal and nothing to recover. Both exits
+    stay open: an ordinary retry proceeds normally, and ordinary startup
+    recovery still interrupts a job sitting at `snapshot_confirmed` exactly
+    as it always did.
     """
 
     _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
@@ -2032,35 +2101,124 @@ def test_an_orphaned_prepare_refuses_without_stranding_the_global_slot(
     )
     request = authority.package_update_mutation_request(job.job_id)
     # A previous, now-dead invocation prepared this exact operation.
-    host.prepare_exact_package_mutation(request)
-    assert host.journal.read(request.mutation_operation_id)["phase"] == "intent"
-    orphaned_digest = host.journal.read(request.mutation_operation_id)[
-        "prepared_evidence_digest"
-    ]
+    prepared = host.prepare_exact_package_mutation(request)
 
-    result = orchestrator.execute_job_owned_mutation(job.job_id)
+    assert prepared.state is HostMutationState.ABSENT
+    assert prepared.prepared_evidence_digest is not None
+    assert host.journal.read(request.mutation_operation_id) is None
+    orphaned = store.package_update_job(job.job_id)
+    assert orphaned.status is PackageUpdateJobStatus.ACTIVE
+    assert orphaned.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
+    assert orphaned.accepted_prepared_evidence_digest is None
 
-    assert result.status is MutationStageStatus.HOST_FAILURE
-    assert "immutable" in (result.reason or "")
-    assert guest.mutations == []
-    assert "execute_exact_package_mutation" not in host.calls
-    # The accepted evidence was never replaced, and nothing was armed.
-    assert (
-        host.journal.read(request.mutation_operation_id)["prepared_evidence_digest"]
-        == orphaned_digest
-    )
-    assert host.journal.read(request.mutation_operation_id)["phase"] == "intent"
-    unchanged = store.package_update_job(job.job_id)
-    assert unchanged.status is PackageUpdateJobStatus.ACTIVE
-    assert unchanged.checkpoint is PackageUpdateCheckpoint.SNAPSHOT_CONFIRMED
-    assert unchanged.mutation_may_have_started_at is None
-    assert unchanged.accepted_prepared_evidence_digest is None
-
-    # And it is not stranded: the existing startup contract frees the slot,
-    # retaining the confirmed pre-update snapshot and fabricating no rollback
-    # authority.
+    # Startup recovery behaviour is unchanged: `snapshot_confirmed` is a
+    # startup-interruptible checkpoint, the confirmed snapshot is retained,
+    # and no rollback authority is fabricated.
     assert authority.recover_interrupted_package_update_jobs() == (job.job_id,)
     recovered = store.package_update_job(job.job_id)
     assert recovered.status is PackageUpdateJobStatus.INTERRUPTED
     assert recovered.snapshot_confirmed_at is not None
     assert recovered.mutation_may_have_started_at is None
+    assert guest.mutations == []
+
+
+def test_a_dead_backends_preparation_never_blocks_the_next_attempt(
+    tmp_path: Path,
+) -> None:
+    """The same crash, resolved the other way: by simply trying again.
+
+    This is the case the pre-arm durable journal used to make unreachable.
+    A dead backend's preparation left an immutable host `intent`, no later
+    invocation could obtain its digest, and the job could not proceed until
+    a restart interrupted it. It must now proceed on the next ordinary
+    attempt.
+    """
+
+    _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
+        tmp_path
+    )
+    request = authority.package_update_mutation_request(job.job_id)
+    host.prepare_exact_package_mutation(request)
+
+    result = orchestrator.execute_job_owned_mutation(job.job_id)
+
+    assert result.status is MutationStageStatus.COMPLETED
+    assert guest.mutations == [1]
+    assert (
+        store.package_update_job(job.job_id).checkpoint
+        is PackageUpdateCheckpoint.MUTATION_COMPLETED
+    )
+
+
+def test_only_the_accepted_digest_ever_becomes_the_host_intent(
+    tmp_path: Path,
+) -> None:
+    """Two real preparations, one accepted digest, one host intent.
+
+    With preparation durable-free, both invocations legitimately produce
+    evidence and both derive the same deterministic operation identity, so
+    identity cannot be what decides who may mutate. The arming transaction
+    picks the winner, the loser's submission is refused BEFORE the host is
+    called at all, and the host journal's very first record is therefore
+    created from the accepted digest and no other.
+    """
+
+    _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
+        tmp_path
+    )
+    request = authority.package_update_mutation_request(job.job_id)
+
+    losing = host.prepare_exact_package_mutation(request)
+    # The guest moves on between the two readings, so the two digests differ
+    # for a real reason rather than by construction.
+    guest.installed[("tzdata", "all")] = "2023d-1"
+    winning = host.prepare_exact_package_mutation(request)
+    assert losing.state is HostMutationState.ABSENT
+    assert winning.state is HostMutationState.ABSENT
+    assert losing.prepared_evidence_digest != winning.prepared_evidence_digest
+    # Neither preparation created anything to contend over.
+    assert host.journal.read(request.mutation_operation_id) is None
+
+    outcome, armed, _ = authority.arm_package_update_mutation(
+        job.job_id,
+        job_packages(job),
+        prepared_evidence_digest=winning.prepared_evidence_digest,
+    )
+    assert armed is PackageMutationArmOutcome.ARMED_NOW
+    assert (
+        store.package_update_job(job.job_id).accepted_prepared_evidence_digest
+        == winning.prepared_evidence_digest
+    )
+
+    # The loser tries to submit its own evidence. Authority refuses before
+    # the callback, so the host is never asked and no intent is created.
+    with pytest.raises(PackageMutationEvidenceNotAccepted):
+        authority.execute_package_mutation_submission_if_current(
+            job.job_id,
+            lambda: host.execute_exact_package_mutation(
+                request,
+                prepared_evidence_digest=losing.prepared_evidence_digest,
+            ),
+            prepared_evidence_digest=losing.prepared_evidence_digest,
+        )
+    assert "execute_exact_package_mutation" not in host.calls
+    assert host.journal.read(request.mutation_operation_id) is None
+    assert guest.mutations == []
+
+    # Only the winner reaches the host, and its digest becomes the binding.
+    submitted = authority.execute_package_mutation_submission_if_current(
+        job.job_id,
+        lambda: host.execute_exact_package_mutation(
+            request, prepared_evidence_digest=winning.prepared_evidence_digest
+        ),
+        prepared_evidence_digest=winning.prepared_evidence_digest,
+    )
+    assert submitted.state is HostMutationState.SUBMITTED
+    assert guest.mutations == [1]
+
+    # And the loser's delayed request can never mutate a second time.
+    late = host.execute_exact_package_mutation(
+        request, prepared_evidence_digest=losing.prepared_evidence_digest
+    )
+    assert late.state is HostMutationState.TERMINAL_SUCCESS
+    assert guest.mutations == [1]

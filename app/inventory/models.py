@@ -67,12 +67,17 @@ class HostMutationState(StrEnum):
     field it did not understand.
     """
 
-    #: No journal record exists. Transient pre-submission routing evidence
-    #: only -- never a release proof, because a helper launched by a backend
-    #: that then died may not have taken its host lease yet.
+    #: No journal record exists. The ordinary state before the backend has
+    #: armed anything -- a read-only prepare deliberately writes nothing --
+    #: and also what a backend that died between arming and executing leaves
+    #: behind. It is transient pre-submission routing evidence only: never a
+    #: release proof, because a helper launched by a backend that then died
+    #: may not have taken its host lease yet. Releasing an armed job needs
+    #: absence to be durably SEALED first, never merely observed.
     ABSENT = "absent"
-    #: A prepare crossed the door and journaled its read-only evidence, but
-    #: no package command has been launched. Also transient routing evidence.
+    #: An already-armed operation reached the host's submit-capable boundary,
+    #: binding the accepted evidence digest, but no package command has been
+    #: launched. Also transient routing evidence.
     INTENT = "intent"
     #: The durable no-future-submit fence. The ONLY evidence that may release
     #: a job which is already past its write-ahead mutation checkpoint.

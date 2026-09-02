@@ -362,7 +362,11 @@ def parse_host_response(
             "host-control returned malformed package mutation evidence",
         )
 
-    if state is HostMutationState.INTENT and evidence is not None:
+    if state is HostMutationState.ABSENT and evidence is not None:
+        # Read-only preparation evidence. It is reported against `absent`
+        # because a PREPARE deliberately creates no durable host state: the
+        # journal's first record is written by the submit-capable EXECUTE,
+        # from the digest authority accepted.
         return _parse_prepared(state, running, reason, evidence, expected_operation_id)
     if (
         state

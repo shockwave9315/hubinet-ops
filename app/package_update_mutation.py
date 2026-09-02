@@ -17,22 +17,42 @@ workload package command in this product.
 ```text
 ACTIVE @ snapshot_confirmed
   -> host PREPARE          (read-only: metadata refresh, SIMULATION, dpkg
-                            identity; journals `intent` + an evidence digest)
+                            identity; returns an evidence digest and writes
+                            NO durable host state)
   -> canonical material    (the SAME parser package scanning uses)
   -> ONE authority transaction:
         re-prove ACTIVE @ snapshot_confirmed
         re-prove current authority     (stale -> released, blocked)
         exact complete-set equality vs the job's IMMUTABLE frozen rows
         COMMIT checkpoint = mutation_may_have_started      (write-ahead)
-  -> short submission critical section: re-prove current authority and, while
-     still holding the authority writer lock, ask the host to EXECUTE
-  -> host durably journals `submitted` BEFORE launching anything, then hands
-     the real package command to a detached runner and returns
+                          + accepted_prepared_evidence_digest
+  -> short submission critical section: re-prove current authority and the
+     accepted digest and, while still holding the authority writer lock, ask
+     the host to EXECUTE
+  -> host journals `intent` bound to that accepted digest, then durably
+     journals `submitted` BEFORE launching anything, then hands the real
+     package command to a detached runner and returns
   -> read-only polling, entirely outside any transaction
   -> terminal host evidence
   -> independent dpkg completion proof
   -> mutation_completed
 ```
+
+## Preparation is read-only in the durable sense too
+
+The host PREPARE writes no journal record. It runs strictly BEFORE the
+write-ahead arming transaction, so anything durable it created would be
+mutation-operation state for an operation that may never be armed -- and,
+being immutable once written, would convert every ordinary pre-arm transient
+(a package scan still RUNNING, a lost PREPARE response, a backend that died
+before arming) into an operation identity that could not be prepared again
+until a backend restart interrupted the job. Preparation is therefore
+repeatable by construction, and the host journal's first record is created by
+the submit-capable EXECUTE path, from the digest this arming transaction
+accepted. Nothing about at-most-once weakens: the host still writes and
+fsyncs `submitted` under its per-VMID lease before any package command can
+be launched, and an armed job with no host record is still resolved by
+durably SEALING that absence, never by inferring anything from it.
 
 ## Two boundaries, and why both exist
 
@@ -60,8 +80,9 @@ later invocation -- a retry, a restart recovery, a concurrent racer -- can
 observe, seal, or complete, and can never submit. That makes "no blind
 resubmission after a crash, timeout, or lost response" structural rather
 than a judgment call at each recovery branch, and it is enforced twice over:
-here, and by the host, which refuses to execute unless the caller presents
-the exact evidence digest its own journal recorded.
+here, and by the host, which binds the accepted digest into its journal's
+first record and then refuses to execute for any caller presenting a
+different one.
 
 ## Failure is never release
 
@@ -120,8 +141,11 @@ from app.package_scan import (
 DEFAULT_MUTATION_POLL_TIMEOUT_SECONDS = 5400.0
 DEFAULT_MUTATION_POLL_INTERVAL_SECONDS = 5.0
 
-#: Host journal states from which a NEW mutation may still be submitted.
-#: Everything else means a package command may already have run.
+#: Host journal states from which a NEW mutation may still be submitted, and
+#: which a durable host seal may therefore fence. `ABSENT` is the ordinary
+#: one -- the backend arms BEFORE calling the host, so a backend that died
+#: between arming and executing leaves exactly this. Everything else means a
+#: package command may already have run.
 _SUBMISSION_PERMITTED_STATES = (
     HostMutationState.ABSENT,
     HostMutationState.INTENT,
@@ -180,7 +204,12 @@ class PackageUpdateMutationHostControl(Protocol):
     def prepare_exact_package_mutation(
         self, request: PackageUpdateMutationRequest
     ) -> HostMutationResult:
-        """Produce fresh execution-time evidence. Non-mutating."""
+        """Produce fresh execution-time evidence. Non-mutating, and durable-free.
+
+        It changes no workload package AND writes no host journal record, so
+        an attempt that never gets armed leaves the operation identity
+        untouched and the next attempt simply prepares again.
+        """
 
     def execute_exact_package_mutation(
         self,
@@ -395,11 +424,15 @@ class PackageUpdateMutationOrchestrator:
                 reason="package mutation preparation failed",
             )
         prepared = self._validated(prepared, request.mutation_operation_id)
-        if prepared.state is not HostMutationState.INTENT:
-            # The host already has an operation past preparation for this
-            # identity while the backend has not armed one. Nothing is
-            # mutated, nothing is armed, and the evidence is surfaced rather
-            # than reasoned around.
+        if prepared.state is not HostMutationState.ABSENT:
+            # Preparation is read-only and creates no durable host state, so
+            # `absent` is the only state a preparable operation can be in.
+            # Anything else means the host already has durable state for
+            # this identity while the backend has not armed one -- which
+            # cannot happen on the ordinary path, because the host's first
+            # record is written by an EXECUTE that only an armed job can
+            # send. Nothing is mutated, nothing is armed, and the evidence
+            # is surfaced rather than reasoned around.
             return MutationStageResult(
                 status=MutationStageStatus.HOST_FAILURE,
                 job=job,
@@ -407,39 +440,6 @@ class PackageUpdateMutationOrchestrator:
                 reason=(
                     "host package mutation evidence is past preparation while "
                     f"the job is not armed ({prepared.state.value})"
-                ),
-            )
-        if all(
-            field is None
-            for field in (
-                prepared.prepared_evidence_digest,
-                prepared.simulation_stdout,
-                prepared.native_architecture,
-                prepared.installed_inventory,
-                prepared.os_release,
-            )
-        ):
-            # The host holds a durable `intent` it will not replace, so this
-            # invocation has no prepared evidence and can never arm. That is
-            # deliberate: a second PREPARE must not be able to overwrite the
-            # digest authority may already have accepted, and a digest cannot
-            # reconstruct the evidence it summarizes.
-            #
-            # It is reported as an ordinary pre-mutation host failure, not
-            # routed to the seal. The job has NOT crossed the write-ahead
-            # boundary -- it is still ACTIVE at `snapshot_confirmed` -- so the
-            # armed-job release path does not apply to it, and the existing
-            # startup contract already resolves it: `snapshot_confirmed` is a
-            # startup-interruptible checkpoint, so restart recovery
-            # terminalizes the job and frees the global slot. Nothing is
-            # stranded, and nothing claims a mutation that did not happen.
-            return MutationStageResult(
-                status=MutationStageStatus.HOST_FAILURE,
-                job=job,
-                failure_class=PackageScanFailure.EXECUTION_FAILED,
-                reason=(
-                    prepared.reason
-                    or "host holds immutable prepared evidence for this operation"
                 ),
             )
         if (

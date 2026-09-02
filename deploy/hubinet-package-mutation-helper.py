@@ -123,6 +123,13 @@ absent -> intent -> sealed_not_submitted        (durably never submitted)
                  -> submitted -> terminal_success | terminal_failure
 ```
 
+`absent` is the ordinary state before the backend has armed anything.
+Preparation is deliberately read-only in the durable sense too -- it writes
+NO journal record -- so `intent` means exactly one thing: an already-armed
+operation reached this submit-capable boundary and has not yet crossed
+`submitted`. Both pre-submission states are sealable, under the same lease,
+into the durable `sealed_not_submitted` fence.
+
 `submitted` is written and fsynced BEFORE the package command is launched,
 and is never resubmitted from -- it is the genuinely uncertain window. The
 real command is run by a detached runner in its own session, reparented to
@@ -1572,6 +1579,14 @@ def _seal_never_submitted(
     submitter by the same non-blocking per-VMID lease: if a submitter took
     the lease first it durably reached `submitted` before launching
     anything, and this seal then refuses.
+
+    `absent` and `intent` seal identically, and `absent` is the ordinary
+    case: the backend arms BEFORE calling the host at all, so a backend that
+    died between arming and executing leaves exactly this -- a durable
+    write-ahead checkpoint with no host record. Holding the lease is what
+    makes converting that absence into a fence sound rather than an
+    inference: no submitter can be between its own `submitted` write and its
+    runner launch while this call owns the lease.
     """
 
     fingerprint = request_fingerprint(request)
@@ -1637,11 +1652,21 @@ def _prepare(
     the same commands the dark execution-plan gate uses. Nothing here can
     change a workload package.
 
-    It journals `intent` with a digest of the exact evidence it returned. The
-    backend must present that same digest back when it asks for the real
-    mutation, which is what makes "the mutation executes only against
-    material the backend actually proved" a durable host-side fact rather
-    than a hope.
+    It is also PURELY read-only in the durable sense: it writes no journal
+    record at all. Preparation happens BEFORE the backend's write-ahead
+    arming transaction, so a durable record written here would be
+    mutation-operation state created for an operation that may never be
+    armed -- and, being immutable once written, would turn any ordinary
+    pre-arm transient (a package scan still RUNNING, a lost PREPARE
+    response, a backend that died before arming) into an operation identity
+    that can never be prepared again without a backend restart. Preparation
+    is therefore repeatable by construction: the durable journal's first
+    record is created by `_execute`, the only path that may submit, from the
+    digest the backend's arming transaction actually accepted.
+
+    The evidence digest is still returned, and is still what binds the
+    mutation to material the backend proved -- it simply becomes a durable
+    host fact at the submit-capable boundary rather than before it.
     """
 
     fingerprint = request_fingerprint(request)
@@ -1651,42 +1676,20 @@ def _prepare(
         record = _require_matching_request(
             journal.read(request["mutation_operation_id"]), fingerprint
         )
-        if record is not None and record["phase"] == "intent":
-            # An intent already exists for this exact operation, and the
-            # digest it carries may ALREADY be the one authority accepted
-            # and armed. Recomputing evidence here and overwriting that
-            # digest is precisely how a second, concurrent PREPARE could
-            # replace the material the arming transaction bound itself to,
-            # so it is refused outright.
+        if record is not None:
+            # ANY durable record means this operation already reached the
+            # submit-capable boundary: `intent` is written by `_execute`
+            # after the backend armed, and every later phase follows it. So
+            # this is not a repeatable pre-arm preparation any more --
+            # preparing again would be meaningless and must never look like
+            # permission to mutate.
             #
-            # The journal deliberately retains only the digest, never the
-            # evidence, so this cannot instead return "the same evidence
-            # again": a digest cannot reconstruct what it summarizes, and
-            # pretending otherwise would be a fabrication. An orphaned
-            # intent -- a PREPARE whose backend died before arming -- is
-            # therefore never permission to execute. Recovery inspects it
-            # and seals it through the existing pre-submission seal, which
-            # blocks the job and releases the global slot without ever
-            # claiming a mutation happened.
             # Reported as the durable phase with NO evidence rather than as
             # an error, so the backend can route it to the existing
             # pre-submission seal instead of leaving the job holding the one
             # global destructive slot with nothing able to resolve it. The
             # seal decision still belongs to this journal: `_seal_never_
             # submitted` refuses once the phase has moved past `intent`.
-            return _response(
-                request,
-                "intent",
-                running=False,
-                reason=(
-                    "package mutation preparation already exists for this "
-                    "operation and its accepted evidence is immutable"
-                ),
-            )
-        if record is not None and record["phase"] != "intent":
-            # Already past preparation -- sealed, submitted, or finished.
-            # Preparing again would be meaningless and must never look like
-            # permission to mutate.
             return _response(
                 request,
                 str(record["phase"]),
@@ -1765,20 +1768,13 @@ def _prepare(
             "simulation_stdout": simulation_stdout,
         }
         digest = evidence_digest(evidence)
-        journal.write(
-            {
-                "journal_version": 1,
-                "mutation_operation_id": request["mutation_operation_id"],
-                "request_fingerprint": fingerprint,
-                "vmid": vmid,
-                "expected_node": expected_node,
-                "phase": "intent",
-                "prepared_evidence_digest": digest,
-            }
-        )
+        # `absent` is the literal truth: this operation has no durable host
+        # state, and preparing again is legal. Nothing here is a promise
+        # that a mutation may happen -- only the backend's arming
+        # transaction can make that decision.
         return _response(
             request,
-            "intent",
+            "absent",
             reason="fresh execution-time evidence prepared; no package changed",
             evidence={**evidence, "prepared_evidence_digest": digest},
         )
@@ -1788,6 +1784,16 @@ def _execute(
     runner: Runner, request: Mapping[str, Any], journal: OperationJournal
 ) -> dict[str, Any]:
     """Cross the submission boundary at most once, then detach the runner.
+
+    This is also where this operation's durable host state BEGINS. The
+    backend reaches here only after its write-ahead arming transaction
+    committed `mutation_may_have_started` and re-proved that this caller
+    carries the exact `accepted_prepared_evidence_digest` that transaction
+    accepted, so the digest presented here is the accepted one by
+    construction. The first thing this does, under the lease, is journal
+    `intent` bound to that digest -- after which the binding is immutable
+    and no later caller can substitute another, which is the host half of
+    "only the accepted evidence may submit".
 
     Returns as soon as `submitted` is durable. It NEVER waits for the package
     command, so the backend may hold its one authority writer lock across
@@ -1803,10 +1809,27 @@ def _execute(
             journal.read(request["mutation_operation_id"]), fingerprint
         )
         if record is None:
-            raise MutationError(
-                "mutation_state_mismatch",
-                "package mutation was never prepared for this operation",
-            )
+            # The FIRST durable record for this operation identity, created
+            # by the only path that may ever submit, from the digest the
+            # backend's arming transaction accepted. Absence is the normal
+            # state here: preparation is read-only and durable-free, so
+            # nothing precedes this write.
+            #
+            # It is a separate fsynced record rather than a direct jump to
+            # `submitted` because it binds the digest before any guest I/O:
+            # every pre-flight fence below can refuse, and a crash in that
+            # window leaves an operation whose accepted digest is already
+            # frozen and which the existing seal still resolves.
+            record = {
+                "journal_version": 1,
+                "mutation_operation_id": request["mutation_operation_id"],
+                "request_fingerprint": fingerprint,
+                "vmid": vmid,
+                "expected_node": expected_node,
+                "phase": "intent",
+                "prepared_evidence_digest": request["prepared_evidence_digest"],
+            }
+            journal.write(record)
         phase = record["phase"]
         if phase == "sealed_not_submitted":
             # The durable seal is terminal with respect to submission, and is
@@ -1848,6 +1871,9 @@ def _execute(
         if record.get("prepared_evidence_digest") != request[
             "prepared_evidence_digest"
         ]:
+            # A pre-existing `intent` froze this operation's accepted digest.
+            # A caller presenting a different one is never served it, no
+            # matter how it obtained it.
             raise MutationError(
                 "mutation_state_mismatch",
                 "package mutation request does not carry the exact prepared "
