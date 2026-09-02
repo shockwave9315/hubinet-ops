@@ -1725,6 +1725,17 @@ _SCHEMA_STATEMENTS = (
               (mutation_may_have_started_at IS NOT NULL AND
                mutation_operation_id IS NOT NULL AND
                accepted_prepared_evidence_digest IS NOT NULL)),
+        -- Rank 7 is health_started. Unlike ranks 8/9 (rollback), health
+        -- validation is never compensation for an uncertain mutation -- it
+        -- is the next stage of a mutation that already succeeded. So,
+        -- deliberately UNLIKE the rollback ranks below, health_started may
+        -- NOT be reached from an unproven mutation: a job stuck at rank 5
+        -- with mutation_completed_at NULL must route to rollback, never to
+        -- health. This is intentionally narrower than the old v13 form
+        -- "rank >= 6 IMPLIES completed" -- it binds ONLY health_started, so
+        -- ranks 8 and 9 remain reachable without mutation_completed_at.
+        CHECK(checkpoint != 'health_started' OR
+              mutation_completed_at IS NOT NULL),
         -- Rank 8 is rollback_may_have_started -- the write-ahead PVE
         -- rollback uncertainty boundary. Both directions, so neither the
         -- checkpoint nor the durable rollback facts can be forged

@@ -1546,6 +1546,15 @@ to their own checkpoints in both directions:
 - `checkpoint = 'mutation_completed'` requires `mutation_completed_at`, and
   `mutation_completed_at` requires rank ≥ 6 — but a later rank no longer
   implies it;
+- `checkpoint = 'health_started'` (rank 7) STILL requires
+  `mutation_completed_at`, deliberately unlike the ranks above it. Health
+  validation is never compensation for an uncertain mutation the way rollback
+  is — it is the next stage of a mutation that already succeeded — so a job
+  stuck at rank 5 with `mutation_completed_at` still NULL must route to
+  rollback, never to health. This is the one place schema v14 keeps the old
+  v13 shape, narrowed to exactly the checkpoint that needs it, rather than
+  reinstating the broad "rank ≥ 6 implies completed" rule the rest of this
+  section removed;
 - rank ≥ 8 (`rollback_may_have_started`) iff both `rollback_operation_id` and
   `rollback_may_have_started_at` exist; rank ≥ 9 (`rollback_completed`) iff
   `rollback_completed_at` exists;
@@ -1629,8 +1638,14 @@ the same helper `select_package_update_rollback_target` uses. Only after that
 boundary is durable may a rollback be submitted, and only from inside
 `execute_rollback_submission_if_current`, which re-proves the rollback
 predicate while holding the authority store's one writer lock across a single
-bounded submission-only host round trip. Task polling and canonical
-confirmation run strictly outside it.
+bounded submission-only host round trip. The instant that call (or a
+reattaching read) returns a known PVE task identity, the orchestrator records
+it durably — in its own short transaction, which ends immediately — BEFORE
+any polling begins. So a failed poll, a lost SSH session, a timeout, or a
+backend crash during that bounded, read-only wait can never cost authority a
+task identity it already observed: the host's journal is not the only place
+that identity survives. Task polling and canonical confirmation run strictly
+outside the writer lock, after that write.
 `app/inventory/contention_policy.py` gains
 `MAX_ROLLBACK_SUBMISSION_TIMEOUT_SECONDS` (90s, enforced in the transport's
 constructor) and derives `MAX_ROLLBACK_CRITICAL_SECTION_SECONDS` (95s); the

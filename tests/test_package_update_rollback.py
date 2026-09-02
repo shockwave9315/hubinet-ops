@@ -45,10 +45,12 @@ from app.inventory import (
     PackageUpdateCheckpoint,
     PackageUpdateEventType,
     PackageUpdateJobStatus,
+    PackageUpdateRollbackRequest,
     RollbackSubmissionRefusedBeforeCallback,
 )
 from app.inventory.rollback_identity import derive_package_rollback_identity
 from app.inventory.snapshot_identity import build_snapshot_ownership
+from app.package_update_snapshot import SnapshotTaskState, SnapshotTaskStatus
 from app.package_update_rollback import (
     HostRollbackResult,
     PackageUpdateRollbackError,
@@ -1946,6 +1948,292 @@ def test_a_host_answering_a_different_operation_is_uncertain(
 
     assert result.outcome is RollbackOperationOutcome.UNCERTAIN
     assert result.job.status is PackageUpdateJobStatus.ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# The known PVE task identity is durable BEFORE polling begins, so a failed
+# poll, a lost SSH session, or a backend crash right there can never cost
+# authority a task identity it already durably observed.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedRollbackHostControl:
+    """A hermetic host-control fake with a scripted, ordered answer queue.
+
+    Each queued entry for ``inspect_rollback_state`` is consumed in order and
+    may be a :class:`HostRollbackResult`, an exception (raised), or a
+    callable of ``request`` returning either -- so a test can bind the answer
+    to the request's own derived ``rollback_operation_id`` without having to
+    predict it. ``submit_result`` follows the same shapes. A call beyond what
+    a scenario scripted, or a submission/seal a scenario never expected, is a
+    test bug rather than host behaviour, so both fail loudly.
+    """
+
+    def __init__(
+        self,
+        inspect_results,
+        *,
+        submit_result=None,
+    ) -> None:
+        self._inspect_results = list(inspect_results)
+        self._submit_result = submit_result
+        self.submit_calls = 0
+        self.inspect_calls = 0
+        self.seal_calls = 0
+
+    @staticmethod
+    def _resolve(item, request):
+        if callable(item):
+            item = item(request)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def submit_same_job_rollback(self, request) -> HostRollbackResult:
+        self.submit_calls += 1
+        if self._submit_result is None:
+            raise AssertionError("this scenario must never submit a rollback")
+        return self._resolve(self._submit_result, request)
+
+    def inspect_rollback_state(self, request) -> HostRollbackResult:
+        self.inspect_calls += 1
+        if not self._inspect_results:
+            raise AssertionError("inspect_rollback_state called more than scripted")
+        return self._resolve(self._inspect_results.pop(0), request)
+
+    def seal_rollback_never_submitted(self, request) -> HostRollbackResult:
+        self.seal_calls += 1
+        raise AssertionError("this scenario must never seal")
+
+
+def _armable_job(tmp_path: Path):
+    """A job past the write-ahead mutation boundary, with NO host control.
+
+    Every test in this cluster drives ``PackageUpdateRollbackOrchestrator``
+    against a purpose-scripted :class:`_ScriptedRollbackHostControl` instead
+    of the real helper, so the exact sequence of host answers -- and exactly
+    when a poll fails -- is deterministic rather than incidental.
+    """
+
+    clock, store, authority, resource, scan, approval, job = _ready_job(tmp_path)
+    authority.arm_package_update_mutation(
+        job.job_id, _fresh_material(job), prepared_evidence_digest="a" * 64
+    )
+    job = authority.package_update_job(job.job_id)
+    ownership = authority.package_update_snapshot_ownership(job.job_id)
+    identity = authority.package_update_snapshot_identity(job.job_id)
+    return authority, job, ownership, identity
+
+
+def _absent_then(*queued):
+    """A pre-submission read proving no rollback has crossed the door yet,
+    followed by whatever the scenario wants to script after submission."""
+
+    def _pre_submission(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+        return HostRollbackResult(
+            outcome=RollbackOperationOutcome.UNCERTAIN,
+            rollback_operation_id=request.rollback_operation_id,
+            rollback_state=HostRollbackState.ABSENT,
+        )
+
+    return [_pre_submission, *queued]
+
+
+def _task_known(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+    """A successful submission response: PVE returned exactly UPID."""
+
+    return HostRollbackResult(
+        outcome=RollbackOperationOutcome.UNCERTAIN,
+        rollback_operation_id=request.rollback_operation_id,
+        task_upid=UPID,
+        rollback_state=HostRollbackState.TASK_KNOWN,
+    )
+
+
+def test_a_known_task_survives_a_first_poll_that_raises(tmp_path: Path) -> None:
+    """Finding B, witness 1: the SSH/helper inspection itself fails."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    host = _ScriptedRollbackHostControl(
+        _absent_then(TimeoutError("helper inspection unavailable")),
+        submit_result=_task_known,
+    )
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority, host, sleep=lambda _s: None, monotonic=_FakeMonotonic(5.0)
+    )
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert result.job.rollback_task_upid == UPID
+    assert authority.package_update_job(job.job_id).rollback_task_upid == UPID
+    assert host.submit_calls == 1
+
+
+def test_a_known_task_survives_a_first_poll_that_returns_generic_uncertainty(
+    tmp_path: Path,
+) -> None:
+    """Finding B, witness 1's variant: the poll returns cleanly, but with no
+    task identity of its own -- the exact shape that previously discarded a
+    task identity the backend already knew."""
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+
+    def _generic_uncertain(request: PackageUpdateRollbackRequest) -> HostRollbackResult:
+        return HostRollbackResult(
+            outcome=RollbackOperationOutcome.UNCERTAIN,
+            rollback_operation_id=request.rollback_operation_id,
+            reason="helper returned no usable task state",
+        )
+
+    host = _ScriptedRollbackHostControl(
+        _absent_then(_generic_uncertain), submit_result=_task_known
+    )
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority, host, sleep=lambda _s: None, monotonic=_FakeMonotonic(5.0)
+    )
+
+    result = orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert result.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert authority.package_update_job(job.job_id).rollback_task_upid == UPID
+    assert host.submit_calls == 1
+
+
+def test_the_known_task_is_durable_before_the_first_poll_call(
+    tmp_path: Path,
+) -> None:
+    """Deterministic crash seam: prove the ORDER directly.
+
+    Immediately after the submission result is processed, and strictly
+    before ``_poll_until_resolved`` makes its first read, the task identity
+    must already be durable -- so a crash exactly there loses nothing.
+    """
+
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    host = _ScriptedRollbackHostControl(
+        _absent_then(
+            lambda request: HostRollbackResult(
+                outcome=RollbackOperationOutcome.COMPLETED,
+                rollback_operation_id=request.rollback_operation_id,
+                task_upid=UPID,
+                rollback_state=HostRollbackState.TERMINAL,
+                task=SnapshotTaskStatus(upid=UPID, terminal=True, state=SnapshotTaskState.OK),
+                snapshots=_canonical_after_rollback(ownership, identity),
+            )
+        ),
+        submit_result=_task_known,
+    )
+    orchestrator = PackageUpdateRollbackOrchestrator(
+        authority, host, sleep=lambda _s: None, monotonic=_FakeMonotonic(5.0)
+    )
+    observed_before_poll: list[str | None] = []
+    original_poll = orchestrator._poll_until_resolved
+
+    def _seam(request, result):
+        observed_before_poll.append(
+            authority.package_update_job(job.job_id).rollback_task_upid
+        )
+        return original_poll(request, result)
+
+    orchestrator._poll_until_resolved = _seam
+
+    orchestrator.roll_back_to_job_snapshot(
+        job.job_id, _canonical_before_rollback(ownership, identity)
+    )
+
+    assert observed_before_poll == [UPID]
+
+
+def test_re_entry_after_a_failed_poll_reattaches_without_resubmitting(
+    tmp_path: Path,
+) -> None:
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    observed = _canonical_before_rollback(ownership, identity)
+    first_host = _ScriptedRollbackHostControl(
+        _absent_then(TimeoutError("helper inspection unavailable")),
+        submit_result=_task_known,
+    )
+    first_orchestrator = PackageUpdateRollbackOrchestrator(
+        authority, first_host, sleep=lambda _s: None, monotonic=_FakeMonotonic(5.0)
+    )
+    first = first_orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+    assert first.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert first_host.submit_calls == 1
+
+    # Re-entry: a fresh host answer proves TASK_KNOWN carries the SAME durable
+    # identity through to a terminal success, with no second submission ever
+    # attempted (the fake raises if `submit_same_job_rollback` is called).
+    second_host = _ScriptedRollbackHostControl(
+        [
+            lambda request: HostRollbackResult(
+                outcome=RollbackOperationOutcome.COMPLETED,
+                rollback_operation_id=request.rollback_operation_id,
+                task_upid=UPID,
+                rollback_state=HostRollbackState.TERMINAL,
+                task=SnapshotTaskStatus(upid=UPID, terminal=True, state=SnapshotTaskState.OK),
+                snapshots=_canonical_after_rollback(ownership, identity),
+            )
+        ],
+        submit_result=None,
+    )
+    second_orchestrator = PackageUpdateRollbackOrchestrator(
+        authority, second_host, sleep=lambda _s: None, monotonic=_FakeMonotonic(5.0)
+    )
+    second = second_orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    assert second.outcome is RollbackOperationOutcome.COMPLETED
+    assert second.job.rollback_task_upid == UPID
+    assert second_host.submit_calls == 0
+
+
+def test_a_conflicting_reattached_task_never_overwrites_the_durable_one(
+    tmp_path: Path,
+) -> None:
+    authority, job, ownership, identity = _armable_job(tmp_path)
+    observed = _canonical_before_rollback(ownership, identity)
+    first_host = _ScriptedRollbackHostControl(
+        _absent_then(TimeoutError("helper inspection unavailable")),
+        submit_result=_task_known,
+    )
+    first_orchestrator = PackageUpdateRollbackOrchestrator(
+        authority, first_host, sleep=lambda _s: None, monotonic=_FakeMonotonic(5.0)
+    )
+    first = first_orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+    assert first.job.rollback_task_upid == UPID
+
+    # A later host answer claims a DIFFERENT task identity for this same
+    # operation -- corrupted state, a stale cache, or a wrong reattach. It
+    # must never overwrite the durable UPID, and must never be treated as
+    # licence to resubmit.
+    conflicting_host = _ScriptedRollbackHostControl(
+        [
+            lambda request: HostRollbackResult(
+                outcome=RollbackOperationOutcome.UNCERTAIN,
+                rollback_operation_id=request.rollback_operation_id,
+                task_upid=OTHER_UPID,
+                rollback_state=HostRollbackState.TASK_KNOWN,
+            )
+        ],
+        submit_result=None,
+    )
+    conflicting_orchestrator = PackageUpdateRollbackOrchestrator(
+        authority,
+        conflicting_host,
+        sleep=lambda _s: None,
+        monotonic=_FakeMonotonic(5.0),
+    )
+
+    second = conflicting_orchestrator.roll_back_to_job_snapshot(job.job_id, observed)
+
+    assert second.outcome is RollbackOperationOutcome.UNCERTAIN
+    assert second.job.rollback_task_upid == UPID
+    assert authority.package_update_job(job.job_id).rollback_task_upid == UPID
+    assert conflicting_host.submit_calls == 0
 
 
 # ===========================================================================

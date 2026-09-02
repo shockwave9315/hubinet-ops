@@ -343,7 +343,16 @@ class PackageUpdateRollbackOrchestrator:
         *,
         allow_pre_submission_seal: bool = True,
     ) -> RollbackStageResult:
-        # D. Task polling and canonical recovery happen entirely outside the
+        # D. The instant a result carries a known PVE task identity, persist
+        # it durably -- BEFORE any polling/sleep loop, and in a short
+        # transaction that ends immediately. From that point on a failed
+        # poll, a lost SSH session, a timeout, or a backend crash can never
+        # cost authority a task identity it already durably observed: the
+        # host's own journal is not the only place that identity survives.
+        early = self._persist_known_task(job.job_id, result)
+        if early is not None:
+            return early
+        # Task polling and canonical recovery happen entirely outside the
         # authority critical section: every iteration is a bounded, read-only
         # host inspection, never a resubmission and never a held writer lock.
         result = self._poll_until_resolved(request, result)
@@ -353,6 +362,32 @@ class PackageUpdateRollbackOrchestrator:
             result,
             allow_pre_submission_seal=allow_pre_submission_seal,
         )
+
+    def _persist_known_task(
+        self, job_id: str, result: HostRollbackResult
+    ) -> RollbackStageResult | None:
+        """Durably record a known PVE task identity before polling begins.
+
+        Returns ``None`` to let the caller proceed (there was nothing to
+        persist, or it persisted cleanly -- including idempotently, if this
+        exact UPID was already durable). Returns a terminal UNCERTAIN result
+        only when persistence itself fails closed, which happens if and only
+        if this result's task identity conflicts with one already recorded --
+        never a reason to keep polling.
+        """
+
+        if result.task_upid is None:
+            return None
+        try:
+            self._authority.record_package_update_rollback_task(
+                job_id, result.task_upid
+            )
+        except Exception:  # noqa: BLE001 - a conflicting task is uncertainty
+            return self._uncertain(
+                job_id,
+                "observed PVE rollback task conflicts with the durable one",
+            )
+        return None
 
     def _resolve_pre_rollback_block(
         self, job: PackageUpdateJob, request: PackageUpdateRollbackRequest
@@ -500,10 +535,12 @@ class PackageUpdateRollbackOrchestrator:
                 job_id, "rollback host operation answered a different operation"
             )
 
-        # Persist the task identity as soon as it is known, whatever the
-        # outcome: it is the only thing that lets a later attempt reattach
-        # instead of guessing, and it is also what permanently forbids the
-        # pre-submission seal for this operation.
+        # Idempotent safeguard, not the primary persistence point: `_finish`
+        # already durably recorded a known task identity BEFORE polling ran,
+        # via `_persist_known_task`. This repeats the same write-once record
+        # for whatever the FINAL (post-poll) result carries, which is
+        # harmless when it is the same UPID already durable, and still fails
+        # closed on a genuine conflict.
         if result.task_upid is not None:
             try:
                 self._authority.record_package_update_rollback_task(

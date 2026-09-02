@@ -1382,6 +1382,92 @@ def test_sql_refuses_completion_before_the_uncertainty_boundary(
     )
 
 
+def test_sql_refuses_health_started_without_proven_mutation_completion(
+    tmp_path: Path,
+) -> None:
+    """Finding A: health validation may never start before the exact package
+    mutation was independently proven complete.
+
+    A job stuck at ``mutation_may_have_started`` with no completion proof --
+    failed, partial, timed out, or simply unproven -- is exactly the job
+    schema v14 keeps eligible for rollback (ranks 8/9) WITHOUT ever
+    fabricating ``mutation_completed_at``. That rollback exception must never
+    widen into a way for `health_started` (rank 7) to be reached the same
+    way: unlike rollback, health is never compensation for an uncertain
+    mutation, it is the next stage of one that already succeeded.
+    """
+
+    _, store, authority, _, _, _, job, *_ = _armed_system(tmp_path)
+    authority.arm_package_update_mutation(
+        job.job_id, job_packages(job), prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST
+    )
+    armed = authority.package_update_job(job.job_id)
+    assert armed.checkpoint is PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED
+    assert armed.mutation_completed_at is None
+
+    # The witness: a buggy backend statement tries to advance straight to
+    # health_started while leaving mutation_completed_at NULL.
+    _assert_sql_rejected(
+        store,
+        "UPDATE package_update_jobs SET checkpoint='health_started' WHERE job_id=?",
+        (job.job_id,),
+    )
+
+
+def test_sql_still_permits_the_rollback_boundary_without_mutation_completion(
+    tmp_path: Path,
+) -> None:
+    """The positive control for the fix above: the ranks 8/9 rollback
+    exception schema v14 exists for must remain reachable from an unproven
+    mutation, completely unaffected by the new health_started gate."""
+
+    _, store, authority, _, _, _, job, *_ = _armed_system(tmp_path)
+    authority.arm_package_update_mutation(
+        job.job_id, job_packages(job), prepared_evidence_digest=ARBITRARY_EVIDENCE_DIGEST
+    )
+    armed = authority.package_update_job(job.job_id)
+    assert armed.checkpoint is PackageUpdateCheckpoint.MUTATION_MAY_HAVE_STARTED
+    assert armed.mutation_completed_at is None
+
+    rollback_operation_id = str(uuid.uuid4())
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE package_update_jobs SET checkpoint='rollback_may_have_started', "
+            "rollback_operation_id=?, rollback_may_have_started_at=? "
+            "WHERE job_id=?",
+            (rollback_operation_id, "2026-01-01T00:00:00+00:00", job.job_id),
+        )
+
+    after = authority.package_update_job(job.job_id)
+    assert after.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+    assert after.mutation_completed_at is None
+
+
+def test_sql_still_permits_health_started_after_a_proven_mutation(
+    tmp_path: Path,
+) -> None:
+    """The other positive control: a mutation actually proven complete may
+    still legally reach health_started under the new, narrower gate."""
+
+    _, store, authority, _, _, _, job, guest, host, orchestrator = _armed_system(
+        tmp_path
+    )
+    orchestrator.execute_job_owned_mutation(job.job_id)
+    completed = authority.package_update_job(job.job_id)
+    assert completed.checkpoint is PackageUpdateCheckpoint.MUTATION_COMPLETED
+    assert completed.mutation_completed_at is not None
+
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE package_update_jobs SET checkpoint='health_started' WHERE job_id=?",
+            (job.job_id,),
+        )
+
+    after = authority.package_update_job(job.job_id)
+    assert after.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert after.mutation_completed_at is not None
+
+
 def test_sql_makes_the_mutation_identity_and_timestamps_write_once(
     tmp_path: Path,
 ) -> None:
