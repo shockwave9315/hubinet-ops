@@ -22,10 +22,10 @@ job ACTIVE at mutation_completed
   -> re-prove the backend still names this exact resource/locator context
   -> ONE bounded read-only host round trip over a separate dark SSH boundary
   -> strict validation of the answer against the FROZEN contract
-  -> re-prove the backend context AGAIN, after the host answered
+  -> early re-prove of backend context after the host answered
   -> aggregate ALL-OF:
-       every probe passed          -> health_completed passed -> SUCCEEDED
-       any probe proven failed     -> health_completed failed -> stays ACTIVE
+       every probe passed          -> atomic final context proof + passed -> SUCCEEDED
+       any probe proven failed     -> atomic final context proof + failed -> ACTIVE
        anything else               -> no verdict at all, retryable
 ```
 
@@ -109,7 +109,12 @@ from app.inventory import (
     PackageUpdateJob,
     PackageUpdateJobHealthProbe,
     PackageUpdateJobStatus,
+    PackageUpdateHealthContextChanged,
     aggregate_health_outcome,
+)
+from app.inventory.health_observation import (
+    HealthProbeSemanticError,
+    require_health_probe_semantics,
 )
 
 
@@ -166,72 +171,6 @@ HOST_PROBE_REASONS: frozenset[str] = frozenset(
         "docker_daemon_unavailable",
     }
 )
-
-#: The only reasons that may accompany each outcome. A host that reports
-#: `passed` with `container_absent`, or `failed` with `command_timed_out`, is
-#: contradicting itself, and a self-contradictory answer is not evidence.
-_REASONS_BY_OUTCOME: dict[HealthProbeOutcome, frozenset[str]] = {
-    HealthProbeOutcome.PASSED: frozenset(
-        {"unit_active", "container_running", "container_healthy"}
-    ),
-    HealthProbeOutcome.FAILED: frozenset(
-        {
-            "unit_not_active",
-            "container_not_running",
-            "container_absent",
-            "container_unhealthy",
-            "container_health_starting",
-            "container_has_no_healthcheck",
-        }
-    ),
-    HealthProbeOutcome.UNKNOWN: frozenset(
-        {
-            "probe_target_not_exact",
-            "probe_target_ambiguous",
-            "guest_unavailable",
-            "command_failed",
-            "command_timed_out",
-            "malformed_output",
-            "docker_daemon_unavailable",
-        }
-    ),
-}
-
-#: Which probe kinds each definitive reason can possibly belong to. A systemd
-#: probe that comes back `container_running` is describing something the
-#: executor was never asked to look at.
-_REASON_KINDS: dict[str, frozenset[HealthProbeKind]] = {
-    "unit_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
-    "unit_not_active": frozenset({HealthProbeKind.SYSTEMD_UNIT_ACTIVE}),
-    "container_running": frozenset({HealthProbeKind.DOCKER_CONTAINER_RUNNING}),
-    "container_healthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
-    "container_not_running": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_absent": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-    "container_unhealthy": frozenset({HealthProbeKind.DOCKER_CONTAINER_HEALTHY}),
-    "container_health_starting": frozenset(
-        {HealthProbeKind.DOCKER_CONTAINER_HEALTHY}
-    ),
-    "container_has_no_healthcheck": frozenset(
-        {HealthProbeKind.DOCKER_CONTAINER_HEALTHY}
-    ),
-    "docker_daemon_unavailable": frozenset(
-        {
-            HealthProbeKind.DOCKER_CONTAINER_RUNNING,
-            HealthProbeKind.DOCKER_CONTAINER_HEALTHY,
-        }
-    ),
-}
-
 
 class HealthStageStatus(StrEnum):
     """How one dark health evaluation attempt ended, from the caller's side."""
@@ -310,7 +249,8 @@ class PackageUpdateHealthOrchestrator:
 
     Every host round trip happens strictly OUTSIDE this store's writer
     transactions. The authority transitions here are short and local: start
-    the evaluation, or accept its exact result. Nothing holds the writer lock
+    the evaluation, or atomically re-prove live context and accept its exact
+    result. Nothing holds the writer lock
     across SSH, `pct`, `systemctl`, `docker`, or a probe loop -- which is
     affordable precisely because a read-only evaluation needs no critical
     section to stop a second destructive submission.
@@ -410,9 +350,14 @@ class PackageUpdateHealthOrchestrator:
         except AuthorityConflict as exc:
             return self._unknown(job.job_id, "resource_context_changed", str(exc))
 
-        decided = self._authority.complete_package_update_health(
-            job.job_id, observations
-        )
+        try:
+            decided = self._authority.complete_package_update_health(
+                job.job_id, observations
+            )
+        except PackageUpdateHealthContextChanged as exc:
+            return self._unknown(
+                job.job_id, "resource_context_changed", str(exc)
+            )
         return HealthStageResult(
             status=(
                 HealthStageStatus.PASSED
@@ -519,15 +464,10 @@ def validate_host_health_result(
             raise PackageUpdateHealthError(
                 "host returned a probe reason outside its bounded taxonomy"
             )
-        if reason not in _REASONS_BY_OUTCOME[outcome]:
-            raise PackageUpdateHealthError(
-                "host returned a probe reason that contradicts its own outcome"
-            )
-        allowed_kinds = _REASON_KINDS.get(reason)
-        if allowed_kinds is not None and probe.kind not in allowed_kinds:
-            raise PackageUpdateHealthError(
-                "host returned a probe reason impossible for that probe kind"
-            )
+        try:
+            require_health_probe_semantics(probe.kind, outcome, reason)
+        except HealthProbeSemanticError as exc:
+            raise PackageUpdateHealthError(f"host returned a probe {exc}") from exc
         observations.append(
             HealthProbeObservation(
                 probe_index=probe.probe_index,

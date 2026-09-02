@@ -26,11 +26,13 @@ guest, with a JSON round trip through the real transport parser.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
 from pathlib import Path
 import sqlite3
 import sys
+from threading import Barrier
 from types import ModuleType
 import uuid
 
@@ -259,6 +261,62 @@ def test_issuance_refuses_a_resource_with_no_health_contract(
 
     with pytest.raises(AuthorityConflict, match="declared resource health contract"):
         _issue(authority, resource, approval)
+
+
+@pytest.mark.parametrize(
+    "probe",
+    (
+        ResourceHealthProbe(
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx"
+        ),
+        ResourceHealthProbe(
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx*"
+        ),
+        ResourceHealthProbe(
+            kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING, target="web/name"
+        ),
+    ),
+)
+def test_storage_valid_but_non_executable_contracts_are_refused_at_issuance(
+    tmp_path: Path, probe: ResourceHealthProbe
+) -> None:
+    """Opaque configuration remains legal, but cannot become a mutation job."""
+
+    _, store, authority, resource, _, approval = _approved_system(
+        tmp_path, health_probes=(probe,)
+    )
+    stored = authority.resource_health_contract(resource.resource_id)
+    assert stored is not None and stored.probes == (probe,)
+
+    with pytest.raises(AuthorityConflict, match="not executable"):
+        _issue(authority, resource, approval)
+    with store._read_transaction() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM package_update_jobs"
+        ).fetchone()["count"] == 0
+
+
+@pytest.mark.parametrize(
+    "probe",
+    (
+        ResourceHealthProbe(
+            kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
+        ),
+        ResourceHealthProbe(
+            kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING, target="web"
+        ),
+        ResourceHealthProbe(
+            kind=HealthProbeKind.DOCKER_CONTAINER_HEALTHY, target="web"
+        ),
+    ),
+)
+def test_every_exact_executor_probe_kind_remains_issuable(
+    tmp_path: Path, probe: ResourceHealthProbe
+) -> None:
+    _, _, authority, resource, _, approval = _approved_system(
+        tmp_path, health_probes=(probe,)
+    )
+    assert _issue(authority, resource, approval).health_probes[0].target == probe.target
 
 
 def test_a_cleared_contract_leaves_no_job_and_no_orphaned_probe_rows(
@@ -729,6 +787,34 @@ def test_a_job_cannot_health_complete_twice(tmp_path: Path) -> None:
         authority.complete_package_update_health(
             job.job_id, _observations(started, (HealthProbeOutcome.PASSED,) * 2)
         )
+
+
+def test_two_concurrent_health_finalizers_accept_exactly_one(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, _, _, job = _mutated_job(tmp_path)
+    started = authority.start_package_update_health(job.job_id)
+    observations = _observations(
+        started, (HealthProbeOutcome.PASSED, HealthProbeOutcome.PASSED)
+    )
+    barrier = Barrier(2)
+
+    def finalize() -> str:
+        barrier.wait()
+        try:
+            authority.complete_package_update_health(job.job_id, observations)
+        except AuthorityConflict:
+            return "refused"
+        return "accepted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (executor.submit(finalize), executor.submit(finalize))
+        outcomes = [future.result() for future in futures]
+
+    assert sorted(outcomes) == ["accepted", "refused"]
+    after = authority.package_update_job(job.job_id)
+    assert after.status is PackageUpdateJobStatus.SUCCEEDED
+    assert len(after.health_probe_results) == 2
 
 
 def test_a_later_result_can_never_overwrite_an_accepted_verdict(
@@ -1230,6 +1316,51 @@ def test_health_transitions_are_refused_once_a_rollback_is_armed(
         authority.start_package_update_health(job.job_id)
 
 
+def test_concurrent_passing_finalizer_and_rollback_arming_are_serialized(
+    tmp_path: Path,
+) -> None:
+    _, _, authority, _, _, _, job = _mutated_job(tmp_path)
+    identity = authority.package_update_snapshot_identity(job.job_id)
+    ownership = authority.package_update_snapshot_ownership(job.job_id)
+    started = authority.start_package_update_health(job.job_id)
+    observations = _observations(
+        started, (HealthProbeOutcome.PASSED, HealthProbeOutcome.PASSED)
+    )
+    snapshots = _canonical(ownership, identity)
+    barrier = Barrier(2)
+
+    def finalize() -> str:
+        barrier.wait()
+        try:
+            authority.complete_package_update_health(job.job_id, observations)
+        except AuthorityConflict:
+            return "health_refused"
+        return "health_accepted"
+
+    def arm_rollback() -> str:
+        barrier.wait()
+        try:
+            authority.arm_package_update_rollback(job.job_id, snapshots)
+        except AuthorityConflict:
+            return "rollback_refused"
+        return "rollback_armed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (executor.submit(finalize), executor.submit(arm_rollback))
+        outcomes = {future.result() for future in futures}
+
+    assert outcomes in (
+        {"health_accepted", "rollback_refused"},
+        {"health_refused", "rollback_armed"},
+    )
+    after = authority.package_update_job(job.job_id)
+    if after.status is PackageUpdateJobStatus.SUCCEEDED:
+        assert len(after.health_probe_results) == 2
+    else:
+        assert after.checkpoint is PackageUpdateCheckpoint.ROLLBACK_MAY_HAVE_STARTED
+        assert after.health_probe_results == ()
+
+
 # ===========================================================================
 # 9. Restart and retry
 # ===========================================================================
@@ -1521,6 +1652,61 @@ def test_a_resource_replaced_during_the_host_call_is_never_accepted(
     assert result.job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
 
 
+@pytest.mark.parametrize(
+    "outcomes",
+    (
+        (HealthProbeOutcome.PASSED, HealthProbeOutcome.PASSED),
+        (HealthProbeOutcome.FAILED, HealthProbeOutcome.PASSED),
+    ),
+)
+def test_context_replaced_after_post_host_proof_before_final_acceptance_is_unknown(
+    tmp_path: Path, monkeypatch, outcomes
+) -> None:
+    """The final in-transaction proof closes the old check/commit window."""
+
+    from tests.test_package_update_snapshot_safety import (
+        _break_incarnation_continuity_at_the_same_locator,
+    )
+
+    _, store, authority, _, _, _, job = _mutated_job(tmp_path)
+    request_calls = 0
+    original_request = authority.package_update_health_request
+
+    def counted_request(job_id):
+        nonlocal request_calls
+        request_calls += 1
+        return original_request(job_id)
+
+    original_complete = authority.complete_package_update_health
+
+    def replace_immediately_before_acceptance(job_id, observations):
+        # Both orchestrator read proofs have completed.  This is the exact
+        # historical transaction gap immediately before BEGIN IMMEDIATE in
+        # the durable finalizer.
+        assert request_calls == 2
+        _break_incarnation_continuity_at_the_same_locator(store, authority)
+        return original_complete(job_id, observations)
+
+    monkeypatch.setattr(authority, "package_update_health_request", counted_request)
+    monkeypatch.setattr(
+        authority, "complete_package_update_health", replace_immediately_before_acceptance
+    )
+
+    result = PackageUpdateHealthOrchestrator(
+        authority, FakeHealthHostControl(outcomes=outcomes)
+    ).evaluate_job_health(job.job_id)
+
+    assert result.status is HealthStageStatus.UNKNOWN
+    assert result.job.status is PackageUpdateJobStatus.ACTIVE
+    assert result.job.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert result.job.health_completed_at is None
+    assert result.job.health_outcome is None
+    assert result.job.health_probe_results == ()
+    event = store.list_package_update_job_events(job.job_id)[-1]
+    assert event.event_type is PackageUpdateEventType.HEALTH_OUTCOME_UNKNOWN
+    assert event.details["reason"] == "resource_context_changed"
+
+
 def test_a_stale_resource_context_is_refused_before_any_host_call(
     tmp_path: Path,
 ) -> None:
@@ -1682,6 +1868,72 @@ def test_a_reason_impossible_for_that_probe_kind_is_rejected(
     )
     with pytest.raises(PackageUpdateHealthError, match="impossible for that probe kind"):
         validate_host_health_result(job, _host_result(job, probes=impossible))
+
+
+@pytest.mark.parametrize(
+    ("probe", "outcome", "reason", "match"),
+    (
+        (
+            ResourceHealthProbe(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
+            ),
+            HealthProbeOutcome.PASSED,
+            "command_failed",
+            "contradicts its own outcome",
+        ),
+        (
+            ResourceHealthProbe(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
+            ),
+            HealthProbeOutcome.FAILED,
+            "command_timed_out",
+            "contradicts its own outcome",
+        ),
+        (
+            ResourceHealthProbe(
+                kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx.service"
+            ),
+            HealthProbeOutcome.PASSED,
+            "container_running",
+            "impossible for that probe kind",
+        ),
+        (
+            ResourceHealthProbe(
+                kind=HealthProbeKind.DOCKER_CONTAINER_RUNNING, target="web"
+            ),
+            HealthProbeOutcome.PASSED,
+            "unit_active",
+            "impossible for that probe kind",
+        ),
+    ),
+)
+def test_authority_directly_refuses_semantically_contradictory_observations(
+    tmp_path: Path,
+    probe: ResourceHealthProbe,
+    outcome: HealthProbeOutcome,
+    reason: str,
+    match: str,
+) -> None:
+    _, _, authority, _, _, _, job = _mutated_job(
+        tmp_path, health_probes=(probe,)
+    )
+    started = authority.start_package_update_health(job.job_id)
+    observation = HealthProbeObservation(
+        probe_index=0,
+        kind=probe.kind,
+        target=probe.target,
+        outcome=outcome,
+        reason=reason,
+    )
+
+    with pytest.raises(AuthorityConflict, match=match):
+        authority.complete_package_update_health(job.job_id, (observation,))
+
+    after = authority.package_update_job(started.job_id)
+    assert after.checkpoint is PackageUpdateCheckpoint.HEALTH_STARTED
+    assert after.health_completed_at is None
+    assert after.health_outcome is None
+    assert after.health_probe_results == ()
 
 
 def test_an_unbounded_host_reason_is_rejected(tmp_path: Path) -> None:
@@ -1957,29 +2209,33 @@ def test_end_to_end_a_missing_container_fails_because_the_daemon_answered(
     assert [r.reason for r in result.job.health_probe_results][0] == "container_absent"
 
 
-def test_end_to_end_a_glob_target_is_unknown_and_never_passes(
+def test_end_to_end_a_glob_target_is_refused_before_a_job_or_mutation_exists(
     tmp_path: Path,
 ) -> None:
-    """The end-to-end version of the false PASS this design exists to stop.
+    """Structural non-executability is known before any lifecycle mutation.
 
     `nginx*` would match the active `nginx.service` through systemd's own
-    pattern expansion. It must not produce a successful update job.
+    pattern expansion. It remains legal opaque configuration, but cannot be
+    frozen into a package-update job and therefore cannot reach snapshot or
+    package mutation.
     """
 
-    store, authority, guest, result = _end_to_end(
+    _, store, authority, resource, _, approval = _approved_system(
         tmp_path,
-        probes=(
+        health_probes=(
             ResourceHealthProbe(
                 kind=HealthProbeKind.SYSTEMD_UNIT_ACTIVE, target="nginx*"
             ),
         ),
     )
+    assert authority.resource_health_contract(resource.resource_id) is not None
 
-    assert result.status is HealthStageStatus.UNKNOWN
-    assert result.job.status is PackageUpdateJobStatus.ACTIVE
-    assert result.job.health_outcome is None
-    event = store.list_package_update_job_events(result.job.job_id)[-1]
-    assert event.details["reason"] == "probe_target_not_exact"
+    with pytest.raises(AuthorityConflict, match="not executable"):
+        _issue(authority, resource, approval)
+    with store._read_transaction() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) AS count FROM package_update_jobs"
+        ).fetchone()["count"] == 0
 
 
 def test_end_to_end_docker_health_is_required_when_it_was_asked_for(

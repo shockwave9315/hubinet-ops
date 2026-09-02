@@ -1,9 +1,9 @@
 """Hubinet Ops 0.5 persistent inventory authority core."""
 
 from .authority import (
-    HEALTH_PROBE_REASONS,
     HealthProbeObservation,
     InventoryAuthority,
+    PackageUpdateHealthContextChanged,
     package_plan_fingerprint,
 )
 from .canonicalization import (
@@ -17,6 +17,9 @@ from .health_contract import (
     MIN_HEALTH_PROBES,
     canonical_health_probes,
     health_contract_fingerprint,
+)
+from .health_observation import (
+    HEALTH_PROBE_REASONS,
 )
 from .contention_policy import (
     AUTHORITY_WRITER_WAIT_BUDGET_MS,
@@ -202,6 +205,7 @@ __all__ = [
     "PackageUpdateEventLevel",
     "PackageUpdateEventType",
     "PackageUpdateExecutionOutcome",
+    "PackageUpdateHealthContextChanged",
     "PackageUpdateHealthRequest",
     "PackageUpdateJob",
     "PackageUpdateJobEvent",

@@ -1936,6 +1936,18 @@ be called successful, and would reach the mutation boundary with nothing to
 validate against. It is refused at issuance, before any snapshot or package
 operation exists.
 
+**A stored contract must also be execution-eligible before issuance.** Schema
+v15 intentionally stores bounded opaque targets and remains unchanged; being
+valid configuration is not proof that the stricter executor can represent it.
+The pure validator in `app/inventory/health_execution.py` therefore checks the
+exact contract inside the issuance transaction before any job row is written.
+It covers all three probe kinds, requires the executor's explicit systemd unit
+suffix and exact non-pattern grammar, and requires the exact Docker name
+grammar. It performs no host I/O. A non-executable contract remains readable
+configuration but produces no job, snapshot, or package mutation. Because the
+standalone host helper cannot import backend code, one regression compares its
+compiled patterns and suffix set byte-for-byte with this backend definition.
+
 The frozen rows are written before the parent job row through the same
 `DEFERRABLE INITIALLY DEFERRED` foreign key the frozen package rows use, and
 triggers make the three columns and the probe rows immutable from then on.
@@ -2077,7 +2089,7 @@ Health execution needs **no new PVE API privilege**: it reads through
 host-local `pct exec` behind its own forced-command SSH boundary, so the
 provisioned production role stays exactly the audit-only pair.
 
-### Live target revalidation, in three places
+### Live target revalidation, including atomic acceptance
 
 A false PASS against a *replacement* guest would be a serious authority failure
 even though the probes change nothing — it would be a false statement that this
@@ -2094,10 +2106,15 @@ job's workload is healthy. So the existing layered model applies:
   dispatcher owns the invariant, exactly as the mutation helper's does: every
   guest command is preceded by its own fresh `revalidate_live_target`, so no
   caller can amortize one check across two commands.
-- **Backend, after the host answered.** The same context proof runs again. A
-  guest replaced while the round trip was in flight means the answer describes
-  a different workload, and neither a PASS nor a FAIL about it is accepted; the
-  job stays fenced and recoverable.
+- **Backend, after the host answered.** The orchestrator runs the same proof as
+  an early rejection. The load-bearing proof then runs once more inside
+  `complete_package_update_health`'s `BEGIN IMMEDIATE` transaction, after the
+  ACTIVE/checkpoint/frozen-contract guards and before observation validation,
+  result insertion, aggregation, and verdict commit. Discovery reconciliation,
+  rollback arming, and a second finalizer cannot interleave between that final
+  proof and commit. A replacement in the old post-host-read/pre-finalizer gap
+  yields UNKNOWN/`resource_context_changed`, zero result rows, no completion or
+  verdict, and an ACTIVE rollback-capable job.
 
 ### The exact commands, and why they are these
 
@@ -2165,6 +2182,8 @@ UNKNOWN. "The command ran" is never a PASS.
 ```text
 env LC_ALL=C docker ps --all --no-trunc --quiet              # daemon oracle
 env LC_ALL=C docker inspect --type container --format <CONST> -- <name>
+env LC_ALL=C docker ps --all --no-trunc --format '{{json .Names}}'
+                                                               # absence proof
 ```
 
 No pipelines, no `docker ps | grep`, and no interpolated format string: the
@@ -2178,13 +2197,16 @@ so the returned `.Name` must equal exactly `/<target>`: an ID-prefix resolution
 reports a different name and is refused rather than accepted as the named
 container.
 
-Absence is definitive only when the daemon **proved** it answered. `docker
-inspect` exits 1 both for "No such container" and for "Cannot connect to the
-Docker daemon", and telling them apart by matching English stderr text would be
-exactly the fragile mechanism this repository avoids. So the fixed,
-argument-less daemon oracle runs once before the probes and again after any
-failing inspect: absence is a FAIL only when the daemon answered on both sides
-of it, and UNKNOWN otherwise.
+An inspect timeout or output overflow is classified before its normally
+non-zero killed-process return code. Any other non-zero inspect is not absence
+merely because the daemon answers. The fixed final command above was verified
+against Docker 26.1.5 on the development host: it is accepted by `docker ps`
+and emits each listed container's complete `.Names` value as one JSON string.
+The helper decodes every bounded line as JSON and compares the requested name
+exactly. Only a successful, well-formed listing in which that exact name is
+absent yields `container_absent`; an unavailable/timed-out/overflowing/
+malformed listing, or a generic inspect failure while the name remains listed,
+is UNKNOWN. No English stderr is parsed.
 
 `docker_container_healthy` is never downgraded to "running". It requires
 `.State.Running` true **and** `.State.Health.Status` exactly `healthy`. Not
@@ -2227,9 +2249,12 @@ transactions. Nothing holds `BEGIN IMMEDIATE` across SSH, `pct`, `systemctl`,
 `docker`, or the probe loop — affordable precisely because a read-only
 evaluation needs no critical section to prevent a second destructive
 submission, unlike the snapshot, mutation, and rollback boundaries. The
-authority transitions are short and local: start the evaluation, or accept its
-exact result. Concurrent or repeated orchestrator calls are safe, at most one
-definitive completion can commit, and a late result can never overwrite an
+authority transitions are short and local: start the evaluation, or atomically
+re-prove live context and accept its exact result. The latter proof, complete
+observation validation, shared kind/outcome/reason semantic validation,
+aggregation, result insertion, and verdict commit all share one
+`BEGIN IMMEDIATE`. Concurrent or repeated orchestrator calls are safe, at most
+one definitive completion can commit, and a late result can never overwrite an
 accepted verdict or a rollback that advanced the job.
 
 ### Not activated

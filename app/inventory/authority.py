@@ -68,6 +68,14 @@ from .health_contract import (
     canonical_health_probes,
     health_contract_fingerprint,
 )
+from .health_execution import (
+    HealthContractExecutionError,
+    require_health_contract_execution_eligible,
+)
+from .health_observation import (
+    HEALTH_PROBE_REASONS,
+    require_health_probe_semantics,
+)
 from .mutation_completion import (
     PackageMutationPostState,
     prove_package_mutation_completion,
@@ -103,37 +111,8 @@ class PackageUpdateExecutionAuthorityTemporarilyUnavailable(AuthorityConflict):
     """Current execution authority cannot be decided while a scan is running."""
 
 
-#: Bounded reason tokens a health probe result may carry. A CLOSED taxonomy,
-#: deliberately: `reason` is durable state and appears in durable events, and
-#: nothing a guest printed -- stdout, stderr, a unit name it echoed back, a
-#: Docker error string -- may ever become part of it. An executor that wants
-#: to say something new adds a token here and says why.
-HEALTH_PROBE_REASONS: frozenset[str] = frozenset(
-    {
-        # -- definitive PASS -------------------------------------------
-        "unit_active",
-        "container_running",
-        "container_healthy",
-        # -- definitive FAIL -------------------------------------------
-        "unit_not_active",
-        "container_not_running",
-        "container_absent",
-        "container_unhealthy",
-        "container_health_starting",
-        "container_has_no_healthcheck",
-        # -- UNKNOWN: could not be evaluated truthfully ----------------
-        "probe_target_not_exact",
-        "probe_target_ambiguous",
-        "guest_unavailable",
-        "command_failed",
-        "command_timed_out",
-        "malformed_output",
-        "docker_daemon_unavailable",
-        "host_unreachable",
-        "host_response_rejected",
-        "resource_context_changed",
-    }
-)
+class PackageUpdateHealthContextChanged(AuthorityConflict):
+    """Final health acceptance found the job's live target context stale."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,15 +197,28 @@ def _match_health_observations_to_frozen_probes(
                 "its index"
             )
         ordered.append(
-            HealthProbeObservation(
-                probe_index=probe.probe_index,
-                kind=probe.kind,
-                target=probe.target,
-                outcome=HealthProbeOutcome(observation.outcome),
-                reason=_require_health_probe_reason(observation.reason),
-            )
+            _coherent_health_observation(probe, observation)
         )
     return tuple(ordered)
+
+
+def _coherent_health_observation(
+    probe: PackageUpdateJobHealthProbe, observation: HealthProbeObservation
+) -> HealthProbeObservation:
+    try:
+        outcome = HealthProbeOutcome(observation.outcome)
+        reason = require_health_probe_semantics(
+            probe.kind, outcome, observation.reason
+        )
+    except ValueError as exc:
+        raise AuthorityConflict(str(exc)) from exc
+    return HealthProbeObservation(
+        probe_index=probe.probe_index,
+        kind=probe.kind,
+        target=probe.target,
+        outcome=outcome,
+        reason=reason,
+    )
 
 
 class _PackageUpdateJobAuthorityState(StrEnum):
@@ -1625,6 +1617,19 @@ class InventoryAuthority:
                             "package update job requires a declared resource "
                             "health contract"
                         )
+                    # Configuration deliberately stores bounded opaque
+                    # targets.  A package-update job is narrower: every
+                    # frozen probe must be structurally representable by the
+                    # exact executor before this transaction may issue it.
+                    # This is pure validation -- no systemctl, Docker, pct,
+                    # SSH, or PVE call occurs here.
+                    try:
+                        require_health_contract_execution_eligible(contract.probes)
+                    except HealthContractExecutionError as exc:
+                        raise AuthorityConflict(
+                            "resource health contract is not executable for a "
+                            "package update job"
+                        ) from exc
                     job_id = _new_uuid()
                     issued_at = _timestamp(decision_time)
 
@@ -4122,6 +4127,15 @@ class InventoryAuthority:
             probes = self._require_coherent_frozen_health_contract(
                 connection, canonical_job_id
             )
+            # This is the load-bearing post-host proof.  It runs inside the
+            # SAME BEGIN IMMEDIATE transaction that validates and inserts the
+            # exact observation set and commits the durable verdict.  Once
+            # this transaction begins, discovery/reconciliation and rollback
+            # arming cannot interleave before commit.
+            if not self._post_mutation_job_context_is_current(connection, job):
+                raise PackageUpdateHealthContextChanged(
+                    "package update job resource or locator context is stale"
+                )
             ordered = _match_health_observations_to_frozen_probes(probes, reported)
             outcome = aggregate_health_outcome(
                 observation.outcome for observation in ordered

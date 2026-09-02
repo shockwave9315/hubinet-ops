@@ -92,6 +92,14 @@ read at 3am. A probe names a target; it never carries a command, a script, or
 a shell fragment, and no caller-supplied text ever becomes command text (see
 "Arbitrary remote shell" under "Not the product").
 
+**Configuration and execution eligibility are separate.** The configuration
+layer keeps probe targets as bounded opaque data; it does not guess, append a
+systemd suffix, or silently rewrite a Docker name. A package-update job is
+narrower: before it is issued, every probe must be structurally representable
+by the exact executor. A bare or pattern systemd target, or a non-exact Docker
+name, may remain stored configuration but cannot authorize snapshot or package
+mutation for an update whose frozen success criterion could never pass.
+
 **No contract means unconfigured, and unconfigured is never success.** A
 resource with no declared contract cannot be health-checked, so its update job
 cannot be called successful and no automatic health-triggered rollback can be

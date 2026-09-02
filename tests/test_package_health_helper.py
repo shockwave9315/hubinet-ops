@@ -179,12 +179,25 @@ class FakeGuest:
 
     def _docker(self, tail):
         if tail[3] == "ps":
-            assert tuple(tail[3:]) == ("ps", "--all", "--no-trunc", "--quiet"), tail
             if not self.docker_daemon_up:
                 return helper.CommandResult(
                     1, b"", b"Cannot connect to the Docker daemon"
                 )
-            return self._ok(b"")
+            if tuple(tail[3:]) == ("ps", "--all", "--no-trunc", "--quiet"):
+                return self._ok(b"")
+            assert tuple(tail[3:]) == (
+                "ps",
+                "--all",
+                "--no-trunc",
+                "--format",
+                helper.DOCKER_NAME_LIST_FORMAT,
+            ), tail
+            return self._ok(
+                b"".join(
+                    json.dumps(name).encode() + b"\n"
+                    for name in self.containers
+                )
+            )
         assert tail[3] == "inspect", tail
         assert tuple(tail[4:6]) == ("--type", "container"), tail
         assert tail[6] == helper.DOCKER_INSPECT_FORMAT_FLAG, tail
@@ -465,11 +478,14 @@ def test_an_absent_container_is_a_failure_only_because_the_daemon_answered() -> 
     assert _evaluate(guest, (("docker_container_running", "gone"),)) == [
         ("failed", "container_absent")
     ]
-    # The oracle ran before the inspect AND again after it failed, so absence
-    # was proven by the daemon answering on both sides rather than by
-    # matching Docker's English error text.
+    # The daemon oracle ran before inspect, and the fixed exact-name inventory
+    # positively proved the requested name absent afterwards.
     oracles = [argv for argv in guest.commands if "ps" in argv]
     assert len(oracles) == 2
+    assert oracles[-1][-2:] == (
+        "--format",
+        helper.DOCKER_NAME_LIST_FORMAT,
+    )
 
 
 def test_a_docker_daemon_that_is_down_is_unknown_never_absent() -> None:
@@ -517,11 +533,78 @@ def test_malformed_inspect_output_is_unknown() -> None:
     ]
 
 
-def test_a_docker_timeout_is_unknown() -> None:
+def test_an_inspect_timeout_with_a_realistic_killed_returncode_is_unknown() -> None:
     guest = FakeGuest()
-    guest.timeout_on = "docker"
-    outcome, _ = _evaluate(guest, (("docker_container_running", "web"),))[0]
-    assert outcome == "unknown"
+    original = guest._docker
+
+    def timed_out(tail):
+        if tail[3] == "inspect":
+            return helper.CommandResult(-9, b"", b"", timed_out=True)
+        return original(tail)
+
+    guest._docker = timed_out
+    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
+        ("unknown", "command_timed_out")
+    ]
+
+
+def test_an_inspect_output_overflow_with_nonzero_returncode_is_unknown() -> None:
+    guest = FakeGuest()
+    original = guest._docker
+
+    def overflowed(tail):
+        if tail[3] == "inspect":
+            return helper.CommandResult(-9, b"x", b"", output_exceeded=True)
+        return original(tail)
+
+    guest._docker = overflowed
+    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
+        ("unknown", "malformed_output")
+    ]
+
+
+def test_a_generic_inspect_failure_is_not_absence_while_name_still_exists() -> None:
+    guest = FakeGuest()
+    original = guest._docker
+
+    def failed(tail):
+        if tail[3] == "inspect":
+            return helper.CommandResult(1, b"", b"generic inspect failure")
+        return original(tail)
+
+    guest._docker = failed
+    assert _evaluate(guest, (("docker_container_running", "web"),)) == [
+        ("unknown", "command_failed")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("listing_result", "reason"),
+    (
+        (
+            helper.CommandResult(1, b"", b"daemon unavailable"),
+            "docker_daemon_unavailable",
+        ),
+        (helper.CommandResult(-9, b"", b"", timed_out=True), "command_timed_out"),
+        (helper.CommandResult(-9, b"x", b"", output_exceeded=True), "malformed_output"),
+        (helper.CommandResult(0, b"not-json\n", b""), "malformed_output"),
+    ),
+)
+def test_an_unusable_exact_name_absence_proof_is_unknown(
+    listing_result, reason: str
+) -> None:
+    guest = FakeGuest()
+    original = guest._docker
+
+    def unusable_listing(tail):
+        if tail[3] == "ps" and "--format" in tail:
+            return listing_result
+        return original(tail)
+
+    guest._docker = unusable_listing
+    assert _evaluate(guest, (("docker_container_running", "gone"),)) == [
+        ("unknown", reason)
+    ]
 
 
 # ===========================================================================
@@ -1030,3 +1113,17 @@ def test_the_helper_can_only_report_reasons_the_backend_accepts() -> None:
 
     assert produced, "no reason tokens were found in the helper"
     assert produced <= HOST_PROBE_REASONS, produced - HOST_PROBE_REASONS
+
+
+def test_backend_eligibility_and_standalone_helper_grammars_are_identical() -> None:
+    """Issuance must never accept a target the standalone helper refuses."""
+
+    from app.inventory.health_execution import (
+        DOCKER_NAME_PATTERN,
+        SYSTEMD_UNIT_PATTERN,
+        SYSTEMD_UNIT_SUFFIXES,
+    )
+
+    assert helper.SYSTEMD_UNIT_RE.pattern == SYSTEMD_UNIT_PATTERN
+    assert helper.SYSTEMD_UNIT_SUFFIXES == SYSTEMD_UNIT_SUFFIXES
+    assert helper.DOCKER_NAME_RE.pattern == DOCKER_NAME_PATTERN

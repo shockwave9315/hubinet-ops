@@ -52,14 +52,14 @@ name matching, and `--` is honoured (verified: `-- --help` is treated as a
 container name). The `--format` template is a constant owned by this file; no
 part of it is built from a request.
 
-Absence is only definitive when the daemon PROVED it answered. `docker inspect`
-exits 1 both for "No such container" and for "Cannot connect to the Docker
-daemon", and telling them apart by matching English stderr text would be
-exactly the fragile mechanism this repository avoids. So a fixed, argument-less
-daemon oracle (`docker ps --all --no-trunc --quiet`, which needs the daemon and
-exits 0 only when it answers) runs once before the probes and again after any
-failing inspect: absence is a FAIL only when the daemon answered on both sides
-of it, and is UNKNOWN otherwise.
+`docker inspect` exits 1 for absence and for other failures, and telling them
+apart by matching English stderr would be fragile. A fixed daemon oracle
+(`docker ps --all --no-trunc --quiet`) runs before the probe. After a failing
+inspect, another fixed command lists every complete container name as one JSON
+string; only a successful, bounded, well-formed listing that does not contain
+the requested exact name proves absence. A timeout, overflow, generic inspect
+failure for a name still present, unavailable daemon, or unusable listing is
+UNKNOWN.
 
 **`docker_container_healthy` is never downgraded to "running".** It requires
 `.State.Running` true AND `.State.Health.Status` exactly `healthy`. A container
@@ -146,6 +146,11 @@ DOCKER_INSPECT_FORMAT = (
 #: Kept beside the template above so the flag and the constant it carries are
 #: audited as one thing.
 DOCKER_INSPECT_FORMAT_FLAG = "--format"
+
+#: Fixed positive absence proof.  Docker 26.1.5 was verified to accept this
+#: exact `ps` shape and emit each container's complete `.Names` value as one
+#: JSON string.  JSON keeps parsing exact without stderr-language matching.
+DOCKER_NAME_LIST_FORMAT = "{{json .Names}}"
 
 #: systemd ActiveState values that are a definitive NOT-active. Anything
 #: outside this set and "active" is an answer this helper does not understand,
@@ -673,14 +678,21 @@ def _inspect_container(
         data_argument=name,
         max_output=64 * 1024,
     )
+    # A real timeout kills the process, so it normally carries BOTH
+    # `timed_out=True` and a negative return code.  Execution bounds must win
+    # before any return-code interpretation or absence proof.
+    if result.timed_out:
+        raise ProbeUnknown("command_timed_out")
+    if result.output_exceeded:
+        raise ProbeUnknown("malformed_output")
     if result.returncode != 0:
-        # `docker inspect` uses the same exit code for "no such container" and
-        # "cannot connect to the daemon", and their stderr differs only in
-        # English prose. So absence is proven by the daemon oracle, never by
-        # matching that text.
-        if _docker_daemon_answered(runner, vmid, expected_node, local_node):
+        # A live daemon does not make every inspect error mean absence.  Only
+        # a separate exact-name inventory may prove the name is not present.
+        if _docker_exact_name_is_absent(
+            runner, vmid, expected_node, local_node, name
+        ):
             raise _ContainerAbsent()
-        raise ProbeUnknown("docker_daemon_unavailable")
+        raise ProbeUnknown("command_failed")
     stdout = _decode(result)
     lines = [line for line in stdout.splitlines() if line.strip()]
     if len(lines) != 1:
@@ -698,6 +710,48 @@ def _inspect_container(
     if running not in ("true", "false"):
         raise ProbeUnknown("malformed_output")
     return observed_name, running == "true", health
+
+
+def _docker_exact_name_is_absent(
+    runner: Runner, vmid: int, expected_node: str, local_node: str, name: str
+) -> bool:
+    """Positively prove an exact container name is absent from a live daemon.
+
+    The argv and format are fixed.  Every listed name is decoded as one JSON
+    string and compared for exact equality.  An unavailable, timed-out,
+    overflowing, non-zero, or malformed listing is UNKNOWN, never absence.
+    """
+
+    result = _run_guest_command(
+        runner,
+        vmid,
+        expected_node,
+        local_node,
+        (
+            "env",
+            "LC_ALL=C",
+            "docker",
+            "ps",
+            "--all",
+            "--no-trunc",
+            "--format",
+            DOCKER_NAME_LIST_FORMAT,
+        ),
+        max_output=1024 * 1024,
+    )
+    stdout = _decode(result)
+    if result.returncode != 0:
+        raise ProbeUnknown("docker_daemon_unavailable")
+    names: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            listed = json.loads(line)
+        except (TypeError, ValueError) as exc:
+            raise ProbeUnknown("malformed_output") from exc
+        if not isinstance(listed, str) or not listed:
+            raise ProbeUnknown("malformed_output")
+        names.append(listed)
+    return name not in names
 
 
 def evaluate_docker_container_running(

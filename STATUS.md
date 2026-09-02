@@ -585,7 +585,11 @@ The full lifecycle is still dark.
   fingerprint, and the complete canonical probe set) into immutable job-owned
   rows. **A resource with no declared contract cannot be issued a job**:
   absence is not health, so a job whose success criterion does not exist could
-  never truthfully be called successful.
+  never truthfully be called successful. Configuration remains bounded opaque
+  data, but issuance now separately requires every stored probe to be
+  structurally representable by the exact executor; a bare/pattern systemd
+  target or invalid Docker execution name produces no job and cannot reach
+  snapshot or package mutation.
 - **One boundary decides which contract applies.** While the job is still
   pre-mutation, the live contract drifting away from the frozen copy makes the
   job stale and forbids the real package mutation, exactly as a changed
@@ -628,18 +632,22 @@ The full lifecycle is still dark.
   names one unit (a glob can match exactly one, so the block rule alone is not
   enough), and an explicit unit-type suffix is required rather than guessed.
   `docker inspect` resolves by ID prefix, so the returned `.Name` must equal
-  the requested container; it cannot tell "no such container" from "daemon
-  unavailable" by exit code, so absence is definitive only when a fixed
-  argument-less daemon oracle proves the daemon answered on both sides of the
-  failing inspect. `docker_container_healthy` is never downgraded to
+  the requested container. Timeout and overflow are classified before the
+  killed process's non-zero return code, and a generic non-zero is never
+  absence merely because the daemon answers. Only a successful bounded fixed
+  listing of every complete container name that omits the requested exact name
+  proves absence. `docker_container_healthy` is never downgraded to
   "running": not running, `unhealthy`, `starting`, and no HEALTHCHECK at all
   are each a definitive failure.
-- **Three layers of live-target proof.** The backend re-proves the exact
-  resource/locator context before the host call and again after it, through
-  the same narrow predicate rollback arming uses; the helper's single guest
-  dispatcher revalidates the live PVE target before every `pct exec`. A guest
-  replaced while the round trip was in flight yields neither a PASS nor a
-  FAIL.
+- **Atomic final live-target proof.** The backend re-proves the exact
+  resource/locator context before the host call and once as an early rejection
+  after it; the helper's single guest dispatcher revalidates before every `pct
+  exec`. The load-bearing proof is inside the same `BEGIN IMMEDIATE` that
+  validates the complete observation set, aggregates it, inserts every result,
+  and commits PASS/FAIL. A guest replaced in the former post-check/pre-commit
+  gap yields UNKNOWN with zero result or verdict rows. The same acceptance
+  boundary also independently enforces the shared probe-kind/outcome/reason
+  semantic matrix rather than trusting the orchestrator to have done so.
 - **No automatic compensation.** A failing verdict reports and stops. Health
   execution makes zero calls into the rollback host control and arms nothing,
   and there is no retry count, grace period, delayed-health policy, threshold,
